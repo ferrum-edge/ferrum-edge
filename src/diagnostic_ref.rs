@@ -2001,12 +2001,19 @@ fn unrouted_rejection_slot(slot: Option<&Arc<DiagnosticSlot>>) -> Option<&Arc<Di
 /// Record a routing rejection (`phase` is [`ROUTE_NOT_FOUND_PHASE`] or
 /// [`MESH_REGISTRY_ONLY_PHASE`]) answered with `status` for a request received
 /// at `started`, with its unrouted detail.
+///
+/// This is also the single funnel every HTTP-family listener (H1/H2 and H3)
+/// passes through on a route miss, so it counts the rejection on
+/// `ferrum_unmatched_requests_total` regardless of whether diagnostic
+/// references are enabled: these requests never reach a plugin, so no other
+/// Prometheus family sees them.
 pub(crate) fn record_route_miss(
     slot: Option<&Arc<DiagnosticSlot>>,
     phase: &'static str,
     started: Instant,
     status: u16,
 ) {
+    crate::plugins::prometheus_metrics::global_registry().record_unmatched_request(phase, status);
     if let Some(slot) = unrouted_rejection_slot(slot) {
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
         slot.record_rejection(DiagnosticRejection::routing(phase, status));

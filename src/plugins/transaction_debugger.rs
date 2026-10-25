@@ -55,7 +55,10 @@
 //!   (client-visible bytes, after every response transform).
 //! * **Redacted before rendering.** JSON objects and form bodies are redacted
 //!   per field; credential-shaped string values (`Bearer …`, `Basic …`,
-//!   JWT-shaped) are replaced anywhere they appear. Structured families without
+//!   compact JWS/JWE tokens recognized by a base64url-decoded JSON protected
+//!   header rather than a literal `eyJ` prefix, well-known provider API-key and
+//!   AWS access-key shapes, and PEM private-key blocks) are replaced anywhere
+//!   they appear, including in header values. Structured families without
 //!   a sound structure-aware redactor (XML, GraphQL) are *not* capturable at
 //!   all, and a body that claims to be JSON but does not parse renders as
 //!   [`BODY_MALFORMED_MARKER`] rather than falling back to a partial rendering
@@ -69,24 +72,39 @@
 //! * **Explicit provenance.** Every request/response emits exactly one capture
 //!   record whose `capture` field distinguishes `captured`, `truncated`,
 //!   `binary`, and `omitted` (with a stable `reason`), so an absent body sample
-//!   is never confused with an empty one.
+//!   is never confused with an empty one. The header-phase and final-body hooks
+//!   share a private per-request, per-instance flag (`CaptureRecordState`),
+//!   so a capture decision that flips between them (a transform that grows,
+//!   empties, or relabels the body) still yields exactly one record.
+//! * **Targeted.** `capture_request_header` / `capture_request_header_value`,
+//!   `capture_sample_rate`, and `capture_expires_at` narrow capture to the
+//!   requests an operator is debugging and switch it off on schedule. A request
+//!   outside the target never buffers and reports a content-free
+//!   `not_selected` / `capture_expired` omission.
+//! * **Opt-in prefix sampling.** `capture_body_prefix` admits `text/plain` and
+//!   form bodies whose declared length exceeds the cap (up to
+//!   [`MAX_PREFIX_SOURCE_BYTES`]) and renders a redacted prefix of complete
+//!   lines / pairs, marked `truncated`. JSON keeps the whole-document rule.
 //!
 //! No captured bytes are written into `ctx.metadata` or the transaction
-//! summary: the sample exists only on the `transaction_debug` tracing target and
-//! is not retained across hooks.
+//! summary: the sample exists only on the `transaction_debug` tracing target.
+//! The only state retained across hooks is the content-free record flag above.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use http::header::HeaderName;
 use serde::ser::SerializeMap;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
 };
+use crate::plugins::utils::auth_flow::constant_time_eq;
 use crate::plugins::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata, status_class,
 };
@@ -99,6 +117,7 @@ use crate::plugins::utils::metadata_redaction::{
     is_sensitive_name_by_listed_rules, metadata_value_is_redacted,
 };
 use crate::proxy::tcp_proxy::StreamIoSide;
+use crate::retry::ErrorClass;
 
 /// Headers that contain sensitive credentials and must be redacted in debug output.
 const SENSITIVE_HEADERS: &[&str] = &[
@@ -123,6 +142,11 @@ const REDACTED: &str = "***REDACTED***";
 /// Closed configuration surface. Kept in lockstep with the OpenAPI
 /// `TransactionDebuggerConfig` schema (`openapi_yaml_tests`).
 pub const TRANSACTION_DEBUGGER_CONFIG_KEYS: &[&str] = &[
+    "capture_body_prefix",
+    "capture_expires_at",
+    "capture_request_header",
+    "capture_request_header_value",
+    "capture_sample_rate",
     "log_request_body",
     "log_response_body",
     "max_request_body_bytes",
@@ -152,6 +176,22 @@ pub const MAX_BODY_CAPTURE_BYTES: u64 = 8192;
 pub const MAX_RENDERED_BODY_BYTES: usize = 64 * 1024;
 
 const _: () = assert!(MAX_RENDERED_BODY_BYTES == 8 * MAX_BODY_CAPTURE_BYTES as usize);
+
+/// Largest declared `Content-Length` that `capture_body_prefix` admits to the
+/// buffered path for a prefix sample. Larger, unknown-length, and JSON bodies
+/// keep streaming exactly as they do without prefix sampling.
+pub const MAX_PREFIX_SOURCE_BYTES: u64 = 1024 * 1024;
+
+/// Maximum length of `capture_request_header_value`.
+pub const MAX_CAPTURE_SELECTOR_VALUE_BYTES: usize = 256;
+
+/// Number of base64url characters of a compact-serialization segment decoded
+/// when deciding whether it is a JOSE protected header (48 decoded bytes).
+const MAX_JOSE_HEADER_PREFIX_CHARS: usize = 64;
+
+/// Process-unique instance ids, so sibling debugger instances on one proxy
+/// keep independent per-request capture-record state.
+static NEXT_TRANSACTION_DEBUGGER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Maximum number of lines retained by unstructured-text redaction.
 const MAX_TEXT_REDACTION_LINES: usize = 256;
@@ -318,7 +358,46 @@ pub struct CapturedBody {
     pub rendered: String,
 }
 
+/// Per-request, per-instance capture-record bookkeeping.
+///
+/// The header-phase hooks (`before_proxy` / `after_proxy`) and the final body
+/// hooks evaluate the capture decision over different header maps, and a body
+/// transform between them can flip it. Whichever hook emits a direction's
+/// record first sets that direction's flag, and every later hook for the same
+/// direction is a no-op, so a flip yields exactly one record instead of zero or
+/// two. Content-free by construction: nothing here describes the body.
+///
+/// `header_selected` memoizes the `capture_request_header` decision from the
+/// original client headers in `on_request_received`. Core moves `ctx.headers`
+/// out of the context while it runs header-preserving `before_proxy` hooks, so
+/// a later hook must not re-read the selector from the live map.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CaptureRecordState {
+    pub(crate) request_emitted: bool,
+    pub(crate) response_emitted: bool,
+    pub(crate) header_selected: Option<bool>,
+}
+
+/// Direction of one capture record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureDirection {
+    Request,
+    Response,
+}
+
+impl CaptureDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
 pub struct TransactionDebugger {
+    /// Process-unique id keying this instance's per-request
+    /// `CaptureRecordState`.
+    instance_id: u64,
     /// Additional header names (lowercase) to redact beyond the built-in list.
     extra_redacted_headers: Vec<String>,
     /// Additional body field names (lowercase) to redact.
@@ -331,6 +410,18 @@ pub struct TransactionDebugger {
     log_response_body: bool,
     max_request_body_bytes: usize,
     max_response_body_bytes: usize,
+    /// Render a redacted prefix of an over-cap `text/plain` / form body
+    /// instead of a content-free omission.
+    capture_body_prefix: bool,
+    /// Requests received at or after this instant are not captured.
+    capture_expires_at: Option<DateTime<Utc>>,
+    /// Lowercase request header that must be present for a capture.
+    capture_request_header: Option<String>,
+    /// Exact value `capture_request_header` must carry, when configured.
+    capture_request_header_value: Option<String>,
+    /// Requests whose sample point is at or above this threshold are not
+    /// captured. `None` selects every request (`capture_sample_rate` 1).
+    capture_sample_threshold: Option<u64>,
     /// Compiled terminal-diagnostic projection, resolved once at construction
     /// (inline `schema:` or global-first `schema_ref:`). `None` keeps the
     /// pre-existing `tracing` field emission byte-for-byte and allocation-free.
@@ -404,7 +495,7 @@ impl TransactionDebugger {
             ));
         }
 
-        let extra_redacted_headers =
+        let mut extra_redacted_headers =
             optional_header_names(config, "redacted_headers")?.unwrap_or_default();
 
         let log_request_body = optional_bool(config, "log_request_body")?.unwrap_or(false);
@@ -413,6 +504,29 @@ impl TransactionDebugger {
             optional_capture_budget(config, "max_request_body_bytes", log_request_body)?;
         let max_response_body_bytes =
             optional_capture_budget(config, "max_response_body_bytes", log_response_body)?;
+        let capture_enabled = log_request_body || log_response_body;
+
+        let capture_body_prefix = optional_bool(config, "capture_body_prefix")?.unwrap_or(false);
+        if capture_body_prefix && !capture_enabled {
+            return Err(
+                "transaction_debugger: `capture_body_prefix` requires `log_request_body` or \
+                 `log_response_body` to be true"
+                    .to_string(),
+            );
+        }
+        let capture_sample_threshold = optional_capture_sample_threshold(config, capture_enabled)?;
+        let capture_expires_at = optional_capture_expiry(config, capture_enabled)?;
+        let capture_request_header = optional_capture_header(config, capture_enabled)?;
+        let capture_request_header_value =
+            optional_capture_header_value(config, capture_request_header.is_some())?;
+        // A configured selector value is an operator-chosen token: keep it out
+        // of the header dumps like any other credential-bearing header.
+        if capture_request_header_value.is_some()
+            && let Some(name) = capture_request_header.as_ref()
+            && !extra_redacted_headers.contains(name)
+        {
+            extra_redacted_headers.push(name.clone());
+        }
 
         let redacted_body_fields =
             optional_body_field_names(config, "redacted_body_fields")?.unwrap_or_default();
@@ -435,6 +549,7 @@ impl TransactionDebugger {
         }
 
         let plugin = Self {
+            instance_id: NEXT_TRANSACTION_DEBUGGER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             extra_redacted_headers,
             redacted_body_fields,
             safe_text_fields: Vec::new(),
@@ -442,6 +557,11 @@ impl TransactionDebugger {
             log_response_body,
             max_request_body_bytes,
             max_response_body_bytes,
+            capture_body_prefix,
+            capture_expires_at,
+            capture_request_header,
+            capture_request_header_value,
+            capture_sample_threshold,
             schema,
         };
         // Deny layer: a credential-shaped or unparseable name cannot be
@@ -567,9 +687,169 @@ impl TransactionDebugger {
         self.max_response_body_bytes
     }
 
+    /// Whether over-cap `text/plain` / form bodies render a redacted prefix.
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
+    pub const fn capture_body_prefix(&self) -> bool {
+        self.capture_body_prefix
+    }
+
+    /// Why this request is outside the operator's capture target, as a fixed
+    /// omission reason, or `None` when it is selected.
+    ///
+    /// Evaluated only from request state that no later hook rewrites for this
+    /// purpose — the receive timestamp, the immediate peer address, and the
+    /// selector header — so the buffering predicates and both emission hooks
+    /// reach the same answer for one request. Expiry is judged against the
+    /// request's receive time, so a request admitted just before the deadline
+    /// is still captured in both directions.
+    fn capture_selection_skip(&self, ctx: &RequestContext) -> Option<&'static str> {
+        self.capture_selection_skip_with(ctx, &ctx.headers)
+    }
+
+    /// [`Self::capture_selection_skip`] with an explicit request-header view
+    /// for the selector, used only when `on_request_received` did not memoize
+    /// the selector decision. `before_proxy` passes the hook header map, which
+    /// is where core keeps the request headers while `ctx.headers` is moved
+    /// out for header-preserving hooks.
+    fn capture_selection_skip_with(
+        &self,
+        ctx: &RequestContext,
+        selector_headers: &HashMap<String, String>,
+    ) -> Option<&'static str> {
+        if self
+            .capture_expires_at
+            .is_some_and(|expires_at| ctx.timestamp_received >= expires_at)
+        {
+            return Some("capture_expired");
+        }
+        if self.capture_request_header.is_some() {
+            let selected = self
+                .memoized_header_selection(ctx)
+                .unwrap_or_else(|| self.header_selects(selector_headers));
+            if !selected {
+                return Some("not_selected");
+            }
+        }
+        if let Some(threshold) = self.capture_sample_threshold
+            && request_sample_point(ctx) >= threshold
+        {
+            return Some("not_selected");
+        }
+        None
+    }
+
+    /// Whether `headers` carries the configured selector header (and, when
+    /// configured, its exact value). `true` when no selector is configured.
+    fn header_selects(&self, headers: &HashMap<String, String>) -> bool {
+        let Some(name) = self.capture_request_header.as_deref() else {
+            return true;
+        };
+        let Some(value) = header_value(headers, name) else {
+            return false;
+        };
+        self.capture_request_header_value
+            .as_deref()
+            .is_none_or(|expected| constant_time_eq(value.trim().as_bytes(), expected.as_bytes()))
+    }
+
+    /// The selector decision `on_request_received` memoized for this request.
+    fn memoized_header_selection(&self, ctx: &RequestContext) -> Option<bool> {
+        ctx.plugin_state()
+            .and_then(|state| {
+                state
+                    .transaction_debugger_capture_records
+                    .get(&self.instance_id)
+            })
+            .and_then(|records| records.header_selected)
+    }
+
+    /// Whether targeting is configured. Targeting is judged from the request
+    /// context, so the context-free final request hook captures nothing then.
+    fn capture_targeting_configured(&self) -> bool {
+        self.capture_expires_at.is_some()
+            || self.capture_request_header.is_some()
+            || self.capture_sample_threshold.is_some()
+    }
+
+    /// Whether this instance already emitted `direction`'s capture record for
+    /// the request.
+    fn capture_record_emitted(&self, ctx: &RequestContext, direction: CaptureDirection) -> bool {
+        ctx.plugin_state()
+            .and_then(|state| {
+                state
+                    .transaction_debugger_capture_records
+                    .get(&self.instance_id)
+            })
+            .is_some_and(|records| match direction {
+                CaptureDirection::Request => records.request_emitted,
+                CaptureDirection::Response => records.response_emitted,
+            })
+    }
+
+    fn mark_capture_record_emitted(&self, ctx: &mut RequestContext, direction: CaptureDirection) {
+        let records = ctx
+            .plugin_state_mut()
+            .transaction_debugger_capture_records
+            .entry(self.instance_id)
+            .or_default();
+        match direction {
+            CaptureDirection::Request => records.request_emitted = true,
+            CaptureDirection::Response => records.response_emitted = true,
+        }
+    }
+
+    /// Request-direction decision including targeting. `selector_headers` is
+    /// the request-header view the selector falls back to when no decision was
+    /// memoized (see [`Self::capture_selection_skip_with`]).
+    fn request_capture_decision_for(
+        &self,
+        ctx: &RequestContext,
+        selector_headers: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
+    ) -> BodyCaptureDecision {
+        if !self.log_request_body {
+            return BodyCaptureDecision::Skip("disabled");
+        }
+        if let Some(reason) = self.capture_selection_skip_with(ctx, selector_headers) {
+            return BodyCaptureDecision::Skip(reason);
+        }
+        self.request_body_capture_decision(headers)
+    }
+
+    /// Response-direction decision including targeting and the request-shape
+    /// exclusion.
+    fn response_capture_decision_for(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> BodyCaptureDecision {
+        if !self.log_response_body {
+            return BodyCaptureDecision::Skip("disabled");
+        }
+        if let Some(reason) = self.capture_selection_skip(ctx) {
+            return BodyCaptureDecision::Skip(reason);
+        }
+        if !self.request_shape_allows_response_capture(ctx) {
+            return BodyCaptureDecision::Skip("protocol_excluded");
+        }
+        self.response_body_capture_decision(headers)
+    }
+
     /// Stable terminal classification derived from the final HTTP/gRPC summary.
+    ///
+    /// A proven client abort — `client_disconnected` together with the
+    /// `ClientDisconnect` class, which core stamps on every pre-header
+    /// cancellation terminal (status 499 / gRPC `CANCELLED`) — is a client
+    /// disconnect, not a dispatch failure. Neither signal alone proves it: a
+    /// gateway deadline or authorization terminal carries the same
+    /// health-neutral class with the flag unset, and a genuine transport error
+    /// still wins over a later body-phase disconnect.
     pub fn classify_http_outcome(summary: &TransactionSummary) -> &'static str {
-        if summary.error_class.is_some() {
+        if summary.client_disconnected
+            && matches!(summary.error_class, Some(ErrorClass::ClientDisconnect))
+        {
+            "client_disconnected"
+        } else if summary.error_class.is_some() {
             "dispatch_error"
         } else if summary.client_disconnected {
             "client_disconnected"
@@ -659,7 +939,9 @@ impl TransactionDebugger {
         headers
             .iter()
             .map(|(k, v)| {
-                if self.is_sensitive(ctx, k) {
+                // A credential-shaped value is redacted whatever the header is
+                // called (`Location: …X-Amz-Credential=AKIA…`).
+                if self.is_sensitive(ctx, k) || looks_like_credential(v) {
                     (k.clone(), REDACTED.to_string())
                 } else {
                     (k.clone(), v.clone())
@@ -683,7 +965,11 @@ impl TransactionDebugger {
         if header_value(headers, "upgrade").is_some() {
             return BodyCaptureDecision::Skip("protocol_excluded");
         }
-        capture_decision(headers, self.max_request_body_bytes)
+        capture_decision(
+            headers,
+            self.max_request_body_bytes,
+            self.capture_body_prefix,
+        )
     }
 
     /// Eligibility of the current response for a bounded body capture.
@@ -694,7 +980,11 @@ impl TransactionDebugger {
         if !self.log_response_body {
             return BodyCaptureDecision::Skip("disabled");
         }
-        capture_decision(headers, self.max_response_body_bytes)
+        capture_decision(
+            headers,
+            self.max_response_body_bytes,
+            self.capture_body_prefix,
+        )
     }
 
     /// Whether the request shape rules out response capture before backend
@@ -807,6 +1097,102 @@ impl TransactionDebugger {
         }
     }
 
+    /// Render a bounded, redacted prefix of a body longer than the capture cap
+    /// (`capture_body_prefix`). A body that fits is rendered whole by
+    /// [`Self::render_captured_body`].
+    ///
+    /// Only families whose redaction unit is self-delimiting get a prefix:
+    /// `text/plain` keeps the complete lines and a form body the complete
+    /// `&`-separated pairs that fit inside the cap; the unit cut by the cap is
+    /// dropped rather than rendered half-redacted. Only the first `max_bytes`
+    /// (never above [`MAX_BODY_CAPTURE_BYTES`]) are ever scanned. JSON needs
+    /// the whole document to know which key a value belongs to, so it returns
+    /// `None`, as does a window holding no complete unit; the caller reports
+    /// those as the ordinary content-free `over_capture_limit` omission.
+    pub fn render_captured_prefix(
+        &self,
+        body: &[u8],
+        kind: BodyKind,
+        max_bytes: usize,
+    ) -> Option<CapturedBody> {
+        let effective_cap = max_bytes.min(MAX_BODY_CAPTURE_BYTES as usize);
+        if body.len() <= effective_cap {
+            return Some(self.render_captured_body(body, kind, max_bytes));
+        }
+        let separator = match kind {
+            BodyKind::Json => return None,
+            BodyKind::Form => b'&',
+            BodyKind::Text => b'\n',
+        };
+        let window = body.get(..effective_cap)?;
+        let end = window.iter().rposition(|byte| *byte == separator)?;
+        if end == 0 {
+            return None;
+        }
+        let original_bytes = body.len();
+        // Cut at an ASCII separator, so a valid UTF-8 body never splits a
+        // multibyte character here; anything else is binary.
+        let Ok(text) = std::str::from_utf8(window.get(..end)?) else {
+            return Some(CapturedBody {
+                state: "binary",
+                kind: "binary",
+                original_bytes,
+                truncated: false,
+                rendered: BODY_BINARY_MARKER.to_string(),
+            });
+        };
+        let redacted = match kind {
+            BodyKind::Json => return None,
+            BodyKind::Form => self.redact_form_body(text),
+            BodyKind::Text => self.redact_text_lines(text).0,
+        };
+        let (slice, _) = truncate_on_char_boundary(&redacted, effective_cap);
+        let (rendered, _) = escape_for_diagnostics(slice);
+        Some(CapturedBody {
+            state: "truncated",
+            kind: kind.as_str(),
+            original_bytes,
+            truncated: true,
+            rendered,
+        })
+    }
+
+    /// The record a final body hook emits for an admitted (`Capture`)
+    /// decision, after re-checking the actual body.
+    fn final_body_record(
+        &self,
+        body: &[u8],
+        kind: BodyKind,
+        max_bytes: usize,
+        decision: BodyCaptureDecision,
+    ) -> (BodyCaptureDecision, Option<CapturedBody>) {
+        // `Content-Length` admitted this message, but the actual body is what
+        // gets walked. A stale/lying header or a transform that grew the body
+        // must not widen the capture ceiling, so fail closed before any UTF-8
+        // scan, parse, or allocation — unless prefix sampling is on, which
+        // scans at most the cap.
+        if body.len() > max_bytes {
+            if self.capture_body_prefix
+                && let Some(sample) = self.render_captured_prefix(body, kind, max_bytes)
+            {
+                return (decision, Some(sample));
+            }
+            return (BodyCaptureDecision::Skip("over_capture_limit"), None);
+        }
+        // The declared length can overstate the message too (a `HEAD` / `304`
+        // response, or a transform that emptied the body). Report the fixed
+        // `empty_body` reason the header screen uses rather than handing an
+        // empty slice to the renderer, where a structured family would report
+        // it as a *malformed* body the peer never sent.
+        if body.is_empty() {
+            return (BodyCaptureDecision::Skip("empty_body"), None);
+        }
+        (
+            decision,
+            Some(self.render_captured_body(body, kind, max_bytes)),
+        )
+    }
+
     /// Whether a body field name (or an unstructured text line) is
     /// credential-bearing under the built-in list, the operator's
     /// `redacted_body_fields` / `redacted_headers`, and the central metadata
@@ -871,6 +1257,10 @@ impl TransactionDebugger {
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
             || lowered.contains("eyj")
+            // Field-independent value shapes: compact JOSE tokens whatever
+            // their header spelling, provider API keys, AWS access keys, and
+            // PEM private-key markers.
+            || looks_like_credential(line)
     }
 
     fn redact_json_value(&self, value: &mut Value, depth: usize, ctx: JsonBodyRedactionContext) {
@@ -982,6 +1372,10 @@ impl TransactionDebugger {
     fn redact_text_lines(&self, text: &str) -> (String, bool) {
         let mut out = String::with_capacity(text.len());
         let mut dropped = false;
+        // The base64 body lines of a PEM private key carry no marker of their
+        // own, so a `-----BEGIN … PRIVATE KEY-----` line redacts every line
+        // through its `-----END` line (or the end of the text).
+        let mut in_private_key_block = false;
         for (index, line) in text.lines().enumerate() {
             if index >= MAX_TEXT_REDACTION_LINES {
                 dropped = true;
@@ -990,7 +1384,19 @@ impl TransactionDebugger {
             if index > 0 {
                 out.push('\n');
             }
-            if self.line_is_sensitive(line) {
+            let redact = if in_private_key_block {
+                if contains_ignore_ascii_case(line, "-----END") {
+                    in_private_key_block = false;
+                }
+                true
+            } else if contains_private_key_marker(line) {
+                in_private_key_block = contains_ignore_ascii_case(line, "-----BEGIN")
+                    && !contains_ignore_ascii_case(line, "-----END");
+                true
+            } else {
+                self.line_is_sensitive(line)
+            };
+            if redact {
                 out.push_str(REDACTED);
             } else {
                 out.push_str(line);
@@ -1005,58 +1411,59 @@ impl TransactionDebugger {
     /// request method and path. The hook header map is the backend-visible one
     /// and carries `:method` / `:path` only on the gRPC and H3 body-transform
     /// paths, so it is the fallback rather than the primary source.
+    ///
+    /// With a context this hook owns the request record whenever
+    /// `before_proxy` has not already emitted one: an admitted request whose
+    /// final body is oversized, empty, or no longer capturable reports that
+    /// omission here. The context-free hook cannot see that state (nor the
+    /// targeting inputs), so it keeps the header-phase split — it only reports
+    /// an admitted body — and captures nothing when targeting is configured.
     fn capture_final_request_body(
         &self,
-        ctx: Option<&RequestContext>,
+        ctx: Option<&mut RequestContext>,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.log_request_body
-            || !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
-        {
+        if !self.log_request_body || !capture_output_enabled() {
             return PluginResult::Continue;
         }
-        let decision = self.request_body_capture_decision(headers);
-        if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
-            let method = ctx
-                .map(|hook_ctx| hook_ctx.method.as_str())
-                .or_else(|| header_value(headers, ":method"))
-                .unwrap_or("-");
-            let path = ctx
-                .map(|hook_ctx| hook_ctx.path.as_str())
-                .or_else(|| header_value(headers, ":path"))
-                .unwrap_or("-");
-            // `Content-Length` admitted this message, but the backend-visible
-            // body is what actually gets walked. A stale/lying header or a
-            // transform that grew the body must not widen the capture ceiling,
-            // so fail closed before any UTF-8 scan, parse, or allocation.
-            if body.len() > max_bytes {
-                self.emit_body_capture(
-                    "request",
-                    method,
-                    path,
-                    BodyCaptureDecision::Skip("over_capture_limit"),
-                    None,
-                );
-                return PluginResult::Continue;
+        let decision = match ctx.as_deref() {
+            Some(hook_ctx) => {
+                if self.capture_record_emitted(hook_ctx, CaptureDirection::Request) {
+                    return PluginResult::Continue;
+                }
+                self.request_capture_decision_for(hook_ctx, &hook_ctx.headers, headers)
             }
-            // The declared length can overstate the message too, and there is
-            // nothing to sample when it does. Report the same fixed
-            // `empty_body` reason the header screen uses rather than handing an
-            // empty slice to the renderer, where a structured family would
-            // report it as a *malformed* body the peer never sent.
-            if body.is_empty() {
-                self.emit_body_capture(
-                    "request",
-                    method,
-                    path,
-                    BodyCaptureDecision::Skip("empty_body"),
-                    None,
-                );
-                return PluginResult::Continue;
+            None => {
+                if self.capture_targeting_configured() {
+                    return PluginResult::Continue;
+                }
+                self.request_body_capture_decision(headers)
             }
-            let sample = self.render_captured_body(body, kind, max_bytes);
-            self.emit_body_capture("request", method, path, decision, Some(&sample));
+        };
+        let (record, sample) = match decision {
+            BodyCaptureDecision::Capture { kind, max_bytes } => {
+                self.final_body_record(body, kind, max_bytes, decision)
+            }
+            BodyCaptureDecision::Skip(_) if ctx.is_none() => return PluginResult::Continue,
+            skip @ BodyCaptureDecision::Skip(_) => (skip, None),
+        };
+        let (method, path) = match ctx.as_deref() {
+            Some(hook_ctx) => (hook_ctx.method.as_str(), hook_ctx.path.as_str()),
+            None => (
+                header_value(headers, ":method").unwrap_or("-"),
+                header_value(headers, ":path").unwrap_or("-"),
+            ),
+        };
+        self.emit_body_capture(
+            CaptureDirection::Request,
+            method,
+            path,
+            record,
+            sample.as_ref(),
+        );
+        if let Some(hook_ctx) = ctx {
+            self.mark_capture_record_emitted(hook_ctx, CaptureDirection::Request);
         }
         PluginResult::Continue
     }
@@ -1066,12 +1473,13 @@ impl TransactionDebugger {
     /// was actually available.
     fn emit_body_capture(
         &self,
-        direction: &'static str,
+        direction: CaptureDirection,
         method: &str,
         path: &str,
         decision: BodyCaptureDecision,
         captured: Option<&CapturedBody>,
     ) {
+        let direction = direction.as_str();
         match (decision, captured) {
             (BodyCaptureDecision::Capture { .. }, Some(sample)) => {
                 tracing::debug!(
@@ -1121,6 +1529,20 @@ impl Plugin for TransactionDebugger {
         if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
             let safe_headers = self.redact_headers(ctx, &ctx.headers);
             tracing::debug!(target: "transaction_debug", method = %ctx.method, path = %ctx.path, client_ip = %ctx.client_ip, headers = ?safe_headers, "Incoming request");
+            // Memoize the selector decision from the original client headers:
+            // core moves `ctx.headers` out while header-preserving
+            // `before_proxy` hooks run, and a request transformer may rewrite
+            // the selector later. Every capture hook reuses this answer.
+            if self.capture_request_header.is_some()
+                && (self.log_request_body || self.log_response_body)
+            {
+                let selected = self.header_selects(&ctx.headers);
+                ctx.plugin_state_mut()
+                    .transaction_debugger_capture_records
+                    .entry(self.instance_id)
+                    .or_default()
+                    .header_selected = Some(selected);
+            }
         }
         PluginResult::Continue
     }
@@ -1133,7 +1555,7 @@ impl Plugin for TransactionDebugger {
         self.log_request_body
             && capture_output_enabled()
             && self
-                .request_body_capture_decision(&ctx.headers)
+                .request_capture_decision_for(ctx, &ctx.headers, &ctx.headers)
                 .is_capture()
     }
 
@@ -1151,6 +1573,7 @@ impl Plugin for TransactionDebugger {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.log_response_body
             && capture_output_enabled()
+            && self.capture_selection_skip(ctx).is_none()
             && self.request_shape_allows_response_capture(ctx)
     }
 
@@ -1205,11 +1628,27 @@ impl Plugin for TransactionDebugger {
         // capture record itself is emitted by `on_final_request_body`, which
         // only runs once the body has actually been buffered.
         if self.log_request_body
-            && tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
+            && capture_output_enabled()
+            && !self.capture_record_emitted(ctx, CaptureDirection::Request)
         {
-            let decision = self.request_body_capture_decision(headers);
+            // Header-preserving hooks run with `ctx.headers` moved into the
+            // hook map, so an empty live map means `headers` is the request
+            // view the selector must read.
+            let selector_headers = if ctx.headers.is_empty() {
+                &*headers
+            } else {
+                &ctx.headers
+            };
+            let decision = self.request_capture_decision_for(ctx, selector_headers, headers);
             if decision.skip_reason().is_some() {
-                self.emit_body_capture("request", &ctx.method, &ctx.path, decision, None);
+                self.emit_body_capture(
+                    CaptureDirection::Request,
+                    &ctx.method,
+                    &ctx.path,
+                    decision,
+                    None,
+                );
+                self.mark_capture_record_emitted(ctx, CaptureDirection::Request);
             }
         }
         PluginResult::Continue
@@ -1251,14 +1690,19 @@ impl Plugin for TransactionDebugger {
         if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
             let safe_headers = self.redact_headers(ctx, response_headers);
             tracing::debug!(target: "transaction_debug", status = response_status, method = %ctx.method, path = %ctx.path, headers = ?safe_headers, "Backend response");
-            if self.log_response_body {
-                let decision = if self.request_shape_allows_response_capture(ctx) {
-                    self.response_body_capture_decision(response_headers)
-                } else {
-                    BodyCaptureDecision::Skip("protocol_excluded")
-                };
+            if self.log_response_body
+                && !self.capture_record_emitted(ctx, CaptureDirection::Response)
+            {
+                let decision = self.response_capture_decision_for(ctx, response_headers);
                 if decision.skip_reason().is_some() {
-                    self.emit_body_capture("response", &ctx.method, &ctx.path, decision, None);
+                    self.emit_body_capture(
+                        CaptureDirection::Response,
+                        &ctx.method,
+                        &ctx.path,
+                        decision,
+                        None,
+                    );
+                    self.mark_capture_record_emitted(ctx, CaptureDirection::Response);
                 }
             }
         }
@@ -1272,46 +1716,34 @@ impl Plugin for TransactionDebugger {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.log_response_body
-            || !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
-        {
+        if !self.log_response_body || !capture_output_enabled() {
             return PluginResult::Continue;
         }
-        if !self.request_shape_allows_response_capture(ctx) {
+        // `after_proxy` already reported this response (an omission), or a
+        // re-invocation of this hook already emitted it.
+        if self.capture_record_emitted(ctx, CaptureDirection::Response) {
             return PluginResult::Continue;
         }
-        let decision = self.response_body_capture_decision(response_headers);
-        if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
-            // Same fail-closed rule as the request side: the client-visible
-            // body, not the declared length, bounds the work done here.
-            if body.len() > max_bytes {
-                self.emit_body_capture(
-                    "response",
-                    &ctx.method,
-                    &ctx.path,
-                    BodyCaptureDecision::Skip("over_capture_limit"),
-                    None,
-                );
-                return PluginResult::Continue;
+        // The final, client-visible header map is authoritative here: a
+        // response transform syncs `Content-Length` / `Content-Type` before
+        // this hook, so a decision that flipped since `after_proxy` reports
+        // the final reason (`over_capture_limit`, `empty_body`, …) instead of
+        // leaving the response with no record at all.
+        let decision = self.response_capture_decision_for(ctx, response_headers);
+        let (record, sample) = match decision {
+            BodyCaptureDecision::Capture { kind, max_bytes } => {
+                self.final_body_record(body, kind, max_bytes, decision)
             }
-            // A `HEAD` or `304` response legitimately declares the length of a
-            // body it does not send, so the actual client-visible slice is
-            // empty even though the header screen admitted it. Report the fixed
-            // `empty_body` reason instead of letting the structured renderer
-            // call an absent body malformed.
-            if body.is_empty() {
-                self.emit_body_capture(
-                    "response",
-                    &ctx.method,
-                    &ctx.path,
-                    BodyCaptureDecision::Skip("empty_body"),
-                    None,
-                );
-                return PluginResult::Continue;
-            }
-            let sample = self.render_captured_body(body, kind, max_bytes);
-            self.emit_body_capture("response", &ctx.method, &ctx.path, decision, Some(&sample));
-        }
+            skip @ BodyCaptureDecision::Skip(_) => (skip, None),
+        };
+        self.emit_body_capture(
+            CaptureDirection::Response,
+            &ctx.method,
+            &ctx.path,
+            record,
+            sample.as_ref(),
+        );
+        self.mark_capture_record_emitted(ctx, CaptureDirection::Response);
         PluginResult::Continue
     }
 
@@ -2047,8 +2479,15 @@ fn capturable_body_kind(content_type: &str) -> Option<BodyKind> {
 ///
 /// Every rejection keeps the message on its ordinary path: an unknown-length,
 /// encoded, oversized, streaming, or non-textual message is never pinned onto
-/// the buffered path just because the debugger is enabled.
-fn capture_decision(headers: &HashMap<String, String>, max_bytes: usize) -> BodyCaptureDecision {
+/// the buffered path just because the debugger is enabled. The one widening is
+/// the explicit `capture_body_prefix` opt-in (`prefix`), which admits a
+/// prefix-renderable family (`text/plain`, form) whose declared length exceeds
+/// the cap but not [`MAX_PREFIX_SOURCE_BYTES`].
+fn capture_decision(
+    headers: &HashMap<String, String>,
+    max_bytes: usize,
+    prefix: bool,
+) -> BodyCaptureDecision {
     let Some(content_type) = header_value(headers, "content-type") else {
         return BodyCaptureDecision::Skip("no_content_type");
     };
@@ -2074,6 +2513,9 @@ fn capture_decision(headers: &HashMap<String, String>, max_bytes: usize) -> Body
         return BodyCaptureDecision::Skip("empty_body");
     }
     if declared_length > max_bytes as u64 {
+        if prefix && kind != BodyKind::Json && declared_length <= MAX_PREFIX_SOURCE_BYTES {
+            return BodyCaptureDecision::Capture { kind, max_bytes };
+        }
         return BodyCaptureDecision::Skip("over_capture_limit");
     }
     BodyCaptureDecision::Capture { kind, max_bytes }
@@ -2152,40 +2594,215 @@ fn escape_for_diagnostics(text: &str) -> (String, bool) {
 }
 
 /// Whether a string value is credential-shaped regardless of the field name
-/// that carried it.
+/// that carried it: an HTTP auth scheme, a compact JWS/JWE token, a
+/// well-known provider API key or AWS access key, or a PEM private key.
+///
+/// Every screen is a single linear pass over bounded input (a header value or
+/// at most a capture-sized body), with no regex and no allocation.
 fn looks_like_credential(value: &str) -> bool {
     let trimmed = value.trim();
-    if contains_ignore_ascii_case(trimmed, "bearer ")
+    contains_ignore_ascii_case(trimmed, "bearer ")
         || contains_ignore_ascii_case(trimmed, "basic ")
+        || contains_private_key_marker(trimmed)
+        || contains_provider_secret(trimmed)
+        || contains_compact_jose(trimmed)
+}
+
+/// A PEM private-key armor line (`-----BEGIN [RSA |EC |OPENSSH |ENCRYPTED |PGP ]PRIVATE KEY…`).
+fn contains_private_key_marker(value: &str) -> bool {
+    value.contains("-----") && contains_ignore_ascii_case(value, "PRIVATE KEY")
+}
+
+/// AWS access-key-id type prefixes; each is followed by 16 uppercase
+/// alphanumerics.
+const AWS_ACCESS_KEY_PREFIXES: &[&str] = &[
+    "AKIA", "ASIA", "ABIA", "ACCA", "AGPA", "AIDA", "AIPA", "ANPA", "ANVA", "APKA", "AROA",
+];
+
+/// Well-known provider secret prefixes and the minimum token length at which a
+/// prefixed token is treated as a credential.
+const PROVIDER_SECRET_PREFIXES: &[(&str, usize)] = &[
+    // GitHub classic and fine-grained tokens.
+    ("ghp_", 40),
+    ("gho_", 40),
+    ("ghu_", 40),
+    ("ghs_", 40),
+    ("ghr_", 40),
+    ("github_pat_", 40),
+    // GitLab personal access tokens.
+    ("glpat-", 26),
+    // Slack bot/user/app/refresh tokens.
+    ("xoxa-", 15),
+    ("xoxb-", 15),
+    ("xoxe-", 15),
+    ("xoxp-", 15),
+    ("xoxr-", 15),
+    ("xoxs-", 15),
+    // OpenAI / Anthropic style `sk-…` keys.
+    ("sk-", 32),
+    // Stripe secret and restricted keys.
+    ("sk_live_", 24),
+    ("sk_test_", 24),
+    ("rk_live_", 24),
+    ("rk_test_", 24),
+    // Google API keys.
+    ("AIza", 39),
+    // npm access tokens.
+    ("npm_", 40),
+];
+
+/// Whether `value` contains a token shaped like an AWS access key id or a
+/// well-known provider API key. Tokens are maximal runs of
+/// `[A-Za-z0-9_-]`, so a key embedded in a URL query, a JSON string, or prose
+/// is still found, and a prefix inside a longer word (`task-…`) is not.
+fn contains_provider_secret(value: &str) -> bool {
+    value
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')))
+        .any(is_provider_secret_token)
+}
+
+fn is_provider_secret_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.len() == 20
+        && AWS_ACCESS_KEY_PREFIXES
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+        && bytes
+            .iter()
+            .skip(4)
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
     {
         return true;
     }
-    // JWT / JWS compact serialization: `eyJ…` header, at least two dots.
-    //
-    // Scan each maximal base64url/compact-token run once. Re-scanning the full
-    // suffix for every `eyJ` occurrence would make an attacker-shaped captured
-    // value quadratic even though the total capture is byte-bounded.
-    trimmed
+    PROVIDER_SECRET_PREFIXES
+        .iter()
+        .any(|(prefix, min_len)| bytes.len() >= *min_len && token.starts_with(prefix))
+}
+
+/// Whether `value` contains a compact JWS/JWE serialization.
+///
+/// Each maximal base64url/compact-token run is scanned once. Re-scanning the
+/// full suffix per candidate would make an attacker-shaped captured value
+/// quadratic even though the total capture is byte-bounded.
+fn contains_compact_jose(value: &str) -> bool {
+    value
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '=')))
-        .any(|token| {
-            let Some(start) = token.find("eyJ") else {
-                return false;
-            };
-            let candidate = &token[start..];
-            if candidate.len() < 20 {
-                return false;
+        .any(token_is_compact_jose)
+}
+
+fn token_is_compact_jose(token: &str) -> bool {
+    // Fast path: the common `eyJ…` header (`{"` encoded) anywhere in the run,
+    // followed by at least two dots.
+    if let Some(start) = token.find("eyJ") {
+        let candidate = &token[start..];
+        if candidate.len() >= 20
+            && candidate
+                .bytes()
+                .filter(|byte| *byte == b'.')
+                .nth(1)
+                .is_some()
+        {
+            return true;
+        }
+    }
+    // Structural rule. RFC 7515 permits whitespace inside the JSON protected
+    // header (`{ "alg": … }` encodes as `eyAi…`, `{\n…` as `ewo…`), so the
+    // literal prefix alone misses valid tokens. Any segment followed by at
+    // least two more `.`-separated segments whose base64url decoding opens a
+    // JSON object (`{`, optional JSON whitespace, `"`) is a compact header.
+    let total_dots = token.bytes().filter(|byte| *byte == b'.').count();
+    if total_dots < 2 {
+        return false;
+    }
+    for (index, segment) in token.split('.').enumerate() {
+        if total_dots - index < 2 {
+            break;
+        }
+        // The header may follow an `=` delimiter (`note=<token>` in text);
+        // base64url padding `=` only ever trails a segment.
+        let unpadded = segment.trim_end_matches('=');
+        let header = unpadded.rsplit_once('=').map_or(unpadded, |(_, tail)| tail);
+        if segment_decodes_to_json_object_start(header) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The 6-bit value of one base64url character.
+const fn base64url_sextet(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// Whether a base64url segment decodes to the start of a JSON object: optional
+/// JSON whitespace, `{`, optional JSON whitespace, `"`. Decodes at most
+/// [`MAX_JOSE_HEADER_PREFIX_CHARS`] characters. A window that is exhausted
+/// while still inside JSON whitespace — before *or* after `{` — fails closed
+/// (treated as a header): RFC 7515 permits arbitrary whitespace there, so a
+/// bounded scan must not let a padded header decide the answer.
+fn segment_decodes_to_json_object_start(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let window = &bytes[..bytes.len().min(MAX_JOSE_HEADER_PREFIX_CHARS)];
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut opened = false;
+    for &byte in window {
+        let Some(sextet) = base64url_sextet(byte) else {
+            return false;
+        };
+        acc = (acc << 6) | u32::from(sextet);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            let decoded = ((acc >> bits) & 0xFF) as u8;
+            acc &= (1u32 << bits) - 1;
+            match decoded {
+                b' ' | b'\t' | b'\n' | b'\r' => {}
+                b'{' if !opened => opened = true,
+                b'"' if opened => return true,
+                _ => return false,
             }
-            let mut dots = 0u8;
-            for byte in candidate.bytes() {
-                if byte == b'.' {
-                    dots += 1;
-                    if dots == 2 {
-                        return true;
-                    }
-                }
-            }
-            false
-        })
+        }
+    }
+    // Reaching here means every decoded byte was JSON whitespace or the one
+    // `{`. A full window cannot rule out a header; a shorter segment ended
+    // without ever reaching a member name.
+    window.len() == MAX_JOSE_HEADER_PREFIX_CHARS
+}
+
+/// Deterministic per-request sample point for `capture_sample_rate`.
+///
+/// Derived from the request's receive timestamp and immediate peer address,
+/// which every hook (and the final-body hook context clone) sees unchanged, so
+/// the buffering predicates and both emission hooks agree. FNV-1a folded
+/// through the splitmix64 finalizer for an even spread.
+fn request_sample_point(ctx: &RequestContext) -> u64 {
+    let seconds = ctx.timestamp_received.timestamp().to_le_bytes();
+    let nanos = ctx
+        .timestamp_received
+        .timestamp_subsec_nanos()
+        .to_le_bytes();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seconds
+        .iter()
+        .chain(nanos.iter())
+        .chain(ctx.direct_client_ip.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
 }
 
 /// Decode one `application/x-www-form-urlencoded` component for sensitivity
@@ -2208,6 +2825,145 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
             .map(Some)
             .ok_or_else(|| format!("transaction_debugger: `{field}` must be a boolean")),
     }
+}
+
+/// Parse `capture_sample_rate` (a number in `(0, 1]`) into the sample-point
+/// threshold below which a request is captured. `None` selects every request.
+fn optional_capture_sample_threshold(
+    config: &Value,
+    capture_enabled: bool,
+) -> Result<Option<u64>, String> {
+    const FIELD: &str = "capture_sample_rate";
+    let rate = match config.get(FIELD) {
+        None => return Ok(None),
+        Some(Value::Null) => {
+            return Err(format!(
+                "transaction_debugger: `{FIELD}` must be a number; null is not allowed"
+            ));
+        }
+        Some(value) => value
+            .as_f64()
+            .ok_or_else(|| format!("transaction_debugger: `{FIELD}` must be a number"))?,
+    };
+    if !capture_enabled {
+        return Err(format!(
+            "transaction_debugger: `{FIELD}` requires `log_request_body` or `log_response_body` to be true"
+        ));
+    }
+    if !rate.is_finite() || rate <= 0.0 || rate > 1.0 {
+        return Err(format!(
+            "transaction_debugger: `{FIELD}` must be greater than 0 and at most 1"
+        ));
+    }
+    if rate >= 1.0 {
+        return Ok(None);
+    }
+    // `rate` is strictly inside (0, 1), so the product stays inside the u64
+    // range; `as` saturates in any case.
+    Ok(Some((rate * u64::MAX as f64) as u64))
+}
+
+/// Parse `capture_expires_at` (an RFC 3339 timestamp). A past instant is
+/// accepted: stored configuration must keep loading after the window closes,
+/// and capture is simply off for requests received from then on.
+fn optional_capture_expiry(
+    config: &Value,
+    capture_enabled: bool,
+) -> Result<Option<DateTime<Utc>>, String> {
+    const FIELD: &str = "capture_expires_at";
+    let raw = match config.get(FIELD) {
+        None => return Ok(None),
+        Some(Value::String(raw)) => raw,
+        Some(Value::Null) => {
+            return Err(format!(
+                "transaction_debugger: `{FIELD}` must be an RFC 3339 timestamp; null is not allowed"
+            ));
+        }
+        Some(_) => {
+            return Err(format!(
+                "transaction_debugger: `{FIELD}` must be an RFC 3339 timestamp string"
+            ));
+        }
+    };
+    if !capture_enabled {
+        return Err(format!(
+            "transaction_debugger: `{FIELD}` requires `log_request_body` or `log_response_body` to be true"
+        ));
+    }
+    DateTime::parse_from_rfc3339(raw)
+        .map(|instant| Some(instant.with_timezone(&Utc)))
+        .map_err(|_| format!("transaction_debugger: `{FIELD}` must be an RFC 3339 timestamp"))
+}
+
+/// Parse `capture_request_header` into a lowercase header name.
+fn optional_capture_header(
+    config: &Value,
+    capture_enabled: bool,
+) -> Result<Option<String>, String> {
+    const FIELD: &str = "capture_request_header";
+    let raw = match config.get(FIELD) {
+        None => return Ok(None),
+        Some(Value::String(raw)) => raw,
+        Some(Value::Null) => {
+            return Err(format!(
+                "transaction_debugger: `{FIELD}` must be a string; null is not allowed"
+            ));
+        }
+        Some(_) => {
+            return Err(format!("transaction_debugger: `{FIELD}` must be a string"));
+        }
+    };
+    if !capture_enabled {
+        return Err(format!(
+            "transaction_debugger: `{FIELD}` requires `log_request_body` or `log_response_body` to be true"
+        ));
+    }
+    if raw.is_empty() {
+        return Err(format!("transaction_debugger: `{FIELD}` must not be empty"));
+    }
+    let lowered = raw.to_ascii_lowercase();
+    let name = HeaderName::from_bytes(lowered.as_bytes())
+        .map_err(|_| format!("transaction_debugger: `{FIELD}` is not a valid HTTP header name"))?;
+    Ok(Some(name.as_str().to_string()))
+}
+
+/// Parse `capture_request_header_value`: 1–[`MAX_CAPTURE_SELECTOR_VALUE_BYTES`]
+/// visible ASCII characters (inner spaces allowed) without surrounding
+/// whitespace. The value is never echoed in an error.
+fn optional_capture_header_value(
+    config: &Value,
+    header_configured: bool,
+) -> Result<Option<String>, String> {
+    const FIELD: &str = "capture_request_header_value";
+    let raw = match config.get(FIELD) {
+        None => return Ok(None),
+        Some(Value::String(raw)) => raw,
+        Some(Value::Null) => {
+            return Err(format!(
+                "transaction_debugger: `{FIELD}` must be a string; null is not allowed"
+            ));
+        }
+        Some(_) => {
+            return Err(format!("transaction_debugger: `{FIELD}` must be a string"));
+        }
+    };
+    if !header_configured {
+        return Err(format!(
+            "transaction_debugger: `{FIELD}` requires `capture_request_header`"
+        ));
+    }
+    let bytes = raw.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= MAX_CAPTURE_SELECTOR_VALUE_BYTES
+        && bytes.iter().all(|byte| (0x20..=0x7e).contains(byte))
+        && bytes.first() != Some(&b' ')
+        && bytes.last() != Some(&b' ');
+    if !valid {
+        return Err(format!(
+            "transaction_debugger: `{FIELD}` must be 1-{MAX_CAPTURE_SELECTOR_VALUE_BYTES} visible ASCII characters without leading or trailing spaces"
+        ));
+    }
+    Ok(Some(raw.clone()))
 }
 
 /// Parse a per-direction capture budget. Out-of-range values are rejected

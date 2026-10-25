@@ -681,7 +681,8 @@ async fn kafka_logging_real_broker_generation_isolation_and_reload_disposal() {
     plugin_b.finalize().await;
 
     // Reload/old-generation disposal: drop a generation with a stuck pending
-    // record on the multi-thread runtime (ordered finalize from Drop). Pause
+    // record on the multi-thread runtime (Drop defers the ordered finalize to a
+    // tracked background task, kafka_logging-SOL-1). Pause
     // the broker after producer construction — Redpanda cannot express
     // under-replicated acks=all via topic `min.insync.replicas`.
     let pending_topic = "ferrum-reload-pending";

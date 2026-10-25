@@ -221,13 +221,17 @@ const META_GRPC_WEB_OWNER: &str = "grpc_web.owner";
 /// trailer frame was rejected, so a second pass cannot re-run the parse and
 /// overwrite the staged diagnostic.
 const META_GRPC_WEB_REQUEST_DECODED: &str = "grpc_web.request_decoded";
-/// Base64-encoded JSON array of `[name, value]` request trailer pairs split
-/// off the request body by the translation owner. Consumed by the gRPC
-/// dispatch paths via [`staged_request_trailers`], which re-validates every
-/// entry (`ctx.metadata` is plugin-writable, so being present is not proof of
-/// provenance).
+/// Reserved, log-omitted metadata name for gRPC-Web request trailers.
+///
+/// Nothing in the gateway writes or reads trailers through this key: the
+/// owner-validated block lives in request-private typed state
+/// ([`StagedRequestTrailers`]) so plugin-writable metadata can neither delete
+/// nor forge it. The name stays reserved so a value planted under it is still
+/// omitted from transaction logs.
 const META_GRPC_WEB_REQUEST_TRAILERS: &str = "grpc_web.request_trailers";
-/// Diagnostic recorded when the request trailer frame failed validation.
+/// Diagnostic recorded when the owner's request-body translation failed: the
+/// request trailer frame failed validation, the text-mode body was not valid
+/// base64, or the owner's mode staging was missing or malformed.
 /// `transform_request_body_with_context` cannot reject, so the owner's
 /// `on_final_request_body_with_context` reads this and fails the request
 /// closed with the field-specific message before backend dispatch.
@@ -520,13 +524,10 @@ pub(crate) const MAX_REQUEST_TRAILER_ENTRIES: usize = 64;
 const MAX_REQUEST_TRAILER_NAME_BYTES: usize = 128;
 /// Maximum length of a single request trailer value.
 const MAX_REQUEST_TRAILER_VALUE_BYTES: usize = 4096;
-/// Maximum base64-encoded JSON staging size for one validated trailer block.
-///
-/// JSON escaping can at most double the accepted 8 KiB wire payload; the
-/// remaining factor covers tuple punctuation and base64 expansion. Check this
-/// before decoding plugin-writable metadata so a forged staging value cannot
-/// trigger an unbounded allocation.
-const MAX_REQUEST_TRAILER_STAGING_BYTES: usize = 4 * MAX_REQUEST_TRAILER_BLOCK_BYTES;
+/// Bytes a request trailer line spends beyond its name and value in the
+/// minimal wire form `name:value\r\n` — the colon plus CRLF. Optional
+/// whitespace around the value is not counted, because the parser trims it.
+const CANONICAL_TRAILER_LINE_OVERHEAD_BYTES: usize = 3;
 
 const ERR_TRAILER_COMPRESSED: &str =
     "compressed gRPC-Web request trailer frames are not defined by the protocol";
@@ -549,6 +550,8 @@ const ERR_TRAILER_VALUE_TOO_LONG: &str = "gRPC-Web request trailer value is too 
 const ERR_TRAILER_BIN_VALUE_INVALID: &str = "gRPC-Web request binary trailer value is not base64";
 const ERR_TRAILER_TOO_MANY_ENTRIES: &str = "too many gRPC-Web request trailer entries";
 const ERR_TRAILER_STAGING_FAILED: &str = "failed to stage validated gRPC-Web request trailers";
+const ERR_TEXT_BODY_NOT_BASE64: &str = "gRPC-Web text request body is not valid base64";
+const ERR_TRANSLATION_STATE_INVALID: &str = "gRPC-Web translation state is missing or malformed";
 
 /// A validated terminal trailer frame split off a gRPC-Web request body.
 pub(crate) struct RequestTrailerFrame {
@@ -762,60 +765,88 @@ fn base64_metadata_member_is_valid(member: &str) -> bool {
                 .is_ok())
 }
 
-/// Serialize validated request trailers for owner-scoped request staging.
-fn encode_request_trailers(trailers: &[(String, String)]) -> Result<String, &'static str> {
-    serde_json::to_vec(trailers)
-        .map(|raw| BASE64.encode(raw))
-        .map_err(|_| ERR_TRAILER_STAGING_FAILED)
-}
-
-/// Remove request-private gRPC-Web staging from a transaction-log metadata
-/// projection.
+/// Remove a gRPC-Web request-trailer staging key from a transaction-log
+/// metadata projection.
 ///
-/// [`META_GRPC_WEB_REQUEST_TRAILERS`] holds the client's COMPLETE trailing
-/// metadata block. It is transport state consumed at dispatch, not
-/// observability metadata, and application trailing metadata may carry
-/// credentials — so it is OMITTED from every summary rather than redacted by
-/// outer-key name matching, which cannot see the names embedded in the encoded
-/// value. Base64 is an encoding, not confidentiality.
-///
-/// This runs on the log CLONE only; `ctx.metadata` keeps the entry so
-/// [`staged_request_trailers`] can still emit the backend's native trailers.
-/// `metadata_redaction::is_internal_only_metadata_key` classifies the same key
-/// so a custom log schema cannot project it back either.
+/// The validated request trailer block is request-private TYPED state
+/// ([`StagedRequestTrailers`] on the request context) and is never written to
+/// `ctx.metadata`, so it cannot reach a log sink through the metadata map.
+/// [`META_GRPC_WEB_REQUEST_TRAILERS`] stays a reserved, log-omitted key anyway,
+/// so a value any plugin plants under that name (application trailing metadata
+/// may carry credentials) is OMITTED from every summary rather than redacted by
+/// outer-key name matching. `metadata_redaction::is_internal_only_metadata_key`
+/// classifies the same key so a custom log schema cannot project it back either.
 pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
     metadata: &mut HashMap<String, String, MS>,
 ) {
     metadata.remove(META_GRPC_WEB_REQUEST_TRAILERS);
 }
 
-/// Decode the staged request trailer block into a native HTTP/2 trailer map.
+/// The validated request trailer block the translation owner split off a
+/// gRPC-Web request body, as request-private typed state.
 ///
-/// Called by the gRPC dispatch paths with the request metadata map. Every entry
-/// is re-validated: `ctx.metadata` is writable by any plugin, so the staged
-/// block being present is not evidence that this plugin wrote it. Any anomaly
-/// answers `None` (dispatch without trailers) rather than forwarding a block
-/// this function cannot prove is the one the owner validated.
-pub(crate) fn staged_request_trailers(
-    metadata: &crate::plugins::MetadataMap,
-) -> Option<http::HeaderMap> {
-    let encoded = metadata.get(META_GRPC_WEB_REQUEST_TRAILERS)?;
-    if encoded.len() > MAX_REQUEST_TRAILER_STAGING_BYTES {
+/// The owner strips the terminal trailer frame from the backend-bound body, so
+/// from that point this record is the ONLY representation of those trailers.
+/// It therefore lives on the request context rather than in `ctx.metadata`:
+/// metadata is writable by every plugin, and a later hook deleting or
+/// rewriting a metadata entry would otherwise make dispatch send the DATA
+/// without the trailers it already removed. Only this module can populate it
+/// (the inner value is private and built solely from entries that passed
+/// [`validated_request_trailer_map`]); the H1/H2 body-hook context adopts it
+/// back onto the live context, and every gRPC dispatch path — first attempt
+/// and retry replay, H1/H2 and H3 — reads it through
+/// [`staged_request_trailers`].
+#[derive(Clone, Default)]
+pub(crate) struct StagedRequestTrailers(Option<std::sync::Arc<http::HeaderMap>>);
+
+/// Application trailing metadata may carry credentials, so a `Debug` rendering
+/// of the request context reports only how many trailers are staged.
+impl std::fmt::Debug for StagedRequestTrailers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedRequestTrailers")
+            .field("entries", &self.0.as_ref().map(|map| map.len()))
+            .finish()
+    }
+}
+
+impl StagedRequestTrailers {
+    /// Stage a validated trailer block, or `None` when an entry fails the
+    /// dispatch-time revalidation (which an admitted block never does).
+    pub(crate) fn from_validated_pairs(trailers: Vec<(String, String)>) -> Option<Self> {
+        validated_request_trailer_map(trailers).map(|map| Self(Some(std::sync::Arc::new(map))))
+    }
+}
+
+/// The native HTTP/2 request trailers a gRPC dispatch sends for this request:
+/// the owner-validated block split off a gRPC-Web body, or `None` when the
+/// request carried no trailer frame. Read from typed request state, never from
+/// plugin-writable metadata, so a hook cannot delete or forge them.
+pub(crate) fn staged_request_trailers(staged: &StagedRequestTrailers) -> Option<http::HeaderMap> {
+    staged.0.as_deref().cloned()
+}
+
+/// Build the native trailer map for a request trailer block, re-checking every
+/// entry against the same rules [`parse_request_trailer_block`] admitted it
+/// under (defense in depth: the map becomes an HTTP/2 header block the backend
+/// holds decoded). Any anomaly answers `None`, which the owner turns into a
+/// request refusal rather than a dispatch without trailers.
+fn validated_request_trailer_map(trailers: Vec<(String, String)>) -> Option<http::HeaderMap> {
+    if trailers.is_empty() || trailers.len() > MAX_REQUEST_TRAILER_ENTRIES {
         return None;
     }
-    let raw = BASE64.decode(encoded).ok()?;
-    let parsed: Vec<(String, String)> = serde_json::from_slice(&raw).ok()?;
-    if parsed.is_empty() || parsed.len() > MAX_REQUEST_TRAILER_ENTRIES {
-        return None;
-    }
-    let mut map = http::HeaderMap::with_capacity(parsed.len());
+    let mut map = http::HeaderMap::with_capacity(trailers.len());
     let mut reconstructed_wire_bytes = 0usize;
-    for (name, value) in parsed {
+    for (name, value) in trailers {
+        // Measure the CANONICAL minimal wire form, `name:value\r\n`. Admission
+        // bounds the received block, whose every line spells at least that
+        // much (the space after the colon is optional OWS the parser trims), so
+        // a block `split_request_trailer_frame` admitted can never exceed this
+        // bound here. Counting a mandatory `: ` separator instead overcounted
+        // one byte per line and refused full-size admitted blocks.
         reconstructed_wire_bytes = reconstructed_wire_bytes
             .checked_add(name.len())?
             .checked_add(value.len())?
-            // `: ` plus CRLF.
-            .checked_add(4)?;
+            .checked_add(CANONICAL_TRAILER_LINE_OVERHEAD_BYTES)?;
         if !is_grpc_metadata_name(&name)
             || is_forbidden_grpc_web_request_trailer_name(&name)
             || name.len() > MAX_REQUEST_TRAILER_NAME_BYTES
@@ -884,7 +915,13 @@ pub(crate) fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut decoded = Vec::with_capacity(data.len() / 4 * 3);
+    // Every segment decodes straight into this one output buffer. A segment of
+    // `n` characters decodes to at most `n / 4 * 3` bytes, so the whole-body
+    // bound below always leaves room for the segment being decoded, and a
+    // client that pads every group (one segment per four characters) costs no
+    // per-segment allocation — only the linear decode itself.
+    let mut decoded = vec![0u8; data.len() / 4 * 3];
+    let mut written = 0usize;
     let mut segment_start = 0usize;
     let mut pos = 0usize;
     while pos < data.len() {
@@ -905,14 +942,29 @@ pub(crate) fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
         if padded {
             // Padding closes this flush. Decode it on its own so the next group,
             // if any, is read as a fresh segment rather than as trailing garbage.
-            decoded.extend(BASE64.decode(&data[segment_start..pos]).ok()?);
+            written =
+                decode_grpc_web_text_segment(&data[segment_start..pos], &mut decoded, written)?;
             segment_start = pos;
         }
     }
     if segment_start < data.len() {
-        decoded.extend(BASE64.decode(&data[segment_start..]).ok()?);
+        written = decode_grpc_web_text_segment(&data[segment_start..], &mut decoded, written)?;
     }
+    decoded.truncate(written);
     Some(decoded)
+}
+
+/// Decode one base64 segment into `output[written..]`, returning the new
+/// write offset, or `None` when the segment is not valid base64 (or, which the
+/// caller's sizing rules out, does not fit).
+fn decode_grpc_web_text_segment(
+    segment: &[u8],
+    output: &mut [u8],
+    written: usize,
+) -> Option<usize> {
+    let room = output.get_mut(written..)?;
+    let decoded_len = BASE64.decode_slice(segment, room).ok()?;
+    written.checked_add(decoded_len)
 }
 
 /// Returns a header map with `content-type: application/grpc` for gRPC error responses.
@@ -1003,6 +1055,23 @@ impl GrpcWebPlugin {
             "text" | "binary" => Some(owned),
             _ => None,
         }
+    }
+
+    /// Latch a terminal request-translation failure for the owner's final
+    /// request-body hook, and mark the request translated so no later pass can
+    /// re-run the decode/split or overwrite the diagnostic. The body transform
+    /// cannot reject on its own; leaving the body untouched instead would let
+    /// the untranslated bytes reach the envelope validator, which judges only
+    /// native framing.
+    fn latch_request_translation_error(&self, ctx: &mut RequestContext, error: &'static str) {
+        ctx.metadata.insert(
+            META_GRPC_WEB_REQUEST_TRAILER_ERROR.to_string(),
+            error.to_string(),
+        );
+        ctx.metadata.insert(
+            META_GRPC_WEB_REQUEST_DECODED.to_string(),
+            self.instance_id_str.clone(),
+        );
     }
 
     /// Native gRPC `Content-Type` this instance staged for its owned
@@ -1103,15 +1172,18 @@ impl GrpcWebPlugin {
         else {
             return BoundedResponseBodyConstruction::CapacityRefused;
         };
-        let mut counted = CountingTrailerPayloadSink::with_ceiling(payload_ceiling);
-        if !write_trailer_frame_payload(
-            &mut counted,
+        // Select, order, and resolve the trailer fields once; the counting and
+        // writing passes both replay this plan, so they emit identical bytes
+        // without re-deriving the candidate list per pass.
+        let trailer_plan = TrailerFramePlan::new(
             response_headers,
             provenance.http_status,
             provenance.trailer_name_allowlist,
             provenance.shadowed_trailers,
             provenance.policy_state,
-        ) {
+        );
+        let mut counted = CountingTrailerPayloadSink::with_ceiling(payload_ceiling);
+        if !trailer_plan.write(&mut counted) {
             return BoundedResponseBodyConstruction::CapacityRefused;
         }
         let payload_len_usize = counted.len;
@@ -1136,14 +1208,7 @@ impl GrpcWebPlugin {
                 if encoder.write_all(body).is_err() || encoder.write_all(&frame_header).is_err() {
                     return BoundedResponseBodyConstruction::CapacityRefused;
                 }
-                if !write_trailer_frame_payload(
-                    &mut WriterTrailerPayloadSink(&mut encoder),
-                    response_headers,
-                    provenance.http_status,
-                    provenance.trailer_name_allowlist,
-                    provenance.shadowed_trailers,
-                    provenance.policy_state,
-                ) {
+                if !trailer_plan.write(&mut WriterTrailerPayloadSink(&mut encoder)) {
                     return BoundedResponseBodyConstruction::CapacityRefused;
                 }
                 if encoder.finish().is_err() {
@@ -1176,14 +1241,7 @@ impl GrpcWebPlugin {
                     return BoundedResponseBodyConstruction::CapacityRefused;
                 }
             }
-            if !write_trailer_frame_payload(
-                &mut output,
-                response_headers,
-                provenance.http_status,
-                provenance.trailer_name_allowlist,
-                provenance.shadowed_trailers,
-                provenance.policy_state,
-            ) {
+            if !trailer_plan.write(&mut output) {
                 return BoundedResponseBodyConstruction::CapacityRefused;
             }
             if output.len() != binary_len {
@@ -2829,29 +2887,33 @@ pub(crate) fn sync_translated_body_trailer_frame_into(
     };
     let is_text = is_grpc_web_text(content_type);
 
-    let Some((suffix_start, binary_len)) = (if is_text {
-        scan_text_grpc_web_trailer_suffix(body)
+    // Text mode: the one full-body decode pass. It also records where the
+    // trailer suffix sits in the ENCODED body, so the identity check below
+    // decodes only that suffix instead of the whole body again.
+    let (suffix_start, binary_len, text_suffix) = if is_text {
+        match scan_text_grpc_web_trailer_suffix(body) {
+            Some(scan) => (scan.suffix_start, scan.binary_len, Some(scan.resume)),
+            // The body transform always emits a complete trailing frame. Refuse
+            // to invent frames when that invariant cannot be proven.
+            None => return SyncTranslatedTrailerOutcome::NoRewrite,
+        }
     } else {
-        trailing_trailer_suffix_start(body).map(|start| (start, body.len()))
-    }) else {
-        // The body transform always emits a complete trailing frame. Refuse to
-        // invent frames when that invariant cannot be proven.
-        return SyncTranslatedTrailerOutcome::NoRewrite;
+        match trailing_trailer_suffix_start(body) {
+            Some(start) => (start, body.len(), None),
+            None => return SyncTranslatedTrailerOutcome::NoRewrite,
+        }
     };
+
+    // Select, order, and resolve the reconciled trailer fields once; the
+    // counting, comparing, and rebuilding passes below all replay this plan.
+    let trailer_plan = TrailerFramePlan::new(reconciled_trailers, http_status, None, None, None);
 
     // Measure the rebuilt trailer payload without retaining it. The counting
     // ceiling is the gRPC u32 frame-length domain (not the output sink): identity
     // short-circuit must not become a capacity refusal, and the bounded sink
     // still refuses any over-ceiling write during a real rebuild.
     let mut counted = CountingTrailerPayloadSink::with_ceiling(u32::MAX as usize);
-    if !write_trailer_frame_payload(
-        &mut counted,
-        reconciled_trailers,
-        http_status,
-        None,
-        None,
-        None,
-    ) {
+    if !trailer_plan.write(&mut counted) {
         return SyncTranslatedTrailerOutcome::Overflow;
     }
     let payload_len_usize = counted.len;
@@ -2873,11 +2935,10 @@ pub(crate) fn sync_translated_body_trailer_frame_into(
     if existing_suffix_len == expected_frame_len
         && trailer_suffix_matches_reconciled(
             body,
-            is_text,
+            text_suffix,
             suffix_start,
             &frame_header,
-            reconciled_trailers,
-            http_status,
+            &trailer_plan,
         )
     {
         return SyncTranslatedTrailerOutcome::Unchanged;
@@ -2916,8 +2977,7 @@ pub(crate) fn sync_translated_body_trailer_frame_into(
             body,
             suffix_start,
             &frame_header,
-            reconciled_trailers,
-            http_status,
+            &trailer_plan,
             &mut output,
         )
     } else {
@@ -2925,8 +2985,7 @@ pub(crate) fn sync_translated_body_trailer_frame_into(
             body,
             suffix_start,
             &frame_header,
-            reconciled_trailers,
-            http_status,
+            &trailer_plan,
             &mut output,
         )
     };
@@ -2978,15 +3037,48 @@ fn stream_decode_base64_groups(encoded: &[u8], mut consume: impl FnMut(&[u8]) ->
     true
 }
 
-/// Locate the trailer-frame suffix start and total binary length of a gRPC-Web
-/// text body by streaming the base64 armouring through a fixed scratch.
-fn scan_text_grpc_web_trailer_suffix(encoded: &[u8]) -> Option<(usize, usize)> {
+/// Where a gRPC-Web text body's trailer-frame suffix sits.
+struct TextTrailerSuffixScan {
+    /// Binary offset of the first trailer-frame header byte.
+    suffix_start: usize,
+    /// Total decoded (binary) length of the body.
+    binary_len: usize,
+    /// The base64 group the suffix's first byte decodes from, so a later pass
+    /// can resume decoding there instead of from the start of the body.
+    resume: Base64GroupPosition,
+}
+
+/// A 4-character base64 group: its offset in the encoded body and the binary
+/// offset of its first decoded byte. Interior flush padding makes the mapping
+/// between the two non-arithmetic, so it is recorded rather than computed.
+#[derive(Debug, Clone, Copy)]
+struct Base64GroupPosition {
+    encoded_offset: usize,
+    binary_offset: usize,
+}
+
+/// Locate the trailer-frame suffix of a gRPC-Web text body by streaming the
+/// base64 armouring through a fixed scratch. This is the only full-body decode
+/// the identity short-circuit needs: it validates the whole armouring and
+/// records the group the suffix starts in.
+fn scan_text_grpc_web_trailer_suffix(encoded: &[u8]) -> Option<TextTrailerSuffixScan> {
     let mut scanner = GrpcWebFrameScanner::new();
-    let ok = stream_decode_base64_groups(encoded, |decoded| scanner.push(decoded));
+    let mut encoded_offset = 0usize;
+    // `stream_decode_base64_groups` hands over exactly one 4-character group
+    // per call, in order.
+    let ok = stream_decode_base64_groups(encoded, |decoded| {
+        scanner.begin_group(encoded_offset);
+        encoded_offset = encoded_offset.saturating_add(4);
+        scanner.push(decoded)
+    });
     if !ok || !scanner.finish() {
         return None;
     }
-    Some((scanner.suffix_start?, scanner.binary_len))
+    Some(TextTrailerSuffixScan {
+        suffix_start: scanner.suffix_start?,
+        binary_len: scanner.binary_len,
+        resume: scanner.suffix_group?,
+    })
 }
 
 /// Incremental gRPC/gRPC-Web frame scanner used over stream-decoded bytes.
@@ -3002,10 +3094,21 @@ struct GrpcWebFrameScanner {
     binary_len: usize,
     suffix_start: Option<usize>,
     malformed: bool,
+    /// Base64 group currently being pushed, as recorded by
+    /// [`Self::begin_group`].
+    current_group: Base64GroupPosition,
+    /// Group in which the frame header currently being assembled began.
+    header_frame_group: Base64GroupPosition,
+    /// Group in which `suffix_start` lies; set and cleared with it.
+    suffix_group: Option<Base64GroupPosition>,
 }
 
 impl GrpcWebFrameScanner {
     fn new() -> Self {
+        let origin = Base64GroupPosition {
+            encoded_offset: 0,
+            binary_offset: 0,
+        };
         Self {
             header: [0u8; GRPC_FRAME_HEADER_BYTES],
             header_filled: 0,
@@ -3016,7 +3119,19 @@ impl GrpcWebFrameScanner {
             binary_len: 0,
             suffix_start: None,
             malformed: false,
+            current_group: origin,
+            header_frame_group: origin,
+            suffix_group: None,
         }
+    }
+
+    /// Record that the next pushed bytes decode from the base64 group at
+    /// `encoded_offset`.
+    fn begin_group(&mut self, encoded_offset: usize) {
+        self.current_group = Base64GroupPosition {
+            encoded_offset,
+            binary_offset: self.binary_len,
+        };
     }
 
     fn push(&mut self, bytes: &[u8]) -> bool {
@@ -3041,6 +3156,7 @@ impl GrpcWebFrameScanner {
         if !self.in_payload {
             if self.header_filled == 0 {
                 self.header_frame_start = offset;
+                self.header_frame_group = self.current_group;
             }
             self.header[self.header_filled] = byte;
             self.header_filled += 1;
@@ -3060,9 +3176,11 @@ impl GrpcWebFrameScanner {
             if self.current_flag == GRPC_FRAME_TRAILER {
                 if self.suffix_start.is_none() {
                     self.suffix_start = Some(self.header_frame_start);
+                    self.suffix_group = Some(self.header_frame_group);
                 }
             } else {
                 self.suffix_start = None;
+                self.suffix_group = None;
             }
             if self.payload_remaining == 0 {
                 self.in_payload = false;
@@ -3573,7 +3691,7 @@ pub(crate) fn record_backend_response_grpc_message_count(
     body: &[u8],
 ) {
     use crate::plugins::mesh::prometheus_helpers as helpers;
-    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+    if !helpers::request_observes_grpc_messages(ctx) {
         return;
     }
     let Some(framing) = passthrough_response_framing(ctx, response_headers) else {
@@ -3623,7 +3741,7 @@ fn record_request_messages(counter: &AtomicU64, passthrough_text_mode: Option<bo
 /// backend-visible body, when the transaction observes gRPC messages. See
 /// [`record_request_messages`] for how a pass-through gRPC-Web upload counts.
 pub(crate) fn record_request_grpc_message_count(ctx: &RequestContext, body: &[u8]) {
-    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+    if crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages(ctx) {
         record_request_messages(
             &ctx.grpc_request_messages_observed,
             passthrough_request_text_mode(ctx),
@@ -3644,7 +3762,7 @@ impl RequestGrpcMessageCounter {
     /// `None` when the transaction does not observe gRPC messages.
     pub(crate) fn for_request(ctx: &RequestContext) -> Option<Self> {
         use crate::plugins::mesh::prometheus_helpers as helpers;
-        if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        if !helpers::request_observes_grpc_messages(ctx) {
             return None;
         }
         Some(Self {
@@ -3684,7 +3802,7 @@ pub(crate) fn request_stream_grpc_message_tap(
     ctx: &RequestContext,
 ) -> Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap> {
     use crate::plugins::mesh::prometheus_helpers as helpers;
-    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+    if !helpers::request_observes_grpc_messages(ctx) {
         return None;
     }
     Some(helpers::GrpcMessageTap::new(
@@ -3701,57 +3819,34 @@ pub(crate) fn request_uploads_passthrough_grpc_web_text(ctx: &RequestContext) ->
 
 /// Compare an existing trailer-frame suffix against the reconciled trailers
 /// without retaining a rebuilt frame or a decoded body copy.
+///
+/// `text_suffix` is `Some` for a text-mode body: the group the suffix starts
+/// in, recorded by the full-body scan that already validated the armouring.
+/// Decoding resumes there, so the comparison decodes only the trailer suffix
+/// (header and payload in ONE pass) rather than re-decoding the whole body.
 fn trailer_suffix_matches_reconciled(
     body: &[u8],
-    is_text: bool,
+    text_suffix: Option<Base64GroupPosition>,
     suffix_start: usize,
     frame_header: &[u8; GRPC_FRAME_HEADER_BYTES],
-    reconciled_trailers: &HashMap<String, String>,
-    http_status: Option<u16>,
+    trailer_plan: &TrailerFramePlan<'_>,
 ) -> bool {
-    if is_text {
-        let mut header_pos = 0usize;
-        let mut binary_pos = 0usize;
-        let header_ok = stream_decode_base64_groups(body, |decoded| {
-            for &byte in decoded {
-                if binary_pos < suffix_start {
-                    binary_pos = binary_pos.saturating_add(1);
-                    continue;
-                }
-                if header_pos < GRPC_FRAME_HEADER_BYTES {
-                    if byte != frame_header[header_pos] {
-                        return false;
-                    }
-                    header_pos += 1;
-                    binary_pos = binary_pos.saturating_add(1);
-                    continue;
-                }
-                // Payload bytes are compared by the pull-comparer below; stop
-                // this scan once the header has been validated.
-                return true;
-            }
-            true
-        });
-        if !header_ok || header_pos != GRPC_FRAME_HEADER_BYTES {
+    if let Some(group) = text_suffix {
+        if group.binary_offset > suffix_start {
             return false;
         }
-        let payload_start = match suffix_start.checked_add(GRPC_FRAME_HEADER_BYTES) {
-            Some(n) => n,
-            None => return false,
-        };
-        let mut iter = Base64DecodedByteIter::skipping(body, payload_start);
+        let mut iter = Base64DecodedByteIter::resuming(body, group, suffix_start);
+        if frame_header
+            .iter()
+            .any(|&expected| iter.next() != Some(expected))
+        {
+            return false;
+        }
         let mut cmp = PullByteComparer {
             iter: &mut iter,
             mismatch: false,
         };
-        if !write_trailer_frame_payload(
-            &mut cmp,
-            reconciled_trailers,
-            http_status,
-            None,
-            None,
-            None,
-        ) {
+        if !trailer_plan.write(&mut cmp) {
             return false;
         }
         !cmp.mismatch && iter.next().is_none()
@@ -3770,14 +3865,7 @@ fn trailer_suffix_matches_reconciled(
             pos: 0,
             mismatch: false,
         };
-        if !write_trailer_frame_payload(
-            &mut cmp,
-            reconciled_trailers,
-            http_status,
-            None,
-            None,
-            None,
-        ) {
+        if !trailer_plan.write(&mut cmp) {
             return false;
         }
         !cmp.mismatch && cmp.pos == cmp.observed.len()
@@ -3834,9 +3922,9 @@ impl TrailerPayloadSink for ObservedSliceComparer<'_> {
     }
 }
 
-/// Fixed-scratch iterator over standard-base64-decoded bytes, optionally
-/// skipping a binary prefix so callers can address a trailer payload region
-/// without retaining a decoded body.
+/// Fixed-scratch iterator over standard-base64-decoded bytes, resuming at a
+/// recorded group and skipping up to a binary offset so callers can address a
+/// trailer region without retaining — or re-decoding — the body before it.
 struct Base64DecodedByteIter<'a> {
     encoded: &'a [u8],
     enc_pos: usize,
@@ -3849,14 +3937,16 @@ struct Base64DecodedByteIter<'a> {
 }
 
 impl<'a> Base64DecodedByteIter<'a> {
-    fn skipping(encoded: &'a [u8], skip_until: usize) -> Self {
+    /// Start decoding at `group` (an already-validated group boundary) and
+    /// yield bytes from binary offset `skip_until` onward.
+    fn resuming(encoded: &'a [u8], group: Base64GroupPosition, skip_until: usize) -> Self {
         Self {
             encoded,
-            enc_pos: 0,
+            enc_pos: group.encoded_offset,
             scratch: [0u8; 3],
             scratch_len: 0,
             scratch_pos: 0,
-            binary_emitted: 0,
+            binary_emitted: group.binary_offset,
             skip_until,
             failed: false,
         }
@@ -3935,8 +4025,7 @@ fn rebuild_binary_grpc_web_trailer_suffix(
     body: &[u8],
     suffix_start: usize,
     frame_header: &[u8; GRPC_FRAME_HEADER_BYTES],
-    reconciled_trailers: &HashMap<String, String>,
-    http_status: Option<u16>,
+    trailer_plan: &TrailerFramePlan<'_>,
     output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
 ) -> bool {
     if suffix_start > body.len() {
@@ -3948,15 +4037,14 @@ fn rebuild_binary_grpc_web_trailer_suffix(
     if !output.push(frame_header) {
         return false;
     }
-    write_trailer_frame_payload(output, reconciled_trailers, http_status, None, None, None)
+    trailer_plan.write(output)
 }
 
 fn rebuild_text_grpc_web_trailer_suffix(
     encoded: &[u8],
     suffix_start: usize,
     frame_header: &[u8; GRPC_FRAME_HEADER_BYTES],
-    reconciled_trailers: &HashMap<String, String>,
-    http_status: Option<u16>,
+    trailer_plan: &TrailerFramePlan<'_>,
     output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
 ) -> bool {
     use std::io::Write;
@@ -3982,14 +4070,7 @@ fn rebuild_text_grpc_web_trailer_suffix(
         if encoder.write_all(frame_header).is_err() {
             return false;
         }
-        if !write_trailer_frame_payload(
-            &mut WriterTrailerPayloadSink(&mut encoder),
-            reconciled_trailers,
-            http_status,
-            None,
-            None,
-            None,
-        ) {
+        if !trailer_plan.write(&mut WriterTrailerPayloadSink(&mut encoder)) {
             return false;
         }
         if encoder.finish().is_err() {
@@ -4172,14 +4253,10 @@ fn build_trailer_frame_with_full_provenance(
 /// Returns `false` only when the sink refused a write, which the bounded
 /// producer path treats as "no translation" and fails closed on.
 ///
-/// Nothing eligible is RETAINED here: names are sorted up front (a stable sort
-/// over names alone reproduces exactly what a stable sort over `(name, value)`
-/// pairs produced, because every occurrence a candidate contributes carries that
-/// candidate's name), and each field's value is borrowed from the immutable
-/// inputs, emitted straight through, and dropped before the next one is
-/// resolved. That is what lets the bounded producer path run this writer against
-/// a counter and then against the final sink without ever holding a complete
-/// trailer payload or a cloned upstream-controlled value (GHSA-pwcm-6rh8-f2gh).
+/// Single-pass convenience over [`TrailerFramePlan`]. Producers that emit the
+/// payload more than once (count, then write or compare) build the plan once
+/// and replay it instead, so candidate selection, sorting, and value resolution
+/// are not repeated per pass.
 fn write_trailer_frame_payload<'a, S: TrailerPayloadSink>(
     payload: &mut S,
     response_headers: &'a HashMap<String, String>,
@@ -4188,121 +4265,196 @@ fn write_trailer_frame_payload<'a, S: TrailerPayloadSink>(
     shadowed_trailers: Option<&'a HashMap<String, [String; 2]>>,
     policy_state: Option<&'a BufferedInitialResponseHeaderPolicyState>,
 ) -> bool {
-    let connection_listed = parse_connection_listed_from_str_map(response_headers);
-    // Candidate names are the live view plus any allowlisted trailer that a
-    // final initial-header policy removed from the compatibility view.
-    // Reserved terminal metadata must still frame from the pre-policy trailer
-    // outcome (matching `reconcile_grpc_trailers_from_view`).
-    let mut candidate_names: Vec<String> = response_headers
-        .keys()
-        .filter_map(|key| is_valid_trailer_header(key).map(|name| name.as_str().to_string()))
-        .collect();
-    if let Some(allowlist) = trailer_name_allowlist {
-        for name in allowlist {
-            if is_valid_trailer_header(name).is_some()
-                && !candidate_names.iter().any(|existing| existing == name)
-            {
-                candidate_names.push(name.clone());
+    TrailerFramePlan::new(
+        response_headers,
+        http_status,
+        trailer_name_allowlist,
+        shadowed_trailers,
+        policy_state,
+    )
+    .write(payload)
+}
+
+/// The trailer-frame fields of one response, selected, ordered, and resolved
+/// ONCE.
+///
+/// The bounded producer paths emit the trailer payload more than once — a
+/// counting pass that fixes the frame length, then a writing (or comparing)
+/// pass — and every pass must produce identical bytes. Candidate selection,
+/// sorting, Connection-listed and provenance filtering, and value resolution
+/// are all pure functions of the same immutable inputs, so they run here once
+/// and every pass replays the plan.
+///
+/// Nothing upstream-controlled is CLONED: every value is borrowed from the
+/// immutable response map / provenance state, and names are borrowed too
+/// unless a key needed normalizing to its lowercase field name. That is what
+/// lets the bounded producer path run the plan against a counter and then
+/// against the final sink without ever holding a complete trailer payload or a
+/// copied upstream value (GHSA-pwcm-6rh8-f2gh).
+struct TrailerFramePlan<'a> {
+    /// `(lowercase name, resolved value)` in deterministic name order.
+    fields: Vec<(std::borrow::Cow<'a, str>, &'a str)>,
+    http_status: Option<u16>,
+}
+
+impl<'a> TrailerFramePlan<'a> {
+    fn new(
+        response_headers: &'a HashMap<String, String>,
+        http_status: Option<u16>,
+        trailer_name_allowlist: Option<&'a HashSet<String>>,
+        shadowed_trailers: Option<&'a HashMap<String, [String; 2]>>,
+        policy_state: Option<&'a BufferedInitialResponseHeaderPolicyState>,
+    ) -> Self {
+        use std::borrow::Cow;
+
+        let connection_listed = parse_connection_listed_from_str_map(response_headers);
+        // Candidate names are the live view plus any allowlisted trailer that a
+        // final initial-header policy removed from the compatibility view.
+        // Reserved terminal metadata must still frame from the pre-policy
+        // trailer outcome (matching `reconcile_grpc_trailers_from_view`).
+        let mut candidate_names: Vec<Cow<'a, str>> = response_headers
+            .keys()
+            .filter_map(|key| {
+                let header = is_valid_trailer_header(key)?;
+                let trimmed = key.trim();
+                Some(if trimmed == header.as_str() {
+                    Cow::Borrowed(trimmed)
+                } else {
+                    Cow::Owned(header.as_str().to_string())
+                })
+            })
+            .collect();
+        // Deterministic ordering: sort by name. Equal names are identical
+        // strings, so an unstable sort orders them exactly as a stable one,
+        // and every occurrence a candidate contributes carries its name.
+        candidate_names.sort_unstable();
+        if let Some(allowlist) = trailer_name_allowlist {
+            let from_view = candidate_names.len();
+            for name in allowlist {
+                if is_valid_trailer_header(name).is_some()
+                    && candidate_names[..from_view]
+                        .binary_search_by(|existing| Ord::cmp(&**existing, name.as_str()))
+                        .is_err()
+                {
+                    candidate_names.push(Cow::Borrowed(name.as_str()));
+                }
+            }
+            if candidate_names.len() > from_view {
+                candidate_names.sort_unstable();
             }
         }
-    }
-    // Deterministic ordering: sort by name, and keep relative occurrence order
-    // for duplicates of the same name. Sorting the NAMES (stably) before
-    // resolution is equivalent to the previous stable sort of resolved
-    // `(name, value)` pairs — all of a candidate's occurrences share its name
-    // and stay contiguous either way — and it is what removes the retained
-    // pair vector.
-    candidate_names.sort();
 
-    let mut has_grpc_status = false;
-    for name in candidate_names {
-        if connection_listed
-            .iter()
-            .any(|listed| listed.eq_ignore_ascii_case(&name))
-        {
-            continue;
-        }
-        if let Some(allowlist) = trailer_name_allowlist
-            && !allowlist.contains(&name)
-            && !is_reserved_grpc_web_terminal_metadata(&name)
-        {
-            continue;
-        }
-        let view_value = response_headers.get(&name).map(String::as_str).or_else(|| {
-            response_headers
+        let mut fields = Vec::with_capacity(candidate_names.len());
+        for name in candidate_names {
+            let name_str: &str = &name;
+            if connection_listed
                 .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(&name))
-                .map(|(_, value)| value.as_str())
-        });
-        let Some(value) =
-            resolve_trailer_frame_value(&name, view_value, shadowed_trailers, policy_state)
-        else {
-            continue;
-        };
-        // Multi-value gRPC metadata is stored LF-joined in the string map (see
-        // `collect_buffered_grpc_trailers`). A carriage return can only come
-        // from a malformed value, not that representation; reject the entire
-        // field before splitting so `line\r\ninjected` cannot turn its suffix
-        // into a second, apparently valid metadata occurrence.
-        if value.contains('\r') {
-            continue;
-        }
-        // Emit each occurrence as its own trailer line and retain the ordinary
-        // printable-ASCII check for every LF-separated value. The occurrence is
-        // written straight through and never accumulated.
-        for occurrence in value.split('\n') {
-            if !is_valid_trailer_value(occurrence) {
+                .any(|listed| listed.eq_ignore_ascii_case(name_str))
+            {
                 continue;
             }
-            if name == "grpc-status" {
-                // Only a present, numeric grpc-status is a valid terminal
-                // status. An empty (`grpc-status:`) or non-numeric
-                // (`grpc-status: abc`) value is malformed — skip forwarding it
-                // so the synthesized mapped status below is emitted instead of
-                // passing a bogus status (or duplicating it).
-                let Ok(code) = occurrence.trim().parse::<u32>() else {
-                    continue;
-                };
-                // Prefer the first valid grpc-status when duplicates are present.
-                if has_grpc_status {
+            if let Some(allowlist) = trailer_name_allowlist
+                && !allowlist.contains(name_str)
+                && !is_reserved_grpc_web_terminal_metadata(name_str)
+            {
+                continue;
+            }
+            let view_value = response_headers
+                .get(name_str)
+                .map(String::as_str)
+                .or_else(|| {
+                    response_headers
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name_str))
+                        .map(|(_, value)| value.as_str())
+                });
+            let Some(value) =
+                resolve_trailer_frame_value(name_str, view_value, shadowed_trailers, policy_state)
+            else {
+                continue;
+            };
+            fields.push((name, value));
+        }
+        Self {
+            fields,
+            http_status,
+        }
+    }
+
+    /// Emit the planned payload into `payload`. Returns `false` only when the
+    /// sink refused a write.
+    fn write<S: TrailerPayloadSink>(&self, payload: &mut S) -> bool {
+        let mut has_grpc_status = false;
+        for (name, value) in &self.fields {
+            let name: &str = name;
+            let value: &str = value;
+            // Multi-value gRPC metadata is stored LF-joined in the string map
+            // (see `collect_buffered_grpc_trailers`). A carriage return can only
+            // come from a malformed value, not that representation; reject the
+            // entire field before splitting so `line\r\ninjected` cannot turn
+            // its suffix into a second, apparently valid metadata occurrence.
+            if value.contains('\r') {
+                continue;
+            }
+            // Emit each occurrence as its own trailer line and retain the
+            // ordinary printable-ASCII check for every LF-separated value. The
+            // occurrence is written straight through and never accumulated.
+            for occurrence in value.split('\n') {
+                if !is_valid_trailer_value(occurrence) {
                     continue;
                 }
-                has_grpc_status = true;
-                // Emit the normalized (parsed) value, not the raw header, so the
-                // forwarded frame is self-consistent with what was validated
-                // (e.g. any surrounding OWS is dropped).
-                if !payload.append(b"grpc-status: ")
-                    || !payload.append(code.to_string().as_bytes())
+                if name == "grpc-status" {
+                    // Only a present, numeric grpc-status is a valid terminal
+                    // status. An empty (`grpc-status:`) or non-numeric
+                    // (`grpc-status: abc`) value is malformed — skip forwarding
+                    // it so the synthesized mapped status below is emitted
+                    // instead of passing a bogus status (or duplicating it).
+                    let Ok(code) = occurrence.trim().parse::<u32>() else {
+                        continue;
+                    };
+                    // Prefer the first valid grpc-status when duplicates are
+                    // present.
+                    if has_grpc_status {
+                        continue;
+                    }
+                    has_grpc_status = true;
+                    // Emit the normalized (parsed) value, not the raw header,
+                    // so the forwarded frame is self-consistent with what was
+                    // validated (e.g. any surrounding OWS is dropped).
+                    if !payload.append(b"grpc-status: ")
+                        || !payload.append(code.to_string().as_bytes())
+                        || !payload.append(b"\r\n")
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+                if !payload.append(name.as_bytes())
+                    || !payload.append(b": ")
+                    || !payload.append(occurrence.as_bytes())
                     || !payload.append(b"\r\n")
                 {
                     return false;
                 }
-                continue;
             }
-            if !payload.append(name.as_bytes())
-                || !payload.append(b": ")
-                || !payload.append(occurrence.as_bytes())
+        }
+
+        // A backend response without a present, numeric grpc-status is
+        // malformed / non-gRPC. Apply the official client HTTP→gRPC mapping so
+        // intermediaries that return 401/403/404/429/502/503/504 without
+        // grpc-status do not collapse to UNKNOWN and break retry
+        // classification.
+        if !has_grpc_status {
+            let mapped = http_response_status_to_grpc_status(self.http_status.unwrap_or(200));
+            if !payload.append(b"grpc-status: ")
+                || !payload.append(mapped.to_string().as_bytes())
                 || !payload.append(b"\r\n")
             {
                 return false;
             }
         }
+        true
     }
-
-    // A backend response without a present, numeric grpc-status is malformed /
-    // non-gRPC. Apply the official client HTTP→gRPC mapping so intermediaries
-    // that return 401/403/404/429/502/503/504 without grpc-status do not
-    // collapse to UNKNOWN and break retry classification.
-    if !has_grpc_status {
-        let mapped = http_response_status_to_grpc_status(http_status.unwrap_or(200));
-        if !payload.append(b"grpc-status: ")
-            || !payload.append(mapped.to_string().as_bytes())
-            || !payload.append(b"\r\n")
-        {
-            return false;
-        }
-    }
-    true
 }
 
 /// Parse gRPC length-prefixed frames from a byte buffer.
@@ -4377,9 +4529,15 @@ impl Plugin for GrpcWebPlugin {
         // owned modes so binary passthrough and decoded text traverse the same
         // complete-envelope validation boundary before backend dispatch.
         // Native gRPC requests have no owner marker and remain streaming.
+        //
+        // A request this instance claimed is buffered even when its shared mode
+        // staging no longer reads as a mode: the owner's final request-body hook
+        // must still run so corrupted staging fails closed rather than
+        // streaming an unvalidated (possibly still base64) envelope.
         ctx.metadata
             .get(META_GRPC_WEB_MODE)
             .is_some_and(|mode| mode == "text" || mode == "binary")
+            || self.is_translation_owner(ctx)
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -4539,7 +4697,10 @@ impl Plugin for GrpcWebPlugin {
                 instance = %self.instance_id_str,
                 "Fail closed: translation owner missing or malformed mode staging"
             );
-            return PluginResult::Continue;
+            // The claim rewrote the request to native gRPC, so dispatching it
+            // without the owner's translation would hand the backend an
+            // undecoded, unvalidated gRPC-Web envelope.
+            return invalid_grpc_web_request(ERR_TRANSLATION_STATE_INVALID);
         };
 
         // Ensure outgoing content-type is native gRPC, keeping the request's
@@ -4630,6 +4791,10 @@ impl Plugin for GrpcWebPlugin {
                     instance = %self.instance_id_str,
                     "Fail closed: refusing request-body decode without valid mode staging"
                 );
+                // Refuse the decode AND latch the refusal: the final hook must
+                // reject even if the staging is later restored to a valid mode,
+                // because this body was never translated.
+                self.latch_request_translation_error(ctx, ERR_TRANSLATION_STATE_INVALID);
                 return None;
             }
         };
@@ -4657,8 +4822,12 @@ impl Plugin for GrpcWebPlugin {
                         instance = %self.instance_id_str,
                         "Failed to base64-decode gRPC-Web text request body"
                     );
-                    // Leave the body untouched; the envelope validator rejects
-                    // the undecodable bytes with a 400 before dispatch.
+                    // Latch the failure instead of relying on the envelope
+                    // validator: it judges native framing only, so raw binary
+                    // frames sent under a text media type (which are not
+                    // base64) would otherwise pass it and reach the backend
+                    // without ever being decoded.
+                    self.latch_request_translation_error(ctx, ERR_TEXT_BODY_NOT_BASE64);
                     return None;
                 }
             }
@@ -4682,14 +4851,7 @@ impl Plugin for GrpcWebPlugin {
                 // This hook cannot reject. Stage the diagnostic and mark the
                 // request translated so `on_final_request_body_with_context`
                 // fails it closed with a field-specific message.
-                ctx.metadata.insert(
-                    META_GRPC_WEB_REQUEST_TRAILER_ERROR.to_string(),
-                    error.to_string(),
-                );
-                ctx.metadata.insert(
-                    META_GRPC_WEB_REQUEST_DECODED.to_string(),
-                    self.instance_id_str.clone(),
-                );
+                self.latch_request_translation_error(ctx, error);
                 return None;
             }
         };
@@ -4703,23 +4865,17 @@ impl Plugin for GrpcWebPlugin {
                     data_len = frame.data_end,
                     "Converted gRPC-Web request trailer frame to native gRPC trailers"
                 );
-                let encoded = match encode_request_trailers(&frame.trailers) {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        ctx.metadata.insert(
-                            META_GRPC_WEB_REQUEST_TRAILER_ERROR.to_string(),
-                            error.to_string(),
-                        );
-                        ctx.metadata.insert(
-                            META_GRPC_WEB_REQUEST_DECODED.to_string(),
-                            self.instance_id_str.clone(),
-                        );
-                        return None;
-                    }
+                let RequestTrailerFrame { data_end, trailers } = frame;
+                // The trailer frame is about to leave the body for good, so the
+                // validated block goes into request-private TYPED state that
+                // dispatch reads directly — not into plugin-writable metadata,
+                // where a later hook could delete or rewrite the only copy.
+                let Some(staged) = StagedRequestTrailers::from_validated_pairs(trailers) else {
+                    self.latch_request_translation_error(ctx, ERR_TRAILER_STAGING_FAILED);
+                    return None;
                 };
-                ctx.metadata
-                    .insert(META_GRPC_WEB_REQUEST_TRAILERS.to_string(), encoded);
-                Some(framed[..frame.data_end].to_vec())
+                ctx.grpc_web_request_trailers = staged;
+                Some(framed[..data_end].to_vec())
             }
             None => None,
         };
@@ -4769,20 +4925,20 @@ impl Plugin for GrpcWebPlugin {
         if !self.is_translation_owner(ctx) {
             return PluginResult::Continue;
         }
-        let Some(mode) = self.owned_translation_mode(ctx) else {
+        if self.owned_translation_mode(ctx).is_none() {
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
                 "Fail closed: translation owner missing mode staging at final request body"
             );
-            return PluginResult::Continue;
-        };
-        if mode != "text" && mode != "binary" {
-            return PluginResult::Continue;
+            // This is the owner's last decision before dispatch: without valid
+            // staging the body was never provably translated.
+            return invalid_grpc_web_request(ERR_TRANSLATION_STATE_INVALID);
         }
-        // A trailer frame that failed validation in the body transform is a
-        // terminal client error: reject with its field-specific diagnostic
-        // before the request can reach the backend without its trailers.
+        // A request-body translation failure latched by the body transform (a
+        // trailer frame that failed validation, an undecodable text body, or
+        // missing staging) is a terminal client error: reject with its
+        // field-specific diagnostic before the request can reach the backend.
         if let Some(error) = ctx.metadata.get(META_GRPC_WEB_REQUEST_TRAILER_ERROR) {
             return invalid_grpc_web_request(error);
         }

@@ -29,8 +29,10 @@ const PROMETHEUS_METRICS_CONFIG_KEYS: &[&str] = &[
     "cache_invalidation_min_age_ms",
     "mesh_series_budget_per_family",
     "render_cache_ttl_seconds",
+    "request_duration_buckets_ms",
     "schema",
     "schema_ref",
+    "session_duration_buckets_ms",
     "stale_entry_ttl_seconds",
 ];
 
@@ -125,6 +127,25 @@ pub struct WsSessionKey {
 pub struct WsTrafficKey {
     pub proxy_id: Arc<str>,
     pub direction: &'static str,
+}
+
+/// Key for `ferrum_unmatched_requests_total`: a closed pre-routing rejection
+/// reason and the gateway-authored response status. Neither label is ever
+/// derived from request input (paths, hosts, and methods are never labels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UnmatchedRequestKey {
+    /// `route_not_found`, `mesh_registry_only`, or `other`.
+    pub reason: &'static str,
+    /// Response status the gateway answered with; `0` if outside `100..=599`.
+    pub status_code: u16,
+}
+
+fn unmatched_request_reason(phase: &str) -> &'static str {
+    match phase {
+        crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE => "route_not_found",
+        crate::diagnostic_ref::MESH_REGISTRY_ONLY_PHASE => "mesh_registry_only",
+        _ => "other",
+    }
 }
 
 /// Composite key for the HTTP-family client-disconnect counter.
@@ -638,12 +659,85 @@ impl TimestampedCostCounter {
     }
 }
 
+/// Default finite upper bounds (milliseconds) for request-scoped duration
+/// histograms: `ferrum_request_duration_ms`, `ferrum_backend_duration_ms`,
+/// `ferrum_edge_overhead_ms`, and `ferrum_mesh_request_duration_ms`.
+///
+/// The range extends to five minutes so long AI/SSE generations and long-poll
+/// requests resolve to a finite bucket instead of saturating `histogram_quantile`
+/// at the former 10 s ceiling. Overridable with `request_duration_buckets_ms`.
+pub const DEFAULT_REQUEST_DURATION_BUCKETS_MS: &[f64] = &[
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+    120000.0, 300000.0,
+];
+
+/// Default finite upper bounds (milliseconds) for session-scoped duration
+/// histograms: `ferrum_stream_duration_ms` (TCP/UDP) and
+/// `ferrum_websocket_session_duration_ms`.
+///
+/// Sessions routinely last minutes to hours, so the range extends to one hour.
+/// Overridable with `session_duration_buckets_ms`.
+pub const DEFAULT_SESSION_DURATION_BUCKETS_MS: &[f64] = &[
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0,
+    300000.0, 900000.0, 1800000.0, 3600000.0,
+];
+
+/// Inclusive upper bound on the number of finite buckets an operator may
+/// configure for one duration layout. Every bucket is one exposition line per
+/// series, so the bound keeps `/metrics` size proportional to series count.
+pub const MAX_DURATION_BUCKETS: usize = 64;
+
+/// The configured layouts for millisecond duration histograms.
+///
+/// Every histogram created for a duration family shares its layout's `Arc`, so
+/// the record path detects a superseded layout by pointer identity alone.
+struct DurationBucketLayouts {
+    request: Arc<[f64]>,
+    session: Arc<[f64]>,
+}
+
+impl DurationBucketLayouts {
+    fn defaults() -> Self {
+        Self {
+            request: Arc::from(DEFAULT_REQUEST_DURATION_BUCKETS_MS),
+            session: Arc::from(DEFAULT_SESSION_DURATION_BUCKETS_MS),
+        }
+    }
+
+    fn layout(&self, kind: DurationLayoutKind) -> &Arc<[f64]> {
+        match kind {
+            DurationLayoutKind::Request => &self.request,
+            DurationLayoutKind::Session => &self.session,
+        }
+    }
+}
+
+/// Which configured duration layout a histogram family uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationLayoutKind {
+    /// `request_duration_buckets_ms` families.
+    Request,
+    /// `session_duration_buckets_ms` families.
+    Session,
+}
+
+/// A captured duration-layout snapshot, standing in for a recorder that loaded
+/// the layouts before a reload published new ones. Test-only handle; the
+/// production record paths load the snapshot themselves.
+#[doc(hidden)]
+pub struct DurationLayoutSnapshotForTest(Arc<DurationBucketLayouts>);
+
 /// Histogram with predefined buckets and a last-updated timestamp.
 pub struct HistogramBuckets {
-    /// Bucket boundaries in the metric's native unit.
-    pub boundaries: Vec<f64>,
-    /// Count of observations <= each boundary
-    pub counts: Vec<CachePadded<AtomicU64>>,
+    /// Strictly increasing finite bucket upper bounds in the metric's native
+    /// unit. Duration histograms share the registry's configured layout `Arc`.
+    pub boundaries: Arc<[f64]>,
+    /// Non-cumulative per-bucket counts: `counts[i]` holds the observations in
+    /// `(boundaries[i - 1], boundaries[i]]`. One observation touches one slot;
+    /// the cumulative `le` series is the prefix sum taken at render time
+    /// ([`Self::cumulative_buckets`]). Values above the last bound are counted
+    /// only by `count` (the `+Inf` bucket).
+    counts: Vec<CachePadded<AtomicU64>>,
     /// Sum of all observations
     pub sum: CachePadded<AtomicU64>, // stored as bits of f64
     /// Total count
@@ -653,13 +747,51 @@ pub struct HistogramBuckets {
 }
 
 impl HistogramBuckets {
-    fn new(epoch: Instant) -> Self {
-        Self::new_with_boundaries(
-            vec![
-                5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
-            ],
-            epoch,
-        )
+    fn with_layout(boundaries: Arc<[f64]>, epoch: Instant) -> Self {
+        let counts = boundaries
+            .iter()
+            .map(|_| CachePadded::new(AtomicU64::new(0)))
+            .collect();
+        Self {
+            boundaries,
+            counts,
+            sum: CachePadded::new(AtomicU64::new(0)),
+            count: CachePadded::new(AtomicU64::new(0)),
+            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
+        }
+    }
+
+    /// `(upper_bound, cumulative_count)` for every finite bucket in ascending
+    /// bound order — the Prometheus `le` series. The running total is
+    /// monotonic by construction even while observations race the scrape.
+    pub fn cumulative_buckets(&self) -> impl Iterator<Item = (f64, u64)> + '_ {
+        let mut running = 0u64;
+        self.boundaries
+            .iter()
+            .zip(self.counts.iter())
+            .map(move |(bound, slot)| {
+                running = running.saturating_add(slot.load(Ordering::Relaxed));
+                (*bound, running)
+            })
+    }
+
+    /// Cumulative count of observations `<= boundaries[index]` (the value of
+    /// the `le` bucket at `index`). An index past the last bound returns the
+    /// total over every finite bucket.
+    pub fn cumulative_count(&self, index: usize) -> u64 {
+        self.counts
+            .iter()
+            .take(index.saturating_add(1))
+            .fold(0u64, |total, slot| {
+                total.saturating_add(slot.load(Ordering::Relaxed))
+            })
+    }
+
+    /// `_count` / `le="+Inf"` value for rendering: never below the last finite
+    /// cumulative bucket, so a scrape racing `observe` cannot expose a
+    /// non-monotonic bucket series.
+    fn rendered_total(&self, finite_total: u64) -> u64 {
+        self.count.load(Ordering::Relaxed).max(finite_total)
     }
 
     fn new_seconds(epoch: Instant) -> Self {
@@ -684,17 +816,7 @@ impl HistogramBuckets {
     }
 
     fn new_with_boundaries(boundaries: Vec<f64>, epoch: Instant) -> Self {
-        let counts = boundaries
-            .iter()
-            .map(|_| CachePadded::new(AtomicU64::new(0)))
-            .collect();
-        Self {
-            boundaries,
-            counts,
-            sum: CachePadded::new(AtomicU64::new(0)),
-            count: CachePadded::new(AtomicU64::new(0)),
-            last_updated: CachePadded::new(AtomicU64::new(epoch.elapsed().as_nanos() as u64)),
-        }
+        Self::with_layout(Arc::from(boundaries), epoch)
     }
 
     fn observe(&self, value: f64, epoch: Instant) {
@@ -716,11 +838,17 @@ impl HistogramBuckets {
                 Err(_) => continue,
             }
         }
-        // Increment bucket counters
-        for (i, boundary) in self.boundaries.iter().enumerate() {
-            if value <= *boundary {
-                self.counts[i].fetch_add(1, Ordering::Relaxed);
-            }
+        // Non-cumulative storage: exactly one bucket slot per observation —
+        // the first bound `>= value`. Boundaries are strictly increasing, so
+        // `partition_point` finds it without touching every bucket. NaN and
+        // values above the last bound land only in `+Inf` (via `count`), as
+        // they did when every matching cumulative bucket was incremented.
+        let index = self.boundaries.partition_point(|bound| *bound < value);
+        if let Some(bound) = self.boundaries.get(index)
+            && value <= *bound
+            && let Some(slot) = self.counts.get(index)
+        {
+            slot.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -736,6 +864,10 @@ const DEFAULT_STALE_TTL_NANOS: u64 = 3_600_000_000_000;
 
 /// Default render cache TTL: 5 seconds.
 const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
+
+/// Headroom reserved past the cached body for the live (uncached) families
+/// `render()` appends, so appending them does not reallocate the whole body.
+const RENDER_LIVE_TAIL_RESERVE_BYTES: usize = 16 * 1024;
 
 /// Default minimum cache age (in nanoseconds) before record() will invalidate.
 /// At high RPS this prevents an Arc allocation on every single request.
@@ -841,6 +973,17 @@ pub struct MetricsRegistry {
     pub backend_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
     /// Gateway overhead histogram buckets by proxy_id
     pub gateway_overhead_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// HTTP-family request body bytes relayed client → backend, by proxy_id
+    /// (`TransactionSummary::bytes_sent`).
+    pub request_body_bytes_counter: DashMap<Arc<str>, TimestampedCounter>,
+    /// HTTP-family response body bytes relayed backend → client, by proxy_id
+    /// (`TransactionSummary::bytes_received`).
+    pub response_body_bytes_counter: DashMap<Arc<str>, TimestampedCounter>,
+    /// Requests refused before routing (no proxy matched, or the mesh
+    /// `REGISTRY_ONLY` policy refused an outbound route miss). These never
+    /// reach any plugin, so they are counted directly by the shared route-miss
+    /// funnel. Keys are a closed reason set × gateway-authored status codes.
+    pub unmatched_request_counter: DashMap<UnmatchedRequestKey, CachePadded<AtomicU64>>,
     /// Prompt tokens from one selected ai_token_metrics instance per request.
     pub ai_prompt_tokens_counter: DashMap<AiUsageKey, TimestampedCounter>,
     /// Completion tokens from one selected ai_token_metrics instance per request.
@@ -879,8 +1022,9 @@ pub struct MetricsRegistry {
     /// this is the alertable signal that the configured quota is currently
     /// being enforced once per gateway process instead of once per fleet.
     pub rate_limit_fallback_decisions: AtomicU64,
-    /// `rate_limiting` requests refused because centralized enforcement was
-    /// unavailable and `redis_failure_policy` is `fail_closed`.
+    /// `rate_limiting` requests refused, and `ws_rate_limiting` sessions
+    /// closed, because centralized enforcement was unavailable and
+    /// `redis_failure_policy` is `fail_closed`.
     pub rate_limit_unavailable_denials: AtomicU64,
     pub ai_rate_limit_local_accounting_tokens: AtomicU64,
     pub ai_rate_limit_unaccounted_tokens: AtomicU64,
@@ -972,6 +1116,16 @@ pub struct MetricsRegistry {
     ai_federation_circuit_half_open_probes: AtomicU64,
     /// Provider attempts skipped because an ai_federation circuit was open.
     ai_federation_circuit_open_skips: AtomicU64,
+    /// Open/half-open ai_federation circuits by configured provider name.
+    /// Live state, not TTL-evicted: an entry is removed when its count returns
+    /// to zero (circuit closed or the circuit dropped on reload), so the key
+    /// set is bounded by the provider names of currently configured
+    /// federation instances.
+    ai_federation_provider_circuits_open: DashMap<Arc<str>, i64>,
+    /// Closed-to-open transitions by configured provider name (TTL-evicted).
+    ai_federation_provider_circuits_opened: DashMap<Arc<str>, TimestampedCounter>,
+    /// Half-open-to-closed recoveries by configured provider name (TTL-evicted).
+    ai_federation_provider_circuits_closed: DashMap<Arc<str>, TimestampedCounter>,
     /// Stream connections by (proxy_id, protocol)
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
@@ -1094,8 +1248,17 @@ pub struct MetricsRegistry {
     /// DP ConfigSync delta-rejection divergence metrics (issue #2394).
     configsync_divergence_metrics:
         ArcSwap<Option<Arc<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetrics>>>,
-    /// Cached render output with generation timestamp
-    render_cache: ArcSwap<Option<(Instant, String)>>,
+    /// Cached render output with the instant its rebuild started. The body is
+    /// shared (`Arc<str>`) by every cache hit.
+    render_cache: ArcSwap<Option<(Instant, Arc<str>)>>,
+    /// Scrape-path single-flight for cache rebuilds. Only a cache MISS takes
+    /// it; hits stay lock-free. Serializing rebuild + publication means a
+    /// slower renderer can never replace a newer snapshot with older counter
+    /// values, and concurrent misses reuse one rebuild instead of each walking
+    /// every map. Never taken on the request-recording path.
+    render_rebuild_lock: std::sync::Mutex<()>,
+    /// Configured bucket layouts for millisecond duration histograms.
+    duration_bucket_layouts: ArcSwap<DurationBucketLayouts>,
     /// Configurable render cache TTL in seconds
     render_cache_ttl_secs: AtomicU64,
     /// Configurable stale entry TTL in nanoseconds
@@ -1134,6 +1297,9 @@ impl MetricsRegistry {
             request_duration_buckets: DashMap::with_shard_amount(shards),
             backend_duration_buckets: DashMap::with_shard_amount(shards),
             gateway_overhead_buckets: DashMap::with_shard_amount(shards),
+            request_body_bytes_counter: DashMap::with_shard_amount(shards),
+            response_body_bytes_counter: DashMap::with_shard_amount(shards),
+            unmatched_request_counter: DashMap::with_shard_amount(shards),
             ai_prompt_tokens_counter: DashMap::with_shard_amount(shards),
             ai_completion_tokens_counter: DashMap::with_shard_amount(shards),
             ai_total_tokens_counter: DashMap::with_shard_amount(shards),
@@ -1195,6 +1361,9 @@ impl MetricsRegistry {
             ai_federation_circuits_closed: AtomicU64::new(0),
             ai_federation_circuit_half_open_probes: AtomicU64::new(0),
             ai_federation_circuit_open_skips: AtomicU64::new(0),
+            ai_federation_provider_circuits_open: DashMap::with_shard_amount(shards),
+            ai_federation_provider_circuits_opened: DashMap::with_shard_amount(shards),
+            ai_federation_provider_circuits_closed: DashMap::with_shard_amount(shards),
             stream_connection_counter: DashMap::with_shard_amount(shards),
             stream_duration_buckets: DashMap::with_shard_amount(shards),
             ws_session_counter: DashMap::with_shard_amount(shards),
@@ -1233,6 +1402,8 @@ impl MetricsRegistry {
             database_delta_poll_metrics: ArcSwap::from_pointee(None),
             configsync_divergence_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
+            render_rebuild_lock: std::sync::Mutex::new(()),
+            duration_bucket_layouts: ArcSwap::from_pointee(DurationBucketLayouts::defaults()),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
             cache_invalidation_min_age_nanos: AtomicU64::new(
@@ -1274,11 +1445,183 @@ impl MetricsRegistry {
             ),
             Ordering::Release,
         );
+        // Fence against an in-flight cache rebuild: a body rendered under the
+        // previous namespace label must not be published after this
+        // invalidation (see `configure_duration_buckets`).
+        let _rebuild = self.lock_render_rebuild();
         // Set namespace label fragment for every namespace.
         if let Ok(mut ns_label) = self.namespace_label.write() {
             *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
         }
         self.render_cache.store(Arc::new(None));
+    }
+
+    /// Acquire the scrape-path rebuild lock. The guarded data is `()`, so a
+    /// guard poisoned by a panicking renderer is always safe to recover.
+    fn lock_render_rebuild(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.render_rebuild_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Publish the millisecond duration-histogram bucket layouts.
+    ///
+    /// `request_bounds` governs `ferrum_request_duration_ms`,
+    /// `ferrum_backend_duration_ms`, `ferrum_edge_overhead_ms`, and
+    /// `ferrum_mesh_request_duration_ms`; `session_bounds` governs
+    /// `ferrum_stream_duration_ms` and `ferrum_websocket_session_duration_ms`.
+    /// Callers pass layouts already validated as non-empty, finite, positive,
+    /// and strictly increasing (the plugin constructor does).
+    ///
+    /// Re-publishing an identical layout is a no-op, so an unchanged reload
+    /// keeps every series. When a layout changes, every retained series of the
+    /// affected families is dropped so a family never exposes two `le`
+    /// layouts at once (cross-series `sum by (le)` would otherwise mix them);
+    /// those series restart from zero under the new layout, which Prometheus
+    /// treats as an ordinary counter reset.
+    ///
+    /// Reload safety: a recorder that captured the previous layout before this
+    /// publication only uses that capture for its shared-guard fast path.
+    /// Every insert or replacement re-reads the CURRENTLY published layout
+    /// while holding the entry's shard write lock, and the retirement sweep
+    /// below takes the same shard locks after publishing, so a late recorder
+    /// can neither resurrect a retired layout nor replace a current-layout
+    /// series with a retired one. The whole publication runs under the
+    /// scrape rebuild lock, so a body rendered before the change cannot be
+    /// published after its cache invalidation.
+    pub fn configure_duration_buckets(&self, request_bounds: &[f64], session_bounds: &[f64]) {
+        let _rebuild = self.lock_render_rebuild();
+        let current = self.duration_bucket_layouts.load_full();
+        let request_changed = current.request.as_ref() != request_bounds;
+        let session_changed = current.session.as_ref() != session_bounds;
+        if !request_changed && !session_changed {
+            return;
+        }
+        let next = Arc::new(DurationBucketLayouts {
+            request: if request_changed {
+                Arc::from(request_bounds)
+            } else {
+                Arc::clone(&current.request)
+            },
+            session: if session_changed {
+                Arc::from(session_bounds)
+            } else {
+                Arc::clone(&current.session)
+            },
+        });
+        self.duration_bucket_layouts.store(Arc::clone(&next));
+
+        if request_changed {
+            let layout = &next.request;
+            for map in [
+                &self.request_duration_buckets,
+                &self.backend_duration_buckets,
+                &self.gateway_overhead_buckets,
+            ] {
+                map.retain(|_, histogram| Arc::ptr_eq(&histogram.boundaries, layout));
+            }
+            self.mesh_request_duration_buckets.retain(|_, histogram| {
+                let keep = Arc::ptr_eq(&histogram.boundaries, layout);
+                if !keep {
+                    self.release_mesh_series(prometheus_helpers::MeshMetricFamily::RequestDuration);
+                }
+                keep
+            });
+        }
+        if session_changed {
+            let layout = &next.session;
+            self.stream_duration_buckets
+                .retain(|_, histogram| Arc::ptr_eq(&histogram.boundaries, layout));
+            self.ws_session_duration_buckets
+                .retain(|_, histogram| Arc::ptr_eq(&histogram.boundaries, layout));
+        }
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// Live request-scoped duration bucket layout (milliseconds).
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn request_duration_buckets_ms_for_test(&self) -> Vec<f64> {
+        self.duration_bucket_layouts.load().request.to_vec()
+    }
+
+    /// Live session-scoped duration bucket layout (milliseconds).
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn session_duration_buckets_ms_for_test(&self) -> Vec<f64> {
+        self.duration_bucket_layouts.load().session.to_vec()
+    }
+
+    /// Capture the currently published duration layouts, as a recorder does
+    /// at the start of `record`.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn duration_layout_snapshot_for_test(&self) -> DurationLayoutSnapshotForTest {
+        DurationLayoutSnapshotForTest(self.duration_bucket_layouts.load_full())
+    }
+
+    /// Record an HTTP-family summary as a recorder that captured `snapshot`
+    /// before a later reload (the late-recorder interleaving).
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn record_with_layout_snapshot_for_test(
+        &self,
+        summary: &TransactionSummary,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        let mesh_key = prometheus_helpers::mesh_request_key(summary);
+        self.record_with_layouts(summary, mesh_key.as_ref(), &snapshot.0);
+    }
+
+    /// Stream-summary counterpart of [`Self::record_with_layout_snapshot_for_test`].
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn record_stream_with_layout_snapshot_for_test(
+        &self,
+        summary: &StreamTransactionSummary,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        self.record_stream_with_layouts(summary, &snapshot.0);
+    }
+
+    /// WebSocket counterpart of [`Self::record_with_layout_snapshot_for_test`].
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn record_ws_session_with_layout_snapshot_for_test(
+        &self,
+        ctx: &WsDisconnectContext,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        self.record_ws_session_with_layouts(ctx, &snapshot.0);
+    }
+
+    /// Count one request refused before routing.
+    ///
+    /// Called from the shared route-miss funnel
+    /// (`crate::diagnostic_ref::record_route_miss`) that every HTTP-family
+    /// listener (H1/H2 and H3) passes through, so unmatched-route `404`s and
+    /// mesh `REGISTRY_ONLY` refusals appear on `/metrics` even though they
+    /// never reach a plugin (and so never reach `ferrum_requests_total`).
+    /// `phase` maps to a closed reason set and `status` is gateway-authored, so
+    /// request paths, hosts, and methods never become labels.
+    pub fn record_unmatched_request(&self, phase: &str, status: u16) {
+        let key = UnmatchedRequestKey {
+            reason: unmatched_request_reason(phase),
+            status_code: if (100..=599).contains(&status) {
+                status
+            } else {
+                0
+            },
+        };
+        Self::update_series(
+            &self.unmatched_request_counter,
+            key,
+            || CachePadded::new(AtomicU64::new(0)),
+            |counter| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+        self.maybe_invalidate_cache();
     }
 
     /// Current `,namespace="…"` label fragment, empty until [`Self::configure`]
@@ -1295,36 +1638,52 @@ impl MetricsRegistry {
     }
 
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
-        let proxy_id: Arc<str> = Arc::from(summary.proxy_id.as_str());
+        let layouts = self.duration_bucket_layouts.load();
+        self.record_stream_with_layouts(summary, &layouts);
+    }
+
+    fn record_stream_with_layouts(
+        &self,
+        summary: &StreamTransactionSummary,
+        layouts: &DurationBucketLayouts,
+    ) {
+        let epoch = self.epoch;
+        let proxy_id = self.observe_proxy_duration(
+            &self.stream_duration_buckets,
+            summary.proxy_id.as_str(),
+            DurationLayoutKind::Session,
+            &layouts.session,
+            summary.duration_ms,
+        );
+        let protocol: Arc<str> = Arc::from(summary.protocol.as_str());
 
         let counter_key = StreamCounterKey {
             proxy_id: Arc::clone(&proxy_id),
-            protocol: Arc::from(summary.protocol.as_str()),
+            protocol: Arc::clone(&protocol),
         };
-        self.stream_connection_counter
-            .entry(counter_key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
-
-        self.stream_duration_buckets
-            .entry(Arc::clone(&proxy_id))
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(summary.duration_ms, self.epoch);
+        Self::update_series(
+            &self.stream_connection_counter,
+            counter_key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         // Always record disconnect cause+direction, even on clean shutdowns,
         // so operators can compare ratios (e.g., graceful vs. error) without
         // having to subtract from the connections-total counter.
         let disconnect_key = StreamDisconnectKey {
             proxy_id,
-            protocol: Arc::from(summary.protocol.as_str()),
+            protocol,
             cause: disconnect_cause_label(summary.disconnect_cause),
             direction: direction_label(summary.disconnect_direction),
             error_class: summary.error_class.as_ref().map(ErrorClass::as_str),
         };
-        self.stream_disconnect_counter
-            .entry(disconnect_key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
+        Self::update_series(
+            &self.stream_disconnect_counter,
+            disconnect_key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         self.record_mesh_tcp_closed_and_bytes(summary);
 
@@ -1483,6 +1842,15 @@ impl MetricsRegistry {
     }
 
     pub fn record_ws_session(&self, ctx: &WsDisconnectContext) {
+        let layouts = self.duration_bucket_layouts.load();
+        self.record_ws_session_with_layouts(ctx, &layouts);
+    }
+
+    fn record_ws_session_with_layouts(
+        &self,
+        ctx: &WsDisconnectContext,
+        layouts: &DurationBucketLayouts,
+    ) {
         let proxy_id: Arc<str> = Arc::from(ctx.proxy_id.as_str());
         let session_key = WsSessionKey {
             proxy_id: Arc::clone(&proxy_id),
@@ -1500,14 +1868,21 @@ impl MetricsRegistry {
                 .unwrap_or("none"),
             termination_reason: websocket_termination_reason_label(ctx),
         };
-        self.ws_session_counter
-            .entry(session_key.clone())
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
-        self.ws_session_duration_buckets
-            .entry(session_key)
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(ctx.duration_ms.max(0.0), self.epoch);
+        let epoch = self.epoch;
+        self.observe_duration(
+            &self.ws_session_duration_buckets,
+            &session_key,
+            || session_key.clone(),
+            DurationLayoutKind::Session,
+            &layouts.session,
+            ctx.duration_ms.max(0.0),
+        );
+        Self::update_series(
+            &self.ws_session_counter,
+            session_key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         for (direction, bytes, frames) in [
             (
@@ -1525,14 +1900,18 @@ impl MetricsRegistry {
                 proxy_id: Arc::clone(&proxy_id),
                 direction,
             };
-            self.ws_bytes_counter
-                .entry(key.clone())
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .add(bytes, self.epoch);
-            self.ws_frames_counter
-                .entry(key)
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .add(frames, self.epoch);
+            Self::update_series(
+                &self.ws_bytes_counter,
+                key.clone(),
+                || TimestampedCounter::new(epoch),
+                |counter| counter.add(bytes, epoch),
+            );
+            Self::update_series(
+                &self.ws_frames_counter,
+                key,
+                || TimestampedCounter::new(epoch),
+                |counter| counter.add(frames, epoch),
+            );
         }
 
         self.maybe_invalidate_cache();
@@ -1557,8 +1936,9 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    /// Record one request refused because centralized rate-limit enforcement
-    /// was unavailable under `redis_failure_policy: fail_closed`.
+    /// Record one request refused (or WebSocket session closed) because
+    /// centralized rate-limit enforcement was unavailable under
+    /// `redis_failure_policy: fail_closed`.
     pub fn record_rate_limit_enforcement_unavailable(&self) {
         self.rate_limit_unavailable_denials
             .fetch_add(1, Ordering::Relaxed);
@@ -1956,6 +2336,51 @@ impl MetricsRegistry {
             |current| Some(current.saturating_sub(1)),
         );
         self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::record_ai_federation_circuit_opened`].
+    /// `provider` is the operator-configured provider name (bounded charset and
+    /// length, at most 128 per instance), never a model or request value.
+    pub fn record_ai_federation_provider_circuit_opened(&self, provider: &str) {
+        let key: Arc<str> = Arc::from(provider);
+        *self
+            .ai_federation_provider_circuits_open
+            .entry(Arc::clone(&key))
+            .or_insert(0) += 1;
+        self.ai_federation_provider_circuits_opened
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::record_ai_federation_circuit_closed`].
+    pub fn record_ai_federation_provider_circuit_closed(&self, provider: &str) {
+        self.decrement_ai_federation_provider_open(provider);
+        self.ai_federation_provider_circuits_closed
+            .entry(Arc::from(provider))
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::release_ai_federation_open_circuit`]
+    /// (an open circuit dropped on reload).
+    pub fn release_ai_federation_provider_open_circuit(&self, provider: &str) {
+        self.decrement_ai_federation_provider_open(provider);
+        self.maybe_invalidate_cache();
+    }
+
+    fn decrement_ai_federation_provider_open(&self, provider: &str) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = self
+            .ai_federation_provider_circuits_open
+            .entry(Arc::from(provider))
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() <= 0 {
+                entry.remove();
+            }
+        }
     }
 
     pub fn record_ai_federation_half_open_probe(&self) {
@@ -2410,13 +2835,40 @@ impl MetricsRegistry {
         mesh_key: Option<&MeshRequestKey>,
     ) {
         // Mirror/shadow summaries represent internal backend probes rather
-        // than client-facing proxy results. They must not affect normal
-        // request counters/histograms exposed on unauthenticated /metrics.
+        // than client-facing proxy results. They must not affect the normal
+        // request counters/histograms exposed on the gated `/metrics` scrape.
         if summary.mirror {
             return;
         }
+        let layouts = self.duration_bucket_layouts.load();
+        self.record_with_layouts(summary, mesh_key, &layouts);
+    }
 
-        let proxy_id: Arc<str> = Arc::from(summary.proxy_id.as_deref().unwrap_or("unknown"));
+    /// `record_with_mesh_key` against an explicit duration-layout snapshot.
+    /// `layouts` only seeds the shared-guard fast paths; inserts re-read the
+    /// published layout (see `configure_duration_buckets`).
+    fn record_with_layouts(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+        layouts: &DurationBucketLayouts,
+    ) {
+        if summary.mirror {
+            return;
+        }
+        let epoch = self.epoch;
+        let proxy_key: &str = summary.proxy_id.as_deref().unwrap_or("unknown");
+
+        // The request-duration histogram is recorded for every transaction, so
+        // its map key is the shared `proxy_id` for every other per-proxy family
+        // below (no per-transaction `Arc<str>` allocation once established).
+        let proxy_id = self.observe_proxy_duration(
+            &self.request_duration_buckets,
+            proxy_key,
+            DurationLayoutKind::Request,
+            &layouts.request,
+            summary.latency_total_ms,
+        );
 
         // Increment request counter (composite key — no format!() allocation)
         let counter_key = CounterKey {
@@ -2426,34 +2878,55 @@ impl MetricsRegistry {
             grpc_status: grpc_status_label(&summary.metadata),
             error_class: summary.metrics_error_class_label(),
         };
-        self.request_counter
-            .entry(counter_key)
-            .or_insert_with(|| TimestampedCounter::new(self.epoch))
-            .increment(self.epoch);
-
-        self.request_duration_buckets
-            .entry(Arc::clone(&proxy_id))
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(summary.latency_total_ms, self.epoch);
+        Self::update_series(
+            &self.request_counter,
+            counter_key,
+            || TimestampedCounter::new(epoch),
+            |counter| counter.increment(epoch),
+        );
 
         // Guard against sentinel value (-1.0) used for streaming responses
         // where total backend latency is unknown at log time.
         if summary.latency_backend_total_ms >= 0.0 {
-            self.backend_duration_buckets
-                .entry(Arc::clone(&proxy_id))
-                .or_insert_with(|| HistogramBuckets::new(self.epoch))
-                .observe(summary.latency_backend_total_ms, self.epoch);
+            self.observe_duration(
+                &self.backend_duration_buckets,
+                proxy_key,
+                || Arc::clone(&proxy_id),
+                DurationLayoutKind::Request,
+                &layouts.request,
+                summary.latency_backend_total_ms,
+            );
         }
 
         // Same sentinel guard for gateway overhead: streamed responses with an
         // unknown backend total emit LATENCY_UNKNOWN_MS rather than inventing
         // overhead from TTFB (issue #2532).
         if summary.latency_gateway_overhead_ms >= 0.0 {
-            self.gateway_overhead_buckets
-                .entry(Arc::clone(&proxy_id))
-                .or_insert_with(|| HistogramBuckets::new(self.epoch))
-                .observe(summary.latency_gateway_overhead_ms, self.epoch);
+            self.observe_duration(
+                &self.gateway_overhead_buckets,
+                proxy_key,
+                || Arc::clone(&proxy_id),
+                DurationLayoutKind::Request,
+                &layouts.request,
+                summary.latency_gateway_overhead_ms,
+            );
         }
+
+        // Per-proxy HTTP-family body bandwidth. Recorded for mesh and non-mesh
+        // traffic alike; the mesh size histograms below are a separate,
+        // identity-labelled view of the same bytes.
+        self.add_proxy_counter(
+            &self.request_body_bytes_counter,
+            proxy_key,
+            &proxy_id,
+            summary.bytes_sent,
+        );
+        self.add_proxy_counter(
+            &self.response_body_bytes_counter,
+            proxy_key,
+            &proxy_id,
+            summary.bytes_received,
+        );
 
         if let Some(usage) = summary.ai_usage_export.as_ref()
             && let Some(provider) = ai_provider_label(usage.provider)
@@ -2463,28 +2936,36 @@ impl MetricsRegistry {
                 provider,
             };
             if let Some(value) = usage.prompt_tokens {
-                self.ai_prompt_tokens_counter
-                    .entry(key.clone())
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .saturating_add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_prompt_tokens_counter,
+                    key.clone(),
+                    || TimestampedCounter::new(epoch),
+                    |counter| counter.saturating_add(value, epoch),
+                );
             }
             if let Some(value) = usage.completion_tokens {
-                self.ai_completion_tokens_counter
-                    .entry(key.clone())
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .saturating_add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_completion_tokens_counter,
+                    key.clone(),
+                    || TimestampedCounter::new(epoch),
+                    |counter| counter.saturating_add(value, epoch),
+                );
             }
             if let Some(value) = usage.total_tokens {
-                self.ai_total_tokens_counter
-                    .entry(key.clone())
-                    .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                    .saturating_add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_total_tokens_counter,
+                    key.clone(),
+                    || TimestampedCounter::new(epoch),
+                    |counter| counter.saturating_add(value, epoch),
+                );
             }
             if let Some(value) = usage.cost.as_ref() {
-                self.ai_estimated_cost_counter
-                    .entry(key)
-                    .or_insert_with(|| TimestampedCostCounter::new(self.epoch))
-                    .add(value, self.epoch);
+                Self::update_series(
+                    &self.ai_estimated_cost_counter,
+                    key,
+                    || TimestampedCostCounter::new(epoch),
+                    |counter| counter.add(value, epoch),
+                );
             }
         }
 
@@ -2516,14 +2997,12 @@ impl MetricsRegistry {
                     mesh_key,
                     prometheus_helpers::MeshMetricFamily::RequestDuration,
                 );
-                let epoch = self.epoch;
-                let latency = summary.latency_total_ms;
-                self.update_mesh_series(
+                self.observe_mesh_duration_series(
                     prometheus_helpers::MeshMetricFamily::RequestDuration,
                     &self.mesh_request_duration_buckets,
                     duration_key,
-                    || HistogramBuckets::new(epoch),
-                    |buckets| buckets.observe(latency, epoch),
+                    &layouts.request,
+                    summary.latency_total_ms,
                 );
             }
             if !prometheus_helpers::mesh_metric_disabled(
@@ -2620,10 +3099,12 @@ impl MetricsRegistry {
         // abort signal rather than a generic body-failure counter.
         if summary.client_disconnected {
             let key = ClientDisconnectKey { proxy_id };
-            self.client_disconnect_counter
-                .entry(key)
-                .or_insert_with(|| TimestampedCounter::new(self.epoch))
-                .increment(self.epoch);
+            Self::update_series(
+                &self.client_disconnect_counter,
+                key,
+                || TimestampedCounter::new(epoch),
+                |counter| counter.increment(epoch),
+            );
         }
 
         self.maybe_invalidate_cache();
@@ -2736,6 +3217,14 @@ impl MetricsRegistry {
         update: impl FnOnce(&V) -> R,
     ) -> Option<R> {
         use dashmap::mapref::entry::Entry;
+        // Established series update under a shared read guard so concurrent
+        // recorders of one hot series do not serialize on the shard write
+        // lock. The guard spans `update`, so eviction cannot remove the entry
+        // mid-update. Only a miss takes the exclusive `entry()` path, which
+        // re-checks occupancy before reserving budget.
+        if let Some(existing) = map.get(&key) {
+            return Some(update(existing.value()));
+        }
         match map.entry(key) {
             Entry::Occupied(entry) => Some(update(entry.get())),
             Entry::Vacant(entry) => {
@@ -2749,6 +3238,180 @@ impl MetricsRegistry {
                 Some(result)
             }
         }
+    }
+
+    /// The duration layout published right now (not a recorder's capture).
+    ///
+    /// Read under an entry's shard write lock by every insert/replace path, so
+    /// a recorder that captured a since-retired layout can never write it back.
+    fn current_duration_layout(&self, kind: DurationLayoutKind) -> Arc<[f64]> {
+        Arc::clone(self.duration_bucket_layouts.load().layout(kind))
+    }
+
+    /// Mesh duration-histogram variant of [`Self::update_mesh_series`] that
+    /// also enforces the published request bucket layout.
+    ///
+    /// `captured` (the recorder's snapshot) only qualifies the shared-guard
+    /// fast path. Under the entry write lock the CURRENT layout decides: a
+    /// retained key whose histogram predates it is reset in place (keeping its
+    /// reserved budget slot), and a current-layout histogram is never replaced
+    /// by a stale capture.
+    fn observe_mesh_duration_series(
+        &self,
+        family: prometheus_helpers::MeshMetricFamily,
+        map: &DashMap<MeshRequestKey, HistogramBuckets>,
+        key: MeshRequestKey,
+        captured: &Arc<[f64]>,
+        value: f64,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        if let Some(existing) = map.get(&key)
+            && Arc::ptr_eq(&existing.boundaries, captured)
+        {
+            existing.observe(value, self.epoch);
+            return;
+        }
+        match map.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let current = self.current_duration_layout(DurationLayoutKind::Request);
+                if !Arc::ptr_eq(&entry.get().boundaries, &current) {
+                    let _superseded =
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
+                }
+                entry.get().observe(value, self.epoch);
+            }
+            Entry::Vacant(entry) => {
+                if !self.try_reserve_mesh_series(family) {
+                    self.record_mesh_series_overflow(family);
+                    return;
+                }
+                let current = self.current_duration_layout(DurationLayoutKind::Request);
+                let histogram = HistogramBuckets::with_layout(current, self.epoch);
+                histogram.observe(value, self.epoch);
+                entry.insert(histogram);
+            }
+        }
+    }
+
+    /// Update one non-mesh series: shared read guard for an established key,
+    /// exclusive `entry()` only to insert a missing one.
+    ///
+    /// The read guard is held across `update`, so stale eviction (`retain`
+    /// takes the shard write lock) cannot remove the entry mid-update, while
+    /// concurrent recorders of the same series proceed in parallel on the
+    /// value's atomics.
+    fn update_series<K, V, R>(
+        map: &DashMap<K, V>,
+        key: K,
+        create: impl FnOnce() -> V,
+        update: impl FnOnce(&V) -> R,
+    ) -> R
+    where
+        K: Eq + std::hash::Hash,
+    {
+        if let Some(existing) = map.get(&key) {
+            return update(existing.value());
+        }
+        let entry = map.entry(key).or_insert_with(create);
+        update(entry.value())
+    }
+
+    /// Observe `value` on a duration histogram keyed by `lookup`.
+    ///
+    /// `captured` (the recorder's layout snapshot) only qualifies the
+    /// shared-read-guard fast path. Every insert or replacement happens under
+    /// the entry's shard write lock against the CURRENTLY published `kind`
+    /// layout: a series carrying a superseded layout is reset to the current
+    /// one, and a recorder whose capture predates a reload can neither
+    /// resurrect the retired layout nor replace a current-layout series.
+    fn observe_duration<K, Q>(
+        &self,
+        map: &DashMap<K, HistogramBuckets>,
+        lookup: &Q,
+        owned_key: impl FnOnce() -> K,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+    ) where
+        K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        use dashmap::mapref::entry::Entry;
+        if let Some(existing) = map.get(lookup)
+            && Arc::ptr_eq(&existing.boundaries, captured)
+        {
+            existing.observe(value, self.epoch);
+            return;
+        }
+        match map.entry(owned_key()) {
+            Entry::Occupied(mut entry) => {
+                let current = self.current_duration_layout(kind);
+                if !Arc::ptr_eq(&entry.get().boundaries, &current) {
+                    let _superseded =
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
+                }
+                entry.get().observe(value, self.epoch);
+            }
+            Entry::Vacant(entry) => {
+                let histogram =
+                    HistogramBuckets::with_layout(self.current_duration_layout(kind), self.epoch);
+                histogram.observe(value, self.epoch);
+                entry.insert(histogram);
+            }
+        }
+    }
+
+    /// Observe a per-proxy duration and return that map's `proxy_id` key.
+    ///
+    /// A per-proxy duration histogram exists for every recorded transaction,
+    /// so its key doubles as the shared `Arc<str>` for the caller's remaining
+    /// per-proxy families: the established-series path clones a refcount
+    /// instead of allocating a fresh `Arc<str>` per transaction.
+    fn observe_proxy_duration(
+        &self,
+        map: &DashMap<Arc<str>, HistogramBuckets>,
+        proxy_key: &str,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
+        value: f64,
+    ) -> Arc<str> {
+        let proxy_id = match map.get(proxy_key) {
+            Some(existing) => {
+                let proxy_id = Arc::clone(existing.key());
+                if Arc::ptr_eq(&existing.boundaries, captured) {
+                    existing.observe(value, self.epoch);
+                    return proxy_id;
+                }
+                proxy_id
+            }
+            None => Arc::from(proxy_key),
+        };
+        self.observe_duration(
+            map,
+            proxy_key,
+            || Arc::clone(&proxy_id),
+            kind,
+            captured,
+            value,
+        );
+        proxy_id
+    }
+
+    /// Add `value` to a per-proxy counter, allocating the key only on a miss.
+    fn add_proxy_counter(
+        &self,
+        map: &DashMap<Arc<str>, TimestampedCounter>,
+        proxy_key: &str,
+        proxy_id: &Arc<str>,
+        value: u64,
+    ) {
+        if let Some(existing) = map.get(proxy_key) {
+            existing.add(value, self.epoch);
+            return;
+        }
+        map.entry(Arc::clone(proxy_id))
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .add(value, self.epoch);
     }
 
     /// Invalidate the render cache only if it's older than the configured
@@ -2806,6 +3469,19 @@ impl MetricsRegistry {
             }
             keep
         });
+
+        for counters in [
+            &self.request_body_bytes_counter,
+            &self.response_body_bytes_counter,
+        ] {
+            counters.retain(|_, value| {
+                let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
+                if !keep {
+                    evicted += 1;
+                }
+                keep
+            });
+        }
 
         for counters in [
             &self.ai_prompt_tokens_counter,
@@ -2971,6 +3647,22 @@ impl MetricsRegistry {
             keep
         });
 
+        self.ai_federation_provider_circuits_opened.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.ai_federation_provider_circuits_closed.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.hbone_tunnel_revocation_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -3086,26 +3778,18 @@ impl MetricsRegistry {
     /// when time simply passes, so no invalidation hook could keep those honest
     /// inside a memoized body — a cached age is wrong by however long the cache
     /// has been held. Rendering them live is the only correct option.
+    ///
+    /// Cache rebuilds are single-flight (see `cacheable_body`): a
+    /// published body is never replaced by one rendered from older counter
+    /// reads, so successive scrapes of the cached families are monotonic.
     pub fn render(&self) -> String {
-        // Check cache
-        let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
-        let cached = self.render_cache.load();
-        let mut output = if let Some((generated_at, ref output)) = **cached
-            && generated_at.elapsed().as_secs() < ttl_secs
-        {
-            output.clone()
-        } else {
-            // Lazy eviction: piggyback on cache-miss (at most once per render_cache_ttl_secs)
-            let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
-            self.evict_stale(stale_ttl);
-
-            let output = self.render_cacheable_body();
-
-            self.render_cache
-                .store(Arc::new(Some((Instant::now(), output.clone()))));
-
-            output
-        };
+        let body = self.cacheable_body();
+        // One copy of the shared cached body, with headroom for the live
+        // families appended below so they do not force a second full-body
+        // reallocation.
+        let mut output = String::with_capacity(body.len() + RENDER_LIVE_TAIL_RESERVE_BYTES);
+        output.push_str(&body);
+        drop(body);
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_grpc_stream_auth_prometheus(&mut output);
@@ -3118,6 +3802,47 @@ impl MetricsRegistry {
         self.append_gateway_listener_status_prometheus(&mut output);
         self.append_k8s_controller_prometheus(&mut output);
         output
+    }
+
+    /// The cached body when it is still within `render_cache_ttl_seconds`.
+    fn fresh_cached_body(&self, ttl_secs: u64) -> Option<Arc<str>> {
+        let cached = self.render_cache.load();
+        match &**cached {
+            Some((generated_at, body)) if generated_at.elapsed().as_secs() < ttl_secs => {
+                Some(Arc::clone(body))
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the memoized registry-owned body, rebuilding it on a miss.
+    ///
+    /// Hits are lock-free. A miss takes the scrape-only `render_rebuild_lock`
+    /// and re-checks the cache, so concurrent misses (for example an HA
+    /// Prometheus pair) coalesce onto one rebuild + eviction sweep. Because
+    /// rebuild and publication are serialized, each published body was read
+    /// from counters no older than the previous publication's: a slower
+    /// renderer can no longer overwrite a newer snapshot and make a cached
+    /// counter go backwards (which `rate()`/`increase()` would read as a
+    /// reset). The generation timestamp is taken before rendering, so the TTL
+    /// never extends past what the body's counter reads justify.
+    fn cacheable_body(&self) -> Arc<str> {
+        let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
+        if let Some(body) = self.fresh_cached_body(ttl_secs) {
+            return body;
+        }
+        let _rebuild = self.lock_render_rebuild();
+        if let Some(body) = self.fresh_cached_body(ttl_secs) {
+            return body;
+        }
+        let started_at = Instant::now();
+        // Lazy eviction: piggyback on cache-miss (at most once per render_cache_ttl_secs)
+        let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+        self.evict_stale(stale_ttl);
+        let body: Arc<str> = Arc::from(self.render_cacheable_body());
+        self.render_cache
+            .store(Arc::new(Some((started_at, Arc::clone(&body)))));
+        body
     }
 
     /// Append the bounded DP configuration-freshness families from live state.
@@ -3587,6 +4312,9 @@ impl MetricsRegistry {
             + self.ws_frames_counter.len() * 180
             + self.hbone_relay_failure_counter.len() * 240
             + self.hbone_tunnel_revocation_counter.len() * 200
+            + self.ai_federation_provider_circuits_open.len() * 160
+            + self.ai_federation_provider_circuits_opened.len() * 160
+            + self.ai_federation_provider_circuits_closed.len() * 160
             + self.hbone_inner_pool_event_counter.len() * 160
             + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
@@ -4510,6 +5238,47 @@ impl MetricsRegistry {
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
+        if !self.ai_federation_provider_circuits_open.is_empty() {
+            output.push_str(
+                "# HELP ferrum_ai_federation_provider_circuits_open Current ai_federation circuits in open or half-open recovery state, by configured provider name.\n",
+            );
+            output.push_str("# TYPE ferrum_ai_federation_provider_circuits_open gauge\n");
+            for entry in self.ai_federation_provider_circuits_open.iter() {
+                let provider = escape_label_value(entry.key());
+                output.push_str(&format!(
+                    "ferrum_ai_federation_provider_circuits_open{{provider=\"{}\"{}}} {}\n",
+                    provider,
+                    ns_label,
+                    *entry.value()
+                ));
+            }
+        }
+        for (name, help, map) in [
+            (
+                "ferrum_ai_federation_provider_circuits_opened_total",
+                "ai_federation circuit closed-to-open transitions, by configured provider name.",
+                &self.ai_federation_provider_circuits_opened,
+            ),
+            (
+                "ferrum_ai_federation_provider_circuits_closed_total",
+                "ai_federation circuit half-open recoveries, by configured provider name.",
+                &self.ai_federation_provider_circuits_closed,
+            ),
+        ] {
+            if map.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            for entry in map.iter() {
+                let provider = escape_label_value(entry.key());
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "{name}{{provider=\"{provider}\"{ns_label}}} {count}\n"
+                ));
+            }
+        }
+
         let amp = crate::udp_amplification::metrics_snapshot();
         for (name, help, value) in [
             (
@@ -4653,6 +5422,51 @@ impl MetricsRegistry {
                 output.push_str(&format!(
                     "ferrum_client_disconnects_total{{proxy_id=\"{}\"{}}} {}\n",
                     proxy_id, ns_label, count
+                ));
+            }
+        }
+
+        // Per-proxy HTTP-family body bandwidth (request/response body bytes).
+        for (map, name, help) in [
+            (
+                &self.request_body_bytes_counter,
+                "ferrum_request_body_bytes_total",
+                "HTTP-family request body bytes relayed from clients to backends.",
+            ),
+            (
+                &self.response_body_bytes_counter,
+                "ferrum_response_body_bytes_total",
+                "HTTP-family response body bytes relayed from backends to clients.",
+            ),
+        ] {
+            if map.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            for entry in map.iter() {
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(entry.key());
+                output.push_str(&format!(
+                    "{name}{{proxy_id=\"{}\"{}}} {}\n",
+                    proxy_id, ns_label, count
+                ));
+            }
+        }
+
+        // Pre-routing rejections that never reach a plugin (unmatched 404s,
+        // mesh REGISTRY_ONLY refusals). Emitted only once one has occurred.
+        if !self.unmatched_request_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_unmatched_requests_total Requests refused before routing because no proxy matched or the mesh REGISTRY_ONLY policy refused an outbound route miss, by closed reason and response status.\n",
+            );
+            output.push_str("# TYPE ferrum_unmatched_requests_total counter\n");
+            for entry in self.unmatched_request_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_unmatched_requests_total{{reason=\"{}\",status_code=\"{}\"{}}} {}\n",
+                    key.reason, key.status_code, ns_label, count
                 ));
             }
         }
@@ -6131,14 +6945,15 @@ fn render_histogram(
     histogram: &HistogramBuckets,
     ns_label: &str,
 ) {
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
+    let mut finite_total = 0;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
         output.push_str(&format!(
             "{}_bucket{{proxy_id=\"{}\",le=\"{}\"{}}} {}\n",
             metric_name, proxy_id, boundary, ns_label, count
         ));
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    let total_count = histogram.rendered_total(finite_total);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     output.push_str(&format!(
         "{}_bucket{{proxy_id=\"{}\",le=\"+Inf\"{}}} {}\n",
@@ -6161,8 +6976,9 @@ fn render_ws_histogram(
     ns_label: &str,
 ) {
     let proxy_id = escape_label_value(&key.proxy_id);
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
+    let mut finite_total = 0;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
         output.push_str(&format!(
             "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\",le=\"{}\"{}}} {}\n",
             proxy_id,
@@ -6176,7 +6992,7 @@ fn render_ws_histogram(
             count
         ));
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    let total_count = histogram.rendered_total(finite_total);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let labels = format!(
         "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"",
@@ -6204,14 +7020,15 @@ fn render_tls_source_fetch_histogram(
 ) {
     let scheme = escape_label_value(&key.scheme);
     let kind = escape_label_value(&key.kind);
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
+    let mut finite_total = 0;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
         output.push_str(&format!(
             "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"{}\"{}}} {}\n",
             scheme, kind, boundary, ns_label, count
         ));
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    let total_count = histogram.rendered_total(finite_total);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     output.push_str(&format!(
         "ferrum_tls_source_fetch_duration_seconds_bucket{{scheme=\"{}\",kind=\"{}\",le=\"+Inf\"{}}} {}\n",
@@ -6236,6 +7053,8 @@ struct PrometheusMetricsTunables {
     stale_entry_ttl_secs: u64,
     cache_invalidation_min_age_ms: u64,
     mesh_series_budget_per_family: usize,
+    request_duration_buckets_ms: Vec<f64>,
+    session_duration_buckets_ms: Vec<f64>,
     namespace: String,
 }
 
@@ -6274,6 +7093,54 @@ fn optional_mesh_series_budget_per_family(config: &Value) -> Result<usize, Strin
     usize::try_from(value).map_err(|_| {
         format!("prometheus_metrics: `mesh_series_budget_per_family` (\"{value}\") exceeds usize")
     })
+}
+
+/// Read an optional duration bucket layout: a non-empty array of at most
+/// [`MAX_DURATION_BUCKETS`] finite, positive, strictly increasing millisecond
+/// upper bounds. The implicit `+Inf` bucket is always appended at render time,
+/// so it must not be listed.
+fn optional_duration_buckets(
+    config: &Value,
+    key: &str,
+    default: &[f64],
+) -> Result<Vec<f64>, String> {
+    let Some(value) = config.get(key) else {
+        return Ok(default.to_vec());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!(
+            "prometheus_metrics: `{key}` must be an array of bucket upper bounds in milliseconds"
+        ));
+    };
+    if items.is_empty() || items.len() > MAX_DURATION_BUCKETS {
+        return Err(format!(
+            "prometheus_metrics: `{key}` must list between 1 and {MAX_DURATION_BUCKETS} bucket \
+             upper bounds (the +Inf bucket is implicit)"
+        ));
+    }
+    let mut bounds: Vec<f64> = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(bound) = item.as_f64() else {
+            return Err(format!(
+                "prometheus_metrics: `{key}[{index}]` must be a number"
+            ));
+        };
+        if !bound.is_finite() || bound <= 0.0 {
+            return Err(format!(
+                "prometheus_metrics: `{key}[{index}]` must be a finite number greater than 0"
+            ));
+        }
+        if let Some(previous) = bounds.last()
+            && bound <= *previous
+        {
+            return Err(format!(
+                "prometheus_metrics: `{key}` must be strictly increasing; `{key}[{index}]` \
+                 ({bound}) is not greater than the previous bound ({previous})"
+            ));
+        }
+        bounds.push(bound);
+    }
+    Ok(bounds)
 }
 
 impl PrometheusMetrics {
@@ -6322,6 +7189,16 @@ impl PrometheusMetrics {
             DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
         )?;
         let mesh_series_budget_per_family = optional_mesh_series_budget_per_family(config)?;
+        let request_duration_buckets_ms = optional_duration_buckets(
+            config,
+            "request_duration_buckets_ms",
+            DEFAULT_REQUEST_DURATION_BUCKETS_MS,
+        )?;
+        let session_duration_buckets_ms = optional_duration_buckets(
+            config,
+            "session_duration_buckets_ms",
+            DEFAULT_SESSION_DURATION_BUCKETS_MS,
+        )?;
 
         Ok(Self {
             registry,
@@ -6330,6 +7207,8 @@ impl PrometheusMetrics {
                 stale_entry_ttl_secs,
                 cache_invalidation_min_age_ms,
                 mesh_series_budget_per_family,
+                request_duration_buckets_ms,
+                session_duration_buckets_ms,
                 namespace: namespace.to_string(),
             },
         })
@@ -6378,10 +7257,15 @@ impl Plugin for PrometheusMetrics {
             self.tunables.mesh_series_budget_per_family,
             &self.tunables.namespace,
         );
+        self.registry.configure_duration_buckets(
+            &self.tunables.request_duration_buckets_ms,
+            &self.tunables.session_duration_buckets_ms,
+        );
     }
 
     /// Reusable (issue #5583): pure observability. Its request-phase hooks
-    /// stamp one observed-marker key on the context; everything else it does is
+    /// mark the context as observed (a typed bit for HTTP, one metadata marker
+    /// for streams); everything else it does is
     /// recording completed transactions. It takes no admission decision, holds
     /// no per-request budget, makes no external
     /// admission call, and never rejects — so nothing an elided CONNECT would
@@ -6394,10 +7278,10 @@ impl Plugin for PrometheusMetrics {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        ctx.metadata.insert(
-            prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-            "1".to_string(),
-        );
+        // A typed context bit, not a metadata marker: the per-request hook
+        // allocates nothing and touches no map. The gRPC message scanners read
+        // it through `prometheus_helpers::request_observes_grpc_messages`.
+        ctx.mark_prometheus_metrics_observed();
         PluginResult::Continue
     }
 
