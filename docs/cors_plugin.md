@@ -39,10 +39,10 @@ write `allowed_origins: ["*"]` when allow-all is intended.
 
 ### Private Network Access
 
-Chromium-based browsers send a [Private Network Access](https://wicg.github.io/private-network-access/)
-preflight (`Access-Control-Request-Private-Network: true`) before a public
-website calls an API on a private or local address. The browser blocks the
-call unless the preflight response carries
+Clients that implement [Private Network Access](https://wicg.github.io/private-network-access/)
+(PNA) send a preflight carrying `Access-Control-Request-Private-Network: true`
+before a public website calls an API on a private or local address, and block
+the call unless the preflight response carries
 `Access-Control-Allow-Private-Network: true`. Ferrum strips every backend
 `Access-Control-*` field on CORS-owned responses, so the backend cannot supply
 that field itself; set `allow_private_network: true` on the gateway policy
@@ -58,6 +58,14 @@ The field is emitted only on a preflight that asked for it, only for an allowed
 origin, and never on actual responses. With `preflight_continue: true` the
 gateway value is written onto the forwarded response. When several CORS
 policies compose, every matching policy must enable `allow_private_network`.
+
+`allow_private_network` answers only the PNA preflight protocol. Chrome 142
+and later replaced the PNA experiment with
+[Local Network Access](https://developer.chrome.com/blog/local-network-access)
+(LNA), a user permission prompt that this response field neither satisfies nor
+replaces. If Chrome blocks a public-to-local call, check the site's local
+network permission in the browser; enabling this option does not change that
+decision, and a call the user has permitted needs no PNA response field.
 
 ### Credentials and Wildcard Origins
 

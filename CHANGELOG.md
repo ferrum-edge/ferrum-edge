@@ -20,11 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `allow_private_network` (default `false`): a preflight from an allowed origin
   that carries `Access-Control-Request-Private-Network: true` is answered with
   `Access-Control-Allow-Private-Network: true`, locally or on a
-  `preflight_continue` forwarded response. Previously no configuration could
-  make a public-to-private browser call work through a CORS-managed route,
-  because the plugin strips the backend's own `Access-Control-*` fields. With
-  several CORS policies, every matching policy must opt in. The field is never
-  sent on actual responses.
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
