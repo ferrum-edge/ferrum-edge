@@ -1156,6 +1156,11 @@ pub(crate) struct TraceExporterOptions {
     allow_plaintext: bool,
     /// Retained-byte ceiling every exporter built from these options charges.
     ceiling: &'static RetainedByteCeiling,
+    /// Count spans this exporter discards after enqueue (terminal collector
+    /// failure, exhausted retries, no HTTP client) on the mesh span-drop
+    /// counter. Set only for `workload_metrics` mesh exporters, so
+    /// standalone `otel_tracing` losses never reach a mesh-named series.
+    mesh_span_drop_accounting: bool,
 }
 
 impl TraceExporterOptions {
@@ -1221,6 +1226,7 @@ impl TraceExporterOptions {
             deployment_environment: optional_string_config(config, "deployment_environment")?,
             allow_plaintext: bool_config(config, "allow_plaintext", false)?,
             ceiling: process_ceiling(),
+            mesh_span_drop_accounting: false,
         })
     }
 }
@@ -1251,6 +1257,8 @@ struct TraceHttpExporterConfig {
     /// Ceiling the queued spans *and* every batch representation built from them
     /// are charged to. Always the process ceiling in production.
     ceiling: &'static RetainedByteCeiling,
+    /// See [`TraceExporterOptions::mesh_span_drop_accounting`].
+    mesh_span_drop_accounting: bool,
 }
 
 struct QueuedSpan {
@@ -1373,7 +1381,7 @@ impl BufferedTraceExporter {
     fn try_reserve_queued_bytes(&self, bytes: usize) -> Result<ProcessByteReservation, String> {
         let process = self.ceiling.try_acquire(bytes).ok_or_else(|| {
             format!(
-                "process-wide observability retained-byte ceiling exceeded (+{bytes} > {})",
+                "{TRACE_EXPORT_PROCESS_CEILING_PREFIX} (+{bytes} > {})",
                 self.ceiling.max()
             )
         })?;
@@ -1386,7 +1394,7 @@ impl BufferedTraceExporter {
             .map(|_| process)
             .map_err(|current| {
                 format!(
-                    "queued byte budget exceeded ({current}+{bytes} > {})",
+                    "{TRACE_EXPORT_BYTE_BUDGET_PREFIX} ({current}+{bytes} > {})",
                     self.buffer_max_bytes
                 )
             })
@@ -1419,7 +1427,7 @@ impl TraceExporter for BufferedTraceExporter {
             .get()
             .ok_or_else(|| "trace exporter worker is unavailable".to_string())?;
         let Some(_admission) = worker.try_admit() else {
-            return Err("trace exporter is shutting down".to_string());
+            return Err(TRACE_EXPORT_SHUTTING_DOWN.to_string());
         };
         self.queued_spans.fetch_add(1, Ordering::Relaxed);
         let bytes = span.approx_queued_bytes();
@@ -1441,9 +1449,46 @@ impl TraceExporter for BufferedTraceExporter {
                 // releases it on drop; only the per-instance charge is manual.
                 self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                 decrement_queued_spans(&self.queued_spans, 1);
-                Err(error.to_string())
+                Err(match error {
+                    mpsc::error::TrySendError::Full(_) => TRACE_EXPORT_QUEUE_FULL,
+                    mpsc::error::TrySendError::Closed(_) => TRACE_EXPORT_QUEUE_CLOSED,
+                }
+                .to_string())
             }
         }
+    }
+}
+
+/// `try_export` refusal when the bounded span queue (`buffer_capacity`) is full.
+const TRACE_EXPORT_QUEUE_FULL: &str = "trace exporter queue is full";
+/// `try_export` refusal when the flush worker's receiver is gone.
+const TRACE_EXPORT_QUEUE_CLOSED: &str = "trace exporter queue is closed";
+/// `try_export` refusal once admission is closed for reload or shutdown.
+const TRACE_EXPORT_SHUTTING_DOWN: &str = "trace exporter is shutting down";
+/// Prefix of the `try_export` refusal for an exhausted process-wide ceiling.
+const TRACE_EXPORT_PROCESS_CEILING_PREFIX: &str =
+    "process-wide observability retained-byte ceiling exceeded";
+/// Prefix of the `try_export` refusal for an exhausted per-exporter byte budget.
+const TRACE_EXPORT_BYTE_BUDGET_PREFIX: &str = "queued byte budget exceeded";
+
+/// Classify a [`TraceExporter::try_export`] refusal into the closed drop-reason
+/// set the mesh span-drop counter reports. The messages are produced only by
+/// [`BufferedTraceExporter::try_export`] from the constants above; anything
+/// else (no flush worker, a poisoned startup lock) is `Unavailable`.
+pub(crate) fn trace_export_drop_reason(
+    error: &str,
+) -> crate::plugins::mesh::prometheus_helpers::MeshTracingSpanDropReason {
+    use crate::plugins::mesh::prometheus_helpers::MeshTracingSpanDropReason;
+    if error == TRACE_EXPORT_QUEUE_FULL {
+        MeshTracingSpanDropReason::QueueFull
+    } else if error.starts_with(TRACE_EXPORT_BYTE_BUDGET_PREFIX) {
+        MeshTracingSpanDropReason::ByteBudget
+    } else if error.starts_with(TRACE_EXPORT_PROCESS_CEILING_PREFIX) {
+        MeshTracingSpanDropReason::ProcessCeiling
+    } else if error == TRACE_EXPORT_SHUTTING_DOWN || error == TRACE_EXPORT_QUEUE_CLOSED {
+        MeshTracingSpanDropReason::ShuttingDown
+    } else {
+        MeshTracingSpanDropReason::Unavailable
     }
 }
 
@@ -1616,6 +1661,7 @@ impl TraceHttpExporterConfig {
             payload_kind,
             allow_plaintext: options.allow_plaintext,
             ceiling: options.ceiling,
+            mesh_span_drop_accounting: options.mesh_span_drop_accounting,
         })
     }
 }
@@ -1633,7 +1679,10 @@ pub(crate) fn trace_exporters_from_providers(
         return Ok(Vec::new());
     }
     let service_name = string_config(config, "service_name", default_service_name)?;
-    let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+    let mut options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+    // Only `workload_metrics` builds exporters here: their post-enqueue
+    // losses belong on the mesh span-drop counter.
+    options.mesh_span_drop_accounting = true;
     providers
         .iter()
         .enumerate()
@@ -1737,6 +1786,7 @@ pub(crate) fn probe_trace_batch_materialization_for_test(
         payload_kind: TracePayloadKind::Otlp,
         allow_plaintext: false,
         ceiling,
+        mesh_span_drop_accounting: false,
     };
 
     let mut spans = Vec::with_capacity(span_count);
@@ -2273,6 +2323,7 @@ async fn deliver_trace_payload(
                 cfg.provider_name,
                 entry_count,
             );
+            record_mesh_trace_batch_discard(cfg, entry_count);
             return;
         };
         let request = match cfg.payload_kind {
@@ -2321,6 +2372,7 @@ async fn deliver_trace_payload(
                         status,
                         entry_count,
                     );
+                    record_mesh_trace_batch_discard(cfg, entry_count);
                     return;
                 }
                 throttle = retry_after_from_headers(response.headers());
@@ -2347,6 +2399,25 @@ async fn deliver_trace_payload(
         cfg.provider_name,
         total_attempts,
         entry_count,
+    );
+    record_mesh_trace_batch_discard(cfg, entry_count);
+}
+
+/// Count spans [`deliver_trace_payload`] permanently lost on the mesh
+/// span-drop counter (`reason="export_failed"`), once per lost span, for
+/// `workload_metrics` exporters only: a discarded batch, or the spans an OTLP
+/// HTTP-200 partial-success response reports as rejected.
+fn record_mesh_trace_batch_discard(cfg: &TraceHttpExporterConfig, entry_count: usize) {
+    if !cfg.mesh_span_drop_accounting || entry_count == 0 {
+        return;
+    }
+    use crate::plugins::mesh::prometheus_helpers::{
+        MeshTracingProvider, MeshTracingSpanDropReason, add_mesh_tracing_spans_dropped,
+    };
+    add_mesh_tracing_spans_dropped(
+        MeshTracingProvider::from_exporter_name(cfg.provider_name),
+        MeshTracingSpanDropReason::ExportFailed,
+        u64::try_from(entry_count).unwrap_or(u64::MAX),
     );
 }
 
@@ -2451,6 +2522,11 @@ async fn handle_otlp_partial_success(
             }
         },
     };
+    // Bounded by the batch: a collector cannot claim more lost spans than sent.
+    record_mesh_trace_batch_discard(
+        cfg,
+        usize::try_from(rejected).map_or(entry_count, |n| n.min(entry_count)),
+    );
     let message_value = partial
         .get("errorMessage")
         .or_else(|| partial.get("error_message"));
@@ -3931,6 +4007,7 @@ mod tests {
             payload_kind: TracePayloadKind::Otlp,
             allow_plaintext: true,
             ceiling: process_ceiling(),
+            mesh_span_drop_accounting: false,
         }
     }
 

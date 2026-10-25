@@ -2838,3 +2838,167 @@ async fn test_otel_tracing_cleartext_endpoint_needs_opt_in_off_loopback() {
         assert!(build(config.clone()).is_ok(), "{config} must be admitted");
     }
 }
+
+/// workload_metrics-MUSE-5: a span a workload_metrics exporter refuses is
+/// counted on `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` with
+/// fixed labels only, never the endpoint or the exporter error text.
+#[tokio::test]
+async fn workload_metrics_counts_refused_spans_by_provider_and_reason() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    // One-slot queue and a flush interval far beyond the test: on this
+    // current-thread runtime the flush worker never runs between the two
+    // `log` calls, so the second span finds the queue full.
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 10_000,
+        "flush_interval_ms": 600_000,
+        "buffer_capacity": 1,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {"url": "http://127.0.0.1:9/api/v2/spans"}
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+    let before = prometheus_helpers::mesh_tracing_spans_dropped_count(
+        MeshTracingProvider::Zipkin,
+        MeshTracingSpanDropReason::QueueFull,
+    );
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let after = prometheus_helpers::mesh_tracing_spans_dropped_count(
+        MeshTracingProvider::Zipkin,
+        MeshTracingSpanDropReason::QueueFull,
+    );
+    assert!(
+        after > before,
+        "queue-full drop must be counted ({before} -> {after})"
+    );
+
+    let mut output = String::new();
+    prometheus_helpers::render_mesh_observability_metrics(&mut output);
+    assert!(
+        output.contains("# TYPE ferrum_mesh_tracing_spans_dropped_total counter"),
+        "{output}"
+    );
+    let series = output
+        .lines()
+        .find(|line| {
+            line.starts_with(
+                "ferrum_mesh_tracing_spans_dropped_total{provider=\"zipkin\",reason=\"queue_full\"}",
+            )
+        })
+        .expect("zipkin queue_full series");
+    assert!(!series.contains("127.0.0.1"), "{series}");
+}
+
+/// PR6817-SOL-2: an enqueued span the exporter discards at delivery (here a
+/// non-retryable collector `400` with no retries) is counted once per lost
+/// span as `reason="export_failed"`, though no queue refusal ever happened.
+#[tokio::test]
+async fn workload_metrics_counts_spans_discarded_after_collector_failure() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/v2/spans"))
+        .respond_with(wiremock::ResponseTemplate::new(400))
+        .mount(&mock_server)
+        .await;
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "max_retries": 0,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {"url": format!("{}/api/v2/spans", mock_server.uri())}
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+    let count = || {
+        prometheus_helpers::mesh_tracing_spans_dropped_count(
+            MeshTracingProvider::Zipkin,
+            MeshTracingSpanDropReason::ExportFailed,
+        )
+    };
+    let before = count();
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    // Completion barrier: the collector saw the batch, then the counter moves.
+    let _ = received_json(&mock_server).await;
+    let mut after = count();
+    for _ in 0..100 {
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        after = count();
+    }
+    assert!(
+        after > before,
+        "a span discarded on a terminal collector failure must be counted ({before} -> {after})"
+    );
+}
+
+/// PR6817-SOL-3: an OTLP collector that answers HTTP 200 with a partial
+/// success rejecting spans lost them as surely as a 400; the rejected count is
+/// recorded as `reason="export_failed"` for workload_metrics exporters.
+#[tokio::test]
+async fn workload_metrics_counts_otlp_partial_success_rejected_spans() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"partialSuccess": {"rejectedSpans": 1}})),
+        )
+        .mount(&mock_server)
+        .await;
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "max_retries": 0,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {"endpoint": format!("{}/v1/traces", mock_server.uri())}
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+    let count = || {
+        prometheus_helpers::mesh_tracing_spans_dropped_count(
+            MeshTracingProvider::OpenTelemetry,
+            MeshTracingSpanDropReason::ExportFailed,
+        )
+    };
+    let before = count();
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    // Completion barrier: the collector saw the batch, then the counter moves.
+    let _ = received_json(&mock_server).await;
+    let mut after = count();
+    for _ in 0..100 {
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        after = count();
+    }
+    assert!(
+        after > before,
+        "spans an OTLP partial success rejected must be counted ({before} -> {after})"
+    );
+}
