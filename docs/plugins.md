@@ -6714,9 +6714,10 @@ per-address. Consumer keys are unaffected.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allow_methods` | String[] or null | *(none)* | Only these gRPC methods are permitted (allowlist). `null` is the same as omission. `[]` is valid block-all policy. |
-| `deny_methods` | String[] or null | `[]` | These gRPC methods are explicitly blocked (checked before allow). `null` is the same as omission. |
-| `method_rate_limits` | Object or null | `{}` | Per-method rate limits keyed by full method path. Each entry accepts only `max_requests` (1–1000000) and `window_seconds` (1–2678400); unknown keys are rejected. `null` is the same as omission. |
+| `allow_methods` | String[] or null | *(none)* | Only these gRPC methods are permitted (allowlist). Entries are exact methods or service-level `package.Service/*` rules. `null` is the same as omission. `[]` is valid block-all policy. |
+| `deny_methods` | String[] or null | `[]` | These gRPC methods are explicitly blocked (checked before allow). Entries are exact methods or service-level `package.Service/*` rules. `null` is the same as omission. |
+| `method_rate_limits` | Object or null | `{}` | Rate limits keyed by full method path or by a service-level `package.Service/*` rule. Each entry accepts only `max_requests` (1–1000000) and `window_seconds` (1–2678400); unknown keys are rejected. `null` is the same as omission. |
+| `default_rate_limit` | Object or null | *(none)* | Rate limit for every method that no `method_rate_limits` key (exact or service-level) covers, with the same closed `{max_requests, window_seconds}` shape. One budget per caller, pooled across all uncovered methods. On its own it is a configured rule. `null` is the same as omission (uncovered methods are not rate limited). |
 | `limit_by` | String or null | `ip` | Rate limit key: `ip` or `consumer`. ASCII case is ignored (`CONSUMER` and `Ip` are admitted). `null` is the same as omission (`ip`). Other values are rejected at plugin load time. |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for method rate-limit counters. ASCII case is ignored (`LOCAL` and `Redis` are admitted). `redis_failure_policy` remains case-sensitive. |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a canonical decimal integer from `0` through `2147483647`, without a sign, zero-padding, or extra slashes (`redis://host:6379/0`). An absent path or bare slash selects database 0. Ferrum uses the portable signed-32-bit bound, stricter than redis-rs's `i64` representation. A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
@@ -6731,13 +6732,31 @@ per-address. Consumer keys are unaffected.
 
 Each configured method accepts one optional leading slash and must use protobuf identifier grammar: `package.Service/Method`, with dot-separated service segments. Leading/trailing whitespace is normalized. Byte-identical duplicates are rejected by OpenAPI `uniqueItems`; duplicates that become equal only after trimming or slash normalization are rejected at runtime because JSON Schema cannot express canonical equality for array entries or object keys.
 
+**Service-level rules.** A method segment of exactly `*` (`package.Service/*`) makes the entry cover every method of that one service, including methods the backend ships later. It is the only wildcard form: the service segment never takes a wildcard (`pkg.*/*` and `*/*` are rejected), a partial method pattern (`Get*`) is rejected, and there is no regex. Request paths are always matched exactly against the service name, so `pkg.Svc/*` does not cover `pkg.SvcV2`. Precedence:
+
+- **Access lists.** A method is denied when it matches any `deny_methods` entry, exact or service-level, and deny always wins: an exact `allow_methods` entry under a denied service is still refused. With `allow_methods` set, a method is admitted when it matches an exact or a service-level allow entry.
+- **Rate limits.** Exactly one rule is charged per request, the most specific one: an exact `method_rate_limits` key, else the `package.Service/*` key for the method's service, else `default_rate_limit`, else none. An exact key is a per-method budget, as before. A service-level key is **one budget per caller pooled across every method of that service** that has no exact key, and `default_rate_limit` is one budget per caller pooled across every method nothing else covers. Pooling is deliberate: request-chosen method names can never mint new counters, so a client cannot grow the local state map by inventing method names. Use exact keys for methods that need their own budget.
+
+Service-level and default rate rules are part of the effective rate semantics, so adding, removing, or changing one starts fresh counters on reload, like any other budget change; an omitted and a `null` `default_rate_limit` are the same policy.
+
 Each rate limit entry is `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit. In Redis mode, `redis_url` and `redis_key_prefix` must be non-empty, the URL must use `redis://` or `rediss://` with an authority and must not carry a URL fragment, and pool/connect/health numeric settings must be positive.
 
-The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. Explicit `null` on those optional fields is the same as omitting them, so a config whose only present rules are null is still a no-op and is rejected. Unknown top-level keys are rejected so a valid method rule cannot mask a misspelled synchronization, identity, or Redis field that would otherwise silently fall back to local, IP-keyed, or shared-prefix enforcement. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, a non-empty `method_rate_limits`, or `default_rate_limit`) — an empty config is rejected. Explicit `null` on those optional fields is the same as omitting them, so a config whose only present rules are null is still a no-op and is rejected. Unknown top-level keys are rejected so a valid method rule cannot mask a misspelled synchronization, identity, or Redis field that would otherwise silently fall back to local, IP-keyed, or shared-prefix enforcement. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
 
 `on_request_received` may populate provisional client-path metadata for early consumers. After the first backend target is selected, `on_backend_path_resolved` clears those three fields, replaces them from the backend-effective method, and enforces allow/deny/rate policy exactly once. Deferred external routing-header hooks run only after that enforcement and cannot change the pinned target. An invalid backend-effective gRPC path fails closed for every policy shape, including deny-only and rate-only configurations. Retries may rotate hosts or ports but do not rotate to a target-specific path that would change the already authorized method.
 
 The backend-path boundary is shared by the HTTP/1.1 + HTTP/2 handler (including gRPC-Web requests classified as gRPC) and the HTTP/3 frontend, including its H3-to-H2 gRPC bridge.
+
+**Rejection contract.** Every rejection carries `content-type: application/grpc` and a JSON `{"error": ...}` body that the gateway never reflects as framed DATA: native gRPC clients get a trailers-only response whose `grpc-status` derives from the HTTP status, and gRPC-Web clients get it reframed as gRPC-Web.
+
+| HTTP status | gRPC status | When | Rate-limit headers |
+|---|---|---|---|
+| `403` | `PERMISSION_DENIED` (7) | The method matches `deny_methods`, is not admitted by `allow_methods`, or the backend-effective path is not a valid `/package.Service/Method` | None |
+| `429` | `RESOURCE_EXHAUSTED` (8) | The matched rate rule's budget is exhausted for this caller | `x-grpc-ratelimit-limit`, `x-grpc-ratelimit-remaining`, `x-grpc-ratelimit-method` |
+| `429` | `RESOURCE_EXHAUSTED` (8) | State capacity: a previously unseen caller key arrived while the local or Redis-fallback map is at its 100,000-key cap (body `{"error":"Rate limit state capacity exceeded"}`) | None |
+| `503` | `UNAVAILABLE` (14) | `sync_mode: redis` with `redis_failure_policy: fail_closed` and the centralized store cannot be consulted | None |
+
+On a quota `429`, `x-grpc-ratelimit-limit` is the matched rule's `max_requests` (for a service-level or default rule, the pooled budget), `x-grpc-ratelimit-remaining` is `0` (the refusal itself carries no other remaining count), and `x-grpc-ratelimit-method` is the refused method as `package.Service/Method` (no leading slash), not the rule that matched. On native gRPC they arrive as metadata on the trailers-only response. The capacity `429` carries none of them because it reflects gateway state pressure, not this caller's budget: a client that sees `RESOURCE_EXHAUSTED` without `x-grpc-ratelimit-limit` should treat it as gateway overload rather than its own quota. No rejection carries a retry hint (`retry-after` or `grpc-retry-pushback-ms`), so clients should back off with jitter. Both `429` kinds increment `ferrum_rate_limit_exceeded_total`; the `503` does not.
 
 **Counter storage** (`sync_mode`): gRPC method rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode uses the shared failover limiter (same charge-then-compensate atomic multi-window admission over the same 16-sub-bucket trailing window, including its documented per-limit steady-state cost and clock contract — a refusal hands back every window it charged — configurable `redis_failure_policy`, Cluster screening, and instance-owned health tasks as `rate_limiting`). While Redis is unavailable the default `fail_closed` policy refuses the call with HTTP `503` (gRPC `UNAVAILABLE`, not `RESOURCE_EXHAUSTED`); `local_fallback` is the explicit opt-in to per-process counters. Local and Redis-fallback maps are capped at 100,000 keys with sampled below-cap stale pruning (every 1,024 rate checks, cooldown-gated to at most once per second) and atomic admission that denies previously unseen local/fallback keys at capacity without deleting active budgets.
 
@@ -6745,7 +6764,7 @@ The backend-path boundary is shared by the HTTP/1.1 + HTTP/2 handler (including 
 plugin_name: grpc_method_router
 config:
   deny_methods:
-    - /admin.AdminService/DeleteAll
+    - /admin.AdminService/*
   method_rate_limits:
     /myapp.UserService/CreateUser:
       max_requests: 10
@@ -6753,6 +6772,12 @@ config:
     /myapp.UserService/ListUsers:
       max_requests: 100
       window_seconds: 60
+    /myapp.ReportService/*:
+      max_requests: 20
+      window_seconds: 60
+  default_rate_limit:
+    max_requests: 200
+    window_seconds: 60
   limit_by: consumer
   sync_mode: redis
   redis_url: "redis://redis-host:6379/4"

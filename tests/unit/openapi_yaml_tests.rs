@@ -2846,6 +2846,55 @@ fn grpc_method_router_schema_matches_runtime_validation() {
             "config should be invalid: {config}"
         );
     }
+
+    // Service-level `package.Service/*` rules and `default_rate_limit`: the
+    // schema and the constructor admit and refuse exactly the same shapes.
+    for config in [
+        json!({"deny_methods": ["/admin.AdminService/*"]}),
+        json!({"allow_methods": [" pkg.Service/* ", "pkg.Other/Call"]}),
+        json!({
+            "method_rate_limits": {
+                "/pkg.Service/*": {"max_requests": 1, "window_seconds": 60},
+                "/pkg.Service/Call": {"max_requests": 2, "window_seconds": 60}
+            }
+        }),
+        json!({"default_rate_limit": {"max_requests": 1, "window_seconds": 60}}),
+        json!({"deny_methods": ["pkg.Service/Denied"], "default_rate_limit": null}),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "config should be valid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config).is_ok(),
+            "runtime should admit schema-valid config: {config}"
+        );
+    }
+    for config in [
+        json!({"deny_methods": ["pkg.*/*"]}),
+        json!({"deny_methods": ["*/*"]}),
+        json!({"allow_methods": ["pkg.Service/Get*"]}),
+        json!({
+            "method_rate_limits": {
+                "pkg.Service/**": {"max_requests": 1, "window_seconds": 60}
+            }
+        }),
+        json!({"default_rate_limit": null}),
+        json!({"default_rate_limit": {"max_requests": 1}}),
+        json!({"default_rate_limit": {"max_requests": 0, "window_seconds": 60}}),
+        json!({
+            "default_rate_limit": {"max_requests": 1, "window_seconds": 60, "burst": 2}
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "config should be invalid: {config}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("grpc_method_router", &config).is_err(),
+            "runtime should reject schema-invalid config: {config}"
+        );
+    }
 }
 
 /// Issue #5004: `RateLimitingConfig` / `RateLimitingRuleConfig` must admit

@@ -34917,10 +34917,23 @@ components:
         for gRPC services. Authorizes the backend-effective gRPC path after
         route rewrites, listen-path stripping, backend-path composition, and
         initial target selection, then populates grpc_service, grpc_method, and
-        grpc_full_method metadata with that final method. At least one access or
-        rate rule is required. Unknown top-level keys are rejected by the runtime
-        and by this schema. Rate-limit counter storage supports only local
-        memory and Redis; database-backed counters are intentionally unsupported.
+        grpc_full_method metadata with that final method. Method rules are exact
+        `package.Service/Method` paths or service-level `package.Service/*`
+        rules (the method segment is exactly `*`; no other wildcard or pattern
+        syntax). At least one access or rate rule is required. Unknown
+        top-level keys are rejected by the runtime and by this schema.
+        Rate-limit counter storage supports only local memory and Redis;
+        database-backed counters are intentionally unsupported. Rejections use
+        content-type application/grpc and map to native gRPC status from the
+        HTTP status: 403 is PERMISSION_DENIED (denied, not allowed, or an
+        unparseable backend-effective path), 429 is RESOURCE_EXHAUSTED, and
+        503 is UNAVAILABLE (fail_closed Redis outage, with no rate-limit
+        headers). A quota 429 carries x-grpc-ratelimit-limit (the matched
+        rule's max_requests), x-grpc-ratelimit-remaining (0), and
+        x-grpc-ratelimit-method (the refused method, without the leading
+        slash) as initial metadata of the trailers-only response; the
+        state-capacity 429 (a previously unseen caller key while the local map
+        is full) carries none of them. No retry hint is sent.
       allOf:
         - anyOf:
             - required: [allow_methods]
@@ -34937,6 +34950,10 @@ components:
                 method_rate_limits:
                   type: object
                   minProperties: 1
+            - required: [default_rate_limit]
+              properties:
+                default_rate_limit:
+                  type: object
         - if:
             required: [sync_mode]
             properties:
@@ -34950,10 +34967,12 @@ components:
           uniqueItems: true
           items:
             type: string
-            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/(?:[A-Za-z_][A-Za-z0-9_]*|\*)\s*$'
           description: >-
             Only these gRPC methods are permitted (allowlist). Each entry is a
-            full method path like /package.Service/Method. Leading/trailing
+            full method path like /package.Service/Method, or
+            /package.Service/* to permit every method of one service.
+            Leading/trailing
             whitespace and one optional leading slash are normalized by the
             runtime. Duplicate normalized forms are rejected at runtime; JSON
             Schema uniqueItems can reject only byte-identical duplicates. `null`
@@ -34963,24 +34982,42 @@ components:
           uniqueItems: true
           items:
             type: string
-            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/(?:[A-Za-z_][A-Za-z0-9_]*|\*)\s*$'
           default: []
           description: >-
-            These gRPC methods are explicitly blocked. Deny takes precedence
-            over allow. Duplicate normalized forms are rejected at runtime;
+            These gRPC methods are explicitly blocked; /package.Service/*
+            blocks every method of one service. Deny takes precedence over
+            allow, including an exact allow entry under a denied service.
+            Duplicate normalized forms are rejected at runtime;
             JSON Schema uniqueItems can reject only byte-identical duplicates.
             `null` is the same as omission (no deny rules).
         method_rate_limits:
           type: [object, "null"]
           propertyNames:
-            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
+            pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/(?:[A-Za-z_][A-Za-z0-9_]*|\*)\s*$'
           additionalProperties:
             $ref: "#/components/schemas/RateSpec"
           description: >-
             Per-method rate limits keyed by full method path
-            (e.g., /myapp.UserService/CreateUser). Duplicate normalized keys
-            cannot be expressed by JSON Schema and are rejected at runtime.
-            `null` is the same as omission (no per-method rates).
+            (e.g., /myapp.UserService/CreateUser) or by a service-level
+            /package.Service/* rule. An exact key wins over the service-level
+            rule for that method, and only the most specific rule is charged.
+            An exact key is a per-method budget; a service-level key is one
+            budget per caller pooled across every method of the service that
+            has no exact key. Duplicate normalized keys cannot be expressed by
+            JSON Schema and are rejected at runtime. `null` is the same as
+            omission (no per-method rates).
+        default_rate_limit:
+          oneOf:
+            - $ref: "#/components/schemas/RateSpec"
+            - type: "null"
+          description: >-
+            Rate limit for every method that no exact or service-level
+            method_rate_limits key covers. It is one budget per caller pooled
+            across all of those methods, so request-chosen method names never
+            create new counters. Keyed by limit_by like every other rule. On
+            its own it is a configured rule. `null` is the same as omission
+            (uncovered methods are not rate limited).
         limit_by:
           type: [string, "null"]
           pattern: '^[Ii][Pp]$|^[Cc][Oo][Nn][Ss][Uu][Mm][Ee][Rr]$'
@@ -41445,7 +41482,8 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Closed rate limit specification used by grpc_method_router. Both fields
+        Closed rate limit specification used by grpc_method_router
+        (method_rate_limits entries and default_rate_limit). Both fields
         are required and must be positive integers; unknown keys are rejected by
         the runtime and by this schema.
       required: [max_requests, window_seconds]
