@@ -8501,27 +8501,29 @@ pub mod _test_support {
             .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
     }
 
-    /// The request trailers a gRPC dispatch would send, read back from
-    /// owner-scoped request staging exactly as the dispatch paths read them.
+    /// The request trailers a gRPC dispatch would send, read back from the
+    /// owner's typed request staging exactly as the dispatch paths read them.
     ///
     /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
     /// the sort is stable, so repeated values of one name keep wire order.
     pub fn staged_grpc_web_request_trailers(
-        metadata: &crate::plugins::MetadataMap,
+        ctx: &crate::plugins::RequestContext,
     ) -> Option<Vec<(String, String)>> {
-        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
-            let mut entries: Vec<(String, String)> = map
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_string(),
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            entries
-        })
+        crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers).map(
+            |map| {
+                let mut entries: Vec<(String, String)> = map
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries
+            },
+        )
     }
 
     pub fn response_content_type(original_ct: &str) -> String {
@@ -9942,6 +9944,45 @@ pub mod _test_support {
             plugins, None, None, headers, body_bytes,
         )
         .await
+    }
+
+    /// Model the H1/H2 buffered request-body hook round trip: clone the live
+    /// context into the compatibility hook context, run the transform chain and
+    /// the final request-body chain on that clone, then hand state back to the
+    /// live context exactly as the dispatcher does (typed terminals and staged
+    /// state first, then the metadata swap). Returns the backend-bound body and
+    /// the final chain's verdict.
+    pub async fn run_buffered_request_body_hook_round_trip_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            body,
+        )
+        .await;
+        let result = crate::proxy::run_final_request_body_hooks(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            &transformed,
+        )
+        .await;
+        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
+        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
+        let request_body = ctx.metadata.remove("request_body");
+        ctx.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
+        (transformed, result)
     }
 
     pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(

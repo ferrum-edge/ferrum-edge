@@ -8904,7 +8904,7 @@ where
             hyper_method.clone(),
             initial_hmap,
             initial_body,
-            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+            crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers),
             grpc_dispatch_proxy,
             &current_url,
             &initial_grpc_transport,
@@ -9189,7 +9189,9 @@ where
                     hmap.clone(),
                     body_bytes.clone(),
                     // A retry replays the complete request, trailers included.
-                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                    crate::plugins::grpc_web::staged_request_trailers(
+                        &ctx.grpc_web_request_trailers,
+                    ),
                     grpc_retry_dispatch_proxy,
                     &current_url,
                     &grpc_retry_transport,
@@ -16085,7 +16087,7 @@ mod tests {
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20hyper_method.clone(),\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_hmap,\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_body,\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers),\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
             ),
             "initial gRPC dispatch must move the prepared headers/body and use the \

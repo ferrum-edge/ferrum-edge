@@ -4772,9 +4772,16 @@ async fn prepare_mesh_request_body(
         crate::plugins::grpc_web::record_request_grpc_message_count(request_ctx, &body);
     }
     let retained = (retain_request_body && !body.is_empty()).then(|| body.clone());
-    let trailers = ctx
-        .as_deref()
-        .and_then(|ctx| crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata));
+    // The gRPC-Web owner stages the split trailer block on whichever context
+    // its body transform ran on: the mutable hook context when this call runs
+    // the hooks, or — for a body already finalized before generic dispatch
+    // (`request_body_prepared`, e.g. finalized-request egress), where no hook
+    // context is passed — the live request context the earlier hook run was
+    // adopted onto. Reading only the hook context dropped the trailers the
+    // owner had already stripped from that prepared body.
+    let trailers = ctx.as_deref().or(request_ctx).and_then(|ctx| {
+        crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers)
+    });
     Ok((
         MeshClientRequestBody::Replayable {
             body,
@@ -38992,7 +38999,9 @@ async fn handle_proxy_request_inner(
                         grpc_method,
                         grpc_headers,
                         grpc_req_body.clone(),
-                        crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                        crate::plugins::grpc_web::staged_request_trailers(
+                            &ctx.grpc_web_request_trailers,
+                        ),
                         grpc_dispatch_proxy,
                         &grpc_backend_url,
                         // The transport materialized for THIS target before any dial:
@@ -39321,7 +39330,7 @@ async fn handle_proxy_request_inner(
                                     grpc_headers,
                                     grpc_req_body.clone(),
                                     crate::plugins::grpc_web::staged_request_trailers(
-                                        &ctx.metadata,
+                                        &ctx.grpc_web_request_trailers,
                                     ),
                                     grpc_dispatch_proxy,
                                     &grpc_backend_url,
@@ -39946,7 +39955,9 @@ async fn handle_proxy_request_inner(
                             grpc_req_headers.clone(),
                             grpc_body_bytes.clone(),
                             // A retry replays the complete request, trailers included.
-                            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                            crate::plugins::grpc_web::staged_request_trailers(
+                                &ctx.grpc_web_request_trailers,
+                            ),
                             grpc_retry_effective_proxy.as_ref(),
                             &grpc_backend_url,
                             // The transport re-materialized for THIS attempt's target:
@@ -47610,7 +47621,9 @@ async fn proxy_to_backend_mesh_retry(
     let mesh_body = MeshClientRequestBody::Replayable {
         body: request_body.cloned().unwrap_or_default(),
         headers: replay_headers.clone(),
-        trailers: crate::plugins::grpc_web::staged_request_trailers(&request_ctx.metadata),
+        trailers: crate::plugins::grpc_web::staged_request_trailers(
+            &request_ctx.grpc_web_request_trailers,
+        ),
     };
     let route_request_body_limit = request_ctx.route_request_body_limit();
     let route_response_body_limit = request_ctx.route_response_body_limit();
@@ -69069,19 +69082,83 @@ mod tests {
         );
     }
 
+    /// PR6826-SOL-2: a body finalized before generic dispatch reaches mesh
+    /// preparation with no hook context, only the live request context the
+    /// earlier hook run was adopted onto. Its validated gRPC-Web trailer block
+    /// must still populate the Replayable body, and a request that staged no
+    /// trailers must still dispatch without any.
+    #[tokio::test]
+    async fn prepare_mesh_request_body_keeps_trailers_staged_on_the_live_context_for_a_prepared_body()
+     {
+        let mut live = RequestContext::new("127.0.0.1".into(), "POST".into(), "/svc/Method".into());
+        live.grpc_web_request_trailers =
+            crate::plugins::grpc_web::StagedRequestTrailers::from_validated_pairs(vec![(
+                "x-checksum".to_string(),
+                "abc".to_string(),
+            )])
+            .expect("valid staged trailer");
+        let trailerless =
+            RequestContext::new("127.0.0.1".into(), "POST".into(), "/svc/Method".into());
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        for (case, request_ctx, expected) in [
+            ("staged on the live context", &live, Some("abc")),
+            ("no trailer frame staged", &trailerless, None),
+        ] {
+            let (mesh_body, _retained) = match prepare_mesh_request_body(
+                ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
+                    method: hyper::Method::POST,
+                    headers: hyper::HeaderMap::new(),
+                    body: b"payload".to_vec(),
+                    trailers: None,
+                    budget: None,
+                })),
+                "POST",
+                &HashMap::new(),
+                1024 * 1024,
+                1_000,
+                None,
+                &[],
+                None,
+                Some(request_ctx),
+                false,
+                true,
+                true,
+                &bytes_sent,
+                None,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(_) => panic!("{case}: a prepared gRPC-Web body must dispatch"),
+            };
+            let MeshClientRequestBody::Replayable { body, trailers, .. } = mesh_body else {
+                panic!("{case}: buffered mesh path must produce Replayable");
+            };
+            assert_eq!(&*body, b"payload", "{case}");
+            assert_eq!(
+                trailers.as_ref().and_then(|trailers| {
+                    trailers
+                        .get("x-checksum")
+                        .and_then(|value| value.to_str().ok())
+                }),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
     /// Empty native trailer maps are harmless, and validated gRPC-Web staged
     /// trailers remain the Replayable representation.
     #[tokio::test]
     async fn prepare_mesh_request_body_keeps_staged_grpc_web_trailers() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-
         let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/svc/Method".into());
-        let staged = BASE64.encode(
-            serde_json::to_vec(&[("x-grpc-web-trailer".to_string(), "kept".to_string())])
-                .expect("stage trailer json"),
-        );
-        ctx.metadata
-            .insert("grpc_web.request_trailers".to_string(), staged);
+        ctx.grpc_web_request_trailers =
+            crate::plugins::grpc_web::StagedRequestTrailers::from_validated_pairs(vec![(
+                "x-grpc-web-trailer".to_string(),
+                "kept".to_string(),
+            )])
+            .expect("valid staged trailer");
         let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let (mesh_body, retained) = match prepare_mesh_request_body(
