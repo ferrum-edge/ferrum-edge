@@ -4141,7 +4141,8 @@ async fn rfc9421_valid_signature_authenticates_and_replay_is_rejected() {
 #[tokio::test]
 async fn rfc9421_binds_every_covered_component() {
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
-    let mutations: [(&str, fn(&mut RequestContext)); 5] = [
+    type ContextMutation = (&'static str, fn(&mut RequestContext));
+    let mutations: [ContextMutation; 5] = [
         ("method", |ctx: &mut RequestContext| {
             ctx.method = "PUT".to_string()
         }),
