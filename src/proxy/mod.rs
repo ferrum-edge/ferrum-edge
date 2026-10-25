@@ -68062,7 +68062,16 @@ mod tests {
             "POST".to_string(),
             "/v1/chat/completions".to_string(),
         );
-        let mut headers = HashMap::new();
+        // `ai_rate_limiter` only consults its budget for AI calls (or bodies
+        // it cannot inspect), so probe with a still-compressed JSON POST: a
+        // budget check with no reservation of its own.
+        let budget_probe_headers = || {
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+            ])
+        };
+        let mut headers = budget_probe_headers();
         assert!(matches!(
             limiter.before_proxy(&mut next_ctx, &mut headers).await,
             PluginResult::Continue
@@ -68095,7 +68104,7 @@ mod tests {
             "POST".to_string(),
             "/v1/chat/completions".to_string(),
         );
-        let mut headers = HashMap::new();
+        let mut headers = budget_probe_headers();
         assert!(matches!(
             limiter
                 .before_proxy(&mut over_limit_ctx, &mut headers)
