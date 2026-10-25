@@ -30082,11 +30082,11 @@ components:
         require_get_method:
           type: boolean
           default: true
-          description: "Reject non-GET requests with 405 (SSE is read-only)"
+          description: "Reject non-GET requests with 405 (SSE is read-only). While this or require_accept_header is enabled, the checks are route admission policy: a native gRPC or WebSocket request to the route, which runs only plain-HTTP plugins, is refused with 403 (rejection phase route_protocol_admission) instead of skipping them."
         require_accept_header:
           type: boolean
           default: true
-          description: "Require an affirmative Accept: text/event-stream entry (406 otherwise; q=0, malformed, or duplicate quality is not affirmative)"
+          description: "Require an affirmative Accept: text/event-stream entry (406 otherwise; q=0, malformed, or duplicate quality is not affirmative). While this or require_get_method is enabled, native gRPC and WebSocket requests to the route are refused with 403 (rejection phase route_protocol_admission)."
         strip_accept_encoding:
           type: boolean
           default: true
@@ -30104,15 +30104,15 @@ components:
           format: uint64
           minimum: 1
           maximum: 18446744073709551615
-          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping. Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
+          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping. Not injected into a genuine backend text/event-stream. Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
         force_sse_content_type:
           type: boolean
           default: false
-          description: "Force Content-Type: text/event-stream even if backend returns something else. Not applied to a response carrying Cache-Control: no-transform (RFC 9110 section 7.7 forbids an intermediary changing Content-Type on one)."
+          description: "Force Content-Type: text/event-stream even if backend returns something else. Not applied to a response carrying Cache-Control: no-transform (RFC 9110 section 7.7 forbids an intermediary changing Content-Type on one), to 206/226 responses, or to bodies under a non-identity Content-Encoding, whether or not wrap_non_sse_responses is enabled."
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type. Wrapping and its relabel are declined together — the origin representation is forwarded unchanged — for 206/226 responses, responses carrying Cache-Control: no-transform (RFC 9110 section 7.7, which also blocks force_sse_content_type), and bodies under a non-identity Content-Encoding. A framed event that exceeds the effective response-body ceiling returns the gateway capacity refusal instead of the unframed body."
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type. Wrapping and its relabel are declined together — the origin representation is forwarded unchanged — for 206/226 responses, responses carrying Cache-Control: no-transform (RFC 9110 section 7.7, which also blocks force_sse_content_type), and bodies under a non-identity Content-Encoding. A framed event that exceeds the effective response-body ceiling returns the gateway capacity refusal instead of the unframed body. Only responses this plugin's after_proxy relabelled are framed, so synthetic responses (response_mock, terminate-mode serverless_function, cache hits) keep their own body and media type."
 
     RateLimitingRuleConfig:
       type: object

@@ -23,7 +23,9 @@
 //! 2. **`before_proxy`** — Shapes the request for the upstream backend:
 //!    - Strips `Accept-Encoding` to prevent compressed chunked responses that
 //!      break SSE framing (SSE relies on line-delimited text over chunked transfer)
-//!    - Forwards `Last-Event-ID` as a header so the backend can resume the stream
+//!    - Forwards the client's `Last-Event-ID` request header so the backend can
+//!      resume the stream. Only the header is honored: a cursor a client sends
+//!      as a query parameter stays in the query string and is not converted.
 //!
 //! 3. **`after_proxy`** — Sets proper SSE response headers:
 //!    - Conservatively merges `Cache-Control` with `no-cache` without weakening
@@ -38,6 +40,11 @@
 //! 4. **`transform_response_body`** — Optionally wraps non-SSE upstream
 //!    responses into `data: ...\n\n` SSE event framing (buffered responses only),
 //!    preserving terminal line-break semantics for EventSource `MessageEvent.data`.
+//!    Framing runs only when `after_proxy` selected it for this response, which
+//!    is also where the `text/event-stream` label is published. Synthetic
+//!    responses (a `response_mock` reply, a serverless terminate reply, a cache
+//!    hit) skip this plugin's `after_proxy`, so they are never framed under the
+//!    producer's own media type.
 //!
 //! ## Representations wrapping declines
 //!
@@ -45,7 +52,8 @@
 //! relabel included — for a representation it cannot convert. The refusal is
 //! decided in `after_proxy`, before the `Content-Type` is touched, so the client
 //! receives the origin's own representation rather than reframed bytes under an
-//! event-stream label:
+//! event-stream label. `force_sse_content_type` declines the same
+//! representations, whether or not wrapping is configured:
 //!
 //! * a `206`/`226` body, which is a fragment the unchanged status still describes;
 //! * a response carrying `Cache-Control: no-transform`, which RFC 9110 §7.7
@@ -385,6 +393,41 @@ impl SsePlugin {
             || original_response_is_event_stream(ctx, response_headers)
             || Self::wrap_refused_for_representation(ctx, response_headers)
     }
+
+    /// Frame a body whose wrapping was already selected, under this response's
+    /// retained ceiling.
+    fn frame_selected_body(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // `after_proxy` already refused these representations before touching a
+        // header. Re-check rather than trusting the arrival: framing
+        // content-coded octets as text, or overriding an origin `no-transform`,
+        // must not become reachable through a direct caller.
+        if Self::wrap_refused_for_representation(ctx, response_headers) {
+            return None;
+        }
+
+        // Built inside a sink sized to this response's retained ceiling, so an
+        // event that would exceed it is refused during construction rather than
+        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). The refusal
+        // is published as the shared pending capacity signal: `after_proxy` has
+        // already selected `text/event-stream` for this response, so leaving the
+        // unconverted body in place would serve plain bytes as a successful
+        // event stream.
+        let construction = self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling());
+        if let BoundedResponseBodyConstruction::Replaced(output) = &construction {
+            debug!(
+                plugin = "sse",
+                original_bytes = body.len(),
+                wrapped_bytes = output.len(),
+                "wrapped response into SSE event"
+            );
+        }
+        construction.into_transform_option(ctx)
+    }
 }
 
 /// The `data: ` field prefix each normalized line is emitted under.
@@ -604,6 +647,17 @@ impl super::Plugin for SsePlugin {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    /// The GET-only and `Accept: text/event-stream` checks refuse requests the
+    /// route must not serve, so they are route admission policy. The client
+    /// selects the native-gRPC or WebSocket flavor by its own headers, and those
+    /// views omit this HTTP-only instance; declaring the bit makes the gateway
+    /// refuse them (`route_protocol_admission`) instead of dispatching a POST or
+    /// an upgrade that skipped both checks. An instance with both checks
+    /// disabled refuses nothing a route relies on, so it does not gate.
+    fn gates_request_admission(&self) -> bool {
+        self.require_get_method || self.require_accept_header
+    }
+
     fn modifies_request_headers(&self) -> bool {
         true
     }
@@ -789,9 +843,11 @@ impl super::Plugin for SsePlugin {
             headers.remove("accept-encoding");
         }
 
-        // Ensure Last-Event-ID is forwarded as a header. Some clients send it
-        // only as a query parameter; the metadata stash from on_request_received
-        // ensures it's always available. The header takes precedence if both exist.
+        // Re-assert the client's Last-Event-ID request header, which
+        // on_request_received bounded and stashed, in case an earlier
+        // before_proxy hook removed it. A header already in the outbound map
+        // wins. Only the request header is honored: a cursor sent as a query
+        // parameter stays in the query string and is not converted here.
         if let Some(last_id) = ctx.metadata.get(LAST_EVENT_ID_METADATA_KEY) {
             headers
                 .entry("last-event-id".to_string())
@@ -844,17 +900,22 @@ impl super::Plugin for SsePlugin {
             return PluginResult::Continue;
         }
 
-        // For a non-SSE backend response, wrapping/forcing depends on the
-        // configured body wrapper running. Preserved 206/226 bytes cannot be
-        // wrapped, and a content-coded body is a compressed bitstream rather
-        // than the text `data:` framing describes, so do not relabel either as
-        // an SSE event stream.
-        let wrap_allowed = self.wrap_non_sse_responses
-            && super::response_body_rewrite_allowed(response_status)
+        // A non-SSE backend response can only become an event stream when its
+        // bytes are a complete text representation. Preserved 206/226 bytes are
+        // a fragment the unchanged status still describes, and a content-coded
+        // body is a compressed bitstream rather than the text an EventSource
+        // parses, so neither wrapping nor forcing relabels them. The decline is
+        // the same whether or not wrapping is configured, so enabling the
+        // wrapper never changes what forcing does.
+        let representation_convertible = super::response_body_rewrite_allowed(response_status)
             && !Self::origin_response_is_encoded(ctx, response_headers);
-        if !origin_was_sse && self.wrap_non_sse_responses && !wrap_allowed {
+        if !origin_was_sse
+            && (self.wrap_non_sse_responses || self.force_sse_content_type)
+            && !representation_convertible
+        {
             return PluginResult::Continue;
         }
+        let wrap_allowed = self.wrap_non_sse_responses && representation_convertible;
 
         let will_wrap = !origin_was_sse && wrap_allowed;
         let will_force = !is_sse && self.force_sse_content_type;
@@ -921,7 +982,7 @@ impl super::Plugin for SsePlugin {
         &self,
         ctx: &mut RequestContext,
         body: &[u8],
-        content_type: Option<&str>,
+        _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if !self.wrap_non_sse_responses || body.is_empty() {
@@ -936,46 +997,22 @@ impl super::Plugin for SsePlugin {
             .metadata
             .remove(WRAP_NON_SSE_METADATA_KEY)
             .is_some_and(|v| v == "1");
-        if wrap_requested {
-            ctx.metadata.remove(RELABELLED_NON_SSE_METADATA_KEY);
-        }
 
-        // Don't double-wrap a genuine upstream SSE response. When after_proxy
-        // already decided to wrap (and may have relabeled Content-Type), honor
-        // that request-scoped decision instead of the mutated media type.
-        // Direct callers without after_proxy still wrap only when the supplied
-        // type is not already SSE.
-        if !wrap_requested && content_type.is_some_and(Self::is_sse_content_type) {
+        // Only `after_proxy` may select framing, because it is the only place
+        // the matching `text/event-stream` label is published. Without its
+        // marker nothing relabelled this response: the synthetic lifecycle (a
+        // `response_mock` reply, a serverless terminate reply, a cache hit)
+        // runs body transforms but skips this plugin's `after_proxy`
+        // (`applies_after_proxy_on_reject` is false), so framing here would
+        // publish `data:` events under the producer's own media type. The
+        // marker also covers the genuine-SSE case: `after_proxy` never sets it
+        // for an origin event stream, whatever the live label says now.
+        if !wrap_requested {
             return None;
         }
+        ctx.metadata.remove(RELABELLED_NON_SSE_METADATA_KEY);
 
-        // `after_proxy` already refused these representations before touching a
-        // header, so reaching here means it never ran for this response (a
-        // direct caller, or a path with no response-header phase). Re-check
-        // rather than trusting the arrival: framing content-coded octets as
-        // text, or overriding an origin `no-transform`, must not become
-        // reachable by skipping a hook.
-        if Self::wrap_refused_for_representation(ctx, response_headers) {
-            return None;
-        }
-
-        // Built inside a sink sized to this response's retained ceiling, so an
-        // event that would exceed it is refused during construction rather than
-        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). The refusal
-        // is published as the shared pending capacity signal: `after_proxy` has
-        // already selected `text/event-stream` for this response, so leaving the
-        // unconverted body in place would serve plain bytes as a successful
-        // event stream.
-        let construction = self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling());
-        if let BoundedResponseBodyConstruction::Replaced(output) = &construction {
-            debug!(
-                plugin = "sse",
-                original_bytes = body.len(),
-                wrapped_bytes = output.len(),
-                "wrapped response into SSE event"
-            );
-        }
-        construction.into_transform_option(ctx)
+        self.frame_selected_body(ctx, body, response_headers)
     }
 
     async fn transform_response_body(
@@ -984,16 +1021,21 @@ impl super::Plugin for SsePlugin {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // Fallback when no request context is available (legacy callers). The
-        // throwaway context carries no pending-signal channel back to a
+        // Context-free byte framing for direct callers. No proxy path calls
+        // this: every response-body phase dispatches the context-aware hook
+        // above, which frames only what `after_proxy` selected. A direct caller
+        // has no header phase, so it owns the media type of what it gets back;
+        // the supplied type only keeps an event stream from being framed twice.
+        // The throwaway context carries no pending-signal channel back to a
         // response-body loop, so a ceiling refusal collapses to `None` here.
-        // That stays self-consistent: a caller with no context also had no
-        // `after_proxy` pass, so no `text/event-stream` label was selected for
-        // the unconverted body to be published under. Every proxy path uses the
-        // context-aware hook above.
+        if !self.wrap_non_sse_responses
+            || body.is_empty()
+            || content_type.is_some_and(Self::is_sse_content_type)
+        {
+            return None;
+        }
         let mut ctx =
             RequestContext::new("0.0.0.0".to_string(), "GET".to_string(), "/".to_string());
-        self.transform_response_body_with_context(&mut ctx, body, content_type, response_headers)
-            .await
+        self.frame_selected_body(&mut ctx, body, response_headers)
     }
 }

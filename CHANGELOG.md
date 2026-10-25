@@ -139,6 +139,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`sse` request checks now apply to every request flavor, and synthetic
+  responses are no longer framed under their own media type.**
+  - While `require_get_method` or `require_accept_header` is enabled (the
+    default), the plugin is route admission policy. A native gRPC request or
+    WebSocket upgrade, whose view does not run this HTTP-only plugin, is now
+    refused with `403` / `route_protocol_admission`. Before, a gRPC `POST` or
+    an upgrade without `Accept: text/event-stream` reached the backend.
+  - `wrap_non_sse_responses` frames a body only when this plugin's
+    `after_proxy` selected it and published `text/event-stream`. A
+    `response_mock` reply, terminate-mode `serverless_function` reply, or
+    cache hit no longer gets `data:` framing under `application/json`.
+  - `force_sse_content_type` no longer relabels `206`/`226` or content-coded
+    responses when wrapping is off. They were already declined when wrapping
+    was on.
+  - Docs now say that only the `Last-Event-ID` request header is forwarded
+    (a query-parameter cursor is not converted), and which idle timeouts
+    affect long-lived event streams.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

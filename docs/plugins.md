@@ -5550,9 +5550,11 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 **Lifecycle:**
 
 1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects a missing or non-affirmative `Accept` with 406 (a `text/event-stream` entry explicitly excluded with `q=0`, or with a malformed/duplicate quality, does not count), bounds `Last-Event-ID` (max 1024 bytes) and stashes it for backend forwarding. The raw ID is omitted from transaction logs (`sse:leid_present` / `sse:leid_bytes` correlation only) and never interpolated into diagnostics.
-2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
-3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body — and declines both for the representations listed under [Representations wrapping declines](#representations-wrapping-declines).
-4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it.
+2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards the client's `Last-Event-ID` request header to the backend. Only the header is honored: a cursor a client or polyfill sends as a query parameter (for example `?lastEventId=42`) stays in the query string and is not converted to a header.
+3. **`after_proxy`** — Conservatively merges `Cache-Control` with `no-cache` without removing origin `private` / `no-store` / `no-transform` / extensions. Adds `X-Accel-Buffering: no`. Strips `Content-Length`. Does **not** emit `Connection: keep-alive` (illegal on HTTP/2 and HTTP/3; unnecessary on HTTP/1.1). Relabels non-SSE responses as `text/event-stream` when `force_sse_content_type` is set and/or when `wrap_non_sse_responses` will convert the body — and declines both for the representations listed under [Representations wrapping declines](#representations-wrapping-declines). `force_sse_content_type` declines the same representations whether or not wrapping is configured.
+4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only), preserving terminal line-break semantics for EventSource `MessageEvent.data`. Wrapping uses the request-scoped wrap decision from `after_proxy`, so it composes with content-type forcing instead of canceling it. Without that decision nothing is framed: synthetic responses (a `response_mock` reply, a terminate-mode `serverless_function` reply, a cache hit) skip this plugin's `after_proxy`, so they keep their own body and media type rather than receiving `data:` framing under, for example, `application/json`.
+
+**Request flavors:** While `require_get_method` or `require_accept_header` is enabled (the default), the GET/Accept checks are route admission policy. This plugin runs only on plain HTTP, so a native gRPC request or a WebSocket upgrade to a route carrying it is refused with `403` / `rejection_phase: "route_protocol_admission"` (trailers-only `PERMISSION_DENIED` for gRPC) instead of reaching the backend without those checks. A global instance applies this to every HTTP-family route. Disabling both checks removes the refusal.
 
 **Config admission:** Config must be a JSON object. Unknown keys are rejected. Explicit `null` members are rejected; omitted keys keep defaults. `retry_ms` must be an unsigned 64-bit integer ≥ 1 when set. Admission is over the JSON numeric **value**, matching the published `SseConfig` schema (JSON Schema `type: integer` admits `2500.0` exactly as it admits `2500`), so an exact integer-valued number is accepted while fractional values and magnitudes outside the `minimum`/`maximum` pair are rejected on both sides.
 
@@ -5562,9 +5564,9 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 
 | Origin response | Outcome |
 |---|---|
-| `206 Partial Content` / `226 IM Used` | Forwarded unchanged; a fragment is not a complete event |
+| `206 Partial Content` / `226 IM Used` | Forwarded unchanged; a fragment is not a complete event. Also suppresses `force_sse_content_type` |
 | `Cache-Control: no-transform` | Forwarded unchanged (RFC 9110 §7.7). This also suppresses `force_sse_content_type`, which §7.7 lists among the fields a `no-transform` response forbids changing. The directive is read from the pristine pre-`after_proxy` snapshot, so a later header rule that strips it cannot unlock wrapping. A `no-transform` token inside a quoted extension value is not the directive |
-| Non-identity `Content-Encoding` | Forwarded unchanged; compressed octets are not the UTF-8 text `data:` framing describes. `strip_accept_encoding` (default on) is what normally prevents this |
+| Non-identity `Content-Encoding` | Forwarded unchanged; compressed octets are not the UTF-8 text `data:` framing describes. Also suppresses `force_sse_content_type`. `strip_accept_encoding` (default on) is what normally prevents this |
 | Genuine `text/event-stream` | Streamed, never double-wrapped — including when retries are configured |
 
 A framed event that would exceed the effective response-body ceiling is a different outcome: the rewrite was claimed and could not be produced, so the shared gateway capacity refusal owns the response rather than the unconverted body being published under the `text/event-stream` label already selected.
@@ -5588,11 +5590,18 @@ A framed event that would exceed the effective response-body ceiling is a differ
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
 | `strip_content_length` | bool | `true` | Remove `Content-Length` from the initial response map (SSE streams are indefinite). `false` does not leave one on the wire: [final response framing](#final-response-framing) removes `Content-Length` from every ordinary streamed response. The flag still governs whether `content-length` joins this instance's response-trailer policy names and whether the gateway's own declared-length accounting sees the backend value. |
-| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 and within the unsigned 64-bit range |
-| `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 and within the unsigned 64-bit range. It is not injected into a genuine backend `text/event-stream`; the backend sends its own `retry:` field there |
+| `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else. Not applied to `206`/`226`, content-coded, or `no-transform` responses |
 | `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses. See [Representations wrapping declines](#representations-wrapping-declines) |
 
 **Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering and delivers a correctly framed `text/event-stream` response (composing with `force_sse_content_type`). When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`. Genuine upstream `text/event-stream` bodies are never double-wrapped: buffering is released as soon as the backend response headers prove the origin selected an event stream, including on a retry-enabled proxy and on the HTTP/3 → HTTP bridge. Wrapping normalizes CR/CRLF to LF and preserves terminal newlines in `MessageEvent.data` (lossy UTF-8 replacement of invalid bytes is separate from newline fidelity).
+
+**Long-lived and sparse streams:** The plugin does not inject keep-alive comments or a `retry:` field into a genuine backend event stream. Two gateway idle bounds decide whether a quiet stream survives, and both default to 30 seconds:
+
+- Per-proxy `backend_read_timeout_ms` bounds the idle time between backend frames (see [Configuration](configuration.md)). Set it above the backend's heartbeat interval, or to `0` to disable the idle bound, for feeds that can go quiet.
+- `FERRUM_HTTP3_IDLE_TIMEOUT` bounds an otherwise idle QUIC connection for HTTP/3 clients. Raise it, or set `0`, when H3 clients hold sparse streams.
+
+A backend that emits its own `: ping` comment lines more often than both bounds keeps every leg active without either change.
 
 ```yaml
 config:

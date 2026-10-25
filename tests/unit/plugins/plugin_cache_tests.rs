@@ -961,6 +961,27 @@ fn every_admission_gating_plugin_marks_the_flavor_views_it_cannot_run_on() {
             true,
             true,
         ),
+        (
+            "sse with its default GET and Accept admission",
+            "sse",
+            json!({}),
+            true,
+            true,
+        ),
+        (
+            "sse with only the Accept check",
+            "sse",
+            json!({"require_get_method": false}),
+            true,
+            true,
+        ),
+        (
+            "sse with both request checks disabled",
+            "sse",
+            json!({"require_get_method": false, "require_accept_header": false}),
+            false,
+            false,
+        ),
     ];
 
     for (row, plugin_name, plugin_config, grpc_refused, websocket_refused) in rows {

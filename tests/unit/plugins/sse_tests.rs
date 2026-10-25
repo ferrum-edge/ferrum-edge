@@ -1,6 +1,7 @@
 use super::plugin_utils::create_test_proxy;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
+    finalize_synthetic_response_for_test,
     install_pending_buffered_response_capacity_refusal_for_test,
     refine_stream_response_for_content_type_for_test, retry_response_decision_context_for_test,
     stamp_original_response_metadata_for_test,
@@ -1895,4 +1896,179 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }
+}
+
+// ── Plugin review fixes: admission fence, synthetic wrap, force consistency ───
+
+/// sse-SOL-2: the GET-only and Accept checks are route admission policy. The
+/// client selects the native-gRPC or WebSocket view by its own headers and
+/// those views omit this HTTP-only instance, so the instance must declare the
+/// bit the gateway's flavor fence refuses on.
+#[test]
+fn test_request_checks_gate_route_admission() {
+    for config in [
+        json!({}),
+        json!({"require_get_method": true, "require_accept_header": false}),
+        json!({"require_get_method": false, "require_accept_header": true}),
+    ] {
+        let plugin = make_plugin(config.clone());
+        assert!(plugin.gates_request_admission(), "{config}");
+    }
+    let permissive = make_plugin(json!({
+        "require_get_method": false,
+        "require_accept_header": false
+    }));
+    assert!(
+        !permissive.gates_request_admission(),
+        "an instance that refuses nothing is not admission policy"
+    );
+}
+
+/// sse-SOL-1: without `after_proxy`'s decision nothing published the
+/// `text/event-stream` label, so the context-aware transform must not frame
+/// the body under the producer's own media type.
+#[tokio::test]
+async fn test_context_transform_does_not_wrap_without_after_proxy_decision() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true, "retry_ms": 2500}));
+    let mut ctx = make_sse_ctx();
+    let headers = json_response_headers();
+    let body = br#"{"message":"hello"}"#;
+
+    let wrapped = plugin
+        .transform_response_body_with_context(&mut ctx, body, Some("application/json"), &headers)
+        .await;
+    assert!(
+        wrapped.is_none(),
+        "no header phase selected wrapping, so the body must stay unframed"
+    );
+}
+
+/// sse-SOL-1: a synthetic 200 (a `response_mock` reply, a serverless terminate
+/// reply) runs body transforms through the shared finalizer but skips this
+/// plugin's `after_proxy`. The client must never receive SSE-framed bytes
+/// under the producer's `application/json` label, with one wrapper or two.
+#[tokio::test]
+async fn test_synthetic_response_is_not_framed_under_its_own_media_type() {
+    let config = json!({"wrap_non_sse_responses": true, "retry_ms": 2500});
+    let one: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(config.clone()))];
+    let two: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(config.clone())),
+        Arc::new(make_plugin(config)),
+    ];
+    for plugins in [one, two] {
+        let original: &[u8] = br#"{"message":"hello"}"#;
+        let mut ctx = make_sse_ctx();
+        let mut status = 200u16;
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), original.len().to_string()),
+        ]);
+        let mut body = Bytes::from_static(br#"{"message":"hello"}"#);
+
+        finalize_synthetic_response_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await;
+
+        assert_eq!(status, 200, "instances={}", plugins.len());
+        assert_eq!(
+            content_type_of(&headers),
+            Some("application/json"),
+            "instances={}",
+            plugins.len()
+        );
+        assert_eq!(&body[..], original, "instances={}", plugins.len());
+    }
+}
+
+/// sse-claude-2: forcing declines the same partial-content and content-coded
+/// representations whether or not wrapping is configured, so toggling the
+/// wrapper never changes what forcing does.
+#[tokio::test]
+async fn test_force_only_does_not_relabel_partial_content() {
+    for config in [
+        json!({"force_sse_content_type": true}),
+        json!({"force_sse_content_type": true, "wrap_non_sse_responses": true}),
+    ] {
+        let plugin = make_plugin(config.clone());
+        for status in [206, 226] {
+            let mut ctx = make_sse_ctx();
+            let mut headers = json_response_headers();
+            headers.insert("content-range".to_string(), "bytes 0-41/100".to_string());
+
+            let result = plugin.after_proxy(&mut ctx, status, &mut headers).await;
+            assert_continue(&result);
+            assert_eq!(
+                content_type_of(&headers),
+                Some("application/json"),
+                "{config} status={status}"
+            );
+            assert_eq!(
+                headers.get("content-length").map(String::as_str),
+                Some("42"),
+                "{config} status={status}"
+            );
+            assert!(!headers.contains_key("cache-control"), "{config} {status}");
+            assert!(!ctx.metadata.contains_key("sse:relabeled_non_sse"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_force_only_does_not_relabel_content_coded_body() {
+    for config in [
+        json!({"force_sse_content_type": true}),
+        json!({"force_sse_content_type": true, "wrap_non_sse_responses": true}),
+    ] {
+        let plugin = make_plugin(config.clone());
+        for coding in ["gzip", "br"] {
+            let (mut ctx, mut headers) =
+                stamped_origin_with("application/json", "content-encoding", coding);
+
+            let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+            assert_continue(&result);
+            assert_eq!(
+                content_type_of(&headers),
+                Some("application/json"),
+                "{config} coding={coding}"
+            );
+            assert!(!ctx.metadata.contains_key("sse:relabeled_non_sse"));
+        }
+    }
+}
+
+/// Forcing a complete identity-coded 200 is unchanged by the decline above.
+#[tokio::test]
+async fn test_force_only_still_relabels_identity_coded_full_response() {
+    let plugin = make_plugin(json!({"force_sse_content_type": true}));
+    let (mut ctx, mut headers) =
+        stamped_origin_with("application/json", "content-encoding", "identity");
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_continue(&result);
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+}
+
+/// sse-claude-3: only the `Last-Event-ID` request header is honored. A cursor
+/// a polyfill sends as a query parameter stays in the query string and is not
+/// promoted to a backend header.
+#[tokio::test]
+async fn test_query_parameter_cursor_is_not_promoted_to_header() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    ctx.query_params
+        .insert("lastEventId".to_string(), "42".to_string());
+    ctx.query_params
+        .insert("last-event-id".to_string(), "42".to_string());
+
+    assert_continue(&plugin.on_request_received(&mut ctx).await);
+    assert!(!ctx.metadata.contains_key(LAST_EVENT_ID_METADATA_KEY));
+
+    let mut headers = HashMap::new();
+    assert_continue(&plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!headers.contains_key("last-event-id"));
 }
