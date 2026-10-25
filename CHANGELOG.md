@@ -8,22 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **`jwks_auth` verifies RSASSA-PSS and Ed25519 tokens, follows OIDC
-  `jwks_uri` migrations, and adds a bounded JWT clock leeway.** The shared
-  JWKS store (also used by `oidc_relying_party` ID-token verification) now
-  admits RSA keys declaring `PS256`/`PS384`/`PS512` and `OKP` Ed25519 keys
-  (`EdDSA`), still binding verification to exactly the JWK's `alg`; `OKP`
-  keys are refused while FIPS mode is enforced, and `ES512` stays
-  unsupported. DPoP proofs may now be signed with `ES384`, `RS384`/`RS512`,
-  `PS256`/`PS384`/`PS512`, or `EdDSA` as well as `ES256`/`RS256`. A
-  `discovery_url` provider re-runs discovery every
-  `jwks_refresh_interval_secs` instead of resolving once per plugin
-  generation. New plugin-level and per-provider `clock_skew_seconds`
-  (default `0`, max `300`) widens `exp`/`nbf` validation and the
-  authenticated-stream deadline equally. Each provider's validation policy is
-  compiled once at construction instead of per verification. The
-  `consumer_identity_claim` schema/rustdoc now state that the identity is
-  never resolved to a gateway Consumer.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -155,30 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **BREAKING — `jwks_auth` refuses an issuer-less `require_mtls_binding`
-  provider beside an unbound provider** (issue #6828). Such a provider has no
-  issuer realm to distinguish its tokens, so a sibling without the binding
-  could authenticate its certificate-bound token without the certificate when
-  the bound provider rejected it on an `aud`/`exp` difference. Configuration
-  load now rejects the mix; pin an exact `issuer` on the mTLS-bound provider,
-  set `require_mtls_binding` on every provider, or split the providers into
-  separate plugin instances. A rediscovered OIDC `jwks_uri` also no longer
-  leaves the superseded store active (and counted by readiness) after a
-  configuration publication captured it.
-- **`jwks_auth` no longer lets an issuer-less provider strip a realm's DPoP
-  or mTLS binding.** A provider without an `issuer` that shared key material
-  with a `require_dpop`/`require_mtls_binding` provider accepted that realm's
-  token as a plain bearer token whenever the realm's own provider rejected it
-  on an `aud`/`exp` difference. It now refuses any token whose verified `iss`
-  is a sender-constrained provider's issuer.
-- **`jwks_auth` DPoP proofs bound to percent-encoded targets are accepted.**
-  The proof `htu` path is now canonicalized like the request path, so a proof
-  for `/v1/items/a%3Ab` matches the frontend's canonical `/v1/items/a:b`
-  instead of failing with `DPoP URL mismatch`.
-- **`jwks_auth` explicit `Authorization` locations no longer hide
-  default-location providers.** A token read through
-  `from_headers: [{name: Authorization}]` on one provider is now also
-  eligible for providers using the default `Authorization: Bearer` location.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

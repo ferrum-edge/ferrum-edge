@@ -28,18 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `jwks_auth`: issuer-less `require_mtls_binding` providers need bound siblings (#6828)
+### `cors` method and header lists are bounded (#6844)
 
-A `jwks_auth` provider that sets `require_mtls_binding: true` but no `issuer`
-is now rejected at configuration load when any other provider in the same
-plugin instance does not also set `require_mtls_binding`. Without an issuer
-realm, the unbound sibling could accept the bound provider's tokens without
-the client certificate. Before upgrading, run `ferrum-edge validate` against
-your configuration; to fix a refused instance, pin the exact `issuer` on the
-mTLS-bound provider (recommended), set `require_mtls_binding` on every
-provider, or move the providers into separate plugin instances on their own
-routes. Instances whose providers all pin an issuer, or that have a single
-provider, are unaffected.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
