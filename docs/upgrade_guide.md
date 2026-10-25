@@ -28,32 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `serverless_function` Lambda errors, AWS credentials, and ceilings (PR #6843)
+### `cors` method and header lists are bounded (#6844)
 
-- **Lambda Invoke API failures follow `on_error`.** For `provider: aws_lambda`,
-  a non-2xx Invoke API status (429 throttling, 403 access denied, 404 missing
-  function, 413 oversized payload, 5xx) is now the invocation failure
-  `lambda_service_error` in every mode. Terminate mode no longer returns the
-  AWS status and error body to the client: `on_error: reject` answers the
-  configured `error_status_code` (default 502) with the fixed error body, and
-  `on_error: continue` proxies to the backend. Clients or alerts that keyed on
-  a passed-through Lambda 429/403 should key on the configured status or the
-  `serverless_function.<id>.error_class` metadata instead. Native gRPC
-  terminate now honors `on_error: continue` for these failures. Azure and GCP
-  HTTP triggers are unchanged.
-- **AWS header-bearing credentials are validated at admission.** An
-  `aws_access_key_id` or `aws_session_token` — in the config or in
-  `AWS_ACCESS_KEY_ID` / `AWS_SESSION_TOKEN` — containing NUL, CR, LF, or another
-  control byte other than horizontal tab is refused at load. Such a value
-  previously failed every invocation; strip the stray newline (a common
-  copy-paste artifact) from the secret.
-- **Bounded ceilings.** `timeout_ms` above 900000 (15 minutes) and
-  `max_response_body_bytes` above 67108864 (64 MiB) are refused at load. Lower
-  any larger value before upgrading.
-- **Optional, no action needed:** `aws_credentials: default_chain` (builds with
-  `secrets-aws` / `cloud-secrets`) lets IRSA, ECS task role, or EC2 instance
-  profile deployments drop static keys, and `payload_format:
-  aws_api_gateway_v2` fronts existing API Gateway HTTP API Lambda handlers.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
