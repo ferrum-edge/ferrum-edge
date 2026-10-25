@@ -28,6 +28,19 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `hmac_auth` `replay_max_entries` bounds (#6853)
+
+`replay_max_entries` now accepts `1`–`10000000`, and it is refused on a
+`signing_profile: ferrum-hmac-v1` policy, where it never had an effect. Before
+upgrading, remove `replay_max_entries` from every `ferrum-hmac-v1` `hmac_auth`
+config, and lower any larger value to at most `10000000` (or move the policy
+to `replay_scope: shared` with `sync_mode: redis` when one process needs more
+replay state). A config that still carries either is rejected at admission
+and at startup. No other `hmac_auth` setting changes: `signed_headers`,
+`required_components`, `max_body_bytes`, and `signing_profile: rfc9421` are
+new opt-ins, and a policy that sets none of them keeps its signing base
+byte-for-byte.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

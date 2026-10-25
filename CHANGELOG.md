@@ -7,7 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`hmac_auth` verifies RFC 9421 HTTP Message Signatures** (issue #6853).
+  `signing_profile: rfc9421` verifies exactly one `Signature-Input` /
+  `Signature` pair (strict, bounded RFC 8941 parsing) with `hmac-sha256` and
+  the Consumer's existing `hmac_auth` secret looked up by `keyid`. Signatures
+  must cover `@method`, `@authority`, `@path`, `@query`, a verified
+  `content-digest`, and any configured `signed_headers` /
+  `required_components`; `created`, `keyid`, and `nonce` are required,
+  `expires` is enforced, and the nonce is single-use through the existing
+  replay authority. Unknown algorithms, components, component parameters, and
+  signature parameters are refused. RFC 9421 Appendix B.2.5 is a pinned test
+  vector. The gateway only verifies; it never signs.
+- **`hmac_auth` `signed_headers` and `max_body_bytes`** (issue #6853).
+  `signed_headers` lists request headers (tenant ids, idempotency keys,
+  `Content-Type`, …) every signature must cover; under the Ferrum profiles
+  each is appended to the signing base as a `\n{name}:{value}` line, and an
+  unset list leaves the base unchanged. `max_body_bytes` (default 10 MiB, at
+  most 256 MiB) replaces the fixed pre-authentication body ceiling.
+- **Replayed signed requests name their Consumer** (issue #6853). A verified
+  `hmac_auth` request rejected as a replay carries the log-visible
+  `replay_rejected_consumer` transaction metadata and a rate-limited warning,
+  without publishing an identity.
+
 ### Changed
+- **BREAKING — `hmac_auth` `replay_max_entries` is bounded and refused under
+  `ferrum-hmac-v1`** (issue #6853). Values above 10,000,000 and any
+  `replay_max_entries` on a `ferrum-hmac-v1` policy (which has no replay
+  state) now fail admission instead of being accepted. Process replay-lane
+  reclamation (shared with `jwks_auth` DPoP) now visits only markers whose
+  expiry bucket is due rather than scanning the whole lane, and HMAC body
+  hashing computes only the digest algorithms the client presented.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
