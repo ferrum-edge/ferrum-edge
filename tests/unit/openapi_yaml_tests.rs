@@ -4631,10 +4631,32 @@ fn ldap_auth_value_constraints_match_runtime_admission() {
         .build(&schema)
         .expect("LdapAuthConfig schema compiles");
 
-    // Value-level admission probed in issue #5038. RFC 4515 filter syntax is
-    // deliberately absent from this table: the grammar is not expressible as a
-    // `pattern`, so filter syntax stays an admission-only rule.
+    // Value-level admission probed in issue #5038. RFC 4515 filter syntax and
+    // RFC 4514 DN syntax are deliberately absent from this table: neither
+    // grammar is expressible as a `pattern`, so both stay admission-only rules.
     let admitted = vec![
+        // Attribute descriptions: names, numeric OIDs, options, padding.
+        direct_bind(json!({"canonical_identity_attribute": "2.5.4.3"})),
+        direct_bind(json!({"canonical_identity_attribute": "  sAMAccountName  "})),
+        direct_bind(json!({"group_attribute": "cn;lang-en"})),
+        direct_bind(json!({"group_member_attribute": "appMember"})),
+        direct_bind(json!({"group_membership_mode": "ad_in_chain"})),
+        direct_bind(json!({"failover_ldap_urls": ["ldaps://ldap2.example.com:636"]})),
+        direct_bind(json!({
+            "ldap_url": "ldap://127.0.0.1:389",
+            "failover_ldap_urls": ["ldap://[::1]:389"]
+        })),
+        direct_bind(json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "starttls": true,
+            "failover_ldap_urls": ["ldap://ldap2.example.com:389"]
+        })),
+        direct_bind(json!({"ldap_url": "ldaps://ldap.example.com:0636"})),
+        direct_bind(json!({"negative_cache_ttl_seconds": 300})),
+        direct_bind(json!({"max_failed_attempts_per_user": 1000})),
+        direct_bind(json!({"failed_attempt_backoff_seconds": 3600})),
+        search_bind(json!({"service_connection_max_age_seconds": 300})),
+        direct_bind(json!({"service_connection_max_age_seconds": 0})),
         // A password is opaque: it is taken verbatim, never trimmed.
         search_bind(json!({"service_account_password": "  padded  "})),
         direct_bind(json!({"max_cache_entries": 1_000_000})),
@@ -4666,6 +4688,33 @@ fn ldap_auth_value_constraints_match_runtime_admission() {
         direct_bind(json!({"ldap_url": "LDAP://127.0.0.1:389"})),
         direct_bind(json!({"ldap_url": "ldaps://admin:secret@localhost"})),
         direct_bind(json!({"hide_credentials": "yes"})),
+        // Port 0 can never be dialed.
+        direct_bind(json!({"ldap_url": "ldaps://localhost:0"})),
+        direct_bind(json!({"ldap_url": "ldaps://localhost:00"})),
+        // Attribute descriptions.
+        direct_bind(json!({"canonical_identity_attribute": "sAM Account Name"})),
+        direct_bind(json!({"canonical_identity_attribute": "1.1"})),
+        direct_bind(json!({"group_attribute": "01.2"})),
+        direct_bind(json!({"group_member_attribute": "member)(uid=*"})),
+        direct_bind(json!({"group_membership_mode": "nested"})),
+        // Failover endpoints share the scheme and the plaintext rules.
+        direct_bind(json!({"failover_ldap_urls": []})),
+        direct_bind(json!({"failover_ldap_urls": ["ldap://127.0.0.1:389"]})),
+        direct_bind(json!({
+            "ldap_url": "ldap://127.0.0.1:389",
+            "failover_ldap_urls": ["ldap://directory.example.test:389"]
+        })),
+        direct_bind(json!({
+            "failover_ldap_urls": ["ldaps://a.example.com", "ldaps://a.example.com"]
+        })),
+        direct_bind(json!({"failover_ldap_urls": ["ldaps://ldap2.example.com:0"]})),
+        direct_bind(json!({"failover_ldap_urls": ["ldaps://admin:secret@ldap2.example.com"]})),
+        // Rejected-credential and reuse bounds.
+        direct_bind(json!({"negative_cache_ttl_seconds": 301})),
+        direct_bind(json!({"max_failed_attempts_per_user": 1001})),
+        direct_bind(json!({"failed_attempt_backoff_seconds": 0})),
+        search_bind(json!({"service_connection_max_age_seconds": 301})),
+        direct_bind(json!({"service_connection_max_age_seconds": 30})),
     ];
 
     for config in admitted {

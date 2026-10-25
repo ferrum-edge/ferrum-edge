@@ -234,7 +234,7 @@ at construction without disclosing credentials.
 
 ### LDAP Auth Cache
 
-**What it stores:** Successful LDAP bind results (a process-random HMAC over the presented username/password -> canonical identity, entry DN, expiry timestamp and last group-check time) to avoid repeated LDAP round-trips. The HMAC prevents a cache-only disclosure from exposing a reusable fast password verifier; a full process-memory compromise can still recover the in-process HMAC key.
+**What it stores:** Successful LDAP bind results (a process-random HMAC over the presented username — folded like a directory login match: trimmed, interior whitespace collapsed, lowercased — and the exact password -> canonical identity, entry DN, expiry timestamp and last group-check time) to avoid repeated LDAP round-trips. When enabled, two further maps share `max_cache_entries` as their cap: rejected credentials (`negative_cache_ttl_seconds`, an HMAC digest -> expiry) and per-username failure runs (`max_failed_attempts_per_user`, an HMAC digest -> consecutive-failure count and backoff deadline). The HMAC prevents a cache-only disclosure from exposing a reusable fast password verifier; a full process-memory compromise can still recover the in-process HMAC key.
 
 **Default limit:** 10,000 entries. Caching is disabled by default.
 
@@ -330,6 +330,8 @@ at construction without disclosing credentials.
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results (1–1,000,000) |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
 | `ldap_auth` | `group_cache_ttl_seconds` | `60` | Longest a cached entry is admitted without re-checking `required_groups` (`0` = every hit; maximum `86400`) |
+| `ldap_auth` | `negative_cache_ttl_seconds` | `0` | How long an exact rejected username/password pair is refused without a directory round trip (`0` = disabled; maximum `300`) |
+| `ldap_auth` | `max_failed_attempts_per_user` | `0` | Consecutive directory rejections after which a username is refused for `failed_attempt_backoff_seconds` (default `60`, 1–3,600) without a directory round trip (`0` = disabled; maximum `1000`) |
 | `oauth2_introspection` | `providers[].max_cache_entries` | `10000` | Per-provider hard entry ceiling, split 75/25 between active and negative results |
 | `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` | Maximum normalized active authorization-result bytes retained per token |
 | `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` | Per-provider total retained bytes, including fixed eviction indexes and entry/key state |
