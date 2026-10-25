@@ -8,32 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `response_caching` refuses `401` and `407` in
-  `cacheable_status_codes`** (issue #6830). Both are only valid with their
-  authentication challenge, which the cache cannot retain (`WWW-Authenticate`
-  is stripped from retained entries by the shared replay-sanitation policy and
-  `Proxy-Authenticate` is hop-scoped), so a stored copy would replay a
-  challenge-less `401` / `407`. A config listing either status now fails
-  admission; remove it from the list. Such responses are also refused at store
-  time.
-- **`response_caching` gains `ignore_request_headers` and a lookup counter.**
-  `ignore_request_headers` is an operator attestation that named request
-  headers (for example a per-request `X-Request-Id` stamped by a CDN) never
-  select the response: each is removed from the request before the key is
-  derived, so the origin never receives it and the key still binds every
-  header the origin sees. Credential/session, gateway-owned re-asserted
-  (`X-Ferrum-*`, `X-Consumer-*`, `X-Authenticated-Identity`, `X-Geo-Country`,
-  `X-Path-Param-*`), `Host`, hop-by-hop, `Cache-Control`/`Pragma`, `If-*`,
-  `Range`, `Max-Forwards`, `Content-*`, `Expect`, `Accept`/`Accept-Encoding`,
-  and `X-Forwarded-*`/forwarding headers are refused (families by prefix), as
-  is a name also in `vary_by_headers`; a non-empty list makes the instance a request
-  header mutator, so it cannot share a proxy with `request_deduplication`.
-  Lookup outcomes are exported as the bounded
-  `ferrum_response_cache_lookups_total{status}` counter (`hit`, `miss`,
-  `bypass`, `revalidated`, `predicted_bypass`). The `respect_cache_control:
-  false` docs now state that it also ignores the origin's `no-store` /
-  `private` / `no-cache` storage prohibitions and qualified field protections,
-  and that authorized responses then can never be stored.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -165,18 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`response_caching` enforces client `max-age` / `min-fresh` and hardens
-  replay sanitation.** A request `Cache-Control: max-age` is compared with the
-  entry's current age and `min-fresh` with its remaining freshness, so an entry
-  the client would not accept is refetched instead of served (`max-age=0`
-  always refetches). `Set-Cookie` and `Content-Range` store refusals match
-  case-insensitively. Retained entries now go through the shared
-  `cache_headers` replay sanitizer used by `ai_semantic_cache` and
-  `request_deduplication`, so per-request trace/correlation IDs,
-  `Retry-After`, `Set-Cookie2`, and `WWW-Authenticate` are no longer replayed
-  from the cache. HIT / REVALIDATED / PREDICTED-BYPASS / request `no-store`
-  lookups no longer stage the storage-side header delta and JSON snapshot only
-  to discard them.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -429,18 +427,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`response_caching` binds the frontend scheme and route construction, and
-  publishes `Vary` on no-cache refreshes.** The key now binds the effective
-  frontend scheme from private connection provenance (the proxy regenerates
-  `X-Forwarded-Proto` from it), so an HTTPS representation is not replayed to
-  a plaintext request for the same authority or vice versa. It also binds the
-  matched proxy's `backend_path`, `strip_listen_path`, and
-  `preserve_host_header`, so a proxy-only reload that changes the assembled
-  origin path or outbound `Host` cannot keep replaying the old route through a
-  retained global cache instance. An honored request `Cache-Control: no-cache`
-  refresh (`BYPASS`) now carries the same downstream `Vary` contract as a
-  `MISS`, so a downstream shared cache cannot store it without the configured
-  and mandatory credential dimensions.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with

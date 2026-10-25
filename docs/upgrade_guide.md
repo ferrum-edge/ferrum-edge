@@ -28,17 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `response_caching` no longer admits `401` / `407` as cacheable statuses (#6830)
+### `cors` method and header lists are bounded (#6844)
 
-`cacheable_status_codes` now refuses `401` and `407` at admission, alongside
-`1xx`, `206`, and `304`. A cached `401` / `407` could only be replayed without
-its authentication challenge (`WWW-Authenticate` is stripped from retained
-entries as per-response state, and `Proxy-Authenticate` is hop-scoped), which
-clients cannot act on. Remove `401` and `407` from every `response_caching`
-`cacheable_status_codes` list before upgrading; a config that still lists
-either fails validation and, under `KeepLastKnownGood`, is not applied on
-reload. No other migration is needed — these responses are simply forwarded
-uncached.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
