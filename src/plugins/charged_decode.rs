@@ -461,8 +461,27 @@ pub(crate) fn decode_one_coding(
     decode_supported_coding(coding, data, limit, concurrent_bytes, reservation, budget)
 }
 
-/// Decode one already-resolved coding; the shared body of [`decode_one_coding`]
-/// and [`decode_charged_content_coding_chain`].
+/// [`decode_one_coding`] that also admits `zstd` (RFC 9659), for inspectors
+/// that walk a coding chain themselves and must decode the `zstd` output the
+/// `compression` plugin can produce (`openapi_validator`). Same strictness,
+/// scratch charge, and output accounting; never used by the representation
+/// gates, which keep reporting `zstd` as unsupported.
+pub(crate) fn decode_one_chain_coding(
+    coding: &str,
+    data: &[u8],
+    limit: usize,
+    concurrent_bytes: usize,
+    reservation: &mut ResponseBufferReservation,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, ChargedDecodeError> {
+    let Some(coding) = SupportedCoding::from_chain_token(coding) else {
+        return Err(ChargedDecodeError::Unsupported);
+    };
+    decode_supported_coding(coding, data, limit, concurrent_bytes, reservation, budget)
+}
+
+/// Decode one already-resolved coding; the shared body of [`decode_one_coding`],
+/// [`decode_one_chain_coding`], and [`decode_charged_content_coding_chain`].
 fn decode_supported_coding(
     coding: SupportedCoding,
     data: &[u8],

@@ -30,7 +30,7 @@ use ferrum_edge::overload::OverloadState;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, UDP_ONLY_PROTOCOLS,
-    UdpDatagramContext, UdpDatagramVerdict,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
 };
 use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_udp_listener};
 use ferrum_edge::request_epoch::RequestEpochStore;
@@ -97,6 +97,42 @@ impl Plugin for RejectingStreamOrderingProbe {
             let _ = tx.send(());
         }
         UdpDatagramVerdict::Drop
+    }
+}
+
+/// Records `UdpDatagramContext::admission_datagram` for every client→backend
+/// datagram the proxy hands to the datagram hook chain.
+#[derive(Default)]
+struct AdmissionFlagProbe {
+    flags: std::sync::Mutex<Vec<bool>>,
+}
+
+#[async_trait]
+impl Plugin for AdmissionFlagProbe {
+    fn name(&self) -> &str {
+        "test_udp_admission_flag_probe"
+    }
+
+    fn priority(&self) -> u16 {
+        0
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        UDP_ONLY_PROTOCOLS
+    }
+
+    fn requires_udp_datagram_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
+        if ctx.direction == UdpDatagramDirection::ClientToBackend {
+            self.flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(ctx.admission_datagram);
+        }
+        UdpDatagramVerdict::Forward
     }
 }
 
@@ -217,6 +253,7 @@ async fn try_spawn_udp_gateway(
     listen_port: u16,
     fault_config: serde_json::Value,
     reject_unauthenticated: bool,
+    extra_probe: Option<Arc<dyn Plugin>>,
 ) -> Option<SpawnedUdpGateway> {
     let proxy = udp_proxy(listen_port, backend_port);
     let proxy_namespace = proxy.namespace.clone();
@@ -250,6 +287,10 @@ async fn try_spawn_udp_gateway(
     } else {
         None
     };
+    if let Some(probe) = extra_probe {
+        prepend_proxy_plugin_for_test(&plugin_cache, &proxy_namespace, PROXY_ID, probe)
+            .expect("inject UDP datagram probe");
+    }
     let attached =
         plugin_cache.get_plugins_for_protocol(&proxy_namespace, PROXY_ID, ProxyProtocol::Udp);
     assert!(
@@ -363,13 +404,14 @@ async fn spawn_udp_gateway_with_retry(
     backend_port: u16,
     fault_config: serde_json::Value,
 ) -> SpawnedUdpGateway {
-    spawn_udp_gateway_with_policy(backend_port, fault_config, false).await
+    spawn_udp_gateway_with_policy(backend_port, fault_config, false, None).await
 }
 
 async fn spawn_udp_gateway_with_policy(
     backend_port: u16,
     fault_config: serde_json::Value,
     reject_unauthenticated: bool,
+    extra_probe: Option<Arc<dyn Plugin>>,
 ) -> SpawnedUdpGateway {
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_udp_port().await.expect("reserve frontend UDP port");
@@ -379,6 +421,7 @@ async fn spawn_udp_gateway_with_policy(
             listen_port,
             fault_config.clone(),
             reject_unauthenticated,
+            extra_probe.clone(),
         )
         .await
         {
@@ -409,6 +452,7 @@ async fn udp_stream_rejection_precedes_first_datagram_fault_delay() {
         backend_port,
         json!({ "delay": { "duration_ms": 2_000, "percentage": 100.0 } }),
         true,
+        None,
     )
     .await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
@@ -582,8 +626,9 @@ async fn udp_session_connect_abort_refuses_new_session() {
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
-    // 100% abort on stream connect and datagram: first datagram is dropped by
-    // on_udp_datagram before session setup can complete an echo.
+    // 100% abort: stream connect refuses admission for the opening datagram
+    // (the first-datagram hook does not re-roll abort for it), and every later
+    // datagram from the same source opens a fresh refused admission attempt.
     let gateway = spawn_udp_gateway_with_retry(
         backend_port,
         json!({ "abort": { "status_code": 503, "percentage": 100.0 } }),
@@ -648,4 +693,50 @@ async fn plugin_cache_reload_removes_udp_fault_injection() {
             .all(|p| p.name() != "fault_injection"),
         "delete/reload must detach fault_injection from UDP"
     );
+}
+
+/// Only the datagram whose arrival opened the plain-UDP session reaches the
+/// datagram hooks flagged as the admission datagram; every later datagram on
+/// the established session is not, so `fault_injection` rolls abort exactly
+/// once for the opening packet and once per later datagram.
+#[tokio::test]
+async fn udp_only_the_session_opening_datagram_is_flagged_as_admission() {
+    let backend = Arc::new(
+        UdpSocket::bind_test("127.0.0.1:0")
+            .await
+            .expect("backend bind"),
+    );
+    let backend_port = backend.local_addr().expect("backend addr").port();
+    let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
+
+    let probe = Arc::new(AdmissionFlagProbe::default());
+    let probe_plugin: Arc<dyn Plugin> = probe.clone();
+    let gateway = spawn_udp_gateway_with_policy(
+        backend_port,
+        json!({ "delay": { "duration_ms": 1, "percentage": 0.000_001 } }),
+        false,
+        Some(probe_plugin),
+    )
+    .await;
+    let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
+    let client = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("client bind");
+
+    for payload in [&b"open"[..], &b"second"[..], &b"third"[..]] {
+        let echoed = echo_round_trip(&client, gateway_addr, payload)
+            .await
+            .expect("datagram must round-trip");
+        assert_eq!(echoed, payload);
+    }
+
+    let flags = probe
+        .flags
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(flags, vec![true, false, false]);
+
+    let _ = gateway.shutdown_tx.send(true);
+    let _ = gateway.join.await;
 }

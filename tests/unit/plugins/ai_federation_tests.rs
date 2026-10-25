@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
+use ferrum_edge::_test_support::{
+    mark_route_request_timeout_in_dispatch_for_test, record_backend_dispatch_outcome_for_test,
+    set_response_presentation_policy_digest_for_test,
+};
 use ferrum_edge::PluginCache;
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
@@ -10,6 +13,7 @@ use ferrum_edge::plugins::{
     ResponseStreamInspector, priority,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
+use ferrum_edge::retry::ErrorClass;
 use ferrum_edge::{
     config::{BackendAllowIps, PoolConfig},
     dns::{DnsCache, DnsConfig},
@@ -9924,5 +9928,1820 @@ fn test_normalized_anthropic_rejects_overflow_without_an_input_base() {
             "claude-sonnet-4-20250514",
         )
         .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes
+// ---------------------------------------------------------------------------
+
+fn gemini_provider_config(provider: &str) -> Value {
+    if provider == "google_vertex" {
+        json!({"google_project_id": "my-project", "google_region": "us-central1"})
+    } else {
+        json!({})
+    }
+}
+
+/// ai_federation-SOL-1: a Gemini 3 `thoughtSignature` on a `functionCall` part
+/// is exported on the OpenAI tool call and restored, byte for byte, on the same
+/// native part when the client sends the assistant message back. Only the
+/// signed part carries it (Gemini signs the first of parallel calls).
+#[test]
+fn gemini_thought_signatures_round_trip_through_openai_tool_calls() {
+    for provider in ["google_gemini", "google_vertex"] {
+        let native = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {"name": "lookup", "args": {"q": "x"}},
+                            "thoughtSignature": "c2lnLUE+/w=="
+                        },
+                        {"functionCall": {"name": "lookup", "args": {"q": "y"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 5
+            }
+        });
+        let (normalized, _, _, _) = test_helpers::normalize_response_test(
+            provider,
+            200,
+            &serde_json::to_vec(&native).unwrap(),
+            "gemini-3-pro-preview",
+        )
+        .unwrap();
+        let message = normalized["choices"][0]["message"].clone();
+        let calls = message["tool_calls"].as_array().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"], "c2lnLUE+/w==",
+            "{provider}: the signature must be exported on the signed call"
+        );
+        assert!(
+            calls[1].get("extra_content").is_none(),
+            "{provider}: an unsigned call must not gain a signature"
+        );
+
+        let request = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [
+                {"role": "user", "content": "Look both up"},
+                message,
+                {"role": "tool", "tool_call_id": calls[0]["id"], "content": "{\"r\":1}"},
+                {"role": "tool", "tool_call_id": calls[1]["id"], "content": "{\"r\":2}"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+                }
+            }]
+        });
+        let (_, _, bytes) = test_helpers::translate_request_test(
+            provider,
+            &request,
+            "gemini-3-pro-preview",
+            &gemini_provider_config(provider),
+        )
+        .unwrap();
+        let outbound: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(outbound["contents"][1]["role"], "model");
+        let parts = outbound["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["functionCall"]["args"], json!({"q": "x"}));
+        assert_eq!(
+            parts[0]["thoughtSignature"], "c2lnLUE+/w==",
+            "{provider}: the exact signature must be restored on the same part"
+        );
+        assert!(parts[1].get("thoughtSignature").is_none());
+        // The function responses still follow as one user turn.
+        assert_eq!(outbound["contents"][2]["role"], "user");
+    }
+}
+
+/// A malformed or oversized signature is refused, never silently sent
+/// unsigned; other adapters ignore the Google-specific extension.
+#[test]
+fn thought_signature_extension_is_bounded_and_validated() {
+    fn request_with_signature(signature: Value) -> Value {
+        json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                        "extra_content": {"google": {"thought_signature": signature}}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+            ]
+        })
+    }
+
+    for bad in [json!(5), json!(""), json!("a".repeat(64 * 1024 + 1))] {
+        let error = test_helpers::translate_request_test(
+            "google_gemini",
+            &request_with_signature(bad),
+            "gemini-3-pro-preview",
+            &json!({}),
+        )
+        .expect_err("malformed signature must fail translation");
+        assert!(error.contains("thought_signature"), "{error}");
+    }
+    assert!(
+        test_helpers::translate_request_test(
+            "google_gemini",
+            &request_with_signature(json!("a".repeat(64 * 1024))),
+            "gemini-3-pro-preview",
+            &json!({}),
+        )
+        .is_ok(),
+        "a signature at the bound is accepted"
+    );
+
+    // Anthropic and Bedrock accept the transcript and drop the extension.
+    for provider in ["anthropic", "aws_bedrock"] {
+        let config = if provider == "aws_bedrock" {
+            json!({"aws_region": "us-east-1"})
+        } else {
+            json!({})
+        };
+        let (_, _, bytes) = test_helpers::translate_request_test(
+            provider,
+            &request_with_signature(json!("sig")),
+            "model-1",
+            &config,
+        )
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("thought"), "{provider}: {text}");
+    }
+
+    // A malformed provider signature fails normalization instead of being
+    // dropped (which would only surface as a provider 400 next turn).
+    let native = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "lookup", "args": {}},
+                    "thoughtSignature": 7
+                }]
+            },
+            "finishReason": "STOP"
+        }]
+    });
+    let error = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&native).unwrap(),
+        "gemini-3-pro-preview",
+    )
+    .expect_err("malformed provider signature must fail normalization");
+    assert!(error.contains("thoughtSignature"), "{error}");
+}
+
+fn streaming_circuit_plugin(extra_root: Value) -> ai_federation::AiFederation {
+    let mut config = json!({
+        "streaming": {"enabled": true},
+        "max_concurrent_requests": 4,
+        "providers": [openai_provider(json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 30}
+        }))]
+    });
+    if let (Some(base), Some(extra)) = (config.as_object_mut(), extra_root.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    streaming_plugin_with(config)
+}
+
+/// ai_federation-SOL-2: a provider dispatch that timed out before any header is
+/// answered by proxy core with a gateway-authored 504, which is NOT in the
+/// default fallback status set. It must still score a circuit failure.
+#[tokio::test]
+async fn streaming_pre_header_transport_timeout_scores_a_circuit_failure() {
+    for (class, on_wire, status) in [
+        (ErrorClass::ReadWriteTimeout, true, 504),
+        (ErrorClass::ConnectionTimeout, false, 504),
+        (ErrorClass::ConnectionRefused, false, 502),
+    ] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        record_backend_dispatch_outcome_for_test(&mut ctx, Some(class), on_wire);
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        let after = plugin
+            .after_proxy(&mut ctx, status, &mut response_headers)
+            .await;
+        assert!(matches!(after, PluginResult::Continue), "{after:?}");
+        assert_eq!(
+            test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+            Some("failed"),
+            "{class:?}: a transport fault is a provider failure whatever its status"
+        );
+        plugin
+            .on_response_stream_terminated(&mut ctx, status, &BodyOutcome::success(32))
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("failed")
+        );
+        assert_eq!(
+            test_helpers::circuit_is_closed_for_test(&plugin, 0),
+            Some(false),
+            "{class:?}: the circuit must open after the threshold"
+        );
+        assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 4);
+    }
+}
+
+/// A half-open probe that times out before headers must REOPEN the circuit; it
+/// used to close it, because the 504 scored as a provider success.
+#[tokio::test]
+async fn streaming_half_open_probe_timeout_reopens_the_circuit() {
+    let plugin = streaming_circuit_plugin(json!({"fallback_enabled": false}));
+    assert!(test_helpers::open_and_cool_down_circuit_for_test(
+        &plugin, 0
+    ));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(true)
+    );
+    record_backend_dispatch_outcome_for_test(&mut ctx, Some(ErrorClass::ReadWriteTimeout), true);
+    let mut response_headers = HashMap::new();
+    let after = plugin
+        .after_proxy(&mut ctx, 504, &mut response_headers)
+        .await;
+    assert!(matches!(after, PluginResult::Continue), "{after:?}");
+
+    // Client gone after the gateway 504: Drop applies the staged failure.
+    drop(ctx);
+    assert_eq!(
+        test_helpers::half_open_probe_in_flight_for_test(&plugin, 0),
+        Some(false)
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(false),
+        "a timed-out probe must reopen the circuit, never close it"
+    );
+}
+
+/// Gateway-local refusals and client disconnects before headers carry no
+/// provider verdict: the claim resolves neutrally, whatever synthetic status
+/// proxy core chose.
+#[tokio::test]
+async fn streaming_gateway_local_pre_header_refusals_are_circuit_neutral() {
+    for (class, status) in [
+        (ErrorClass::DispatchPolicyRejected, 502),
+        (ErrorClass::BackendConnectionLimit, 503),
+        (ErrorClass::ClientDisconnect, 499),
+    ] {
+        let plugin = streaming_circuit_plugin(json!({"fallback_on_status_codes": [502, 503]}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        record_backend_dispatch_outcome_for_test(&mut ctx, Some(class), false);
+        let mut response_headers = HashMap::new();
+        let after = plugin
+            .after_proxy(&mut ctx, status, &mut response_headers)
+            .await;
+        assert!(matches!(after, PluginResult::Continue), "{after:?}");
+        assert_eq!(
+            test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+            None,
+            "{class:?}: no provider verdict may be staged"
+        );
+        plugin
+            .on_response_stream_terminated(&mut ctx, status, &BodyOutcome::success(16))
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("released"),
+            "{class:?}"
+        );
+        assert_eq!(
+            test_helpers::circuit_is_closed_for_test(&plugin, 0),
+            Some(true),
+            "{class:?}: a gateway-local refusal must not open the circuit"
+        );
+    }
+}
+
+/// A 2xx stream whose body dies on a provider read timeout or reset after
+/// headers never reaches the guard's `on_end`, so only the termination hook can
+/// score it. It must be a circuit failure, not a neutral release.
+#[tokio::test]
+async fn streaming_mid_body_provider_fault_scores_a_circuit_failure() {
+    for class in [
+        ErrorClass::ReadWriteTimeout,
+        ErrorClass::ConnectionReset,
+        ErrorClass::ProtocolError,
+    ] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let after = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        assert!(matches!(after, PluginResult::Continue), "{after:?}");
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("guard");
+        match inspector.on_chunk(b"data: {\"a\":1}\n\n").await {
+            ResponseStreamAction::Forward(_) => {}
+            ResponseStreamAction::Terminate(_) => panic!("a valid event must be forwarded"),
+        }
+        // The driver exits on the body error without `on_end`.
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::error(class, 14, false))
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("failed"),
+            "{class:?}"
+        );
+        assert_eq!(
+            test_helpers::circuit_is_closed_for_test(&plugin, 0),
+            Some(false),
+            "{class:?}: a dead provider stream must trip the circuit"
+        );
+        drop(inspector);
+        drop(ctx);
+        assert_eq!(test_helpers::available_request_slots_for_test(&plugin), 4);
+    }
+}
+
+/// A mid-body client disconnect or a gateway-local body cut stays neutral, and
+/// a provider body fault overrides a verdict staged at non-2xx headers.
+#[tokio::test]
+async fn streaming_body_outcome_scoring_distinguishes_provider_and_client_faults() {
+    for outcome in [
+        BodyOutcome::client_disconnect(14),
+        BodyOutcome::error(ErrorClass::ReadWriteTimeout, 14, true),
+        BodyOutcome::error(ErrorClass::DispatchPolicyRejected, 14, false),
+    ] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &outcome)
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("released"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            test_helpers::circuit_is_closed_for_test(&plugin, 0),
+            Some(true)
+        );
+    }
+
+    // An ordinary 404 is staged as a provider answer, but a reset while its
+    // error body streams means the provider never delivered it.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .after_proxy(&mut ctx, 404, &mut response_headers)
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("succeeded")
+    );
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            404,
+            &BodyOutcome::error(ErrorClass::ConnectionReset, 4, false),
+        )
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+    // Exactly once: a second termination cannot re-score.
+    plugin
+        .on_response_stream_terminated(&mut ctx, 404, &BodyOutcome::success(4))
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+}
+
+fn json_schema_response_format() -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "decision",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {"approved": {"type": "boolean"}},
+                "required": ["approved"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+fn with_fields(mut body: Value, fields: Value) -> Value {
+    if let (Some(base), Some(extra)) = (body.as_object_mut(), fields.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    body
+}
+
+fn translated_body(provider: &str, body: &Value) -> Result<Value, String> {
+    let config = match provider {
+        "aws_bedrock" => json!({"aws_region": "us-east-1"}),
+        "google_vertex" => gemini_provider_config(provider),
+        _ => json!({}),
+    };
+    let model = match provider {
+        "google_gemini" | "google_vertex" => "gemini-2.0-flash",
+        "aws_bedrock" => "anthropic.claude-3-sonnet-20240229-v1:0",
+        _ => "claude-sonnet-4-20250514",
+    };
+    test_helpers::translate_request_test(provider, body, model, &config)
+        .map(|(_, _, bytes)| serde_json::from_slice(&bytes).unwrap())
+}
+
+/// ai_federation-SOL-3 / MUSE-1: Gemini and Vertex carry structured-output and
+/// the extended generation controls into `generationConfig`.
+#[test]
+fn gemini_maps_structured_output_and_extended_generation_controls() {
+    for provider in ["google_gemini", "google_vertex"] {
+        let body = with_fields(
+            sample_openai_request(),
+            json!({
+                "response_format": json_schema_response_format(),
+                "n": 2,
+                "seed": 7,
+                "presence_penalty": 0.5,
+                "frequency_penalty": 0.0
+            }),
+        );
+        let parsed = translated_body(provider, &body).unwrap();
+        let config = &parsed["generationConfig"];
+        assert_eq!(config["responseMimeType"], "application/json", "{provider}");
+        assert_eq!(
+            config["responseJsonSchema"],
+            json_schema_response_format()["json_schema"]["schema"],
+            "{provider}: the client schema must reach the provider unchanged"
+        );
+        assert_eq!(config["candidateCount"], 2);
+        assert_eq!(config["seed"], 7);
+        assert_eq!(config["presencePenalty"], 0.5);
+        assert!(
+            config.get("frequencyPenalty").is_none(),
+            "a zero penalty is the provider default and is not sent"
+        );
+
+        let json_mode = translated_body(
+            provider,
+            &with_fields(
+                sample_openai_request(),
+                json!({"response_format": {"type": "json_object"}}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            json_mode["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(
+            json_mode["generationConfig"]
+                .get("responseJsonSchema")
+                .is_none()
+        );
+    }
+}
+
+/// Anything a translating adapter cannot represent is refused during
+/// translation instead of silently dropped.
+#[test]
+fn translating_adapters_refuse_unrepresentable_generation_controls() {
+    let tools = json!([{
+        "type": "function",
+        "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}
+    }]);
+    let gemini_only = [
+        (
+            "response_format",
+            json!({"response_format": {"type": "json_object"}}),
+        ),
+        (
+            "response_format",
+            json!({"response_format": json_schema_response_format()}),
+        ),
+        ("n", json!({"n": 3})),
+        ("seed", json!({"seed": 1})),
+        ("presence_penalty", json!({"presence_penalty": 0.3})),
+        ("frequency_penalty", json!({"frequency_penalty": -0.2})),
+    ];
+    for provider in ["anthropic", "aws_bedrock"] {
+        for (field, fields) in &gemini_only {
+            let error = translated_body(
+                provider,
+                &with_fields(sample_openai_request(), fields.clone()),
+            )
+            .expect_err("unrepresentable control must be refused");
+            assert!(error.contains(field), "{provider}/{field}: {error}");
+        }
+    }
+    let nowhere = [
+        ("logprobs", json!({"logprobs": true})),
+        ("top_logprobs", json!({"top_logprobs": 2})),
+        ("logit_bias", json!({"logit_bias": {"50256": -100}})),
+        ("reasoning_effort", json!({"reasoning_effort": "high"})),
+        (
+            "audio",
+            json!({"audio": {"voice": "alloy", "format": "wav"}}),
+        ),
+        ("modalities", json!({"modalities": ["text", "audio"]})),
+        (
+            "strict",
+            json!({"tools": [{
+                "type": "function",
+                "function": {"name": "lookup", "strict": true, "parameters": {"type": "object"}}
+            }]}),
+        ),
+    ];
+    for provider in ["anthropic", "google_gemini", "google_vertex", "aws_bedrock"] {
+        for (field, fields) in &nowhere {
+            let error = translated_body(
+                provider,
+                &with_fields(sample_openai_request(), fields.clone()),
+            )
+            .expect_err("unrepresentable control must be refused");
+            assert!(error.contains(field), "{provider}/{field}: {error}");
+        }
+    }
+    for provider in ["google_gemini", "google_vertex", "aws_bedrock"] {
+        let error = translated_body(
+            provider,
+            &with_fields(
+                sample_openai_request(),
+                json!({"tools": tools.clone(), "parallel_tool_calls": false}),
+            ),
+        )
+        .expect_err("parallel tool use cannot be disabled here");
+        assert!(error.contains("parallel_tool_calls"), "{provider}: {error}");
+    }
+}
+
+/// Neutral values are the provider defaults and are accepted everywhere.
+#[test]
+fn neutral_generation_controls_are_accepted_by_every_translating_adapter() {
+    let body = with_fields(
+        sample_openai_request(),
+        json!({
+            "response_format": {"type": "text"},
+            "n": 1,
+            "presence_penalty": 0,
+            "frequency_penalty": 0.0,
+            "logprobs": false,
+            "logit_bias": {},
+            "parallel_tool_calls": true,
+            "modalities": ["text"],
+            "seed": null,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "lookup", "strict": false, "parameters": {"type": "object"}}
+            }]
+        }),
+    );
+    for provider in ["anthropic", "google_gemini", "google_vertex", "aws_bedrock"] {
+        let parsed = translated_body(provider, &body)
+            .unwrap_or_else(|error| panic!("{provider} refused neutral controls: {error}"));
+        if provider.starts_with("google") {
+            let config = &parsed["generationConfig"];
+            for key in [
+                "responseMimeType",
+                "candidateCount",
+                "seed",
+                "presencePenalty",
+                "frequencyPenalty",
+            ] {
+                assert!(config.get(key).is_none(), "{provider}: unexpected {key}");
+            }
+        }
+    }
+    // `parallel_tool_calls: false` with no tools has nothing to disable.
+    for provider in ["google_gemini", "aws_bedrock"] {
+        assert!(
+            translated_body(
+                provider,
+                &with_fields(
+                    sample_openai_request(),
+                    json!({"parallel_tool_calls": false})
+                ),
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn anthropic_maps_parallel_tool_calls_false_onto_tool_choice() {
+    let tools = json!([{
+        "type": "function",
+        "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}
+    }]);
+    for (choice, expected) in [
+        (
+            None,
+            json!({"type": "auto", "disable_parallel_tool_use": true}),
+        ),
+        (
+            Some(json!("required")),
+            json!({"type": "any", "disable_parallel_tool_use": true}),
+        ),
+        (
+            Some(json!({"type": "function", "function": {"name": "lookup"}})),
+            json!({"type": "tool", "name": "lookup", "disable_parallel_tool_use": true}),
+        ),
+        (Some(json!("none")), json!({"type": "none"})),
+    ] {
+        let mut body = with_fields(
+            sample_openai_request(),
+            json!({"tools": tools.clone(), "parallel_tool_calls": false}),
+        );
+        if let Some(choice) = choice {
+            body["tool_choice"] = choice;
+        }
+        let parsed = translated_body("anthropic", &body).unwrap();
+        assert_eq!(parsed["tool_choice"], expected);
+    }
+}
+
+#[test]
+fn malformed_generation_controls_fail_translation() {
+    for fields in [
+        json!({"n": 0}),
+        json!({"n": "2"}),
+        json!({"seed": 1.5}),
+        json!({"presence_penalty": "high"}),
+        json!({"response_format": {"type": "xml"}}),
+        json!({"response_format": "json_object"}),
+        json!({"response_format": {"type": "json_schema"}}),
+        json!({"response_format": {"type": "json_schema", "json_schema": {"schema": []}}}),
+        // A schema-less json_schema is malformed, never downgraded to JSON mode.
+        json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}}),
+        json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": null}}}),
+        json!({"response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object"}, "strict": "yes"}}}),
+        json!({"parallel_tool_calls": "no"}),
+        json!({"logprobs": "yes"}),
+    ] {
+        assert!(
+            translated_body(
+                "google_gemini",
+                &with_fields(sample_openai_request(), fields.clone())
+            )
+            .is_err(),
+            "accepted {fields}"
+        );
+    }
+}
+
+/// A provider that cannot represent the control declines and fallback reaches
+/// one that forwards it; with no such provider the caller gets a 400 before
+/// any provider I/O.
+#[tokio::test]
+async fn unrepresentable_control_falls_back_or_fails_before_provider_io() {
+    let anthropic_server = MockServer::start().await;
+    let openai_server = MockServer::start().await;
+    mount_openai_success(&openai_server).await;
+    let anthropic = json!({
+        "name": "anthropic-primary",
+        "provider_type": "anthropic",
+        "api_key": "sk-ant-test",
+        "base_url": anthropic_server.uri(),
+        "allow_plaintext": true
+    });
+    let openai = json!({
+        "name": "openai-fallback",
+        "provider_type": "openai",
+        "api_key": "sk-test",
+        "base_url": openai_server.uri(),
+        "allow_plaintext": true
+    });
+    let body = json!({
+        "model": "shared-model",
+        "messages": [{"role": "user", "content": "Approve?"}],
+        "response_format": json_schema_response_format()
+    });
+
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"providers": [anthropic.clone(), openai]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    let mut ctx = post_json_ctx(&body);
+    let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+        other => panic!("expected the fallback provider's response, got {other:?}"),
+    }
+    let outbound = first_received_json(&openai_server).await;
+    assert_eq!(
+        outbound["response_format"],
+        json_schema_response_format(),
+        "the OpenAI-compatible fallback receives the contract unchanged"
+    );
+    assert_no_provider_requests(&anthropic_server).await;
+
+    let only_anthropic = ai_federation::AiFederation::new(
+        &json!({"providers": [anthropic]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    let mut ctx = post_json_ctx(&body);
+    let result = run_federation_final_body(&only_anthropic, &mut ctx, &json_headers()).await;
+    let (status, response) = reject_status(&result).expect("expected a rejection");
+    assert_eq!(status, 400);
+    let parsed: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(parsed["error"]["code"], "provider_translation_failed");
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("response_format")
+    );
+    assert_no_provider_requests(&anthropic_server).await;
+}
+
+/// ai_federation-MUSE-2: provider timeouts share the 24 h ceiling.
+#[test]
+fn provider_timeouts_are_capped_at_one_day() {
+    for field in ["connect_timeout_seconds", "read_timeout_seconds"] {
+        let error = build_federation(openai_provider(json!({ field: 86_401 })))
+            .err()
+            .unwrap_or_else(|| panic!("{field} above the ceiling must be refused"));
+        assert!(error.contains("86400"), "{field}: {error}");
+        let plugin = build_federation(openai_provider(json!({ field: 86_400 })))
+            .unwrap_or_else(|error| panic!("{field} at the ceiling is valid: {error}"));
+        let (connect, read) = test_helpers::provider_timeouts_seconds_for_test(&plugin, 0).unwrap();
+        if field == "connect_timeout_seconds" {
+            assert_eq!((connect, read), (86_400, 60));
+        } else {
+            assert_eq!((connect, read), (5, 86_400));
+        }
+    }
+}
+
+fn named_openai(name: &str, extra: Value) -> Value {
+    let mut provider = openai_provider(extra);
+    provider["name"] = json!(name);
+    provider
+}
+
+/// ai_federation-MUSE-4: `weight` is validated, picks the first attempt among
+/// the leading equal-priority group, and keeps fallback order deterministic.
+#[test]
+fn provider_weight_is_validated() {
+    for bad in [json!(0), json!(1001), json!("2"), json!(-1), json!(1.5)] {
+        let error = build_federation(openai_provider(json!({ "weight": bad.clone() })))
+            .err()
+            .unwrap_or_else(|| panic!("accepted weight {bad}"));
+        assert!(error.contains("weight"), "{bad}: {error}");
+    }
+    for good in [1, 1000] {
+        assert!(build_federation(openai_provider(json!({ "weight": good }))).is_ok());
+    }
+}
+
+#[test]
+fn weighted_first_choice_follows_the_roll_and_keeps_fallback_order() {
+    let plugin = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({"priority": 1, "weight": 1})),
+            named_openai("b", json!({"priority": 1, "weight": 3})),
+            named_openai("c", json!({"priority": 2}))
+        ]
+    }));
+    let order = |roll| test_helpers::ordered_provider_names_for_test(&plugin, "gpt-4o", roll);
+    assert_eq!(order(0), ["a", "b", "c"]);
+    for roll in 1..=3 {
+        assert_eq!(order(roll), ["b", "a", "c"], "roll {roll}");
+    }
+    assert_eq!(
+        order(4),
+        ["a", "b", "c"],
+        "the roll wraps by the total weight"
+    );
+
+    // The live selection is a permutation of the same set with the lower
+    // priority provider always last, and both weighted providers lead.
+    let mut leaders = std::collections::HashSet::new();
+    for _ in 0..400 {
+        let live = test_helpers::provider_attempt_order_for_test(&plugin, "gpt-4o");
+        assert_eq!(live.len(), 3);
+        assert_eq!(live[2], "c");
+        leaders.insert(live[0].clone());
+    }
+    assert_eq!(
+        leaders.len(),
+        2,
+        "both weighted providers must be chosen first"
+    );
+}
+
+#[test]
+fn unweighted_or_single_leader_groups_keep_configuration_order() {
+    let unweighted = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({"priority": 1})),
+            named_openai("b", json!({"priority": 1}))
+        ]
+    }));
+    for _ in 0..100 {
+        assert_eq!(
+            test_helpers::provider_attempt_order_for_test(&unweighted, "gpt-4o"),
+            ["a", "b"]
+        );
+    }
+    let single_leader = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({"priority": 1})),
+            named_openai("b", json!({"priority": 2, "weight": 5})),
+            named_openai("c", json!({"priority": 2, "weight": 5}))
+        ]
+    }));
+    for roll in 0..20 {
+        assert_eq!(
+            test_helpers::ordered_provider_names_for_test(&single_leader, "gpt-4o", roll),
+            ["a", "b", "c"]
+        );
+    }
+}
+
+#[test]
+fn weighted_selection_gives_no_share_to_a_provider_that_cannot_admit() {
+    let plugin = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({
+                "priority": 1,
+                "weight": 100,
+                "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 600}
+            })),
+            named_openai("b", json!({"priority": 1, "weight": 1}))
+        ]
+    }));
+    assert!(test_helpers::open_circuit_for_test(&plugin, 0));
+    for roll in 0..101 {
+        assert_eq!(
+            test_helpers::ordered_provider_names_for_test(&plugin, "gpt-4o", roll),
+            ["b", "a"],
+            "roll {roll}"
+        );
+    }
+}
+
+/// The streaming claim uses the same weighted selection.
+#[tokio::test]
+async fn streaming_claim_uses_weighted_selection() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [
+            named_openai("a", json!({"priority": 1, "weight": 1})),
+            named_openai("b", json!({"priority": 1, "weight": 1}))
+        ]
+    }));
+    let mut chosen = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let (ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let (provider, _, _) = test_helpers::owned_stream_claim_for_test(&plugin, &ctx).unwrap();
+        chosen.insert(provider);
+        drop(ctx);
+    }
+    assert_eq!(chosen.len(), 2);
+}
+
+/// ai_federation-MUSE-3: provider credentials accept a whole-value
+/// `${FERRUM_PLUGIN_SECRET_<NAME>}` reference resolved at construction.
+#[tokio::test]
+async fn provider_api_key_resolves_a_plugin_secret_reference() {
+    let plugin = {
+        let env = crate::unit::env_lock::EnvGuard::new(&[]);
+        env.set(
+            "FERRUM_PLUGIN_SECRET_FED_REVIEW_KEY",
+            "sk-from-secret-store",
+        );
+        streaming_plugin_with(json!({
+            "streaming": {"enabled": true},
+            "providers": [openai_provider(json!({
+                "api_key": "${FERRUM_PLUGIN_SECRET_FED_REVIEW_KEY}"
+            }))]
+        }))
+    };
+    let (_ctx, headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer sk-from-secret-store")
+    );
+}
+
+#[test]
+fn provider_secret_references_are_scoped_and_never_echoed() {
+    // Only `FERRUM_*` keys are touched, so this does not race the file's
+    // ambient-AWS readers.
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    env.set("FERRUM_PLUGIN_SECRET_FED_AWS_SECRET", "config-secret");
+    env.set("FERRUM_PLUGIN_SECRET_FED_EMPTY", "");
+
+    // Outside the namespace: refused before anything is read.
+    let error = build_federation(openai_provider(json!({
+        "api_key": "${AWS_SECRET_ACCESS_KEY}"
+    })))
+    .err()
+    .expect("a non-namespace reference must be refused");
+    assert!(error.contains("FERRUM_PLUGIN_SECRET_"), "{error}");
+    assert!(!error.contains("AWS_SECRET_ACCESS_KEY"), "{error}");
+
+    // Unset or empty referenced values fail closed without echoing the name.
+    for reference in [
+        "${FERRUM_PLUGIN_SECRET_FED_UNSET}",
+        "${FERRUM_PLUGIN_SECRET_FED_EMPTY}",
+    ] {
+        let error = build_federation(openai_provider(json!({ "api_key": reference })))
+            .err()
+            .unwrap_or_else(|| panic!("{reference} must be refused"));
+        assert!(
+            !error.contains("FED_UNSET") && !error.contains("FED_EMPTY"),
+            "{error}"
+        );
+    }
+    let error = build_federation(json!({
+        "name": "vertex",
+        "provider_type": "google_vertex",
+        "google_project_id": "proj",
+        "google_region": "us-central1",
+        "google_service_account_json": "${FERRUM_PLUGIN_SECRET_FED_UNSET}"
+    }))
+    .err()
+    .expect("an unset service-account reference must be refused");
+    assert!(error.contains("google_service_account_json"), "{error}");
+
+    // AWS secrets: a namespace reference resolves and counts as config
+    // credentials (no ambient endpoint scope), an unset one is refused.
+    let bedrock = |secret: &str, token: Option<&str>| {
+        let mut provider = json!({
+            "name": "bedrock",
+            "provider_type": "aws_bedrock",
+            "aws_region": "us-east-1",
+            "base_url": "https://bedrock.internal.example",
+            "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key": secret
+        });
+        if let Some(token) = token {
+            provider["aws_session_token"] = json!(token);
+        }
+        build_federation(provider)
+    };
+    assert!(bedrock("${FERRUM_PLUGIN_SECRET_FED_AWS_SECRET}", None).is_ok());
+    assert!(bedrock("${FERRUM_PLUGIN_SECRET_FED_UNSET}", None).is_err());
+    assert!(
+        bedrock(
+            "${FERRUM_PLUGIN_SECRET_FED_AWS_SECRET}",
+            Some("${FERRUM_PLUGIN_SECRET_FED_UNSET}")
+        )
+        .is_err()
+    );
+    drop(env);
+}
+
+fn provider_gauge_line(output: &str, provider: &str) -> Option<String> {
+    let needle = format!("provider=\"{provider}\"");
+    output
+        .lines()
+        .find(|line| {
+            line.starts_with("ferrum_ai_federation_provider_circuits_open{")
+                && line.contains(&needle)
+        })
+        .map(str::to_string)
+}
+
+/// ai_federation-MUSE-5: circuit transitions are labelled with the configured
+/// provider name, and dropping the circuit releases its gauge series.
+#[tokio::test]
+async fn provider_circuit_metrics_carry_the_configured_provider_name() {
+    let name = "fed-review-metrics-probe";
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "fallback_on_status_codes": [429],
+        "providers": [named_openai(name, json!({
+            "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 600}
+        }))]
+    }));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 429, &mut response_headers)
+        .await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 429, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(false)
+    );
+
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let output = registry.render_uncached();
+    let line = provider_gauge_line(&output, name).expect("per-provider gauge series");
+    assert!(line.ends_with(" 1"), "{line}");
+    assert!(
+        output.lines().any(|line| line
+            .starts_with("ferrum_ai_federation_provider_circuits_opened_total{")
+            && line.contains(&format!("provider=\"{name}\""))),
+        "per-provider opened counter"
+    );
+
+    drop(ctx);
+    drop(plugin);
+    let output = registry.render_uncached();
+    assert!(
+        provider_gauge_line(&output, name).is_none(),
+        "dropping an open circuit must release its gauge series"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR #6816 review round 1
+// ---------------------------------------------------------------------------
+
+/// Arm a 1 ms route-rule total request deadline on `ctx` and let it elapse.
+async fn expire_route_total_deadline(ctx: &mut RequestContext) {
+    ctx.route_override_request_timeout_ms = Some(1);
+    ctx.arm_route_request_deadline(false);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert!(
+        ctx.route_request_deadline_at()
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    );
+}
+
+/// PR6816-SOL-1 / MUSE-1 / MUSE-2: federation mirrors proxy core's route
+/// deadline settlement exactly. A body the route wrapper cut (total deadline or
+/// per-attempt budget: the transport's typed `route_policy_cut` flag) is
+/// neutral; before the response head, core's own charge decides — a deadline
+/// that expired while the provider held the attempt is charged
+/// (`read_write_timeout`), one that expired before any backend held it is
+/// recorded as the neutral `dispatch_policy_rejected`.
+#[tokio::test]
+async fn streaming_route_deadline_settlement_mirrors_core() {
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = event_stream_response_headers();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            200,
+            &BodyOutcome::error(ErrorClass::ReadWriteTimeout, 64, false)
+                .with_route_policy_cut(true),
+        )
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("released")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true),
+        "a route policy cut must not open a healthy provider's circuit"
+    );
+
+    // Pre-header, charged: core cancelled the attempt the provider held.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    expire_route_total_deadline(&mut ctx).await;
+    record_backend_dispatch_outcome_for_test(&mut ctx, Some(ErrorClass::ReadWriteTimeout), true);
+    mark_route_request_timeout_in_dispatch_for_test(&mut ctx);
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 504, &mut response_headers)
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("failed"),
+        "core charges a route expiry the provider held, so federation does too"
+    );
+    drop(ctx);
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(false)
+    );
+
+    // Pre-header, uncharged: no backend held the request.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    expire_route_total_deadline(&mut ctx).await;
+    record_backend_dispatch_outcome_for_test(
+        &mut ctx,
+        Some(ErrorClass::DispatchPolicyRejected),
+        false,
+    );
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 504, &mut response_headers)
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        None
+    );
+    drop(ctx);
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true)
+    );
+}
+
+/// PR6816-MUSE-3: only proxy core's post-wire backend-failure classes count.
+/// A graceful remote close or an unclassified request error does not.
+#[tokio::test]
+async fn streaming_body_fault_classes_match_core_post_wire_set() {
+    for (class, expected) in [
+        (ErrorClass::GracefulRemoteClose, "released"),
+        (ErrorClass::RequestError, "released"),
+        (ErrorClass::ConnectionClosed, "failed"),
+        (ErrorClass::ResponseBodyTooLarge, "failed"),
+    ] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::error(class, 8, false))
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some(expected),
+            "{class:?}"
+        );
+    }
+}
+
+/// PR6816-SOL-2: a strict schema is forwarded to Gemini only when every
+/// keyword is in the enforced subset; otherwise it is refused before I/O.
+#[test]
+fn gemini_strict_json_schema_must_stay_inside_the_enforced_subset() {
+    fn with_schema(schema: Value, strict: bool) -> Value {
+        with_fields(
+            sample_openai_request(),
+            json!({"response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "s", "strict": strict, "schema": schema}
+            }}),
+        )
+    }
+    let supported = json!({
+        "type": "object",
+        "title": "Decision",
+        "properties": {
+            "approved": {"type": "boolean", "description": "outcome"},
+            "when": {"type": "string", "format": "date-time"},
+            "score": {"type": "number", "minimum": 0, "maximum": 1},
+            "tags": {"type": "array", "items": {"type": "string", "enum": ["a", "b"]}, "minItems": 1, "maxItems": 3},
+            "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]},
+            "either": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "child": {"$ref": "#/$defs/child"}
+        },
+        "$defs": {"child": {"type": "object", "properties": {"x": {"type": "string"}}}},
+        "required": ["approved"],
+        "additionalProperties": false
+    });
+    for provider in ["google_gemini", "google_vertex"] {
+        let parsed = translated_body(provider, &with_schema(supported.clone(), true))
+            .unwrap_or_else(|error| {
+                panic!("{provider} refused a supported strict schema: {error}")
+            });
+        assert_eq!(parsed["generationConfig"]["responseJsonSchema"], supported);
+    }
+
+    for (keyword, schema) in [
+        (
+            "maxLength",
+            json!({"type": "object", "properties": {"id": {"type": "string", "maxLength": 8}}}),
+        ),
+        (
+            "minProperties",
+            json!({"type": "object", "minProperties": 1}),
+        ),
+        (
+            "uniqueItems",
+            json!({"type": "array", "items": {"type": "string"}, "uniqueItems": true}),
+        ),
+        ("pattern", json!({"type": "string", "pattern": "^a"})),
+        ("oneOf", json!({"oneOf": [{"type": "string"}]})),
+        ("format", json!({"type": "string", "format": "email"})),
+        ("$ref", json!({"$ref": "https://example.com/schema.json"})),
+        (
+            "contains",
+            json!({"$defs": {"x": {"type": "array", "contains": {"type": "string"}}}}),
+        ),
+    ] {
+        let error = translated_body("google_gemini", &with_schema(schema.clone(), true))
+            .expect_err("an unenforced strict keyword must be refused");
+        assert!(error.contains("response_format"), "{keyword}: {error}");
+        assert!(error.contains(keyword), "{keyword}: {error}");
+        // The same schema without `strict` is guidance and is forwarded.
+        let parsed = translated_body("google_gemini", &with_schema(schema.clone(), false)).unwrap();
+        assert_eq!(parsed["generationConfig"]["responseJsonSchema"], schema);
+    }
+
+    // Hostile nesting is bounded rather than walked without limit.
+    let mut deep = json!({"type": "string"});
+    for _ in 0..40 {
+        deep = json!({"type": "array", "items": deep});
+    }
+    assert!(translated_body("google_gemini", &with_schema(deep, true)).is_err());
+}
+
+/// PR6816-MUSE-1: explicit nulls in the extension are an unset field.
+#[test]
+fn null_thought_signature_extension_is_treated_as_absent() {
+    for extra in [
+        json!(null),
+        json!({"google": null}),
+        json!({"google": {"thought_signature": null}}),
+    ] {
+        let request = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                        "extra_content": extra
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+            ]
+        });
+        for provider in ["google_gemini", "openai", "anthropic"] {
+            let result =
+                test_helpers::translate_request_test(provider, &request, "model-1", &json!({}));
+            assert!(result.is_ok(), "{provider} rejected {extra}: {result:?}");
+        }
+        let (_, _, bytes) =
+            test_helpers::translate_request_test("google_gemini", &request, "gemini-3", &json!({}))
+                .unwrap();
+        let outbound: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            outbound["contents"][1]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
+    }
+
+    let native = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "lookup", "args": {}},
+                    "thoughtSignature": null
+                }]
+            },
+            "finishReason": "STOP"
+        }]
+    });
+    let (normalized, _, _, _) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&native).unwrap(),
+        "gemini-3-pro-preview",
+    )
+    .unwrap();
+    assert!(
+        normalized["choices"][0]["message"]["tool_calls"][0]
+            .get("extra_content")
+            .is_none()
+    );
+}
+
+/// PR6816-MUSE-7: reasoning depth, verbosity, and the legacy function-calling
+/// pair have no faithful translation and are refused.
+#[test]
+fn reasoning_verbosity_and_legacy_functions_are_refused_by_translating_adapters() {
+    for (field, fields) in [
+        ("reasoning", json!({"reasoning": {"effort": "high"}})),
+        ("verbosity", json!({"verbosity": "low"})),
+        ("reasoning_effort", json!({"reasoning_effort": "minimal"})),
+        (
+            "functions",
+            json!({"functions": [{"name": "lookup", "parameters": {"type": "object"}}]}),
+        ),
+        ("function_call", json!({"function_call": "auto"})),
+    ] {
+        for provider in ["anthropic", "google_gemini", "google_vertex", "aws_bedrock"] {
+            let error = translated_body(
+                provider,
+                &with_fields(sample_openai_request(), fields.clone()),
+            )
+            .expect_err("must be refused");
+            assert!(error.contains(field), "{provider}/{field}: {error}");
+        }
+    }
+    // `null` is an unset field.
+    for provider in ["anthropic", "google_gemini", "aws_bedrock"] {
+        assert!(
+            translated_body(
+                provider,
+                &with_fields(
+                    sample_openai_request(),
+                    json!({"reasoning": null, "verbosity": null})
+                ),
+            )
+            .is_ok()
+        );
+    }
+}
+
+/// PR6816-MUSE-5: no random value is drawn unless two providers can take the
+/// first attempt, and streaming-ineligible providers get no share.
+#[test]
+fn weighted_selection_draws_only_when_the_choice_can_change() {
+    let one_admitting = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({
+                "priority": 1,
+                "weight": 5,
+                "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 600}
+            })),
+            named_openai("b", json!({"priority": 1, "weight": 5}))
+        ]
+    }));
+    assert!(test_helpers::open_circuit_for_test(&one_admitting, 0));
+    let (drawn, order) =
+        test_helpers::weighted_roll_drawn_for_test(&one_admitting, "gpt-4o", false, 0);
+    assert!(!drawn, "a lone admitting provider needs no draw");
+    assert_eq!(order, ["b", "a"]);
+
+    let single_leader = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({"priority": 1})),
+            named_openai("b", json!({"priority": 2, "weight": 5}))
+        ]
+    }));
+    let (drawn, order) =
+        test_helpers::weighted_roll_drawn_for_test(&single_leader, "gpt-4o", false, 0);
+    assert!(!drawn);
+    assert_eq!(order, ["a", "b"]);
+
+    let two = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({"priority": 1, "weight": 1})),
+            named_openai("b", json!({"priority": 1, "weight": 1}))
+        ]
+    }));
+    let (drawn, order) = test_helpers::weighted_roll_drawn_for_test(&two, "gpt-4o", false, 1);
+    assert!(drawn);
+    assert_eq!(order, ["b", "a"]);
+}
+
+#[test]
+fn streaming_weighted_selection_gives_no_share_to_ineligible_providers() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [
+            {
+                "name": "claude",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant",
+                "priority": 1,
+                "weight": 1000
+            },
+            named_openai("a", json!({"priority": 1, "weight": 1, "model_patterns": []})),
+            named_openai("b", json!({"priority": 1, "weight": 1, "model_patterns": []}))
+        ]
+    }));
+    // Anthropic cannot stream here, so the share is split over a and b only.
+    let (drawn, order) = test_helpers::weighted_roll_drawn_for_test(&plugin, "any-model", true, 0);
+    assert!(drawn);
+    assert_eq!(order, ["a", "claude", "b"]);
+    let (_, order) = test_helpers::weighted_roll_drawn_for_test(&plugin, "any-model", true, 1);
+    assert_eq!(order, ["b", "claude", "a"]);
+    // The buffered path can use Anthropic, so it keeps its share there.
+    let (_, order) = test_helpers::weighted_roll_drawn_for_test(&plugin, "any-model", false, 0);
+    assert_eq!(order[0], "claude");
+}
+
+// ---------------------------------------------------------------------------
+// PR #6816 review round 2
+// ---------------------------------------------------------------------------
+
+/// PR6816-SOL-1 (round 2): the cause is decided from what the transport
+/// recorded at the terminal, not from the clock when the deferred hook runs.
+/// A provider fault observed BEFORE the route deadline still opens the
+/// circuit even when the termination hook runs after the deadline.
+#[tokio::test]
+async fn provider_fault_observed_before_the_route_deadline_still_counts() {
+    for class in [ErrorClass::ConnectionReset, ErrorClass::ReadWriteTimeout] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        ctx.route_override_request_timeout_ms = Some(40);
+        ctx.arm_route_request_deadline(false);
+        // The provider fault is recorded without the route-cut flag while the
+        // route budget still runs...
+        let outcome = BodyOutcome::error(class, 32, false);
+        // ...and the deferred termination hook only runs after it elapsed.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &outcome)
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("failed"),
+            "{class:?}"
+        );
+        assert_eq!(
+            test_helpers::circuit_is_closed_for_test(&plugin, 0),
+            Some(false)
+        );
+    }
+}
+
+/// The typed route-cut bit is authoritative, and only a timeout (never a
+/// reset) can be inferred as the route cut from its observation time.
+#[tokio::test]
+async fn route_policy_cut_provenance_is_typed_and_class_specific() {
+    // The transport's typed bit: neutral even with no deadline armed.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = event_stream_response_headers();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            200,
+            &BodyOutcome::error(ErrorClass::ReadWriteTimeout, 32, false)
+                .with_route_policy_cut(true),
+        )
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("released")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true)
+    );
+
+    // Without the flag nothing is inferred from clocks: neither a timeout nor
+    // a reset recorded after the deadline elapsed is taken as the route cut.
+    for class in [ErrorClass::ReadWriteTimeout, ErrorClass::ConnectionReset] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        expire_route_total_deadline(&mut ctx).await;
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::error(class, 32, false))
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("failed"),
+            "{class:?}"
+        );
+    }
+
+    // A reset observed after the deadline is not the route wrapper's cut.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = event_stream_response_headers();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    expire_route_total_deadline(&mut ctx).await;
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            200,
+            &BodyOutcome::error(ErrorClass::ConnectionReset, 32, false),
+        )
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+
+    // Pre-header: without core's typed route-timeout marker a 504 transport
+    // timeout is the provider's, however late the hook runs.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    expire_route_total_deadline(&mut ctx).await;
+    record_backend_dispatch_outcome_for_test(&mut ctx, Some(ErrorClass::ReadWriteTimeout), true);
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 504, &mut response_headers)
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+}
+
+/// PR6816-SOL-2 (round 2): reference shapes Google cannot represent are
+/// refused for a strict schema; supported references still pass.
+#[test]
+fn gemini_strict_schema_references_follow_google_restrictions() {
+    fn strict(schema: Value) -> Value {
+        with_fields(
+            sample_openai_request(),
+            json!({"response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "s", "strict": true, "schema": schema}
+            }}),
+        )
+    }
+    // Root `$ref` with its own `$defs`, and an acyclic definition chain.
+    for accepted in [
+        json!({
+            "$ref": "#/$defs/root",
+            "$defs": {
+                "root": {"type": "object", "properties": {"leaf": {"$ref": "#/$defs/leaf"}}},
+                "leaf": {"type": "string"}
+            }
+        }),
+        json!({
+            "type": "object",
+            "properties": {"score": {"$ref": "#/$defs/score"}},
+            "$defs": {"score": {"type": "number", "minimum": 0, "maximum": 1}}
+        }),
+    ] {
+        assert!(
+            translated_body("google_gemini", &strict(accepted.clone())).is_ok(),
+            "refused {accepted}"
+        );
+    }
+
+    for (needle, schema) in [
+        (
+            "sibling",
+            json!({
+                "type": "object",
+                "properties": {"score": {"$ref": "#/$defs/score", "maximum": 1}},
+                "$defs": {"score": {"type": "number", "minimum": 0}}
+            }),
+        ),
+        (
+            "`$ref`",
+            json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}),
+        ),
+        (
+            "`$ref`",
+            json!({"type": "object", "properties": {"x": {"$ref": "#/properties/y"}}}),
+        ),
+        (
+            "below the root",
+            json!({
+                "type": "object",
+                "properties": {"x": {"type": "object", "$defs": {"y": {"type": "string"}}}}
+            }),
+        ),
+        (
+            "recursive",
+            json!({
+                "type": "object",
+                "properties": {"child": {"$ref": "#"}},
+                "required": ["child"]
+            }),
+        ),
+        (
+            "recursive",
+            json!({
+                "$ref": "#/$defs/a",
+                "$defs": {
+                    "a": {"type": "object", "properties": {"b": {"$ref": "#/$defs/b"}}},
+                    "b": {"type": "array", "items": {"$ref": "#/$defs/a"}}
+                }
+            }),
+        ),
+        (
+            "maxLength",
+            json!({
+                "type": "object",
+                "properties": {"x": {"$ref": "#/$defs/x"}},
+                "$defs": {"x": {"type": "string", "maxLength": 3}}
+            }),
+        ),
+    ] {
+        let error = translated_body("google_gemini", &strict(schema.clone()))
+            .expect_err("an unrepresentable strict reference shape must be refused");
+        assert!(error.contains(needle), "{needle}: {error}");
+        assert!(error.contains("response_format"), "{error}");
+    }
+}
+
+/// A strict schema with a reference sibling never reaches the Gemini primary;
+/// the capable fallback receives the schema unchanged.
+#[tokio::test]
+async fn strict_reference_sibling_falls_back_without_gemini_io() {
+    let gemini_server = MockServer::start().await;
+    let openai_server = MockServer::start().await;
+    mount_openai_success(&openai_server).await;
+    let schema = json!({
+        "type": "object",
+        "properties": {"score": {"$ref": "#/$defs/score", "maximum": 1}},
+        "required": ["score"],
+        "additionalProperties": false,
+        "$defs": {"score": {"type": "number", "minimum": 0}}
+    });
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"providers": [
+            {
+                "name": "gemini-primary",
+                "provider_type": "google_gemini",
+                "api_key": "gemini-test",
+                "base_url": gemini_server.uri(),
+                "allow_plaintext": true
+            },
+            {
+                "name": "openai-fallback",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": openai_server.uri(),
+                "allow_plaintext": true
+            }
+        ]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    let body = json!({
+        "model": "shared-model",
+        "messages": [{"role": "user", "content": "Score it"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "s", "strict": true, "schema": schema.clone()}
+        }
+    });
+    let mut ctx = post_json_ctx(&body);
+    let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+        other => panic!("expected the fallback provider's response, got {other:?}"),
+    }
+    let outbound = first_received_json(&openai_server).await;
+    assert_eq!(outbound["response_format"]["json_schema"]["schema"], schema);
+    assert_no_provider_requests(&gemini_server).await;
+}
+
+fn metric_value(output: &str, family: &str, provider: &str) -> Option<String> {
+    let needle = format!("provider=\"{provider}\"");
+    output
+        .lines()
+        .find(|line| line.starts_with(&format!("{family}{{")) && line.contains(&needle))
+        .and_then(|line| line.rsplit(' ').next())
+        .map(str::to_string)
+}
+
+/// PR6816-SOL-3: a half-open close preempted after its state change while a
+/// late failure reopens the circuit must leave the labelled gauge open and
+/// count both transitions; dropping the circuit then releases the series.
+#[test]
+fn close_reopen_publication_race_keeps_the_labelled_gauge_open() {
+    let provider = "fed-review-r2-race-probe";
+    let (committed, output) = test_helpers::close_reopen_publication_race_for_test(provider);
+    assert!(
+        committed,
+        "the half-open close must commit for the race to apply"
+    );
+    assert_eq!(
+        metric_value(
+            &output,
+            "ferrum_ai_federation_provider_circuits_open",
+            provider
+        )
+        .as_deref(),
+        Some("1"),
+        "the reopened circuit must still publish as open: {output}"
+    );
+    assert_eq!(
+        metric_value(
+            &output,
+            "ferrum_ai_federation_provider_circuits_opened_total",
+            provider
+        )
+        .as_deref(),
+        Some("2"),
+        "the interposed reopen is a new open cycle"
+    );
+    assert_eq!(
+        metric_value(
+            &output,
+            "ferrum_ai_federation_provider_circuits_closed_total",
+            provider
+        )
+        .as_deref(),
+        Some("1")
+    );
+    let after = ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+    assert_eq!(
+        metric_value(
+            &after,
+            "ferrum_ai_federation_provider_circuits_open",
+            provider
+        ),
+        None,
+        "dropping the circuit releases its gauge series"
+    );
+}
+
+/// PR6816-MUSE-3 (round 2): a provider whose `multimodal_mode` refuses the
+/// request's content parts draws no weighted first-attempt share.
+#[test]
+fn weighted_selection_gives_no_share_to_a_multimodal_reject_provider() {
+    let plugin = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("rejects", json!({
+                "priority": 1,
+                "weight": 1000,
+                "multimodal_mode": "reject"
+            })),
+            named_openai("accepts", json!({"priority": 1, "weight": 1}))
+        ]
+    }));
+    let image_body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+            ]
+        }]
+    });
+    for roll in [0, 1, 500, 999] {
+        assert_eq!(
+            test_helpers::buffered_weighted_order_for_test(&plugin, "gpt-4o", &image_body, roll),
+            ["accepts", "rejects"],
+            "roll {roll}"
+        );
+    }
+    // A text-only request keeps the configured shares.
+    let text_body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]});
+    assert_eq!(
+        test_helpers::buffered_weighted_order_for_test(&plugin, "gpt-4o", &text_body, 0),
+        ["rejects", "accepts"]
     );
 }

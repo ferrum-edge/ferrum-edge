@@ -8242,6 +8242,7 @@ async fn handle_h3_request(
                 authorization_termination: ctx
                     .authorization_termination()
                     .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+                route_policy_cut: outcome.route_deadline_cut,
             };
             run_response_stream_termination_hooks(
                 &plugins,
@@ -9732,6 +9733,7 @@ async fn handle_h3_request(
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+            route_policy_cut: route_deadline_cut,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
@@ -10366,6 +10368,7 @@ async fn handle_h3_request(
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+            route_policy_cut: h3_stream_result.route_deadline_cut,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;

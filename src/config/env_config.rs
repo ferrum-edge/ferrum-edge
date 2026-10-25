@@ -372,6 +372,163 @@ pub fn kafka_native_config_allowed() -> bool {
     .unwrap_or(false)
 }
 
+/// Settings key for the operator attestation that lets `kafka_logging` run
+/// under a backend egress policy that can deny addresses.
+pub const KAFKA_ALLOWED_BROKERS_KEY: &str = "FERRUM_KAFKA_ALLOWED_BROKERS";
+
+/// One `host:port` entry of [`KafkaBrokerAllowance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KafkaAllowedBrokerEndpoint {
+    /// Lowercased host, IPv6 brackets removed.
+    host: String,
+    /// The host as an IP when it is an IP literal.
+    ip: Option<std::net::IpAddr>,
+    port: u16,
+}
+
+/// Node-operator attestation of the Kafka brokers `kafka_logging` may reach
+/// under a restrictive backend egress policy (`FERRUM_KAFKA_ALLOWED_BROKERS`).
+///
+/// librdkafka resolves bootstrap hostnames itself and dials every broker the
+/// cluster advertises in metadata, outside Ferrum's resolver, and the pinned
+/// client has no connect/resolve hook. Ferrum therefore cannot screen those
+/// dials. This allowance is the operator's statement that the listed brokers
+/// — and the cluster they advertise — are trusted destinations. Admission
+/// checks that every `broker_list` entry is listed; literal broker IPs still
+/// go through the dangerous-range baseline. It never relaxes the policy for
+/// any other client.
+#[derive(Debug, Clone, Default)]
+pub struct KafkaBrokerAllowance {
+    endpoints: Vec<KafkaAllowedBrokerEndpoint>,
+    cidrs: CidrSet,
+}
+
+impl KafkaBrokerAllowance {
+    /// True when the operator listed nothing (the default).
+    pub fn is_empty(&self) -> bool {
+        self.endpoints.is_empty() && self.cidrs.is_empty()
+    }
+
+    /// Whether the bootstrap destination `host:port` is attested.
+    ///
+    /// `host` is the unbracketed host librdkafka will dial and `literal_ip`
+    /// is its address when the host is an IP literal. A hostname is covered
+    /// only by an exact (ASCII case-insensitive) `host:port` entry; an IP
+    /// literal is covered by an equal `ip:port` entry or by a listed CIDR/IP.
+    pub fn covers(&self, host: &str, literal_ip: Option<std::net::IpAddr>, port: u16) -> bool {
+        match literal_ip {
+            Some(ip) => {
+                self.cidrs.contains(&ip)
+                    || self
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.port == port && endpoint.ip == Some(ip))
+            }
+            None => self.endpoints.iter().any(|endpoint| {
+                endpoint.port == port
+                    && endpoint.ip.is_none()
+                    && endpoint.host.eq_ignore_ascii_case(host)
+            }),
+        }
+    }
+}
+
+/// Parse `FERRUM_KAFKA_ALLOWED_BROKERS`.
+///
+/// Unset or blank is an empty allowance. Entries are comma-separated and each
+/// is `host:port`, `ip:port`, `[ipv6]:port`, a bare IP, or a CIDR. A malformed
+/// entry, an empty entry, or a CIDR list that covers a whole address family is
+/// an error, so a typo cannot widen or silently drop the attestation.
+pub fn parse_kafka_allowed_brokers(raw: Option<&str>) -> Result<KafkaBrokerAllowance, String> {
+    let Some(raw) = raw else {
+        return Ok(KafkaBrokerAllowance::default());
+    };
+    if raw.trim().is_empty() {
+        return Ok(KafkaBrokerAllowance::default());
+    }
+    let mut endpoints = Vec::new();
+    let mut cidr_entries: Vec<&str> = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(format!(
+                "{KAFKA_ALLOWED_BROKERS_KEY} contains an empty entry (check for a doubled or \
+                 trailing comma)"
+            ));
+        }
+        if entry.contains('/') || entry.parse::<std::net::IpAddr>().is_ok() {
+            cidr_entries.push(entry);
+            continue;
+        }
+        endpoints.push(parse_kafka_allowed_broker_endpoint(entry)?);
+    }
+    let cidrs = CidrSet::parse_strict(&cidr_entries.join(","))
+        .map_err(|error| format!("{KAFKA_ALLOWED_BROKERS_KEY}: {error}"))?;
+    if cidrs.permits_all_family() {
+        return Err(format!(
+            "{KAFKA_ALLOWED_BROKERS_KEY} must not cover an entire address family; list the \
+             brokers (or their subnets) the Kafka cluster actually advertises"
+        ));
+    }
+    Ok(KafkaBrokerAllowance { endpoints, cidrs })
+}
+
+fn parse_kafka_allowed_broker_endpoint(entry: &str) -> Result<KafkaAllowedBrokerEndpoint, String> {
+    let shape_error = || {
+        format!(
+            "{KAFKA_ALLOWED_BROKERS_KEY} entry {entry:?} must be host:port, ip:port, \
+             [ipv6]:port, an IP, or a CIDR"
+        )
+    };
+    let (host, port, bracketed) = if let Some(rest) = entry.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or_else(shape_error)?;
+        let port = after.strip_prefix(':').ok_or_else(shape_error)?;
+        (host, port, true)
+    } else {
+        let (host, port) = entry.rsplit_once(':').ok_or_else(shape_error)?;
+        if host.contains(':') {
+            return Err(format!(
+                "{KAFKA_ALLOWED_BROKERS_KEY} entry {entry:?}: write an IPv6 broker as [ipv6]:port"
+            ));
+        }
+        (host, port, false)
+    };
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(shape_error)?;
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+    {
+        return Err(shape_error());
+    }
+    let ip = host.parse::<std::net::IpAddr>().ok();
+    if bracketed != matches!(ip, Some(std::net::IpAddr::V6(_))) {
+        return Err(shape_error());
+    }
+    Ok(KafkaAllowedBrokerEndpoint {
+        host: host.to_ascii_lowercase(),
+        ip,
+        port,
+    })
+}
+
+/// This process's `FERRUM_KAFKA_ALLOWED_BROKERS` attestation.
+///
+/// Resolved with the same env-over-`ferrum.conf` precedence `EnvConfig` uses,
+/// at each plugin admission, so every admission path in the process gives one
+/// answer. `EnvConfig` refuses startup on a malformed value; if one is seen
+/// here anyway, the allowance is empty (fail closed).
+pub fn kafka_allowed_brokers() -> KafkaBrokerAllowance {
+    parse_kafka_allowed_brokers(
+        crate::config::conf_file::resolve_ferrum_var(KAFKA_ALLOWED_BROKERS_KEY).as_deref(),
+    )
+    .unwrap_or_default()
+}
+
 /// Settings key for the shared TLS state document byte ceiling.
 pub const TLS_STORE_MAX_DOCUMENT_BYTES_KEY: &str = "FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES";
 /// Default shared TLS state document byte ceiling (16 MiB).
@@ -1674,6 +1831,28 @@ impl BackendEgressPolicy {
         matches!(self.allow_ips, BackendAllowIps::Both)
             && self.deny_cidrs.is_empty()
             && !self.block_dangerous
+    }
+
+    /// The dangerous-range baseline verdict for `addr` alone, after the
+    /// explicit `FERRUM_BACKEND_ALLOW_CIDRS` escape hatch: `deny_reason`
+    /// precedence with `FERRUM_BACKEND_DENY_CIDRS` and the
+    /// `FERRUM_BACKEND_ALLOW_IPS` mode taken out.
+    ///
+    /// For operator attestations that may waive the deny list and the mode
+    /// filter for a specific destination (`FERRUM_KAFKA_ALLOWED_BROKERS`) but
+    /// must never waive the metadata/link-local/multicast/unspecified baseline.
+    /// Admission-time only: it clones the allow list.
+    pub fn dangerous_range_reason(&self, addr: &std::net::IpAddr) -> Option<&'static str> {
+        if !self.block_dangerous {
+            return None;
+        }
+        Self {
+            allow_ips: BackendAllowIps::Both,
+            allow_cidrs: self.allow_cidrs.clone(),
+            deny_cidrs: CidrSet::default(),
+            block_dangerous: true,
+        }
+        .deny_reason(addr)
     }
 }
 
@@ -5295,6 +5474,9 @@ impl EnvConfig {
         parse_kafka_allow_native_config(
             resolve_var(conf, KAFKA_ALLOW_NATIVE_CONFIG_KEY).as_deref(),
         )?;
+        // Same for the broker attestation: a malformed list must refuse
+        // startup rather than read as an empty allowance.
+        parse_kafka_allowed_brokers(resolve_var(conf, KAFKA_ALLOWED_BROKERS_KEY).as_deref())?;
 
         let (tls_source_max_blocking_concurrency, tls_source_load_timeout_seconds) =
             parse_tls_source_execution_policy(

@@ -2046,7 +2046,8 @@ impl PluginHttpClient {
     /// preserving the triggering client's `Host` and dialing a different
     /// authority. Shares DNS, TLS posture, pool/keepalive, redirect, and
     /// no-proxy invariants with [`get`]. Pass builders from this client through
-    /// [`execute_http1_redacted`] so redaction and egress screening still run.
+    /// [`execute_http1_redacted_single_attempt`] so redaction and egress
+    /// screening still run.
     pub fn get_http1(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
         self.http1_companion().ok_or(PluginHttpClientUnavailable)
     }
@@ -2172,7 +2173,13 @@ impl PluginHttpClient {
     /// default shared client and callers cannot select an arbitrary embedded
     /// `reqwest::Client` through their request builder. Egress screening,
     /// slow-call logging, and error redaction are identical.
-    pub async fn execute_http1_redacted(
+    ///
+    /// Always exactly one attempt, whatever `FERRUM_PLUGIN_HTTP_MAX_RETRIES`
+    /// says: the one caller (`load_testing` peer fan-out) sends a control
+    /// request that IS a decision — it starts a cohort on the peer — so a
+    /// transport-level replay after a lost response could start a second,
+    /// unrequested cohort.
+    pub async fn execute_http1_redacted_single_attempt(
         &self,
         request: reqwest::RequestBuilder,
         label: &str,
@@ -2194,7 +2201,7 @@ impl PluginHttpClient {
             label,
             None,
             Some(redacted_url),
-            RetryDisposition::SharedPolicy,
+            RetryDisposition::SingleAttempt,
         )
         .await
         .map_err(|e| {
