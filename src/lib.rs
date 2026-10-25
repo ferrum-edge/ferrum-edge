@@ -10238,6 +10238,15 @@ pub mod _test_support {
         crate::proxy::request_may_have_body(method, headers)
     }
 
+    /// Whether the HTTP/1.1 dispatchers add explicit `Transfer-Encoding:
+    /// chunked` for this method and outbound body.
+    pub fn h1_request_requires_explicit_chunked_framing<B>(method: &str, body: &B) -> bool
+    where
+        B: http_body::Body + ?Sized,
+    {
+        crate::proxy::h1_request_requires_explicit_chunked_framing(method, body)
+    }
+
     /// Proxy core's stale request-digest retirement over the final outbound
     /// headers (clone-on-write into `owned_proxy_headers`).
     pub fn retire_stale_request_integrity_headers(

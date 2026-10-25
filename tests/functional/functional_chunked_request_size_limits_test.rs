@@ -182,11 +182,16 @@ async fn run_body_len_backend(listener: TcpListener) {
         tokio::spawn(async move {
             let request = read_http_request(&mut stream).await;
             let body_len = request_body_len(&request);
+            let framing = request_framing(&request);
             let body = format!(r#"{{"body_len":{body_len}}}"#);
+            // The observations are echoed as headers too, so a HEAD request,
+            // whose response carries no body, can still be checked.
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Length: {}\r\n\
                  Content-Type: application/json\r\n\
+                 X-Observed-Body-Len: {body_len}\r\n\
+                 X-Observed-Request-Framing: {framing}\r\n\
                  Connection: close\r\n\
                  \r\n\
                  {body}",
@@ -252,6 +257,24 @@ fn request_body_complete(buf: &[u8], header_end: usize) -> bool {
         return decode_chunked_body(&buf[header_end..]).is_some();
     }
     true
+}
+
+/// Which body framing the backend saw on the request head: `content-length`,
+/// `chunked`, or `none`.
+fn request_framing(request: &[u8]) -> &'static str {
+    let Some(header_end) = find_header_end(request) else {
+        return "none";
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    if header_value(&headers, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        "chunked"
+    } else if header_value(&headers, "content-length").is_some() {
+        "content-length"
+    } else {
+        "none"
+    }
 }
 
 fn request_body_len(request: &[u8]) -> usize {
@@ -375,11 +398,21 @@ async fn functional_chunked_request_size_limit_http1_zero_disables_limit() {
     assert_eq!(body, r#"{"body_len":24}"#);
 }
 
-/// Send one HTTP/2 prior-knowledge request whose HEADERS frame leaves the
-/// stream open with no `Content-Length` or `Transfer-Encoding`, then `body` as
-/// DATA carrying END_STREAM. Returns the status and (except for `HEAD`, whose
-/// response carries no DATA) the response body.
-async fn send_h2_open_stream_upload(proxy_port: u16, method: &str, body: &[u8]) -> (u16, String) {
+/// What the client received for one HTTP/2 upload, plus what the backend
+/// reported observing (echoed back as response headers).
+struct H2UploadOutcome {
+    status: u16,
+    body: String,
+    backend_body_len: Option<String>,
+    backend_framing: Option<String>,
+}
+
+/// Send one HTTP/2 prior-knowledge request with no `Content-Length` or
+/// `Transfer-Encoding`. With `Some(body)` the HEADERS frame leaves the stream
+/// open and `body` follows as DATA carrying END_STREAM; with `None` END_STREAM
+/// rides the HEADERS frame (a transport-proven empty body). The response body
+/// is read except for `HEAD`, whose response carries no DATA.
+async fn send_h2_upload(proxy_port: u16, method: &str, body: Option<&[u8]>) -> H2UploadOutcome {
     let stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect H2 upload");
@@ -394,16 +427,27 @@ async fn send_h2_open_stream_upload(proxy_port: u16, method: &str, body: &[u8]) 
         .body(())
         .expect("build H2 upload request");
     let (response, mut request_body) = sender
-        .send_request(request, false)
+        .send_request(request, body.is_none())
         .expect("send H2 upload headers");
-    request_body
-        .send_data(Bytes::copy_from_slice(body), true)
-        .expect("send H2 upload DATA");
+    if let Some(body) = body {
+        request_body
+            .send_data(Bytes::copy_from_slice(body), true)
+            .expect("send H2 upload DATA");
+    }
     let response = tokio::time::timeout(Duration::from_secs(10), response)
         .await
         .expect("H2 upload response timed out")
         .expect("receive H2 upload response");
     let status = response.status().as_u16();
+    let observed = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let backend_body_len = observed("x-observed-body-len");
+    let backend_framing = observed("x-observed-request-framing");
     let mut response_bytes = Vec::new();
     if method != "HEAD" {
         let mut response_body = response.into_body();
@@ -415,17 +459,24 @@ async fn send_h2_open_stream_upload(proxy_port: u16, method: &str, body: &[u8]) 
     }
     drop(sender);
     connection_task.abort();
-    (
+    H2UploadOutcome {
         status,
-        String::from_utf8_lossy(&response_bytes).into_owned(),
-    )
+        body: String::from_utf8_lossy(&response_bytes).into_owned(),
+        backend_body_len,
+        backend_framing,
+    }
 }
 
 /// An HTTP/2 `GET`/`HEAD`/`OPTIONS` may carry DATA without `Content-Length`.
 /// The HTTP/1.1 dispatchers used to infer "no body" from the method and
 /// missing framing headers and send an empty backend body instead: a permitted
 /// upload lost its payload, and an oversized one never reached the
-/// size-limited adapter, so the route ceiling never produced its `413`.
+/// size-limited adapter, so the route ceiling never produced its `413`. Even
+/// with the body attached, hyper's HTTP/1.1 encoder sends an unknown-length
+/// `GET`/`HEAD` body as zero-length unless the request is explicitly chunked,
+/// so the backend's own observation of the payload and its framing is checked
+/// too. A transport-proven empty request must stay bodyless with no
+/// `Transfer-Encoding`.
 async fn assert_h2_open_stream_uploads_honor_route_limit(pool_http1_direct: bool) {
     let harness = ChunkedRequestHarness::with_route_limit(8, pool_http1_direct).await;
     let transport = if pool_http1_direct {
@@ -434,37 +485,79 @@ async fn assert_h2_open_stream_uploads_honor_route_limit(pool_http1_direct: bool
         "reqwest"
     };
 
-    // Empty, below, and exactly at the ceiling.
-    let payloads: [&[u8]; 3] = [b"", b"1234", b"12345678"];
-    for method in ["GET", "OPTIONS"] {
+    // END_STREAM on HEADERS: the empty-body fast path, no framing upstream.
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let outcome = send_h2_upload(harness.proxy_port, method, None).await;
+        assert_eq!(
+            outcome.status, 200,
+            "{transport}: empty {method}: body={}",
+            outcome.body
+        );
+        assert_eq!(
+            outcome.backend_body_len.as_deref(),
+            Some("0"),
+            "{transport}: empty {method}"
+        );
+        assert_eq!(
+            outcome.backend_framing.as_deref(),
+            Some("none"),
+            "{transport}: an empty {method} must reach the backend without Transfer-Encoding"
+        );
+    }
+
+    // Open stream, then DATA: below and exactly at the ceiling.
+    let payloads: [&[u8]; 2] = [b"1234", b"12345678"];
+    for method in ["GET", "HEAD", "OPTIONS"] {
         for payload in payloads {
-            let (status, body) =
-                send_h2_open_stream_upload(harness.proxy_port, method, payload).await;
+            let outcome = send_h2_upload(harness.proxy_port, method, Some(payload)).await;
+            let len = payload.len();
             assert_eq!(
-                status,
-                200,
-                "{transport}: {method} with {} DATA bytes: body={body}",
-                payload.len()
+                outcome.status, 200,
+                "{transport}: {method} with {len} DATA bytes: body={}",
+                outcome.body
+            );
+            let expected_len = len.to_string();
+            assert_eq!(
+                outcome.backend_body_len.as_deref(),
+                Some(expected_len.as_str()),
+                "{transport}: {method} must forward its {len}-byte payload"
             );
             assert_eq!(
-                body,
-                format!(r#"{{"body_len":{}}}"#, payload.len()),
-                "{transport}: {method} must forward its {}-byte payload",
-                payload.len()
+                outcome.backend_framing.as_deref(),
+                Some("chunked"),
+                "{transport}: {method} with an unknown-length payload must be chunked upstream"
             );
+            if method != "HEAD" {
+                assert_eq!(
+                    outcome.body,
+                    format!(r#"{{"body_len":{len}}}"#),
+                    "{transport}: {method}"
+                );
+            }
         }
     }
 
-    for method in ["GET", "HEAD", "OPTIONS"] {
-        let (status, body) =
-            send_h2_open_stream_upload(harness.proxy_port, method, b"123456789").await;
+    // Open stream with an empty DATA frame: whatever framing the dispatcher
+    // picks, the backend sees no payload.
+    for method in ["GET", "OPTIONS"] {
+        let outcome = send_h2_upload(harness.proxy_port, method, Some(&b""[..])).await;
+        assert_eq!(outcome.status, 200, "{transport}: {method}");
         assert_eq!(
-            status, 413,
-            "{transport}: {method} with 9 DATA bytes over an 8-byte route limit: body={body}"
+            outcome.body, r#"{"body_len":0}"#,
+            "{transport}: {method} with an empty DATA frame"
+        );
+    }
+
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let outcome = send_h2_upload(harness.proxy_port, method, Some(&b"123456789"[..])).await;
+        assert_eq!(
+            outcome.status, 413,
+            "{transport}: {method} with 9 DATA bytes over an 8-byte route limit: body={}",
+            outcome.body
         );
         if method != "HEAD" {
             assert_eq!(
-                body, r#"{"error":"Request body exceeds maximum size"}"#,
+                outcome.body, r#"{"error":"Request body exceeds maximum size"}"#,
                 "{transport}: {method} overrun must carry the shared 413 body"
             );
         }

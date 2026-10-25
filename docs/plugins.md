@@ -6563,9 +6563,13 @@ HTTP/1.1 dispatchers (the direct HTTP/1.1 pool and the reqwest fallback) decide
 body presence from the request body itself, not only from the method and
 framing headers, so that body is forwarded through the size-limited adapter: a
 payload at or under `max_bytes` reaches the backend intact and a larger one is
-refused with `413`. Only a body the transport has already proven empty (no
+refused with `413`. Because hyper's HTTP/1.1 client would otherwise send an
+unknown-length `GET`/`HEAD` body as zero-length, such a request is sent upstream
+with an explicit `Transfer-Encoding: chunked` (only on a dispatch known to be
+HTTP/1.1; HTTP/2 and HTTP/3 requests never carry it, and an exact-length body
+keeps `Content-Length`). Only a body the transport has already proven empty (no
 HTTP/1.1 framing, END_STREAM on the HTTP/2 HEADERS frame, or an empty buffered
-body) takes the empty-body fast path.
+body) takes the empty-body fast path and reaches the backend with no framing.
 
 **One 413 body.** Every `413` for this policy carries the gateway's shared
 request-body-size body, `{"error":"Request body exceeds maximum size"}`, whether
