@@ -56,9 +56,10 @@
 //!   matching `role: "function"` results); Anthropic SSE events are normalized
 //!   back to OpenAI `chat.completion.chunk` SSE. OpenAI `tool_choice: "none"`
 //!   becomes Anthropic `{"type":"none"}` with the tools list retained;
-//!   unsupported tool_choice values and forced tool use with manual extended
-//!   thinking (`thinking.type: "enabled"`) are rejected at admission. Adaptive
-//!   thinking may combine with OpenAI `required` / named choices. Provider
+//!   unsupported tool_choice values, and extended thinking (manual or
+//!   adaptive) combined with callable tools or a tool-result continuation, are
+//!   rejected at admission: signed thinking blocks cannot round-trip through
+//!   the OpenAI representation. Provider
 //!   `tool_use` under a none constraint fails closed instead of becoming OpenAI
 //!   `tool_calls`. Normalization requires Anthropic `message_stop` (or an
 //!   explicit provider `error`) before emitting a success-shaped terminal
@@ -983,17 +984,24 @@ impl AiStreamRouter {
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
             let parsed = parse_endpoint(&name, endpoint, allow_plaintext, &backend_allow_ips)?;
             // Gemini carries the model ONLY in the URL. A fixed-model endpoint
-            // behind a wildcard pattern would generate every matched model with
-            // whatever model the endpoint hard-codes while the claim and every
-            // normalized chunk stamp the requested one. A fixed endpoint is
-            // admitted only behind exact (non-wildcard) patterns.
-            if provider_type == ProviderType::GoogleGemini
-                && !parsed.has_model_placeholder
-                && model_patterns.iter().any(|pattern| pattern.contains('*'))
-            {
-                return Err(format!(
-                    "ai_stream_router: provider {name:?} is `google_gemini` with an `endpoint` that has no `{{model}}` placeholder; Gemini routes the model only through the URL, so either add `{{model}}` to the endpoint or restrict `model_patterns` to exact model names without `*`"
-                ));
+            // would generate every admitted model with whatever model the
+            // endpoint hard-codes while the claim and every normalized chunk
+            // stamp the requested one. Without `{model}`, the provider may
+            // therefore admit exactly one exact model name, and it must be the
+            // model the endpoint path itself names (`.../models/<model>:...`).
+            if provider_type == ProviderType::GoogleGemini && !parsed.has_model_placeholder {
+                let fixed_model_matches = match model_patterns.as_slice() {
+                    [pattern] => {
+                        !pattern.contains('*')
+                            && parsed.path.contains(&format!("/models/{pattern}:"))
+                    }
+                    _ => false,
+                };
+                if !fixed_model_matches {
+                    return Err(format!(
+                        "ai_stream_router: provider {name:?} is `google_gemini` with an `endpoint` that has no `{{model}}` placeholder; Gemini routes the model only through the URL, so either add `{{model}}` to the endpoint or set `model_patterns` to the single exact model the endpoint path names (`.../models/<model>:...`)"
+                    ));
+                }
             }
 
             let api_key = config_or_env_str(pv, &name, "api_key")?.ok_or(format!(
@@ -1615,11 +1623,27 @@ enum UserContentPart {
     Image(InlineImage),
 }
 
+/// Whether `data` is structurally valid standard-alphabet base64: decoded by a
+/// real decoder, so padding placement, final-quantum length, and trailing bits
+/// are all checked (an alphabet-only scan admitted `=` or `AA=A`). Padding may
+/// be present or stripped; a URL-safe alphabet is rejected. The caller bounds
+/// `data` first, so the transient decode buffer is bounded too.
 fn is_base64_payload(data: &str) -> bool {
+    use base64::Engine as _;
+    use base64::alphabet;
+    use base64::engine::DecodePaddingMode;
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+
+    const DECODER: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
     !data.is_empty()
-        && data
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+        && DECODER
+            .decode(data.as_bytes())
+            .is_ok_and(|decoded| !decoded.is_empty())
 }
 
 /// Closed OpenAI `{"type":"image_url","image_url":{"url":...,"detail"?}}`
@@ -2301,19 +2325,21 @@ fn validate_anthropic_translation(
     let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
     let tool_choice_kind = tool_choice.as_ref().map(|(kind, _)| *kind);
     let thinking = resolve_anthropic_thinking(openai_body, tool_choice_kind, default_max_tokens)?;
-    if thinking
-        .as_ref()
-        .and_then(|thinking| thinking.get("type"))
-        .and_then(Value::as_str)
-        == Some("enabled")
-    {
-        // Manual extended thinking with tool use requires the provider's
-        // signed thinking blocks to be replayed, unmodified, at the start of
-        // the assistant turn that carries `tool_use` when its `tool_result`s
+    if matches!(
+        thinking
+            .as_ref()
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str),
+        Some("enabled" | "adaptive")
+    ) {
+        // Extended thinking (manual or adaptive) with tool use requires the
+        // provider's signed thinking blocks emitted in a tool-use turn to be
+        // replayed, complete and unmodified, when that turn's `tool_result`s
         // come back. The OpenAI Chat Completions representation has no carrier
-        // for those blocks, so the continuation would be rejected by the
-        // provider. Refuse the combination up front with a clear diagnostic
-        // instead of letting the agent loop fail on its second turn.
+        // for those blocks: manual mode would be rejected by the provider, and
+        // adaptive mode would silently lose the reasoning state the turn was
+        // built on. Refuse the combination up front with a clear diagnostic
+        // instead of letting the agent loop degrade or fail on its second turn.
         let tools_callable = openai_declared_tool_names(openai_body)?.is_some()
             && tool_choice_kind != Some(ToolChoiceKind::None);
         let continues_tool_turn = messages
@@ -2330,7 +2356,7 @@ fn validate_anthropic_translation(
             });
         if tools_callable || continues_tool_turn {
             return Err(
-                "manual extended thinking (thinking.type \"enabled\") cannot be combined with callable tools or a tool-result continuation: signed thinking blocks cannot be round-tripped through the OpenAI representation; use adaptive thinking, tool_choice \"none\", or disable thinking for tool turns".to_string(),
+                "extended thinking (thinking.type \"enabled\" or \"adaptive\") cannot be combined with callable tools or a tool-result continuation: signed thinking blocks cannot be round-tripped through the OpenAI representation; use tool_choice \"none\" or disable thinking for tool turns".to_string(),
             );
         }
     }
@@ -2502,7 +2528,117 @@ fn openai_choice_count(openai_body: &Value) -> Result<Option<u64>, ParamRejectio
 /// otherwise the JSON-object or JSON-schema request.
 enum ResponseFormat<'a> {
     JsonObject,
-    JsonSchema { schema: &'a Value },
+    JsonSchema { schema: &'a Value, strict: bool },
+}
+
+/// JSON Schema keywords Gemini `responseJsonSchema` documents as enforced.
+/// Deliberately conservative: an unlisted keyword (`minLength`, `pattern`,
+/// `uniqueItems`, `oneOf`, `const`, ...) is treated as unenforced, so a strict
+/// schema using it is refused rather than silently weakened.
+const GEMINI_STRICT_SCHEMA_KEYWORDS: &[&str] = &[
+    "type",
+    "title",
+    "description",
+    "enum",
+    "format",
+    "anyOf",
+    "$ref",
+    "$defs",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "prefixItems",
+    "minItems",
+    "maxItems",
+    "minimum",
+    "maximum",
+];
+
+/// String `format` values Gemini documents as enforced.
+const GEMINI_STRICT_SCHEMA_FORMATS: &[&str] = &["date-time", "date", "time"];
+
+/// Annotation keywords that may sit beside `$ref` (they change no constraint).
+const GEMINI_REF_SIBLING_ANNOTATIONS: &[&str] = &["$ref", "title", "description"];
+
+/// Nesting bound for the strict-schema screen; deeper schemas are refused
+/// rather than walked, so hostile nesting cannot grow the stack.
+const MAX_STRICT_SCHEMA_DEPTH: usize = 32;
+
+/// Check one strict JSON Schema node (and every nested subschema) against the
+/// Gemini-enforced subset. Diagnostics are fixed and never echo schema keys or
+/// values.
+fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), &'static str> {
+    if depth > MAX_STRICT_SCHEMA_DEPTH {
+        return Err("strict response_format json_schema nests too deeply for Gemini translation");
+    }
+    let object = match schema {
+        // Boolean subschemas (`true` / `false`) carry no keywords.
+        Value::Bool(_) => return Ok(()),
+        Value::Object(object) => object,
+        _ => return Err("strict response_format json_schema contains a non-object subschema"),
+    };
+    if object.contains_key("$ref")
+        && object
+            .keys()
+            .any(|keyword| !GEMINI_REF_SIBLING_ANNOTATIONS.contains(&keyword.as_str()))
+    {
+        return Err(
+            "strict response_format json_schema combines `$ref` with sibling constraints, which Gemini does not apply",
+        );
+    }
+    for (keyword, value) in object {
+        if !GEMINI_STRICT_SCHEMA_KEYWORDS.contains(&keyword.as_str()) {
+            return Err(
+                "strict response_format json_schema uses a keyword Gemini does not enforce",
+            );
+        }
+        match keyword.as_str() {
+            "format" => {
+                if !value
+                    .as_str()
+                    .is_some_and(|format| GEMINI_STRICT_SCHEMA_FORMATS.contains(&format))
+                {
+                    return Err(
+                        "strict response_format json_schema uses a `format` Gemini does not enforce (supported: date-time, date, time)",
+                    );
+                }
+            }
+            "$ref" => {
+                // Only document-local references resolve inside the schema the
+                // provider receives.
+                if !value
+                    .as_str()
+                    .is_some_and(|reference| reference.starts_with('#'))
+                {
+                    return Err(
+                        "strict response_format json_schema `$ref` must be a local `#...` reference",
+                    );
+                }
+            }
+            "properties" | "$defs" => {
+                let members = value.as_object().ok_or(
+                    "strict response_format json_schema `properties` / `$defs` must be an object",
+                )?;
+                for member in members.values() {
+                    screen_gemini_strict_schema(member, depth + 1)?;
+                }
+            }
+            "anyOf" | "prefixItems" => {
+                let members = value.as_array().ok_or(
+                    "strict response_format json_schema `anyOf` / `prefixItems` must be an array",
+                )?;
+                for member in members {
+                    screen_gemini_strict_schema(member, depth + 1)?;
+                }
+            }
+            "items" | "additionalProperties" => {
+                screen_gemini_strict_schema(value, depth + 1)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn openai_response_format(
@@ -2535,12 +2671,14 @@ fn openai_response_format(
             if !spec.get("name").is_some_and(Value::is_string) {
                 return Err(invalid());
             }
+            let strict = match spec.get("strict") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(strict)) => *strict,
+                Some(_) => return Err(invalid()),
+            };
             if spec
-                .get("strict")
-                .is_some_and(|strict| !strict.is_boolean() && !strict.is_null())
-                || spec
-                    .get("description")
-                    .is_some_and(|description| !description.is_string() && !description.is_null())
+                .get("description")
+                .is_some_and(|description| !description.is_string() && !description.is_null())
             {
                 return Err(invalid());
             }
@@ -2548,7 +2686,7 @@ fn openai_response_format(
                 .get("schema")
                 .filter(|schema| schema.is_object())
                 .ok_or_else(invalid)?;
-            Ok(Some(ResponseFormat::JsonSchema { schema }))
+            Ok(Some(ResponseFormat::JsonSchema { schema, strict }))
         }
         _ => Err(invalid()),
     }
@@ -2612,7 +2750,18 @@ fn validate_gemini_request_params(openai_body: &Value) -> Result<(), ParamReject
     if present(openai_body, "seed").is_some_and(|seed| seed.as_i64().is_none()) {
         return Err(ParamRejection::invalid("seed", "seed must be an integer"));
     }
-    openai_response_format(openai_body)?;
+    // A STRICT schema is a contract the client relies on: every constraint in
+    // it must be one Gemini enforces, or the request is refused rather than
+    // answered with output that may violate it. Non-strict schemas are
+    // best-effort in OpenAI's own contract and are forwarded as-is.
+    if let Some(ResponseFormat::JsonSchema {
+        schema,
+        strict: true,
+    }) = openai_response_format(openai_body)?
+    {
+        screen_gemini_strict_schema(schema, 0)
+            .map_err(|message| ParamRejection::unsupported("response_format", message))?;
+    }
     // Gemini has no switch that limits a turn to one function call, so a
     // client that disabled parallel calls for callable tools cannot have that
     // contract honored.
@@ -2698,9 +2847,11 @@ fn resolve_anthropic_tool_choice(
 }
 
 /// Forward closed Anthropic thinking shapes when present. Manual extended
-/// thinking (`type: "enabled"`) cannot combine with forced tool use; adaptive
-/// thinking may. Budget must satisfy Anthropic's ordinary contract relative to
-/// the effective `max_tokens` this route forwards.
+/// thinking (`type: "enabled"`) cannot combine with forced tool use (the
+/// broader tools/continuation refusal for both manual and adaptive thinking
+/// lives in [`validate_anthropic_translation`]). Budget must satisfy
+/// Anthropic's ordinary contract relative to the effective `max_tokens` this
+/// route forwards.
 fn resolve_anthropic_thinking(
     openai_body: &Value,
     tool_choice_kind: Option<ToolChoiceKind>,
@@ -3515,7 +3666,7 @@ fn translate_to_gemini(openai_body: &Value, prevalidated: bool) -> Result<Vec<u8
                 Value::String("application/json".to_string()),
             );
         }
-        Some(ResponseFormat::JsonSchema { schema }) => {
+        Some(ResponseFormat::JsonSchema { schema, .. }) => {
             gen_config.insert(
                 "responseMimeType".to_string(),
                 Value::String("application/json".to_string()),

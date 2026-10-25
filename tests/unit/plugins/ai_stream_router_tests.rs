@@ -1282,41 +1282,47 @@ async fn test_anthropic_extended_thinking_tool_choice_combinations() {
         assert!(ctx.route_override_backend_host.is_none());
     }
 
-    let adaptive = json!({
-        "model": "claude-3-5-sonnet",
-        "stream": true,
-        "messages": [{"role": "user", "content": "weather?"}],
-        "tools": weather_tools(),
-        "tool_choice": "auto",
-        "thinking": {"type": "adaptive"}
-    });
-    let parsed = translate_anthropic_body(&adaptive)
-        .await
-        .expect("adaptive thinking with auto must translate");
-    assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
-
-    // Adaptive thinking supports forced tool use (required / named).
-    for (tool_choice, expected) in [
-        (json!("required"), json!({"type": "any"})),
-        (
-            json!({"type": "function", "function": {"name": "get_weather"}}),
-            json!({"type": "tool", "name": "get_weather"}),
-        ),
+    // Adaptive thinking loses the same signed blocks across a tool turn, so it
+    // is refused with callable tools too (auto, required, named, implicit).
+    for tool_choice in [
+        Some(json!("auto")),
+        Some(json!("required")),
+        Some(json!({"type": "function", "function": {"name": "get_weather"}})),
+        None,
     ] {
-        let body = json!({
+        let mut body = json!({
             "model": "claude-3-5-sonnet",
             "stream": true,
             "messages": [{"role": "user", "content": "weather?"}],
             "tools": weather_tools(),
-            "tool_choice": tool_choice,
             "thinking": {"type": "adaptive"}
         });
-        let parsed = translate_anthropic_body(&body)
-            .await
-            .expect("adaptive thinking with forced tool_choice must translate");
-        assert_eq!(parsed["tool_choice"], expected);
-        assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+        if let Some(tool_choice) = tool_choice {
+            body["tool_choice"] = tool_choice;
+        }
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), Some(400));
+        if let PluginResult::Reject { body, .. } = result {
+            assert!(body.contains("invalid_thinking"), "{body}");
+        }
     }
+
+    // Adaptive thinking with tools that cannot be called is still admitted.
+    let adaptive_none = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "none",
+        "thinking": {"type": "adaptive"}
+    });
+    let parsed = translate_anthropic_body(&adaptive_none)
+        .await
+        .expect("adaptive thinking with tool_choice none must translate");
+    assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(parsed["tool_choice"], json!({"type": "none"}));
 
     // Forced tool use with manual enabled thinking is rejected at admission.
     for tool_choice in [
@@ -5162,14 +5168,16 @@ async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
          document it replaced"
     );
 
-    // The same envelope is refused (leaving the response alone) when the
-    // response's retained ceiling cannot hold it, rather than being built first
-    // and measured after.
+    // The same envelope is refused when the response's retained ceiling cannot
+    // hold it, rather than being built first and measured after. The refusal
+    // replaces the provider body with an EMPTY one: leaving the response alone
+    // would deliver the raw provider bytes under the repaired OpenAI headers
+    // (ai_stream_router-CLAUDE-2).
     let mut tiny = post_ctx(&claude);
     let mut headers = json_headers();
     plugin.before_proxy(&mut tiny, &mut headers).await;
     tiny.max_response_body_size_bytes = 8;
-    assert!(
+    assert_eq!(
         plugin
             .normalize_response_body_with_context(
                 &mut tiny,
@@ -5178,10 +5186,10 @@ async fn test_upstream_error_envelope_is_serialized_through_the_bound() {
                 Some("text/event-stream"),
                 &response_headers,
             )
-            .await
-            .is_none(),
+            .await,
+        Some(Vec::new()),
         "an envelope larger than the retained ceiling must be refused during \
-         construction"
+         construction, and the raw provider body must still be replaced"
     );
 }
 
@@ -5223,20 +5231,36 @@ async fn test_buffered_normalizer_is_bounded_by_a_route_ceiling_below_the_slice_
         let mut headers = json_headers();
         plugin.before_proxy(&mut ctx, &mut headers).await;
         ctx.max_response_body_size_bytes = ceiling;
+        // The refusal never leaves the raw provider body in place
+        // (ai_stream_router-CLAUDE-2): the replacement is the bounded
+        // upstream-error terminal, or empty when even that cannot fit.
+        let refused = plugin
+            .normalize_response_body_with_context(
+                &mut ctx,
+                200,
+                body.as_bytes(),
+                Some("text/event-stream"),
+                &HashMap::new(),
+            )
+            .await
+            .expect("a refused normalization must still replace the provider body");
         assert!(
-            plugin
-                .normalize_response_body_with_context(
-                    &mut ctx,
-                    200,
-                    body.as_bytes(),
-                    Some("text/event-stream"),
-                    &HashMap::new(),
-                )
-                .await
-                .is_none(),
+            refused.len() <= ceiling,
             "a normalization larger than a {ceiling}-byte retained ceiling must be \
              refused, including ceilings below the buffered slice size"
         );
+        assert_ne!(refused, normalized);
+        let refused_text = std::str::from_utf8(&refused).expect("UTF-8 replacement");
+        assert!(
+            !refused_text.contains("content_block_delta"),
+            "raw provider framing must never be delivered"
+        );
+        if ceiling >= 512 {
+            assert!(refused_text.contains("upstream_error"), "{refused_text}");
+            assert!(refused_text.trim_end().ends_with("data: [DONE]"));
+        } else {
+            assert!(refused.is_empty());
+        }
     }
 
     // A ceiling that exactly covers the normalized output still admits it, so
@@ -10845,7 +10869,7 @@ async fn gemini_round_trips_client_thought_signatures_onto_function_call_parts()
 // --- ai_stream_router-SOL-3: manual thinking + tool continuation -------------
 
 #[tokio::test]
-async fn manual_thinking_tool_result_continuation_is_refused_up_front() {
+async fn thinking_tool_result_continuation_is_refused_up_front() {
     let plugin = build(openai_and_anthropic_config());
     let continuation = |thinking: Value| {
         json!({
@@ -10872,11 +10896,19 @@ async fn manual_thinking_tool_result_continuation_is_refused_up_front() {
     assert_eq!(reject_status(&result), Some(400));
     assert_eq!(rejected_param(&result).as_deref(), Some("thinking"));
 
-    // Adaptive thinking tolerates omitted thinking blocks and stays admitted.
-    let parsed = translate_anthropic_body(&continuation(json!({"type": "adaptive"})))
+    // Adaptive thinking would silently drop the same signed blocks, so its
+    // continuation is refused too.
+    let mut ctx = post_ctx(&continuation(json!({"type": "adaptive"})));
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    assert_eq!(rejected_param(&result).as_deref(), Some("thinking"));
+
+    // Disabled thinking keeps the tool loop working.
+    let parsed = translate_anthropic_body(&continuation(json!({"type": "disabled"})))
         .await
-        .expect("adaptive thinking continuation must translate");
-    assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+        .expect("a continuation without thinking must translate");
+    assert_eq!(parsed["thinking"], json!({"type": "disabled"}));
 }
 
 // --- ai_stream_router-SOL-4 / -CLAUDE-4: request parameter fidelity ----------
@@ -11420,6 +11452,25 @@ fn gemini_fixed_model_endpoints_require_exact_model_patterns() {
     .err()
     .expect("a wildcard pattern behind a fixed-model Gemini endpoint must be refused");
     assert!(error.contains("{model}"), "{error}");
+    // Exact names are refused too unless they are exactly the one model the
+    // fixed URL names: two names, or one different name, would mislabel the
+    // endpoint's generation.
+    for patterns in [
+        json!(["gemini-2.5-flash", "gemini-2.5-pro"]),
+        json!(["gemini-2.5-pro"]),
+        json!(["gemini-2.5"]),
+    ] {
+        let error = AiStreamRouter::new(
+            &single_provider(json!({
+                "name": "g", "provider_type": "google_gemini", "endpoint": fixed,
+                "api_key": "k", "model_patterns": patterns.clone()
+            })),
+            http_client(),
+        )
+        .err()
+        .expect("model_patterns that differ from the fixed URL model must be refused");
+        assert!(error.contains("{model}"), "{patterns}: {error}");
+    }
     assert!(
         AiStreamRouter::new(
             &single_provider(json!({
@@ -11581,7 +11632,7 @@ async fn azure_openai_provider_installs_the_api_key_header_on_every_pass() {
         headers.get("api-key").map(String::as_str),
         Some("azure-secret-key")
     );
-    assert!(headers.get("authorization").is_none());
+    assert!(!headers.contains_key("authorization"));
     assert_no_value_anywhere(&headers, "client-token");
     assert!(
         ctx.route_override_path
@@ -11610,7 +11661,7 @@ async fn azure_openai_provider_installs_the_api_key_header_on_every_pass() {
         headers.get("api-key").map(String::as_str),
         Some("azure-secret-key")
     );
-    assert!(headers.get("authorization").is_none());
+    assert!(!headers.contains_key("authorization"));
     assert!(matches!(
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, &out)
@@ -11703,5 +11754,154 @@ async fn unsupported_image_parts_are_rejected_without_echoing_them() {
     assert_eq!(
         reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
         Some(400)
+    );
+}
+
+// --- PR #6824 review round 1 -------------------------------------------------
+
+fn route_override_destination_digest(tls: Option<BackendTlsConfig>) -> [u8; 32] {
+    use ferrum_edge::plugins::utils::replay_partition::{
+        PartitionHasher, append_destination_partition,
+    };
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.route_override_resolved_tls = tls;
+    let mut hasher = PartitionHasher::new("ai_stream_router_review");
+    append_destination_partition(&mut hasher, &ctx);
+    hasher.digest()
+}
+
+#[test]
+fn replay_partitions_bind_the_provider_client_identity_isolation() {
+    let isolated = BackendTlsConfig::isolated_public_verify();
+    let inheriting = BackendTlsConfig {
+        suppress_global_client_identity: false,
+        ..BackendTlsConfig::isolated_public_verify()
+    };
+    assert_ne!(
+        route_override_destination_digest(Some(isolated.clone())),
+        route_override_destination_digest(Some(inheriting.clone())),
+        "a destination that may present the gateway client identity must not share \
+         a replay partition with one that never does"
+    );
+    // The marker is bound only when set, so existing digests are stable.
+    assert_eq!(
+        route_override_destination_digest(Some(inheriting.clone())),
+        route_override_destination_digest(Some(inheriting))
+    );
+    assert_eq!(
+        route_override_destination_digest(Some(isolated.clone())),
+        route_override_destination_digest(Some(isolated))
+    );
+}
+
+#[tokio::test]
+async fn gemini_strict_json_schema_must_be_representable() {
+    let plugin = build(gemini_config());
+    let strict_request = |schema: Value, strict: bool| {
+        json!({
+            "model": "gemini-1.5-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "result", "strict": strict, "schema": schema}
+            }
+        })
+    };
+    // A representable control with nesting, refs, and arrays still translates.
+    let representable = json!({
+        "type": "object",
+        "$defs": {"item": {"type": "string", "enum": ["a", "b"]}},
+        "properties": {
+            "when": {"type": "string", "format": "date-time"},
+            "items": {"type": "array", "items": {"$ref": "#/$defs/item", "description": "x"}, "minItems": 1},
+            "choice": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}
+        },
+        "required": ["when"],
+        "additionalProperties": false
+    });
+    let parsed = translate_gemini_body(&plugin, &strict_request(representable.clone(), true))
+        .await
+        .expect("a representable strict schema must translate");
+    assert_eq!(
+        parsed["generationConfig"]["responseJsonSchema"],
+        representable
+    );
+
+    for unsupported in [
+        json!({"type": "object", "properties": {"id": {"type": "string", "minLength": 8}}}),
+        json!({"type": "array", "uniqueItems": true, "items": {"type": "string"}}),
+        json!({"type": "object", "properties": {"deep": {"type": "object", "properties": {"x": {"type": "string", "pattern": "^a"}}}}}),
+        json!({"oneOf": [{"type": "string"}, {"type": "integer"}]}),
+        json!({"type": "string", "format": "email"}),
+        json!({"type": "object", "properties": {"r": {"$ref": "#/$defs/x", "minItems": 1}}, "$defs": {"x": {"type": "array"}}}),
+        json!({"$ref": "https://schemas.example.invalid/remote.json"}),
+        json!({"type": "object", "properties": {"x": 7}}),
+    ] {
+        let error = translate_gemini_body(&plugin, &strict_request(unsupported.clone(), true))
+            .await
+            .expect_err("an unenforceable strict schema must be refused");
+        assert_eq!(
+            reject_param(&error).as_deref(),
+            Some("response_format"),
+            "{unsupported}: {error}"
+        );
+        assert!(!error.contains("schemas.example.invalid"), "{error}");
+    }
+
+    // A non-strict schema is best-effort by OpenAI's own contract.
+    let loose = json!({"type": "object", "properties": {"id": {"type": "string", "minLength": 8}}});
+    let parsed = translate_gemini_body(&plugin, &strict_request(loose.clone(), false))
+        .await
+        .expect("a non-strict schema is forwarded as-is");
+    assert_eq!(parsed["generationConfig"]["responseJsonSchema"], loose);
+}
+
+#[tokio::test]
+async fn structurally_invalid_base64_images_are_refused_for_both_providers() {
+    let anthropic = build(openai_and_anthropic_config());
+    let gemini = build(gemini_config());
+    for payload in [
+        "=",
+        "AA=A",
+        "A",
+        "AAAAA",
+        "iVBORw0KGgo=====",
+        "iV-ORw0KGgo=",
+    ] {
+        let url = format!("data:image/png;base64,{payload}");
+        for (plugin, model) in [
+            (&anthropic, "claude-3-5-sonnet"),
+            (&gemini, "gemini-1.5-flash"),
+        ] {
+            let body = image_request(model, &url);
+            let mut ctx = post_ctx(&body);
+            let mut headers = json_headers();
+            match plugin.before_proxy(&mut ctx, &mut headers).await {
+                PluginResult::Reject {
+                    status_code, body, ..
+                } => {
+                    assert_eq!(status_code, 400, "{model} {payload}");
+                    assert!(
+                        body.contains("not valid base64"),
+                        "{model} {payload}: {body}"
+                    );
+                }
+                other => panic!("{model} must refuse {payload:?}: {other:?}"),
+            }
+        }
+    }
+    // Unpadded canonical base64 is still accepted.
+    assert!(
+        translate_anthropic_body(&image_request(
+            "claude-3-5-sonnet",
+            "data:image/png;base64,iVBORw0KGgo"
+        ))
+        .await
+        .is_some()
     );
 }

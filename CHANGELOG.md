@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING: `ai_stream_router` refuses configurations and requests it
+  cannot honor exactly** (issue #6824). Admission now rejects an empty
+  `anthropic_version`, endpoint userinfo or `#fragment`, `default_max_tokens`
+  on a non-`anthropic` provider, and a `google_gemini` endpoint without
+  `{model}` unless `model_patterns` is the single model the URL names.
+  Requests now get an OpenAI-shaped `400` for a mistyped
+  `max_tokens` / `max_completion_tokens`, unrepresentable parameters
+  (`logit_bias`, `logprobs`, Anthropic `n > 1` / penalties / `seed` / JSON
+  `response_format`, Gemini `parallel_tool_calls: false` with callable tools,
+  an unenforceable strict Gemini schema), and Anthropic extended thinking
+  (manual or adaptive) with callable tools or a tool-result continuation —
+  all previously admitted and silently weakened. A claimed Anthropic 2xx
+  response that is not `text/event-stream` now fails closed (`502`), and an
+  HTTPS provider without `inherit_backend_tls` no longer inherits the global
+  CA bundle, `FERRUM_TLS_NO_VERIFY`, or the global backend client
+  certificate. See the upgrade guide.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -149,9 +165,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `disable_parallel_tool_use`; parameters a provider cannot honor
   (`logit_bias`, `logprobs`, Anthropic `n > 1` / penalties / `seed` / JSON
   `response_format`, Gemini `parallel_tool_calls: false`) are rejected with a
-  `400` naming the parameter instead of being dropped. Manual Anthropic
-  extended thinking with callable tools or a tool-result continuation is
-  refused up front (signed thinking blocks cannot round-trip). A mistyped
+  `400` naming the parameter instead of being dropped. Anthropic extended
+  thinking (manual or adaptive) with callable tools or a tool-result
+  continuation is refused up front (signed thinking blocks cannot
+  round-trip), and a strict Gemini `json_schema` must use only keywords Gemini
+  enforces. A mistyped
   `max_tokens` / `max_completion_tokens` is a `400`, and the Anthropic default
   is the new per-provider `default_max_tokens` (default `4096`). User-message
   base64 data-URL images translate to native Anthropic / Gemini image parts.
