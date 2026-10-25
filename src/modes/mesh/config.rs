@@ -7133,6 +7133,9 @@ fn validate_virtual_service_cors_policies(
             ),
         ];
         for (field, values, validate) in string_lists {
+            if let Err(err) = crate::plugins::cors::validate_token_list_count(field, values.len()) {
+                errors.push(format!("{context}: {err}"));
+            }
             for (index, value) in values.iter().enumerate() {
                 let trimmed = value.trim();
                 if trimmed.is_empty() {

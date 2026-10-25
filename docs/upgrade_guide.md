@@ -28,27 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `oidc_relying_party` session context, logout, discovery, and redirects (PR #6833)
+### `cors` method and header lists are bounded (#6844)
 
-- **Users sign in again once.** The session and pending-login encryption
-  context now covers only what a session asserts, so every cookie issued by the
-  previous release is refused and the browser is sent through login. After the
-  upgrade, changing presentation or admission settings (challenge statuses,
-  redirect allowlist, cache sizes, logout settings, `max_cookie_bytes`) no
-  longer signs users out.
-- **Logout needs a same-origin request.** Link to `logout_path` from pages on
-  the same origin or submit a same-origin `POST`. A `GET`/`HEAD` without
-  `Sec-Fetch-Site: same-origin` or `none`, or a cross-site `POST`, now answers
-  `403` and changes nothing; non-browser clients should `POST`.
-- **Discovery must report the configured issuer.** Set `providers[].issuer` to
-  exactly the `issuer` member of the discovery document (including any trailing
-  slash). HTTPS endpoints on other origins are now accepted.
-- **Paths and redirect entries are validated.** `callback_path` and
-  `logout_path` must be canonical request paths (no percent-escapes, `//`, dot
-  segments, or backslashes); update `redirect_uri` to match.
-  `trusted_redirect_hosts` entries must be `host` or `host:port`; list
-  `host:8443` explicitly for a non-default port, and keep the redirect target
-  on `redirect_uri`'s scheme.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 

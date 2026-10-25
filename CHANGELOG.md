@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,37 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`oidc_relying_party` production-launch hardening.** Successful WebSocket
-  handshakes now receive the rotated or slid session cookie (they bypass
-  `after_proxy`). A claims-freshness re-challenge after a spent or
-  indeterminate refresh no longer deletes the browser's session cookie, which
-  could erase a newer rotated cookie from another replica. A refresh the
-  provider accepted (`2xx`) but whose response cannot be validated drops the
-  consumed refresh token instead of republishing and retrying it. Sessions too
-  large for one browser cookie are split across bounded `<cookie_name>.N`
-  chunk cookies, an over-cap session is refused at the callback with a named
-  error, and every session cookie carries `Max-Age` equal to its remaining
-  absolute lifetime. Callback/logout paths must be canonical request paths.
-  The per-source pending-login cap holds when the replay cache is full (beyond
-  one extra cache-worth of sealed-only flows, login starts answer `503`).
-  Discovery documents must carry the configured `issuer`, and their HTTPS
-  endpoints may now be cross-origin (Google, Microsoft Entra ID). Post-login
-  redirects are checked as origins (scheme, port, userinfo). Logout requires
-  `Sec-Fetch-Site: same-origin`/`none` for `GET`/`HEAD` and refuses cross-site
-  `POST`s (issue #6660). New `providers[].max_age_secs`,
-  `providers[].authorization_params`, and `providers[].forward_access_token`
-  options. Breaking changes are listed in the entry below.
-- **BREAKING — `oidc_relying_party` session context, logout, discovery, and
-  redirect admission** (issue/PR #6833). The session AEAD context no longer
-  binds presentation and admission settings, so existing sessions and in-flight
-  logins are invalidated once on upgrade. A logout `GET`/`HEAD` without
-  `Sec-Fetch-Site: same-origin` or `none` (including a cross-site link) and a
-  cross-site logout `POST` answer `403`. A discovery document whose `issuer` is
-  missing or differs from the configured `issuer` is refused. Non-canonical
-  `callback_path`/`logout_path` values and `trusted_redirect_hosts` entries
-  that are not a bare `host` / `host:port` are refused at admission, and a
-  host-only entry no longer admits a non-default port or a different scheme
-  than `redirect_uri`.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
