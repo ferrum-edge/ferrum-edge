@@ -100,7 +100,7 @@ fn h3_route_miss_delivers_to_global_access_logs_only_when_configured() {
 fn unrouted_summary_is_proxyless_and_names_the_routing_phase() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let start = source
-        .find("pub(crate) async fn log_unrouted_request(")
+        .find("pub async fn log_unrouted_request(")
         .expect("unrouted log helper");
     let body = &source[start..];
     let body = &body[..body.find("\n}\n").expect("helper end")];
