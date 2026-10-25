@@ -2569,6 +2569,25 @@ pub(crate) async fn hmac_consumer_candidate_errors(
         .unwrap_or_default())
 }
 
+/// Reject an admin Consumer/credential write whose `jwt` secret is already
+/// configured on another consumer in the namespace. `jwt_auth` picks the
+/// verifying Consumer from the signer-chosen identity claim, so a shared JWT
+/// secret lets each holder sign as the other. Snapshot-based like the HMAC
+/// check; only collisions involving this consumer are reported, so a
+/// pre-existing duplicate between two other Consumers (quarantined on load)
+/// does not block an unrelated write.
+pub(crate) async fn jwt_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
+        .validate_unique_jwt_credentials_for_consumers(&[consumer.id.as_str()])
+        .err()
+        .unwrap_or_default())
+}
+
 impl ValidationError {
     fn into_messages(self) -> Vec<String> {
         match self {
@@ -6017,6 +6036,13 @@ impl AdminResource for Consumer {
         if resource.has_credential("hmac_auth") {
             errors.extend(
                 hmac_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
+        }
+        if resource.has_credential("jwt") {
+            errors.extend(
+                jwt_consumer_candidate_errors(db, namespace, resource)
                     .await
                     .map_err(AfterValidateError::Db)?,
             );

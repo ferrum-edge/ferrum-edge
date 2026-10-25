@@ -3165,7 +3165,7 @@ who can read the database, a replica, or a backup file.
 |---|---|---|---|
 | `basicauth` | `hmac_sha256:<64 lowercase hex>`, derived under `FERRUM_BASIC_AUTH_HMAC_SECRET` | Verification only has to compare hashes | Nothing directly usable without the server-side HMAC secret |
 | `keyauth` | The API key verbatim | The presented key is matched against the stored key by indexed lookup | Every API key, immediately replayable against the gateway |
-| `jwt` | The HS256 shared secret verbatim | HS256 verification needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
+| `jwt` | The HMAC shared secret verbatim | HMAC verification (HS256/HS384/HS512) needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
 | `hmac_auth` | The shared secret verbatim | The request HMAC is recomputed from the secret | Every shared secret; the reader can forge accepted signatures |
 | `mtls_auth` | The certificate identity string only | Matching is on identity, not on a secret | No private key material — none is ever stored |
 
@@ -3195,7 +3195,7 @@ contains. See [Consumer credential redaction](admin_api.md#consumers) and
 
 ### `jwt_auth`
 
-Authenticates requests using HS256 JWT Bearer tokens matched against consumer credentials.
+Authenticates requests using HMAC-signed (HS256 by default, or HS384 / HS512) JWT Bearer tokens matched against consumer credentials.
 
 **Priority:** 1100
 
@@ -3209,16 +3209,46 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 | `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
 | `require_nbf` | Boolean | `false` | Require an `nbf` claim; when present, `nbf` is always validated |
 | `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
+| `algorithm` | String | `HS256` | HMAC algorithm every token on this instance must use: `HS256`, `HS384`, or `HS512`. Pinned by configuration and never taken from the token header; a token whose header names any other algorithm (another HMAC size, `none`, or an asymmetric algorithm) is rejected. RSA/EC/JWKS verification belongs to `jwks_auth` |
+| `hide_credentials` | Boolean | `false` | Remove the token-bearing location before proxying an authenticated request, including when another mechanism wins a multi-auth chain (the `key_auth` contract). For `header:Authorization` only a `Bearer` value is removed, so another scheme's credential on a shared route is left alone. Defaults to `false` so backends that re-verify the JWT keep receiving it; enable it whenever the backend does not need the token, and especially with a `query:<name>` lookup, where the token otherwise reaches backend access logs inside the URL |
 
 Registered claims are validated for shape as well as value. A present `iss` must be exactly one string (RFC 7519 §4.1.1): an array, object, number, boolean, or null `iss` is rejected with the generic `401` even when one array element matches a configured issuer, and even when no issuer is configured. `exp` is an RFC 7519 §2 NumericDate — a JSON number that may carry a fractional part — so a conforming fractional expiry bounds the authenticated stream exactly like an integer one; fractional `exp` seconds truncate toward the past, so the enforced expiry is never later than the one the token states. `nbf` presence and validation are delegated to the JWT validation layer, which decides them on its own terms; Ferrum does not normalize a fractional `nbf`.
 
-**Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:
+**Consumer credential** (`jwt`) — array. Each secret must contain at least 32 non-whitespace characters (and at most 4096):
 ```yaml
 credentials:
   jwt:
     - secret: "consumer-specific-hs256-secret-key-here"
     - secret: "new-secret-at-least-32-chars-long"
 ```
+
+Each Consumer needs its own JWT secret. The token's signer chooses the
+identity claim, so a secret configured on two Consumers would let a holder of
+it sign tokens as either one. Create, update, batch, restore, the credential
+endpoints, and file-mode config loading refuse a secret already configured on
+another Consumer in the same namespace (rotation entries within one Consumer
+may repeat, and separate namespaces may reuse a secret). A database-mode load,
+a CP snapshot or delta, and every runtime config swap quarantine stored JWT
+credentials that are weak, malformed, or shared: a shared secret is removed
+from **every** Consumer that holds it, because no holder is a trustworthy
+owner, and each quarantine is logged at `error`. Ownership counts every
+secret a Consumer stores, including one in an entry that is itself malformed
+or weak. A running gateway also remembers (as namespace-bound digests, at most
+4096 per namespace with the oldest forgotten first and a warning logged) every
+secret it has seen shared in an accepted configuration, including ones a
+database full load already stripped, so a later incremental change cannot
+reactivate it on one holder while the other holder is no longer visible. The
+memory is process-local: a restart, a control plane, and a data plane fed
+already-stripped snapshots judge only the current source, so give every
+Consumer that held a shared secret a new, distinct one. A changed Consumer carrying
+`jwt` makes database-mode and control-plane polling take a full reload. The verifier additionally
+never checks a signature against a stored secret below the 32 non-whitespace
+character floor. A token naming an unknown identity (or a Consumer with no
+usable secret) spends one discarded signature verification against a random,
+per-instance key, about the cost of one wrong-signature attempt against a
+real Consumer. This narrows, but does not fully remove, timing differences: a
+Consumer with several rotation secrets still costs one verification per
+secret.
 
 ### `key_auth`
 

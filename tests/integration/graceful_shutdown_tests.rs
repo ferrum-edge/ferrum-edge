@@ -131,6 +131,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig::default());
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies,
         consumers: vec![],
@@ -730,6 +731,7 @@ fn create_test_proxy_state_with_env(
     let dns_cache = DnsCache::new(DnsConfig::default());
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies,
         consumers: vec![],

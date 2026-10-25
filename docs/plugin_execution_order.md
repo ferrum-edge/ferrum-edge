@@ -1709,7 +1709,7 @@ Given all built-in plugins enabled, the execution order is:
 | 15 | `jwks_auth` | 1000 | authenticate, before_proxy |
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |
 | 17 | `oidc_relying_party` | 1075 | on_request_received, authenticate, before_proxy, after_proxy, apply_websocket_handshake_response_headers |
-| 18 | `jwt_auth` | 1100 | authenticate |
+| 18 | `jwt_auth` | 1100 | authenticate, before_proxy |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
 | 20 | `ldap_auth` | 1250 | authenticate, before_proxy |
 | 21 | `basic_auth` | 1300 | authenticate, before_proxy |

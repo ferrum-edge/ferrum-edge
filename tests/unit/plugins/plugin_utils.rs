@@ -103,7 +103,7 @@ pub fn create_test_consumer() -> Consumer {
     let mut jwt_creds = Map::new();
     jwt_creds.insert(
         "secret".to_string(),
-        Value::String("test-jwt-secret".to_string()),
+        Value::String("test-jwt-secret-0123456789abcdefghij".to_string()),
     );
     credentials.insert(
         "jwt".to_string(),
