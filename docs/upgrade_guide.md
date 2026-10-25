@@ -62,6 +62,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
   `body_validator.{request,response}_{outcome,status,detail}` metadata, and
   these keys are on the built-in log allowlist.
 
+### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
+
+In `aggregate_router` mode prompts, resources, and resource templates are now
+policy-gated. `policy.default_prompt_action` and
+`policy.default_resource_action` fall back to `policy.default_action`, whose
+default is `deny`, so a gateway that exposed prompts or resources with
+`default_action: deny` now lists and routes none of them. Allow them per item
+in `policy.prompts` / `policy.resources`, or set the family default to `allow`
+to keep the previous behavior. Aggregate-routed calls no longer carry the
+client's `Authorization`, `Proxy-Authorization`, `Cookie`, route credential
+headers, or query string to the upstream (the backend query is committed
+empty, and the header boundary is re-asserted after later header rules); set `servers.<id>.forward_client_credentials:
+true` for an upstream that must receive end-user tokens, or configure a
+service credential in `servers.<id>.headers`. A `discovery.on_schema_change:
+hide_until_configured` quarantine now holds across new sessions until the
+configuration changes. An aggregate `DELETE` without the session header now
+answers `400` instead of `200`. See [plugins.md](plugins.md#mcp_gateway).
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
