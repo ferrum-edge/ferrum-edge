@@ -62,6 +62,11 @@ const DEFAULT_SESSION_MAX_COOKIE_BYTES: u64 = 8000;
 /// minimum: every login answers 503 instead of the configuration being refused
 /// (issue #5029).
 const MIN_SESSION_MAX_COOKIE_BYTES: u64 = 1024;
+/// Upper bound on a sealed session or pending-flow value accepted on *read*:
+/// the largest `session.max_cookie_bytes` admission allows. The configured cap
+/// governs only what this generation issues, so lowering it on a reload keeps
+/// every value an earlier generation issued readable.
+const MAX_SESSION_COOKIE_READ_BYTES: usize = DEFAULT_SESSION_MAX_COOKIE_BYTES as usize;
 /// Largest complete session `Set-Cookie` line — `name=value` plus every
 /// attribute — the plugin emits.
 ///
@@ -816,21 +821,48 @@ impl RefreshFlightMap {
 /// (the leader was cancelled before publishing) frees the entry so followers
 /// re-elect exactly one replacement; a published leader sets `retain` so the
 /// completed record stays addressable for `REFRESH_FLIGHT_RETENTION`.
-/// `ptr_eq` ensures only our own slot is removed, never a newer leader's.
+/// `ptr_eq` ensures only our own slot is touched, never a newer leader's.
+///
+/// Re-election is only safe while the grant may not have reached the
+/// provider. Once the token endpoint answered `2xx`, `consumed_fallback` holds
+/// the state every holder of the spent token must adopt; a leader cancelled
+/// after that point (a client disconnect or gRPC deadline while the body,
+/// JWKS, or UserInfo is still being awaited) publishes it as a completed record
+/// instead of freeing the slot, so no follower can become a new leader and
+/// resubmit the consumed refresh token (PR6833-SOL-1).
 struct RefreshFlightCleanup<'a> {
     map: &'a RefreshFlightMap,
     key: [u8; 32],
     slot: Arc<RefreshFlightSlot>,
     retain: bool,
+    consumed_fallback: Option<RefreshFlightResult>,
 }
 
 impl Drop for RefreshFlightCleanup<'_> {
     fn drop(&mut self) {
-        if !self.retain {
-            self.map
-                .flights
-                .remove_if(&self.key, |_, existing| Arc::ptr_eq(existing, &self.slot));
+        if self.retain {
+            return;
         }
+        if let Some(result) = self.consumed_fallback.take() {
+            // The leader's sender is gone, so publish through a fresh,
+            // already-completed slot. Followers waiting on the old one see
+            // `LeaderGone`, re-join, and adopt this record.
+            let (_completed_tx, rx) =
+                watch::channel::<RefreshFlightValue>(Some(Arc::new(RefreshFlightRecord {
+                    completed_at: Instant::now(),
+                    result,
+                })));
+            let replacement = Arc::new(RefreshFlightSlot { rx });
+            if let Some(mut entry) = self.map.flights.get_mut(&self.key)
+                && Arc::ptr_eq(entry.value(), &self.slot)
+            {
+                *entry.value_mut() = replacement;
+            }
+            return;
+        }
+        self.map
+            .flights
+            .remove_if(&self.key, |_, existing| Arc::ptr_eq(existing, &self.slot));
     }
 }
 
@@ -1254,15 +1286,20 @@ impl OidcRelyingParty {
 
         let post_login_redirect_param =
             optional_behavior_string(behavior_obj, "post_login_redirect_param")?;
-        // `Url::host_str` lowercases a parsed DNS host, so entries are
-        // normalized the same way; a mixed-case entry used to match nothing.
-        // An entry may name an explicit port (`host:8443`); see
-        // `sanitize_redirect` for the origin rules.
+        // Entries are normalized to `host:effective-port` under the callback
+        // scheme, exactly as `sanitize_redirect` renders a target: DNS hosts
+        // lowercase, a host-only entry binds the scheme's default port, and an
+        // explicit `host:443` / `host:80` names that same default port
+        // (PR6833-SOL-4). Anything that is not a bare authority is refused.
+        let callback_scheme = Url::parse(&redirect_uri)
+            .map_err(|e| format!("oidc_relying_party: `redirect_uri` is invalid: {e}"))?
+            .scheme()
+            .to_string();
         let trusted_redirect_hosts =
             parse_behavior_string_array(behavior_obj, "trusted_redirect_hosts")?
-                .into_iter()
-                .map(|host| host.to_ascii_lowercase())
-                .collect::<Vec<_>>();
+                .iter()
+                .map(|entry| normalize_trusted_redirect_origin(entry, &callback_scheme))
+                .collect::<Result<Vec<_>, _>>()?;
         if post_login_redirect_param.is_some() && trusted_redirect_hosts.is_empty() {
             return Err("oidc_relying_party: `behavior.trusted_redirect_hosts` is required when `post_login_redirect_param` is set".to_string());
         }
@@ -2143,9 +2180,17 @@ impl OidcRelyingParty {
                         key: flight_key,
                         slot,
                         retain: false,
+                        consumed_fallback: None,
                     };
                     let (outcome, published) = match self
-                        .refresh_tokens(&discovery, &refresh_token, payload, now, proxy_hops)
+                        .refresh_tokens(
+                            &discovery,
+                            &refresh_token,
+                            payload,
+                            now,
+                            proxy_hops,
+                            &mut cleanup.consumed_fallback,
+                        )
                         .await
                     {
                         Ok(claims_refreshed) => {
@@ -2319,6 +2364,7 @@ impl OidcRelyingParty {
         payload: &mut SessionPayload,
         now: i64,
         proxy_hops: Option<u8>,
+        consumed_fallback: &mut Option<RefreshFlightResult>,
     ) -> Result<bool, RefreshFailure> {
         let params = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
@@ -2333,7 +2379,20 @@ impl OidcRelyingParty {
         }
         // From here on the provider has accepted the grant: the submitted
         // refresh token is spent (and, with rotation, already replaced), so no
-        // failure below may be retried with it.
+        // failure below may be retried with it. Arm the cancellation fallback
+        // before the first post-grant await: if this request is dropped while
+        // the body, JWKS, or UserInfo is pending, the flight publishes the
+        // session with its refresh token dropped instead of letting a follower
+        // resubmit the spent token.
+        let mut dropped = payload.clone();
+        dropped.refresh_token_b64 = None;
+        *consumed_fallback = Some(match self.seal_session_value(&dropped) {
+            Ok(sealed) => RefreshFlightResult::Rotated {
+                sealed,
+                claims_refreshed: false,
+            },
+            Err(_) => RefreshFlightResult::SpentCredential,
+        });
         self.adopt_refresh_response(discovery, response, payload, now, proxy_hops)
             .await
             .map_err(RefreshFailure::Consumed)
@@ -2594,11 +2653,13 @@ impl OidcRelyingParty {
     }
 
     fn open_pending_flow(&self, sealed: &str, expected_state: &str) -> Option<PendingFlowPayload> {
-        if sealed.is_empty() || sealed.len() > self.session.max_cookie_bytes {
+        // Read bound, not the issuance cap: a reload that lowers
+        // `max_cookie_bytes` must not fail logins already in flight.
+        if sealed.is_empty() || sealed.len() > MAX_SESSION_COOKIE_READ_BYTES {
             return None;
         }
         let bytes = self.session.pending_codec.open(sealed)?;
-        if bytes.len() > self.session.max_cookie_bytes {
+        if bytes.len() > MAX_SESSION_COOKIE_READ_BYTES {
             return None;
         }
         let payload: PendingFlowPayload = serde_json::from_slice(&bytes).ok()?;
@@ -2762,7 +2823,11 @@ impl OidcRelyingParty {
         if !(2..=MAX_SESSION_COOKIE_CHUNKS).contains(&count) {
             return None;
         }
-        let max = self.session.max_cookie_bytes;
+        // Bound reassembly by the largest value any admitted configuration can
+        // issue, not by this instance's issuance cap: lowering
+        // `max_cookie_bytes` on a reload must not invalidate sessions an
+        // earlier generation legitimately issued (PR6833-SOL-3).
+        let max = MAX_SESSION_COOKIE_READ_BYTES;
         if first_part.len() > max {
             return None;
         }
@@ -3083,9 +3148,10 @@ impl OidcRelyingParty {
     /// A target is trusted only as an origin, not just a host name (MUSE-6):
     /// it must use the same scheme as `redirect_uri` (so an `https` login can
     /// never be sent on to `http`), carry no userinfo, and match a
-    /// `behavior.trusted_redirect_hosts` entry by host *and* port — an entry
-    /// without a port admits only the scheme's default port, and `host:port`
-    /// admits exactly that port. Anything else lands on
+    /// `behavior.trusted_redirect_hosts` entry by host *and* effective port —
+    /// an entry without a port admits only the scheme's default port, and
+    /// `host:port` admits exactly that port (`host:443` is the same origin as
+    /// `host` under `https`). Anything else lands on
     /// `behavior.post_login_default_path`.
     fn sanitize_redirect(&self, original: &str) -> String {
         let fallback = || self.behavior.post_login_default_path.clone();
@@ -3104,17 +3170,12 @@ impl OidcRelyingParty {
         {
             return fallback();
         }
-        // `Url::port` is `None` for the scheme's default port.
-        let authority = match parsed.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
+        // Same `host:effective-port` form the allowlist was normalized to.
+        let Some(port) = parsed.port_or_known_default() else {
+            return fallback();
         };
-        if self
-            .behavior
-            .trusted_redirect_hosts
-            .iter()
-            .any(|trusted| *trusted == authority)
-        {
+        let authority = format!("{host}:{port}");
+        if self.behavior.trusted_redirect_hosts.contains(&authority) {
             original.to_string()
         } else {
             fallback()
@@ -4428,6 +4489,22 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
     }
 }
 
+/// Normalize one `behavior.trusted_redirect_hosts` entry (`host` or
+/// `host:port`) to `host:effective-port` under the callback scheme.
+fn normalize_trusted_redirect_origin(entry: &str, scheme: &str) -> Result<String, String> {
+    let invalid = || {
+        "oidc_relying_party: `behavior.trusted_redirect_hosts` entries must be `host` or `host:port`"
+            .to_string()
+    };
+    if entry.contains(['/', '?', '#', '@']) {
+        return Err(invalid());
+    }
+    let parsed = Url::parse(&format!("{scheme}://{entry}/")).map_err(|_| invalid())?;
+    let host = parsed.host_str().ok_or_else(invalid)?;
+    let port = parsed.port_or_known_default().ok_or_else(invalid)?;
+    Ok(format!("{host}:{port}"))
+}
+
 /// Parse `providers[].authorization_params`: static extra authorization-request
 /// parameters such as `prompt`, `acr_values`, or `login_hint` (MUSE-14).
 fn parse_authorization_params(
@@ -5409,6 +5486,7 @@ pub(crate) mod refresh_flight_test_seams {
                             key,
                             slot,
                             retain: false,
+                            consumed_fallback: None,
                         },
                     })
                 }

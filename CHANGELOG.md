@@ -158,12 +158,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Sec-Fetch-Site: same-origin`/`none` for `GET`/`HEAD` and refuses cross-site
   `POST`s (issue #6660). New `providers[].max_age_secs`,
   `providers[].authorization_params`, and `providers[].forward_access_token`
-  options. **Breaking:** the session context no longer binds presentation and
-  admission settings, so existing sessions and in-flight logins are
-  invalidated once on upgrade; GET logout links from other sites stop working;
-  discovery documents without a matching `issuer` and non-canonical
-  callback/logout paths are refused; `trusted_redirect_hosts` entries without a
-  port no longer admit non-default ports.
+  options. Breaking changes are listed in the entry below.
+- **BREAKING — `oidc_relying_party` session context, logout, discovery, and
+  redirect admission** (issue/PR #6833). The session AEAD context no longer
+  binds presentation and admission settings, so existing sessions and in-flight
+  logins are invalidated once on upgrade. A logout `GET`/`HEAD` without
+  `Sec-Fetch-Site: same-origin` or `none` (including a cross-site link) and a
+  cross-site logout `POST` answer `403`. A discovery document whose `issuer` is
+  missing or differs from the configured `issuer` is refused. Non-canonical
+  `callback_path`/`logout_path` values and `trusted_redirect_hosts` entries
+  that are not a bare `host` / `host:port` are refused at admission, and a
+  host-only entry no longer admits a non-default port or a different scheme
+  than `redirect_uri`.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

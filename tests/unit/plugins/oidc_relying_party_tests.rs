@@ -5584,22 +5584,51 @@ async fn callback_plugin_with(
 #[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn post_login_redirects_require_a_trusted_origin() {
-    for (target, expected) in [
+    const HOST_ONLY: &[&str] = &["App.Example.com"];
+    const DEFAULT_PORT: &[&str] = &["app.example.com:443"];
+    const OTHER_PORT: &[&str] = &["app.example.com:8443"];
+    for (trusted, target, expected) in [
         (
+            HOST_ONLY,
             "https://app.example.com/account",
             "https://app.example.com/account",
         ),
-        ("http://app.example.com/account", "/"),
-        ("https://app.example.com:9443/admin", "/"),
-        ("https://user@app.example.com/account", "/"),
+        (HOST_ONLY, "http://app.example.com/account", "/"),
+        (HOST_ONLY, "https://app.example.com:9443/admin", "/"),
+        (HOST_ONLY, "https://user@app.example.com/account", "/"),
         (
+            HOST_ONLY,
             "https://APP.example.com/account",
             "https://APP.example.com/account",
         ),
+        // An explicit default port is the same origin as the bare host, in
+        // both the allowlist entry and the target (PR6833-SOL-4).
+        (
+            HOST_ONLY,
+            "https://app.example.com:443/account",
+            "https://app.example.com:443/account",
+        ),
+        (
+            DEFAULT_PORT,
+            "https://app.example.com/account",
+            "https://app.example.com/account",
+        ),
+        (
+            DEFAULT_PORT,
+            "https://app.example.com:443/account",
+            "https://app.example.com:443/account",
+        ),
+        (DEFAULT_PORT, "https://app.example.com:8443/account", "/"),
+        (
+            OTHER_PORT,
+            "https://app.example.com:8443/admin",
+            "https://app.example.com:8443/admin",
+        ),
+        (OTHER_PORT, "https://app.example.com/admin", "/"),
     ] {
         let server = MockServer::start().await;
         let plugin = callback_plugin_with(&server, |config| {
-            config["behavior"]["trusted_redirect_hosts"] = json!(["App.Example.com"]);
+            config["behavior"]["trusted_redirect_hosts"] = json!(trusted);
         })
         .await;
         let mut ctx = html_ctx();
@@ -5617,9 +5646,143 @@ async fn post_login_redirects_require_a_trusted_origin() {
         assert_eq!(
             headers.get("location").map(String::as_str),
             Some(expected),
-            "rd={target}"
+            "trusted={trusted:?} rd={target}"
         );
     }
+}
+
+/// PR6833-SOL-4: an allowlist entry that is not a bare `host` / `host:port`
+/// authority is refused at admission instead of silently matching nothing.
+#[test]
+fn new_rejects_trusted_redirect_entries_that_are_not_authorities() {
+    for entry in [
+        "app.example.com/account",
+        "user@app.example.com",
+        "app.example.com?x=1",
+        "app.example.com:notaport",
+    ] {
+        let mut config = base_config();
+        config["behavior"]["trusted_redirect_hosts"] = json!([entry]);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("trusted_redirect_hosts entry {entry:?} must be rejected"));
+        assert!(error.contains("trusted_redirect_hosts"), "{entry}: {error}");
+    }
+    let mut config = base_config();
+    config["behavior"]["trusted_redirect_hosts"] = json!(["app.example.com:443", "[::1]:8443"]);
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
+
+/// PR6833-SOL-3: `max_cookie_bytes` bounds only what is issued. Lowering it on
+/// a reload keeps a chunked session larger than the new cap readable.
+#[tokio::test]
+async fn lowering_the_cookie_cap_keeps_existing_chunked_sessions() {
+    let original = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let now = chrono::Utc::now().timestamp();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &original,
+        json!({"sub": "alice", "exp": now + 3600, "groups": "g".repeat(3500)}),
+        false,
+    )
+    .expect("session seals");
+    let header = browser_cookie_header(&set_cookie);
+    assert!(
+        header.len() > 4000,
+        "the fixture must exceed the lowered cap: {}",
+        header.len()
+    );
+
+    let mut lowered = base_config();
+    lowered["session"]["max_cookie_bytes"] = json!(4000);
+    let reloaded =
+        OidcRelyingParty::new(&lowered, PluginHttpClient::default()).expect("valid oidc config");
+    let mut ctx = api_ctx_with_cookie_header(&header);
+    assert_continue(
+        reloaded
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+}
+
+/// PR6833-SOL-1: a leader cancelled after the provider answered `2xx` (here
+/// while the JWKS keys for the refreshed ID token are still being fetched)
+/// must publish the dropped-token state, so the next request carrying the
+/// spent token adopts it instead of becoming a new leader and resubmitting.
+#[tokio::test]
+async fn cancelled_leader_after_an_accepted_refresh_never_resubmits_the_spent_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(json!({"keys": []})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "id_token": "refreshed-id-token-awaiting-jwks",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+    let mut config = refresh_config(&format!("{}/token", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "cancelled@example.test",
+            "exp": now + 3600
+        }),
+        Some("original-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    // The leader posts the grant, receives the 2xx, then blocks on JWKS and is
+    // dropped by the deadline. (If a reused wiremock address left keys cached,
+    // it completes instead; either way the token must be spent exactly once.)
+    let mut cancelled = session_ctx(&cookie);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(1500),
+        plugin.authenticate(&mut cancelled, &consumer_index),
+    )
+    .await;
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        token_endpoint_requests(&requests),
+        1,
+        "the leader reached the token endpoint before it was cancelled"
+    );
+
+    let mut follower = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut follower, &consumer_index).await);
+    let adopted = rolling_cookie(&plugin, &mut follower)
+        .await
+        .expect("the follower adopts the published dropped-token session");
+    let payload = oidc_open_session_cookie_for_test(&plugin, &adopted).expect("cookie opens");
+    assert_eq!(payload["refresh_token_b64"], json!(null));
+    assert_eq!(payload["access_token_b64"], json!("test-access-token"));
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        token_endpoint_requests(&requests),
+        1,
+        "a consumed refresh token must never be resubmitted after cancellation"
+    );
 }
 
 /// MUSE-14: static authorization parameters and `max_age` are sent with the

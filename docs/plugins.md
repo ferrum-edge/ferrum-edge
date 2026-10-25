@@ -2914,7 +2914,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `behavior.state_cache_max_entries` | u64 | Per-instance pending-login replay cache size (default: `10000`); when full, logins continue as sealed-only flows up to one more cache-worth, then answer `503`; does not block cross-replica callbacks |
 | `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`), enforced even when the replay cache is full |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
-| `behavior.trusted_redirect_hosts` | String[] | Origins allowed for post-login redirects, as `host` (default port only) or `host:port`, case-insensitive; the target must also use `redirect_uri`'s scheme and carry no userinfo |
+| `behavior.trusted_redirect_hosts` | String[] | Origins allowed for post-login redirects, as `host` (default port only) or `host:port` (`host:443` equals `host` under `https`), case-insensitive; other shapes are rejected. The target must also use `redirect_uri`'s scheme and carry no userinfo |
 
 `session.encryption_secret` and `session.encryption_secret_previous` are checked
 at admission (Admin API create/update, batch, restore, and file/database config

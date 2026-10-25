@@ -24680,7 +24680,7 @@ components:
               default: 8000
               minimum: 1024
               maximum: 8000
-              description: Maximum encoded size of the sealed session value and of sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes. A session whose complete Set-Cookie line would exceed 4000 bytes is split across `<cookie_name>.0`…`<cookie_name>.N` chunk cookies (at most 9) that each fit a browser cookie; a session above this cap is refused at the callback with a named error instead of being emitted. Every session cookie carries Max-Age equal to the remaining absolute session lifetime. Not part of the session context, so changing it does not invalidate existing sessions.
+              description: Maximum encoded size of the sealed session value and of sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes. A session whose complete Set-Cookie line would exceed 4000 bytes is split across `<cookie_name>.0`…`<cookie_name>.N` chunk cookies (at most 9) that each fit a browser cookie; a session above this cap is refused at the callback with a named error instead of being emitted. Every session cookie carries Max-Age equal to the remaining absolute session lifetime. Not part of the session context, and it bounds only what is issued: existing sessions and in-flight logins up to the 8000-byte admission maximum stay readable after it is lowered.
             secure:
               type: boolean
               default: true
@@ -24748,7 +24748,7 @@ components:
               items:
                 type: string
                 minLength: 1
-              description: Origins a post-login redirect may target, as `host` (scheme default port only) or `host:port`; compared case-insensitively. A target must also use redirect_uri's scheme and carry no userinfo; anything else lands on post_login_default_path.
+              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo; anything else lands on post_login_default_path.
             refresh_skew_secs:
               type: integer
               format: uint64

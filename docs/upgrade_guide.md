@@ -28,6 +28,28 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `oidc_relying_party` session context, logout, discovery, and redirects (PR #6833)
+
+- **Users sign in again once.** The session and pending-login encryption
+  context now covers only what a session asserts, so every cookie issued by the
+  previous release is refused and the browser is sent through login. After the
+  upgrade, changing presentation or admission settings (challenge statuses,
+  redirect allowlist, cache sizes, logout settings, `max_cookie_bytes`) no
+  longer signs users out.
+- **Logout needs a same-origin request.** Link to `logout_path` from pages on
+  the same origin or submit a same-origin `POST`. A `GET`/`HEAD` without
+  `Sec-Fetch-Site: same-origin` or `none`, or a cross-site `POST`, now answers
+  `403` and changes nothing; non-browser clients should `POST`.
+- **Discovery must report the configured issuer.** Set `providers[].issuer` to
+  exactly the `issuer` member of the discovery document (including any trailing
+  slash). HTTPS endpoints on other origins are now accepted.
+- **Paths and redirect entries are validated.** `callback_path` and
+  `logout_path` must be canonical request paths (no percent-escapes, `//`, dot
+  segments, or backslashes); update `redirect_uri` to match.
+  `trusted_redirect_hosts` entries must be `host` or `host:port`; list
+  `host:8443` explicitly for a non-default port, and keep the redirect target
+  on `redirect_uri`'s scheme.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
