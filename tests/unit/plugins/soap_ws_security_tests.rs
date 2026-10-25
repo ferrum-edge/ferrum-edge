@@ -11518,6 +11518,52 @@ async fn oversized_namespace_markup_is_refused_before_parsing() {
     }
 }
 
+/// A start tag that never terminates is not "within bounds" just because the
+/// screen cannot frame it: the parser tokenizes (and duplicate-checks) every
+/// declaration of such a tag before it discovers the missing `>` at end of
+/// input. Every unterminated construct is refused before parsing, with the
+/// parser's own end-of-input category.
+#[tokio::test]
+async fn unterminated_markup_is_refused_before_parsing() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let prefix =
+        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>"#;
+    let declarations: String = (0..300)
+        .map(|index| format!(r#" xmlns:p{index}="urn:{index:0>2000}""#))
+        .collect();
+    let long_uri = "A".repeat(3_000);
+    for (label, body) in [
+        (
+            "unterminated tag with many long declarations",
+            format!("{prefix}<Item{declarations}"),
+        ),
+        (
+            "unterminated attribute quote",
+            format!(r#"{prefix}<Item xmlns:p="urn:{long_uri}"#),
+        ),
+        ("unterminated comment", format!("{prefix}<!-- never closed")),
+        (
+            "unterminated CDATA",
+            format!("{prefix}<Item><![CDATA[ never closed"),
+        ),
+        (
+            "unterminated processing instruction",
+            format!("{prefix}<?pi never closed"),
+        ),
+        ("trailing open bracket", format!("{prefix}<")),
+    ] {
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), 400, "{label}");
+        assert!(
+            reject_body(&result).contains("document ended before markup was complete"),
+            "{label}: got {}",
+            reject_body(&result)
+        );
+    }
+}
+
 /// The ceilings sit far above real messages: a URI of exactly 2048 bytes and
 /// an element with exactly 256 attributes are still accepted, as is markup
 /// that merely looks oversized inside a comment or CDATA section.

@@ -425,7 +425,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     XML parser runs: at most 256 attributes per start tag (namespace
     declarations included), 256-byte attribute names / namespace prefixes,
     and 2048-byte namespace URIs. Larger markup is refused with `400`
-    (`xml_namespace_bounds`).
+    (`xml_namespace_bounds`), and a start tag, comment, CDATA section,
+    processing instruction, or quote that never terminates is refused as
+    malformed by the same pre-parse scan.
   - **Linear-time MTOM boundary search** (`memchr::memmem`) replaces a
     window search that was O(body × boundary) on near-match payloads.
 - **`soap_ws_security` correctness and interop.**

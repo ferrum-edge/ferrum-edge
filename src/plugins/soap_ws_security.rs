@@ -451,7 +451,7 @@ const MIN_NAMESPACE_SCAN_BUDGET: usize = 4_194_304;
 
 /// Hard ceilings on governed-envelope markup that namespace processing scales
 /// with, enforced over the raw envelope before it is parsed (see
-/// [`raw_markup_within_namespace_bounds`]).
+/// [`screen_raw_namespace_markup`]).
 ///
 /// Every namespace prefix, namespace URI, and attribute name is
 /// caller-chosen, and the parser's own duplicate-attribute check and every
@@ -5371,12 +5371,26 @@ impl SoapWsSecurity {
         // the parser's own duplicate-attribute check is quadratic in a tag's
         // attributes and compares their namespace URIs, so a ceiling applied
         // after parsing would protect canonicalization but not the parse.
-        if !raw_markup_within_namespace_bounds(envelope) {
-            return Err(SoapRejection::new(
-                400,
-                "SOAP request exceeds the supported XML namespace and attribute bounds",
-                "xml_namespace_bounds",
-            ));
+        match screen_raw_namespace_markup(envelope) {
+            RawMarkupScreen::Within => {}
+            RawMarkupScreen::Exceeded => {
+                return Err(SoapRejection::new(
+                    400,
+                    "SOAP request exceeds the supported XML namespace and attribute bounds",
+                    "xml_namespace_bounds",
+                ));
+            }
+            // Same fixed category and failure class the parser reports for
+            // markup that ends before it is complete, refused before the
+            // parser can tokenize an unbounded unterminated tag.
+            RawMarkupScreen::Unframed => {
+                return Err(SoapRejection::new(
+                    400,
+                    "WS-Security: malformed or overly complex SOAP XML: document ended before \
+                     markup was complete",
+                    "malformed_xml",
+                ));
+            }
         }
 
         // One bounded parse for the whole message. Every structural selection
@@ -7422,7 +7436,19 @@ pub(crate) fn count_raw_id_occurrences(xml: &str, ids: &[&str]) -> Result<Vec<us
     Ok(counts)
 }
 
-/// Whether every start tag in the raw envelope stays within
+/// Outcome of [`screen_raw_namespace_markup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawMarkupScreen {
+    /// Every start tag is framed and within every ceiling.
+    Within,
+    /// A framed start tag exceeds a ceiling.
+    Exceeded,
+    /// A start tag, comment, CDATA section, processing instruction, or
+    /// declaration never terminates (including an unbalanced attribute quote).
+    Unframed,
+}
+
+/// Screen every start tag in the raw envelope against
 /// [`MAX_ATTRIBUTES_PER_ELEMENT`] attributes, [`MAX_ATTRIBUTE_NAME_BYTES`] per
 /// attribute name, and — for an `xmlns` / `xmlns:prefix` declaration —
 /// [`MAX_NAMESPACE_URI_BYTES`] of declared URI.
@@ -7431,30 +7457,36 @@ pub(crate) fn count_raw_id_occurrences(xml: &str, ids: &[&str]) -> Result<Vec<us
 /// (comments, CDATA, processing instructions, and declarations are skipped as
 /// non-element spans; attribute values are quote-aware). Lengths are raw
 /// bytes, which can only over-state a value that uses character references, so
-/// the ceiling is conservative. A construct this scan cannot frame (an
-/// unterminated tag, comment, CDATA section, or quote) ends the scan as
-/// "within bounds": the same bytes are not well-formed XML, so the parser that
-/// runs next refuses them with its own fixed category.
-fn raw_markup_within_namespace_bounds(xml: &str) -> bool {
+/// the ceiling is conservative.
+///
+/// A construct the scan cannot frame is [`RawMarkupScreen::Unframed`], never
+/// "within bounds". The bytes are not well-formed XML, but the parser only
+/// discovers that at end of input — after it has tokenized, and checked for
+/// duplicates, every attribute and namespace declaration of an unterminated
+/// tag. Letting such a tag through would hand the parser exactly the
+/// unbounded tag the ceilings exist to refuse. Well-formed XML always frames:
+/// `<` cannot appear unescaped in character data or attribute values, so every
+/// `<` this scan meets opens markup the parser would also see.
+fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
     let mut search_from = 0usize;
     while let Some(rel) = xml.get(search_from..).and_then(|rest| rest.find('<')) {
         let tag_start = search_from + rel;
         match xml.as_bytes().get(tag_start + 1) {
-            None => return true,
+            None => return RawMarkupScreen::Unframed,
             Some(b'/') => {
                 search_from = tag_start + 1;
                 continue;
             }
             Some(b'!') => {
                 let Ok(next) = skip_markup_declaration(xml, tag_start) else {
-                    return true;
+                    return RawMarkupScreen::Unframed;
                 };
                 search_from = next;
                 continue;
             }
             Some(b'?') => {
                 let Ok(next) = skip_processing_instruction(xml, tag_start) else {
-                    return true;
+                    return RawMarkupScreen::Unframed;
                 };
                 search_from = next;
                 continue;
@@ -7462,10 +7494,10 @@ fn raw_markup_within_namespace_bounds(xml: &str) -> bool {
             Some(_) => {}
         }
         let Some(tag_end_rel) = find_start_tag_end(xml, tag_start) else {
-            return true;
+            return RawMarkupScreen::Unframed;
         };
         let Some(tag) = xml.get(tag_start + 1..tag_start + tag_end_rel) else {
-            return true;
+            return RawMarkupScreen::Unframed;
         };
         let mut attributes = 0usize;
         let exceeded = scan_tag_attributes(tag, |name, value| {
@@ -7476,11 +7508,11 @@ fn raw_markup_within_namespace_bounds(xml: &str) -> bool {
                 || (declares_namespace && value.len() > MAX_NAMESPACE_URI_BYTES)
         });
         if exceeded {
-            return false;
+            return RawMarkupScreen::Exceeded;
         }
         search_from = tag_start + tag_end_rel + 1;
     }
-    true
+    RawMarkupScreen::Within
 }
 
 fn skip_markup_declaration(xml: &str, tag_start: usize) -> Result<usize, String> {
