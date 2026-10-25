@@ -9992,6 +9992,14 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": ["::/0", "2001:db8::1/128"]}),
         json!({"allow": ["::ffff:127.0.0.1/96", "::ffff:127.0.0.1/128"]}),
         json!({"allow": [" [::1] ", " fe80::1%eth0/64 "]}),
+        // Compressed IPv6 with an embedded dotted IPv4 tail after a hextet.
+        json!({"allow": ["2001:db8::1:192.0.2.1", "[2001:db8::1:192.0.2.1]/64"]}),
+        json!({"allow": ["::1:192.0.2.1", "1:2:3:4:5::192.0.2.1"]}),
+        // Alternative spellings of IPv4-mapped IPv6 at /96 and /128.
+        json!({"allow": ["0::ffff:c000:201/96", "0::ffff:c000:201/128"]}),
+        json!({"allow": ["[0::ffff:c000:201]/96", "0:0:0:0:0:ffff::/96"]}),
+        json!({"allow": ["0::ffff:192.0.2.1/128", "::0:ffff:192.0.2.1/96"]}),
+        json!({"allow": ["[fe80::1%eth0]/64", "fe80::1%25"]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, true);
         assert!(
@@ -10020,6 +10028,26 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": ["::ffff:127.0.0.1/95"]}),
         json!({"allow": ["010.1.2.3"]}),
         json!({"allow": ["+10.1.2.3"]}),
+        // Mapped IPv6 below /96 in spellings other than `::ffff:`.
+        json!({"deny": ["0::ffff:c000:201/64"]}),
+        json!({"deny": ["[0::ffff:c000:201]/95"]}),
+        json!({"deny": ["0:0:0:0:0:ffff::/64"]}),
+        json!({"deny": ["0:0::ffff:c000:201/0"]}),
+        json!({"deny": ["::0:ffff:192.0.2.1/95"]}),
+        // No room for a dotted tail after six hextets and `::`.
+        json!({"allow": ["1:2:3:4:5:6::192.0.2.1"]}),
+        // Non-canonical CIDR prefixes.
+        json!({"allow": ["10.0.0.0/08"]}),
+        json!({"allow": ["10.0.0.0/+8"]}),
+        json!({"allow": ["0.0.0.0/00"]}),
+        json!({"allow": ["::ffff:192.0.2.0/096"]}),
+        json!({"allow": ["2001:db8::/032"]}),
+        // Empty or malformed IPv6 zones.
+        json!({"allow": ["fe80::1%"]}),
+        json!({"allow": ["[fe80::1%]"]}),
+        json!({"allow": ["fe80::1%/64"]}),
+        json!({"allow": ["fe80::1%a b"]}),
+        json!({"allow": ["fe80::1%a]"]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
         assert!(

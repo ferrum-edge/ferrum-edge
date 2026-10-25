@@ -5111,6 +5111,38 @@ pub mod _test_support {
         }
     }
 
+    /// Drive the production frontend-DTLS plugin-rejection summary path: the
+    /// same attribution snapshot and emission the DTLS accept handler runs
+    /// when its `on_stream_connect` chain rejects. Returns whether a summary
+    /// was emitted.
+    pub async fn emit_dtls_plugin_rejection_summary_for_test(
+        plugins: Vec<Arc<dyn Plugin>>,
+        proxy: &crate::config::types::Proxy,
+        ctx: &crate::plugins::StreamConnectionContext,
+        client_ip: &str,
+        listen_port: u16,
+    ) -> bool {
+        let progress = crate::proxy::udp_proxy::dtls_plugin_rejection_progress(
+            Arc::new(plugins),
+            proxy.name.as_deref(),
+            proxy.effective_scheme(),
+            format!("{}:{}", proxy.backend_host, proxy.backend_port),
+            ctx,
+        );
+        crate::proxy::udp_proxy::emit_dtls_plugin_rejection_summary(
+            progress,
+            crate::proxy::udp_proxy::DtlsPluginRejection {
+                namespace: &proxy.namespace,
+                proxy_id: &proxy.id,
+                client_ip,
+                listen_port,
+                connected_wall_at: chrono::Utc::now(),
+                duration_ms: 0.0,
+            },
+        )
+        .await
+    }
+
     /// The production wrapper that decides whether a stream-setup DNS resolve
     /// failure becomes a typed `StreamSetupKind::DnsLookup` or stays an
     /// untyped gateway-side egress-policy denial.
