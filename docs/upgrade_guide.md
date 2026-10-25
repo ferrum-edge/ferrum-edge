@@ -197,6 +197,36 @@ answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
 
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
+
 ### Backend idle connections: higher default ceiling (#6793)
 
 `FERRUM_POOL_MAX_IDLE_PER_HOST` now defaults to `256` (was `64`). No configuration change is required. The ceiling reserves nothing: each backend keeps only the connections its own concurrent requests opened, and the direct HTTP/1.1 pool now reuses the most recently returned connection first, so connections left over from a burst close after `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`. A backend whose sustained concurrency exceeded 64 (up to 256) now keeps those connections instead of having them dropped and redialed; for higher sustained concurrency per backend, raise the ceiling up to `1024`. If a backend caps its own accepted connections, or the gateway runs under a tight `ulimit -n`, size that limit for the backend's peak concurrency, or set `FERRUM_POOL_MAX_IDLE_PER_HOST=64` to keep the previous behavior. The new `ferrum_connection_pool_h1_*` metrics show idle connections, dials, reuse, and evictions.

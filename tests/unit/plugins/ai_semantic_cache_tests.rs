@@ -11,7 +11,7 @@ use ferrum_edge::_test_support::{
     ai_semantic_cache_instance_id_for_test, ai_semantic_cache_maintenance_committed_for_test,
     ai_semantic_cache_maintenance_handle_count_for_test,
     ai_semantic_cache_maintenance_staged_for_test, ai_semantic_cache_notify_cleanup_for_test,
-    ai_semantic_cache_redis_quarantine_cap_for_test,
+    ai_semantic_cache_redis_hit_verdict_for_test, ai_semantic_cache_redis_quarantine_cap_for_test,
     ai_semantic_cache_redis_quarantine_delete_failures_for_test,
     ai_semantic_cache_redis_quarantine_dial_permits_for_test,
     ai_semantic_cache_redis_quarantine_fingerprint_content_for_test,
@@ -32,7 +32,7 @@ use ferrum_edge::_test_support::{
     ai_semantic_cache_vector_snapshot_accounted_bytes_for_test,
     apply_buffered_request_body_normalization_before_before_proxy_for_test,
     rebuild_ai_semantic_cache_vector_index, set_ai_semantic_cache_embedding,
-    set_ai_semantic_cache_scope_key,
+    set_ai_semantic_cache_scope_key, set_response_presentation_policy_digest_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::config::{BackendAllowIps, PoolConfig};
@@ -55,6 +55,20 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+// Marker `ai_federation` records once a provider returned response headers
+// (mirrors the `pub(crate)` `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`).
+const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str = "ferrum:external_operation_completed";
+
+// Marker `ai_federation` records only when the provider's original response
+// headers allowed shared-cache retention (mirrors the `pub(crate)`
+// `ai_federation::PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY`).
+const PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY: &str = "ferrum:provider_response_retainable";
+
+/// Static response-presentation policy digest every test context carries, as
+/// the protocol entry paths copy it from the request's plugin-cache view. A
+/// context without one has an unprovable policy and bypasses the cache.
+const TEST_PRESENTATION_POLICY_DIGEST: [u8; 32] = [0x5c; 32];
 
 fn semantic_request_body() -> Value {
     json!({
@@ -211,6 +225,10 @@ async fn run_lookup_get_status(
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx.metadata
         .insert("request_body".to_string(), body_str.to_string());
     if let Some(c) = consumer {
@@ -234,6 +252,10 @@ async fn run_lookup(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata
         .insert("request_body".to_string(), body_str.to_string());
@@ -259,6 +281,10 @@ async fn store_response(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata
         .insert("request_body".to_string(), body_str.to_string());
@@ -613,6 +639,10 @@ async fn provider_managed_contexts_bypass_lookup_and_staging() {
             "cached_content",
             json!({"contents": [{"parts": [{"text": "Hello"}]}]}),
         ),
+        (
+            "conversation_id",
+            json!({"model": "command-r", "message": "Hello"}),
+        ),
     ] {
         for context in [
             json!("context-a"),
@@ -756,6 +786,10 @@ async fn normalize_semantic_cache_request(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
@@ -1522,6 +1556,10 @@ async fn test_response_buffering_only_for_cache_misses() {
         "GET".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut get_ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     let mut get_headers = HashMap::new();
     get_headers.insert("content-type".to_string(), "application/json".to_string());
     let result = drive_cache_lookup(&plugin, &mut get_ctx, &get_headers).await;
@@ -1532,6 +1570,10 @@ async fn test_response_buffering_only_for_cache_misses() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut json_post_ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     json_post_ctx.metadata.insert(
         "request_body".to_string(),
@@ -1557,6 +1599,10 @@ async fn test_response_buffering_releases_streaming_ai_responses() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -1612,6 +1658,10 @@ async fn test_cache_miss_then_hit() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx1.metadata
         .insert("request_body".to_string(), body_str.clone());
     let mut headers1 = HashMap::new();
@@ -1636,6 +1686,10 @@ async fn test_cache_miss_then_hit() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx2.metadata
         .insert("request_body".to_string(), body_str.clone());
@@ -1737,6 +1791,10 @@ async fn synthetic_short_circuit_2xx_is_not_stored_in_semantic_cache() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx1.metadata
         .insert("request_body".to_string(), body_str.clone());
     let mut headers1 = HashMap::new();
@@ -1780,6 +1838,10 @@ async fn synthetic_short_circuit_2xx_is_not_stored_in_semantic_cache() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx2.metadata
         .insert("request_body".to_string(), body_str.clone());
     let mut headers2 = HashMap::new();
@@ -1814,6 +1876,10 @@ async fn genuine_backend_response_is_still_stored_without_synthetic_marker() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx1.metadata
         .insert("request_body".to_string(), body_str.clone());
     let mut headers1 = HashMap::new();
@@ -1841,6 +1907,10 @@ async fn genuine_backend_response_is_still_stored_without_synthetic_marker() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx2.metadata
         .insert("request_body".to_string(), body_str.clone());
@@ -2265,6 +2335,10 @@ async fn test_semantic_similarity_hit_after_exact_miss() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&body2).unwrap(),
@@ -2338,6 +2412,10 @@ async fn test_semantic_embedding_failure_falls_back_to_miss() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -2526,6 +2604,10 @@ async fn test_semantic_similarity_respects_consumer_scope() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&body2).unwrap(),
@@ -2557,6 +2639,10 @@ async fn test_different_prompts_no_cache_hit() {
         "POST".to_string(),
         "/chat".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx1.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&body1).unwrap(),
@@ -2580,6 +2666,10 @@ async fn test_different_prompts_no_cache_hit() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/chat".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx2.metadata.insert(
         "request_body".to_string(),
@@ -2608,6 +2698,10 @@ async fn test_exact_key_preserves_case_and_whitespace() {
         "POST".to_string(),
         "/chat".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx1.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&body1).unwrap(),
@@ -2631,6 +2725,10 @@ async fn test_exact_key_preserves_case_and_whitespace() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/chat".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx2.metadata.insert(
         "request_body".to_string(),
@@ -2798,6 +2896,10 @@ async fn test_different_model_no_cache_hit() {
         "POST".to_string(),
         "/chat".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx1.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&body1).unwrap(),
@@ -2822,6 +2924,10 @@ async fn test_different_model_no_cache_hit() {
         "POST".to_string(),
         "/chat".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx2.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&body2).unwrap(),
@@ -2841,6 +2947,10 @@ async fn test_different_model_no_cache_hit() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/chat".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx3,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx3.metadata.insert(
         "request_body".to_string(),
@@ -2866,6 +2976,10 @@ async fn test_get_request_skipped() {
         "GET".to_string(),
         "/chat".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     let headers = HashMap::new();
 
     let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
@@ -2882,6 +2996,10 @@ async fn test_non_json_skipped() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/chat".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/plain".to_string());
@@ -2903,6 +3021,10 @@ async fn test_error_response_not_cached() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/chat".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -3064,11 +3186,17 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
     });
     let body_str = serde_json::to_string(&body_json).unwrap();
 
-    // First request — cache MISS, store response with a Set-Cookie / Auth header.
+    // First request — cache MISS, store response with an Authorization header.
+    // (A `Set-Cookie` response is not retained at all; see
+    // `response_retention_directives_and_set_cookie_are_never_stored`.)
     let mut ctx1 = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx1.metadata
         .insert("request_body".to_string(), body_str.clone());
@@ -3078,10 +3206,6 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
 
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
-    response_headers.insert(
-        "Set-Cookie".to_string(),
-        "session=user-A-secret".to_string(),
-    );
     response_headers.insert(
         "authorization".to_string(),
         "Bearer user-A-token".to_string(),
@@ -3101,6 +3225,10 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
         "203.0.113.99".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx2.metadata
         .insert("request_body".to_string(), body_str.clone());
@@ -3155,6 +3283,10 @@ async fn test_ietf_ratelimit_headers_not_replayed_on_cache_hit() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx1,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx1.metadata
         .insert("request_body".to_string(), body_str.clone());
     let mut req = HashMap::new();
@@ -3175,6 +3307,10 @@ async fn test_ietf_ratelimit_headers_not_replayed_on_cache_hit() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx2.metadata.insert("request_body".to_string(), body_str);
     let result = drive_cache_lookup(&plugin, &mut ctx2, &req).await;
@@ -3934,6 +4070,10 @@ async fn store_with_cache_key(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata
         .insert(staging_key(plugin, "cache_key"), cache_key.to_string());
@@ -4837,9 +4977,10 @@ async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
 #[tokio::test]
 async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     let mock_server = MockServer::start().await;
-    // Three embedding requests per original provider family, plus the staged
-    // and lookup requests for the cross-conversation Cohere isolation case.
-    mount_embedding_mock(&mock_server, 11).await;
+    // Three embedding requests per provider family. The Cohere
+    // `conversation_id` requests bypass before any embedding call, because a
+    // persisted conversation is provider-managed state.
+    mount_embedding_mock(&mock_server, 9).await;
     let plugin = make_plugin(semantic_config(&mock_server));
 
     let cohere1 = json!({
@@ -4898,7 +5039,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
             None
         )
         .await,
-        "Cohere semantic cache must not cross conversation_id scopes"
+        "Cohere conversation_id requests must never be answered from the cache"
     );
 
     let tgi1 = json!({
@@ -5203,6 +5344,10 @@ async fn run_two_instance_miss_store_semantic_hit(exact_first: bool) {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx.metadata
         .insert("request_body".to_string(), body1_str.clone());
     let mut headers = HashMap::new();
@@ -5353,6 +5498,10 @@ async fn reject_bypass_clears_only_current_instance_staging() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata.insert("request_body".to_string(), body_str);
     let mut headers = HashMap::new();
@@ -5745,6 +5894,10 @@ async fn distinct_request_paths_do_not_collide_within_one_proxy() {
             "POST".to_string(),
             path.to_string(),
         );
+        set_response_presentation_policy_digest_for_test(
+            &mut ctx,
+            Some(TEST_PRESENTATION_POLICY_DIGEST),
+        );
         ctx.matched_proxy = Some(Arc::clone(proxy));
         ctx.metadata
             .insert("request_body".to_string(), body_str.to_string());
@@ -5923,6 +6076,10 @@ async fn identical_semantic_misses_coalesce_to_one_embedding_call() {
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
             );
+            set_response_presentation_policy_digest_for_test(
+                &mut ctx,
+                Some(TEST_PRESENTATION_POLICY_DIGEST),
+            );
             ctx.matched_proxy = Some(proxy);
             ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
@@ -5974,6 +6131,10 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
             "POST".to_string(),
             "/v1/chat/completions".to_string(),
         );
+        set_response_presentation_policy_digest_for_test(
+            &mut ctx,
+            Some(TEST_PRESENTATION_POLICY_DIGEST),
+        );
         ctx.matched_proxy = Some(proxy_leader);
         ctx.metadata.insert("request_body".to_string(), body_leader);
         let mut headers = HashMap::new();
@@ -5995,6 +6156,10 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
                 "127.0.0.1".to_string(),
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
+            );
+            set_response_presentation_policy_digest_for_test(
+                &mut ctx,
+                Some(TEST_PRESENTATION_POLICY_DIGEST),
             );
             ctx.matched_proxy = Some(proxy);
             ctx.metadata.insert("request_body".to_string(), body_str);
@@ -6050,6 +6215,10 @@ async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
             );
+            set_response_presentation_policy_digest_for_test(
+                &mut ctx,
+                Some(TEST_PRESENTATION_POLICY_DIGEST),
+            );
             ctx.matched_proxy = Some(proxy);
             ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
@@ -6097,6 +6266,10 @@ async fn high_cardinality_distinct_misses_are_semaphore_bounded() {
                 "127.0.0.1".to_string(),
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
+            );
+            set_response_presentation_policy_digest_for_test(
+                &mut ctx,
+                Some(TEST_PRESENTATION_POLICY_DIGEST),
             );
             ctx.matched_proxy = Some(proxy);
             ctx.metadata.insert("request_body".to_string(), body_str);
@@ -6155,6 +6328,10 @@ async fn embedding_semaphore_admission_wait_is_bounded() {
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
             );
+            set_response_presentation_policy_digest_for_test(
+                &mut ctx,
+                Some(TEST_PRESENTATION_POLICY_DIGEST),
+            );
             ctx.matched_proxy = Some(proxy);
             ctx.metadata.insert(
                 "request_body".to_string(),
@@ -6189,6 +6366,10 @@ async fn route_rewrite_and_effective_upstream_isolate_cache_entries() {
             "127.0.0.1".to_string(),
             "POST".to_string(),
             path.to_string(),
+        );
+        set_response_presentation_policy_digest_for_test(
+            &mut ctx,
+            Some(TEST_PRESENTATION_POLICY_DIGEST),
         );
         ctx.matched_proxy = Some(Arc::clone(proxy));
         if let Some(upstream) = upstream {
@@ -6568,6 +6749,10 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.metadata
         .insert("request_body".to_string(), body_str.clone());
@@ -6589,6 +6774,10 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx2,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx2.matched_proxy = Some(proxy);
     ctx2.metadata.insert("request_body".to_string(), body_str);
@@ -6810,7 +6999,7 @@ fn redis_quarantine_found_hit_admits_before_fingerprint() {
         "Ok(BoundedRedisValue::Oversized{length})=>{",
     );
     let admit = found
-        .find("admit_redis_hit(")
+        .find("self.classify_redis_hit(entry,&redis_key)")
         .expect("Found path must admit before fingerprinting");
     let fingerprint = found
         .find("redis_quarantine_fingerprint_content(&data)")
@@ -6826,14 +7015,35 @@ fn redis_quarantine_found_hit_admits_before_fingerprint() {
     let dial = after
         .find("quarantine_invalid_redis_entry(")
         .expect("inadmissible Found values must be quarantined");
+    let invalid = found
+        .find("RedisHitVerdict::Invalid=>{")
+        .expect("inadmissible Found values must take the Invalid arm");
     assert!(
-        found.contains("None=>{") && claim < dial,
+        invalid < fingerprint && claim < dial,
         "inadmissible Found values must fingerprint, then claim the key before any DEL dial"
     );
     assert!(
         !found[..admit].contains("redis_quarantine_fingerprint_content"),
-        "quarantine fingerprint must not precede admit_redis_hit on the Found path"
+        "quarantine fingerprint must not precede classify_redis_hit on the Found path"
     );
+    // An authentic but not-fresh envelope (expired, or sealed beyond the
+    // clock-skew allowance) is a plain miss: its arm must neither fingerprint,
+    // claim, nor dial a compare-and-delete.
+    let not_fresh = source_region(
+        found,
+        "RedisHitVerdict::NotFresh=>{",
+        "RedisHitVerdict::Invalid=>{",
+    );
+    for forbidden in [
+        "redis_quarantine_fingerprint_content",
+        "try_claim",
+        "quarantine_invalid_redis_entry",
+    ] {
+        assert!(
+            !not_fresh.contains(forbidden),
+            "the NotFresh arm must not quarantine ({forbidden})"
+        );
+    }
 }
 
 #[test]
@@ -7041,6 +7251,10 @@ fn semantic_ctx(client_ip: &str, body_str: &str) -> RequestContext {
         client_ip.to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.metadata
         .insert("request_body".to_string(), body_str.to_string());
@@ -7269,6 +7483,10 @@ fn partition_ctx(
         client_ip.to_string(),
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
     );
     ctx.matched_proxy = proxy;
     ctx.metadata
@@ -8122,6 +8340,10 @@ async fn run_compression_cache_lookup(
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(
+        &mut ctx,
+        Some(TEST_PRESENTATION_POLICY_DIGEST),
+    );
     // Production populates this before plugin hooks. Zero means unlimited and
     // deliberately disables compression's bounded response-buffer admission.
     ctx.max_response_body_size_bytes = 1024 * 1024;
@@ -8452,6 +8674,10 @@ async fn embedding_call_carries_the_proxy_hop_count() {
             "POST".to_string(),
             "/v1/chat/completions".to_string(),
         );
+        set_response_presentation_policy_digest_for_test(
+            &mut ctx,
+            Some(TEST_PRESENTATION_POLICY_DIGEST),
+        );
         let body = semantic_request_body().to_string();
         ctx.metadata.insert("request_body".to_string(), body);
         ctx.outbound_proxy_hops = outbound_proxy_hops;
@@ -8521,4 +8747,757 @@ fn cleartext_embedding_endpoint_requires_opt_in_off_loopback() {
             "{endpoint} must be admitted without the opt-in"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review regressions
+// ---------------------------------------------------------------------------
+
+fn json_request_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+/// A lookup context whose static response-presentation digest is chosen by the
+/// test (`None` models an unprovable policy).
+fn policy_ctx(body: &str, presentation: Option<[u8; 32]>) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(&mut ctx, presentation);
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    ctx
+}
+
+/// Embedding mock without a call-count expectation, returning the same unit
+/// vector for every input so only the semantic scope can separate requests.
+async fn mount_fixed_embedding(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": [1.0, 0.0, 0.0]}]
+        })))
+        .mount(server)
+        .await;
+}
+
+/// SOL-1: an entry retained under one response-presentation policy must not
+/// replay (skipping ordinary response transforms) once the static policy
+/// changes — for example a new `response_transformer` field-removal rule —
+/// even though the request, caller, destination, and TTL are unchanged.
+#[tokio::test]
+async fn changed_presentation_policy_retires_retained_entries() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let headers = json_request_headers();
+    let original = [0x11; 32];
+    let tightened = [0x22; 32];
+
+    let mut store_ctx = policy_ctx(REPLAY_BODY, Some(original));
+    assert!(matches!(
+        drive_cache_lookup(&plugin, &mut store_ctx, &headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(staged_status(&plugin, &store_ctx), Some("MISS"));
+    let _ = plugin
+        .on_final_response_body(
+            &mut store_ctx,
+            200,
+            &headers,
+            br#"{"answer":"Paris","internal_note":"x"}"#,
+        )
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+    let mut changed = policy_ctx(REPLAY_BODY, Some(tightened));
+    assert!(
+        matches!(
+            drive_cache_lookup(&plugin, &mut changed, &headers).await,
+            PluginResult::Continue
+        ),
+        "an entry produced under a superseded presentation policy must not replay"
+    );
+    assert_eq!(staged_status(&plugin, &changed), Some("MISS"));
+
+    let mut unchanged = policy_ctx(REPLAY_BODY, Some(original));
+    assert!(
+        matches!(
+            drive_cache_lookup(&plugin, &mut unchanged, &headers).await,
+            PluginResult::RejectBinary { .. }
+        ),
+        "the unchanged policy must still hit"
+    );
+}
+
+/// SOL-1: a request whose presentation policy cannot be established (no
+/// plugin-cache view, or a `Dynamic` presentation plugin on the proxy) neither
+/// replays nor retains: "unknown" never matches anything.
+#[tokio::test]
+async fn unprovable_presentation_policy_bypasses_lookup_and_store() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let headers = json_request_headers();
+
+    let mut seed = policy_ctx(REPLAY_BODY, Some(TEST_PRESENTATION_POLICY_DIGEST));
+    assert!(matches!(
+        drive_cache_lookup(&plugin, &mut seed, &headers).await,
+        PluginResult::Continue
+    ));
+    let _ = plugin
+        .on_final_response_body(&mut seed, 200, &headers, br#"{"answer":"Paris"}"#)
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+    let mut unprovable = policy_ctx(REPLAY_BODY, None);
+    assert!(matches!(
+        drive_cache_lookup(&plugin, &mut unprovable, &headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(staged_status(&plugin, &unprovable), Some("BYPASS"));
+    assert!(!has_staged_cache_key(&plugin, &unprovable));
+    let _ = plugin
+        .on_final_response_body(&mut unprovable, 200, &headers, br#"{"answer":"Lyon"}"#)
+        .await;
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(1),
+        "an unprovable-policy response must not be retained"
+    );
+}
+
+/// SOL-1: semantic scopes bind the same provenance, so a semantic neighbour
+/// retained under another presentation policy is outside the scope.
+#[tokio::test]
+async fn semantic_scope_binds_presentation_policy() {
+    let server = MockServer::start().await;
+    mount_embedding_mock(&server, 2).await;
+    let plugin = make_plugin(semantic_config(&server));
+    let id = instance_id(&plugin);
+    let headers = json_request_headers();
+    let body = serde_json::to_string(&semantic_request_body()).unwrap();
+
+    let mut first = policy_ctx(&body, Some([0x11; 32]));
+    let _ = drive_cache_lookup(&plugin, &mut first, &headers).await;
+    let mut second = policy_ctx(&body, Some([0x22; 32]));
+    let _ = drive_cache_lookup(&plugin, &mut second, &headers).await;
+
+    let first_scope = ai_semantic_cache_scope_key(&first, id).map(str::to_string);
+    let second_scope = ai_semantic_cache_scope_key(&second, id).map(str::to_string);
+    assert!(first_scope.is_some(), "a semantic miss must stage a scope");
+    assert_ne!(
+        first_scope, second_scope,
+        "the semantic scope must bind the response-presentation policy"
+    );
+}
+
+fn messages_system_body(instruction: &str, user: &str) -> Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": user}
+        ]
+    })
+}
+
+fn messages_developer_body(instruction: &str, user: &str) -> Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "developer", "content": instruction},
+            {"role": "user", "content": user}
+        ]
+    })
+}
+
+fn anthropic_system_body(instruction: &str, user: &str) -> Value {
+    json!({
+        "model": "claude-sonnet-4",
+        "system": instruction,
+        "messages": [{"role": "user", "content": user}]
+    })
+}
+
+fn responses_instructions_body(instruction: &str, user: &str) -> Value {
+    json!({"model": "gpt-4.1", "instructions": instruction, "input": user})
+}
+
+fn responses_developer_item_body(instruction: &str, user: &str) -> Value {
+    json!({
+        "model": "gpt-4.1",
+        "input": [
+            {"role": "developer", "content": instruction},
+            {"role": "user", "content": user}
+        ]
+    })
+}
+
+fn gemini_system_instruction_body(instruction: &str, user: &str) -> Value {
+    json!({
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}]
+    })
+}
+
+fn cohere_preamble_body(instruction: &str, user: &str) -> Value {
+    json!({"model": "command-r", "preamble": instruction, "message": user})
+}
+
+/// One instruction-container case: label, body builder, stored instruction,
+/// and the case/whitespace-only variant that must not share its scope.
+type InstructionScopeCase = (
+    &'static str,
+    fn(&str, &str) -> Value,
+    &'static str,
+    &'static str,
+);
+
+/// SOL-2: governing instructions are an exact partition of the semantic scope.
+/// A capitalization- or indentation-only instruction change must never
+/// semantic-hit, even with an identical user turn and an identical embedding;
+/// the same instruction with a different user turn still does (control).
+#[tokio::test]
+async fn semantic_instruction_scope_is_byte_exact_across_instruction_containers() {
+    let server = MockServer::start().await;
+    mount_fixed_embedding(&server).await;
+
+    let cases: [InstructionScopeCase; 7] = [
+        (
+            "messages system",
+            messages_system_body,
+            "Return exactly \"ACME\".",
+            "Return exactly \"acme\".",
+        ),
+        (
+            "messages developer indentation",
+            messages_developer_body,
+            "Emit:\n    def f():\n        return 1",
+            "Emit:\n  def f():\n    return 1",
+        ),
+        (
+            "anthropic system",
+            anthropic_system_body,
+            "Sign every answer as ACME.",
+            "Sign every answer as acme.",
+        ),
+        (
+            "responses instructions",
+            responses_instructions_body,
+            "Reply in UPPERCASE.",
+            "Reply in uppercase.",
+        ),
+        (
+            "responses developer item",
+            responses_developer_item_body,
+            "Answer only JSON.",
+            "Answer only plain text.",
+        ),
+        (
+            "gemini systemInstruction",
+            gemini_system_instruction_body,
+            "Answer as ACME.",
+            "Answer as acme.",
+        ),
+        (
+            "cohere preamble",
+            cohere_preamble_body,
+            "Sign as ACME.",
+            "Sign  as ACME.",
+        ),
+    ];
+
+    for (label, body, instruction, changed_instruction) in cases {
+        let plugin = make_plugin(semantic_config(&server));
+        store_response(
+            &plugin,
+            &body(instruction, "Proceed.").to_string(),
+            None,
+            br#""ok""#,
+        )
+        .await;
+        assert!(
+            !run_lookup_get_status(
+                &plugin,
+                &body(changed_instruction, "Proceed.").to_string(),
+                None
+            )
+            .await,
+            "{label}: an instruction change must not semantic-hit"
+        );
+        let (ctx, result) =
+            run_lookup(&plugin, &body(instruction, "Go ahead.").to_string(), None).await;
+        assert!(
+            matches!(result, PluginResult::RejectBinary { .. }),
+            "{label}: the same instruction with another user turn must semantic-hit"
+        );
+        assert_eq!(staged_match(&plugin, &ctx), Some("semantic"), "{label}");
+    }
+}
+
+/// SOL-2: Responses `system`/`developer` input items are instruction state, not
+/// embedding input.
+#[tokio::test]
+async fn responses_instruction_items_are_excluded_from_embedding_input() {
+    let server = MockServer::start().await;
+    // Registered first, so any embedding request carrying the developer text
+    // would match it — and it must match none.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(body_string_contains("answer only"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    mount_fixed_embedding(&server).await;
+    let plugin = make_plugin(semantic_config(&server));
+    let (ctx, result) = run_lookup(
+        &plugin,
+        &responses_developer_item_body("Answer only JSON.", "What is 2+2?").to_string(),
+        None,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        ai_semantic_cache_scope_key(&ctx, instance_id(&plugin)).is_some(),
+        "the user turn must still be embedded and staged"
+    );
+}
+
+/// SOL-3: a Cohere `conversation_id` names mutable provider-persisted history,
+/// so the same request bytes do not imply the same model input. Every such
+/// request bypasses lookup and storage, in any encoding.
+#[tokio::test]
+async fn cohere_conversation_id_requests_bypass_lookup_and_storage() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let ask = json!({
+        "model": "command-r",
+        "conversation_id": "c1",
+        "message": "What is the secret word?"
+    });
+    let teach = json!({
+        "model": "command-r",
+        "conversation_id": "c1",
+        "message": "The secret word is fish. Remember it."
+    });
+    for body in [&ask, &teach, &ask] {
+        let (mut ctx, result) = run_lookup(&plugin, &body.to_string(), None).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(staged_status(&plugin, &ctx), Some("BYPASS"));
+        assert!(!has_staged_cache_key(&plugin, &ctx));
+        let _ = plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &json_request_headers(),
+                br#"{"text":"I do not know."}"#,
+            )
+            .await;
+        assert_eq!(plugin.tracked_keys_count(), Some(0));
+    }
+
+    for conversation_id in [json!(42), json!({"id": "c1"}), json!(null), json!("")] {
+        let body = json!({
+            "model": "command-r",
+            "conversation_id": conversation_id,
+            "message": "What is the secret word?"
+        });
+        let (ctx, _) = run_lookup(&plugin, &body.to_string(), None).await;
+        assert_eq!(
+            staged_status(&plugin, &ctx),
+            Some("BYPASS"),
+            "every conversation_id encoding is provider-managed state: {body}"
+        );
+    }
+}
+
+/// SOL-4: a provider-backed `ai_federation` answer travels the synthetic
+/// response pipeline, but it is a genuine model response. With federation's
+/// external-operation provenance AND its origin-retention eligibility marker it
+/// is retained once the committed response is final, so the documented
+/// cache-before-federation chain populates. A fabricated synthetic body, or a
+/// provider answer whose origin headers forbade retention (no eligibility
+/// marker), is not.
+#[tokio::test]
+async fn provider_backed_federation_response_populates_the_cache() {
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
+
+    let provider_body: &'static [u8] =
+        br#"{"id":"chatcmpl-1","choices":[{"message":{"content":"Paris"}}]}"#;
+    for (external_operation, origin_retainable, expect_cached) in [
+        (true, true, true),
+        (true, false, false),
+        (false, false, false),
+    ] {
+        let cache = Arc::new(make_plugin(json!({"ttl_seconds": 300})));
+        let plugins = vec![Arc::clone(&cache) as Arc<dyn Plugin>];
+        let (mut ctx, result) = run_lookup(&cache, REPLAY_BODY, None).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(staged_status(&cache, &ctx), Some("MISS"));
+        if external_operation {
+            // Recorded by `ai_federation` once a provider returned headers.
+            ctx.metadata.insert(
+                EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
+        if origin_retainable {
+            // Recorded by `ai_federation` when the provider's ORIGINAL headers
+            // carried no `no-store` / `private` / `Set-Cookie`.
+            ctx.metadata.insert(
+                PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
+        let rejection = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from_static(provider_body),
+            headers: json_request_headers(),
+        };
+        let _ = finalize_plugin_rejection_for_test(&plugins, &mut ctx, rejection).await;
+
+        let (_, replay) = run_lookup(&cache, REPLAY_BODY, None).await;
+        if expect_cached {
+            assert_eq!(cache.tracked_keys_count(), Some(1));
+            match replay {
+                PluginResult::RejectBinary { body, .. } => {
+                    assert_eq!(body.as_ref(), provider_body);
+                }
+                other => panic!("the federation answer must replay, got {other:?}"),
+            }
+        } else {
+            assert_eq!(
+                cache.tracked_keys_count(),
+                Some(0),
+                "external={external_operation} retainable={origin_retainable}: must not retain"
+            );
+            assert!(matches!(replay, PluginResult::Continue));
+        }
+    }
+}
+
+/// PR6822-SOL-2: on the synthetic path the reject `after_proxy` header hooks
+/// run after the body hooks. A late `Cache-Control: no-store` / `private` or
+/// `Set-Cookie` on the final client-visible response must drop the staged
+/// provider-backed entry; without a late header it is retained (control).
+#[tokio::test]
+async fn late_synthetic_response_headers_decide_federation_retention() {
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
+    use ferrum_edge::plugins::response_transformer::ResponseTransformer;
+
+    let provider_body: &'static [u8] = br#"{"id":"chatcmpl-1","answer":"Paris"}"#;
+    for late_header in [
+        None,
+        Some(("cache-control", "no-store")),
+        Some(("cache-control", "private")),
+        Some(("set-cookie", "sid=rotated")),
+    ] {
+        let cache = Arc::new(make_plugin(json!({"ttl_seconds": 300})));
+        let mut plugins = vec![Arc::clone(&cache) as Arc<dyn Plugin>];
+        if let Some((name, value)) = late_header {
+            plugins.push(Arc::new(
+                ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "target": "header",
+                        "operation": "add",
+                        "key": name,
+                        "value": value
+                    }]
+                }))
+                .expect("late header rule must be valid"),
+            ) as Arc<dyn Plugin>);
+        }
+        plugins.sort_by_key(|plugin| plugin.priority());
+        let (mut ctx, _) = run_lookup(&cache, REPLAY_BODY, None).await;
+        for key in [
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY,
+            PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY,
+        ] {
+            ctx.metadata.insert(key.to_string(), "true".to_string());
+        }
+        let rejection = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from_static(provider_body),
+            headers: json_request_headers(),
+        };
+        let finalized = finalize_plugin_rejection_for_test(&plugins, &mut ctx, rejection).await;
+        if let (Some((name, value)), PluginResult::RejectBinary { headers, .. }) =
+            (late_header, &finalized)
+        {
+            assert_eq!(
+                headers.get(name).map(String::as_str),
+                Some(value),
+                "the late header rule must reach the client-visible response"
+            );
+        }
+        let expect_cached = late_header.is_none();
+        assert_eq!(
+            cache.tracked_keys_count(),
+            Some(usize::from(expect_cached)),
+            "late header {late_header:?}"
+        );
+        assert_eq!(
+            run_lookup_get_status(&cache, REPLAY_BODY, None).await,
+            expect_cached,
+            "late header {late_header:?}"
+        );
+    }
+}
+
+/// MUSE-1: duplicate object members make the keyed (last-wins) view and a
+/// first-wins provider's view diverge. Such bodies bypass lookup and storage.
+#[tokio::test]
+async fn duplicate_json_members_bypass_lookup_and_storage() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let clean = r#"{"model":"gpt-x","messages":[{"role":"user","content":"hi"}]}"#;
+    let duplicate_model =
+        r#"{"model":"cheap","model":"gpt-x","messages":[{"role":"user","content":"hi"}]}"#;
+    let escaped_duplicate_messages = r#"{"model":"gpt-x","messages":[{"role":"user","content":"other"}],"messages":[{"role":"user","content":"hi"}]}"#;
+    for body in [duplicate_model, escaped_duplicate_messages] {
+        let (mut ctx, result) = run_lookup(&plugin, body, None).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(staged_status(&plugin, &ctx), Some("BYPASS"), "{body}");
+        assert!(!has_staged_cache_key(&plugin, &ctx), "{body}");
+        let _ = plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &json_request_headers(),
+                br#"{"answer":"from the cheap model"}"#,
+            )
+            .await;
+        assert_eq!(plugin.tracked_keys_count(), Some(0), "{body}");
+    }
+    let (ctx, result) = run_lookup(&plugin, clean, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
+}
+
+/// MUSE-3: origin retention directives and session-establishing responses are
+/// never retained; an ordinary freshness directive still caches.
+#[tokio::test]
+async fn response_retention_directives_and_set_cookie_are_never_stored() {
+    for (name, value) in [
+        ("cache-control", "no-store"),
+        ("Cache-Control", "private"),
+        ("cache-control", "max-age=0, private=\"x-account, x-tier\""),
+        ("cache-control", "public, NO-STORE"),
+        ("Set-Cookie", "sid=abc; HttpOnly"),
+    ] {
+        let plugin = make_plugin(json!({"ttl_seconds": 300}));
+        let (mut ctx, result) = run_lookup(&plugin, REPLAY_BODY, None).await;
+        assert!(matches!(result, PluginResult::Continue));
+        let mut headers = json_request_headers();
+        headers.insert(name.to_string(), value.to_string());
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        assert_eq!(plugin.tracked_keys_count(), Some(0), "{name}: {value}");
+        assert!(!run_lookup_get_status(&plugin, REPLAY_BODY, None).await);
+    }
+
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let (mut ctx, _) = run_lookup(&plugin, REPLAY_BODY, None).await;
+    let mut headers = json_request_headers();
+    headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(run_lookup_get_status(&plugin, REPLAY_BODY, None).await);
+}
+
+/// MUSE-3: a client `Cache-Control: no-store` / `no-cache` bypasses lookup and
+/// storage, whether it is on the finalized outbound view or only on the
+/// request context's header view (an outbound transform removed it).
+#[tokio::test]
+async fn request_no_store_and_no_cache_bypass_lookup_and_storage() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    store_response(&plugin, REPLAY_BODY, None, br#"{"ok":"cached"}"#).await;
+    assert!(run_lookup_get_status(&plugin, REPLAY_BODY, None).await);
+
+    for directive in ["no-store", "no-cache", "No-Cache", "max-age=0, no-cache"] {
+        let mut outbound = policy_ctx(REPLAY_BODY, Some(TEST_PRESENTATION_POLICY_DIGEST));
+        let mut headers = json_request_headers();
+        headers.insert("cache-control".to_string(), directive.to_string());
+        assert!(matches!(
+            drive_cache_lookup(&plugin, &mut outbound, &headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            staged_status(&plugin, &outbound),
+            Some("BYPASS"),
+            "{directive}"
+        );
+        assert!(!has_staged_cache_key(&plugin, &outbound), "{directive}");
+
+        let mut context_only = policy_ctx(REPLAY_BODY, Some(TEST_PRESENTATION_POLICY_DIGEST));
+        context_only
+            .headers
+            .insert("Cache-Control".to_string(), directive.to_string());
+        assert!(matches!(
+            drive_cache_lookup(&plugin, &mut context_only, &json_request_headers()).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            staged_status(&plugin, &context_only),
+            Some("BYPASS"),
+            "{directive}"
+        );
+    }
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+/// MUSE-4 / MUSE-3: an authentic Redis envelope sealed by a replica whose clock
+/// runs slightly ahead is admitted, one sealed far ahead or expired is a plain
+/// miss (never quarantined/deleted), and only inauthentic or inadmissible
+/// envelopes — including a retained `no-store` response — are quarantined.
+#[test]
+fn redis_hit_verdict_tolerates_seal_clock_skew_and_quarantines_only_invalid() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS
+    }));
+    let key = "ferrum:ai_cache:skew";
+    let headers = json_request_headers();
+    let body: &[u8] = br#"{"ok":true}"#;
+    let verdict = |headers: &HashMap<String, String>, body: &[u8], offset: i64| {
+        ai_semantic_cache_redis_hit_verdict_for_test(&plugin, key, headers, body, offset)
+    };
+
+    assert_eq!(verdict(&headers, body, 0), "admit");
+    assert_eq!(verdict(&headers, body, 30), "admit", "small forward skew");
+    assert_eq!(verdict(&headers, body, -300), "admit");
+    assert_eq!(verdict(&headers, body, 3_600), "miss", "far-future seal");
+    assert_eq!(
+        verdict(&headers, body, -600),
+        "miss",
+        "authentic but expired"
+    );
+    assert_eq!(verdict(&headers, body, -86_400), "miss");
+
+    let mut no_store = headers.clone();
+    no_store.insert("cache-control".to_string(), "no-store".to_string());
+    assert_eq!(verdict(&no_store, body, 0), "quarantine");
+    assert_eq!(verdict(&headers, b"not-json".as_slice(), 0), "quarantine");
+}
+
+/// MUSE-5: a canonical `stream: true` request is never answered from a
+/// retained SSE stream, so it must not pay the embedding round-trip; the exact
+/// lookup and MISS staging still run. A `stream: false` control still embeds.
+#[tokio::test]
+async fn deterministic_stream_requests_skip_the_embedding_round_trip() {
+    let server = MockServer::start().await;
+    mount_embedding_mock(&server, 1).await;
+    let plugin = make_plugin(semantic_config(&server));
+    let id = instance_id(&plugin);
+
+    let streaming = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Capital of France?"}]
+    });
+    let (ctx, result) = run_lookup(&plugin, &streaming.to_string(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
+    assert!(has_staged_cache_key(&plugin, &ctx));
+    assert!(ai_semantic_cache_scope_key(&ctx, id).is_none());
+
+    let buffered = json!({
+        "model": "gpt-4o",
+        "stream": false,
+        "messages": [{"role": "user", "content": "Capital of France?"}]
+    });
+    let (ctx, result) = run_lookup(&plugin, &buffered.to_string(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ai_semantic_cache_scope_key(&ctx, id).is_some());
+}
+
+/// Look up a fresh prompt (MISS) and run the store hook over a provider-backed
+/// synthetic answer, as the synthetic finalizer does before any committed hook.
+async fn stage_provider_backed_synthetic(
+    plugin: &AiSemanticCache,
+    prompt: &str,
+    body: &[u8],
+) -> RequestContext {
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": prompt}]
+    })
+    .to_string();
+    let (mut ctx, result) = run_lookup(plugin, &request, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    for key in [
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY,
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY,
+        PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY,
+    ] {
+        ctx.metadata.insert(key.to_string(), "true".to_string());
+    }
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &json_request_headers(), body)
+        .await;
+    ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    ctx
+}
+
+/// PR6822-SOL-7: a staged provider-backed synthetic entry is charged against
+/// `max_total_size_bytes` BEFORE its body is copied, so staged entries waiting
+/// for their committed hook cannot exceed the hard budget; a refusal or a
+/// dropped request releases the reservation, and publication transfers it
+/// without reserving twice.
+#[tokio::test]
+async fn staged_synthetic_stores_are_charged_against_the_byte_budget() {
+    const BUDGET: usize = 6_000;
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "max_entry_size_bytes": 4_096,
+        "max_total_size_bytes": BUDGET
+    }));
+    let body = serde_json::to_vec(&json!({"answer": "x".repeat(3_000)})).unwrap();
+
+    // Two staged entries would need more than the budget: the second is
+    // refused before any copy, and nothing is published yet.
+    let mut first = stage_provider_backed_synthetic(&plugin, "one", &body).await;
+    let staged = ai_semantic_cache_cache_budget_used_for_test(&plugin);
+    assert!(
+        staged > body.len() && staged <= BUDGET,
+        "a staged entry must hold its reservation: {staged}"
+    );
+    let second = stage_provider_backed_synthetic(&plugin, "two", &body).await;
+    assert_eq!(
+        ai_semantic_cache_cache_budget_used_for_test(&plugin),
+        staged,
+        "a second staged entry over budget must be refused, not retained"
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    drop(second);
+
+    // A final-header refusal releases the staged reservation.
+    let mut no_store = json_request_headers();
+    no_store.insert("cache-control".to_string(), "no-store".to_string());
+    plugin
+        .on_response_committed(&mut first, 200, &no_store, &body)
+        .await;
+    assert_eq!(ai_semantic_cache_cache_budget_used_for_test(&plugin), 0);
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+
+    // A request dropped before its committed hook releases it too.
+    let cancelled = stage_provider_backed_synthetic(&plugin, "three", &body).await;
+    assert!(ai_semantic_cache_cache_budget_used_for_test(&plugin) > 0);
+    drop(cancelled);
+    assert_eq!(ai_semantic_cache_cache_budget_used_for_test(&plugin), 0);
+
+    // Publication moves the reservation into the entry without a second one.
+    let mut published = stage_provider_backed_synthetic(&plugin, "four", &body).await;
+    let reserved = ai_semantic_cache_cache_budget_used_for_test(&plugin);
+    plugin
+        .on_response_committed(&mut published, 200, &json_request_headers(), &body)
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_eq!(
+        ai_semantic_cache_cache_budget_used_for_test(&plugin),
+        reserved,
+        "publication must transfer, not duplicate, the reservation"
+    );
 }
