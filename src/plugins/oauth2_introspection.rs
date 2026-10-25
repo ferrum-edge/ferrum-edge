@@ -3,6 +3,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -140,6 +141,10 @@ struct IntrospectionProvider {
     /// How long a resolved discovery endpoint is used before the discovery
     /// document is fetched again.
     discovery_refresh_interval: Duration,
+    /// Discovery attempts (successful or failed) whose outcome the worker has
+    /// fully processed — published or kept the endpoint, or logged the
+    /// failure — before it sleeps. Observability for deterministic tests.
+    discovery_attempts_completed: Arc<AtomicU64>,
     /// Admit RFC 8705 certificate-bound tokens (`cnf."x5t#S256"`) when the
     /// frontend client certificate matches the bound thumbprint.
     accept_mtls_bound_tokens: bool,
@@ -543,6 +548,7 @@ impl Oauth2Introspection {
                     .as_ref()
                     .map(|parsed| ResolvedEndpoint::new(parsed.url.clone())),
                 discovery_refresh_interval: Duration::from_secs(discovery_refresh_interval_secs),
+                discovery_attempts_completed: Arc::new(AtomicU64::new(0)),
                 accept_mtls_bound_tokens,
                 audiences,
                 token_locations,
@@ -640,6 +646,21 @@ impl Oauth2Introspection {
             claim_header_destinations,
             discovery_tasks: Mutex::new(None),
         })
+    }
+
+    /// Per provider, how many discovery attempts the background worker has
+    /// fully processed (`0` for a provider without `discovery_url`). Lets
+    /// external tests wait for a refresh outcome instead of sleeping.
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn completed_discovery_attempts(&self) -> Vec<u64> {
+        self.providers
+            .iter()
+            .map(|provider| {
+                provider
+                    .discovery_attempts_completed
+                    .load(Ordering::Acquire)
+            })
+            .collect()
     }
 
     async fn authenticate_request(
@@ -1621,6 +1642,7 @@ impl super::Plugin for Oauth2Introspection {
                     discovery_url: discovery.url.clone(),
                     redacted_discovery_url: discovery.redacted.clone(),
                     refresh_interval: provider.discovery_refresh_interval,
+                    attempts_completed: Arc::clone(&provider.discovery_attempts_completed),
                 })
             })
             .collect();
@@ -2599,6 +2621,7 @@ struct DiscoveryTask {
     discovery_url: String,
     redacted_discovery_url: String,
     refresh_interval: Duration,
+    attempts_completed: Arc<AtomicU64>,
 }
 
 /// Resolve, then keep refreshing, one provider's introspection endpoint.
@@ -2623,6 +2646,7 @@ fn spawn_discovery_task(
             discovery_url,
             redacted_discovery_url,
             refresh_interval,
+            attempts_completed,
         } = task;
         let mut failures: u32 = 0;
         loop {
@@ -2651,6 +2675,7 @@ fn spawn_discovery_task(
                             "OIDC discovery refresh kept the introspection endpoint"
                         );
                     }
+                    attempts_completed.fetch_add(1, Ordering::Release);
                     tokio::time::sleep(refresh_interval).await;
                 }
                 Err(error) => {
@@ -2661,6 +2686,7 @@ fn spawn_discovery_task(
                         retained_last_known_endpoint,
                         "OIDC discovery failed"
                     );
+                    attempts_completed.fetch_add(1, Ordering::Release);
                     failures = failures.saturating_add(1);
                     let backoff = Duration::from_secs(
                         INITIAL_BACKOFF_SECS

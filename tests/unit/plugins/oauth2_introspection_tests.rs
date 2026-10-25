@@ -15,7 +15,7 @@ use futures_util::future::join_all;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3204,9 +3204,15 @@ async fn introspection_concurrency_limits_are_configurable_and_enforced() {
     }
 }
 
+/// Deadlock bound for the discovery tests' waits. Elapsed time is never the
+/// evidence of completion; each wait observes the outcome it needs.
+const DISCOVERY_WAIT_BOUND: Duration = Duration::from_secs(20);
+
 /// Authenticate one token repeatedly until discovery has resolved an endpoint.
+/// An unresolved endpoint answers `503` without contacting any provider.
 async fn authenticate_once_discovery_resolves(plugin: &Oauth2Introspection, token: &str) {
-    for _ in 0..80 {
+    let deadline = tokio::time::Instant::now() + DISCOVERY_WAIT_BOUND;
+    loop {
         match plugin
             .authenticate(&mut make_ctx(token), &ConsumerIndex::new(&[]))
             .await
@@ -3214,30 +3220,16 @@ async fn authenticate_once_discovery_resolves(plugin: &Oauth2Introspection, toke
             PluginResult::Continue => return,
             PluginResult::Reject {
                 status_code: 503, ..
-            } => tokio::time::sleep(Duration::from_millis(25)).await,
+            } => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "discovery never resolved an introspection endpoint"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             other => panic!("unexpected result while discovery resolves: {other:?}"),
         }
     }
-    panic!("discovery never resolved an introspection endpoint");
-}
-
-async fn wait_for_discovery_requests(server: &MockServer, at_least: usize) {
-    for _ in 0..200 {
-        let discovery_requests = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|request| request.method.as_str() == "GET")
-            .count();
-        if discovery_requests >= at_least {
-            // Let the worker finish validating and publishing the response.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("discovery worker did not issue {at_least} requests");
 }
 
 fn introspection_posts(requests: &[wiremock::Request], endpoint_path: &str) -> usize {
@@ -3247,21 +3239,43 @@ fn introspection_posts(requests: &[wiremock::Request], endpoint_path: &str) -> u
         .count()
 }
 
-/// Mount a discovery document that advertises `/introspect-a` on its first
-/// fetch and answers later fetches with `later`.
-async fn rotating_discovery_server(later: fn(&str) -> ResponseTemplate) -> MockServer {
+/// A discovery document that advertises `/introspect-a` until the test sets
+/// `rotate`, then answers every later fetch with `rotated`. It records the
+/// 1-based ordinal of the first fetch that received the rotated answer, so the
+/// test can wait for the worker to finish processing exactly that fetch.
+struct RotatingDiscovery {
+    server: MockServer,
+    rotate: Arc<AtomicBool>,
+    first_rotated_fetch: Arc<AtomicUsize>,
+}
+
+async fn rotating_discovery_server(rotated: fn(&str) -> ResponseTemplate) -> RotatingDiscovery {
     let server = MockServer::start().await;
     let uri = server.uri();
+    let rotate = Arc::new(AtomicBool::new(false));
+    let first_rotated_fetch = Arc::new(AtomicUsize::new(0));
     let fetches = Arc::new(AtomicUsize::new(0));
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
-        .respond_with(move |_: &wiremock::Request| {
-            if fetches.fetch_add(1, Ordering::SeqCst) == 0 {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "introspection_endpoint": format!("{uri}/introspect-a")
-                }))
-            } else {
-                later(&uri)
+        .respond_with({
+            let rotate = Arc::clone(&rotate);
+            let first_rotated_fetch = Arc::clone(&first_rotated_fetch);
+            move |_: &wiremock::Request| {
+                let ordinal = fetches.fetch_add(1, Ordering::SeqCst) + 1;
+                if rotate.load(Ordering::SeqCst) {
+                    // Only the first rotated fetch is recorded.
+                    let _ = first_rotated_fetch.compare_exchange(
+                        0,
+                        ordinal,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                    rotated(&uri)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "introspection_endpoint": format!("{uri}/introspect-a")
+                    }))
+                }
             }
         })
         .mount(&server)
@@ -3275,7 +3289,35 @@ async fn rotating_discovery_server(later: fn(&str) -> ResponseTemplate) -> MockS
             .mount(&server)
             .await;
     }
-    server
+    RotatingDiscovery {
+        server,
+        rotate,
+        first_rotated_fetch,
+    }
+}
+
+/// Release the rotated discovery answer and wait until the worker has fully
+/// processed the first fetch that received it — published the new endpoint,
+/// or handled the failure — using the plugin's completed-attempt counter.
+/// The worker fetches sequentially, so fetch `n` is processed exactly when the
+/// counter reaches `n`.
+async fn rotate_and_wait_for_processed_refresh(
+    discovery: &RotatingDiscovery,
+    plugin: &Oauth2Introspection,
+) {
+    discovery.rotate.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + DISCOVERY_WAIT_BOUND;
+    loop {
+        let rotated_fetch = discovery.first_rotated_fetch.load(Ordering::SeqCst) as u64;
+        if rotated_fetch > 0 && plugin.completed_discovery_attempts()[0] >= rotated_fetch {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the discovery worker never processed a rotated refresh"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn refreshing_discovery_plugin(server: &MockServer) -> Oauth2Introspection {
@@ -3292,24 +3334,26 @@ fn refreshing_discovery_plugin(server: &MockServer) -> Oauth2Introspection {
 /// resolution, so a moved endpoint is picked up without a rebuild.
 #[tokio::test]
 async fn discovery_refresh_moves_to_a_republished_endpoint() {
-    let server = rotating_discovery_server(|uri| {
+    let discovery = rotating_discovery_server(|uri| {
         ResponseTemplate::new(200).set_body_json(json!({
             "introspection_endpoint": format!("{uri}/introspect-b")
         }))
     })
     .await;
-    let plugin = refreshing_discovery_plugin(&server);
+    let plugin = refreshing_discovery_plugin(&discovery.server);
+    assert_eq!(plugin.completed_discovery_attempts(), vec![0]);
     plugin.start_background_tasks().unwrap();
 
+    // Every fetch advertises A until rotation, so this lookup uses A.
     authenticate_once_discovery_resolves(&plugin, "before-refresh").await;
-    wait_for_discovery_requests(&server, 2).await;
+    rotate_and_wait_for_processed_refresh(&discovery, &plugin).await;
     assert_continue(
         plugin
             .authenticate(&mut make_ctx("after-refresh"), &ConsumerIndex::new(&[]))
             .await,
     );
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = discovery.server.received_requests().await.unwrap();
     assert_eq!(introspection_posts(&requests, "/introspect-a"), 1);
     assert_eq!(introspection_posts(&requests, "/introspect-b"), 1);
 }
@@ -3318,12 +3362,13 @@ async fn discovery_refresh_moves_to_a_republished_endpoint() {
 /// known endpoint instead of dropping back to `503`.
 #[tokio::test]
 async fn failed_discovery_refresh_keeps_the_last_known_endpoint() {
-    let server = rotating_discovery_server(|_| ResponseTemplate::new(503)).await;
-    let plugin = refreshing_discovery_plugin(&server);
+    let discovery = rotating_discovery_server(|_| ResponseTemplate::new(503)).await;
+    let plugin = refreshing_discovery_plugin(&discovery.server);
     plugin.start_background_tasks().unwrap();
 
     authenticate_once_discovery_resolves(&plugin, "before-failed-refresh").await;
-    wait_for_discovery_requests(&server, 2).await;
+    // Retention is asserted only after the failed refresh was processed.
+    rotate_and_wait_for_processed_refresh(&discovery, &plugin).await;
     assert_continue(
         plugin
             .authenticate(
@@ -3333,7 +3378,7 @@ async fn failed_discovery_refresh_keeps_the_last_known_endpoint() {
             .await,
     );
 
-    let requests = server.received_requests().await.unwrap();
+    let requests = discovery.server.received_requests().await.unwrap();
     assert_eq!(introspection_posts(&requests, "/introspect-a"), 2);
     assert_eq!(introspection_posts(&requests, "/introspect-b"), 0);
 }
