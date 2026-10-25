@@ -178,6 +178,10 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "ai_model",
     "ai_prompt_compressor.compressed_tokens",
     "ai_prompt_compressor.fields_compressed",
+    "ai_prompt_compressor.observed_compressed_tokens",
+    "ai_prompt_compressor.observed_fields_compressed",
+    "ai_prompt_compressor.observed_original_tokens",
+    "ai_prompt_compressor.observed_tokens_saved",
     "ai_prompt_compressor.original_tokens",
     "ai_prompt_compressor.tokens_saved",
     "ai_prompt_tokens",
@@ -612,7 +616,15 @@ fn is_builtin_metadata_key_family(key: &str) -> bool {
             is_decimal_instance_id(id)
                 && matches!(
                     suffix,
-                    "original_tokens" | "compressed_tokens" | "tokens_saved" | "fields_compressed"
+                    "original_tokens"
+                        | "compressed_tokens"
+                        | "tokens_saved"
+                        | "fields_compressed"
+                        | "observed_original_tokens"
+                        | "observed_compressed_tokens"
+                        | "observed_tokens_saved"
+                        | "observed_fields_compressed"
+                        | "skipped"
                 )
         });
     }

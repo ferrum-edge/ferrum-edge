@@ -37577,16 +37577,18 @@ components:
                 contains:
                   type: string
                   pattern: '^\s*[Uu][Ss][Ee][Rr]\s*$'
-      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a bounded model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt only for admitted OpenAI Chat Completions or Text Completions representations. Code blocks, inline code, URLs, Unicode numbers, common identifiers, and negations are preserved verbatim. Configured preserve markers use a bounded representation-preserving fallback whenever statistical compression is skipped. Successful compression rewrites reserialize the complete JSON body. No model files, network calls, or external services are used."
+      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a bounded model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt for admitted OpenAI Chat Completions or Text Completions representations, and — as fixed-family opt-ins — OpenAI Responses instructions/input message text and Anthropic Messages system/messages[].content text blocks. Code blocks, inline code, URLs, Unicode numbers, and common identifiers are preserved verbatim; negations, restrictive connectives (unless, except, only) and the word after them, plus conditions, obligations, quantifiers, and spelled-out numbers, are always kept. Configured preserve markers use a bounded representation-preserving fallback whenever statistical compression is skipped, and the final hook refuses (400) an admitted final representation — including the decoded view of a content-coded body — that still carries a marker in a string value. Successful compression rewrites reserialize the complete JSON body. No model files, network calls, or external services are used."
       properties:
         compress_roles:
           type: array
           items:
             type: string
             pattern: '\S'
+            maxLength: 64
           default: [user]
           minItems: 1
-          description: "Message roles whose content is compressed (case-insensitive). Defaults to user only so system instructions are preserved; add 'system'/'assistant'/'tool' to compress those too. When 'user' is included, the legacy top-level `prompt` field is also compressed."
+          maxItems: 32
+          description: "Message roles whose content is compressed (case-insensitive; at most 32 entries of at most 64 characters). Defaults to user only so system instructions are preserved; add 'system'/'assistant'/'tool' to compress those too. When 'user' is included, the legacy top-level `prompt` field (and a string Responses `input`) is also compressed. 'system' covers the Anthropic top-level system prompt; 'system' or 'developer' covers Responses `instructions`."
         target_ratio:
           type: number
           format: float
@@ -37599,13 +37601,13 @@ components:
           minimum: 0
           maximum: 131072
           default: 200
-          description: "Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. Token counts are estimated (~4 characters per token); no model tokenizer is embedded."
+          description: "Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. Token counts are estimated (~4 characters per token); no model tokenizer is embedded. A mathematically integral value is accepted however it is spelled (200 and 200.0 alike)."
         max_scan_bytes:
           type: integer
           minimum: 1
           maximum: 1048576
           default: 1048576
-          description: "Skip statistical compression when the request body exceeds this size. Configured preserve-marker sanitation remains active up to the immutable 1048576-byte hard body/output maximum and fails closed above it. Eligible prompt text is additionally capped at 524288 bytes, 32768 combined whitespace/tokenizer/marker work units, 256 rewritable fields, and 1024 preserve markers per body. A transformed body is staged beside request metadata for wire-path reuse only when it is at most 65536 bytes."
+          description: "A mathematically integral value is accepted however it is spelled. Skip statistical compression when the request body exceeds this size. Configured preserve-marker sanitation remains active up to the immutable 1048576-byte hard body/output maximum and fails closed above it. Eligible prompt text is additionally capped at 524288 bytes, 32768 combined whitespace/tokenizer/marker work units, 256 rewritable fields, and 1024 preserve markers per body. A transformed body is staged beside request metadata for wire-path reuse only when it is at most 65536 bytes."
         preserve_tag:
           type: string
           minLength: 1
@@ -37614,9 +37616,26 @@ components:
           description: "Optional marker name. Text wrapped in <TAG>...</TAG> in JSON string values is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Preserve-marker sanitation applies only to string values: object member-name bytes are preserved and names are never sanitized, including marker-shaped or escaped content. Nested spans are flattened while preserving their text; unmatched and JSON-escaped markers in values are stripped deterministically from every admitted request family even when statistical compression is skipped. Name may contain at most 64 ASCII letters, digits, '-', and '_'."
         request_family:
           type: string
-          enum: [auto, chat_completions, text_completions]
+          enum: [auto, chat_completions, text_completions, responses, anthropic_messages]
           default: auto
-          description: "Request-family gate. 'auto' requires a body shape matching the standard endpoint path suffix (/chat/completions or /completions). A fixed family is an explicit opt-in for compatible custom endpoint paths; malformed, provider-native, or ambiguous body shapes pass through unchanged. Fixed 'text_completions' requires 'user' in compress_roles (after trimming and case normalization)."
+          description: "Request-family gate. 'auto' requires a body shape matching the standard endpoint path suffix (/chat/completions or /completions). A fixed family is an explicit opt-in for compatible custom endpoint paths; malformed, provider-native, or ambiguous body shapes pass through unchanged. 'responses' admits OpenAI Responses bodies (string or array `input`; message items' input_text/output_text parts; `instructions`) and 'anthropic_messages' admits Anthropic Messages bodies (`messages` plus optional top-level `system`; text blocks only); neither is ever admitted by 'auto'. Fixed 'text_completions' requires 'user' in compress_roles (after trimming and case normalization)."
+        target_max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 131072
+          description: "Optional aggregate estimated-token budget for all eligible prompt text in one request. Requests within it are not statistically compressed; larger requests keep a per-request word ratio of target_max_tokens / eligible_tokens, never more aggressive than target_ratio. Best effort: protected spans, the target_ratio floor, and the word-versus-token approximation can leave a request above the budget, which is then forwarded rather than refused. A mathematically integral value is accepted however it is spelled."
+        mode:
+          type: string
+          enum: [enforce, observe]
+          default: enforce
+          description: "'enforce' forwards compressed prompts. 'observe' runs the same bounded pipeline, records would-be savings under ai_prompt_compressor.observed_* metadata, and forwards the original prompt text; configured preserve markers are still removed and still fail closed."
+        sample_rate:
+          type: number
+          format: float
+          default: 1
+          exclusiveMinimum: 0
+          maximum: 1
+          description: "Fraction of requests eligible for statistical compression (or observation), decided deterministically per request and instance. Unsampled requests are forwarded uncompressed with ai_prompt_compressor.instances.<id>.skipped=not_sampled; preserve-marker sanitation applies to every request."
 
     AiResponseGuardConfig:
       type: object
