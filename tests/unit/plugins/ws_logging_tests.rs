@@ -191,7 +191,8 @@ fn test_ws_logging_rejects_unknown_endpont_url_key() {
         }),
         default_client(),
     )
-    .expect_err("typo endpont_url must fail construction");
+    .err()
+    .expect("typo endpont_url must fail construction");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("endpont_url"), "{err}");
     assert!(err.contains("did you mean `endpoint_url`?"), "{err}");
@@ -255,7 +256,8 @@ async fn test_ws_logging_wss_rejects_mixed_ca_bundle_at_construction() {
             &json!({"endpoint_url": "wss://localhost:9300/logs"}),
             client_with_ca(ca_path.to_str().expect("utf8 path")),
         )
-        .expect_err("a rejected later CA record must reject plugin construction");
+        .err()
+        .expect("a rejected later CA record must reject plugin construction");
         let visible = [
             "ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`",
             "certificate record #2",
@@ -296,7 +298,8 @@ async fn test_ws_logging_wss_rejects_all_malformed_ca_bundle() {
         &json!({"endpoint_url": "wss://localhost:9300/logs"}),
         client_with_ca(ca_path.to_str().expect("utf8 path")),
     )
-    .expect_err("an all-malformed CA bundle must reject plugin construction");
+    .err()
+    .expect("an all-malformed CA bundle must reject plugin construction");
     assert!(
         error.contains("ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`"),
         "{error}"
@@ -320,7 +323,8 @@ async fn test_ws_logging_wss_rejects_empty_custom_ca_store() {
         &json!({"endpoint_url": "wss://localhost:9300/logs"}),
         client_with_ca(ca_path.to_str().expect("utf8 path")),
     )
-    .expect_err("an empty custom CA store must reject plugin construction");
+    .err()
+    .expect("an empty custom CA store must reject plugin construction");
     assert!(
         error.contains("ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`"),
         "{error}"
@@ -2104,7 +2108,8 @@ fn wss_source_diagnostics_distinguish_io_invalid_source_and_size() {
             &json!({"endpoint_url": "wss://localhost:9300/logs"}),
             client_with_ca(source),
         )
-        .expect_err("declared invalid CA source must reject construction");
+        .err()
+        .expect("declared invalid CA source must reject construction");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for expected in [
             "ws_logging",
@@ -2239,14 +2244,16 @@ async fn ws_logging_refuses_credential_query_parameters_port_zero_and_fragments(
         &json!({ "endpoint_url": "ws://localhost:0/logs" }),
         default_client(),
     )
-    .expect_err("port 0 must be refused");
+    .err()
+    .expect("port 0 must be refused");
     assert!(port_zero.contains("port"), "{port_zero}");
 
     let fragment = WsLogging::new(
         &json!({ "endpoint_url": "ws://localhost:9300/logs#frag" }),
         default_client(),
     )
-    .expect_err("fragment must be refused");
+    .err()
+    .expect("fragment must be refused");
     assert!(fragment.contains("fragment"), "{fragment}");
 
     // Non-credential query parameters stay admissible.
