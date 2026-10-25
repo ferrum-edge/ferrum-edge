@@ -273,15 +273,16 @@ async fn the_shared_body_scan_engine_serves_both_directions() {
     // rustfmt line breaking cannot change the result. The request side
     // forwards the caller's body extent (prefix scans are not judged as
     // refused JSON); the response side has no JSON-path rules and always
-    // scans as complete.
+    // scans as complete. Neither carries a gRPC message split (`None`): only
+    // the HTTP final-body hooks pass one.
     let compact = scan
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .replace(",)", ")");
     for entry in [
-        "self.scan_body_rules(subject,body,content_type,BodyDirection::Request,extent)",
-        "self.scan_body_rules(subject,body,content_type,BodyDirection::Response,BodyExtent::Complete)",
+        "self.scan_body_rules(subject,body,content_type,BodyDirection::Request,extent,None)",
+        "self.scan_body_rules(subject,body,content_type,BodyDirection::Response,BodyExtent::Complete,None)",
     ] {
         assert!(
             compact.contains(entry),

@@ -45,7 +45,10 @@ pub const BUILTIN_RESPONSE_BODY_PRODUCERS: &[&str] = &[
 /// built-in that can require framing but is missing here would let a proxy
 /// accept compression the plugin then cannot see, so
 /// `tests/unit/plugins/plugin_doc_parity_tests.rs` pins the set against the
-/// documented `on_ws_frame` / parser-limit phases. Out-of-tree plugins declare
+/// documented `on_ws_frame` / parser-limit phases. `api_chargeback` is the one
+/// built-in whose need is config-dependent (only bandwidth pricing requires the
+/// parsed relay); it is deliberately absent here and passthrough admission
+/// answers for it from its parsed pricing. Out-of-tree plugins declare
 /// the capability by overriding `requires_ws_frame_hooks()`,
 /// `websocket_size_limits()`, or `requires_websocket_framing()`; admission
 /// constructs them and asks the instance.
@@ -644,9 +647,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ws_frame_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9050,
-        active_phases: "on_ws_frame, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
+        active_phases: "on_ws_policy_close, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
         matrix_protocols: WS_ONLY_PROTOCOLS,
-        protocol_rationale: "`on_ws_frame` records policy decisions such as Close; delivery observations are emitted after successful destination sends",
+        protocol_rationale: "`on_ws_policy_close` records final policy Close decisions; delivery observations are emitted after successful destination sends",
     },
     BuiltinPluginParityMeta {
         name: "statsd_logging",

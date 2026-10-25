@@ -17548,6 +17548,8 @@ async fn handle_websocket_request_authenticated(
                             &adaptive_buf,
                             ws_client_trust_session,
                             ws_deflate_session,
+                            // H1/H2 write straight to the client transport.
+                            None,
                         )
                         .await
                     }
@@ -17575,6 +17577,8 @@ async fn handle_websocket_request_authenticated(
                             &adaptive_buf,
                             ws_client_trust_session,
                             ws_deflate_session,
+                            // H1/H2 write straight to the client transport.
+                            None,
                         )
                         .await
                     }
@@ -17614,6 +17618,7 @@ async fn handle_websocket_request_authenticated(
                             &adaptive_buf,
                             ws_client_trust_session,
                             ws_deflate_session,
+                            None,
                         ))
                         .await;
                         // This is the Unix pool's per-target PHYSICAL
@@ -20120,7 +20125,9 @@ pub(crate) fn ws_fragment_policy_close_for_error(
 /// the completing message must not be admitted on an exhausted budget.
 ///
 /// Only `Message::Close` is honored: there is no message to mutate here.
-/// Observational plugins are skipped so they cannot see a partial decision.
+/// Observational plugins are skipped so they cannot see a partial decision;
+/// the caller reports the final Close to them through
+/// [`observe_ws_policy_close`].
 pub(crate) async fn apply_ws_fragment_plugins(
     plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
@@ -20563,6 +20570,8 @@ impl WsFrameDeliveryBatch {
 
 pub(crate) fn prepare_ws_frame_deliveries(
     plugins: &[Arc<dyn Plugin>],
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
     message: &Message,
 ) -> WsFrameDeliveryBatch {
     if plugins.is_empty() {
@@ -20572,7 +20581,9 @@ pub(crate) fn prepare_ws_frame_deliveries(
     // stack-only; allocate only when multiple delivery observers are configured.
     let mut out = WsFrameDeliveryBatch::None;
     for (index, plugin) in plugins.iter().enumerate() {
-        if let Some(observation) = plugin.prepare_ws_frame_delivery(message) {
+        if let Some(observation) =
+            plugin.prepare_ws_frame_delivery(connection_id, direction, message)
+        {
             out.push(index, observation);
         }
     }
@@ -20638,12 +20649,36 @@ pub(crate) fn guard_ws_control_transform(
     }
 }
 
+/// Report one gateway-published policy Close to every decision observer
+/// ([`Plugin::observes_ws_frame_decisions`]) in the session's frame-hook list.
+///
+/// Called once per relay-half policy decision, after the decision is final,
+/// so observation never depends on where an observer sits in priority order
+/// (an observer ordered before the rejecting plugin still records it). Runs
+/// only on the teardown path — never per delivered message.
+pub(crate) fn observe_ws_policy_close(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    close: Option<&CloseFrame>,
+) {
+    for plugin in plugins {
+        if plugin.observes_ws_frame_decisions() {
+            plugin.on_ws_policy_close(proxy_id, connection_id, direction, close);
+        }
+    }
+}
+
 /// Apply priority-ordered `on_ws_frame` hooks for one reassembled message.
 ///
 /// The first terminal `Message::Close` from an admission/mutating plugin wins:
-/// later mutating plugins are skipped so they cannot charge budget or replace
-/// the Close, while observational hooks
-/// ([`Plugin::observes_ws_frame_decisions`]) still receive the final decision.
+/// the rest of the chain is skipped so no later plugin can charge budget or
+/// replace the Close. Observational hooks
+/// ([`Plugin::observes_ws_frame_decisions`]) run at their priority position
+/// for messages the chain is still processing (their return value is
+/// ignored), and every observer receives the final Close exactly once through
+/// [`observe_ws_policy_close`] after the full pass, whatever its priority.
 /// The control-frame guard runs after the chain so Ping/Pong type flips are
 /// restored before any post-send delivery observation sees the message.
 /// Both relay directions and all H1/H2/H3 frontends share this helper.
@@ -20663,12 +20698,8 @@ pub(crate) async fn apply_ws_frame_plugins(
     }
     let original = raw.clone();
     let mut current = raw;
-    let mut terminal_close = false;
     for plugin in plugins {
         let observes_decisions = plugin.observes_ws_frame_decisions();
-        if terminal_close && !observes_decisions {
-            continue;
-        }
         let transformed = plugin
             .on_ws_frame(proxy_id, connection_id, direction, &current)
             .await;
@@ -20678,13 +20709,18 @@ pub(crate) async fn apply_ws_frame_plugins(
             continue;
         }
         if let Some(transformed) = transformed {
-            if matches!(&transformed, Message::Close(_)) {
-                terminal_close = true;
-            }
+            let terminal_close = matches!(&transformed, Message::Close(_));
             current = transformed;
+            if terminal_close {
+                break;
+            }
         }
     }
-    guard_ws_control_transform(&original, current, direction)
+    let outgoing = guard_ws_control_transform(&original, current, direction);
+    if let Message::Close(close) = &outgoing {
+        observe_ws_policy_close(plugins, proxy_id, connection_id, direction, close.as_ref());
+    }
+    outgoing
 }
 
 enum WsNextMessage {
@@ -20904,6 +20940,32 @@ where
     writer.flush().await
 }
 
+/// `(direction, error class, I/O side)` failure attribution the framed relay
+/// records for `on_ws_disconnect`.
+pub type WsRelayFailure = (
+    crate::plugins::Direction,
+    retry::ErrorClass,
+    Option<tcp_proxy::StreamIoSide>,
+);
+
+/// Deferred verdict of a frontend's own client transport, for frontends whose
+/// WebSocket bytes cross an internal bridge before reaching the client.
+///
+/// HTTP/3 Extended CONNECT is the one such frontend: the shared framer writes
+/// into an in-process duplex and a pump task performs the real QUIC writes, so
+/// a client-side write or FIN failure (for example a peer `STOP_SENDING` while
+/// the pump is still draining the final Close) happens after the framer
+/// already considers the session finished. The framed relay drops its client
+/// transport (signalling end of stream to the bridge), awaits this future,
+/// and records a returned failure — when the relay itself recorded none —
+/// BEFORE it fires `on_ws_disconnect`, so the terminal record carries the
+/// transport outcome instead of a clean close. The future must bound itself
+/// (the H3 pump drain grace) and must not depend on the relay continuing to
+/// hold the client transport. Frontends that write to the client directly pass
+/// `None`.
+pub type WsClientTransportSettle<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<WsRelayFailure>> + Send + 'a>>;
+
 /// Entry point for every frontend's WebSocket relay (H1 Upgrade, H2 and H3
 /// Extended CONNECT).
 ///
@@ -20942,6 +21004,7 @@ pub(crate) async fn run_websocket_session<C, B>(
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     client_trust: Option<crate::tls::ClientTrustSession>,
     permessage_deflate: Option<ws_permessage_deflate::WsDeflateTermination>,
+    client_transport_settle: Option<WsClientTransportSettle<'_>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -20971,6 +21034,7 @@ where
             client_trust,
             ws_permessage_deflate::PlainOutbound,
             ws_permessage_deflate::PlainOutbound,
+            client_transport_settle,
         )
         .await;
     };
@@ -21015,6 +21079,7 @@ where
             client_trust,
             streams.to_backend,
             streams.to_client,
+            client_transport_settle,
         )
         .await
     })
@@ -21076,6 +21141,11 @@ pub(crate) async fn run_websocket_proxy<C, B, E>(
     // is written toward the backend / client (RFC 7692 re-deflate).
     mut to_backend_codec: E,
     mut to_client_codec: E,
+    // H3 bridge transport verdict, settled after the framed relay drops its
+    // client transport and before `on_ws_disconnect` (see
+    // [`WsClientTransportSettle`]). Unused on the raw tunnel path, where the
+    // caller still awaits its own bridge teardown.
+    client_transport_settle: Option<WsClientTransportSettle<'_>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -21500,6 +21570,13 @@ where
                         .await
                     {
                         debug!("Fragment budget rejected client->backend reassembly frames");
+                        observe_ws_policy_close(
+                            &ctb_plugins,
+                            &proxy_id_ctb,
+                            connection_id,
+                            WebSocketFrameDirection::ClientToBackend,
+                            close_frame.as_ref(),
+                        );
                         let close = publish_ws_policy_close(
                             &policy_close_ctb,
                             &cancel_ctb,
@@ -21562,7 +21639,12 @@ where
                             // write failure discard them (no "attempted" frame event).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             let delivery =
-                                prepare_ws_frame_deliveries(&ctb_plugins, &outgoing);
+                                prepare_ws_frame_deliveries(
+                                    &ctb_plugins,
+                                    connection_id,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                    &outgoing,
+                                );
                             // RFC 7692 terminate: re-deflate toward a backend
                             // leg that negotiated compression, after every
                             // plugin saw the plaintext. Identity otherwise.
@@ -21632,7 +21714,12 @@ where
                             let close_msg = Message::Close(close_frame);
                             let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
                             let delivery =
-                                prepare_ws_frame_deliveries(&ctb_plugins, &close_msg);
+                                prepare_ws_frame_deliveries(
+                                    &ctb_plugins,
+                                    connection_id,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                    &close_msg,
+                                );
                             // Race cancel in case the opposite direction already exited while
                             // we were decoding this Close frame. The send future is polled
                             // first after the cancel check so the happy path does not block.
@@ -21700,6 +21787,13 @@ where
                                 );
                                 // Cancellation precedes the bounded polite write so policy
                                 // teardown cannot be held by a non-reading destination.
+                                observe_ws_policy_close(
+                                    &ctb_plugins,
+                                    &proxy_id_ctb,
+                                    connection_id,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                    Some(&close),
+                                );
                                 let close = publish_ws_policy_close(
                                     &policy_close_ctb,
                                     &cancel_ctb,
@@ -21719,6 +21813,13 @@ where
                                     max_size,
                                     "WebSocket global size limit rejected input before forwarding"
                                 );
+                                observe_ws_policy_close(
+                                    &ctb_plugins,
+                                    &proxy_id_ctb,
+                                    connection_id,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                    Some(&close),
+                                );
                                 let close = publish_ws_policy_close(
                                     &policy_close_ctb,
                                     &cancel_ctb,
@@ -21735,6 +21836,13 @@ where
                                     direction = "client->backend",
                                     limit_kind,
                                     "WebSocket incomplete-message policy rejected input before forwarding"
+                                );
+                                observe_ws_policy_close(
+                                    &ctb_plugins,
+                                    &proxy_id_ctb,
+                                    connection_id,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                    Some(&close),
                                 );
                                 let close = publish_ws_policy_close(
                                     &policy_close_ctb,
@@ -21754,10 +21862,18 @@ where
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );
+                                let close = fault.close_frame();
+                                observe_ws_policy_close(
+                                    &ctb_plugins,
+                                    &proxy_id_ctb,
+                                    connection_id,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                    Some(&close),
+                                );
                                 let close = publish_ws_policy_close(
                                     &policy_close_ctb,
                                     &cancel_ctb,
-                                    Some(fault.close_frame()),
+                                    Some(close),
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 ws_permessage_deflate_error_class(fault, true)
@@ -21873,6 +21989,13 @@ where
                         .await
                     {
                         debug!("Fragment budget rejected backend->client reassembly frames");
+                        observe_ws_policy_close(
+                            &btc_plugins,
+                            &proxy_id_btc,
+                            connection_id,
+                            WebSocketFrameDirection::BackendToClient,
+                            close_frame.as_ref(),
+                        );
                         let close = publish_ws_policy_close(
                             &policy_close_btc,
                             &cancel_btc,
@@ -21923,7 +22046,12 @@ where
                             // before `send(outgoing)` moves the frame (mirror of c2b).
                             let outgoing_payload_bytes = ws_message_payload_bytes(&outgoing);
                             let delivery =
-                                prepare_ws_frame_deliveries(&btc_plugins, &outgoing);
+                                prepare_ws_frame_deliveries(
+                                    &btc_plugins,
+                                    connection_id,
+                                    WebSocketFrameDirection::BackendToClient,
+                                    &outgoing,
+                                );
                             // Mirror of c2b: re-deflate toward a client leg
                             // that negotiated compression.
                             let outgoing = to_client_codec.encode(outgoing);
@@ -21985,7 +22113,12 @@ where
                             let close_msg = Message::Close(close_frame);
                             let outgoing_payload_bytes = ws_message_payload_bytes(&close_msg);
                             let delivery =
-                                prepare_ws_frame_deliveries(&btc_plugins, &close_msg);
+                                prepare_ws_frame_deliveries(
+                                    &btc_plugins,
+                                    connection_id,
+                                    WebSocketFrameDirection::BackendToClient,
+                                    &close_msg,
+                                );
                             // Race cancel in case c2b has already exited.
                             tokio::select! {
                                 biased;
@@ -22045,6 +22178,13 @@ where
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
                                 );
+                                observe_ws_policy_close(
+                                    &btc_plugins,
+                                    &proxy_id_btc,
+                                    connection_id,
+                                    WebSocketFrameDirection::BackendToClient,
+                                    Some(&close),
+                                );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
                                     &cancel_btc,
@@ -22064,6 +22204,13 @@ where
                                     max_size,
                                     "WebSocket global size limit rejected input before forwarding"
                                 );
+                                observe_ws_policy_close(
+                                    &btc_plugins,
+                                    &proxy_id_btc,
+                                    connection_id,
+                                    WebSocketFrameDirection::BackendToClient,
+                                    Some(&close),
+                                );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
                                     &cancel_btc,
@@ -22080,6 +22227,13 @@ where
                                     direction = "backend->client",
                                     limit_kind,
                                     "WebSocket incomplete-message policy rejected input before forwarding"
+                                );
+                                observe_ws_policy_close(
+                                    &btc_plugins,
+                                    &proxy_id_btc,
+                                    connection_id,
+                                    WebSocketFrameDirection::BackendToClient,
+                                    Some(&close),
                                 );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
@@ -22099,10 +22253,18 @@ where
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );
+                                let close = fault.close_frame();
+                                observe_ws_policy_close(
+                                    &btc_plugins,
+                                    &proxy_id_btc,
+                                    connection_id,
+                                    WebSocketFrameDirection::BackendToClient,
+                                    Some(&close),
+                                );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
                                     &cancel_btc,
-                                    Some(fault.close_frame()),
+                                    Some(close),
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
                                 ws_permessage_deflate_error_class(fault, false)
@@ -22255,7 +22417,7 @@ where
             ));
         }
     } else if tokio::time::timeout(WS_DRAIN_GRACE, async {
-        tokio::join!(c2b, b2c);
+        tokio::join!(&mut c2b, &mut b2c);
     })
     .await
     .is_err()
@@ -22265,6 +22427,19 @@ where
             retry::ErrorClass::ReadWriteTimeout,
             None,
         ));
+    }
+
+    // Both halves are finished or abandoned. Dropping them releases the client
+    // framer and with it the client transport, which is the end-of-stream
+    // signal a bridged frontend (H3) needs before its pump can settle. A
+    // bridge-side failure is recorded only when the relay recorded none, so
+    // the relay's own first failure keeps its direction and side.
+    drop(c2b);
+    drop(b2c);
+    if let Some(settle) = client_transport_settle
+        && let Some(failure) = settle.await
+    {
+        let _ = first_failure.set(failure);
     }
 
     let termination_reason = termination_reason.get().copied().unwrap_or_else(|| {
@@ -28956,8 +29131,13 @@ pub(crate) fn replace_buffered_response_with_authorization_terminal(
         // No gRPC terminal metadata exists for an ordinary HTTP response, so
         // the fixed redacted `401` is the terminal. Nothing here echoes an
         // expiry instant, claim, subject, or provider.
-        let (status, headers, body) =
+        let (status, mut headers, body) =
             authorization_expired_pre_commitment_response(ctx, termination, false);
+        decorate_plain_authorization_terminal_headers(
+            ctx,
+            initial_response_header_policy_plugins,
+            &mut headers,
+        );
         *response_headers = headers;
         *response_body = match body {
             ResponseBody::Buffered(bytes) => bytes,
@@ -34140,6 +34320,11 @@ async fn handle_proxy_request_inner(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // Whether DATA may follow the head, from the transport itself: hyper
+    // reports end-of-stream for an HTTP/1.1 request without body framing and
+    // for an HTTP/2 HEADERS frame carrying END_STREAM. Body policies read this
+    // instead of trusting an omittable `Content-Length` / `Content-Type`.
+    ctx.inbound_request_body_may_follow = Some(!http_body::Body::is_end_stream(req.body()));
     let mut request_scheme = if is_tls { "https" } else { "http" };
     ctx.request_is_secure = is_tls;
     ctx.metadata.insert(
@@ -35175,6 +35360,13 @@ async fn handle_proxy_request_inner(
                             client_ip = %ctx.client_ip,
                             reject_status,
                             "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
+                        );
+                        crate::plugins::mesh::outbound_registry::warn_http_registry_deny(
+                            request_host.as_deref(),
+                            authority_port,
+                            Some(listen_port),
+                            &ctx.client_ip,
+                            crate::plugins::mesh::outbound_registry::DENY_SOURCE_ROUTE_MISS,
                         );
                         ctx.terminal_record.mark_counted();
                         state.request_count.fetch_add(1, Ordering::Relaxed);
@@ -43625,6 +43817,7 @@ async fn handle_proxy_request_inner(
         &mut response_status,
         &mut response_headers,
         &mut response_body,
+        initial_response_header_policy_plugins.as_ref(),
     );
     if precommit_authorization_terminal.is_some() {
         backend_resp.connection_error = false;
@@ -44493,6 +44686,7 @@ async fn handle_proxy_request_inner(
         &mut response_status,
         &mut response_headers,
         &mut response_body,
+        initial_response_header_policy_plugins.as_ref(),
     );
     if final_precommit_authorization_terminal.is_some() {
         // The terminal is fully buffered, so the summary and the latency
@@ -57420,6 +57614,42 @@ pub(crate) fn authorization_expired_pre_commitment_response(
     )
 }
 
+/// Apply the route's precomputed initial-response header policy (for example
+/// `security_headers`) to the fixed plain-HTTP authorization terminal, then
+/// restore the fields that terminal owns.
+///
+/// Only the context-free static policy runs: no asynchronous or request-state
+/// hook is replayed after expiry, and no backend header survives, because the
+/// map starts from the freshly built terminal. Framing stays with the final
+/// wire boundary and the JSON `Content-Type` is re-asserted after policy, so
+/// the fixed body cannot be relabeled. As on every gateway `401`, policy may
+/// replace the mandatory challenge (RFC 9110 §15.5.2) with one well-formed
+/// challenge list but cannot leave the response without one: anything else
+/// restores the reauthentication challenge.
+fn decorate_plain_authorization_terminal_headers(
+    ctx: &RequestContext,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    headers: &mut HashMap<String, String>,
+) {
+    if initial_response_header_policy_plugins.is_empty() {
+        return;
+    }
+    finalize_plain_gateway_error_response_headers(initial_response_header_policy_plugins, headers);
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("content-type"));
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let policy_challenge_is_well_formed = {
+        let present = crate::plugins::utils::auth_flow::response_authentication_challenges(headers);
+        matches!(
+            present.as_slice(),
+            [value] if *value == value.trim()
+                && crate::plugins::utils::auth_flow::is_valid_authentication_challenge(value)
+        )
+    };
+    if !policy_challenge_is_well_formed {
+        insert_reauthentication_challenge(headers, ctx);
+    }
+}
+
 /// Decide the shared pre-commitment terminal without constructing a body.
 #[inline]
 pub(crate) fn request_authorization_termination(
@@ -57473,17 +57703,29 @@ pub(crate) fn apply_precommit_authorization_terminal(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut ResponseBody,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     let termination = request_authorization_termination(ctx, max_lifetime_seconds)?;
     // The authorization terminal replaces whatever response was selected
     // (issue #6774).
     ctx.note_gateway_response_replacement();
-    let (terminal_status, terminal_headers, terminal_body) =
+    let (terminal_status, mut terminal_headers, terminal_body) =
         authorization_expired_pre_commitment_response(
             ctx,
             termination,
             request_uses_grpc_content_type,
         );
+    // The replacement discards every header the response phases decorated,
+    // including the route's static security policy, and nothing awaits after
+    // this gate to re-decorate it. Reapply that context-free policy to the
+    // fixed plain-HTTP `401` synchronously.
+    if terminal_status == StatusCode::UNAUTHORIZED.as_u16() {
+        decorate_plain_authorization_terminal_headers(
+            ctx,
+            initial_response_header_policy_plugins,
+            &mut terminal_headers,
+        );
+    }
     *response_status = terminal_status;
     *response_headers = terminal_headers;
     *response_body = terminal_body;
@@ -68083,7 +68325,16 @@ mod tests {
             "POST".to_string(),
             "/v1/chat/completions".to_string(),
         );
-        let mut headers = HashMap::new();
+        // `ai_rate_limiter` only consults its budget for AI calls (or bodies
+        // it cannot inspect), so probe with a still-compressed JSON POST: a
+        // budget check with no reservation of its own.
+        let budget_probe_headers = || {
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+            ])
+        };
+        let mut headers = budget_probe_headers();
         assert!(matches!(
             limiter.before_proxy(&mut next_ctx, &mut headers).await,
             PluginResult::Continue
@@ -68116,7 +68367,7 @@ mod tests {
             "POST".to_string(),
             "/v1/chat/completions".to_string(),
         );
-        let mut headers = HashMap::new();
+        let mut headers = budget_probe_headers();
         assert!(matches!(
             limiter
                 .before_proxy(&mut over_limit_ctx, &mut headers)

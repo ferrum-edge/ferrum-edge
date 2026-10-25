@@ -141,11 +141,12 @@ impl WsSessionPolicy {
             inspect_client_to_backend && waf.has_enforcing_body_policy(BodyDirection::Request, ctx);
         let enforcing_backend_to_client = inspect_backend_to_client
             && waf.has_enforcing_body_policy(BodyDirection::Response, ctx);
-        // The `(mode == enforce && on_body_too_large == block)` term both HTTP
-        // body predicates OR in: a strict size cap is a blocking body
-        // disposition on its own, independent of per-rule `action`.
-        let strict_size_cap = waf.config.mode == GlobalMode::Enforce
-            && waf.config.on_body_too_large == TooLargeAction::Block;
+        // The `(on_body_too_large == block && strict_block_applies)` term both
+        // HTTP body predicates OR in: a strict size cap is a blocking body
+        // disposition on its own, independent of per-rule `action`, unless a
+        // `header_present` secret exempted the upgrade request.
+        let strict_size_cap =
+            waf.config.on_body_too_large == TooLargeAction::Block && waf.strict_block_applies(ctx);
         Self {
             suppressed_by_request: waf.exemptions.suppresses_rule_for_request(ctx),
             rule_conditions: waf
@@ -279,7 +280,11 @@ impl WafWsSession {
             TooLargeAction::Skip => return Err(None),
             TooLargeAction::ScanTruncated => false,
             TooLargeAction::FailClosed => self.policy.enforces(governed),
-            TooLargeAction::Block => self.waf.config.mode == GlobalMode::Enforce,
+            // A `header_present` secret on the upgrade request exempts the
+            // session from the strict cap too, as `Waf::clamp_body` does.
+            TooLargeAction::Block => {
+                self.waf.config.mode == GlobalMode::Enforce && !self.policy.suppressed_by_request
+            }
         };
         // A block is terminal for the session and always recorded. The
         // non-blocking prefix-scan arm is a lost-coverage signal that can
@@ -448,7 +453,9 @@ impl WafWsSession {
             return None;
         }
         let block = match self.waf.config.on_scan_timeout {
-            TimeoutAction::Block => true,
+            // A `header_present`-exempt session is not closed on a clean but
+            // late message either, mirroring `Waf::finish_timeout`.
+            TimeoutAction::Block => !self.policy.suppressed_by_request,
             TimeoutAction::FailClosed => self.policy.timeout_enforces(body_direction(direction)),
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
         };
@@ -474,6 +481,31 @@ impl WafWsSession {
             );
         }
         block.then(|| policy_close(CLOSE_REASON_UNINSPECTABLE))
+    }
+}
+
+impl Waf {
+    /// Bind this instance to the upgrade `ctx` exactly as the relay does and
+    /// decide a CLEAN message in `direction` whose scan missed its deadline;
+    /// `true` when the session closes. Not a production API: external tests
+    /// use it to pin the WebSocket `on_scan_timeout` disposition without
+    /// depending on how long a real scan takes.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests
+    pub fn ws_clean_timed_out_message_closes_for_test(
+        self: Arc<Self>,
+        ctx: &RequestContext,
+        direction: WebSocketFrameDirection,
+    ) -> bool {
+        let policy = WsSessionPolicy::from_upgrade(&self, ctx);
+        let session = WafWsSession { waf: self, policy };
+        let outcome = ScanOutcome {
+            timed_out: true,
+            ..ScanOutcome::default()
+        };
+        session
+            .finish("test-proxy", 0, direction, &outcome)
+            .is_some()
     }
 }
 
