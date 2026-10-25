@@ -8,29 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **`otel_tracing` hardening** (plugin production-launch review). Two
-  effective `otel_tracing` instances on one proxy are now rejected at
-  admission: the gateway SERVER span, its sampling decision, and the attempt
-  recorder are single request slots. Custom export `headers` that repeat a
-  name case-insensitively, set an exporter-managed header (`Content-Type`,
-  `Content-Length`, `Content-Encoding`, `Transfer-Encoding`, `Host`), or set
-  `Authorization` beside `authorization` are rejected at construction. A
-  trusted parent's `tracestate` is forwarded only when it is a valid W3C list
-  (32 members, key/value grammar, no duplicate keys, 8 KiB); an invalid one is
-  dropped. New `compression: none | gzip` option sends OTLP batches with
-  `Content-Encoding: gzip`. Span admissions and delivery losses are published
-  on `ferrum_plugin_log_sink_records_{accepted,dropped}_total{plugin="otel_tracing"}`.
-  Successful WebSocket handshakes now echo the gateway SERVER `traceparent`,
-  and propagation-only mode no longer builds a span per request only to drop it.
-  When `otel_tracing` and a trace-enabled `workload_metrics` run on one request,
-  the first to establish the gateway SERVER span owns it and the other reuses
-  it, so attempt CLIENT spans and the exported SERVER span no longer reference
-  a parent that is never exported, and `workload_metrics` no longer restores a
-  caller `tracestate` that `otel_tracing` dropped as untrusted. Once
-  `otel_tracing` forwards the SERVER span it owns it, so a later
-  `request_transformer` rewrite of `traceparent` cannot re-derive a span the
-  attempt recorder already froze, and a `tracestate` `workload_metrics`
-  imports is W3C-validated too.
 - **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
   `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
   most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
