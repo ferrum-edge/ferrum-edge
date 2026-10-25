@@ -1996,7 +1996,7 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 
 Unknown top-level keys are rejected at construction (for example a misspelled `render_cache_ttl_secnds` cannot silently leave the default TTL). Registration is `OptionalFailOpen`: Admin create/update still returns HTTP 400 for an invalid enabled config, while file-mode `validate`/load and plugin-cache rebuild warn, naming the unknown key, and omit this instance rather than failing the gateway. `schema` / `schema_ref` remain unsupported and fail with an explicit diagnostic.
 
-**Hooks:** `on_request_received` and `on_stream_connect` mark the transaction as observed so mesh TCP lifecycle accounting and gRPC message counters can complete later; they always return Continue. `log`, `on_stream_disconnect`, and `on_ws_disconnect` record the terminal HTTP/gRPC, stream, and WebSocket series.
+**Hooks:** `on_request_received` and `on_stream_connect` mark the transaction as observed so mesh TCP lifecycle accounting and gRPC message counters can complete later (HTTP requests carry a typed, allocation-free context bit; streams carry an internal metadata marker); they always return Continue. `log`, `on_stream_disconnect`, and `on_ws_disconnect` record the terminal HTTP/gRPC, stream, and WebSocket series.
 
 **What the plugin owns on `/metrics`.** The authenticated admin `/metrics`
 endpoint is built in and always renders the process registry; it does not

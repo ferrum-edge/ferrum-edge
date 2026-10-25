@@ -318,17 +318,39 @@ plugin_configs:
     assert_eq!(resp.status(), 200, "routed request should succeed");
     let _ = resp.bytes().await;
 
-    sleep(Duration::from_secs(1)).await;
-
-    let body = client
-        .get(gateway.admin_url("/metrics"))
-        .header("Authorization", gateway.auth_header())
-        .send()
-        .await
-        .expect("Failed to scrape /metrics")
-        .text()
-        .await
-        .expect("Failed to read /metrics body");
+    // The routed transaction is recorded by a separately scheduled terminal
+    // logging task; draining the response does not join it. Scrape until the
+    // monotonic series that task records appear, under a bounded deadline,
+    // instead of trusting a fixed sleep. Traffic is never resent.
+    let routed_series_recorded = |body: &str| {
+        body.lines().any(|line| {
+            line.starts_with("ferrum_request_body_bytes_total{proxy_id=\"bytes-proxy\"")
+        }) && body.lines().any(|line| {
+            line.starts_with("ferrum_response_body_bytes_total{proxy_id=\"bytes-proxy\"")
+        }) && body.lines().any(|line| {
+            line.starts_with("ferrum_request_duration_ms_count{proxy_id=\"bytes-proxy\"")
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let body = loop {
+        let body = client
+            .get(gateway.admin_url("/metrics"))
+            .header("Authorization", gateway.auth_header())
+            .send()
+            .await
+            .expect("Failed to scrape /metrics")
+            .text()
+            .await
+            .expect("Failed to read /metrics body");
+        if routed_series_recorded(body.as_str()) {
+            break body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "routed series never appeared within 15s. Last /metrics:\n{body}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
 
     let sample = |prefix: &str| -> Option<u64> {
         body.lines()

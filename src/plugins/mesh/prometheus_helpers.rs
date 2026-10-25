@@ -139,10 +139,13 @@ pub struct MeshRequestKey {
 
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
 /// Stamped by the single enabled process-global `prometheus_metrics` plugin
-/// when its request/stream hook actually observed this transaction.
+/// when its stream hook actually observed this connection. (HTTP-family
+/// requests carry the same fact as the typed
+/// [`crate::plugins::RequestContext::prometheus_metrics_observed`] bit, so the
+/// per-request hook allocates nothing.)
 ///
-/// Workload-metrics producers and body scanners require this marker before
-/// updating the global registry. Mesh mode auto-injects `workload_metrics`, but
+/// Stream lifecycle producers require this marker before updating the global
+/// registry. Mesh mode auto-injects `workload_metrics`, but
 /// it deliberately does not auto-inject a Prometheus exporter; without this
 /// gate, the opened half of a TCP lifecycle and gRPC body scanners would still
 /// run in deployments where `/metrics` was otherwise plugin-gated silent.
@@ -2881,13 +2884,17 @@ pub fn is_mesh_grpc_protocol(protocol: &str) -> bool {
 
 /// True when the Prometheus hook observed a gRPC (or gRPC-Web) transaction that
 /// should populate authoritative length-prefixed message counters.
-pub fn metadata_observes_grpc_messages<MS: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, MS>,
-) -> bool {
-    metadata.contains_key(MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
-        && metadata
+///
+/// Observation is the typed
+/// [`crate::plugins::RequestContext::prometheus_metrics_observed`]
+/// bit the request hook sets (no per-request metadata marker); the protocol
+/// still comes from routing metadata.
+pub fn request_observes_grpc_messages(ctx: &crate::plugins::RequestContext) -> bool {
+    ctx.prometheus_metrics_observed()
+        && ctx
+            .metadata
             .get("request_protocol")
-            .or_else(|| metadata.get("mesh.request_protocol"))
+            .or_else(|| ctx.metadata.get("mesh.request_protocol"))
             .is_some_and(|protocol| is_mesh_grpc_protocol(protocol))
 }
 
@@ -2919,12 +2926,12 @@ pub fn record_complete_grpc_message_count(counter: &AtomicU64, body: &[u8]) {
 ///
 /// Both directions therefore describe the native gRPC representation exchanged
 /// with the backend, and `fetch_max` keeps retried/replayed buffers idempotent.
-pub fn record_native_grpc_message_count<MS: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, MS>,
+pub fn record_native_grpc_message_count(
+    ctx: &crate::plugins::RequestContext,
     counter: &AtomicU64,
     body: &[u8],
 ) {
-    if metadata_observes_grpc_messages(metadata) {
+    if request_observes_grpc_messages(ctx) {
         record_complete_grpc_message_count(counter, body);
     }
 }

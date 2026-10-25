@@ -703,7 +703,29 @@ impl DurationBucketLayouts {
             session: Arc::from(DEFAULT_SESSION_DURATION_BUCKETS_MS),
         }
     }
+
+    fn layout(&self, kind: DurationLayoutKind) -> &Arc<[f64]> {
+        match kind {
+            DurationLayoutKind::Request => &self.request,
+            DurationLayoutKind::Session => &self.session,
+        }
+    }
 }
+
+/// Which configured duration layout a histogram family uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationLayoutKind {
+    /// `request_duration_buckets_ms` families.
+    Request,
+    /// `session_duration_buckets_ms` families.
+    Session,
+}
+
+/// A captured duration-layout snapshot, standing in for a recorder that loaded
+/// the layouts before a reload published new ones. Test-only handle; the
+/// production record paths load the snapshot themselves.
+#[doc(hidden)]
+pub struct DurationLayoutSnapshotForTest(Arc<DurationBucketLayouts>);
 
 /// Histogram with predefined buckets and a last-updated timestamp.
 pub struct HistogramBuckets {
@@ -1387,11 +1409,23 @@ impl MetricsRegistry {
             ),
             Ordering::Release,
         );
+        // Fence against an in-flight cache rebuild: a body rendered under the
+        // previous namespace label must not be published after this
+        // invalidation (see `configure_duration_buckets`).
+        let _rebuild = self.lock_render_rebuild();
         // Set namespace label fragment for every namespace.
         if let Ok(mut ns_label) = self.namespace_label.write() {
             *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
         }
         self.render_cache.store(Arc::new(None));
+    }
+
+    /// Acquire the scrape-path rebuild lock. The guarded data is `()`, so a
+    /// guard poisoned by a panicking renderer is always safe to recover.
+    fn lock_render_rebuild(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.render_rebuild_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Publish the millisecond duration-histogram bucket layouts.
@@ -1408,10 +1442,19 @@ impl MetricsRegistry {
     /// affected families is dropped so a family never exposes two `le`
     /// layouts at once (cross-series `sum by (le)` would otherwise mix them);
     /// those series restart from zero under the new layout, which Prometheus
-    /// treats as an ordinary counter reset. A record racing the change that
-    /// still creates an old-layout series is reset by the record path on its
-    /// next observation.
+    /// treats as an ordinary counter reset.
+    ///
+    /// Reload safety: a recorder that captured the previous layout before this
+    /// publication only uses that capture for its shared-guard fast path.
+    /// Every insert or replacement re-reads the CURRENTLY published layout
+    /// while holding the entry's shard write lock, and the retirement sweep
+    /// below takes the same shard locks after publishing, so a late recorder
+    /// can neither resurrect a retired layout nor replace a current-layout
+    /// series with a retired one. The whole publication runs under the
+    /// scrape rebuild lock, so a body rendered before the change cannot be
+    /// published after its cache invalidation.
     pub fn configure_duration_buckets(&self, request_bounds: &[f64], session_bounds: &[f64]) {
+        let _rebuild = self.lock_render_rebuild();
         let current = self.duration_bucket_layouts.load_full();
         let request_changed = current.request.as_ref() != request_bounds;
         let session_changed = current.session.as_ref() != session_bounds;
@@ -1473,6 +1516,49 @@ impl MetricsRegistry {
         self.duration_bucket_layouts.load().session.to_vec()
     }
 
+    /// Capture the currently published duration layouts, as a recorder does
+    /// at the start of `record`.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn duration_layout_snapshot_for_test(&self) -> DurationLayoutSnapshotForTest {
+        DurationLayoutSnapshotForTest(self.duration_bucket_layouts.load_full())
+    }
+
+    /// Record an HTTP-family summary as a recorder that captured `snapshot`
+    /// before a later reload (the late-recorder interleaving).
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn record_with_layout_snapshot_for_test(
+        &self,
+        summary: &TransactionSummary,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        let mesh_key = prometheus_helpers::mesh_request_key(summary);
+        self.record_with_layouts(summary, mesh_key.as_ref(), &snapshot.0);
+    }
+
+    /// Stream-summary counterpart of [`Self::record_with_layout_snapshot_for_test`].
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn record_stream_with_layout_snapshot_for_test(
+        &self,
+        summary: &StreamTransactionSummary,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        self.record_stream_with_layouts(summary, &snapshot.0);
+    }
+
+    /// WebSocket counterpart of [`Self::record_with_layout_snapshot_for_test`].
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn record_ws_session_with_layout_snapshot_for_test(
+        &self,
+        ctx: &WsDisconnectContext,
+        snapshot: &DurationLayoutSnapshotForTest,
+    ) {
+        self.record_ws_session_with_layouts(ctx, &snapshot.0);
+    }
+
     /// Count one request refused before routing.
     ///
     /// Called from the shared route-miss funnel
@@ -1516,11 +1602,20 @@ impl MetricsRegistry {
     }
 
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
-        let epoch = self.epoch;
         let layouts = self.duration_bucket_layouts.load();
+        self.record_stream_with_layouts(summary, &layouts);
+    }
+
+    fn record_stream_with_layouts(
+        &self,
+        summary: &StreamTransactionSummary,
+        layouts: &DurationBucketLayouts,
+    ) {
+        let epoch = self.epoch;
         let proxy_id = self.observe_proxy_duration(
             &self.stream_duration_buckets,
             summary.proxy_id.as_str(),
+            DurationLayoutKind::Session,
             &layouts.session,
             summary.duration_ms,
         );
@@ -1711,6 +1806,15 @@ impl MetricsRegistry {
     }
 
     pub fn record_ws_session(&self, ctx: &WsDisconnectContext) {
+        let layouts = self.duration_bucket_layouts.load();
+        self.record_ws_session_with_layouts(ctx, &layouts);
+    }
+
+    fn record_ws_session_with_layouts(
+        &self,
+        ctx: &WsDisconnectContext,
+        layouts: &DurationBucketLayouts,
+    ) {
         let proxy_id: Arc<str> = Arc::from(ctx.proxy_id.as_str());
         let session_key = WsSessionKey {
             proxy_id: Arc::clone(&proxy_id),
@@ -1729,11 +1833,11 @@ impl MetricsRegistry {
             termination_reason: websocket_termination_reason_label(ctx),
         };
         let epoch = self.epoch;
-        let layouts = self.duration_bucket_layouts.load();
         self.observe_duration(
             &self.ws_session_duration_buckets,
             &session_key,
             || session_key.clone(),
+            DurationLayoutKind::Session,
             &layouts.session,
             ctx.duration_ms.max(0.0),
         );
@@ -2643,9 +2747,23 @@ impl MetricsRegistry {
         if summary.mirror {
             return;
         }
-
-        let epoch = self.epoch;
         let layouts = self.duration_bucket_layouts.load();
+        self.record_with_layouts(summary, mesh_key, &layouts);
+    }
+
+    /// `record_with_mesh_key` against an explicit duration-layout snapshot.
+    /// `layouts` only seeds the shared-guard fast paths; inserts re-read the
+    /// published layout (see `configure_duration_buckets`).
+    fn record_with_layouts(
+        &self,
+        summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+        layouts: &DurationBucketLayouts,
+    ) {
+        if summary.mirror {
+            return;
+        }
+        let epoch = self.epoch;
         let proxy_key: &str = summary.proxy_id.as_deref().unwrap_or("unknown");
 
         // The request-duration histogram is recorded for every transaction, so
@@ -2654,6 +2772,7 @@ impl MetricsRegistry {
         let proxy_id = self.observe_proxy_duration(
             &self.request_duration_buckets,
             proxy_key,
+            DurationLayoutKind::Request,
             &layouts.request,
             summary.latency_total_ms,
         );
@@ -2680,6 +2799,7 @@ impl MetricsRegistry {
                 &self.backend_duration_buckets,
                 proxy_key,
                 || Arc::clone(&proxy_id),
+                DurationLayoutKind::Request,
                 &layouts.request,
                 summary.latency_backend_total_ms,
             );
@@ -2693,6 +2813,7 @@ impl MetricsRegistry {
                 &self.gateway_overhead_buckets,
                 proxy_key,
                 || Arc::clone(&proxy_id),
+                DurationLayoutKind::Request,
                 &layouts.request,
                 summary.latency_gateway_overhead_ms,
             );
@@ -3026,32 +3147,43 @@ impl MetricsRegistry {
         }
     }
 
+    /// The duration layout published right now (not a recorder's capture).
+    ///
+    /// Read under an entry's shard write lock by every insert/replace path, so
+    /// a recorder that captured a since-retired layout can never write it back.
+    fn current_duration_layout(&self, kind: DurationLayoutKind) -> Arc<[f64]> {
+        Arc::clone(self.duration_bucket_layouts.load().layout(kind))
+    }
+
     /// Mesh duration-histogram variant of [`Self::update_mesh_series`] that
-    /// also enforces the configured bucket layout. A retained key whose
-    /// histogram predates a layout change is reset in place (it keeps its
-    /// reserved budget slot) so one series never mixes `le` layouts.
+    /// also enforces the published request bucket layout.
+    ///
+    /// `captured` (the recorder's snapshot) only qualifies the shared-guard
+    /// fast path. Under the entry write lock the CURRENT layout decides: a
+    /// retained key whose histogram predates it is reset in place (keeping its
+    /// reserved budget slot), and a current-layout histogram is never replaced
+    /// by a stale capture.
     fn observe_mesh_duration_series(
         &self,
         family: prometheus_helpers::MeshMetricFamily,
         map: &DashMap<MeshRequestKey, HistogramBuckets>,
         key: MeshRequestKey,
-        layout: &Arc<[f64]>,
+        captured: &Arc<[f64]>,
         value: f64,
     ) {
         use dashmap::mapref::entry::Entry;
         if let Some(existing) = map.get(&key)
-            && Arc::ptr_eq(&existing.boundaries, layout)
+            && Arc::ptr_eq(&existing.boundaries, captured)
         {
             existing.observe(value, self.epoch);
             return;
         }
         match map.entry(key) {
             Entry::Occupied(mut entry) => {
-                if !Arc::ptr_eq(&entry.get().boundaries, layout) {
-                    let _superseded = entry.insert(HistogramBuckets::with_layout(
-                        Arc::clone(layout),
-                        self.epoch,
-                    ));
+                let current = self.current_duration_layout(DurationLayoutKind::Request);
+                if !Arc::ptr_eq(&entry.get().boundaries, &current) {
+                    let _superseded =
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
                 }
                 entry.get().observe(value, self.epoch);
             }
@@ -3060,7 +3192,8 @@ impl MetricsRegistry {
                     self.record_mesh_series_overflow(family);
                     return;
                 }
-                let histogram = HistogramBuckets::with_layout(Arc::clone(layout), self.epoch);
+                let current = self.current_duration_layout(DurationLayoutKind::Request);
+                let histogram = HistogramBuckets::with_layout(current, self.epoch);
                 histogram.observe(value, self.epoch);
                 entry.insert(histogram);
             }
@@ -3090,19 +3223,21 @@ impl MetricsRegistry {
         update(entry.value())
     }
 
-    /// Observe `value` on a duration histogram keyed by `lookup` under the
-    /// configured `layout`.
+    /// Observe `value` on a duration histogram keyed by `lookup`.
     ///
-    /// An established series carrying the current layout updates under a
-    /// shared read guard. A series still carrying a superseded layout (recorded
-    /// concurrently with a reconfiguration) is reset to the current layout
-    /// under the entry write lock, so one series never mixes `le` layouts.
+    /// `captured` (the recorder's layout snapshot) only qualifies the
+    /// shared-read-guard fast path. Every insert or replacement happens under
+    /// the entry's shard write lock against the CURRENTLY published `kind`
+    /// layout: a series carrying a superseded layout is reset to the current
+    /// one, and a recorder whose capture predates a reload can neither
+    /// resurrect the retired layout nor replace a current-layout series.
     fn observe_duration<K, Q>(
         &self,
         map: &DashMap<K, HistogramBuckets>,
         lookup: &Q,
         owned_key: impl FnOnce() -> K,
-        layout: &Arc<[f64]>,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
         value: f64,
     ) where
         K: Eq + std::hash::Hash + std::borrow::Borrow<Q>,
@@ -3110,23 +3245,23 @@ impl MetricsRegistry {
     {
         use dashmap::mapref::entry::Entry;
         if let Some(existing) = map.get(lookup)
-            && Arc::ptr_eq(&existing.boundaries, layout)
+            && Arc::ptr_eq(&existing.boundaries, captured)
         {
             existing.observe(value, self.epoch);
             return;
         }
         match map.entry(owned_key()) {
             Entry::Occupied(mut entry) => {
-                if !Arc::ptr_eq(&entry.get().boundaries, layout) {
-                    let _superseded = entry.insert(HistogramBuckets::with_layout(
-                        Arc::clone(layout),
-                        self.epoch,
-                    ));
+                let current = self.current_duration_layout(kind);
+                if !Arc::ptr_eq(&entry.get().boundaries, &current) {
+                    let _superseded =
+                        entry.insert(HistogramBuckets::with_layout(current, self.epoch));
                 }
                 entry.get().observe(value, self.epoch);
             }
             Entry::Vacant(entry) => {
-                let histogram = HistogramBuckets::with_layout(Arc::clone(layout), self.epoch);
+                let histogram =
+                    HistogramBuckets::with_layout(self.current_duration_layout(kind), self.epoch);
                 histogram.observe(value, self.epoch);
                 entry.insert(histogram);
             }
@@ -3143,13 +3278,14 @@ impl MetricsRegistry {
         &self,
         map: &DashMap<Arc<str>, HistogramBuckets>,
         proxy_key: &str,
-        layout: &Arc<[f64]>,
+        kind: DurationLayoutKind,
+        captured: &Arc<[f64]>,
         value: f64,
     ) -> Arc<str> {
         let proxy_id = match map.get(proxy_key) {
             Some(existing) => {
                 let proxy_id = Arc::clone(existing.key());
-                if Arc::ptr_eq(&existing.boundaries, layout) {
+                if Arc::ptr_eq(&existing.boundaries, captured) {
                     existing.observe(value, self.epoch);
                     return proxy_id;
                 }
@@ -3157,7 +3293,14 @@ impl MetricsRegistry {
             }
             None => Arc::from(proxy_key),
         };
-        self.observe_duration(map, proxy_key, || Arc::clone(&proxy_id), layout, value);
+        self.observe_duration(
+            map,
+            proxy_key,
+            || Arc::clone(&proxy_id),
+            kind,
+            captured,
+            value,
+        );
         proxy_id
     }
 
@@ -3579,12 +3722,7 @@ impl MetricsRegistry {
         if let Some(body) = self.fresh_cached_body(ttl_secs) {
             return body;
         }
-        // A panic while rendering would poison the lock; the guarded data is
-        // `()`, so recovering the guard is always sound.
-        let _rebuild = self
-            .render_rebuild_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _rebuild = self.lock_render_rebuild();
         if let Some(body) = self.fresh_cached_body(ttl_secs) {
             return body;
         }
@@ -6962,7 +7100,8 @@ impl Plugin for PrometheusMetrics {
     }
 
     /// Reusable (issue #5583): pure observability. Its request-phase hooks
-    /// stamp one observed-marker key on the context; everything else it does is
+    /// mark the context as observed (a typed bit for HTTP, one metadata marker
+    /// for streams); everything else it does is
     /// recording completed transactions. It takes no admission decision, holds
     /// no per-request budget, makes no external
     /// admission call, and never rejects — so nothing an elided CONNECT would
@@ -6975,18 +7114,10 @@ impl Plugin for PrometheusMetrics {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        // Consumers only test for the key's presence (and the key is omitted
-        // from serialized summaries), so the value is the non-allocating empty
-        // string and an already-stamped context is left untouched.
-        if !ctx
-            .metadata
-            .contains_key(prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
-        {
-            ctx.metadata.insert(
-                prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-                String::new(),
-            );
-        }
+        // A typed context bit, not a metadata marker: the per-request hook
+        // allocates nothing and touches no map. The gRPC message scanners read
+        // it through `prometheus_helpers::request_observes_grpc_messages`.
+        ctx.mark_prometheus_metrics_observed();
         PluginResult::Continue
     }
 

@@ -2800,6 +2800,13 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
+    /// Set by the process-global `prometheus_metrics` request hook when it
+    /// observed this transaction. Gates the gRPC message scanners (see
+    /// [`crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages`]).
+    ///
+    /// A typed bit rather than a `metadata` marker so the per-request hook
+    /// allocates nothing; it never reaches transaction logs.
+    prometheus_metrics_observed: bool,
     /// Per-request memo of duplicate-object-member screens over governed JSON
     /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
     /// `body_validator`, and `ai_tool_governor` can all inspect the same
@@ -4396,6 +4403,7 @@ impl RequestContext {
             h3_response_upstream_is_fallback: false,
             original_accept_encoding: None,
             websocket_response_boundary: false,
+            prometheus_metrics_observed: false,
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             governed_request_body_plaintext: None,
             finalized_response_replay: false,
@@ -5976,6 +5984,7 @@ impl RequestContext {
             h3_response_upstream_is_fallback: self.h3_response_upstream_is_fallback,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
+            prometheus_metrics_observed: self.prometheus_metrics_observed,
             json_scan_memo: self.json_scan_memo.clone(),
             // Deliberately NOT carried: the shared request representation gate
             // stages this view from the exact `(headers, body)` pair the final
@@ -6371,6 +6380,17 @@ impl RequestContext {
 
     pub(crate) fn has_websocket_response_boundary(&self) -> bool {
         self.websocket_response_boundary
+    }
+
+    /// Record that the `prometheus_metrics` request hook observed this
+    /// transaction. Idempotent and allocation-free.
+    pub fn mark_prometheus_metrics_observed(&mut self) {
+        self.prometheus_metrics_observed = true;
+    }
+
+    /// Whether the `prometheus_metrics` request hook observed this transaction.
+    pub fn prometheus_metrics_observed(&self) -> bool {
+        self.prometheus_metrics_observed
     }
 
     pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {

@@ -8791,7 +8791,7 @@ where
     // reachable only when no body-transforming plugin is configured. `bytes_sent`
     // above stays the raw client-wire length.
     crate::plugins::mesh::prometheus_helpers::record_native_grpc_message_count(
-        &ctx.metadata,
+        ctx,
         &ctx.grpc_request_messages_observed,
         &body,
     );

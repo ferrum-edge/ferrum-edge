@@ -40971,9 +40971,7 @@ async fn handle_proxy_request_inner(
                 // counts decoded message frames. Attached independently of
                 // whether a deferred logger is present so message metrics are
                 // not silently zero when plugins are absent.
-                if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                    &ctx.metadata,
-                ) {
+                if crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages(&ctx) {
                     body = body.with_grpc_message_counter(Arc::clone(
                         &ctx.grpc_response_messages_observed,
                     ));
@@ -45794,7 +45792,7 @@ async fn handle_proxy_request_inner(
     // buffered one, which carries no backend gRPC messages. Genuinely buffered
     // backend bodies were already counted from `backend_resp.body` above.
     if body_will_stream
-        && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
+        && crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages(&ctx)
     {
         body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
     }

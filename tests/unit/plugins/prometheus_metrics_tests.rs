@@ -3913,10 +3913,11 @@ fn route_miss_funnel_counts_unmatched_requests_on_every_listener() {
     );
 }
 
-/// M1: the request-phase observation marker stays a presence-only key and an
-/// already-stamped context is left untouched.
+/// M1 / PR6827-SOL-2: a fresh request context is marked observed through a
+/// typed bit; the hook inserts nothing into the metadata map (no owned marker
+/// key per request), and the gRPC message scanners read that bit.
 #[tokio::test]
-async fn request_observation_marker_is_presence_only_and_idempotent() {
+async fn request_observation_is_a_typed_flag_without_metadata_insertion() {
     let plugin = PrometheusMetrics::new_with_registry_for_test(
         &json!({}),
         "ferrum",
@@ -3924,23 +3925,228 @@ async fn request_observation_marker_is_presence_only_and_idempotent() {
     )
     .expect("default config");
 
-    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "POST".to_string(), "/".to_string());
+    ctx.metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    let metadata_before = ctx.metadata.clone();
+    assert!(!ctx.prometheus_metrics_observed());
+    assert!(!prometheus_helpers::request_observes_grpc_messages(&ctx));
+
     plugin.on_request_received(&mut ctx).await;
+    assert!(ctx.prometheus_metrics_observed());
+    assert_eq!(
+        ctx.metadata, metadata_before,
+        "the request hook must not insert an owned marker into metadata"
+    );
     assert!(
-        ctx.metadata
+        !ctx.metadata
             .contains_key(prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
     );
+    assert!(prometheus_helpers::request_observes_grpc_messages(&ctx));
 
-    ctx.metadata.insert(
+    // A metadata marker written by anything else no longer enables scanners
+    // for an unobserved request.
+    let mut forged =
+        RequestContext::new("10.0.0.2".to_string(), "POST".to_string(), "/".to_string());
+    forged
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    forged.metadata.insert(
         prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-        "stamped-earlier".to_string(),
+        "1".to_string(),
     );
-    plugin.on_request_received(&mut ctx).await;
+    assert!(!prometheus_helpers::request_observes_grpc_messages(&forged));
+}
+
+fn mesh_layout_summary(proxy_id: &str) -> TransactionSummary {
+    let mut summary = make_summary(proxy_id, "GET", 200, 50.0, 40.0);
+    summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.source.namespace".to_string(), "default".to_string()),
+        (
+            "mesh.source.principal".to_string(),
+            "spiffe://cluster.local/ns/default/sa/frontend".to_string(),
+        ),
+        ("mesh.source.app".to_string(), "frontend".to_string()),
+        ("mesh.source.service".to_string(), "frontend".to_string()),
+        (
+            "mesh.destination.workload".to_string(),
+            "payments".to_string(),
+        ),
+        (
+            "mesh.destination.namespace".to_string(),
+            "default".to_string(),
+        ),
+        (
+            "mesh.destination.service".to_string(),
+            "payments".to_string(),
+        ),
+        ("mesh.request_protocol".to_string(), "http".to_string()),
+        (
+            "mesh.connection_security_policy".to_string(),
+            "mutual_tls".to_string(),
+        ),
+    ]);
+    summary
+}
+
+/// PR6827-SOL-1: a recorder that captured the request layout before a reload
+/// (late recorder) must neither replace a current-layout histogram with the
+/// retired layout (losing its observations) nor create a retired-layout series
+/// after the retirement sweep. Covers the HTTP and mesh duration families.
+#[test]
+fn late_recorder_cannot_restore_a_retired_request_layout() {
+    const NEW_LAYOUT: [f64; 2] = [100.0, 1000.0];
+    let registry = MetricsRegistry::new();
+    let summary = mesh_layout_summary("late-http");
+
+    // Recorder A captures the default layout, then is "descheduled".
+    let stale = registry.duration_layout_snapshot_for_test();
+    // A committed reload publishes the new layout and sweeps the maps.
+    registry.configure_duration_buckets(
+        &NEW_LAYOUT,
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_SESSION_DURATION_BUCKETS_MS,
+    );
+    // Recorder B records under the new layout.
+    registry.record(&summary);
+    // A resumes with its stale capture: same series, then a never-seen proxy.
+    registry.record_with_layout_snapshot_for_test(&summary, &stale);
+    registry.record_with_layout_snapshot_for_test(&mesh_layout_summary("late-fresh"), &stale);
+
+    for (family, map) in [
+        ("request", &registry.request_duration_buckets),
+        ("backend", &registry.backend_duration_buckets),
+        ("overhead", &registry.gateway_overhead_buckets),
+    ] {
+        let established = map.get("late-http").expect("established series");
+        assert_eq!(
+            &*established.boundaries,
+            &NEW_LAYOUT[..],
+            "{family}: a late recorder must not swap in the retired layout"
+        );
+        assert_eq!(
+            established.count.load(Ordering::Relaxed),
+            2,
+            "{family}: the current-layout series must keep B's observation"
+        );
+        drop(established);
+        let fresh = map.get("late-fresh").expect("fresh series");
+        assert_eq!(
+            &*fresh.boundaries,
+            &NEW_LAYOUT[..],
+            "{family}: a late recorder must not create a retired-layout series"
+        );
+    }
+
+    assert_eq!(registry.mesh_request_duration_buckets.len(), 1);
+    {
+        let mesh = registry
+            .mesh_request_duration_buckets
+            .iter()
+            .next()
+            .expect("mesh duration series");
+        assert_eq!(&*mesh.value().boundaries, &NEW_LAYOUT[..]);
+        assert_eq!(mesh.value().count.load(Ordering::Relaxed), 3);
+    }
     assert_eq!(
-        ctx.metadata
-            .get(prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
-            .map(String::as_str),
-        Some("stamped-earlier"),
-        "an already-stamped context must not be re-allocated or overwritten"
+        registry.mesh_series_live_for_test("REQUEST_DURATION"),
+        Some(1)
     );
+
+    let output = registry.render_uncached();
+    for family in [
+        "ferrum_request_duration_ms_bucket",
+        "ferrum_backend_duration_ms_bucket",
+        "ferrum_edge_overhead_ms_bucket",
+        "ferrum_mesh_request_duration_ms_bucket",
+    ] {
+        assert!(
+            !output
+                .lines()
+                .any(|line| line.starts_with(family) && line.contains("le=\"5\"")),
+            "{family} must expose only the published layout:\n{output}"
+        );
+    }
+}
+
+/// PR6827-SOL-1: the same late-recorder fence for the session layout
+/// (`ferrum_stream_duration_ms` and `ferrum_websocket_session_duration_ms`).
+#[test]
+fn late_recorder_cannot_restore_a_retired_session_layout() {
+    const NEW_LAYOUT: [f64; 2] = [1000.0, 60000.0];
+    let registry = MetricsRegistry::new();
+    let stream = make_stream_summary("late-stream", "tcp");
+    let ws = make_ws_summary("late-ws");
+
+    let stale = registry.duration_layout_snapshot_for_test();
+    registry.configure_duration_buckets(
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_REQUEST_DURATION_BUCKETS_MS,
+        &NEW_LAYOUT,
+    );
+    registry.record_stream(&stream);
+    registry.record_ws_session(&ws);
+    registry.record_stream_with_layout_snapshot_for_test(&stream, &stale);
+    registry.record_ws_session_with_layout_snapshot_for_test(&ws, &stale);
+    registry.record_stream_with_layout_snapshot_for_test(
+        &make_stream_summary("late-stream-fresh", "tcp"),
+        &stale,
+    );
+    registry
+        .record_ws_session_with_layout_snapshot_for_test(&make_ws_summary("late-ws-fresh"), &stale);
+
+    for proxy in ["late-stream", "late-stream-fresh"] {
+        let hist = registry
+            .stream_duration_buckets
+            .get(proxy)
+            .expect("stream duration series");
+        assert_eq!(&*hist.boundaries, &NEW_LAYOUT[..], "{proxy}");
+    }
+    assert_eq!(
+        registry
+            .stream_duration_buckets
+            .get("late-stream")
+            .expect("stream duration series")
+            .count
+            .load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(registry.ws_session_duration_buckets.len(), 2);
+    for entry in registry.ws_session_duration_buckets.iter() {
+        assert_eq!(&*entry.value().boundaries, &NEW_LAYOUT[..]);
+        let expected = if &*entry.key().proxy_id == "late-ws" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(entry.value().count.load(Ordering::Relaxed), expected);
+    }
+}
+
+/// PR6827-SOL-1: configuration publication is fenced against an in-flight
+/// cache rebuild, so a body rendered before a layout or namespace change can
+/// never be published after that change's cache invalidation.
+#[test]
+fn configuration_publication_is_fenced_against_cache_rebuilds() {
+    const SRC: &str = include_str!("../../../src/plugins/prometheus_metrics.rs");
+    let body_of = |signature: &str| -> &str {
+        let start = SRC.find(signature).unwrap_or_else(|| panic!("{signature}"));
+        let rest = &SRC[start..];
+        &rest[..rest.find("\n    }\n").expect("function end")]
+    };
+    for signature in [
+        "pub fn configure_duration_buckets(",
+        "pub fn configure(\n",
+        "fn cacheable_body(&self)",
+    ] {
+        let body = body_of(signature);
+        let fenced = body
+            .find("self.lock_render_rebuild()")
+            .unwrap_or_else(|| panic!("{signature} must take the render rebuild lock"));
+        if let Some(invalidate) = body.find("self.render_cache.store(Arc::new(None))") {
+            assert!(
+                fenced < invalidate,
+                "{signature} must invalidate the cache while holding the rebuild lock"
+            );
+        }
+    }
 }
