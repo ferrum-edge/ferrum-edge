@@ -11091,6 +11091,89 @@ async fn saml_standard_one_time_use_and_proxy_restriction_are_accepted() {
     );
 }
 
+/// A recognized condition name does not make a condition evaluable: SAML
+/// Core §7.1 lets an IdP derive the standard types and select the derivation
+/// with `xsi:type`, adding restrictions of its own, and extension attributes or
+/// children on the base type are equally unevaluated. Each is refused before
+/// the assertion id is claimed.
+#[tokio::test]
+async fn saml_derived_or_extended_standard_conditions_are_rejected() {
+    const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+    let audience = saml_fixtures::TEST_AUDIENCE;
+    for (label, condition) in [
+        (
+            "derived OneTimeUse",
+            format!(
+                r#"<saml:OneTimeUse xmlns:xsi="{XSI}" xmlns:corp="urn:example:corp" xsi:type="corp:ManagedDeviceOneTimeUse" corp:RequiredDeviceClass="managed"/>"#
+            ),
+        ),
+        (
+            "OneTimeUse extension attribute",
+            r#"<saml:OneTimeUse xmlns:corp="urn:example:corp" corp:RequiredDeviceClass="managed"/>"#
+                .to_string(),
+        ),
+        (
+            "derived ProxyRestriction",
+            format!(
+                r#"<saml:ProxyRestriction xmlns:xsi="{XSI}" xmlns:corp="urn:example:corp" xsi:type="corp:ManagedProxyRestriction" Count="0"/>"#
+            ),
+        ),
+        (
+            "derived AudienceRestriction",
+            format!(
+                r#"<saml:AudienceRestriction xmlns:xsi="{XSI}" xmlns:corp="urn:example:corp" xsi:type="corp:ManagedAudienceRestriction"><saml:Audience>{audience}</saml:Audience></saml:AudienceRestriction>"#
+            ),
+        ),
+        (
+            "AudienceRestriction extension child",
+            format!(
+                r#"<saml:AudienceRestriction><saml:Audience>{audience}</saml:Audience><corp:DeviceClass xmlns:corp="urn:example:corp">managed</corp:DeviceClass></saml:AudienceRestriction>"#
+            ),
+        ),
+        (
+            "SAML-namespace type of another condition",
+            format!(r#"<saml:OneTimeUse xmlns:xsi="{XSI}" xsi:type="saml:ProxyRestrictionType"/>"#),
+        ),
+    ] {
+        let mut builder = saml_fixtures::AssertionBuilder::new(
+            "_assertion-derived-condition",
+            SAML_ISSUER,
+            "alice@example.com",
+        );
+        builder.extra_conditions = Some(condition);
+        let (result, ctx) = saml_outcome(&plugin, &builder.build()).await;
+        assert_eq!(reject_status(&result), 401, "{label}");
+        assert!(
+            reject_body(&result).contains("unsupported condition"),
+            "{label}: got {}",
+            reject_body(&result)
+        );
+        assert!(ctx.authenticated_identity.is_none(), "{label}");
+    }
+
+    // The standard type named explicitly is the base condition itself.
+    let mut explicit = saml_fixtures::AssertionBuilder::new(
+        "_assertion-derived-condition",
+        SAML_ISSUER,
+        "alice@example.com",
+    );
+    explicit.extra_conditions = Some(format!(
+        r#"<saml:OneTimeUse xmlns:xsi="{XSI}" xsi:type="saml:OneTimeUseType"/>"#
+    ));
+    let (result, ctx) = saml_outcome(&plugin, &explicit.build()).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "the explicit standard type is accepted, and the refused id was never claimed: \
+         {result:?}"
+    );
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("alice@example.com")
+    );
+}
+
 #[tokio::test]
 async fn saml_duplicate_one_time_use_is_rejected() {
     let bundle = saml_fixtures::IdpBundle::new();
@@ -11327,6 +11410,26 @@ fn namespace_resolution_work_is_bounded_independently_of_bytes() {
         .join(" ");
     let error = soap_exclusive_canonicalize_element_for_test(&xml, "SignedInfo", &prefix_list)
         .expect_err("unbounded namespace-resolution work must be refused");
+    assert!(
+        error.contains("namespace-resolution work budget"),
+        "got: {error}"
+    );
+
+    // Comparison cost scales with prefix LENGTH as well as count: a few
+    // hundred near-equal long prefixes and one long unbound PrefixList token
+    // stay cheap in entries but not in compared bytes, and must be refused.
+    let common = "x".repeat(1_990);
+    let mut long_declarations = String::new();
+    for index in 0..200 {
+        long_declarations.push_str(&format!(" xmlns:p{common}{index:06}=\"urn:p{index}\""));
+    }
+    let long_xml = format!(
+        "<root{long_declarations}><SignedInfo>{}</SignedInfo></root>",
+        "<a/>".repeat(300)
+    );
+    let long_token = format!("p{common}zzzzzz");
+    let error = soap_exclusive_canonicalize_element_for_test(&long_xml, "SignedInfo", &long_token)
+        .expect_err("long-prefix comparison work must be charged");
     assert!(
         error.contains("namespace-resolution work budget"),
         "got: {error}"

@@ -361,6 +361,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `soap_ws_security` UsernameToken passwords shaped `${...}` are
+  environment references** (issue #6820). A `username_token.credentials[].password`
+  of exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is resolved at admission; any
+  other `${...}` value (a literal password of that shape, or a reference to a
+  variable outside the plugin-secret namespace) is refused at admission.
+  Shared replay scope also now refuses an evicting Redis (`maxmemory_policy`
+  other than `noeviction` with a finite `maxmemory`) and needs `INFO`.
 - **`soap_ws_security` hardening.**
   - **Shared replay claims refuse an evicting Redis.** `nonce.replay_scope:
     shared` now uses the retention-authority Redis client, so every
@@ -372,13 +379,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     recoverable outage; both fail closed (`401`). The ACL user needs `INFO`.
   - **SAML `Conditions` are evaluated exhaustively** (SAML Core 2.0
     §2.5.1.1). Besides `AudienceRestriction`, at most one `OneTimeUse` and one
-    `ProxyRestriction` are accepted; any other condition (a `saml:Condition`
-    extension or foreign element) rejects the assertion before its id is
+    `ProxyRestriction` are accepted, each only in its standard shape (an
+    `xsi:type` must resolve to its own standard SAML type; no extension
+    attributes or non-`Audience` children). Any other condition — a
+    `saml:Condition` extension, a derived (SAML Core §7.1) or extended standard
+    condition, or a foreign element — rejects the assertion before its id is
     claimed instead of being ignored.
-  - **Namespace resolution is charged to a per-message allowance** (16 ×
-    decoded body, floor 1 048 576 scanned entries), so inherited declarations
-    cannot multiply canonicalization CPU on `SignedInfo` before the signature
-    is checked.
+  - **Namespace resolution is charged to a per-message allowance** (scanned
+    entries × compared prefix bytes, 32 × decoded body, floor 4 194 304), so
+    inherited declarations and long prefixes cannot multiply canonicalization
+    CPU on `SignedInfo` before the signature is checked.
   - **Linear-time MTOM boundary search** (`memchr::memmem`) replaces a
     window search that was O(body × boundary) on near-match payloads.
 - **`soap_ws_security` correctness and interop.**
@@ -395,9 +405,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     enabled identity mechanisms alternatives: at least one must be presented
     and every presented token must verify. It needs two enabled mechanisms.
   - A UsernameToken `password` of exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is
-    resolved at admission from that environment variable. **BREAKING:** a
-    literal password of that `${...}` shape is now a reference, and a
-    reference outside the plugin-secret namespace is refused.
+    resolved at admission from that environment variable (breaking for literal
+    `${...}` passwords; see below).
   - Docs and OpenAPI no longer promise a Consumer mapping: a SOAP principal
     is an external `authenticated_identity` only (issue #6082), so Consumer
     ACL groups do not apply to it.

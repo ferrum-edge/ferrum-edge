@@ -28,6 +28,23 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `soap_ws_security`: `${...}` passwords, evicting shared Redis, SAML conditions (#6820)
+
+- A `username_token.credentials[].password` of exactly
+  `${FERRUM_PLUGIN_SECRET_<NAME>}` is now resolved from that environment
+  variable at admission. A literal password of the shape `${...}`, or a
+  reference to any other variable, is refused at admission. Change such a
+  literal password, or move the secret into a `FERRUM_PLUGIN_SECRET_<NAME>`
+  variable (directly or through `_FILE` / `_VAULT` / `_AWS` / `_AZURE` /
+  `_GCP`) set on every node that constructs the plugin, CP included.
+- `nonce.replay_scope: shared` now requires a Redis that cannot evict claims:
+  `maxmemory: 0` or `maxmemory_policy: noeviction`, proven with `INFO MEMORY`
+  (grant `INFO` to the ACL user). An evicting endpoint fails every SOAP replay
+  claim closed (`401`) until its policy is fixed and the plugin is reloaded.
+- SAML assertions carrying a condition other than a standard-shape
+  `AudienceRestriction`, `OneTimeUse`, or `ProxyRestriction` (including
+  `xsi:type`-derived or extended standard conditions) are now rejected.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

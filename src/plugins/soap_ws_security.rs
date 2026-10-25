@@ -390,6 +390,7 @@ const SOAP12_ROLE_ULTIMATE_RECEIVER: &str =
 const SAML2_ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 const SAML2_CM_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 const SAML2_CM_HOLDER_OF_KEY: &str = "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key";
+const XSI_NAMESPACE_URI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Upper bound on the number of `<Reference>` elements processed in a single
 /// `<SignedInfo>`.
@@ -436,15 +437,17 @@ const CANONICALIZATION_BUDGET_MULTIPLIER: usize = 2;
 /// namespace list. Declarations are inherited, so a caller can put a thousand
 /// of them on one ancestor and make each of tens of thousands of tiny elements
 /// pay for all of them — CPU the byte budget never sees, spent on `SignedInfo`
-/// before the signature is verified. The allowance charges one unit per
-/// in-scope entry scanned. A realistic message resolves a handful of prefixes
-/// against a few dozen in-scope namespaces per element, a small fraction of
-/// this multiple of its own size.
-const NAMESPACE_SCAN_BUDGET_MULTIPLIER: usize = 16;
+/// before the signature is verified. Each scanned entry is a string comparison
+/// against the prefix being resolved, and prefixes are attacker-chosen and
+/// unbounded in length, so the allowance charges in-scope entries × compared
+/// prefix bytes, not the entry count alone. A realistic message resolves a
+/// handful of short prefixes against a few dozen in-scope namespaces per
+/// element, a small fraction of this multiple of its own size.
+const NAMESPACE_SCAN_BUDGET_MULTIPLIER: usize = 32;
 
 /// Floor for the namespace-resolution allowance, so small envelopes keep ample
 /// room.
-const MIN_NAMESPACE_SCAN_BUDGET: usize = 1_048_576;
+const MIN_NAMESPACE_SCAN_BUDGET: usize = 4_194_304;
 
 /// Bounds for MTOM/XOP (`multipart/related`) unpacking. The gateway only ever
 /// walks part *headers* looking for the SOAP root part; attachment payloads are
@@ -4256,6 +4259,14 @@ impl SoapWsSecurity {
         // under conditions its issuer did not grant. Every element child of
         // `Conditions` is therefore classified; nothing unrecognized passes.
         for condition in conditions.children().filter(Node::is_element) {
+            // A recognized element name is not enough: SAML Core §7.1 lets an
+            // IdP derive any of these types and select the derivation with
+            // `xsi:type`, adding restrictions (attributes, children) of its
+            // own. A derived type, or extension content on the base type, is a
+            // condition the gateway cannot evaluate, so it is indeterminate.
+            if !standard_saml_condition_shape(condition) {
+                return Err(unsupported_saml_condition());
+            }
             if condition.has_tag_name((SAML2_ASSERTION_NS, "OneTimeUse")) {
                 // Satisfied by construction: every accepted assertion is claimed
                 // exactly once below. The schema admits at most one.
@@ -4283,13 +4294,10 @@ impl SoapWsSecurity {
                 continue;
             }
             if !condition.has_tag_name((SAML2_ASSERTION_NS, "AudienceRestriction")) {
-                // A generic `saml:Condition` extension (`xsi:type`) or any other
-                // element. The name is never echoed: it is caller-controlled.
-                return Err(
-                    "WS-Security: SAML Conditions carries an unsupported condition — an \
-                     assertion whose conditions the gateway cannot evaluate is rejected"
-                        .to_string(),
-                );
+                // Unreachable: `standard_saml_condition_shape` admits only the
+                // three standard conditions. Kept so a future edit to that
+                // helper cannot turn an unknown condition into an audience.
+                return Err(unsupported_saml_condition());
             }
             let restriction = condition;
             audience_restrictions += 1;
@@ -5144,6 +5152,62 @@ const CREDENTIAL_STRIP_RANGE_KEY: &str = "soap_ws_security.credential_strip_rang
 const CREDENTIAL_REMOVAL_UNSUPPORTED_MESSAGE: &str =
     "WS-Security: this SOAP representation cannot have its UsernameToken removed";
 const CREDENTIAL_REMOVAL_UNSUPPORTED_CLASS: &str = "credential_removal_unsupported_representation";
+
+/// The fixed rejection for a SAML condition the gateway cannot evaluate. Never
+/// echoes the condition name or type: both are caller-controlled.
+fn unsupported_saml_condition() -> String {
+    "WS-Security: SAML Conditions carries an unsupported condition — an assertion whose \
+     conditions the gateway cannot evaluate is rejected"
+        .to_string()
+}
+
+/// Whether `condition` is exactly one of the three standard SAML 2.0
+/// conditions this plugin evaluates, in its standard shape.
+///
+/// - The element must be `saml:AudienceRestriction`, `saml:OneTimeUse`, or
+///   `saml:ProxyRestriction`; anything else (a generic `saml:Condition`
+///   extension, a foreign element) is unsupported.
+/// - An `xsi:type`, when present, must resolve (through the element's in-scope
+///   namespaces) to the standard type of that same element. A derived type
+///   (SAML Core §7.1) carries restrictions the gateway does not implement.
+/// - No attribute other than the schema's own (`Count` on ProxyRestriction)
+///   and that `xsi:type`, and no child element other than `saml:Audience`
+///   (AudienceRestriction, ProxyRestriction), is admitted: extension content on
+///   the base type is equally unevaluated.
+fn standard_saml_condition_shape(condition: Node<'_, '_>) -> bool {
+    let (standard_type, allowed_attributes, audience_children): (&str, &[&str], bool) =
+        if condition.has_tag_name((SAML2_ASSERTION_NS, "AudienceRestriction")) {
+            ("AudienceRestrictionType", &[], true)
+        } else if condition.has_tag_name((SAML2_ASSERTION_NS, "OneTimeUse")) {
+            ("OneTimeUseType", &[], false)
+        } else if condition.has_tag_name((SAML2_ASSERTION_NS, "ProxyRestriction")) {
+            ("ProxyRestrictionType", &["Count"], true)
+        } else {
+            return false;
+        };
+    for attribute in condition.attributes() {
+        match attribute.namespace() {
+            Some(XSI_NAMESPACE_URI) if attribute.name() == "type" => {
+                let declared = attribute.value().trim();
+                let (prefix, local) = match declared.split_once(':') {
+                    Some((prefix, local)) => (Some(prefix), local),
+                    None => (None, declared),
+                };
+                if local != standard_type
+                    || condition.lookup_namespace_uri(prefix) != Some(SAML2_ASSERTION_NS)
+                {
+                    return false;
+                }
+            }
+            None if allowed_attributes.contains(&attribute.name()) => {}
+            _ => return false,
+        }
+    }
+    condition
+        .children()
+        .filter(Node::is_element)
+        .all(|child| audience_children && child.has_tag_name((SAML2_ASSERTION_NS, "Audience")))
+}
 
 /// Whether the selected Security header presents a namespace-correct
 /// `wsse:UsernameToken` (`require_mechanisms: any` selection only; the
@@ -6550,12 +6614,15 @@ impl WorkBudget {
         }
     }
 
-    /// Charge one namespace lookup that scans `in_scope` entries, before it
-    /// runs.
-    fn charge_namespace_scan(&mut self, in_scope: usize) -> Result<(), String> {
+    /// Charge one namespace-resolution step, before it runs: a scan over
+    /// `entries` list entries, each compared against a prefix of
+    /// `prefix_len` bytes (an empty / default prefix still costs one unit per
+    /// entry).
+    fn charge_namespace_scan(&mut self, entries: usize, prefix_len: usize) -> Result<(), String> {
+        let work = entries.max(1).saturating_mul(prefix_len.max(1));
         self.namespace_scan_remaining = self
             .namespace_scan_remaining
-            .checked_sub(in_scope.max(1))
+            .checked_sub(work)
             .ok_or_else(|| {
                 "WS-Security: message exceeds the permitted XML namespace-resolution work budget"
                     .to_string()
@@ -6601,8 +6668,8 @@ impl<'budget> BoundedCanonicalOutput<'budget> {
     }
 
     /// Charge namespace-resolution work to the shared budget before it runs.
-    fn charge_namespace_scan(&mut self, entries: usize) -> Result<(), String> {
-        self.budget.charge_namespace_scan(entries)
+    fn charge_namespace_scan(&mut self, entries: usize, prefix_len: usize) -> Result<(), String> {
+        self.budget.charge_namespace_scan(entries, prefix_len)
     }
 
     fn push_str(&mut self, text: &str) -> Result<(), String> {
@@ -6994,11 +7061,12 @@ fn canonicalize_node(
         .split_once(':')
         .map(|(prefix, _)| prefix)
         .unwrap_or("");
-    // Every de-duplicating insert scans the list built so far and every prefix
-    // resolution scans the element's whole in-scope namespace list. Neither
-    // emits a byte, so both are charged to the namespace-resolution allowance
-    // before they run (see `NAMESPACE_SCAN_BUDGET_MULTIPLIER`).
-    output.charge_namespace_scan(required_prefixes.len())?;
+    // Every de-duplicating insert compares the prefix against the list built
+    // so far and every prefix resolution compares it against the element's
+    // whole in-scope namespace list. Neither emits a byte, so both are charged
+    // — entries × prefix bytes — to the namespace-resolution allowance before
+    // they run (see `NAMESPACE_SCAN_BUDGET_MULTIPLIER`).
+    output.charge_namespace_scan(required_prefixes.len(), element_prefix.len())?;
     add_required_prefix(&mut required_prefixes, element_prefix, true);
 
     let mut attributes = Vec::new();
@@ -7008,7 +7076,7 @@ fn canonicalize_node(
             "WS-Security: XML parser returned an invalid attribute range".to_string()
         })?;
         if let Some((prefix, _)) = attribute_qname.split_once(':') {
-            output.charge_namespace_scan(required_prefixes.len())?;
+            output.charge_namespace_scan(required_prefixes.len(), prefix.len())?;
             add_required_prefix(&mut required_prefixes, prefix, true);
         }
         attributes.push((
@@ -7025,7 +7093,7 @@ fn canonicalize_node(
         if prefix == "xml" {
             continue;
         }
-        output.charge_namespace_scan(in_scope_namespaces)?;
+        output.charge_namespace_scan(in_scope_namespaces, prefix.len())?;
         let namespace_uri = if prefix.is_empty() {
             node.lookup_namespace_uri(None).unwrap_or("")
         } else if let Some(uri) = node.lookup_namespace_uri(Some(prefix)) {
