@@ -798,15 +798,21 @@ The capture listener terminates nothing. It:
 infrastructure namespace while the pods it captures for do not. The control
 plane therefore resolves a dedicated, least-privilege inventory for this
 subscription — the enrolled destination workloads plus the PeerAuthentication
-candidates applicable to them — and carries it on its own slice fields
-(`node_waypoint_capture_destinations`, `node_waypoint_capture_peer_authentications`)
-over native MeshSubscribe, xDS ECDS carriers, and the file source alike. It is
-authorized before it leaves the control plane (CP namespace scope plus the
-bearer `ns` claim, with a `Single`-scope control plane a hard boundary), and it
-never widens the ordinary `workloads` / `services` / `peer_authentications`
-views. A control plane that emits no inventory, an unauthorized namespace, an
-unknown NodeWaypoint identity, and a pod enrolled on a *different* node's
-NodeWaypoint all resolve to nothing and the connection is refused. See
+candidates and AuthorizationPolicy entries applicable to them — and carries it
+on its own slice fields (`node_waypoint_capture_destinations`,
+`node_waypoint_capture_peer_authentications`,
+`node_waypoint_capture_mesh_policies`) over native MeshSubscribe, xDS ECDS
+carriers, and the file source alike. It is authorized before it leaves the
+control plane (CP namespace scope plus the bearer `ns` claim, with a
+`Single`-scope control plane a hard boundary), and it never widens the ordinary
+`workloads` / `services` / `peer_authentications` / `mesh_policies` views. A
+control plane that emits no inventory, an unauthorized namespace, an unknown
+NodeWaypoint identity, and a pod enrolled on a *different* node's NodeWaypoint
+all resolve to nothing and the connection is refused. A captured connection is
+authorized against the destination pod's own AuthorizationPolicy set from that
+inventory, not the NodeWaypoint namespace's; a control plane that sends
+destinations without proof that it resolved their AuthorizationPolicy set is
+refused and the previous complete generation keeps serving. See
 [`docs/mesh.md`](mesh.md) for the full contract.
 
 Every one of those gates is fail-closed: an unresolvable or ambiguous
