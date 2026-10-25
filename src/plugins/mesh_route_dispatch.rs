@@ -740,6 +740,7 @@ impl From<RouteBackendTlsConfig> for BackendTlsConfig {
             san_allow_list: value.san_allow_list,
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         }
     }
 }

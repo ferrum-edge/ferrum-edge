@@ -139,6 +139,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`ai_stream_router` provider-translation fidelity.** Gemini
+  `thoughtSignature` parts no longer terminate otherwise valid streams: a
+  function-call signature is surfaced as the OpenAI tool call's
+  `extra_content.google.thought_signature` and restored onto the same Gemini
+  `functionCall` part on the next request. Gemini maps `response_format`
+  (`responseMimeType` / `responseJsonSchema`), `n`, penalties, and `seed`;
+  Anthropic maps `parallel_tool_calls: false` to
+  `disable_parallel_tool_use`; parameters a provider cannot honor
+  (`logit_bias`, `logprobs`, Anthropic `n > 1` / penalties / `seed` / JSON
+  `response_format`, Gemini `parallel_tool_calls: false`) are rejected with a
+  `400` naming the parameter instead of being dropped. Manual Anthropic
+  extended thinking with callable tools or a tool-result continuation is
+  refused up front (signed thinking blocks cannot round-trip). A mistyped
+  `max_tokens` / `max_completion_tokens` is a `400`, and the Anthropic default
+  is the new per-provider `default_max_tokens` (default `4096`). User-message
+  base64 data-URL images translate to native Anthropic / Gemini image parts.
+  A claimed Anthropic 2xx response that is not `text/event-stream`, and a
+  buffered normalization that outgrows the retained ceiling, now fail closed
+  instead of delivering raw provider bytes. New `azure_openai` provider type
+  (`api-key` auth); configurable `max_stream_bytes`, `max_stream_events`, and
+  `max_normalized_stream_bytes`; admission now rejects an empty
+  `anthropic_version`, endpoint userinfo / fragments, and a `google_gemini`
+  endpoint without `{model}` behind wildcard patterns. The claim reuses its
+  validated parse of an unchanged client body in the translation hook and
+  skips re-parsing its own untouched translation in the final-body hook.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder
@@ -328,6 +353,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. EastWestGateway keeps the unscoped fail-closed fallback.
 
 ### Security
+- **`ai_stream_router` isolates third-party provider TLS and strips every
+  canonical credential header.** An `https` provider without
+  `inherit_backend_tls` now commits `BackendTlsConfig::isolated_public_verify()`
+  instead of `default_verify()`: verification against the built-in public
+  roots only (`system://`), never the global `FERRUM_TLS_CA_BUNDLE_PATH`, never
+  disabled by `FERRUM_TLS_NO_VERIFY`, and never presenting the global
+  `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_KEY_PATH` identity. The new
+  runtime-only `BackendTlsConfig::suppress_global_client_identity` marker is
+  honored by the shared backend TLS builder and by every reqwest / direct-H2 /
+  gRPC / HTTP/3 pool and TLS-config-cache key (`|noglobalid`). The provider
+  boundary now strips the canonical credential set shared with replay
+  partitioning (adding `apikey`, `x-access-token`, `x-auth-token`,
+  `x-amz-security-token`, `x-forwarded-authorization`), underscore spellings,
+  and the route's own configured authentication header locations, on the
+  claim and on every final backend-header pass. The broader set also applies
+  to `ai_federation`'s streaming provider boundary, which shares the helper.
 
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to

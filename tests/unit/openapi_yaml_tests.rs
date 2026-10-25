@@ -4981,6 +4981,9 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
             "fail_on_no_matching_provider": null,
             "inject_usage_options": null,
             "normalize_response_stream": null,
+            "max_stream_bytes": null,
+            "max_stream_events": null,
+            "max_normalized_stream_bytes": null,
             "providers": [{
                 "name": "p",
                 "provider_type": "anthropic",
@@ -4990,8 +4993,17 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
                 "priority": null,
                 "allow_plaintext": null,
                 "anthropic_version": null,
+                "default_max_tokens": null,
                 "inherit_backend_tls": null
             }]
+        }),
+        provider_with(json!({"provider_type": "azure_openai"})),
+        provider_with(json!({"provider_type": "anthropic", "default_max_tokens": 32000})),
+        json!({
+            "max_stream_bytes": 33554432,
+            "max_stream_events": 500000,
+            "max_normalized_stream_bytes": 67108864,
+            "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]
         }),
         // Plaintext with the opt-in the constructor requires.
         provider_with(json!({
@@ -5006,6 +5018,12 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
     for invalid in [
         provider_with(json!({"priority": 4294967296u64})),
         provider_with(json!({"name": ""})),
+        provider_with(json!({"provider_type": "anthropic", "anthropic_version": ""})),
+        provider_with(json!({"provider_type": "anthropic", "default_max_tokens": 0})),
+        json!({
+            "max_stream_events": 10,
+            "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]
+        }),
         provider_with(json!({"api_key": ""})),
         provider_with(json!({"model_patterns": [""]})),
         provider_with(json!({"endpoint": "not-url"})),
