@@ -1049,3 +1049,95 @@ async fn websocket_view_keeps_rtds_disabled_consumers_ineligible() {
             .any(|p| p.participates_in_route_request_header_finalization())
     );
 }
+
+#[tokio::test]
+async fn websocket_rejection_finalizes_route_response_list_before_later_policy() {
+    // PR6821-SOL-4: the WebSocket stand-in for `response_transformer` must
+    // keep its chain position on rejection answers. Finalizing in the
+    // end-of-chain fallback ran the route list after `security_headers`
+    // (4080), so a later scrub lost to an earlier route write.
+    let config = make_config(vec![
+        plugin_config(
+            "resp",
+            "response_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "sec",
+            "security_headers",
+            json!({"remove": ["x-route-debug"]}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {"uri": "/new", "redirect_code": 302},
+                "response_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Route-Debug", "value": "internal-route-detail"},
+                    {"operation": "remove", "target": "header", "key": "X-Frame-Options"},
+                    {"operation": "add", "target": "header", "key": "X-Route-Add", "value": "once"}
+                ]
+            }]}),
+            None,
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::WebSocket);
+    assert!(plugins.iter().all(|p| p.name() != "response_transformer"));
+    let stand_in = plugins
+        .iter()
+        .position(|p| p.participates_in_route_response_header_finalization())
+        .expect("response consumer stand-in in the WebSocket view");
+    let scrub = plugins
+        .iter()
+        .position(|p| p.name() == "security_headers")
+        .expect("security_headers in the WebSocket view");
+    assert!(stand_in < scrub);
+    assert!(plugins[stand_in].applies_after_proxy_on_reject());
+
+    let mut ctx = make_ctx();
+    let mut request_headers = HashMap::new();
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers: mut response_headers,
+    } = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut request_headers).await
+    else {
+        panic!("the redirect rule must answer the handshake");
+    };
+    assert_eq!(status_code, 302);
+    let mut status = status_code;
+    let mut body = bytes::Bytes::from(body);
+    apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut body,
+        &mut response_headers,
+    )
+    .await;
+
+    assert!(
+        !response_headers.contains_key("x-route-debug"),
+        "the later security_headers scrub must win over the earlier route write; got {:?}",
+        response_headers.get("x-route-debug")
+    );
+    assert_eq!(
+        response_headers.get("x-frame-options").map(String::as_str),
+        Some("SAMEORIGIN"),
+        "the later security_headers set must win over the earlier route remove"
+    );
+    assert_eq!(
+        response_headers.get("x-route-add").map(String::as_str),
+        Some("once"),
+        "a non-idempotent route add must apply exactly once"
+    );
+    assert!(ctx.route_override_response_transform.is_none());
+}

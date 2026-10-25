@@ -570,6 +570,15 @@ impl Plugin for RouteHeaderConsumerStandIn {
     fn participates_in_route_response_header_finalization(&self) -> bool {
         self.response
     }
+
+    /// The replaced `response_transformer` opts into reject hooks, so the
+    /// stand-in must too: the rejection loop finalizes the route response
+    /// list at this chain position, before later decorators such as
+    /// `security_headers`, instead of in the end-of-chain fallback after
+    /// them (which would let an earlier route write override a later scrub).
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.response
+    }
 }
 
 /// Where `filter_for_protocol` inserts route-header consumer stand-ins: the
