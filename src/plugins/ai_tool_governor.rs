@@ -4952,7 +4952,7 @@ impl StreamingToolCallAccumulator {
             "response.function_call_arguments.delta" => match block_output_index(frame) {
                 Some(index) => {
                     let slot = ToolSlot::ResponsesItem(index);
-                    if !self.positions.contains_key(&(0, slot)) {
+                    if !self.positions.contains_key(&(0usize, slot)) {
                         // Argument bytes for a call no event opened: the call
                         // stays never-named and therefore ungovernable.
                         self.malformed = true;
@@ -4992,7 +4992,7 @@ impl StreamingToolCallAccumulator {
     /// the same index is an identity change, never a continuation.
     fn open_responses_call(&mut self, index: usize, item: &Value) {
         let slot = ToolSlot::ResponsesItem(index);
-        if self.positions.contains_key(&(0, slot)) {
+        if self.positions.contains_key(&(0usize, slot)) {
             self.malformed = true;
             return;
         }
@@ -5016,8 +5016,9 @@ impl StreamingToolCallAccumulator {
         name: Option<&Value>,
         arguments: Option<&Value>,
     ) {
-        let key = (0, ToolSlot::ResponsesItem(index));
-        let Some(&position) = self.positions.get(&key) else {
+        let key: (usize, ToolSlot) = (0, ToolSlot::ResponsesItem(index));
+        let existing_position = self.positions.get(&key).copied();
+        let Some(position) = existing_position else {
             self.push_delta(0, key.1, None, name, arguments);
             return;
         };
