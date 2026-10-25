@@ -267,7 +267,11 @@ base64 = "0.23"
 # flate2; the explicit dependency makes the Bedrock integrity check intentional.
 crc32fast = "1"
 url = "2"
-# Mozilla Public Suffix List for browser-equivalent Set-Cookie Domain handling.
+# Mozilla Public Suffix List for browser-equivalent Set-Cookie Domain handling
+# and CORS credentialed-wildcard classification. A version bump must regenerate
+# `src/plugins/cors_psl_ancestors.rs` from the new bundled list; the
+# `psl_ancestor_index_is_generated_from_the_locked_psl_version` unit test fails
+# until the index header names the locked version.
 psl = "2"
 percent-encoding = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
