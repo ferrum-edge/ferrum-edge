@@ -340,7 +340,7 @@ use chrono::{DateTime, Datelike, Utc};
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use tracing::{debug, warn};
@@ -474,7 +474,15 @@ const MIN_NAMESPACE_SCAN_BUDGET: usize = 4_194_304;
 ///   `n² × longest name + p² × longest URI + d² × longest prefix` per tag.
 /// - **Prefix resolution** — each prefixed attribute and a prefixed element
 ///   name scans the declarations in scope at that element, comparing
-///   prefixes: charged `in-scope declarations × prefix length`.
+///   prefixes: charged `in-scope declarations × prefix length`. An unprefixed
+///   element name scans the same list for the default namespace: charged one
+///   unit per in-scope entry.
+/// - **Namespace intern table** — every distinct `(prefix, URI)` binding is
+///   interned for the whole parse (scope closure never releases it) and each
+///   new one is inserted into a sorted vector. The distinct-binding count is
+///   capped at [`MAX_DISTINCT_NAMESPACE_BINDINGS`], bounding the table and each
+///   insertion's shift; every declaration's binary search is charged
+///   `(⌈log2 distinct⌉ + 1) × (name + URI length)`.
 /// - **Inherited-scope merge** — an element that declares namespaces re-tests
 ///   each inherited binding against the bindings collected so far for it:
 ///   charged `inherited × (own + inherited) × longest declared prefix`. An
@@ -508,6 +516,17 @@ const MAX_ATTRIBUTES_PER_ELEMENT: usize = 64;
 /// Ceiling on namespace declarations in scope at any one element (the
 /// declarations of all its open ancestors and its own).
 const MAX_IN_SCOPE_NAMESPACE_DECLARATIONS: usize = 256;
+/// Ceiling on distinct `(prefix, URI)` bindings across the whole envelope.
+///
+/// roxmltree interns every distinct binding for the entire parse — scope
+/// closure never releases it — in a `values` table plus a `sorted_order`
+/// vector that each new binding is inserted into, shifting every later entry.
+/// Bounding the distinct count bounds that table and every insertion's shift;
+/// repeating an identical binding (a WCF collection's `xmlns=""` resets, a SAML
+/// attribute list's local `xs` / `xsi`) reuses its entry and does not count
+/// again. Raw values are compared, so two spellings of one URI count twice,
+/// which can only over-state the table.
+const MAX_DISTINCT_NAMESPACE_BINDINGS: usize = 256;
 /// Raw-markup comparison allowance multiplier, applied to the envelope length.
 const RAW_MARKUP_WORK_MULTIPLIER: usize = 32;
 /// Floor for the raw-markup comparison allowance.
@@ -7354,9 +7373,9 @@ fn extract_full_tag_name_from_tag(tag: &str) -> Option<&str> {
     }
 }
 
-fn scan_tag_attributes<F>(tag: &str, mut on_attr: F) -> bool
+fn scan_tag_attributes<'t, F>(tag: &'t str, mut on_attr: F) -> bool
 where
-    F: FnMut(&str, &str) -> bool,
+    F: FnMut(&'t str, &'t str) -> bool,
 {
     let bytes = tag.as_bytes();
     let mut i = 0usize;
@@ -7496,9 +7515,9 @@ enum RawMarkupScreen {
 /// Screen every start tag in the raw envelope against the per-item ceilings
 /// and the document-wide aggregates documented on
 /// [`MAX_NAMESPACE_URI_BYTES`]: attributes per tag, attribute-name, prefix, and
-/// URI length, declarations in scope at each element, and the accumulated
-/// parser comparison work (duplicate checks, prefix resolution, and
-/// inherited-scope merges).
+/// URI length, declarations in scope at each element, distinct bindings across
+/// the document, and the accumulated parser comparison work (duplicate checks,
+/// prefix resolution, intern-table searches, and inherited-scope merges).
 ///
 /// One linear pass that recognizes start tags exactly as the id scan does
 /// (comments, CDATA, processing instructions, and declarations are skipped as
@@ -7528,6 +7547,10 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
     let mut depth = 0usize;
     let mut declaring_scopes: Vec<(usize, usize)> = Vec::new();
     let mut in_scope = 0usize;
+    // Distinct `(prefix, raw URI)` bindings seen anywhere in the document;
+    // bounded by `MAX_DISTINCT_NAMESPACE_BINDINGS` (the insert that would pass
+    // it refuses), so the set itself stays small.
+    let mut distinct_bindings: HashSet<(Option<&str>, &str)> = HashSet::new();
     let mut search_from = 0usize;
     while let Some(rel) = xml.get(search_from..).and_then(|rest| rest.find('<')) {
         let tag_start = search_from + rel;
@@ -7577,6 +7600,7 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
         let mut longest_name = 0usize;
         let mut longest_prefix = 0usize;
         let mut prefixed_prefix_bytes = 0usize;
+        let mut intern_search_work = 0usize;
         let exceeded = scan_tag_attributes(tag, |name, value| {
             attributes += 1;
             if attributes > MAX_ATTRIBUTES_PER_ELEMENT || name.len() > MAX_ATTRIBUTE_NAME_BYTES {
@@ -7589,6 +7613,22 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
                 {
                     return true;
                 }
+                // The parser keys its intern table by (prefix, URI); `xmlns`
+                // and `*:xmlns` both bind the default (no-prefix) namespace.
+                let bound_prefix = name.strip_prefix("xmlns:");
+                if distinct_bindings.insert((bound_prefix, value))
+                    && distinct_bindings.len() > MAX_DISTINCT_NAMESPACE_BINDINGS
+                {
+                    return true;
+                }
+                // Each declaration binary-searches the intern table, comparing
+                // (prefix, URI): ≤ ⌈log2 distinct⌉ + 1 comparisons of at most
+                // the declaration's own name and URI.
+                let probes = usize::BITS
+                    .saturating_sub(distinct_bindings.len().leading_zeros())
+                    .saturating_add(1) as usize;
+                intern_search_work = intern_search_work
+                    .saturating_add(probes.saturating_mul(name.len().saturating_add(value.len())));
                 longest_uri = longest_uri.max(value.len());
                 longest_prefix = longest_prefix.max(name.len());
                 return false;
@@ -7624,7 +7664,13 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
         {
             prefixed_prefix_bytes = prefixed_prefix_bytes.saturating_add(prefix.len().max(1));
         }
-        let resolution_work = element_scope.max(1).saturating_mul(prefixed_prefix_bytes);
+        // Every element name, prefixed or not, is resolved by scanning the
+        // element's scope (an unprefixed name looks up the default namespace,
+        // one cheap comparison per entry); prefixed names and attributes also
+        // compare their prefix bytes.
+        let resolution_work = element_scope
+            .max(1)
+            .saturating_mul(prefixed_prefix_bytes.saturating_add(1));
         let regular = attributes.saturating_sub(declared);
         let tag_work = regular
             .saturating_mul(regular)
@@ -7640,7 +7686,8 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
                     .saturating_mul(longest_prefix.max(1)),
             )
             .saturating_add(merge_work)
-            .saturating_add(resolution_work);
+            .saturating_add(resolution_work)
+            .saturating_add(intern_search_work);
         work = work.saturating_add(tag_work);
         if work > allowance {
             return RawMarkupScreen::Exceeded;

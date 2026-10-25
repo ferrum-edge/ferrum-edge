@@ -47,7 +47,8 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 - Governed envelopes with more than 64 attributes on one element, an
   attribute name over 128 bytes, a namespace declaration name over 70 bytes,
   a namespace URI over 2048 bytes, more than 256 namespace declarations in
-  scope at one element, or parser comparison work beyond 32 × envelope length
+  scope at one element, more than 256 distinct namespace bindings, or parser
+  comparison work beyond 32 × envelope length
   are now refused with
   `400` (`xml_namespace_bounds`) before parsing.
 

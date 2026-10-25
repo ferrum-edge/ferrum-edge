@@ -11632,6 +11632,32 @@ async fn ordinary_namespace_inheritance_is_accepted() {
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
 }
 
+/// PR6820-SOL-9: the parser interns every distinct `(prefix, URI)` binding for
+/// the whole parse and inserts each new one into a sorted vector, so many
+/// disjoint siblings that each declare a DIFFERENT binding grow that table
+/// quadratically even though every scope stays tiny. The document-wide distinct
+/// binding ceiling refuses them before parsing; repeated identical bindings
+/// (the collection tests below) do not count again.
+#[tokio::test]
+async fn many_distinct_sibling_bindings_are_refused_before_parsing() {
+    let leaves: String = (0..300)
+        .rev()
+        .map(|index| format!("<x xmlns:p='urn:u{index:05}'/>"))
+        .collect();
+    let result = timestamp_only_outcome_with_item(&format!("<Item>{leaves}</Item>")).await;
+    assert_eq!(reject_status(&result), 400);
+    assert!(
+        reject_body(&result).contains("namespace and attribute bounds"),
+        "got: {}",
+        reject_body(&result)
+    );
+
+    // The same sibling shape repeating one binding stays within every bound.
+    let repeated = "<x xmlns:p='urn:u00001'/>".repeat(300);
+    let result = timestamp_only_outcome_with_item(&format!("<Item>{repeated}</Item>")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+}
+
 /// Disjoint siblings that each redeclare one binding keep the active scope
 /// tiny, so parser work stays linear however many there are. A WCF `XmlNode[]`
 /// collection resets the default namespace on every row; it must be accepted
