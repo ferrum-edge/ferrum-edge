@@ -83,6 +83,41 @@ pub fn log_level_reloader() -> Option<&'static dyn LogLevelReloader> {
     RELOADER.get().map(|reloader| reloader.as_ref())
 }
 
+/// Dependency log targets whose records render credential-bearing protocol
+/// bytes verbatim. The gateway never emits them, whatever `RUST_LOG` or
+/// `FERRUM_LOG_LEVEL` asks for.
+///
+/// `tungstenite::handshake::client` logs the complete serialized WebSocket
+/// upgrade request at TRACE: the request target (path and query) and every
+/// header, including a proxied client's `Authorization` / `Cookie` and the
+/// `ws_logging` `custom_headers` collector credentials. The module's only
+/// other records are a TRACE "handshake initiated" and a DEBUG "handshake
+/// done" line, so silencing the target drops no warning or error.
+pub const CREDENTIAL_DUMPING_LOG_TARGETS: &[&str] = &["tungstenite::handshake::client"];
+
+/// Add an `off` directive for every [`CREDENTIAL_DUMPING_LOG_TARGETS`] entry.
+///
+/// The binary applies this to every output filter it builds, at startup and
+/// on an RTDS log-level reload. `EnvFilter` replaces a directive that names
+/// the same target, so an operator directive such as
+/// `tungstenite::handshake::client=trace` is overridden as well. A span- or
+/// field-scoped directive is more specific than a target directive and is not
+/// overridden; do not write one for these targets.
+pub fn suppress_credential_dumping_log_targets(
+    mut filter: tracing_subscriber::EnvFilter,
+) -> tracing_subscriber::EnvFilter {
+    for target in CREDENTIAL_DUMPING_LOG_TARGETS {
+        // A `<module path>=off` directive always parses; a parse failure would
+        // only mean a malformed constant, and skipping it keeps startup alive.
+        if let Ok(directive) =
+            format!("{target}=off").parse::<tracing_subscriber::filter::Directive>()
+        {
+            filter = filter.add_directive(directive);
+        }
+    }
+    filter
+}
+
 /// Process-global, non-blocking sink for transaction access logs.
 ///
 /// The `stdout_logging` plugin writes one JSON line per proxied transaction

@@ -29,6 +29,11 @@
 //! - CRL list (`FERRUM_TLS_CRL_FILE_PATH`) is applied via `WebPkiServerVerifier`
 //!   under the shared `tls::crl_policy`, so revoked log-sink certificates are
 //!   rejected. Matches the proxy backend / DTLS / frontend mTLS surfaces.
+//!
+//! **Credentials**: collector credentials travel in `custom_headers` on the
+//! upgrade request (values may embed one `${FERRUM_PLUGIN_SECRET_<NAME>}`
+//! reference), never in the request URI: credential-shaped `endpoint_url`
+//! query names and URL userinfo are refused at construction.
 
 use async_trait::async_trait;
 use futures_util::SinkExt;
@@ -50,6 +55,7 @@ use super::utils::log_schema::{
     DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
     SummarySchema, TimestampFormat, resolve_schema,
 };
+use super::utils::plugin_secret_env::resolve_plugin_secret_env;
 use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
@@ -72,8 +78,10 @@ pub const WS_LOGGING_CONFIG_KEYS: &[&str] = &[
     "buffer_capacity",
     "buffer_max_bytes",
     "connect_timeout_ms",
+    "custom_headers",
     "endpoint_url",
     "flush_interval_ms",
+    "inbound_message_policy",
     "max_entry_bytes",
     "max_retries",
     "reconnect_delay_ms",
@@ -101,6 +109,72 @@ const MIN_TIMEOUT_MS: u64 = 100;
 const MAX_RETRY_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
 const MAX_RECONNECT_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
 const MAX_RETRIES: u64 = MAX_BATCH_RETRIES;
+
+/// Largest batch payload a persistent connection keeps open after sending.
+///
+/// Tungstenite copies every outbound frame into a connection-owned output
+/// buffer and only drains it on write, so the buffer's allocation stays at
+/// the largest frame the connection ever sent. The batch's byte leases are
+/// released once the send completes, so that allocation would otherwise sit
+/// outside `buffer_max_bytes` and the process retained-byte ceiling for as
+/// long as the connection lives. A successful send above this size closes
+/// the connection, which frees the buffer; the next batch reconnects. A kept
+/// connection therefore retains at most about twice this value (Vec growth)
+/// of output capacity, independent of `batch_size` and `max_entry_bytes`.
+pub const WS_MAX_PERSISTENT_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Upper bound on configured `custom_headers` entries.
+pub const WS_MAX_CUSTOM_HEADERS: usize = 32;
+
+/// Handshake headers tungstenite writes itself or that would change the
+/// upgrade framing; `custom_headers` may not set them.
+const WS_RESERVED_HANDSHAKE_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "expect",
+    "host",
+    "keep-alive",
+    "proxy-connection",
+    "sec-websocket-accept",
+    "sec-websocket-extensions",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Exact (lowercased, decoded) `endpoint_url` query parameter names refused
+/// because they carry a reusable credential.
+const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] = &[
+    "auth",
+    "jwt",
+    "key",
+    "pass",
+    "pwd",
+    "sid",
+    "sig",
+    "signature",
+];
+
+/// Substrings that mark a credential-bearing `endpoint_url` query parameter
+/// name (`access_token`, `x-api-key`, `client_secret`, `sessionid`, ...).
+const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
+    "access_key",
+    "accesskey",
+    "api-key",
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "credential",
+    "passwd",
+    "password",
+    "secret",
+    "session",
+    "token",
+];
 
 /// Pre-serialized log entry admitted under slot + byte budgets.
 ///
@@ -130,8 +204,12 @@ struct WsDisconnectLogEntry<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_method: Option<&'static str>,
     backend_target: &'a str,
+    http_method: &'a str,
+    request_path: &'a str,
+    handshake_status_code: u16,
     protocol: &'static str,
     listen_port: u16,
+    connection_id: u64,
     duration_ms: f64,
     frames_client_to_backend: u64,
     frames_backend_to_client: u64,
@@ -192,8 +270,12 @@ impl SchemaSerializable for WsDisconnectLogEntry<'_> {
                 None => Ok(()),
             },
             "backend_target" => map.serialize_entry(out_key, self.backend_target),
+            "http_method" => map.serialize_entry(out_key, self.http_method),
+            "request_path" => map.serialize_entry(out_key, self.request_path),
+            "handshake_status_code" => map.serialize_entry(out_key, &self.handshake_status_code),
             "protocol" => map.serialize_entry(out_key, self.protocol),
             "listen_port" => map.serialize_entry(out_key, &self.listen_port),
+            "connection_id" => map.serialize_entry(out_key, &self.connection_id),
             "duration_ms" => map.serialize_entry(out_key, &self.duration_ms),
             "frames_client_to_backend" => {
                 map.serialize_entry(out_key, &self.frames_client_to_backend)
@@ -282,8 +364,12 @@ impl<'a> From<&'a WsDisconnectContext> for WsDisconnectLogEntry<'a> {
             consumer_username: ctx.consumer_username.as_deref(),
             auth_method: ctx.auth_method,
             backend_target: ctx.backend_target.as_str(),
+            http_method: ctx.http_method.as_str(),
+            request_path: ctx.request_path.as_str(),
+            handshake_status_code: ctx.handshake_status_code,
             protocol: "websocket",
             listen_port: ctx.listen_port,
+            connection_id: ctx.connection_id,
             duration_ms: ctx.duration_ms,
             frames_client_to_backend: ctx.frames_client_to_backend,
             frames_backend_to_client: ctx.frames_backend_to_client,
@@ -315,6 +401,12 @@ struct WsConfig {
     /// Active backend egress policy, rechecked immediately before each dial.
     backend_egress_policy: BackendEgressPolicy,
     connector: Option<tokio_tungstenite::Connector>,
+    /// Operator handshake headers (`custom_headers`), values marked sensitive.
+    /// Carried on the upgrade request only, never in the request URI.
+    custom_headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    /// `inbound_message_policy: ignore` — discard collector Text/Binary
+    /// frames instead of invalidating the connection.
+    ignore_inbound_messages: bool,
     batch_size: usize,
     flush_interval: Duration,
     max_retries: u32,
@@ -549,6 +641,15 @@ impl WsLogging {
                 "ws_logging: `endpoint_url` must include a hostname or IP address".to_string(),
             );
         }
+        if parsed_url.fragment().is_some() {
+            return Err("ws_logging: `endpoint_url` must not include a fragment".to_string());
+        }
+        // `Url::parse` admits an explicit `:0`, which no collector can listen
+        // on: every dial would fail and every batch would be discarded.
+        if parsed_url.port() == Some(0) {
+            return Err("ws_logging: `endpoint_url` port must be between 1 and 65535".to_string());
+        }
+        screen_endpoint_query_credentials(&parsed_url)?;
         let endpoint_hostname = endpoint_hostname(&parsed_url)?;
         let endpoint_url_for_logs = redacted_endpoint_url(&parsed_url);
         // `Url::parse` is more lenient than tungstenite's `http::Uri` request
@@ -690,6 +791,18 @@ impl WsLogging {
         let endpoint_port = parsed_url.port_or_known_default().ok_or_else(|| {
             "ws_logging: `endpoint_url` has no port and no default port for its scheme".to_string()
         })?;
+        let custom_headers = parse_ws_custom_headers(config)?;
+        let ignore_inbound_messages = match config.get("inbound_message_policy").map(Value::as_str)
+        {
+            None | Some(Some("invalidate")) => false,
+            Some(Some("ignore")) => true,
+            Some(_) => {
+                return Err(
+                    "ws_logging: `inbound_message_policy` must be \"invalidate\" or \"ignore\""
+                        .to_string(),
+                );
+            }
+        };
 
         let ws_config = WsConfig {
             endpoint_url,
@@ -699,6 +812,8 @@ impl WsLogging {
             dns_cache,
             backend_egress_policy,
             connector,
+            custom_headers,
+            ignore_inbound_messages,
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
             max_retries,
@@ -953,6 +1068,123 @@ fn endpoint_authority(endpoint_url: &str) -> Option<&str> {
         .find(['/', '?', '#'])
         .unwrap_or(authority_and_path.len());
     Some(&authority_and_path[..authority_end])
+}
+
+/// Refuse `endpoint_url` query parameters whose (decoded) name marks a
+/// reusable credential.
+///
+/// The request target travels on the WebSocket request line, which proxies,
+/// collectors, and dependency diagnostics routinely record, and the admitted
+/// URL is ordinary configuration. Collector credentials belong in
+/// `custom_headers`, whose values are marked sensitive, redacted from admin
+/// projections, and never part of the URI. A name that is still
+/// percent-encoded after one decode is refused too, so a layered encoding
+/// cannot hide a credential name from this screen.
+fn screen_endpoint_query_credentials(parsed_url: &Url) -> Result<(), String> {
+    for (name, _) in parsed_url.query_pairs() {
+        let lowered = name.to_ascii_lowercase();
+        if lowered.contains('%') {
+            return Err(
+                "ws_logging: `endpoint_url` query parameter names must not be percent-encoded \
+                 more than once"
+                    .to_string(),
+            );
+        }
+        if CREDENTIAL_QUERY_PARAM_NAMES.contains(&lowered.as_str())
+            || CREDENTIAL_QUERY_PARAM_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker))
+        {
+            return Err(format!(
+                "ws_logging: `endpoint_url` query parameter {lowered:?} names a credential; send \
+                 collector credentials in `custom_headers` (for example `Authorization`), which \
+                 never appear in the request URI"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse `custom_headers`: a bounded object of header name to string value
+/// added to the WebSocket upgrade request.
+///
+/// A value may embed one `${FERRUM_PLUGIN_SECRET_<NAME>}` reference, resolved
+/// at construction through the plugin-secret namespace (any other variable is
+/// refused before anything is read). Names the handshake owns are refused, as
+/// are case-insensitive duplicates. Diagnostics name the header, never its
+/// value; resolved values are marked sensitive.
+fn parse_ws_custom_headers(
+    config: &Value,
+) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, String> {
+    let Some(raw) = config.get("custom_headers") else {
+        return Ok(Vec::new());
+    };
+    let map = raw.as_object().ok_or_else(|| {
+        "ws_logging: `custom_headers` must be an object of header name to string value".to_string()
+    })?;
+    if map.len() > WS_MAX_CUSTOM_HEADERS {
+        return Err(format!(
+            "ws_logging: `custom_headers` may hold at most {WS_MAX_CUSTOM_HEADERS} headers"
+        ));
+    }
+    let mut headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        let name = http::HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+            format!("ws_logging: `custom_headers` name {key:?} is not a valid HTTP header name")
+        })?;
+        if WS_RESERVED_HANDSHAKE_HEADERS.contains(&name.as_str()) {
+            return Err(format!(
+                "ws_logging: `custom_headers` cannot set `{name}`; the WebSocket handshake owns \
+                 that header"
+            ));
+        }
+        if headers.iter().any(|(existing, _)| *existing == name) {
+            return Err(format!(
+                "ws_logging: `custom_headers` sets `{name}` more than once (header names are \
+                 case-insensitive)"
+            ));
+        }
+        let raw_value = value.as_str().ok_or_else(|| {
+            format!("ws_logging: `custom_headers` value for `{name}` must be a string")
+        })?;
+        let resolved = resolve_custom_header_value(name.as_str(), raw_value)?;
+        let mut header_value = http::HeaderValue::from_str(&resolved).map_err(|_| {
+            format!(
+                "ws_logging: `custom_headers` value for `{name}` is not a valid HTTP header value"
+            )
+        })?;
+        header_value.set_sensitive(true);
+        headers.push((name, header_value));
+    }
+    Ok(headers)
+}
+
+/// Resolve at most one embedded `${FERRUM_PLUGIN_SECRET_<NAME>}` reference in
+/// a `custom_headers` value, keeping the literal text around it (so
+/// `Bearer ${FERRUM_PLUGIN_SECRET_COLLECTOR_TOKEN}` works). A value without
+/// `${` is used verbatim.
+fn resolve_custom_header_value(name: &str, raw: &str) -> Result<String, String> {
+    let Some(start) = raw.find("${") else {
+        return Ok(raw.to_string());
+    };
+    let label = format!("ws_logging: `custom_headers` value for `{name}`");
+    let after_open = &raw[start + 2..];
+    let Some(end) = after_open.find('}') else {
+        return Err(format!("{label} has an unterminated `${{...}}` reference"));
+    };
+    let reference = &after_open[..end];
+    let suffix = &after_open[end + 1..];
+    if suffix.contains("${") {
+        return Err(format!(
+            "{label} may contain at most one `${{FERRUM_PLUGIN_SECRET_<NAME>}}` reference"
+        ));
+    }
+    let secret = resolve_plugin_secret_env(&label, reference)?;
+    let mut value = String::with_capacity(start + secret.len() + suffix.len());
+    value.push_str(&raw[..start]);
+    value.push_str(&secret);
+    value.push_str(suffix);
+    Ok(value)
 }
 
 /// Build a `tokio_tungstenite::Connector::Rustls` that follows the gateway's
@@ -1331,7 +1563,8 @@ type WsSink = futures_util::stream::SplitSink<
 /// TCP/TLS stream) alive until the peer eventually closes, briefly
 /// stacking two drain tasks + two connections during a reconnect.
 ///
-/// The plugin is write-only. Unexpected Text/Binary frames, server Close,
+/// The plugin is write-only. Unexpected Text/Binary frames (unless
+/// `inbound_message_policy: ignore`), server Close,
 /// or read errors mark the connection finished so the flush loop invalidates
 /// the complete connection (sink + drain) rather than leaving an unpolled
 /// read half while the writer keeps the stale socket selected.
@@ -1435,7 +1668,17 @@ async fn send_batch(
         if let Some(ref mut ws) = conn {
             let msg = tokio_tungstenite::tungstenite::protocol::Message::Text(payload.json.clone());
             match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
-                Ok(Ok(())) => return conn,
+                Ok(Ok(())) => {
+                    if payload.json.len() > WS_MAX_PERSISTENT_FRAME_BYTES {
+                        // The codec's output buffer now holds an allocation at
+                        // least this frame's size that no lease charges once
+                        // `payload` drops. Close the connection so that
+                        // allocation is freed; the next batch reconnects.
+                        let _ = tokio::time::timeout(cfg.write_timeout, ws.sink.close()).await;
+                        return None;
+                    }
+                    return conn;
+                }
                 Ok(Err(e)) => {
                     warn_sampled!(
                         "WebSocket logging: send failed to {}: {e} (attempt {}/{})",
@@ -1519,7 +1762,10 @@ fn screen_ws_dial_candidate(cfg: &WsConfig, candidate: IpAddr) -> Result<(), Str
 /// each concrete candidate immediately before its socket is opened. Only
 /// screened addresses are dialed; the hostname is never handed to a client that
 /// could re-resolve it.
-async fn connect_screened_stream(cfg: &WsConfig) -> Result<tokio::net::TcpStream, String> {
+async fn connect_screened_stream(
+    cfg: &WsConfig,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::net::TcpStream, String> {
     let candidates = cfg
         .dns_cache
         .resolve_all_fresh(&cfg.endpoint_hostname)
@@ -1530,14 +1776,67 @@ async fn connect_screened_stream(cfg: &WsConfig) -> Result<tokio::net::TcpStream
         screen_ws_dial_candidate(cfg, candidate)?;
     }
 
+    // Deliberately re-screened inside the dial loop so the policy decision
+    // stays adjacent to the dial, and so a plugin instance whose active policy
+    // is stricter than the resolver's still fails closed.
+    dial_screened_candidates(&candidates, cfg.endpoint_port, deadline, |candidate| {
+        screen_ws_dial_candidate(cfg, candidate)
+    })
+    .await
+}
+
+/// The time one dial candidate may spend connecting.
+///
+/// While more than one candidate remains, each gets an equal share of what is
+/// left of the establishment budget, so a candidate that silently drops SYNs
+/// (a broken IPv6 route ahead of a healthy IPv4 address) cannot spend the
+/// whole `connect_timeout_ms` and starve the rest. The last candidate gets no
+/// slice of its own (`None`): the outer establishment deadline bounds it, as
+/// it bounds a single-address endpoint.
+#[doc(hidden)]
+pub fn candidate_connect_slice(
+    remaining: Duration,
+    remaining_candidates: usize,
+) -> Option<Duration> {
+    if remaining_candidates <= 1 {
+        return None;
+    }
+    let share = u32::try_from(remaining_candidates).unwrap_or(u32::MAX);
+    Some(remaining / share)
+}
+
+/// Dial `candidates` in order on `port`, re-screening each with `screen`
+/// immediately before its socket is opened and bounding every non-final
+/// attempt by [`candidate_connect_slice`] of the time left before `deadline`.
+/// Returns the first connected stream; a screen refusal fails the whole dial.
+#[doc(hidden)]
+pub async fn dial_screened_candidates<F>(
+    candidates: &[IpAddr],
+    port: u16,
+    deadline: tokio::time::Instant,
+    screen: F,
+) -> Result<tokio::net::TcpStream, String>
+where
+    F: Fn(IpAddr) -> Result<(), String>,
+{
     let mut last_connect_error = None;
-    for candidate in candidates {
-        // Deliberately repeated after the whole-set screen so the policy
-        // decision stays adjacent to the dial, and so a plugin instance whose
-        // active policy is stricter than the resolver's still fails closed.
-        screen_ws_dial_candidate(cfg, candidate)?;
-        let socket_addr = SocketAddr::new(candidate, cfg.endpoint_port);
-        match tokio::net::TcpStream::connect(socket_addr).await {
+    for (index, &candidate) in candidates.iter().enumerate() {
+        screen(candidate)?;
+        let socket_addr = SocketAddr::new(candidate, port);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let attempt = tokio::net::TcpStream::connect(socket_addr);
+        let result = match candidate_connect_slice(remaining, candidates.len() - index) {
+            Some(slice) => tokio::time::timeout(slice, attempt)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "candidate connect time slice elapsed",
+                    ))
+                }),
+            None => attempt.await,
+        };
+        match result {
             Ok(stream) => return Ok(stream),
             Err(error) => last_connect_error = Some((socket_addr, error)),
         }
@@ -1578,6 +1877,7 @@ async fn connect_screened_stream(cfg: &WsConfig) -> Result<tokio::net::TcpStream
 /// finished so the flush loop invalidates both halves together.
 async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 
     // ws_logging is intentionally write-only. Keep inbound parsing bounded
@@ -1587,12 +1887,24 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     ws_cfg.max_message_size = Some(64 << 10);
     ws_cfg.max_frame_size = Some(16 << 10);
 
+    let deadline = tokio::time::Instant::now() + cfg.connect_timeout;
     let connect_fut = async {
-        let stream = connect_screened_stream(cfg)
+        let stream = connect_screened_stream(cfg, deadline)
             .await
             .map_err(WsConnectError::Egress)?;
+        // A fresh request per handshake (tungstenite mints a new
+        // `Sec-WebSocket-Key`). Credentials ride `custom_headers`, never the
+        // admitted URI, whose query names were screened at construction.
+        let mut request = cfg
+            .endpoint_url
+            .as_str()
+            .into_client_request()
+            .map_err(WsConnectError::Handshake)?;
+        for (name, value) in &cfg.custom_headers {
+            request.headers_mut().insert(name.clone(), value.clone());
+        }
         tokio_tungstenite::client_async_tls_with_config(
-            cfg.endpoint_url.as_str(),
+            request,
             stream,
             Some(ws_cfg),
             cfg.connector.clone(),
@@ -1601,17 +1913,22 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
         .map_err(WsConnectError::Handshake)
     };
 
-    match tokio::time::timeout(cfg.connect_timeout, connect_fut).await {
+    match tokio::time::timeout_at(deadline, connect_fut).await {
         Ok(Ok((stream, _response))) => {
             let (sink, mut read) = stream.split();
             let (done_tx, done_rx) = watch::channel(false);
+            let ignore_inbound_messages = cfg.ignore_inbound_messages;
             // Drain the read half so tungstenite can service Ping/Pong
-            // and server-initiated Close frames. Mark finished on
-            // application data, Close, or read error so the writer cannot
-            // keep selecting a read-dead socket.
+            // and server-initiated Close frames. Mark finished on Close or
+            // read error (and on application data unless
+            // `inbound_message_policy: ignore`) so the writer cannot keep
+            // selecting a read-dead socket. Ignored frames are already bounded
+            // by `max_message_size` / `max_frame_size` and dropped unread.
             let drain = tokio::spawn(async move {
                 while let Some(item) = read.next().await {
                     match item {
+                        Ok(Message::Text(_)) | Ok(Message::Binary(_))
+                            if ignore_inbound_messages => {}
                         Ok(Message::Text(_)) | Ok(Message::Binary(_)) => {
                             let _ = done_tx.send(true);
                             break;
@@ -1680,8 +1997,12 @@ mod tests {
             consumer_username: Some("alice"),
             auth_method: None,
             backend_target: "wss://backend.example.com:9000/ws",
+            http_method: "GET",
+            request_path: "/ws",
+            handshake_status_code: 101,
             protocol: "websocket",
             listen_port: 8080,
+            connection_id: 7,
             duration_ms: 42.0,
             frames_client_to_backend: 3,
             frames_backend_to_client: 5,
@@ -1711,13 +2032,14 @@ mod tests {
     fn ws_disconnect_flatten_keeps_metadata_named_like_unowned_http_natives() {
         // Round-3 regression: a WebSocket-disconnect entry is serialized through
         // a `summary_type: http` ws_logging schema, whose native specs include
-        // HTTP-only fields (`http_method`, `request_path`,
-        // `response_status_code`) that `WsDisconnectLogEntry::serialize_native`
-        // never emits. Those specs must NOT reserve the flatten output key, so
-        // disconnect metadata sharing the name survives under the default
-        // `on_collision: skip`.
+        // HTTP-only fields (`response_status_code`, ...) that
+        // `WsDisconnectLogEntry::serialize_native` never emits. Those specs
+        // must NOT reserve the flatten output key, so disconnect metadata
+        // sharing the name survives under the default `on_collision: skip`.
+        // `http_method` / `request_path` ARE disconnect natives (the handshake
+        // method and original path), so they win over same-named metadata.
         let mut metadata = crate::plugins::MetadataMap::default();
-        metadata.insert("http_method".to_string(), "GET".to_string());
+        metadata.insert("http_method".to_string(), "POST".to_string());
         metadata.insert("request_path".to_string(), "/live".to_string());
         metadata.insert("response_status_code".to_string(), "101".to_string());
         // A metadata key colliding with a native the disconnect entry DOES own
@@ -1734,7 +2056,7 @@ mod tests {
         );
 
         assert_eq!(v.get("http_method").and_then(Value::as_str), Some("GET"));
-        assert_eq!(v.get("request_path").and_then(Value::as_str), Some("/live"));
+        assert_eq!(v.get("request_path").and_then(Value::as_str), Some("/ws"));
         assert_eq!(
             v.get("response_status_code").and_then(Value::as_str),
             Some("101")

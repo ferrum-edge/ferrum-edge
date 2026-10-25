@@ -399,7 +399,15 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         ],
     ),
     ("udp_logging", NONE),
-    ("ws_logging", &[endpoint_url(&["endpoint_url"])]),
+    (
+        "ws_logging",
+        &[
+            endpoint_url(&["endpoint_url"]),
+            // Upgrade-request headers are the supported collector-credential
+            // channel (`Authorization`, API-key headers).
+            secret(&["custom_headers", "*"]),
+        ],
+    ),
     ("transaction_debugger", NONE),
     // ---- Notifications ----------------------------------------------------
     (

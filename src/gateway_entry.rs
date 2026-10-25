@@ -342,8 +342,9 @@ fn init_logging() -> Result<LoggingGuards, String> {
     // double-charge events that count once and surface twice. Only the
     // visible fmt filter responds to `ferrum.log.level`.
     let installed = if log_counter_enabled {
-        let fmt_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
+        let fmt_filter = logging::suppress_credential_dumping_log_targets(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
+        );
         let (fmt_reload_layer, fmt_handle) = reload::Layer::new(fmt_filter);
         let log_counter_level_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
@@ -377,8 +378,9 @@ fn init_logging() -> Result<LoggingGuards, String> {
     };
 
     if !installed {
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
+        let env_filter = logging::suppress_credential_dumping_log_targets(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
+        );
         let (reload_layer, fallback_handle) = reload::Layer::new(env_filter);
         let fmt_layer = tracing_subscriber::fmt::layer()
             .json()
@@ -444,6 +446,7 @@ where
 {
     fn reload(&self, directive: &str) -> Result<(), String> {
         let filter = EnvFilter::try_new(directive)
+            .map(logging::suppress_credential_dumping_log_targets)
             .map_err(|_| format!("invalid filter directive {directive:?}"))?;
         self.handle
             .reload(filter)

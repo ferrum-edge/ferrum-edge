@@ -207,16 +207,23 @@ when a WebSocket session disconnects, and only there are the WebSocket-disconnec
 keys valid. The native keys available to `omit`, `rename`, and `order` are:
 
 `event`, `namespace`, `proxy_id`, `proxy_name`, `client_ip`,
-`consumer_username`, `auth_method`, `backend_target`, `protocol`,
-`listen_port`, `duration_ms`, `frames_client_to_backend`,
+`consumer_username`, `auth_method`, `backend_target`, `http_method`,
+`request_path`, `handshake_status_code`, `protocol`, `listen_port`,
+`connection_id`, `duration_ms`, `frames_client_to_backend`,
 `frames_backend_to_client`, `bytes_client_to_backend`,
 `bytes_backend_to_client`, `timestamp_connected`, `timestamp_disconnected`,
 `direction`, `io_side`, `error_class`, and `metadata`.
 
-The disconnect-specific keys are `event`, `frames_client_to_backend`,
-`frames_backend_to_client`, `bytes_client_to_backend`,
-`bytes_backend_to_client`, `timestamp_connected`, `timestamp_disconnected`,
-`direction`, and `io_side`. Byte totals are the session payload volume already
+The disconnect-specific keys are `event`, `handshake_status_code`,
+`connection_id`, `frames_client_to_backend`, `frames_backend_to_client`,
+`bytes_client_to_backend`, `bytes_backend_to_client`, `timestamp_connected`,
+`timestamp_disconnected`, `direction`, and `io_side`. `http_method`,
+`request_path`, and `handshake_status_code` repeat the upgrade handshake
+(`GET` / `101` for HTTP/1.1, `CONNECT` / `200` for HTTP/2 and HTTP/3 Extended
+CONNECT; `request_path` is the original client path, not a rewritten backend
+path). `connection_id` is the process-local WebSocket session ID that
+`ws_frame_logging` frame events carry; join on (`gateway_instance_id`,
+`proxy_id`, `connection_id`) across gateway processes. Byte totals are the session payload volume already
 computed by the relay (including H1/H2 tunnel mode, where frame counts stay
 zero). Timestamps are RFC3339 wall-clock instants captured at upgrade and
 teardown so delayed batch delivery does not replace event time with receipt

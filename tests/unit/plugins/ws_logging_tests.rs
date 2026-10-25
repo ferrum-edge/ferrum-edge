@@ -551,7 +551,9 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
                     "event": "kind",
                     "frames_client_to_backend": "upstream_frames",
                     "direction": "disconnect_direction",
-                    "io_side": "failure_side"
+                    "io_side": "failure_side",
+                    "connection_id": "session_id",
+                    "handshake_status_code": "upgrade_status"
                 },
                 "omit": ["frames_backend_to_client", "proxy_name"],
                 "order": ["kind", "upstream_frames", "*"],
@@ -574,6 +576,7 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
     ctx.auth_method = Some("jwt_auth");
     ctx.error_class = Some(ErrorClass::ConnectionReset);
     ctx.io_side = Some(StreamIoSide::Write);
+    ctx.connection_id = 77;
     plugin.on_ws_disconnect(&ctx).await;
 
     let payload = await_within("custom-schema disconnect batch", payload_rx)
@@ -601,6 +604,13 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
     assert!(entry.get("frames_backend_to_client").is_none());
     assert!(entry.get("proxy_name").is_none());
     assert!(entry.get("metadata").is_none());
+    // Session join key and handshake fields are schema-addressable natives.
+    assert_eq!(entry["session_id"], 77);
+    assert_eq!(entry["upgrade_status"], 101);
+    assert_eq!(entry["http_method"], "GET");
+    assert_eq!(entry["request_path"], "/");
+    assert!(entry.get("connection_id").is_none());
+    assert!(entry.get("handshake_status_code").is_none());
 
     drop(plugin);
     let _ = await_within("custom-schema server shutdown", server).await;
@@ -1041,6 +1051,13 @@ async fn test_ws_logging_native_disconnect_preserves_bytes_and_timestamps() {
     ctx.bytes_backend_to_client = 8192;
     ctx.timestamp_connected = "2026-07-20T12:00:00+00:00".to_string();
     ctx.timestamp_disconnected = "2026-07-20T12:00:05+00:00".to_string();
+    // An HTTP/3 Extended CONNECT session: the disconnect record must repeat
+    // the handshake method/status/original path and carry the session ID
+    // `ws_frame_logging` frame events use.
+    ctx.http_method = "CONNECT".to_string();
+    ctx.request_path = "/chat".to_string();
+    ctx.handshake_status_code = 200;
+    ctx.connection_id = 4242;
     plugin.on_ws_disconnect(&ctx).await;
 
     let payload = await_within("native disconnect batch", payload_rx)
@@ -1055,6 +1072,10 @@ async fn test_ws_logging_native_disconnect_preserves_bytes_and_timestamps() {
     assert_eq!(entry["bytes_backend_to_client"], 8192);
     assert_eq!(entry["timestamp_connected"], "2026-07-20T12:00:00+00:00");
     assert_eq!(entry["timestamp_disconnected"], "2026-07-20T12:00:05+00:00");
+    assert_eq!(entry["http_method"], "CONNECT");
+    assert_eq!(entry["request_path"], "/chat");
+    assert_eq!(entry["handshake_status_code"], 200);
+    assert_eq!(entry["connection_id"], 4242);
 
     drop(plugin);
     let _ = await_within("native disconnect server shutdown", server).await;
@@ -1504,7 +1525,7 @@ async fn test_ws_logging_diagnostics_redact_endpoint_path_and_query() {
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": format!(
-                "ws://127.0.0.1:1/{path_secret}/ingest?token={query_secret}"
+                "ws://127.0.0.1:1/{path_secret}/ingest?stream={query_secret}"
             ),
             "batch_size": 1,
             "flush_interval_ms": 100,
@@ -2180,4 +2201,447 @@ async fn ws_logging_connect_failures_charge_one_backoff_and_none_after_the_last_
         "reconnect and retry delays must not both be charged; discard took {elapsed:?}"
     );
     drop(plugin);
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint admission: credential-shaped query names, port 0, fragments
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ws_logging_refuses_credential_query_parameters_port_zero_and_fragments() {
+    for endpoint in [
+        "ws://localhost:9300/logs?token=abc",
+        "ws://localhost:9300/logs?access_token=abc",
+        "ws://localhost:9300/logs?stream=a&API_KEY=abc",
+        "ws://localhost:9300/logs?x-api-key=abc",
+        "ws://localhost:9300/logs?client_secret=abc",
+        "ws://localhost:9300/logs?sessionid=abc",
+        "ws://localhost:9300/logs?password=abc",
+        "ws://localhost:9300/logs?key=abc",
+        "ws://localhost:9300/logs?sig=abc",
+        "ws://localhost:9300/logs?Authorization=Bearer%20abc",
+        // Percent-encoded once: decodes to `token`.
+        "ws://localhost:9300/logs?to%6Ben=abc",
+        // Percent-encoded twice: still encoded after one decode.
+        "ws://localhost:9300/logs?to%256Ben=abc",
+    ] {
+        let error = WsLogging::new(&json!({ "endpoint_url": endpoint }), default_client())
+            .err()
+            .unwrap_or_else(|| panic!("{endpoint} must be refused"));
+        assert!(error.contains("endpoint_url"), "{endpoint}: {error}");
+        assert!(
+            !error.contains("abc"),
+            "{endpoint}: diagnostic echoed a query value: {error}"
+        );
+    }
+
+    let port_zero = WsLogging::new(
+        &json!({ "endpoint_url": "ws://localhost:0/logs" }),
+        default_client(),
+    )
+    .err()
+    .expect("port 0 must be refused");
+    assert!(port_zero.contains("port"), "{port_zero}");
+
+    let fragment = WsLogging::new(
+        &json!({ "endpoint_url": "ws://localhost:9300/logs#frag" }),
+        default_client(),
+    )
+    .err()
+    .expect("fragment must be refused");
+    assert!(fragment.contains("fragment"), "{fragment}");
+
+    // Non-credential query parameters stay admissible.
+    for endpoint in [
+        "ws://localhost:9300/logs?stream=edge&format=json",
+        "ws://localhost:9300/logs?dataset=prod",
+        "ws://localhost:65535/logs",
+    ] {
+        WsLogging::new(&json!({ "endpoint_url": endpoint }), default_client())
+            .unwrap_or_else(|error| panic!("{endpoint} must be admitted: {error}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// custom_headers: the supported collector-credential channel
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ws_logging_rejects_invalid_custom_headers() {
+    let too_many: serde_json::Map<String, serde_json::Value> =
+        (0..33).map(|i| (format!("x-h{i}"), json!("v"))).collect();
+    for (headers, needle) in [
+        (json!("Authorization: x"), "must be an object"),
+        (json!({"Host": "evil.example"}), "handshake owns"),
+        (json!({"Sec-WebSocket-Key": "AAAA"}), "handshake owns"),
+        (json!({"upgrade": "h2c"}), "handshake owns"),
+        (json!({"bad header": "v"}), "not a valid HTTP header name"),
+        (json!({"X-Tenant": 7}), "must be a string"),
+        (
+            json!({"X-Tenant": "line\r\nInjected: yes"}),
+            "not a valid HTTP header value",
+        ),
+        (
+            json!({"Authorization": "a", "authorization": "b"}),
+            "more than once",
+        ),
+        (json!(too_many), "at most 32"),
+        (
+            json!({"Authorization": "Bearer ${FERRUM_ADMIN_JWT_SECRET}"}),
+            "FERRUM_PLUGIN_SECRET_<NAME>",
+        ),
+        (
+            json!({"Authorization": "Bearer ${FERRUM_PLUGIN_SECRET_UNTERMINATED"}),
+            "unterminated",
+        ),
+        (
+            json!({"Authorization": "${FERRUM_PLUGIN_SECRET_A}${FERRUM_PLUGIN_SECRET_B}"}),
+            "at most one",
+        ),
+    ] {
+        let error = WsLogging::new(
+            &json!({
+                "endpoint_url": "ws://localhost:9300/logs",
+                "custom_headers": headers
+            }),
+            default_client(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("custom_headers {headers} must be refused"));
+        assert!(error.contains(needle), "{headers}: {error}");
+        assert!(
+            !error.contains("Injected"),
+            "diagnostic echoed a header value: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ws_logging_rejects_invalid_inbound_message_policy() {
+    for policy in [json!("drop"), json!(true), json!("")] {
+        let error = WsLogging::new(
+            &json!({
+                "endpoint_url": "ws://localhost:9300/logs",
+                "inbound_message_policy": policy
+            }),
+            default_client(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("inbound_message_policy {policy} must be refused"));
+        assert!(error.contains("inbound_message_policy"), "{error}");
+    }
+    for policy in ["invalidate", "ignore"] {
+        WsLogging::new(
+            &json!({
+                "endpoint_url": "ws://localhost:9300/logs",
+                "inbound_message_policy": policy
+            }),
+            default_client(),
+        )
+        .unwrap_or_else(|error| panic!("{policy} must be admitted: {error}"));
+    }
+}
+
+/// The upgrade request carries `custom_headers` (with a resolved
+/// plugin-secret reference) while its request target carries no credential.
+// tokio-tungstenite's header callback requires its concrete ErrorResponse;
+// the test cannot box that error without changing the callback contract.
+#[allow(clippy::result_large_err)]
+#[tokio::test]
+async fn ws_logging_custom_headers_reach_the_collector_handshake() {
+    const SECRET_CANARY: &str = "ws-logging-header-secret-canary";
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let endpoint = format!("ws://{addr}/logs?stream=edge");
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, String, String)>();
+
+    let server = tokio::spawn(async move {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+        let (stream, _) = listener.accept().await.expect("accept");
+        let capture = move |req: &Request, res: Response| -> Result<Response, ErrorResponse> {
+            let header = |name: &str| {
+                req.headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let target = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_default();
+            let _ = seen_tx.send((
+                header("authorization"),
+                header("x-collector-tenant"),
+                target,
+            ));
+            Ok(res)
+        };
+        let ws = tokio_tungstenite::accept_hdr_async(stream, capture)
+            .await
+            .expect("handshake");
+        let (_sink, mut read) = ws.split();
+        let _ = read.next().await;
+    });
+
+    // Resolution happens at construction; release the env lock before any await.
+    let plugin = {
+        let env = crate::unit::env_lock::EnvGuard::new(&[]);
+        env.set("FERRUM_PLUGIN_SECRET_WS_LOGGING_TEST_TOKEN", SECRET_CANARY);
+        WsLogging::new(
+            &json!({
+                "endpoint_url": endpoint,
+                "custom_headers": {
+                    "Authorization": "Bearer ${FERRUM_PLUGIN_SECRET_WS_LOGGING_TEST_TOKEN}",
+                    "X-Collector-Tenant": "acme"
+                },
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "max_retries": 0,
+                "reconnect_delay_ms": 100,
+                "buffer_capacity": 16
+            }),
+            default_client(),
+        )
+        .expect("build plugin")
+    };
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    let (authorization, tenant, target) = await_within("captured handshake", seen_rx)
+        .await
+        .expect("handshake channel closed");
+    assert_eq!(authorization, format!("Bearer {SECRET_CANARY}"));
+    assert_eq!(tenant, "acme");
+    assert_eq!(target, "/logs?stream=edge");
+    assert!(!target.contains(SECRET_CANARY));
+
+    drop(plugin);
+    let _ = await_within("custom-headers server shutdown", server).await;
+}
+
+// ---------------------------------------------------------------------------
+// inbound_message_policy: ignore keeps an acknowledging collector's connection
+// ---------------------------------------------------------------------------
+
+/// Receives `(connection number, payload length)` for each collector batch.
+type BatchReceiver = tokio::sync::mpsc::UnboundedReceiver<(usize, usize)>;
+
+/// Spawn a collector that numbers each accepted connection, answers every
+/// Text batch with a Text acknowledgement when `ack` is set, and reports
+/// `(connection number, payload length)` per received batch.
+fn spawn_counting_collector(
+    listener: TcpListener,
+    ack: bool,
+) -> (tokio::task::JoinHandle<()>, BatchReceiver) {
+    let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    let server = tokio::spawn(async move {
+        let mut connection = 0usize;
+        while let Ok((stream, _)) = listener.accept().await {
+            connection += 1;
+            let number = connection;
+            let batch_tx = batch_tx.clone();
+            tokio::spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let (mut sink, mut read) = ws.split();
+                while let Some(Ok(message)) = read.next().await {
+                    if let Message::Text(payload) = message {
+                        let _ = batch_tx.send((number, payload.len()));
+                        if ack && sink.send(Message::Text("ack".into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (server, batch_rx)
+}
+
+async fn next_batch(batches: &mut BatchReceiver, label: &str) -> (usize, usize) {
+    await_within(label, batches.recv())
+        .await
+        .unwrap_or_else(|| panic!("collector closed before {label}"))
+}
+
+#[tokio::test]
+async fn ws_logging_ignore_policy_keeps_connection_across_acknowledgements() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let (server, mut batches) = spawn_counting_collector(listener, true);
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            "inbound_message_policy": "ignore",
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 2,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    for round in 0..3 {
+        plugin.log(&create_test_transaction_summary()).await;
+        let (connection, _) = next_batch(&mut batches, "acknowledged batch").await;
+        assert_eq!(
+            connection, 1,
+            "batch {round} must reuse the first connection under `ignore`"
+        );
+        // Give the drain task time to read the acknowledgement before the
+        // next batch; under `invalidate` that read would force a reconnect.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    drop(plugin);
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Large successful sends retire the connection (codec buffer release)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ws_logging_large_batch_send_retires_connection_and_small_batches_reuse() {
+    use ferrum_edge::plugins::ws_logging::WS_MAX_PERSISTENT_FRAME_BYTES;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let (server, mut batches) = spawn_counting_collector(listener, false);
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            // Only batch size triggers a flush, so each pair is one frame.
+            "batch_size": 2,
+            "flush_interval_ms": 600000,
+            "max_retries": 1,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16,
+            "max_entry_bytes": 1048576,
+            "buffer_max_bytes": 16777216
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // Two ~600 KiB records: one frame above the persistent-frame ceiling.
+    let mut large = test_ws_disconnect_context();
+    large.proxy_name = Some("p".repeat(600 * 1024));
+    plugin.on_ws_disconnect(&large).await;
+    plugin.on_ws_disconnect(&large).await;
+    let (first_connection, first_len) = next_batch(&mut batches, "large batch").await;
+    assert_eq!(first_connection, 1);
+    assert!(
+        first_len > WS_MAX_PERSISTENT_FRAME_BYTES,
+        "fixture must exceed the ceiling: {first_len}"
+    );
+
+    // The large send closed connection 1, so the next batch dials afresh, and
+    // a small batch keeps its connection for the one after it.
+    let small = test_ws_disconnect_context();
+    plugin.on_ws_disconnect(&small).await;
+    plugin.on_ws_disconnect(&small).await;
+    let (second_connection, second_len) = next_batch(&mut batches, "first small batch").await;
+    assert!(second_len < WS_MAX_PERSISTENT_FRAME_BYTES);
+    assert_eq!(
+        second_connection, 2,
+        "a connection that sent a frame above the ceiling must not be reused"
+    );
+
+    plugin.on_ws_disconnect(&small).await;
+    plugin.on_ws_disconnect(&small).await;
+    let (third_connection, _) = next_batch(&mut batches, "second small batch").await;
+    assert_eq!(
+        third_connection, 2,
+        "a connection that only sent small frames stays persistent"
+    );
+
+    drop(plugin);
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Per-candidate dial time slices
+// ---------------------------------------------------------------------------
+
+#[test]
+fn candidate_connect_slice_shares_remaining_budget_and_leaves_last_unsliced() {
+    use ferrum_edge::plugins::ws_logging::candidate_connect_slice;
+
+    let budget = Duration::from_millis(6000);
+    assert_eq!(candidate_connect_slice(budget, 0), None);
+    assert_eq!(candidate_connect_slice(budget, 1), None);
+    assert_eq!(
+        candidate_connect_slice(budget, 2),
+        Some(Duration::from_millis(3000))
+    );
+    assert_eq!(
+        candidate_connect_slice(budget, 3),
+        Some(Duration::from_millis(2000))
+    );
+    assert_eq!(
+        candidate_connect_slice(Duration::ZERO, 2),
+        Some(Duration::ZERO)
+    );
+}
+
+#[tokio::test]
+async fn ws_logging_unreachable_first_candidate_cannot_starve_a_live_second() {
+    use ferrum_edge::plugins::ws_logging::dial_screened_candidates;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accept = tokio::spawn(async move { listener.accept().await.map(|(stream, _)| stream) });
+
+    // TEST-NET-1 (RFC 5737) is never routed: a SYN to it is dropped (the
+    // blackhole case) or refused locally at once; either way the live
+    // loopback candidate must be reached inside the establishment budget.
+    let candidates = [
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    ];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    let stream = tokio::time::timeout(
+        Duration::from_secs(4),
+        dial_screened_candidates(&candidates, port, deadline, |_| Ok(())),
+    )
+    .await
+    .expect("dial must finish within the budget")
+    .expect("the live second candidate must be dialed");
+    assert_eq!(
+        stream.peer_addr().expect("peer").ip(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    );
+    let _ = await_within("loopback accept", accept).await;
+}
+
+#[tokio::test]
+async fn ws_logging_candidate_screen_refusal_fails_the_whole_dial() {
+    use ferrum_edge::plugins::ws_logging::dial_screened_candidates;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let candidates = [IpAddr::V4(Ipv4Addr::LOCALHOST)];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let error = dial_screened_candidates(&candidates, 9, deadline, |candidate| {
+        Err(format!("dial candidate {candidate} denied"))
+    })
+    .await
+    .err()
+    .expect("a screen refusal must fail the dial");
+    assert!(error.contains("denied"), "{error}");
 }

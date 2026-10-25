@@ -233,6 +233,43 @@ fn http_logging_endpoint_and_every_custom_header_value_are_projected() {
 }
 
 #[test]
+fn ws_logging_endpoint_and_every_custom_header_value_are_projected() {
+    let projected = project(
+        "ws_logging",
+        json!({
+            "endpoint_url": "wss://collector.example.com/ingest/ws-path-canary?stream=ws-query-canary",
+            "custom_headers": {
+                "Authorization": "Bearer ws-header-canary",
+                "X-Collector-Tenant": "ws-tenant-canary"
+            },
+            "batch_size": 50
+        }),
+    );
+    assert_eq!(
+        projected["endpoint_url"],
+        "wss://collector.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(projected["custom_headers"]["Authorization"], REDACTED);
+    assert_eq!(projected["custom_headers"]["X-Collector-Tenant"], REDACTED);
+    assert!(
+        projected["custom_headers"]
+            .as_object()
+            .expect("headers object")
+            .contains_key("X-Collector-Tenant")
+    );
+    assert_eq!(projected["batch_size"], 50);
+    assert_no_canaries(
+        &projected,
+        &[
+            "ws-path-canary",
+            "ws-query-canary",
+            "ws-header-canary",
+            "ws-tenant-canary",
+        ],
+    );
+}
+
+#[test]
 fn waf_header_present_secret_values_are_projected() {
     let projected = project(
         "waf",

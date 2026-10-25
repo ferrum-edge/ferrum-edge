@@ -426,3 +426,102 @@ fn blocked_writer_produces_bounded_shutdown_and_incomplete_drain_count() {
     wake.notify_all();
     wait_until(|| sink.snapshot().queued_records == 0);
 }
+
+/// Thread-safe in-memory `MakeWriter` for the filter tests below.
+#[derive(Clone, Default)]
+struct FilterCapture(Arc<Mutex<Vec<u8>>>);
+
+impl FilterCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+impl Write for FilterCapture {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FilterCapture {
+    type Writer = FilterCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Emit, under `directives` plus the gateway's credential-target override, a
+/// TRACE record on the tungstenite client-handshake target (which renders the
+/// complete upgrade request) and a TRACE record on a sibling tungstenite
+/// target, and return what reached the output.
+fn render_under_gateway_filter(directives: &str) -> String {
+    let writer = FilterCapture::default();
+    let filter = ferrum_edge::logging::suppress_credential_dumping_log_targets(
+        tracing_subscriber::EnvFilter::new(directives),
+    );
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .with_env_filter(filter)
+        .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::trace!(
+            target: "tungstenite::handshake::client",
+            "Request: GET /ingest?stream=handshake-path-canary HTTP/1.1 authorization: Bearer handshake-header-canary"
+        );
+        tracing::debug!(
+            target: "tungstenite::handshake::client",
+            "Client handshake done."
+        );
+        tracing::trace!(target: "tungstenite::protocol", "sibling-target-visible");
+    });
+    writer.contents()
+}
+
+#[test]
+fn credential_dumping_handshake_target_is_off_even_under_trace() {
+    for directives in [
+        "trace",
+        "tungstenite=trace",
+        // An operator directive naming the target explicitly is replaced too.
+        "warn,tungstenite::handshake::client=trace",
+    ] {
+        let output = render_under_gateway_filter(directives);
+        assert!(
+            !output.contains("handshake-path-canary"),
+            "{directives}: request target leaked: {output}"
+        );
+        assert!(
+            !output.contains("handshake-header-canary"),
+            "{directives}: handshake header leaked: {output}"
+        );
+        assert!(
+            !output.contains("Client handshake done."),
+            "{directives}: the whole target must be off: {output}"
+        );
+    }
+    // The override is target-scoped: other tungstenite TRACE still renders.
+    assert!(render_under_gateway_filter("trace").contains("sibling-target-visible"));
+    assert!(render_under_gateway_filter("tungstenite=trace").contains("sibling-target-visible"));
+}
+
+#[test]
+fn credential_dumping_override_never_raises_verbosity() {
+    // An `off` directive can only lower a level: under `warn`, nothing from
+    // either tungstenite target appears.
+    let output = render_under_gateway_filter("warn");
+    assert!(!output.contains("sibling-target-visible"), "{output}");
+    assert!(!output.contains("Client handshake done."), "{output}");
+    assert!(
+        ferrum_edge::logging::CREDENTIAL_DUMPING_LOG_TARGETS
+            .contains(&"tungstenite::handshake::client")
+    );
+}

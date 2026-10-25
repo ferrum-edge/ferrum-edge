@@ -8325,12 +8325,53 @@ async fn ws_logging_schema_matches_strict_runtime_config_contract() {
         json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "schema_ref": ""}),
         json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "batch_size": 0}),
         json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "flush_interval_ms": 99}),
+        json!({"endpoint_url": "ws://127.0.0.1:0/ingest"}),
+        json!({"endpoint_url": "ws://127.0.0.1:00/ingest"}),
+        json!({"endpoint_url": "ws://127.0.0.1:65536/ingest"}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest#fragment"}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "custom_headers": "x"}),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "custom_headers": {"X-Tenant": 7}
+        }),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "inbound_message_policy": "drop"
+        }),
     ];
     for config in runtime_and_schema_invalid {
         assert_component_validity(&spec, "WsLoggingConfig", &config, false);
         assert!(
             WsLogging::new(&config, PluginHttpClient::default()).is_err(),
             "runtime accepted OpenAPI-invalid ws_logging config: {config}"
+        );
+    }
+
+    let valid_new_fields = json!({
+        "endpoint_url": "ws://127.0.0.1:65535/ingest?stream=edge",
+        "custom_headers": {"X-Collector-Tenant": "acme", "Authorization": "Bearer literal"},
+        "inbound_message_policy": "ignore"
+    });
+    assert_component_validity(&spec, "WsLoggingConfig", &valid_new_fields, true);
+    assert!(WsLogging::new(&valid_new_fields, PluginHttpClient::default()).is_ok());
+
+    // Credential-shaped query names, handshake-owned header names, and
+    // plugin-secret reference shapes are runtime-only screens.
+    for runtime_only in [
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest?token=abc"}),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "custom_headers": {"Host": "other.example"}
+        }),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "custom_headers": {"Authorization": "${FERRUM_ADMIN_JWT_SECRET}"}
+        }),
+    ] {
+        assert_component_validity(&spec, "WsLoggingConfig", &runtime_only, true);
+        assert!(
+            WsLogging::new(&runtime_only, PluginHttpClient::default()).is_err(),
+            "runtime must refuse {runtime_only}"
         );
     }
 
