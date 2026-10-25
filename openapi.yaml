@@ -33105,7 +33105,12 @@ components:
         (`200` maps to INTERNAL / 13). `grpc-message` is derived from the
         canned body text, not returned as RPC DATA. gRPC-Web uses browser
         framing rather than the configured body. WebSocket support applies
-        to the handshake only.
+        to the handshake only. The plugin runs in `on_request_received` at
+        priority 125, before authentication, authorization, IP restriction,
+        rate limiting, and the WAF, so a termination (including a configured
+        2xx mock) is served without authenticating the caller or counting
+        against rate limits; use `response_mock` (a `before_proxy` plugin
+        that runs after authentication) for authenticated mocking.
       allOf:
         - if:
             required: [status_code]
@@ -33158,9 +33163,11 @@ components:
             - pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
             - pattern: '^[\t\u0020-\u007E]+$'
           description: >-
-            `Content-Type` header value for ordinary HTTP. Surrounding
-            whitespace is trimmed; the result must be nonempty and a valid
-            HTTP header value (visible ASCII plus HTAB). The default-body
+            `Content-Type` header value for ordinary HTTP. Every character
+            must be visible ASCII, space, or HTAB (runtime construction refuses
+            obs-text and control bytes exactly as this schema does);
+            surrounding spaces and tabs are trimmed and the result must be
+            nonempty. The default-body
             renderer classifies the media subtype exactly as `json`/`xml` or
             an RFC 6838 structured suffix (`+json`/`+xml`) after stripping
             parameters — not by arbitrary substring match (so
@@ -33194,6 +33201,43 @@ components:
             types emit `message` as plain text. JSON escaping of envelope string
             slots is applied automatically; XML-invalid control characters in
             `message` are rejected when XML rendering is selected.
+        headers:
+          type: object
+          maxProperties: 32
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              anyOf:
+                - pattern: '^(?:[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]|[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ii][Oo][Nn]-[Ii][Nn][Ff][Oo]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]|[Ss][Ee][Tt]-[Cc][Oo][Oo][Kk][Ii][Ee]2|[Ww][Ww][Ww]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Xx]-[Gg][Aa][Tt][Ee][Ww][Aa][Yy]-[Ee][Rr][Rr][Oo][Rr]|[Xx]-[Gg][Aa][Tt][Ee][Ww][Aa][Yy]-[Uu][Pp][Ss][Tt][Rr][Ee][Aa][Mm]-[Ss][Tt][Aa][Tt][Uu][Ss])$'
+                - pattern: '^(?:[Xx]-[Ff][Ee][Rr][Rr][Uu][Mm]-|[Gg][Rr][Pp][Cc]-)'
+          additionalProperties:
+            type: string
+            maxLength: 4096
+            pattern: '^(?:[\u0021-\u007E](?:[\t\u0020-\u007E]*[\u0021-\u007E])?)?$'
+          description: >-
+            Extra response headers for the canned response, for example
+            `Retry-After` on a 503 maintenance page or `Cache-Control:
+            no-store` so downstream caches do not keep serving it. At most 32
+            entries. Names must be HTTP field-name tokens and are
+            case-insensitive (two spellings of one name are rejected at
+            construction); they are emitted lowercase. Values are visible
+            ASCII with interior spaces/tabs, no leading or trailing whitespace,
+            at most 4096 bytes. Refused names: protocol-managed hop-by-hop and
+            framing fields (`Connection`, `Content-Length`, `Keep-Alive`,
+            `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
+            `Transfer-Encoding`, `Upgrade`); `Content-Type` (use
+            `content_type`); credential and challenge fields (`Set-Cookie`,
+            `Set-Cookie2`, `Authorization`, `Proxy-Authorization`,
+            `WWW-Authenticate`, `Authentication-Info`,
+            `Proxy-Authentication-Info`); and gateway-owned fields
+            (`X-Gateway-Error`, `X-Gateway-Upstream-Status`, and the
+            `X-Ferrum-*` and `grpc-*` families). The fail-closed `403` for a
+            2xx CONNECT/Extended CONNECT termination does not carry these
+            headers. Native gRPC still answers trailers-only with
+            `content-type: application/grpc`.
         trigger:
           type: object
           additionalProperties: false
@@ -33218,16 +33262,20 @@ components:
               type: string
               minLength: 1
               allOf:
-                - pattern: '^(\*|/[^?#\u0000-\u0020\u007F%\\]*)$'
+                - pattern: '^(\*|/[^?#\u0000-\u0020\u007F-\u009F%\\<>`]*)$'
                 - not:
                     pattern: '(^|/)\.\.?(?:/|$)'
               description: >-
                 Only terminate when the canonical request path starts with this
                 prefix. Must start with `/`, or be exactly `*` to match the
-                asterisk-form target of a server-wide `OPTIONS *` request, and
-                contain no control characters, query delimiter (`?`), fragment
-                delimiter (`#`), or literal space; any other value can never
-                match a parsed `Uri::path()`. The prefix must also already be a
+                asterisk-form target of a server-wide `OPTIONS *` request (which
+                only reaches the plugin on a route that matches that target, such
+                as a host-only or regex route; prefix listen paths never match
+                `*`), and contain no control characters (C0, DEL, or C1), query
+                delimiter (`?`), fragment delimiter (`#`), literal space, `<`,
+                `>`, or backtick; any other value can never match a parsed
+                `Uri::path()`. Literal `"`, `{`, `}`, `[`, `]`, `^`, `|`, and
+                UTF-8 are reachable and admitted. The prefix must also already be a
                 canonical policy path: request paths are canonicalized at the
                 frontend boundary (percent-escapes of characters that are legal
                 literally in a path are decoded, and every other escape —
@@ -33255,11 +33303,19 @@ components:
             header_value:
               type: string
               default: ""
+              allOf:
+                - pattern: '^[^\u0000-\u0008\u000A-\u001F\u007F]*$'
+                - not:
+                    pattern: '^[\t ]+$'
               description: >-
                 Optional exact value for `header`. Empty (default) matches
-                presence of any field line. A non-empty value matches when any
-                individual field line equals that value exactly — never against
-                a comma-folded multi-line serialization.
+                presence of any field line. A non-empty value must be a legal
+                HTTP field value (no control character other than HTAB) and
+                not only whitespace; surrounding spaces/tabs are trimmed. It
+                matches when any individual field line's RFC 9110 field value
+                (the line with surrounding spaces/tabs stripped, so HTTP/1.1,
+                HTTP/2, and HTTP/3 compare identically) equals it exactly —
+                never against a comma-folded multi-line serialization.
 
     ResponseMockConfig:
       type: object
