@@ -31812,7 +31812,7 @@ components:
     FaultInjectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; TCP/UDP/DTLS session admission faults run on stream connect; UDP/DTLS also apply per-datagram faults on on_udp_datagram (client→backend) in isolated session workers without blocking the shared recv loop."
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; TCP/UDP/DTLS session admission faults run on stream connect; UDP/DTLS also apply per-datagram faults on on_udp_datagram (client→backend) in isolated session workers without blocking the shared recv loop. Each fault side is decided once per first contact: a session's first client→backend datagram (the plain-UDP opening packet, or the first DTLS application datagram after an admitted handshake) has its abort decided only by stream connect and its delay only by the datagram hook. Optional `match.headers` targets HTTP-family requests and `expires_at` ends the experiment."
       properties:
         abort:
           type: [object, "null"]
@@ -31881,6 +31881,44 @@ components:
             `ferrum.fault_injection.<scope>.abort_percent` and `.delay_percent`
             atomically with this plugin config. Missing or malformed keys fall
             back independently to the static percentage.
+        match:
+          type: [object, "null"]
+          additionalProperties: false
+          description: >-
+            Optional blast-radius targeting; null is equivalent to omission.
+            An HTTP-family request is faulted only when every configured header
+            is present on the client-sent request with a field line exactly
+            equal to the configured value; unmatched requests are never faulted
+            and consume no roll. Raw TCP connections and UDP/DTLS datagrams
+            carry no request headers, so an instance with `match` never faults
+            stream or datagram traffic.
+          properties:
+            headers:
+              type: object
+              minProperties: 1
+              maxProperties: 16
+              description: >-
+                Header name to exact expected value. Names are valid HTTP
+                header names, matched case-insensitively and unique ignoring
+                case; gateway-asserted names (`x-consumer-*`, the private GeoIP
+                header, path-param headers) are rejected. Values are valid HTTP
+                header values compared byte-for-byte (case-sensitive) against
+                each field line. Values are redacted in non-admin projections.
+              propertyNames:
+                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+              additionalProperties:
+                type: string
+          required: [headers]
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            Optional RFC 3339 timestamp (offset required) ending the
+            experiment; null is equivalent to omission. From this wall-clock
+            instant every hook of the instance is a no-op. A timestamp already
+            in the past is accepted and leaves the instance inert, so a stored
+            config that outlives its experiment never blocks a restart or
+            reload.
       anyOf:
         - required: [abort]
           properties:

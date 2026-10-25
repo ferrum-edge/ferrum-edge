@@ -11796,6 +11796,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::DecryptedApp,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::dtls_reply_commit_after_backend_hooks(
             plugins, &ctx, plan, &trust.0,
@@ -12066,6 +12067,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::udp_reply_commit_after_backend_hooks(plugins, &ctx, plan)
             .await

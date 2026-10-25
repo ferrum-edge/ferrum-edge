@@ -6944,6 +6944,51 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
 }
 
 #[test]
+fn fault_injection_schema_matches_blast_radius_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let abort = json!({"status_code": 503, "percentage": 1.0});
+
+    for (extra, expected_valid) in [
+        (json!({"match": {"headers": {"x-chaos-test": "1"}}}), true),
+        (json!({"match": {"headers": {"X-Chaos-Test": "1"}}}), true),
+        (json!({"match": null, "expires_at": null}), true),
+        (json!({"expires_at": "2026-11-01T12:30:00Z"}), true),
+        (json!({"match": {}}), false),
+        (json!({"match": {"headers": {}}}), false),
+        (json!({"match": {"headers": {"x-chaos-test": 1}}}), false),
+        (json!({"match": {"headers": {"bad header": "1"}}}), false),
+        (
+            json!({"match": {"headers": {"x-chaos-test": "1"}, "methods": ["GET"]}}),
+            false,
+        ),
+        (json!({"match": "x-chaos-test"}), false),
+        (json!({"expires_at": 1_798_000_000}), false),
+    ] {
+        let mut instance = extra.clone();
+        instance["abort"] = abort.clone();
+        assert_component_validity(&spec, "FaultInjectionConfig", &instance, expected_valid);
+        assert_eq!(
+            ferrum_edge::plugins::fault_injection::FaultInjectionPlugin::new(&instance).is_ok(),
+            expected_valid,
+            "runtime admission must agree with the published schema for {instance}"
+        );
+    }
+
+    let too_many: serde_json::Map<String, serde_json::Value> = (0..=16)
+        .map(|i| (format!("x-chaos-{i}"), json!("1")))
+        .collect();
+    let instance = json!({"abort": abort, "match": {"headers": too_many}});
+    assert_component_validity(&spec, "FaultInjectionConfig", &instance, false);
+    assert_eq!(
+        spec.pointer(
+            "/components/schemas/FaultInjectionConfig/properties/match/properties/headers/maxProperties"
+        ),
+        Some(&json!(ferrum_edge::plugins::fault_injection::MAX_MATCH_HEADERS))
+    );
+}
+
+#[test]
 fn request_transformer_schema_matches_runtime_target_and_value_contract() {
     use ferrum_edge::plugins::request_transformer::RequestTransformer;
 
