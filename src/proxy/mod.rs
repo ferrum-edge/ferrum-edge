@@ -18395,6 +18395,48 @@ fn request_integrity_retirement_applies(
         && request_body_rules_may_rewrite(&ctx.method, headers)
 }
 
+/// The initial dispatch-boundary gateway-assertion refresh shared by the H1/H2
+/// ladder and the native HTTP/3 frontend.
+///
+/// Strip plugin-controlled gateway assertions and inject only the
+/// authenticated principal and the private GeoIP result. The common
+/// no-assertion request returns after one scan of the header names.
+///
+/// When no plugin has materialized an owned outbound map, `ctx.headers` IS the
+/// outbound map (every later stage — the hop-limit and `Max-Forwards`
+/// re-assertions, the deferred `before_proxy` passes — writes it in place), so
+/// a request that carries no principal is refreshed in place through
+/// `mem::take` instead of cloning every header name and value. A GeoIP-only
+/// request is exactly that case: `geo_restriction` already wrote the verified
+/// country into `ctx.headers`, so copying the whole map to re-assert two bytes
+/// was pure waste. A request with a resolved principal keeps the owned copy
+/// it always had, leaving `ctx.headers` without the injected identity.
+pub(crate) fn refresh_initial_backend_gateway_assertion_headers(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    let has_principal =
+        ctx.backend_consumer_username().is_some() || ctx.backend_authenticated_identity().is_some();
+    let source_has_reserved_assertion = owned_proxy_headers
+        .as_ref()
+        .unwrap_or(&ctx.headers)
+        .keys()
+        .any(|name| headers_mod::is_gateway_assertion_header(name));
+    if !has_principal && ctx.backend_geo_country().is_none() && !source_has_reserved_assertion {
+        return;
+    }
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        refresh_backend_gateway_assertion_headers(ctx, headers);
+    } else if has_principal {
+        let headers = owned_proxy_headers.insert(ctx.headers.clone());
+        refresh_backend_gateway_assertion_headers(ctx, headers);
+    } else {
+        let mut headers = std::mem::take(&mut ctx.headers);
+        refresh_backend_gateway_assertion_headers(ctx, &mut headers);
+        ctx.headers = headers;
+    }
+}
+
 fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
@@ -37446,19 +37488,10 @@ async fn handle_proxy_request_inner(
 
     // Strip plugin-controlled gateway assertions and inject only the
     // authenticated principal and private GeoIP result. The common
-    // no-assertion path avoids materializing an owned header map.
-    let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
-    let source_has_reserved_assertion = effective_headers
-        .keys()
-        .any(|name| headers_mod::is_gateway_assertion_header(name));
-    if ctx.backend_consumer_username().is_some()
-        || ctx.backend_authenticated_identity().is_some()
-        || ctx.backend_geo_country().is_some()
-        || source_has_reserved_assertion
-    {
-        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        refresh_backend_gateway_assertion_headers(&ctx, headers);
-    }
+    // no-assertion path avoids materializing an owned header map, and a
+    // GeoIP-only request refreshes `ctx.headers` in place. The native HTTP/3
+    // frontend makes the same call at the same point — keep both in sync.
+    refresh_initial_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
     // Stale request digests: decided over the final outbound headers, after
     // every `before_proxy` hook and the route-header finalizer. The native
     // HTTP/3 frontend does the same at the same point — keep both in sync.
@@ -39873,6 +39906,7 @@ async fn handle_proxy_request_inner(
                             // the fully-streamed upload gets the gateway-owned pump
                             // instead of a bounded collect.
                             grpc_buffered_upload_auth_deadline.as_ref(),
+                            ctx.request_trailer_credential_header_names(),
                         )
                     });
                     tokio::pin!(attempt);
@@ -53236,7 +53270,10 @@ async fn proxy_to_backend_direct_h1(
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     )
-                    .with_h2_end_stream_required(require_end_stream);
+                    .with_h2_end_stream_required(require_end_stream)
+                    .with_trailer_credential_header_names(
+                        request_ctx.request_trailer_credential_header_names(),
+                    );
                     let (limited, pump) = install_streaming_upload_authorization(
                         limited,
                         upload_auth_deadline.as_ref(),
@@ -53252,7 +53289,10 @@ async fn proxy_to_backend_direct_h1(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     )
-                    .with_h2_end_stream_required(require_end_stream);
+                    .with_h2_end_stream_required(require_end_stream)
+                    .with_trailer_credential_header_names(
+                        request_ctx.request_trailer_credential_header_names(),
+                    );
                     let (counting, pump) = install_counting_upload_authorization(
                         counting,
                         upload_auth_deadline.as_ref(),
@@ -55128,6 +55168,20 @@ pub fn check_host_authority_consistency(
 ///    the only permitted value is "trailers"; any other value (or an empty list element
 ///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
 ///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
+///
+/// 6. **One `Authorization` credential** (all HTTP versions, WebSocket upgrades and
+///    Extended CONNECT included): RFC 9110 §11.6.2 defines `Authorization` as a single
+///    `credentials` production, not a list, so repeated field lines are malformed.
+///    Ferrum folds repeated lines into one comma-joined value before authentication,
+///    and credential hiding (`basic_auth` / `ldap_auth` `hide_credentials`) reasons
+///    about the folded value's FIRST scheme only, so `Authorization: Bearer x` followed
+///    by `Authorization: Basic <password>` would forward the Basic password to the
+///    backend whenever another mechanism authenticated the request. Rejecting the
+///    ambiguous shape here — before any authentication short-circuit — closes that for
+///    every protocol at once. A single field line whose value carries a second
+///    credential after a top-level comma (`Bearer x, Basic <password>`) is the same
+///    ambiguity and is rejected too; the scan is quote-aware, so `auth-param` lists
+///    such as `Digest username="a, b", realm="r"` are unaffected.
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
@@ -55299,7 +55353,104 @@ fn check_protocol_headers_with_wire_framing(
         }
     }
 
+    // 6. Exactly one Authorization credential (all HTTP versions).
+    check_single_authorization_credential(headers)
+}
+
+/// Check 6 of [`check_protocol_headers`]: the request carries at most one
+/// `Authorization` field line, and that line carries one credential.
+///
+/// Allocation-free: one `get_all` walk plus, only when the value holds a comma,
+/// one bounded byte scan of it.
+fn check_single_authorization_credential(headers: &hyper::HeaderMap) -> Option<&'static str> {
+    let mut values = headers.get_all(hyper::header::AUTHORIZATION).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return Some(r#"{"error":"Request contains multiple Authorization headers"}"#);
+    }
+    if authorization_value_has_additional_credential(first.as_bytes()) {
+        return Some(r#"{"error":"Authorization header contains more than one credential"}"#);
+    }
     None
+}
+
+/// Whether an `Authorization` value carries a second `credentials` production
+/// after a top-level comma (RFC 9110 §11.6.2 / §11.4).
+///
+/// A comma inside a quoted string never separates anything. After a top-level
+/// comma, an `auth-param` (`token BWS "=" ...`) continues the same credential,
+/// while a bare token followed by anything other than `=` begins a new
+/// `auth-scheme`. Empty list elements are ignored.
+fn authorization_value_has_additional_credential(value: &[u8]) -> bool {
+    if !value.contains(&b',') {
+        return false;
+    }
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, &byte) in value.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+        } else if byte == b','
+            && authorization_list_element_starts_credential(value.get(index + 1..).unwrap_or(&[]))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the list element that follows a top-level comma in an
+/// `Authorization` value begins a new `credentials` production rather than an
+/// `auth-param`.
+fn authorization_list_element_starts_credential(rest: &[u8]) -> bool {
+    let rest = trim_leading_ows(rest);
+    let token_len = rest
+        .iter()
+        .take_while(|&&byte| is_authorization_tchar(byte))
+        .count();
+    if token_len == 0 {
+        return false;
+    }
+    let after_token = trim_leading_ows(rest.get(token_len..).unwrap_or(&[]));
+    after_token.first() != Some(&b'=')
+}
+
+fn trim_leading_ows(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|&byte| byte != b' ' && byte != b'\t')
+        .unwrap_or(bytes.len());
+    bytes.get(start..).unwrap_or(&[])
+}
+
+/// RFC 9110 §5.6.2 `tchar`.
+fn is_authorization_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// `401` for a request on a connection whose client-certificate trust was
@@ -59443,7 +59594,10 @@ async fn proxy_to_backend_hbone_after_ready(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             )
-            .with_h2_end_stream_required(require_end_stream);
+            .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            );
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
@@ -60578,7 +60732,10 @@ async fn proxy_to_backend_unix(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             )
-            .with_h2_end_stream_required(require_end_stream);
+            .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            );
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
@@ -62265,7 +62422,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     Arc::clone(&body_size_exceeded),
                     Arc::clone(ctx_bytes_sent_observed),
                 )
-                .with_h2_end_stream_required(require_end_stream);
+                .with_h2_end_stream_required(require_end_stream)
+                .with_trailer_credential_header_names(
+                    request_ctx.request_trailer_credential_header_names(),
+                );
                 // Full upload lifecycle for the UPLOAD direction (#3815). With an
                 // authorization lifetime: the adapter deadline plus a
                 // gateway-owned pump, so the bound still fires while this pooled
@@ -63320,7 +63480,10 @@ async fn proxy_to_backend_http2(
                 completion_tx,
                 cancel_rx,
             )
-            .with_h2_end_stream_required(require_end_stream);
+            .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            );
             if let Some(tap) = observe_grpc {
                 body = body.with_grpc_message_tap(tap);
             }
@@ -63353,6 +63516,9 @@ async fn proxy_to_backend_http2(
             )
             .with_cancel(cancel_rx)
             .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            )
             .with_grpc_message_tap(tap);
             // No auth plan on this arm, but a live `backend_write_timeout_ms`
             // still needs its watermark (issue #4055): the adapter exists
@@ -63402,6 +63568,8 @@ async fn proxy_to_backend_http2(
                     published: false,
                     latch,
                     require_end_stream,
+                    trailer_credential_header_names: ctx
+                        .and_then(|ctx| ctx.request_trailer_credential_header_names()),
                 },
                 None,
                 None,

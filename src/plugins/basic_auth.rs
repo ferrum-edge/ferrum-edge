@@ -14,7 +14,11 @@
 //! losing Basic credential would otherwise still ride along. Only the `Basic`
 //! scheme is removed; a `Bearer` or other scheme another policy needs is left
 //! untouched. `hide_credentials: false` is the explicit legacy opt-out and
-//! mirrors `key_auth`'s convention.
+//! mirrors `key_auth`'s convention. A request presenting more than one
+//! `Authorization` credential (repeated field lines, or a second credential
+//! after a top-level comma) never reaches this plugin: the ingress protocol
+//! guard rejects it with `400`, so the field this plugin hides is always the
+//! request's only credential.
 
 use crate::fips::approved::HmacSha256;
 use async_trait::async_trait;
@@ -298,6 +302,14 @@ impl AuthMechanism for BasicAuth {
 /// [`BasicAuth::extract`] parses, so it is exactly the one this plugin is
 /// responsible for keeping off the backend. Any other scheme belongs to another
 /// policy and is left in place.
+///
+/// Inspecting only the first token is sound because the ingress protocol guard
+/// (`crate::proxy::check_protocol_headers`, check 6) rejects every request
+/// whose `Authorization` arrives as more than one field line, or whose single
+/// value carries a second credential after a top-level comma, on HTTP/1.1,
+/// HTTP/2, HTTP/3 and WebSocket alike. Without it, `Bearer x` followed by a
+/// second `Basic <password>` line folds to `Bearer x, Basic <password>`, which
+/// this predicate would leave in place for the backend.
 fn authorization_value_is_basic(value: &str) -> bool {
     value
         .split(|c: char| c.is_ascii_whitespace())

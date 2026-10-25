@@ -1581,3 +1581,118 @@ fn h1_parse_envelope_bytes_match_check_protocol_headers_messages() {
             .contains("x-gateway-error")
     );
 }
+
+// ============================================================================
+// One Authorization credential per request (basic_auth hide_credentials)
+// ============================================================================
+//
+// `Authorization` is a single `credentials` production (RFC 9110 §11.6.2).
+// Ferrum folds repeated field lines into one `", "`-joined value before
+// authentication, and `basic_auth` / `ldap_auth` hide only a value whose FIRST
+// scheme is `Basic`, so `Bearer x` + `Basic <password>` used to forward the
+// password whenever another mechanism authenticated the request. The guard
+// refuses every such shape before routing, on every HTTP version.
+
+const ALICE_BASIC: &str = "Basic YWxpY2U6c2VjcmV0";
+const MULTIPLE_AUTHORIZATION: &str =
+    r#"{"error":"Request contains multiple Authorization headers"}"#;
+const FOLDED_AUTHORIZATION: &str =
+    r#"{"error":"Authorization header contains more than one credential"}"#;
+
+fn headers_with_authorization(values: &[&str]) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("example.com"));
+    for value in values {
+        headers.append(
+            hyper::header::AUTHORIZATION,
+            HeaderValue::from_str(value).expect("authorization value"),
+        );
+    }
+    headers
+}
+
+const ALL_VERSIONS: [hyper::Version; 4] = [
+    hyper::Version::HTTP_10,
+    hyper::Version::HTTP_11,
+    hyper::Version::HTTP_2,
+    hyper::Version::HTTP_3,
+];
+
+#[test]
+fn repeated_authorization_field_lines_are_refused_on_every_version() {
+    for version in ALL_VERSIONS {
+        for values in [
+            ["Bearer unused", ALICE_BASIC],
+            [ALICE_BASIC, "Bearer unused"],
+            [ALICE_BASIC, ALICE_BASIC],
+            ["Bearer a", "Bearer b"],
+        ] {
+            let headers = headers_with_authorization(&values);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(MULTIPLE_AUTHORIZATION),
+                "{version:?} {values:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn folded_second_credential_in_one_authorization_line_is_refused() {
+    for version in ALL_VERSIONS {
+        for value in [
+            "Bearer unused, Basic YWxpY2U6c2VjcmV0",
+            "Bearer unused,Basic YWxpY2U6c2VjcmV0",
+            "Bearer unused ,  basic YWxpY2U6c2VjcmV0",
+            "Basic YWxpY2U6c2VjcmV0, Bearer unused",
+            // A credential whose auth-param list is followed by another scheme.
+            r#"Digest username="a", realm="r", Basic YWxpY2U6c2VjcmV0"#,
+            // A bare trailing scheme token is a new credential too.
+            "Bearer unused, Basic",
+        ] {
+            let headers = headers_with_authorization(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                Some(FOLDED_AUTHORIZATION),
+                "{version:?} {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_authorization_credentials_are_still_accepted() {
+    for version in ALL_VERSIONS {
+        for value in [
+            ALICE_BASIC,
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJib2IifQ.c2lnbmF0dXJl",
+            // auth-param lists: every comma-separated element is `name=value`.
+            r#"Digest username="bob", realm="r", nonce="n", uri="/", response="x""#,
+            "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=abcdef",
+            // BWS around `=` is still an auth-param (RFC 9110 §11.2).
+            "Custom a = 1, b =2",
+            // A comma inside a quoted string separates nothing.
+            r#"Digest username="a, Basic YWxpY2U6c2VjcmV0", realm="r""#,
+            r#"Digest username="esc \" , Basic x", realm="r""#,
+            // Empty list elements are not credentials.
+            "Custom a=1, , b=2",
+            "Bearer unused,",
+        ] {
+            let headers = headers_with_authorization(&[value]);
+            assert_eq!(
+                check_protocol(&headers, version),
+                None,
+                "{version:?} {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_request_without_authorization_is_unaffected() {
+    for version in ALL_VERSIONS {
+        let headers = headers_with_authorization(&[]);
+        assert_eq!(check_protocol(&headers, version), None, "{version:?}");
+    }
+}

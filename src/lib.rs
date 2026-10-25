@@ -1368,6 +1368,18 @@ pub mod _test_support {
         ctx.clone_for_final_request_body_hooks()
     }
 
+    /// Run the initial dispatch-boundary gateway-assertion refresh the H1/H2
+    /// ladder and the native HTTP/3 frontend share
+    /// (`crate::proxy::refresh_initial_backend_gateway_assertion_headers`),
+    /// so ownership tests can observe whether it materialized an owned copy
+    /// of the request header map.
+    pub fn refresh_initial_backend_gateway_assertion_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<std::collections::HashMap<String, String>>,
+    ) {
+        crate::proxy::refresh_initial_backend_gateway_assertion_headers(ctx, owned_proxy_headers);
+    }
+
     /// Install the route's precomputed credential-header registry so external
     /// replay-partition tests can exercise stripped custom auth locations.
     pub fn set_replay_credential_headers_for_test(
@@ -14770,6 +14782,7 @@ pub mod _test_support {
             upload_observer: None,
             grpc_messages: None,
             grpc_scanner: None,
+            trailer_credential_header_names: None,
         });
         let first = std::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx)).await;
         drop(join);
@@ -16217,6 +16230,29 @@ pub mod _test_support {
         }
     }
 
+    /// The trailer block the backend would observe after the native HTTP/3
+    /// relays' late boundary: the static filter
+    /// (`sanitize_backend_request_trailers`) followed by the route's configured
+    /// credential header locations
+    /// (`strip_configured_credential_request_trailers`), exactly the two calls
+    /// the H3 client relay, the H3 gRPC upload pump, and the H3-to-H2 bridge
+    /// make.
+    ///
+    /// Sorted by `(name, value)`.
+    pub fn sanitized_backend_request_trailers_for_route(
+        trailers: &[(&str, &str)],
+        credential_header_names: &[&str],
+    ) -> Vec<(String, String)> {
+        let names: Vec<String> = credential_header_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let mut map = request_trailer_probe_map(trailers);
+        crate::proxy::headers::sanitize_backend_request_trailers(&mut map);
+        crate::proxy::headers::strip_configured_credential_request_trailers(&mut map, &names);
+        sorted_trailer_entries(&map)
+    }
+
     /// A DATA frame must cross the late request-trailer boundary byte-for-byte:
     /// the sanitizer is a trailer-only filter, never a body rewriter.
     pub fn sanitize_backend_request_trailer_frame_preserves_data(payload: &'static [u8]) -> bool {
@@ -16267,6 +16303,50 @@ pub mod _test_support {
         }
         // Dropping the join disarms cancellation (a dropped sender is not a
         // cancellation), so the pump is never torn down mid-relay.
+        drop(join);
+        forwarded_trailers.sort();
+        (forwarded_data, forwarded_trailers)
+    }
+
+    /// [`h1_h2_upload_source_forwarded_frames`] with a route's configured
+    /// credential header locations, driven through
+    /// `UploadSource::poll_frame_with_trailer_credentials` — the seam
+    /// `SizeLimitedIncoming`, `CountingIncoming`, and `GrpcBody::Streaming`
+    /// poll with the list `RequestContext::request_trailer_credential_header_names`
+    /// hands them.
+    pub async fn h1_h2_upload_source_forwarded_frames_for_route(
+        payload: &'static [u8],
+        trailers: &[(&str, &str)],
+        credential_header_names: &[&str],
+    ) -> (Vec<u8>, Vec<(String, String)>) {
+        let names: Vec<String> = credential_header_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let body = RequestTrailerProbeBody {
+            data: Some(bytes::Bytes::from_static(payload)),
+            trailers: Some(request_trailer_probe_map(trailers)),
+        };
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, None, 0, false);
+        let mut source = crate::proxy::body::UploadSource::Pumped(source);
+        let mut forwarded_data = Vec::new();
+        let mut forwarded_trailers = Vec::new();
+        loop {
+            let next =
+                std::future::poll_fn(|cx| source.poll_frame_with_trailer_credentials(cx, &names))
+                    .await;
+            match next {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => forwarded_data.extend_from_slice(data.as_ref()),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(map) => forwarded_trailers.extend(sorted_trailer_entries(&map)),
+                        Err(_) => panic!("unexpected non-data non-trailer frame"),
+                    },
+                },
+                Some(Err(e)) => panic!("probe upload failed: {e}"),
+                None => break,
+            }
+        }
         drop(join);
         forwarded_trailers.sort();
         (forwarded_data, forwarded_trailers)

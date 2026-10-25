@@ -14,6 +14,13 @@
 //! - native gRPC (h2c frontend to an h2c gRPC backend).
 //! - HTTP/3 gRPC through the H3-to-HTTP/2 gRPC bridge.
 //!
+//! The same request-header ingress boundary also owns `Authorization`: a
+//! request carrying more than one credential (repeated field lines, or a second
+//! credential folded after a comma) is refused with `400` on HTTP/1.1,
+//! HTTP/2, HTTP/3, and a WebSocket upgrade before any auth plugin runs, so a
+//! `key_auth`-authenticated request cannot smuggle a `Basic` password past
+//! `basic_auth`'s `hide_credentials`.
+//!
 //! Run with:
 //!
 //! ```bash
@@ -450,6 +457,245 @@ async fn spawn_h3_grpc_gateway(backend_port: u16) -> (GatewayHarness, u16) {
         }
     }
     panic!("failed to spawn H3 gRPC gateway after retries: {last_err}");
+}
+
+// ---------------------------------------------------------------------------
+// One Authorization credential per request (basic_auth hide_credentials)
+// ---------------------------------------------------------------------------
+
+/// Base64 of `alice:secret`: the reusable Basic password that must never reach
+/// a backend asserting a different principal.
+const ALICE_BASIC: &str = "YWxpY2U6c2VjcmV0";
+const BASIC_AUTH_TEST_SECRET: &str = "functional-basic-auth-hmac-secret-0123456789";
+
+/// `key_auth` and `basic_auth` (default `hide_credentials: true`) in a
+/// first-success multi-auth chain on one proxy. Bob authenticates by API key;
+/// no Basic consumer is needed, because the refusal must happen before any
+/// mechanism runs.
+fn key_and_basic_auth_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "authz-ingress",
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "pool_enable_http2": false,
+            "auth_mode": "multi",
+            "plugins": [
+                {"plugin_config_id": "authz-ingress-key-auth"},
+                {"plugin_config_id": "authz-ingress-basic-auth"}
+            ]
+        }],
+        "consumers": [{
+            "id": "authz-ingress-bob",
+            "username": CONSUMER_USERNAME,
+            "custom_id": CONSUMER_CUSTOM_ID,
+            "credentials": {"keyauth": [{"key": API_KEY}]}
+        }],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "authz-ingress-key-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "authz-ingress",
+                "enabled": true,
+                "config": {}
+            },
+            {
+                "id": "authz-ingress-basic-auth",
+                "plugin_name": "basic_auth",
+                "scope": "proxy",
+                "proxy_id": "authz-ingress",
+                "enabled": true,
+                "config": {}
+            }
+        ]
+    });
+    serde_yaml::to_string(&config).expect("serialize authorization ingress config")
+}
+
+/// Send one raw HTTP/1.1 request head and return the response status code.
+async fn raw_http1_status(port: u16, head: &str) -> u16 {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect raw http1");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write raw http1 request");
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 2048];
+    let read = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(read.is_ok(), "raw HTTP/1.1 response timed out");
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no HTTP/1.1 status line in {text:?}"))
+}
+
+#[ignore]
+#[tokio::test]
+async fn multiple_authorization_credentials_are_refused_before_auth_on_h1_h2_h3_and_websocket() {
+    let backend = CapturingBackend::spawn().await;
+    let mut gateway = TestGateway::builder()
+        .mode_file(key_and_basic_auth_config(backend.port))
+        .log_level("warn")
+        .env("FERRUM_BASIC_AUTH_HMAC_SECRET", BASIC_AUTH_TEST_SECRET)
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start authorization ingress gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+    let port = gateway.proxy_port;
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
+
+    // Control: ONE foreign-scheme credential beside the winning API key is
+    // forwarded unchanged — basic_auth only removes its own `Basic` scheme.
+    let control = format!(
+        "GET /authz/control HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {API_KEY}\r\n\
+         Authorization: Bearer unused\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(raw_http1_status(port, &control).await, 200);
+    let head = backend
+        .wait_for_target_prefix("/authz/control", Duration::from_secs(5))
+        .await
+        .expect("control request reaches the backend");
+    assert!(
+        head_field_lines(&head)
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                && value == "Bearer unused"),
+        "a lone foreign-scheme Authorization must still reach the backend:\n{head}"
+    );
+
+    // HTTP/1.1: a second Authorization field line carrying Basic.
+    let h1_repeated = format!(
+        "GET /authz/h1-repeated HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {API_KEY}\r\n\
+         Authorization: Bearer unused\r\nAuthorization: Basic {ALICE_BASIC}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    assert_eq!(raw_http1_status(port, &h1_repeated).await, 400);
+    // Reversed order: the Basic line first is refused just the same.
+    let h1_reversed = format!(
+        "GET /authz/h1-reversed HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {API_KEY}\r\n\
+         authorization: Basic {ALICE_BASIC}\r\nAUTHORIZATION: Bearer unused\r\n\
+         Connection: close\r\n\r\n"
+    );
+    assert_eq!(raw_http1_status(port, &h1_reversed).await, 400);
+    // One field line that folds a second credential after a comma.
+    let h1_folded = format!(
+        "GET /authz/h1-folded HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {API_KEY}\r\n\
+         Authorization: Bearer unused, Basic {ALICE_BASIC}\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(raw_http1_status(port, &h1_folded).await, 400);
+
+    // HTTP/1.1 WebSocket upgrade: refused before the 101, so no backend
+    // handshake ever carries the Basic line.
+    let websocket = format!(
+        "GET /authz/ws-repeated HTTP/1.1\r\nHost: 127.0.0.1\r\nx-api-key: {API_KEY}\r\n\
+         Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Authorization: Bearer unused\r\nAuthorization: Basic {ALICE_BASIC}\r\n\r\n"
+    );
+    assert_eq!(raw_http1_status(port, &websocket).await, 400);
+
+    // HTTP/2 (h2c prior knowledge): repeated field lines.
+    let stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect h2c");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = Request::builder()
+        .uri(format!("http://127.0.0.1:{port}/authz/h2-repeated"))
+        .header("x-api-key", API_KEY)
+        .header("authorization", "Bearer unused")
+        .header("authorization", format!("Basic {ALICE_BASIC}"))
+        .body(Empty::<Bytes>::new())
+        .expect("h2 request");
+    let response = sender.send_request(request).await.expect("send h2 request");
+    let h2_status = response.status();
+    let _ = response.into_body().collect().await;
+    drop(sender);
+    conn_task.abort();
+    assert_eq!(h2_status, StatusCode::BAD_REQUEST, "HTTP/2 must refuse");
+
+    // HTTP/3: repeated field lines.
+    let h3 = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://localhost:{https_port}/authz/h3-repeated");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let h3_status = loop {
+        let options = GetOptions::default()
+            .method(Method::GET)
+            .header("x-api-key", API_KEY)
+            .header("authorization", "Bearer unused")
+            .header("authorization", format!("Basic {ALICE_BASIC}"));
+        match h3.get_with_options(&url, options).await {
+            Ok(response) => break response.status,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("H3 request did not complete: {error}"),
+        }
+    };
+    assert_eq!(h3_status, StatusCode::BAD_REQUEST, "HTTP/3 must refuse");
+
+    for path in [
+        "/authz/h1-repeated",
+        "/authz/h1-reversed",
+        "/authz/h1-folded",
+        "/authz/ws-repeated",
+        "/authz/h2-repeated",
+        "/authz/h3-repeated",
+    ] {
+        assert!(
+            backend.head_for_target_prefix(path).is_none(),
+            "{path}: a request with more than one Authorization credential reached the backend"
+        );
+    }
+    assert!(
+        backend
+            .heads
+            .lock()
+            .expect("heads lock")
+            .iter()
+            .all(|head| !head.contains(ALICE_BASIC)),
+        "the Basic password must never reach a backend"
+    );
+
+    gateway.shutdown();
 }
 
 // ---------------------------------------------------------------------------

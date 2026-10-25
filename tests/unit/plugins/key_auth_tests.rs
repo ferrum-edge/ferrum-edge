@@ -840,3 +840,150 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+// ── `;` sub-parameter credential aliases (query locations) ─────────────────
+
+const AMBIGUOUS_QUERY_BODY: &str = r#"{"error":"Ambiguous API key query parameter"}"#;
+
+/// A request context whose query is parsed exactly as the H1/H2 and H3
+/// frontends parse it: the raw wire query retained, then split on `&` only.
+fn context_with_raw_query(raw_query: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/resource".to_string(),
+    );
+    ctx.set_raw_query_string(raw_query.to_string());
+    ctx.materialize_query_params();
+    ctx
+}
+
+/// The reviewed scenario: another mechanism (here simulated by never calling
+/// `authenticate`) wins a multi-auth chain while the custom query credential
+/// rides only behind a `;`. Discovery runs for every auth instance before the
+/// chain short-circuits, and `before_proxy` runs for every plugin, so the
+/// alias must be marked for policy redaction AND stripped from the forwarded
+/// query.
+#[tokio::test]
+async fn test_key_auth_hides_a_semicolon_alias_when_another_mechanism_wins() {
+    let plugin = KeyAuth::new(&json!({"key_location": "query:tenant_ticket"})).unwrap();
+    let mut ctx = context_with_raw_query("carrier=;tenant_ticket=launch-key-0123456789&keep=1");
+    assert!(
+        !ctx.query_params.contains_key("tenant_ticket"),
+        "Ferrum's `&`-only parser does not see the alias as the configured name"
+    );
+
+    plugin.mark_query_credentials_for_redaction(&mut ctx);
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.tenant_ticket")
+            .map(String::as_str),
+        Some("true"),
+        "the alias must be marked so delegated-policy payloads redact it"
+    );
+    let mut backend_headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut backend_headers).await);
+
+    let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert_eq!(forwarded, "keep=1");
+    assert!(!forwarded.contains("launch-key-0123456789"));
+}
+
+#[tokio::test]
+async fn test_key_auth_semicolon_alias_respects_explicit_preservation() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": "query:tenant_ticket",
+        "hide_credentials": false
+    }))
+    .unwrap();
+    let mut ctx = context_with_raw_query("carrier=;tenant_ticket=launch-key-0123456789&keep=1");
+    plugin.mark_query_credentials_for_redaction(&mut ctx);
+    // Policy redaction still applies; forwarding is the operator's opt-out.
+    assert_eq!(
+        ctx.metadata
+            .get("auth.query_credential_param.tenant_ticket")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("auth.strip_query_param.tenant_ticket")
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_refuses_an_ambiguous_semicolon_query_credential() {
+    let plugin = KeyAuth::new(&json!({"key_location": "query:api_key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    for raw_query in [
+        // Only the alias carries the (valid) key: it must not authenticate.
+        "carrier=;api_key=test-api-key",
+        // A valid ordinary occurrence beside a different aliased value.
+        "api_key=test-api-key&carrier=;api_key=other-key-0123456789",
+        // The `;` sits in the NAME, so Ferrum's name is `api_key;x`.
+        "api_key;x=1&carrier=1",
+        // Percent-encoded sub-pair name.
+        "carrier=;api%5Fkey=test-api-key",
+    ] {
+        let mut ctx = context_with_raw_query(raw_query);
+        assert_reject_body(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            AMBIGUOUS_QUERY_BODY,
+        );
+        assert!(ctx.identified_consumer.is_none(), "{raw_query}");
+    }
+}
+
+#[tokio::test]
+async fn test_key_auth_semicolon_inside_a_value_is_not_an_alias() {
+    let plugin = KeyAuth::new(&json!({"key_location": "query:api_key"})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    // Ferrum reads the whole value `test-api-key;x=1`; that is a lookup miss,
+    // not an ambiguity.
+    let mut ctx = context_with_raw_query("api_key=test-api-key;x=1");
+    assert_reject_body(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        r#"{"error":"Invalid API key"}"#,
+    );
+
+    // An unrelated `;` elsewhere leaves an ordinary credential authenticating.
+    let mut ctx = context_with_raw_query("api_key=test-api-key&carrier=a;b=c");
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert!(ctx.identified_consumer.is_some());
+}
+
+// ── Borrowed credential lookup (no behavior change) ────────────────────────
+
+/// The authenticate hook borrows the key from the request instead of copying
+/// it into an owned credential. Outcomes must be exactly the shared flow's:
+/// a folded repeated header still misses (blank keys stay pinned by
+/// `test_key_auth_whitespace_key_is_rejected`), and a successful lookup still
+/// commits the consumer and method.
+#[tokio::test]
+async fn test_key_auth_borrowed_lookup_keeps_the_shared_auth_contract() {
+    let plugin = KeyAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+
+    let expected_username = create_test_consumer().username;
+    let mut single = context_with_materialized_raw_header("x-api-key", "test-api-key");
+    assert_continue(plugin.authenticate(&mut single, &consumer_index).await);
+    assert_eq!(
+        single
+            .identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str()),
+        Some(expected_username.as_str())
+    );
+    assert_eq!(single.auth_method, Some("key_auth"));
+
+    let mut repeated = context_with_materialized_repeated_raw_header_bytes(
+        "x-api-key",
+        &[b"test-api-key", b"test-api-key"],
+    );
+    assert_reject_body(
+        plugin.authenticate(&mut repeated, &consumer_index).await,
+        r#"{"error":"Invalid API key"}"#,
+    );
+    assert!(repeated.identified_consumer.is_none());
+}

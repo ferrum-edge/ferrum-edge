@@ -18,6 +18,15 @@
 //! declared size of its distinct MMDB paths. If the file is unavailable at
 //! construction time on a runtime node, the plugin degrades gracefully and
 //! lookups use `on_lookup_failure`; a readable but invalid database is rejected.
+//!
+//! Every decision stamps two fixed-grammar metadata values for transaction
+//! logs — [`GEO_DECISION_METADATA_KEY`] (one of seven reasons) and, when a
+//! country was resolved, [`GEO_COUNTRY_METADATA_KEY`] (an ISO 3166-1 alpha-2
+//! code) — on both the HTTP and the stream hook. Both names are on the
+//! built-in log allowlist
+//! (`crate::plugins::utils::metadata_redaction::BUILTIN_SAFE_METADATA_KEYS`).
+//! Construction logs the loaded database's build date and age so a stale
+//! `.mmdb` is visible at every load and reload.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
@@ -35,6 +44,55 @@ use crate::config::types::{
 };
 
 const GEO_COUNTRY_HEADER: &str = "x-geo-country";
+
+/// Metadata key carrying the decision reason for this request or stream
+/// session: `allowed`, `country_not_allowed`, `country_denied`,
+/// `lookup_failed_allowed`, `lookup_failed_denied`, `db_not_loaded_allowed`, or
+/// `db_not_loaded_denied`. Fixed cardinality, so it is log-allowlisted.
+pub const GEO_DECISION_METADATA_KEY: &str = "geo.decision";
+
+/// Metadata key carrying the resolved ISO 3166-1 alpha-2 country code, on
+/// admitted and rejected requests alike. Absent when no country was resolved.
+pub const GEO_COUNTRY_METADATA_KEY: &str = "geo.country";
+
+/// A `.mmdb` older than this is reported at `warn` when it is loaded. MaxMind
+/// republishes its country databases weekly.
+const STALE_DATABASE_AGE_DAYS: u64 = 30;
+
+/// Why `check_ip` decided the way it did. The `as_str` set is the closed value
+/// grammar of [`GEO_DECISION_METADATA_KEY`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeoDecision {
+    Allowed,
+    CountryNotAllowed,
+    CountryDenied,
+    LookupFailedAllowed,
+    LookupFailedDenied,
+    DbNotLoadedAllowed,
+    DbNotLoadedDenied,
+}
+
+impl GeoDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::CountryNotAllowed => "country_not_allowed",
+            Self::CountryDenied => "country_denied",
+            Self::LookupFailedAllowed => "lookup_failed_allowed",
+            Self::LookupFailedDenied => "lookup_failed_denied",
+            Self::DbNotLoadedAllowed => "db_not_loaded_allowed",
+            Self::DbNotLoadedDenied => "db_not_loaded_denied",
+        }
+    }
+}
+
+/// One `check_ip` verdict: the plugin result, the resolved country (when
+/// any), and the decision reason for metadata.
+struct GeoVerdict {
+    result: PluginResult,
+    country: Option<CountryCode>,
+    decision: GeoDecision,
+}
 const CONFIG_KEYS: &[&str] = &[
     "db_path",
     "allow_countries",
@@ -200,7 +258,10 @@ impl GeoRestriction {
         // fallback condition. Once bytes are readable, however, corruption,
         // product mismatch, and incompatible records reject the generation.
         let reader = match loader(&db_path) {
-            Ok(reader) => Some(reader),
+            Ok(reader) => {
+                log_database_freshness(&reader);
+                Some(reader)
+            }
             Err(CountryMmdbLoadError::Unavailable(error)) => {
                 // The loader Debug-quotes the path around native filesystem
                 // errors, so cause sanitization retains the I/O stage/reason.
@@ -261,28 +322,30 @@ impl GeoRestriction {
     /// search the mapped IPv6 range rather than the IPv4 country record —
     /// either way the request falls through to `on_lookup_failure`, whose
     /// default is `allow` (GHSA-vjwj-657f-5w9g).
-    fn lookup_country(&self, ip: std::net::IpAddr) -> Result<Option<CountryCode>, String> {
-        let reader = self
-            .reader
-            .as_ref()
-            .ok_or_else(|| "MaxMind database not loaded".to_string())?;
-
-        let result = reader.lookup(ip).map_err(|e| e.to_string())?;
+    ///
+    /// `None` is the single "no country could be determined" outcome — no
+    /// loaded database, a lookup or decode error, an address absent from the
+    /// database, or a record without a usable code — which the only caller
+    /// routes to `on_lookup_failure`. Errors are never formatted: the request
+    /// path allocates nothing on failure. `registered_country` is decoded only
+    /// when the record has no direct `country` (direct precedence is the
+    /// pinned behavior), so the common record costs one path decode.
+    fn lookup_country(&self, ip: std::net::IpAddr) -> Option<CountryCode> {
+        let reader = self.reader.as_ref()?;
+        let result = reader.lookup(ip).ok()?;
         let direct: Option<&str> = result
             .decode_path(&maxminddb::path!["country", "iso_code"])
-            .map_err(|e| e.to_string())?;
-        let registered: Option<&str> = result
-            .decode_path(&maxminddb::path!["registered_country", "iso_code"])
-            .map_err(|e| e.to_string())?;
-        let Some(raw_code) = direct.or(registered) else {
-            return Ok(None);
+            .ok()?;
+        let raw_code = match direct {
+            Some(code) => code,
+            None => result
+                .decode_path::<&str>(&maxminddb::path!["registered_country", "iso_code"])
+                .ok()??,
         };
         // CountryMmdbSnapshot is published only after every record has passed
         // the shared supported-code invariant. Keep the request path to packed
         // parsing plus the constant-time policy bitset lookup.
         CountryCode::parse(raw_code)
-            .map(Some)
-            .ok_or_else(|| format!("invalid country code in MaxMind record: {raw_code:?}"))
     }
 
     /// Check whether the client IP's country is allowed.
@@ -292,11 +355,7 @@ impl GeoRestriction {
     /// identity means the authoritative client IP is not an address literal, so
     /// no country can be determined and the configured `on_lookup_failure`
     /// policy decides — the same branch an unresolvable address takes.
-    fn check_ip(
-        &self,
-        canonical_ip: Option<std::net::IpAddr>,
-        client_ip: &str,
-    ) -> (PluginResult, Option<CountryCode>) {
+    fn check_ip(&self, canonical_ip: Option<std::net::IpAddr>, client_ip: &str) -> GeoVerdict {
         if self.reader.is_none() {
             // Database file not loaded — apply the configured failure policy.
             return match self.on_lookup_failure {
@@ -304,7 +363,11 @@ impl GeoRestriction {
                     // Fail-open: surface that the geo gate is disabled because
                     // the .mmdb is absent (first occurrence at warn).
                     self.log_fail_open(client_ip, "db_not_loaded");
-                    (PluginResult::Continue, None)
+                    GeoVerdict {
+                        result: PluginResult::Continue,
+                        country: None,
+                        decision: GeoDecision::DbNotLoadedAllowed,
+                    }
                 }
                 LookupFailureAction::Deny => {
                     warn_sampled!(
@@ -314,22 +377,23 @@ impl GeoRestriction {
                         reason = "db_not_loaded",
                         "MaxMind database not loaded, denying by on_lookup_failure policy"
                     );
-                    (
-                        PluginResult::Reject {
+                    GeoVerdict {
+                        result: PluginResult::Reject {
                             status_code: 403,
                             body: r#"{"error":"Access denied: GeoIP database not available"}"#
                                 .to_string(),
                             headers: HashMap::new(),
                         },
-                        None,
-                    )
+                        country: None,
+                        decision: GeoDecision::DbNotLoadedDenied,
+                    }
                 }
             };
         }
 
         // No typed identity, a lookup error, and an address absent from the
         // database are one outcome: no country could be determined.
-        let country = match canonical_ip.and_then(|ip| self.lookup_country(ip).ok().flatten()) {
+        let country = match canonical_ip.and_then(|ip| self.lookup_country(ip)) {
             Some(code) => code,
             None => {
                 // Lookup failed or IP not in database
@@ -340,7 +404,11 @@ impl GeoRestriction {
                         // operator can detect unresolved traffic slipping past
                         // the geo gate.
                         self.log_fail_open(client_ip, "lookup_failed");
-                        return (PluginResult::Continue, None);
+                        return GeoVerdict {
+                            result: PluginResult::Continue,
+                            country: None,
+                            decision: GeoDecision::LookupFailedAllowed,
+                        };
                     }
                     LookupFailureAction::Deny => {
                         warn_sampled!(
@@ -349,15 +417,16 @@ impl GeoRestriction {
                             reason = "lookup_failed",
                             "GeoIP lookup failed, denying by policy"
                         );
-                        return (
-                            PluginResult::Reject {
+                        return GeoVerdict {
+                            result: PluginResult::Reject {
                                 status_code: 403,
                                 body: r#"{"error":"Access denied: unable to determine geographic location"}"#
                                     .to_string(),
                                 headers: HashMap::new(),
                             },
-                            None,
-                        );
+                            country: None,
+                            decision: GeoDecision::LookupFailedDenied,
+                        };
                     }
                 }
             }
@@ -372,14 +441,15 @@ impl GeoRestriction {
                 reason = "country_not_allowed",
                 "Country not in allow list"
             );
-            return (
-                PluginResult::Reject {
+            return GeoVerdict {
+                result: PluginResult::Reject {
                     status_code: 403,
                     body: r#"{"error":"Access denied from your geographic location"}"#.to_string(),
                     headers: HashMap::new(),
                 },
-                Some(country),
-            );
+                country: Some(country),
+                decision: GeoDecision::CountryNotAllowed,
+            };
         }
 
         // Deny-list mode: listed countries are blocked
@@ -391,17 +461,55 @@ impl GeoRestriction {
                 reason = "country_denied",
                 "Country in deny list"
             );
-            return (
-                PluginResult::Reject {
+            return GeoVerdict {
+                result: PluginResult::Reject {
                     status_code: 403,
                     body: r#"{"error":"Access denied from your geographic location"}"#.to_string(),
                     headers: HashMap::new(),
                 },
-                Some(country),
-            );
+                country: Some(country),
+                decision: GeoDecision::CountryDenied,
+            };
         }
 
-        (PluginResult::Continue, Some(country))
+        GeoVerdict {
+            result: PluginResult::Continue,
+            country: Some(country),
+            decision: GeoDecision::Allowed,
+        }
+    }
+}
+
+/// Report the loaded database's build date and age. A database older than
+/// [`STALE_DATABASE_AGE_DAYS`] is a `warn` — country assignments drift as
+/// address space is reallocated — and a fresh one is `debug`. The source path
+/// is deliberately not logged, matching the plugin's other load diagnostics;
+/// `database_type` is safe to emit because a published snapshot has already
+/// passed the closed supported-product check.
+fn log_database_freshness(snapshot: &CountryMmdbSnapshot) {
+    let metadata = snapshot.metadata();
+    let build_epoch = metadata.build_epoch;
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let age_days = now_epoch.saturating_sub(build_epoch) / 86_400;
+    if age_days > STALE_DATABASE_AGE_DAYS {
+        warn!(
+            plugin = "geo_restriction",
+            database_type = %metadata.database_type,
+            build_epoch,
+            age_days,
+            stale_after_days = STALE_DATABASE_AGE_DAYS,
+            "MaxMind database is stale; country assignments may be outdated — refresh the .mmdb"
+        );
+    } else {
+        debug!(
+            plugin = "geo_restriction",
+            database_type = %metadata.database_type,
+            build_epoch,
+            age_days,
+            "MaxMind database loaded"
+        );
     }
 }
 
@@ -566,12 +674,52 @@ impl Plugin for GeoRestriction {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
-        let (result, _country) = self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip);
+        let GeoVerdict {
+            result,
+            country,
+            decision,
+        } = self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip);
+        ctx.insert_metadata(
+            GEO_DECISION_METADATA_KEY.to_string(),
+            decision.as_str().to_string(),
+        );
+        // The pair always describes THIS evaluation: an unresolved lookup
+        // removes a country an earlier instance recorded.
+        match country {
+            Some(code) => {
+                ctx.insert_metadata(GEO_COUNTRY_METADATA_KEY.to_string(), code.into_string())
+            }
+            None => {
+                if let Some(metadata) = ctx.metadata.as_mut() {
+                    metadata.remove(GEO_COUNTRY_METADATA_KEY);
+                }
+            }
+        }
         result
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let (result, country) = self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip);
+        let GeoVerdict {
+            result,
+            country,
+            decision,
+        } = self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip);
+        ctx.metadata.insert(
+            GEO_DECISION_METADATA_KEY.to_string(),
+            decision.as_str().to_string(),
+        );
+        // The pair always describes THIS evaluation: an unresolved lookup
+        // removes a country an earlier instance recorded. The private country
+        // assertion and its header are deliberately left alone below.
+        match country {
+            Some(code) => {
+                ctx.metadata
+                    .insert(GEO_COUNTRY_METADATA_KEY.to_string(), code.into_string());
+            }
+            None => {
+                ctx.metadata.remove(GEO_COUNTRY_METADATA_KEY);
+            }
+        }
 
         // Header materialization centrally strips every client-supplied value
         // before the plugin chain. Writing the authoritative value here avoids

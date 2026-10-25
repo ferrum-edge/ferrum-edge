@@ -920,8 +920,14 @@ Removed from the trailer section: RFC 9110 §7.6.1 request-direction hop-by-hop
 and framing fields (`connection`, `expect`, `keep-alive`, `proxy-authorization`,
 `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
 `content-length`); reserved gateway assertions (the whole `x-consumer-*`
-namespace and `x-geo-country`); Ferrum-owned names (`x-ferrum-*`,
-`x-path-param-*`); credentials (`authorization`, `cookie`, `x-api-key`);
+namespace and `x-geo-country`, matched with the same ASCII-case-insensitive,
+`_`-equals-`-` predicate as the initial header block, so `x_geo_country`,
+`x_geo-country`, and `x-geo_country` are removed too); Ferrum-owned names
+(`x-ferrum-*`, `x-path-param-*`); credentials (`authorization`, `cookie`,
+`x-api-key`, plus every credential header location the route's auth plugins
+configure — a `key_auth` `header:<name>`, a custom `jwt_auth` / `jwks_auth` /
+`oauth2_introspection` token header — removed whether or not
+`hide_credentials` is set, because trailers are never a credential location);
 forwarding identity the gateway regenerates (`x-forwarded-*`, `forwarded`);
 initial-only gRPC call parameters (`grpc-*`); the gateway-owned `early-data`
 marker; the initial-section-only `via` intermediary chain; and header-section

@@ -4981,7 +4981,7 @@ fn every_streaming_h1h2_upload_installs_the_gateway_owned_pump() {
         .find("deadline.expired(cx)")
         .expect("native gRPC authorization deadline check");
     let bridge_poll = native_grpc_poll
-        .find("incoming.poll_frame(cx)")
+        .find("incoming.poll_frame_with_trailer_credentials(")
         .expect("native gRPC upload bridge poll");
     assert!(
         expiry_check < bridge_poll,

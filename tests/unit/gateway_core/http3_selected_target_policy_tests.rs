@@ -1253,13 +1253,17 @@ fn h3_deferred_hooks_cannot_spoof_backend_gateway_assertions() {
         .find("\npub(crate) fn sanitize_backend_request_trailers")
         .expect("sanitize helper must follow the forbid predicate");
     let forbidden = &forbidden_tail[..forbidden_end];
+    // One folded predicate covers both the `x-consumer-*` namespace and the
+    // private `x-geo-country` assertion, `_`/`-` spellings included, exactly as
+    // the initial header block scrubs them.
     assert!(
-        forbidden.contains("\"x-geo-country\""),
-        "H3 client trailers must not reintroduce a reserved geo assertion"
+        forbidden.contains("|| is_gateway_assertion_header(name)"),
+        "shared request-trailer forbid helper must reject consumer identity and geo \
+         assertions through the folded gateway predicate"
     );
     assert!(
-        forbidden.contains("|| is_consumer_assertion_header(name)"),
-        "shared request-trailer forbid helper must reject consumer identity assertions"
+        !forbidden.contains("\"x-geo-country\""),
+        "a literal geo arm would match only the hyphen spelling; the folded predicate owns it"
     );
 }
 
