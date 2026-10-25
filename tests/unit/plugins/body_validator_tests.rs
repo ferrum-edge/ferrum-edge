@@ -6893,6 +6893,7 @@ const PB_FILE_ENUM: u32 = 5;
 /// message Node { Node next = 1; }
 /// enum Level { LOW = 0; }
 /// message Leveled { Level level = 1; }
+/// message Mapped { map<int32, Child> children = 1; }
 /// ```
 fn proto3_review_set() -> Vec<u8> {
     let child = pb_message("Child", &[]);
@@ -6912,6 +6913,25 @@ fn proto3_review_set() -> Vec<u8> {
         "Leveled",
         &[pb_enum_field("level", 1, PB_LABEL_OPTIONAL, ".t3.Level")],
     );
+    let entry = pb_as_map_entry(pb_message(
+        "ChildrenEntry",
+        &[
+            pb_field("key", 1, PB_LABEL_OPTIONAL, PB_TYPE_INT32),
+            pb_message_field("value", 2, PB_LABEL_OPTIONAL, ".t3.Child"),
+        ],
+    ));
+    let mapped = pb_with_nested(
+        pb_message(
+            "Mapped",
+            &[pb_message_field(
+                "children",
+                1,
+                PB_LABEL_REPEATED,
+                ".t3.Mapped.ChildrenEntry",
+            )],
+        ),
+        &entry,
+    );
     pb_file(
         "t3.proto",
         "t3",
@@ -6922,6 +6942,7 @@ fn proto3_review_set() -> Vec<u8> {
             (PB_FILE_MESSAGE, node),
             (PB_FILE_ENUM, level),
             (PB_FILE_MESSAGE, leveled),
+            (PB_FILE_MESSAGE, mapped),
         ],
     )
 }
@@ -7049,6 +7070,7 @@ fn protobuf_decode_working_set_is_charged_to_the_aggregate_budget() {
         ResponseBufferBudgetProbe,
         body_validator_protobuf_request_outcome_in_budget_for_test as outcome,
     };
+    const GRPC: &str = "application/grpc";
     let plugin = protobuf_plugin();
     let payload = encode_hello_request("Ada", 36);
     let plain = grpc_frame(&payload);
@@ -7058,14 +7080,17 @@ fn protobuf_decode_working_set_is_charged_to_the_aggregate_budget() {
     // One 64 KiB block cannot admit the gzip decoder's own heap.
     let small = ResponseBufferBudgetProbe::new(64 * 1024, 64 * 1024);
     let small_available = small.available_bytes();
-    assert_eq!(outcome(&plugin, &small, path, &compressed), "capacity");
+    assert_eq!(
+        outcome(&plugin, &small, path, GRPC, &compressed),
+        "capacity"
+    );
     assert_eq!(
         small.available_bytes(),
         small_available,
         "refusal leaks no charge"
     );
     // ...but an uncompressed frame's small reflected working set fits.
-    assert_eq!(outcome(&plugin, &small, path, &plain), "pass");
+    assert_eq!(outcome(&plugin, &small, path, GRPC, &plain), "pass");
     assert_eq!(
         small.available_bytes(),
         small_available,
@@ -7074,16 +7099,16 @@ fn protobuf_decode_working_set_is_charged_to_the_aggregate_budget() {
 
     // With the block held elsewhere even the uncompressed decode is refused.
     let held = small.try_reserve(64 * 1024).expect("hold the only block");
-    assert_eq!(outcome(&plugin, &small, path, &plain), "capacity");
+    assert_eq!(outcome(&plugin, &small, path, GRPC, &plain), "capacity");
     drop(held);
-    assert_eq!(outcome(&plugin, &small, path, &plain), "pass");
+    assert_eq!(outcome(&plugin, &small, path, GRPC, &plain), "pass");
 
     let large = ResponseBufferBudgetProbe::new(64 * 1024 * 1024, 64 * 1024 * 1024);
     let large_available = large.available_bytes();
-    assert_eq!(outcome(&plugin, &large, path, &compressed), "pass");
+    assert_eq!(outcome(&plugin, &large, path, GRPC, &compressed), "pass");
     assert_eq!(large.available_bytes(), large_available);
     assert_eq!(
-        outcome(&plugin, &large, path, &grpc_frame(&[0xFF, 0xFE])),
+        outcome(&plugin, &large, path, GRPC, &grpc_frame(&[0xFF, 0xFE])),
         "invalid"
     );
 }
@@ -7122,14 +7147,60 @@ async fn an_undeclared_closed_enum_number_cannot_satisfy_a_required_field() {
             .await,
         Some(502),
     );
-    // A declared value followed by an undeclared duplicate leaves the last
-    // occurrence undeclared, so the field is still unset.
-    let mut duplicate = pb_varint_field(1, 0);
-    duplicate.extend(pb_varint_field(1, 7));
-    assert_reject(
+    // Wire-occurrence semantics, not "last reflected value": an undeclared
+    // occurrence goes to the unknown-field set and does not erase an earlier
+    // declared value, so `SAFE` then `7` is initialized...
+    let mut declared_then_unknown = pb_varint_field(1, 0);
+    declared_then_unknown.extend(pb_varint_field(1, 7));
+    let declared_then_unknown = grpc_frame(&declared_then_unknown);
+    assert_continue(
         plugin
-            .on_final_request_body(&headers, &grpc_frame(&duplicate))
+            .on_final_request_body(&headers, &declared_then_unknown)
             .await,
+    );
+    let mut unknown_then_declared = pb_varint_field(1, 7);
+    unknown_then_declared.extend(pb_varint_field(1, 0));
+    let unknown_then_declared = grpc_frame(&unknown_then_declared);
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, &unknown_then_declared)
+            .await,
+    );
+
+    // ...while strict mode refuses the unknown occurrence in either order and
+    // in either direction.
+    let strict = review_plugin(
+        &dir,
+        json!({
+            "protobuf_request_type": "e2.Request",
+            "protobuf_response_type": "e2.Request",
+            "protobuf_reject_unknown_fields": true
+        }),
+    );
+    for frame in [&declared_then_unknown, &unknown_then_declared] {
+        assert_reject(
+            strict.on_final_request_body(&headers, frame).await,
+            Some(400),
+        );
+        let mut ctx = grpc_ctx();
+        assert_reject(
+            strict
+                .finalize_client_visible_response_body(
+                    &mut ctx,
+                    200,
+                    &grpc_response_headers(),
+                    frame,
+                )
+                .await,
+            Some(502),
+        );
+    }
+    assert_continue(strict.on_final_request_body(&headers, &declared).await);
+
+    // A gzip-compressed undeclared-only frame is judged the same way.
+    let compressed = grpc_frame_with_flag(1, &gzip_member(&pb_varint_field(1, 1)));
+    assert_reject(
+        plugin.on_final_request_body(&headers, &compressed).await,
         Some(400),
     );
 }
@@ -7813,4 +7884,286 @@ async fn a_single_direction_method_entry_does_not_fall_back_to_the_default_type(
         plugin.on_final_request_body(&other, &frame).await,
         Some(400),
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PR #6845 fix round 1
+// ═══════════════════════════════════════════════════════════════════════
+
+/// PR6845-SOL-2: the method is the trailing `/Service/Method` of whichever
+/// path names it, and the bound backend-effective path outranks a synthetic
+/// (possibly unstripped) `:path`.
+#[tokio::test]
+async fn the_backend_effective_method_selects_the_descriptor_on_every_path_shape() {
+    use ferrum_edge::_test_support::bind_authorized_backend_path_for_test;
+
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {"request": "test.HelloRequest"}
+        },
+        "protobuf_reject_unknown_fields": true
+    }))
+    .unwrap();
+    let mut unknown = encode_hello_request("Eve", 25);
+    unknown.extend_from_slice(&[0x98, 0x06, 0x01]);
+    let unknown = grpc_frame(&unknown);
+
+    // An unstripped listen-path prefix on the synthetic `:path`.
+    let mut headers = content_type_headers("application/grpc");
+    headers.insert(
+        ":path".to_string(),
+        "/edge/test.Greeter/SayHello".to_string(),
+    );
+    assert_reject(
+        plugin.on_final_request_body(&headers, &unknown).await,
+        Some(400),
+    );
+
+    // The bound backend-effective path wins over a conflicting `:path`.
+    headers.insert(":path".to_string(), "/test.Greeter/Other".to_string());
+    let mut ctx = hello_ctx("/edge/test.Greeter/Other");
+    bind_authorized_backend_path_for_test(&mut ctx, "/api/test.Greeter/SayHello");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &unknown)
+            .await,
+        Some(400),
+    );
+    // ...in the other direction too: an enrolled `:path` does not enroll a
+    // backend method that is not.
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    let mut other = hello_ctx("/test.Greeter/SayHello");
+    bind_authorized_backend_path_for_test(&mut other, "/test.Greeter/Other");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut other, &headers, &unknown)
+            .await,
+    );
+
+    // A prefixed request path on a dispatcher with no `:path` (HTTP/3), and the
+    // buffering vote for the same prefixed path.
+    let no_path = content_type_headers("application/grpc");
+    let mut h3 = hello_ctx("/edge/test.Greeter/SayHello");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut h3, &no_path, &unknown)
+            .await,
+        Some(400),
+    );
+    h3.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(plugin.should_buffer_request_body(&h3));
+}
+
+/// PR6845-SOL-1: a path-only route rewrite must re-ask the per-method
+/// request-buffering vote on both dispatcher families; otherwise a request
+/// rewritten onto an enrolled method streams past the validator.
+#[test]
+fn path_only_route_rewrites_recompute_request_body_requirements_on_every_ladder() {
+    let h1 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    for (name, source) in [("H1/H2", h1), ("H3", h3)] {
+        let recompute = source
+            .find("} else if ctx.route_override_path.is_some() {")
+            .unwrap_or_else(|| panic!("{name} must recompute after a path-only rewrite"));
+        let window: String = source[recompute..].chars().take(1200).collect();
+        assert!(
+            window.contains("final_request_body_requirements("),
+            "{name}: the path-only branch must recompute the requirements"
+        );
+    }
+
+    // The vote itself honors the pending rewrite.
+    let plugin = protobuf_plugin_with_method_messages();
+    let mut ctx = hello_ctx("/alias.Greeter/SayHello");
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    ctx.route_override_path = Some("/test.Greeter/SayHello".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+}
+
+/// PR6845-SOL-3: a client-supplied `Upgrade` header does not make an ordinary
+/// upload a tunnel; only a transport-classified WebSocket or CONNECT does.
+#[tokio::test]
+async fn a_bogus_upgrade_header_does_not_bypass_strict_media_type_admission() {
+    use ferrum_edge::_test_support::set_request_http_flavor_for_test;
+
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "reject_unsupported_media_types": true
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    ctx.headers
+        .insert("upgrade".to_string(), "ignored".to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"x":1}"#));
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let mut headers = ctx.headers.clone();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(415));
+
+    let mut with_length = ctx.headers.clone();
+    with_length.insert("content-length".to_string(), "7".to_string());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    assert_reject(
+        plugin.before_proxy(&mut ctx, &mut with_length).await,
+        Some(415),
+    );
+
+    // A genuine (frontend-classified) WebSocket handshake is exempt.
+    let mut websocket = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/ws".to_string(),
+    );
+    set_request_http_flavor_for_test(
+        &mut websocket,
+        ferrum_edge::config::types::HttpFlavor::WebSocket,
+    );
+    let mut headers = HashMap::from([("upgrade".to_string(), "websocket".to_string())]);
+    assert_continue(plugin.before_proxy(&mut websocket, &mut headers).await);
+}
+
+/// PR6845-SOL-5: a map entry whose message value is omitted on the wire still
+/// reflects into a default message, so it is charged before reflection.
+#[tokio::test]
+async fn omitted_map_message_values_are_charged_before_reflection() {
+    let dir = review_descriptor_dir(proto3_review_set());
+    let plugin = review_plugin(&dir, json!({"protobuf_request_type": "t3.Mapped"}));
+    let headers = grpc_request_headers();
+    let entries = |count: u64| {
+        let mut payload = Vec::new();
+        for key in 0..count {
+            payload.extend(pb_len_field(1, &pb_varint_field(1, key)));
+        }
+        payload
+    };
+
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, &grpc_frame(&entries(49_000)))
+            .await,
+    );
+    let over = entries(50_001);
+    let body = reject_body(
+        plugin
+            .on_final_request_body(&headers, &grpc_frame(&over))
+            .await,
+    );
+    assert!(body.contains("inspection budget"), "{body}");
+    let compressed = grpc_frame_with_flag(1, &gzip_member(&over));
+    let body = reject_body(plugin.on_final_request_body(&headers, &compressed).await);
+    assert!(body.contains("inspection budget"), "{body}");
+
+    // An explicit value is not charged twice: 49,000 entries that each carry
+    // an (empty) value message still fit.
+    let mut explicit = Vec::new();
+    for key in 0..49_000u64 {
+        let mut entry = pb_varint_field(1, key);
+        entry.extend(pb_len_field(2, &[]));
+        explicit.extend(pb_len_field(1, &entry));
+    }
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, &grpc_frame(&explicit))
+            .await,
+    );
+}
+
+/// PR6845-SOL-6: a gRPC-Web text body's base64 output is charged to the
+/// aggregate budget, refused when it cannot be admitted, and released after.
+#[test]
+fn grpc_web_text_decode_is_charged_to_the_aggregate_budget() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ferrum_edge::_test_support::{
+        ResponseBufferBudgetProbe,
+        body_validator_protobuf_request_outcome_in_budget_for_test as outcome,
+    };
+    const TEXT: &str = "application/grpc-web-text+proto";
+
+    let plugin = protobuf_plugin();
+    let path = "/test.Greeter/SayHello";
+    let frame = grpc_frame(&encode_hello_request("Ada", 36));
+    let small_text = BASE64.encode(frame.as_slice()).into_bytes();
+
+    let probe = ResponseBufferBudgetProbe::new(64 * 1024, 64 * 1024);
+    let available = probe.available_bytes();
+    assert_eq!(outcome(&plugin, &probe, path, TEXT, &small_text), "pass");
+    assert_eq!(
+        probe.available_bytes(),
+        available,
+        "a pass releases its charge"
+    );
+
+    let held = probe.try_reserve(64 * 1024).expect("hold the only block");
+    assert_eq!(
+        outcome(&plugin, &probe, path, TEXT, &small_text),
+        "capacity"
+    );
+    drop(held);
+
+    // A ~48 KiB message in a ~64 KiB text body cannot fit one block once the
+    // decoded buffer and the reflected copy are both charged.
+    let large = grpc_frame(&encode_hello_request(&"a".repeat(48 * 1024), 36));
+    let large_text = BASE64.encode(large.as_slice()).into_bytes();
+    assert_eq!(
+        outcome(&plugin, &probe, path, TEXT, &large_text),
+        "capacity"
+    );
+    assert_eq!(
+        probe.available_bytes(),
+        available,
+        "a refusal leaks no charge"
+    );
+
+    let roomy = ResponseBufferBudgetProbe::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+    assert_eq!(outcome(&plugin, &roomy, path, TEXT, &large_text), "pass");
+    // Segmented (padded-then-continued) text still decodes into one buffer.
+    let mut segmented = BASE64.encode(&frame.as_slice()[..2]).into_bytes();
+    segmented.extend(BASE64.encode(&frame.as_slice()[2..]).into_bytes());
+    assert_eq!(outcome(&plugin, &roomy, path, TEXT, &segmented), "pass");
+}
+
+/// PR6845-SOL-7: an origin status outside `response_status_codes` does not
+/// claim the origin-encoding gate, so an encoded error document is left alone.
+#[test]
+fn excluded_origin_statuses_do_not_claim_the_origin_encoding_gate() {
+    use ferrum_edge::_test_support::record_origin_http_response_status_for_test;
+
+    let plugin = response_schema_plugin(json!({"type": "object", "required": ["id"]}));
+    let encoded = |status: u16| {
+        let mut ctx = make_response_ctx();
+        ctx.metadata.insert(
+            "ferrum:origin_encoded_response".to_string(),
+            "zstd".to_string(),
+        );
+        record_origin_http_response_status_for_test(&mut ctx, status);
+        ctx
+    };
+    assert!(plugin.enforces_response_body_policy(&encoded(200), Some("application/json"), b""));
+    for status in [404u16, 422, 500, 206] {
+        assert!(
+            !plugin.enforces_response_body_policy(&encoded(status), Some("application/json"), b""),
+            "status {status} is outside the validated scope and must not claim"
+        );
+    }
+
+    let scoped = BodyValidator::new(&json!({
+        "response_required_fields": ["id"],
+        "response_status_codes": ["2XX", 422]
+    }))
+    .unwrap();
+    assert!(scoped.enforces_response_body_policy(&encoded(422), Some("application/json"), b""));
 }

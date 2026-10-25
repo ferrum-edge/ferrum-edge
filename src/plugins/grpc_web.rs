@@ -884,7 +884,12 @@ pub(crate) fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut decoded = Vec::with_capacity(data.len() / 4 * 3);
+    // ONE output allocation, sized to the decoded upper bound, that every
+    // segment decodes into in place. Decoding each segment into its own `Vec`
+    // and appending it held two output buffers at once, which a caller that
+    // charged the decoded capacity before calling this could not account for.
+    let mut decoded = vec![0u8; data.len() / 4 * 3];
+    let mut written = 0usize;
     let mut segment_start = 0usize;
     let mut pos = 0usize;
     while pos < data.len() {
@@ -905,13 +910,18 @@ pub(crate) fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
         if padded {
             // Padding closes this flush. Decode it on its own so the next group,
             // if any, is read as a fresh segment rather than as trailing garbage.
-            decoded.extend(BASE64.decode(&data[segment_start..pos]).ok()?);
+            written += BASE64
+                .decode_slice(&data[segment_start..pos], decoded.get_mut(written..)?)
+                .ok()?;
             segment_start = pos;
         }
     }
     if segment_start < data.len() {
-        decoded.extend(BASE64.decode(&data[segment_start..]).ok()?);
+        written += BASE64
+            .decode_slice(&data[segment_start..], decoded.get_mut(written..)?)
+            .ok()?;
     }
+    decoded.truncate(written);
     Some(decoded)
 }
 

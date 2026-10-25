@@ -1264,12 +1264,16 @@ impl BodyValidator {
             budget,
         )?;
 
+        let policy = ProtobufMessagePolicy {
+            check_required: self.protobuf_pool_has_proto2,
+            reject_unknown: self.protobuf_reject_unknown_fields,
+        };
         let mut preflight = ProtobufDecodePreflight::default();
         if let Err(error) = preflight.charge_message() {
             return Err(error.into_failure());
         }
         if let Err(error) =
-            preflight_protobuf_fields(&payload, Some(descriptor), None, 0, &mut preflight)
+            preflight_protobuf_fields(&payload, Some(descriptor), None, 0, &mut preflight, policy)
         {
             return Err(error.into_failure());
         }
@@ -1309,11 +1313,8 @@ impl BodyValidator {
         // the decoded outer message left unknown fields inside nested,
         // repeated, map-value, oneof, and extension messages unexamined even
         // though `protobuf_reject_unknown_fields` is documented as a strict
-        // schema policy (`GHSA-cqmm-vj3c-g8w8`).
-        let policy = ProtobufMessagePolicy {
-            check_required: self.protobuf_pool_has_proto2,
-            reject_unknown: self.protobuf_reject_unknown_fields,
-        };
+        // schema policy (`GHSA-cqmm-vj3c-g8w8`). Closed-enum occurrences were
+        // already judged on the wire by the preflight above.
         if policy.is_active() {
             let mut walk_budget = ProtobufWalkBudget::default();
             check_protobuf_message(&msg, policy, &mut walk_budget)?;
@@ -1321,21 +1322,26 @@ impl BodyValidator {
         Ok(())
     }
 
-    /// Request-side native-gRPC protobuf validation against an explicitly
-    /// bound aggregate budget, reduced to a fixed outcome label.
+    /// Request-side gRPC protobuf validation of `body` in the framing named by
+    /// `content_type`, against an explicitly bound aggregate budget, reduced to
+    /// a fixed outcome label.
     #[allow(dead_code)] // reached via `_test_support` from the external test crate
     pub(crate) fn protobuf_request_outcome_in(
         &self,
         grpc_path: &str,
+        content_type: &str,
         body: &[u8],
         budget: BudgetRef<'_>,
     ) -> &'static str {
-        let Some(descriptor) = self.get_request_descriptor(grpc_path) else {
+        let Some(representation) = grpc_representation(content_type) else {
+            return "unconfigured";
+        };
+        let Some(descriptor) = self.get_request_descriptor(canonical_grpc_method(grpc_path)) else {
             return "unconfigured";
         };
         match self.validate_grpc_representation(
             body,
-            GrpcRepresentation::Native,
+            representation,
             descriptor,
             Direction::Request,
             None,
@@ -1373,23 +1379,36 @@ impl BodyValidator {
         self.response_json_validator.is_some() || !self.response_required_fields.is_empty()
     }
 
-    /// Resolve the gRPC method path a request/response belongs to from the
-    /// request context.
+    /// Resolve the gRPC method a request/response belongs to from the request
+    /// context, as the canonical `/Service/Method` key.
     ///
-    /// Prefer `grpc_full_method` set by `grpc_method_router` when available;
-    /// otherwise fall back to `ctx.path`, which the dispatch ladders keep equal
-    /// to the backend-visible request path (a route-override rewrite is
-    /// mirrored onto it). Backends never echo `:path` in responses.
+    /// The backend-effective path the gateway bound after route policy
+    /// (`authorized_backend_path`, private and not plugin-writable) wins when
+    /// present; then `grpc_full_method` set by `grpc_method_router`; then
+    /// `ctx.path`, onto which a route-override rewrite is mirrored. Whatever the
+    /// source, only the trailing `/Service/Method` is the method: listen-path
+    /// stripping and backend base-path composition add or remove a PREFIX, so
+    /// the client path, the synthetic `:path`, and the backend-effective path
+    /// all name the same method. Backends never echo `:path` in responses.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
+        if let Some(path) = ctx.authorized_backend_path() {
+            return Cow::Borrowed(canonical_grpc_method(path));
+        }
         match ctx.metadata.get("grpc_full_method") {
-            Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
+            Some(method) if method.starts_with('/') => {
+                Cow::Borrowed(canonical_grpc_method(method.as_str()))
+            }
             Some(method) => {
                 let mut path = String::with_capacity(method.len() + 1);
                 path.push('/');
                 path.push_str(method);
-                Cow::Owned(path)
+                if canonical_grpc_method(&path).len() == path.len() {
+                    Cow::Owned(path)
+                } else {
+                    Cow::Owned(canonical_grpc_method(&path).to_string())
+                }
             }
-            None => Cow::Borrowed(ctx.path.as_str()),
+            None => Cow::Borrowed(canonical_grpc_method(ctx.path.as_str())),
         }
     }
 
@@ -1410,10 +1429,10 @@ impl BodyValidator {
     fn protobuf_request_may_apply(&self, ctx: &RequestContext) -> bool {
         self.protobuf_targets
             .request_applies(&Self::grpc_method_path(ctx))
-            || ctx
-                .route_override_path
-                .as_deref()
-                .is_some_and(|path| self.protobuf_targets.request_applies(path))
+            || ctx.route_override_path.as_deref().is_some_and(|path| {
+                self.protobuf_targets
+                    .request_applies(canonical_grpc_method(path))
+            })
     }
 
     /// Whether this exchange's upstream status selects response validation:
@@ -1591,12 +1610,34 @@ fn request_grpc_method_path<'a>(
     headers: &'a HashMap<String, String>,
     ctx: Option<&'a RequestContext>,
 ) -> Cow<'a, str> {
+    // The bound backend-effective path is authoritative; a synthetic `:path`
+    // (the local, possibly unstripped request path) never outranks it.
+    if let Some(path) = ctx.and_then(RequestContext::authorized_backend_path) {
+        return Cow::Borrowed(canonical_grpc_method(path));
+    }
     if let Some(path) = headers.get(":path") {
-        return Cow::Borrowed(path.as_str());
+        return Cow::Borrowed(canonical_grpc_method(path.as_str()));
     }
     match ctx {
         Some(ctx) => BodyValidator::grpc_method_path(ctx),
         None => Cow::Borrowed(""),
+    }
+}
+
+/// The canonical gRPC method key of a request path: its trailing
+/// `/Service/Method` (query and fragment excluded). A gRPC method is always the
+/// last two path segments, so a listen-path prefix, a stripped prefix, or a
+/// backend base path cannot make the same method select a different
+/// `protobuf_method_messages` entry.
+fn canonical_grpc_method(path: &str) -> &str {
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    let path = &path[..end];
+    let Some(last) = path.rfind('/') else {
+        return path;
+    };
+    match path[..last].rfind('/') {
+        Some(start) => &path[start..],
+        None => path,
     }
 }
 
@@ -1672,11 +1713,19 @@ fn request_headers_declare_body_framing(headers: &HashMap<String, String>) -> bo
     headers.contains_key("content-length") || headers.contains_key("transfer-encoding")
 }
 
-/// A `CONNECT` (including HTTP/2 extended CONNECT) or `Upgrade` request opens
-/// a tunnel or a WebSocket; what follows is not a request body this plugin
-/// governs, so strict media-type admission does not apply to it.
-fn request_opens_tunnel(method: &str, headers: &HashMap<String, String>) -> bool {
-    method.eq_ignore_ascii_case("CONNECT") || headers.contains_key("upgrade")
+/// A `CONNECT` request (including HTTP/2 extended CONNECT and mesh HBONE) or a
+/// transport-classified WebSocket handshake opens a tunnel; what follows is not
+/// a request body this plugin governs, so strict media-type admission does not
+/// apply to it. Decided from trusted request state (the request line and the
+/// frontend's own flavor classification), never from a client-supplied
+/// `Upgrade` header, which an ordinary upload can carry.
+fn request_opens_tunnel(ctx: &RequestContext) -> bool {
+    ctx.method.eq_ignore_ascii_case("CONNECT")
+        || ctx.is_hbone_connect_relay()
+        || matches!(
+            ctx.request_http_flavor(),
+            crate::config::types::HttpFlavor::WebSocket
+        )
 }
 
 /// Whether a request ungoverned by any configured rule carries a body, for
@@ -1688,7 +1737,7 @@ fn ungoverned_request_carries_body(
     ctx: &RequestContext,
     headers: &HashMap<String, String>,
 ) -> bool {
-    if request_opens_tunnel(&ctx.method, headers) {
+    if request_opens_tunnel(ctx) {
         return false;
     }
     if let Some(length) = headers.get("content-length") {
@@ -1810,11 +1859,17 @@ struct ProtobufDecodePreflight {
 }
 
 /// Why the wire preflight refused a payload.
-#[derive(Clone, Copy)]
 enum PreflightError {
     Malformed,
     Budget,
     Depth,
+    /// A closed-enum occurrence outside the declared set under
+    /// `protobuf_reject_unknown_fields`: an unknown field to a conforming
+    /// proto2 reader.
+    UnknownClosedEnum,
+    /// A proto2 `required` closed-enum field whose every occurrence was
+    /// undeclared: a conforming reader leaves it unset.
+    MissingRequired(String),
 }
 
 impl PreflightError {
@@ -1823,6 +1878,12 @@ impl PreflightError {
             Self::Malformed => PROTOBUF_DECODE_FAILED_DETAIL,
             Self::Budget => PROTOBUF_BUDGET_DETAIL,
             Self::Depth => PROTOBUF_DEPTH_DETAIL,
+            Self::UnknownClosedEnum => "Message contains 1 unknown field(s)",
+            Self::MissingRequired(name) => {
+                return ProtobufFailure::Invalid(format!(
+                    "Missing required protobuf field: {name}"
+                ));
+            }
         };
         ProtobufFailure::Invalid(detail.to_string())
     }
@@ -1859,6 +1920,15 @@ enum WireFieldShape {
     Message(MessageDescriptor),
     /// A repeated numeric field whose length-delimited form is packed.
     Packed(PackedWidth),
+    /// A CLOSED (proto2) enum field. Each wire occurrence is judged on its own:
+    /// a conforming reader puts an undeclared number in the unknown-field set
+    /// and keeps any earlier declared value, while the reflection decoder simply
+    /// overwrites the field with the last number it read.
+    ClosedEnum {
+        enum_type: EnumDescriptor,
+        repeated: bool,
+        required: bool,
+    },
     /// Anything else: one value per occurrence.
     Other,
 }
@@ -1871,15 +1941,28 @@ enum PackedWidth {
 }
 
 fn wire_field_shape(descriptor: &MessageDescriptor, number: u32) -> WireFieldShape {
-    let (kind, is_list) = if let Some(field) = descriptor.get_field(number) {
-        (field.kind(), field.is_list())
+    let (kind, is_list, required) = if let Some(field) = descriptor.get_field(number) {
+        (
+            field.kind(),
+            field.is_list(),
+            field.cardinality() == Cardinality::Required,
+        )
     } else if let Some(extension) = descriptor.get_extension(number) {
-        (extension.kind(), extension.is_list())
+        (
+            extension.kind(),
+            extension.is_list(),
+            extension.cardinality() == Cardinality::Required,
+        )
     } else {
         return WireFieldShape::Other;
     };
     match kind {
         Kind::Message(message) => WireFieldShape::Message(message),
+        Kind::Enum(enum_type) if enum_is_closed(&enum_type) => WireFieldShape::ClosedEnum {
+            enum_type,
+            repeated: is_list,
+            required,
+        },
         _ if !is_list => WireFieldShape::Other,
         Kind::Double | Kind::Fixed64 | Kind::Sfixed64 => {
             WireFieldShape::Packed(PackedWidth::Fixed64)
@@ -1943,10 +2026,14 @@ fn preflight_protobuf_fields(
     end_group: Option<u32>,
     depth: usize,
     budget: &mut ProtobufDecodePreflight,
+    policy: ProtobufMessagePolicy,
 ) -> Result<usize, PreflightError> {
     if depth > MAX_PROTOBUF_MESSAGE_DEPTH {
         return Err(PreflightError::Depth);
     }
+    // `(field number, saw a declared value)` for every required closed-enum
+    // field that occurred in THIS message. Allocates only when one occurs.
+    let mut required_closed_enums: Vec<(u32, bool)> = Vec::new();
     let mut pos = 0usize;
     while pos < buf.len() {
         let key = read_wire_varint(buf, &mut pos).ok_or(PreflightError::Malformed)?;
@@ -1957,6 +2044,7 @@ fn preflight_protobuf_fields(
         }
         if wire_type == 4 {
             return if end_group == Some(number) {
+                check_required_closed_enums(descriptor, &required_closed_enums, policy)?;
                 Ok(pos)
             } else {
                 Err(PreflightError::Malformed)
@@ -1969,7 +2057,28 @@ fn preflight_protobuf_fields(
         };
         match wire_type {
             0 => {
-                read_wire_varint(buf, &mut pos).ok_or(PreflightError::Malformed)?;
+                let value = read_wire_varint(buf, &mut pos).ok_or(PreflightError::Malformed)?;
+                if let WireFieldShape::ClosedEnum {
+                    enum_type,
+                    required,
+                    ..
+                } = &shape
+                {
+                    let declared = closed_enum_value_is_declared(enum_type, value);
+                    if !declared && policy.reject_unknown {
+                        return Err(PreflightError::UnknownClosedEnum);
+                    }
+                    if *required {
+                        if let Some(index) = required_closed_enums
+                            .iter()
+                            .position(|(field, _)| *field == number)
+                        {
+                            required_closed_enums[index].1 |= declared;
+                        } else {
+                            required_closed_enums.push((number, declared));
+                        }
+                    }
+                }
             }
             1 => {
                 take_wire_bytes(buf, &mut pos, 8).ok_or(PreflightError::Malformed)?;
@@ -1987,12 +2096,58 @@ fn preflight_protobuf_fields(
                     WireFieldShape::Message(nested) if nested.is_map_entry() => {
                         // A map entry is not a reflected message of its own
                         // (its key and value land in the parent's map), so it
-                        // adds no nesting level; its value message does.
-                        preflight_protobuf_fields(payload, Some(&nested), None, depth, budget)?;
+                        // adds no nesting level; its value message does. The
+                        // decoder materializes a DEFAULT value message for every
+                        // entry even when the value field is omitted on the
+                        // wire, so that message is charged here, once per
+                        // entry, and not again for an explicit value.
+                        if matches!(nested.map_entry_value_field().kind(), Kind::Message(_)) {
+                            budget.charge_message()?;
+                        }
+                        preflight_protobuf_fields(
+                            payload,
+                            Some(&nested),
+                            None,
+                            depth,
+                            budget,
+                            policy,
+                        )?;
                     }
                     WireFieldShape::Message(nested) => {
-                        budget.charge_message()?;
-                        preflight_protobuf_fields(payload, Some(&nested), None, depth + 1, budget)?;
+                        let charged_by_map_entry = number == MAP_ENTRY_VALUE_FIELD
+                            && descriptor.is_some_and(MessageDescriptor::is_map_entry);
+                        if !charged_by_map_entry {
+                            budget.charge_message()?;
+                        }
+                        preflight_protobuf_fields(
+                            payload,
+                            Some(&nested),
+                            None,
+                            depth + 1,
+                            budget,
+                            policy,
+                        )?;
+                    }
+                    WireFieldShape::ClosedEnum {
+                        enum_type,
+                        repeated: true,
+                        ..
+                    } => {
+                        // Packed closed-enum list: every element is its own
+                        // occurrence.
+                        let mut element = 0usize;
+                        let mut elements = 0usize;
+                        while element < payload.len() {
+                            let value = read_wire_varint(payload, &mut element)
+                                .ok_or(PreflightError::Malformed)?;
+                            elements += 1;
+                            if policy.reject_unknown
+                                && !closed_enum_value_is_declared(&enum_type, value)
+                            {
+                                return Err(PreflightError::UnknownClosedEnum);
+                            }
+                        }
+                        budget.charge_values(elements)?;
                     }
                     WireFieldShape::Packed(width) => {
                         let elements = match width {
@@ -2004,7 +2159,7 @@ fn preflight_protobuf_fields(
                         };
                         budget.charge_values(elements)?;
                     }
-                    WireFieldShape::Other => {}
+                    WireFieldShape::ClosedEnum { .. } | WireFieldShape::Other => {}
                 }
             }
             3 => {
@@ -2022,6 +2177,7 @@ fn preflight_protobuf_fields(
                     Some(number),
                     depth + 1,
                     budget,
+                    policy,
                 )?;
                 pos += consumed;
             }
@@ -2032,7 +2188,41 @@ fn preflight_protobuf_fields(
         // A group opened in this buffer never closed.
         return Err(PreflightError::Malformed);
     }
+    check_required_closed_enums(descriptor, &required_closed_enums, policy)?;
     Ok(pos)
+}
+
+/// A map entry's value field number (`MapEntry.value = 2`).
+const MAP_ENTRY_VALUE_FIELD: u32 = 2;
+
+/// Whether a wire varint is a declared number of a closed enum. Enum numbers
+/// are `int32` on the wire (negative numbers are sign-extended to ten bytes),
+/// so the truncation matches the decoder's own `int32` read.
+fn closed_enum_value_is_declared(enum_type: &EnumDescriptor, value: u64) -> bool {
+    enum_type.get_value(value as i32).is_some()
+}
+
+/// Refuse a message in which a proto2 `required` closed-enum field occurred
+/// only with undeclared numbers. (A field that never occurred at all is the
+/// post-decode initialization walk's to reject.)
+fn check_required_closed_enums(
+    descriptor: Option<&MessageDescriptor>,
+    seen: &[(u32, bool)],
+    policy: ProtobufMessagePolicy,
+) -> Result<(), PreflightError> {
+    if !policy.check_required {
+        return Ok(());
+    }
+    for (number, seen_declared) in seen {
+        if !seen_declared {
+            let name = descriptor
+                .and_then(|descriptor| descriptor.get_field(*number))
+                .map(|field| field.name().to_string())
+                .unwrap_or_default();
+            return Err(PreflightError::MissingRequired(name));
+        }
+    }
+    Ok(())
 }
 
 fn default_grpc_max_decompressed_size_bytes() -> Result<usize, String> {
@@ -2761,9 +2951,7 @@ fn check_protobuf_message_at(
     if policy.check_required {
         let descriptor = message.descriptor();
         for field in descriptor.fields() {
-            if field.cardinality() == Cardinality::Required
-                && !required_field_present(message, &field)
-            {
+            if field.cardinality() == Cardinality::Required && !message.has_field(&field) {
                 let name = field.name();
                 return Err(format!("Missing required protobuf field: {path}{name}"));
             }
@@ -2774,12 +2962,6 @@ fn check_protobuf_message_at(
     // legal unless it is itself `required`, which the loop above already
     // rejected.
     for (field, value) in message.fields() {
-        // A closed (proto2) enum value outside the declared set is an UNKNOWN
-        // field to a conforming reader, which the reflection decoder instead
-        // stores as an ordinary present number.
-        if policy.reject_unknown && closed_enum_holds_undeclared_value(&field, value) {
-            return Err("Message contains 1 unknown field(s)".to_string());
-        }
         let restore = path.len();
         path.push_str(field.name());
         path.push('.');
@@ -2805,49 +2987,6 @@ fn check_protobuf_message_at(
 /// admits only its declared numbers; a proto3 (open) enum keeps any number.
 fn enum_is_closed(enum_type: &EnumDescriptor) -> bool {
     enum_type.parent_file().syntax() == Syntax::Proto2
-}
-
-/// proto2 initialization presence for a `required` field.
-///
-/// The reflection decoder records every enum number it reads as a present
-/// value, but a conforming proto2 reader moves a closed-enum number outside the
-/// declared set to the unknown-field set, leaving the field ABSENT — so such a
-/// value cannot satisfy `required`.
-fn required_field_present(message: &DynamicMessage, field: &FieldDescriptor) -> bool {
-    if !message.has_field(field) {
-        return false;
-    }
-    let value = message.get_field(field);
-    match (field.kind(), value.as_ref()) {
-        (Kind::Enum(enum_type), ProtobufValue::EnumNumber(number))
-            if enum_is_closed(&enum_type) =>
-        {
-            enum_type.get_value(*number).is_some()
-        }
-        _ => true,
-    }
-}
-
-/// Whether a present closed-enum field (singular, repeated, or a map whose
-/// value type is a closed enum) carries a number outside the declared set.
-fn closed_enum_holds_undeclared_value(field: &FieldDescriptor, value: &ProtobufValue) -> bool {
-    let enum_type = match field.kind() {
-        Kind::Enum(enum_type) => enum_type,
-        Kind::Message(entry) if field.is_map() => match entry.map_entry_value_field().kind() {
-            Kind::Enum(enum_type) => enum_type,
-            _ => return false,
-        },
-        _ => return false,
-    };
-    if !enum_is_closed(&enum_type) {
-        return false;
-    }
-    let undeclared = |value: &ProtobufValue| matches!(value, ProtobufValue::EnumNumber(number) if enum_type.get_value(*number).is_none());
-    match value {
-        ProtobufValue::List(items) => items.iter().any(undeclared),
-        ProtobufValue::Map(entries) => entries.values().any(undeclared),
-        other => undeclared(other),
-    }
 }
 
 fn check_protobuf_message_in_value(
@@ -4181,7 +4320,7 @@ impl Plugin for BodyValidator {
         // carries a body when its headers do not already say.
         self.reject_unsupported_media_types
             && !request_headers_declare_body_framing(&ctx.headers)
-            && !request_opens_tunnel(&ctx.method, &ctx.headers)
+            && !request_opens_tunnel(ctx)
     }
 
     async fn before_proxy(
@@ -4562,6 +4701,12 @@ impl Plugin for BodyValidator {
     ) -> bool {
         self.enforcement_mode == EnforcementMode::Block
             && self.final_response_body_policy_applies(response_content_type)
+            // A status outside `response_status_codes` is never validated, so
+            // its encoded body must not be claimed (decoded, or refused for an
+            // unsupported coding / exhausted budget) on this plugin's behalf.
+            && ctx
+                .origin_http_response_status()
+                .is_none_or(|status| self.response_status_validated(ctx, status))
             && !ctx
                 .metadata
                 .contains_key(crate::proxy::ORIGIN_FRAGMENT_RESPONSE_METADATA_KEY)

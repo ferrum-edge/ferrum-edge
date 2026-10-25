@@ -5923,6 +5923,17 @@ async fn handle_h3_request(
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
+    } else if ctx.route_override_path.is_some() {
+        // Same as the H1/H2 ladder: a path-only route rewrite can select a
+        // method a per-method body policy did not vote for before_proxy.
+        crate::proxy::final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_plugin_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress,
+        )
     } else {
         (
             initial_plugin_needs_request_buffering,

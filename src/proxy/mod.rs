@@ -36763,6 +36763,20 @@ async fn handle_proxy_request_inner(
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
+    } else if ctx.route_override_path.is_some() {
+        // A path-only route rewrite (`mesh_route_dispatch` without a header
+        // change) can select a different gRPC method or operation than the one
+        // the pre-`before_proxy` vote saw. A per-method body policy that voted
+        // "not mine" for the client path must be asked again, or the rewritten
+        // request would stream past it.
+        final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress_before_dispatch,
+        )
     } else {
         (
             initial_requires_request_body_buffering,

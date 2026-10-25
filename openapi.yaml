@@ -31789,7 +31789,8 @@ components:
             a media type outside content_types, an allowlisted type no rule can
             inspect, or a gRPC request when no protobuf request rule is
             configured. Bodyless requests (proven by Content-Length 0 or by the
-            buffered transport), CONNECT, and Upgrade requests are unaffected.
+            buffered transport), CONNECT requests, and frontend-classified
+            WebSocket handshakes are unaffected; a bare Upgrade header is not.
             Requires at least one request validation rule.
         protobuf_descriptor_path:
           type: string
@@ -31844,9 +31845,11 @@ components:
             rejects the configuration. An entry is direction-authoritative: a
             direction it omits is not validated for that method, rather than
             falling back to protobuf_request_type / protobuf_response_type. The
-            request method is taken from the synthetic :path the native gRPC
-            ladder injects, otherwise from grpc_full_method or the request
-            path, so per-method rules apply on HTTP/3 and every dispatcher.
+            method is the trailing /Service/Method of the bound
+            backend-effective path, else (request side) the synthetic :path the
+            native gRPC ladder injects, else grpc_full_method, else the request
+            path, so prefixes and backend base paths cannot change which entry
+            applies and per-method rules apply on HTTP/3 and every dispatcher.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
@@ -31855,9 +31858,11 @@ components:
             the top level and inside every present nested, repeated, map-value,
             oneof, and extension message value, in both directions, under the
             same bounded 32-level / 50000-message walk as the initialization
-            check. A closed (proto2) enum field carrying a number outside the
-            declared set is an unknown field too (and cannot satisfy a required
-            field); open proto3 enums keep any number. The rejection carries a count only, never a field number or
+            check. A closed (proto2) enum is judged per wire occurrence: any
+            occurrence outside the declared set is an unknown field (refused in
+            either order, including packed, map-value, and extension values),
+            and a required closed-enum field with only undeclared occurrences
+            is unset; open proto3 enums keep any number. The rejection carries a count only, never a field number or
             payload byte. This is independent of proto2 required-field
             initialization, which is always enforced: a decoded message that
             omits any proto2 required field, at the top level or inside a
