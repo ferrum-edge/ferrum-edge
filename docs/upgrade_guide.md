@@ -28,6 +28,20 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `oauth2_introspection` `private_key_jwt` assertion audience (#6840)
+
+A `private_key_jwt` client assertion now carries `aud` = the resolved
+introspection endpoint URL (the configured `introspection_endpoint`, or the
+endpoint OIDC discovery resolved) unless the new
+`providers[].client_auth.client_assertion_audience` is set. It no longer
+follows `providers[].issuer`. Providers without `issuer` already used the
+endpoint and are unaffected. If a provider pins `issuer`, uses
+`private_key_jwt`, and its authorization server expects the issuer
+identifier as the assertion audience, add
+`client_assertion_audience: "<issuer>"` to its `client_auth` before
+upgrading; otherwise every uncached introspection call is refused by the
+authorization server and the gateway answers `503`.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

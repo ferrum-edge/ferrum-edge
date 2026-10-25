@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `oauth2_introspection` `private_key_jwt` assertions default to
+  the introspection endpoint audience** (issue #6840). A provider that pinned
+  `issuer` used to sign its client assertion with `aud` = `issuer`, so an
+  authorization server requiring the introspection URL (Okta, for example)
+  refused every call while the issuer pin was on. The assertion `aud` is now
+  the new `client_auth.client_assertion_audience` when set, otherwise the
+  resolved introspection endpoint, independent of `issuer`. Providers whose
+  server requires the issuer as the assertion audience must set
+  `client_assertion_audience` to it.
 - **`oauth2_introspection` concurrency limits are configurable.** The fixed
   32-per-provider / 128-per-process caps on uncached introspection calls are
   replaced by `providers[].max_concurrent_introspections` (default `32`) and a
