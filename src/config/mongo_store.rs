@@ -10068,7 +10068,12 @@ mod inner {
             // secrets (on every Consumer sharing one) before this snapshot
             // can publish or broadcast. Runs before identity quarantine so a
             // consumer that quarantine removes still counts as a key holder.
-            let jwt_quarantined = config.quarantine_invalid_jwt_credentials();
+            let jwt_outcome = config.quarantine_invalid_jwt_credentials_against(
+                &crate::config::types::JwtSharedSecretHistory::default(),
+            );
+            // Hand the stripped shared secrets to the serving `ProxyState`.
+            config.quarantined_jwt_shared_secrets = jwt_outcome.shared;
+            let jwt_quarantined = jwt_outcome.messages;
             for message in &jwt_quarantined {
                 error!(
                     "MongoDB config: {}",

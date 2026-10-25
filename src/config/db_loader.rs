@@ -2730,7 +2730,13 @@ impl DatabaseStore {
         // guard covers stored rows. It runs BEFORE identity quarantine: a
         // consumer that identity quarantine removes still knows its secrets,
         // so it must count as a holder when shared-key ownership is judged.
-        let jwt_quarantined = config.quarantine_invalid_jwt_credentials();
+        let jwt_outcome = config.quarantine_invalid_jwt_credentials_against(
+            &crate::config::types::JwtSharedSecretHistory::default(),
+        );
+        // Hand the stripped shared secrets to the serving `ProxyState`, which
+        // would otherwise receive this snapshot with no trace of them.
+        config.quarantined_jwt_shared_secrets = jwt_outcome.shared;
+        let jwt_quarantined = jwt_outcome.messages;
         if !jwt_quarantined.is_empty() {
             for message in &jwt_quarantined {
                 error!("{}", crate::startup::sanitize_startup_cause(message, &[]));

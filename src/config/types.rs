@@ -362,7 +362,7 @@ fn jwt_credential_value_is_admissible(value: &serde_json::Value) -> bool {
     }
 }
 
-/// Why [`GatewayConfig::quarantine_invalid_jwt_credentials_with_history`]
+/// Why [`GatewayConfig::quarantine_invalid_jwt_credentials_against`]
 /// strips a Consumer's `jwt` credential.
 enum JwtQuarantineReason {
     /// Another Consumer in the namespace holds one of its secrets.
@@ -373,6 +373,88 @@ enum JwtQuarantineReason {
     Weak,
 }
 
+/// Upper bound on the shared-secret digests [`JwtSharedSecretHistory`] keeps
+/// per namespace. Past it the oldest digest is evicted (and the caller warns),
+/// so a config source that keeps presenting new shared secrets cannot grow the
+/// process without bound.
+pub const JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE: usize = 4096;
+
+/// Namespace-bound SHA-256 digest identifying a Consumer `jwt` secret without
+/// retaining it.
+fn jwt_shared_secret_digest(namespace: &str, secret: &str) -> [u8; 32] {
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update(b"ferrum-edge/jwt-shared-secret/v1\0");
+    hasher.update((namespace.len() as u64).to_be_bytes());
+    hasher.update(namespace.as_bytes());
+    hasher.update(secret.as_bytes());
+    hasher.finalize()
+}
+
+/// Consumer `jwt` secrets one quarantine pass saw configured on more than one
+/// Consumer of a namespace, as namespace-bound digests (never the secret).
+///
+/// The quarantine only *reports* these; the owner of a
+/// [`JwtSharedSecretHistory`] merges them once the candidate they came from
+/// is accepted, so a rejected candidate never records anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JwtSharedSecretRecords {
+    entries: Vec<(String, [u8; 32])>,
+}
+
+impl JwtSharedSecretRecords {
+    fn push(&mut self, namespace: &str, secret: &str) {
+        let digest = jwt_shared_secret_digest(namespace, secret);
+        if !self
+            .entries
+            .iter()
+            .any(|(ns, existing)| ns == namespace && *existing == digest)
+        {
+            self.entries.push((namespace.to_string(), digest));
+        }
+    }
+
+    /// Append `other`'s records, skipping duplicates.
+    pub fn extend(&mut self, other: JwtSharedSecretRecords) {
+        for (namespace, digest) in other.entries {
+            if !self
+                .entries
+                .iter()
+                .any(|(ns, existing)| *ns == namespace && *existing == digest)
+            {
+                self.entries.push((namespace, digest));
+            }
+        }
+    }
+
+    /// Number of distinct recorded shared secrets.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Result of [`GatewayConfig::quarantine_invalid_jwt_credentials_against`].
+#[derive(Debug, Default)]
+pub struct JwtQuarantineOutcome {
+    /// One human-readable message per quarantined credential (never the
+    /// secret); callers log these at `error!` severity.
+    pub messages: Vec<String>,
+    /// Secrets shared in this snapshot, for the caller to merge into its
+    /// history once the snapshot is accepted.
+    pub shared: JwtSharedSecretRecords,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NamespaceJwtSharedSecrets {
+    digests: HashSet<[u8; 32]>,
+    /// Insertion order, oldest first, for bounded eviction.
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
 /// Process-local record of Consumer `jwt` secrets that were configured on
 /// more than one Consumer of a namespace.
 ///
@@ -380,39 +462,63 @@ enum JwtQuarantineReason {
 /// be reactivated by a later incremental swap that no longer shows the other
 /// holder (the live snapshot it patches is already quarantined). Entries are
 /// SHA-256 digests bound to the namespace; the secret itself is never kept.
-/// The record only grows; a process restart (an authoritative fresh load)
-/// starts empty.
+/// Each namespace keeps at most
+/// [`JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE`] digests, evicting the
+/// oldest. The record is process-local: a restart starts empty and judges
+/// only the fresh authoritative snapshot, which is why a shared secret must be
+/// replaced on every Consumer that held it.
 #[derive(Debug, Clone, Default)]
 pub struct JwtSharedSecretHistory {
-    digests: HashSet<[u8; 32]>,
+    namespaces: HashMap<String, NamespaceJwtSharedSecrets>,
 }
 
 impl JwtSharedSecretHistory {
-    fn digest(namespace: &str, secret: &str) -> [u8; 32] {
-        let mut hasher = crate::fips::approved::Sha256::new();
-        hasher.update(b"ferrum-edge/jwt-shared-secret/v1\0");
-        hasher.update((namespace.len() as u64).to_be_bytes());
-        hasher.update(namespace.as_bytes());
-        hasher.update(secret.as_bytes());
-        hasher.finalize()
-    }
-
-    pub(crate) fn record(&mut self, namespace: &str, secret: &str) {
-        self.digests.insert(Self::digest(namespace, secret));
-    }
-
     pub(crate) fn contains(&self, namespace: &str, secret: &str) -> bool {
-        !self.digests.is_empty() && self.digests.contains(&Self::digest(namespace, secret))
+        self.namespaces.get(namespace).is_some_and(|recorded| {
+            recorded
+                .digests
+                .contains(&jwt_shared_secret_digest(namespace, secret))
+        })
     }
 
-    /// Number of recorded shared secrets.
+    /// Merge `records` with the default per-namespace bound. Returns how many
+    /// older digests were evicted to stay within it.
+    pub fn merge(&mut self, records: &JwtSharedSecretRecords) -> usize {
+        self.merge_with_limit(records, JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE)
+    }
+
+    /// [`Self::merge`] with an explicit per-namespace bound (at least 1).
+    pub fn merge_with_limit(&mut self, records: &JwtSharedSecretRecords, limit: usize) -> usize {
+        let limit = limit.max(1);
+        let mut evicted = 0;
+        for (namespace, digest) in &records.entries {
+            let recorded = self.namespaces.entry(namespace.clone()).or_default();
+            if recorded.digests.insert(*digest) {
+                recorded.order.push_back(*digest);
+                while recorded.order.len() > limit {
+                    if let Some(oldest) = recorded.order.pop_front() {
+                        recorded.digests.remove(&oldest);
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+        evicted
+    }
+
+    /// Number of recorded shared secrets across namespaces.
     pub fn len(&self) -> usize {
-        self.digests.len()
+        self.namespaces
+            .values()
+            .map(|recorded| recorded.digests.len())
+            .sum()
     }
 
     /// Whether no shared secret has been recorded.
     pub fn is_empty(&self) -> bool {
-        self.digests.is_empty()
+        self.namespaces
+            .values()
+            .all(|recorded| recorded.digests.is_empty())
     }
 }
 /// Minimum byte length for the server-side Basic-auth HMAC secret.
@@ -3654,6 +3760,16 @@ pub struct GatewayConfig {
     /// a rejected `POST /plugins`, prefixed with the plugin name and config id.
     #[serde(skip)]
     pub quarantined_plugin_configs: Vec<String>,
+    /// Consumer `jwt` secrets a full load found shared and stripped
+    /// (namespace-bound digests, never the secret).
+    ///
+    /// DERIVED, PROCESS-LOCAL ONLY: `#[serde(skip)]`, never persisted and
+    /// never on the ConfigSync wire. The SQL/Mongo full loaders fill it so the
+    /// serving `ProxyState` can seed its shared-secret history from a snapshot
+    /// that reaches it already stripped; `ProxyState` takes it on construction
+    /// and on every accepted swap.
+    #[serde(skip)]
+    pub quarantined_jwt_shared_secrets: JwtSharedSecretRecords,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
@@ -5215,10 +5331,11 @@ impl GatewayConfig {
     /// Fail-closed handling of Consumer `jwt` credential policy at full-load
     /// time, for a snapshot judged on its own (no earlier generation).
     ///
-    /// See [`Self::quarantine_invalid_jwt_credentials_with_history`]; this is
-    /// that function with an empty history.
+    /// See [`Self::quarantine_invalid_jwt_credentials_against`]; this is
+    /// that function with an empty history, returning only the messages.
     pub fn quarantine_invalid_jwt_credentials(&mut self) -> Vec<String> {
-        self.quarantine_invalid_jwt_credentials_with_history(&mut JwtSharedSecretHistory::default())
+        self.quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default())
+            .messages
     }
 
     /// Fail-closed handling of Consumer `jwt` credential policy at full-load
@@ -5244,8 +5361,10 @@ impl GatewayConfig {
     ///   carrying a string `secret` with at least [`MIN_JWT_SECRET_LENGTH`]
     ///   non-whitespace characters.
     ///
-    /// Secrets shared in this snapshot are added to `history` (as namespace-
-    /// bound SHA-256 digests, never the secret). The same secret may be
+    /// Secrets shared in this snapshot are returned in
+    /// [`JwtQuarantineOutcome::shared`] (as namespace-bound digests, never the
+    /// secret); `history` itself is only read, so the caller decides whether
+    /// the candidate was accepted before recording them. The same secret may be
     /// reused in a different namespace. Extra legacy fields beside `secret`
     /// (for example a historical `algorithm: HS256` selector) are left to
     /// admission-time validation; the verifier only ever reads `secret`.
@@ -5254,12 +5373,12 @@ impl GatewayConfig {
     /// pre-existing and out-of-band rows and snapshots from sources that
     /// bypass the SQL/Mongo loaders. A stripped credential fails closed: the
     /// `jwt_auth` plugin returns 401 for a consumer with no `jwt` entries.
-    /// Returns one human-readable message per quarantined credential (never
-    /// containing the secret); callers log these at `error!` severity.
-    pub fn quarantine_invalid_jwt_credentials_with_history(
+    /// Messages never contain the secret; callers log them at `error!`.
+    pub fn quarantine_invalid_jwt_credentials_against(
         &mut self,
-        history: &mut JwtSharedSecretHistory,
-    ) -> Vec<String> {
+        history: &JwtSharedSecretHistory,
+    ) -> JwtQuarantineOutcome {
+        let mut shared = JwtSharedSecretRecords::default();
         let decisions: Vec<Option<JwtQuarantineReason>> = {
             let mut holders: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
             for consumer in &self.consumers {
@@ -5277,7 +5396,7 @@ impl GatewayConfig {
             }
             for ((namespace, secret), ids) in &holders {
                 if ids.len() > 1 {
-                    history.record(namespace, secret);
+                    shared.push(namespace, secret);
                 }
             }
 
@@ -5296,9 +5415,10 @@ impl GatewayConfig {
                     if let Some(other_id) = other_holder {
                         return Some(JwtQuarantineReason::Shared(other_id));
                     }
-                    if secrets
-                        .iter()
-                        .any(|secret| history.contains(namespace, secret))
+                    if !history.namespaces.is_empty()
+                        && secrets
+                            .iter()
+                            .any(|secret| history.contains(namespace, secret))
                     {
                         return Some(JwtQuarantineReason::PreviouslyShared);
                     }
@@ -5322,7 +5442,8 @@ impl GatewayConfig {
                      configured on consumer {:?} in namespace {:?} — whoever holds a shared \
                      secret can sign tokens as either Consumer, so the credential is excluded \
                      on every Consumer that shares it. Give each of them a new, distinct \
-                     secret to restore it.",
+                     secret to restore it, before any restart: a restarted process no longer \
+                     knows which secrets were shared.",
                     consumer.id, other_id, consumer.namespace
                 ),
                 JwtQuarantineReason::PreviouslyShared => format!(
@@ -5343,7 +5464,7 @@ impl GatewayConfig {
             });
         }
 
-        messages
+        JwtQuarantineOutcome { messages, shared }
     }
 
     /// Reject a runtime snapshot in which one keyauth key, basicauth username,

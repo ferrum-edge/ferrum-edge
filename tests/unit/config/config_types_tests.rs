@@ -2085,19 +2085,21 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
         jwt_consumer("alice", "alice", &[shared]),
         jwt_consumer("eve", "eve", &[shared]),
     ];
-    assert_eq!(
-        config
-            .quarantine_invalid_jwt_credentials_with_history(&mut history)
-            .len(),
-        2
-    );
+    let outcome = config.quarantine_invalid_jwt_credentials_against(&history);
+    assert_eq!(outcome.messages.len(), 2);
+    assert_eq!(outcome.shared.len(), 1);
+    // The quarantine only reports; the caller records accepted candidates.
+    assert!(history.is_empty());
+    assert_eq!(history.merge(&outcome.shared), 0);
     assert_eq!(history.len(), 1);
 
     // Generation 2: a point delta re-delivers Alice with the same secret on
     // top of the stripped snapshot (Eve's stripped credential is gone).
     config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
     assert!(config.validate_unique_jwt_credentials().is_ok());
-    let messages = config.quarantine_invalid_jwt_credentials_with_history(&mut history);
+    let messages = config
+        .quarantine_invalid_jwt_credentials_against(&history)
+        .messages;
     assert_eq!(messages.len(), 1, "{messages:?}");
     assert!(messages[0].contains("\"alice\""));
     assert!(!messages[0].contains(shared));
@@ -2120,11 +2122,106 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
     config.consumers.push(tenant);
     assert!(
         config
-            .quarantine_invalid_jwt_credentials_with_history(&mut history)
+            .quarantine_invalid_jwt_credentials_against(&history)
+            .messages
             .is_empty()
     );
     assert!(config.consumers[0].has_credential("jwt"));
     assert!(config.consumers[2].has_credential("jwt"));
+}
+
+/// PR #6865 review (SOL-5 / MUSE-4): the history is bounded per namespace;
+/// past the bound the oldest digests are evicted and the eviction is
+/// reported so the caller can warn.
+#[test]
+fn test_jwt_shared_secret_history_is_bounded_per_namespace() {
+    use ferrum_edge::config::types::JwtSharedSecretHistory;
+
+    fn shared_pair(namespace: &str, secret: &str) -> GatewayConfig {
+        let mut alice = jwt_consumer("alice", "alice", &[secret]);
+        alice.namespace = namespace.to_string();
+        let mut eve = jwt_consumer("eve", "eve", &[secret]);
+        eve.namespace = namespace.to_string();
+        let mut config = empty_config();
+        config.consumers = vec![alice, eve];
+        config
+    }
+
+    let mut history = JwtSharedSecretHistory::default();
+    let secrets: Vec<String> = (0..4)
+        .map(|generation| format!("generation-{generation}-shared-jwt-secret-0123456789"))
+        .collect();
+    let mut evicted = 0;
+    for secret in &secrets {
+        let outcome = shared_pair("ferrum", secret)
+            .quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default());
+        evicted += history.merge_with_limit(&outcome.shared, 3);
+    }
+    assert_eq!(evicted, 1, "the fourth distinct secret evicts the oldest");
+    assert_eq!(history.len(), 3);
+
+    // Re-merging an already remembered secret neither grows nor evicts.
+    let repeat = shared_pair("ferrum", &secrets[3])
+        .quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default());
+    assert_eq!(history.merge_with_limit(&repeat.shared, 3), 0);
+    assert_eq!(history.len(), 3);
+
+    // The oldest secret is forgotten; the newest is still enforced.
+    let mut oldest = empty_config();
+    oldest.consumers = vec![jwt_consumer("alice", "alice", &[secrets[0].as_str()])];
+    assert!(
+        oldest
+            .quarantine_invalid_jwt_credentials_against(&history)
+            .messages
+            .is_empty()
+    );
+    let mut newest = empty_config();
+    newest.consumers = vec![jwt_consumer("alice", "alice", &[secrets[3].as_str()])];
+    assert_eq!(
+        newest
+            .quarantine_invalid_jwt_credentials_against(&history)
+            .messages
+            .len(),
+        1
+    );
+
+    // The bound is per namespace: another namespace has its own budget.
+    let other = shared_pair("tenant-b", &secrets[0])
+        .quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default());
+    assert_eq!(history.merge_with_limit(&other.shared, 3), 0);
+    assert_eq!(history.len(), 4);
+    assert_eq!(
+        ferrum_edge::config::types::JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE,
+        4096
+    );
+}
+
+/// PR #6865 review (SOL-4 / MUSE-2): a full loader that strips a shared JWT
+/// secret hands its digest to the serving process through the snapshot.
+#[test]
+fn test_jwt_loader_outcome_reports_stripped_shared_secrets() {
+    let shared = "loader-shared-jwt-secret-at-least-32-chars";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[shared]),
+        jwt_consumer("eve", "eve", &[shared]),
+        jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+    ];
+    let outcome = config.quarantine_invalid_jwt_credentials_against(
+        &ferrum_edge::config::types::JwtSharedSecretHistory::default(),
+    );
+    assert_eq!(outcome.messages.len(), 2);
+    assert_eq!(outcome.shared.len(), 1);
+    assert!(config.quarantined_jwt_shared_secrets.is_empty());
+
+    const SQL: &str = include_str!("../../../src/config/db_loader.rs");
+    const MONGO: &str = include_str!("../../../src/config/mongo_store.rs");
+    for (name, source) in [("SQL", SQL), ("Mongo", MONGO)] {
+        assert!(
+            source.contains("config.quarantined_jwt_shared_secrets = jwt_outcome.shared;"),
+            "{name} full load must hand stripped shared secrets to ProxyState"
+        );
+    }
 }
 
 /// PR #6865 review (MUSE-1): a point-loaded consumer carrying `jwt` escalates
@@ -2166,7 +2263,7 @@ fn test_jwt_secret_policy_is_wired_into_every_boundary() {
     // history; the comparison helper uses a read-only copy of it.
     assert_eq!(
         PROXY
-            .matches("for message in self.quarantine_jwt_credentials(&mut new_config) {")
+            .matches("self.quarantine_jwt_credentials(&mut new_config, Some(")
             .count(),
         2,
         "update_config and apply_incremental must both quarantine JWT credentials"
@@ -2176,13 +2273,20 @@ fn test_jwt_secret_policy_is_wired_into_every_boundary() {
         .nth(1)
         .expect("canonicalize_snapshot_for_comparison");
     let canonicalize = &canonicalize[..canonicalize.find("\n    }\n").expect("function end")];
-    assert!(canonicalize.contains("quarantine_invalid_jwt_credentials_with_history"));
+    assert!(canonicalize.contains("self.quarantine_jwt_credentials(&mut candidate, None)"));
+    // Only accepted candidates record into the history.
+    assert!(PROXY.contains(
+        "if outcome.accepted() {\n            self.record_jwt_shared_secrets(&jwt_shared);"
+    ));
+    assert!(PROXY.contains(
+        "if matches!(&applied, IncrementalApplyResult::Outcome(outcome) if outcome.accepted()) {"
+    ));
 
     // Both full loaders judge JWT ownership before identity quarantine can
     // remove a holder.
     for (name, source) in [("SQL", SQL), ("Mongo", MONGO)] {
         let jwt = source
-            .find("config.quarantine_invalid_jwt_credentials()")
+            .find("config.quarantine_invalid_jwt_credentials_against(")
             .unwrap_or_else(|| panic!("{name} full load must quarantine JWT credentials"));
         let identity = source
             .find("config.quarantine_colliding_consumer_identities()")
