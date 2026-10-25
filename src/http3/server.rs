@@ -4134,6 +4134,20 @@ async fn handle_h3_request(
                 "Not Found",
             )
             .await?;
+            // Same contract as the H1/H2 route miss: global access logs record
+            // it, and without one this is a single pointer check.
+            if let Some(unrouted_log_plugins) =
+                epoch.plugin_cache.unrouted_transaction_log_plugins()
+            {
+                ctx.materialize_headers();
+                crate::proxy::log_unrouted_request(
+                    &unrouted_log_plugins,
+                    &ctx,
+                    StatusCode::NOT_FOUND.as_u16(),
+                    start_time,
+                )
+                .await;
+            }
             return Ok(());
         }
     };

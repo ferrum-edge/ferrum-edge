@@ -518,6 +518,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "waf.would_block_reason",
     "websocket.session.duration_ms",
     "websocket.termination_reason",
+    "websocket.timestamp_disconnected",
     "workload_metrics.captured_b3",
     "workload_metrics.captured_traceparent",
     "workload_metrics.captured_tracestate",

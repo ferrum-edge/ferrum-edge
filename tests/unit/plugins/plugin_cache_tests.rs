@@ -307,26 +307,28 @@ fn cache_diagnostics_withhold_values_before_startup_and_reload_log_emission() {
             vec!["Removed security plugin", "is not supported"],
             false,
         ),
+        // `stdout_logging` is `KeepLastKnownGood`: an unconstructible access
+        // log rejects the generation instead of being omitted.
         (
             "stdout_logging",
             json!({"filter": {"errors_only": DIAGNOSTIC_VALUE}}),
             None,
             vec!["filter.errors_only", "must be a boolean"],
-            true,
+            false,
         ),
         (
             "stdout_logging",
             json!({"filter": {(DIAGNOSTIC_VALUE): true}}),
             None,
             vec!["unknown configuration key(s)", "`stdout_logging.filter`"],
-            true,
+            false,
         ),
         (
             "stdout_logging",
             json!({"filter": {"status_code_max": 918273641}}),
             None,
-            vec!["`filter.status_code_max`", "must be between 0 and 65535"],
-            true,
+            vec!["`filter.status_code_max`", "must be between 0 and 999"],
+            false,
         ),
         (
             "request_size_limiting",
@@ -3070,16 +3072,24 @@ fn istio_route_transform_consumers_preserve_same_name_global_rules() {
 
 #[test]
 fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
+    // `transaction_debugger` is `OptionalFailOpen` (`stdout_logging` is
+    // `KeepLastKnownGood` and would reject the generation instead).
     let config = make_config(
         vec![
             make_proxy("p1", "/api", vec!["ps1"]),
             make_proxy("p2", "/web", vec![]),
         ],
         vec![
-            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config(
+                "g1",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
             make_plugin_config_with_json(
                 "ps1",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::Proxy,
                 Some("p1"),
@@ -3095,8 +3105,69 @@ fn test_invalid_optional_proxy_scoped_plugin_still_shadows_global() {
     assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
     assert_eq!(
         cache.get_plugins("ferrum", "p2")[0].name(),
-        "stdout_logging"
+        "transaction_debugger"
     );
+}
+
+/// `stdout_logging` is the access log and is registered `KeepLastKnownGood`:
+/// a reload that cannot construct it is refused, and the previous generation —
+/// including its logger — keeps serving instead of a logger-less one.
+#[test]
+fn invalid_stdout_logging_reload_keeps_the_previous_logger() {
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("stdout_logging"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood)
+    );
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "access-log",
+            "stdout_logging",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let invalid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "access-log",
+            "stdout_logging",
+            json!({"filtr": {"errors_only": true}}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+
+    assert!(
+        PluginCache::new(&invalid).is_err(),
+        "startup has no previous generation to keep and must fail"
+    );
+
+    let cache = PluginCache::new(&valid).unwrap();
+    let before = cache.get_plugins("ferrum", "p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "stdout_logging");
+
+    let error = cache
+        .rebuild(&invalid)
+        .expect_err("an unconstructible access log must reject the full rebuild");
+    assert!(error.contains("stdout_logging"), "{error}");
+    assert!(Arc::ptr_eq(&before, &cache.get_plugins("ferrum", "p1")));
+
+    let delta = ConfigDelta::compute(&valid, &invalid);
+    let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(&valid, &invalid);
+    cache
+        .apply_delta(
+            &invalid,
+            &proxy_ids,
+            &delta.removed_proxy_ids,
+            delta.global_plugin_configs_changed,
+        )
+        .expect_err("an unconstructible access log must reject the delta reload");
+    let after = cache.get_plugins("ferrum", "p1");
+    assert!(Arc::ptr_eq(&before, &after));
+    assert_eq!(after[0].name(), "stdout_logging");
 }
 
 #[test]
@@ -8603,7 +8674,7 @@ fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
         ],
         vec![make_plugin_config(
             "global-stdout",
-            "stdout_logging",
+            "transaction_debugger",
             PluginScope::Global,
             None,
             true,
@@ -8619,14 +8690,14 @@ fn test_apply_delta_invalid_optional_proxy_scoped_plugin_shadows_global() {
         vec![
             make_plugin_config(
                 "global-stdout",
-                "stdout_logging",
+                "transaction_debugger",
                 PluginScope::Global,
                 None,
                 true,
             ),
             make_plugin_config_with_json(
                 "bad-stdout",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::Proxy,
                 Some("p1"),
@@ -8665,7 +8736,7 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
         ],
         vec![make_plugin_config(
             "global-stdout",
-            "stdout_logging",
+            "transaction_debugger",
             PluginScope::Global,
             None,
             true,
@@ -8681,14 +8752,14 @@ fn test_apply_delta_invalid_optional_proxy_group_plugin_shadows_global() {
         vec![
             make_plugin_config(
                 "global-stdout",
-                "stdout_logging",
+                "transaction_debugger",
                 PluginScope::Global,
                 None,
                 true,
             ),
             make_plugin_config_with_json(
                 "bad-group",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::ProxyGroup,
                 None,
@@ -11042,10 +11113,16 @@ fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
             make_proxy("p2", "/web", vec![]),
         ],
         vec![
-            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config(
+                "g1",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
             make_plugin_config_with_json(
                 "group1",
-                "stdout_logging",
+                "transaction_debugger",
                 json!("bad-config"),
                 PluginScope::ProxyGroup,
                 None,
@@ -11061,7 +11138,7 @@ fn test_invalid_optional_proxy_group_plugin_still_shadows_global() {
     assert_eq!(cache.get_plugins("ferrum", "p2").len(), 1);
     assert_eq!(
         cache.get_plugins("ferrum", "p2")[0].name(),
-        "stdout_logging"
+        "transaction_debugger"
     );
 }
 
@@ -14847,5 +14924,85 @@ fn plugin_instance_wrapper_forwards_every_plugin_trait_method() {
     assert!(
         stale.is_empty(),
         "PluginInstanceWrapper overrides names the Plugin trait no longer declares: {stale:?}"
+    );
+}
+
+/// A route-miss `404` has no proxy view, so its summary goes to the global
+/// access logs the cache precomputes: global, trigger-free `stdout_logging`
+/// instances only. A generation without one exposes nothing, which is what
+/// keeps the dispatchers' no-logger route miss allocation-free.
+#[test]
+fn unrouted_transaction_log_plugins_are_global_trigger_free_stdout_loggers() {
+    let without_global_logger = make_config(
+        vec![make_proxy("p1", "/api", vec!["scoped-log"])],
+        vec![
+            make_plugin_config(
+                "scoped-log",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "global-debugger",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&without_global_logger).unwrap();
+    assert!(
+        cache.unrouted_transaction_log_plugins().is_empty(),
+        "proxy-scoped loggers and other global sinks never receive route misses"
+    );
+
+    let trigger: PluginTrigger = serde_json::from_value(json!({
+        "when": {"match": {"method": ["GET"]}}
+    }))
+    .unwrap();
+    let with_global_logger = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config(
+                "global-log",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config_with_priority(
+                "gated-log",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+                None,
+                Some(trigger),
+            ),
+            make_plugin_config(
+                "global-debugger",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    cache.rebuild(&with_global_logger).unwrap();
+    let sinks = cache.unrouted_transaction_log_plugins();
+    assert_eq!(
+        sinks.len(),
+        1,
+        "only the trigger-free global stdout_logging instance receives route misses"
+    );
+    assert_eq!(sinks[0].name(), "stdout_logging");
+    assert!(!sinks[0].has_execution_trigger());
+
+    cache.rebuild(&without_global_logger).unwrap();
+    assert!(
+        cache.unrouted_transaction_log_plugins().is_empty(),
+        "removing the global logger restores the no-logger route-miss path"
     );
 }

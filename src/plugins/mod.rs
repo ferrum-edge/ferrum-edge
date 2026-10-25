@@ -14173,7 +14173,9 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
         "transaction_log_schema",
         PluginFailurePolicy::KeepLastKnownGood,
     ),
-    builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
+    // The access log is an audit trail: a reload that cannot construct it keeps
+    // the previous generation instead of publishing one without it.
+    builtin_plugin("stdout_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("tcp_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),

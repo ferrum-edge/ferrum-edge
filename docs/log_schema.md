@@ -471,7 +471,7 @@ list and serializes as `[REDACTED]`.
 
 | Plugin | Schema-aware output | Notes |
 |---|---|---|
-| `stdout_logging` | Full | Reserves bounded stdout queue capacity before serialization; independent of `FERRUM_LOG_LEVEL`. Optional flat filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) or compiled `expression` tree runs before schema application. |
+| `stdout_logging` | Full | Reserves bounded stdout queue capacity before serialization; independent of `FERRUM_LOG_LEVEL`. Optional flat filter (`status_code_min/max`, `min_latency_ms`, `errors_only`) or compiled `expression` tree, then optional `sampling`, run before schema application. |
 | `http_logging` | Full | Batched JSON array. |
 | `tcp_logging` | Full | NDJSON, one line per entry. |
 | `udp_logging` | Full | Batched JSON array per UDP datagram. Operators should keep per-summary size under MTU. |

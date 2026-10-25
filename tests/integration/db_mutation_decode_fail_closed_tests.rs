@@ -367,8 +367,8 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
     // insert stands in for a row written before the constructor was tightened.
     insert_named_plugin(
         &store,
-        "stdout-typo",
-        "stdout_logging",
+        "debugger-typo",
+        "transaction_debugger",
         r#"{"filtr":{}}"#,
         &ts,
     )
@@ -397,15 +397,15 @@ async fn serving_load_quarantines_unconstructible_plugin_row_while_cp_load_rejec
         "the quarantine must be reported so database mode raises config_rejected"
     );
     assert!(
-        runtime_config.quarantined_plugin_configs[0].contains("stdout-typo")
-            && runtime_config.quarantined_plugin_configs[0].contains("stdout_logging"),
+        runtime_config.quarantined_plugin_configs[0].contains("debugger-typo")
+            && runtime_config.quarantined_plugin_configs[0].contains("transaction_debugger"),
         "the quarantine message names the plugin and its config id: {:?}",
         runtime_config.quarantined_plugin_configs
     );
 
     // Control plane: an unconstructible row whose plugin is NOT OptionalFailOpen
     // is refused outright, so it is never broadcast to the data-plane fleet.
-    // (The `stdout_logging` typo above is exempt in both modes — a serving mode
+    // (The `transaction_debugger` typo above is exempt in both modes — a serving mode
     // quarantines it and the CP omits it with a warning — so the CP half of
     // this contract needs a FailClosed row: the exact reproduction from issue
     // #4526, a closed config object with a typo'd key.)

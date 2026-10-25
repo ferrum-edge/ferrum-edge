@@ -307,8 +307,12 @@ that token covers is labelled `dispatch_policy_rejected` here). Access-log
 `ferrum_plugin_log_sink_records_accepted_total{plugin}` publish the record
 accounting of the per-plugin observability sinks (`http_logging`,
 `tcp_logging`, `udp_logging`, `ws_logging`, `statsd_logging`, `loki_logging`,
-`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`), so a
-truncated audit trail is visible on `/metrics` rather than only in logs.
+`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`,
+`stdout_logging`), so a truncated audit trail is visible on `/metrics` rather
+than only in logs. `stdout_logging` counts its access records' outcomes at the
+shared process stdout queue (`queue_full` is that queue's saturation), so
+access-record loss is attributable apart from runtime tracing records;
+`ferrum_log_sink_*{sink="stdout"}` counts both together.
 
 These are **not** the same as `ferrum_log_sink_*{sink}`, which covers only the
 process-global stdout/stderr writers, and not the same as
@@ -318,7 +322,7 @@ batch-materialization layer for the process as a whole.
 Both label values come from fixed compile-time sets and never carry an
 endpoint, topic, namespace, policy id, or record content:
 
-| `plugin` | one of the nine sinks above, or `other` for a sink identity outside the closed set |
+| `plugin` | one of the ten sinks above, or `other` for a sink identity outside the closed set |
 | --- | --- |
 | `reason` | `batch_discard`, `byte_budget`, `queue_full`, `record_too_large`, `shutdown`, `sink_error` |
 
