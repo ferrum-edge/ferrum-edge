@@ -106,6 +106,7 @@ fn empty_proxy_metrics_serializes_mode_skeletons_for_cp_and_node_agent() {
             value["tcp_connection_throttle"]["replica_limit_behavior"],
             "configured_limit_per_replica"
         );
+        assert_eq!(value["tcp_connection_throttle"]["active_connections"], 0);
     }
 }
 

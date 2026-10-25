@@ -3455,15 +3455,23 @@ pub(crate) async fn run_tcp_stream_connect_plugins(
                 proxy_id = %proxy_id,
                 client = %client_ip,
                 connection = connection_label,
+                plugin = plugin.name(),
                 "TCP stream connection rejected by plugin"
             );
             // Finalize after the rejecting hook (and every prior hook) ran,
             // before the caller emits the disconnect summary. Non-mesh streams
             // carry no mesh metadata and are a no-op here.
             crate::plugins::mesh::prometheus_helpers::finalize_mesh_tcp_opened_stream(stream_ctx);
-            return Err(
-                StreamSetupError::new(StreamSetupKind::RejectedByPlugin, rejection_detail).into(),
-            );
+            // Name the refusing plugin in the setup error, which becomes the
+            // disconnect summary's `connection_error`, so a throttle refusal is
+            // distinguishable from an ACL/WAF/policy one. The message is
+            // formatted once either way, so naming the plugin adds no
+            // allocation.
+            return Err(StreamSetupError::new(
+                StreamSetupKind::RejectedByPlugin,
+                format_args!("{} {rejection_detail}", plugin.name()),
+            )
+            .into());
         }
     }
     // A withdrawal that landed as the last hook returned is settled here rather

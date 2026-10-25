@@ -4392,6 +4392,18 @@ pub mod _test_support {
         )
     }
 
+    // ── plugins/ws_logging ──────────────────────────────────────────────────
+    /// Construct WebSocket logging against a test-owned retained-byte ceiling,
+    /// covering both record admission and the persistent connection's codec
+    /// output charge.
+    pub fn ws_logging_with_ceiling_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+    ) -> Result<crate::plugins::ws_logging::WsLogging, String> {
+        crate::plugins::ws_logging::WsLogging::new_with_ceiling(config, http_client, ceiling)
+    }
+
     /// Deterministic probe: an immediate librdkafka `QueueFull` waits for
     /// queue space within `budget` instead of dropping the record at once, and
     /// a saturated producer stops waiting until an enqueue succeeds.
@@ -9735,6 +9747,22 @@ pub mod _test_support {
         .await
     }
 
+    /// The production successful-WebSocket-handshake response header pass,
+    /// including the matched route response-header list.
+    pub fn finalize_successful_websocket_response_headers_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::finalize_successful_websocket_response_headers(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+        );
+    }
+
     /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
     /// rejection parts (status, body, headers) when an `after_proxy` hook
     /// rejects or exhausts the RPC deadline, so tests can assert which gateway
@@ -10370,6 +10398,15 @@ pub mod _test_support {
 
     pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
         crate::proxy::request_may_have_body(method, headers)
+    }
+
+    /// Whether the HTTP/1.1 dispatchers add explicit `Transfer-Encoding:
+    /// chunked` for this method and outbound body.
+    pub fn h1_request_requires_explicit_chunked_framing<B>(method: &str, body: &B) -> bool
+    where
+        B: http_body::Body + ?Sized,
+    {
+        crate::proxy::h1_request_requires_explicit_chunked_framing(method, body)
     }
 
     /// Proxy core's stale request-digest retirement over the final outbound
@@ -11204,6 +11241,16 @@ pub mod _test_support {
     ) -> Option<std::time::Duration> {
         ctx.credential_deadline_at
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// Whether `ctx` carries, or would admit, a verified peer SPIFFE identity
+    /// — the HBONE refusal paths' peerless classifier. Exposed so external
+    /// tests can pin its agreement with `spiffe_identity` admission after a
+    /// captured deadline elapses.
+    pub fn has_verified_peer_spiffe_identity_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::plugins::mesh::spiffe_identity::has_verified_peer_spiffe_identity(ctx)
     }
 
     /// The accepted request credential's monotonic deadline Instant, if any.

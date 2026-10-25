@@ -887,7 +887,11 @@ fn cp_admission_skips_disabled_and_optional_fail_open_plugin_configs() {
     let config = GatewayConfig {
         plugin_configs: vec![
             disabled,
-            plugin_config_for_gate("stdout-typo", "stdout_logging", json!({"filtr": {}})),
+            plugin_config_for_gate(
+                "debugger-typo",
+                "transaction_debugger",
+                json!({"filtr": {}}),
+            ),
         ],
         ..GatewayConfig::default()
     };
@@ -936,7 +940,11 @@ fn serving_mode_quarantine_drops_only_unconstructible_optional_plugins() {
                 "request_size_limiting",
                 json!({"max_bytes": 1024, "max_bytez": 1}),
             ),
-            plugin_config_for_gate("stdout-typo", "stdout_logging", json!({"filtr": {}})),
+            plugin_config_for_gate(
+                "debugger-typo",
+                "transaction_debugger",
+                json!({"filtr": {}}),
+            ),
             plugin_config_for_gate("cid", "correlation_id", json!({})),
         ],
         ..GatewayConfig::default()
@@ -947,7 +955,7 @@ fn serving_mode_quarantine_drops_only_unconstructible_optional_plugins() {
 
     assert_eq!(quarantined.len(), 1, "only the bad row is quarantined");
     assert!(
-        quarantined[0].contains("stdout-typo"),
+        quarantined[0].contains("debugger-typo"),
         "the quarantine message names the offending plugin config: {quarantined:?}"
     );
     let surviving: Vec<&str> = config

@@ -1717,7 +1717,7 @@ Fields covered by the schema include:
 | `serverless_function` | `function_url`, `aws_endpoint_url` | structural URL |
 | `serverless_function` | `azure_function_key` | `[REDACTED]` (sent verbatim as `x-functions-key`) |
 | `http_logging`, `loki_logging`, `ws_logging` | `endpoint_url` | structural URL |
-| `http_logging`, `loki_logging` | `custom_headers.*` | `[REDACTED]` |
+| `http_logging`, `loki_logging`, `ws_logging` | `custom_headers.*` | `[REDACTED]` |
 | `loki_logging` | `authorization_header` | `[REDACTED]` |
 | `otel_tracing` | `endpoint` | structural URL |
 | `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |

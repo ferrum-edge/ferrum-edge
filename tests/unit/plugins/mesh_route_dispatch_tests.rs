@@ -1100,7 +1100,7 @@ fn explicit_tls_override_applies_to_clone() {
     let proxy = test_proxy();
     let mut ctx = ctx();
     ctx.route_override_backend_host = Some("canary.svc".to_string());
-    ctx.route_override_resolved_tls = Some(BackendTlsConfig {
+    ctx.route_override_resolved_tls = Some(Arc::new(BackendTlsConfig {
         client_cert_path: Some("/certs/canary.pem".to_string()),
         client_key_path: Some("/certs/canary.key".to_string()),
         server_ca_cert_path: Some("/certs/canary-ca.pem".to_string()),
@@ -1110,7 +1110,7 @@ fn explicit_tls_override_applies_to_clone() {
         san_allow_list_key_digest: None,
         tls_refused: false,
         suppress_global_client_identity: false,
-    });
+    }));
 
     let result = ctx.apply_route_overrides(Arc::clone(&proxy));
     assert_eq!(result.backend_host, "canary.svc");
@@ -3462,4 +3462,517 @@ async fn node_waypoint_authz_denial_carries_no_route_response_transform() {
         "a security denial must not carry route response headers"
     );
     assert!(!request.route_override_response_transform_published);
+}
+
+// ── plugin-review hardening: operand grammar, Host ownership, observability,
+//    shared compiled policy, Istio match parity ─────────────────────────────
+
+fn redirect_rule(redirect: serde_json::Value) -> serde_json::Value {
+    json!({"rules": [{"match": {"methods": ["GET"]}, "redirect": redirect}]})
+}
+
+fn rewrite_rule(rewrite: serde_json::Value) -> serde_json::Value {
+    json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "api"},
+        "rewrite": rewrite
+    }]})
+}
+
+#[test]
+fn redirect_and_authority_operands_must_be_url_grammar() {
+    // Each of these was admitted and then corrupted `Location` / `Host`, or
+    // answered 400 on every matching request (mesh_route_dispatch-CLAUDE-1).
+    for (config, needle) in [
+        (
+            redirect_rule(json!({"uri": "new"})),
+            "redirect.uri` must be an absolute path",
+        ),
+        (
+            redirect_rule(json!({"uri": "/%2e%2e/admin"})),
+            "redirect.uri` path is not canonical",
+        ),
+        (
+            redirect_rule(json!({"uri": "/a\\b"})),
+            "redirect.uri` path is not canonical",
+        ),
+        (
+            redirect_rule(json!({"uri": "/new#frag"})),
+            "redirect.uri` must not contain a fragment",
+        ),
+        (
+            redirect_rule(json!({"uri": "/new?x=1", "match_prefix": "/old"})),
+            "redirect.uri` must not carry a query",
+        ),
+        (
+            redirect_rule(json!({"authority": "a/b"})),
+            "redirect.authority` must be `host` or `host:port`",
+        ),
+        (
+            redirect_rule(json!({"authority": "user@host.example"})),
+            "redirect.authority` must be `host` or `host:port`",
+        ),
+        (
+            redirect_rule(json!({"authority": "host.example:0"})),
+            "redirect.authority` must be `host` or `host:port`",
+        ),
+        (
+            redirect_rule(json!({"authority": "::1"})),
+            "redirect.authority` must be `host` or `host:port`",
+        ),
+        (
+            rewrite_rule(json!({"authority": "backend/internal"})),
+            "rewrite.authority` must be `host` or `host:port`",
+        ),
+        (
+            rewrite_rule(json!({"authority": "user@backend"})),
+            "rewrite.authority` must be `host` or `host:port`",
+        ),
+        (
+            rewrite_rule(json!({"authority": "[::1"})),
+            "rewrite.authority` must be `host` or `host:port`",
+        ),
+    ] {
+        let err = MeshRouteDispatch::new(&config)
+            .expect_err(&format!("{config} must be refused at construction"));
+        assert!(err.contains(needle), "{config}: got {err}");
+    }
+
+    for config in [
+        redirect_rule(json!({"uri": "/new?x=1"})),
+        redirect_rule(json!({"uri": "/", "match_prefix": ""})),
+        redirect_rule(json!({"authority": "[::1]:8443"})),
+        redirect_rule(json!({"authority": "api.example.com:8080"})),
+        rewrite_rule(json!({"authority": "internal.svc:8443"})),
+        rewrite_rule(json!({"authority": "[2001:db8::10]:8080"})),
+        rewrite_rule(json!({"authority": "backend_internal.example"})),
+    ] {
+        MeshRouteDispatch::new(&config).unwrap_or_else(|err| panic!("{config}: {err}"));
+    }
+}
+
+/// Stand-in for any earlier plugin that legitimately owns the forwarded Host
+/// (mesh_route_dispatch-SOL-2). It runs before the dispatch block.
+struct EarlierHostPolicy;
+
+#[async_trait::async_trait]
+impl Plugin for EarlierHostPolicy {
+    fn name(&self) -> &str {
+        "custom_earlier_host_policy"
+    }
+
+    fn priority(&self) -> u16 {
+        2990
+    }
+
+    fn modifies_request_headers(&self) -> bool {
+        true
+    }
+
+    async fn before_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        headers.insert("host".to_string(), "tenant-a.internal".to_string());
+        PluginResult::Continue
+    }
+}
+
+/// The clone-path request a header-modifying chain sees: `ctx.headers` keeps
+/// the client's original Host while the chain threads a cloned map.
+fn clone_path_request() -> (RequestContext, HashMap<String, String>) {
+    let mut request = ctx();
+    request.headers = HashMap::from([("host".to_string(), "public.example".to_string())]);
+    let headers = request.headers.clone();
+    (request, headers)
+}
+
+#[tokio::test]
+async fn non_authority_rule_keeps_an_earlier_plugins_host() {
+    let dispatch = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"backend_host": "backend.internal", "backend_port": 8080}
+    }]}))
+    .expect("dispatch config");
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(EarlierHostPolicy), Arc::new(dispatch)];
+    let (mut request, mut headers) = clone_path_request();
+
+    let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+        &plugins,
+        &mut request,
+        &mut headers,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(
+        request.route_override_backend_host.as_deref(),
+        Some("backend.internal")
+    );
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("tenant-a.internal"),
+        "a rule without an authority rewrite must not restore the client Host over \
+         another plugin's Host policy"
+    );
+}
+
+#[tokio::test]
+async fn later_rule_undoes_only_the_dispatchers_own_host_rewrite() {
+    let rewriting = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "internal"},
+        "rewrite": {"authority": "internal.svc"}
+    }]}))
+    .expect("rewriting instance");
+    let plain = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "other"}
+    }]}))
+    .expect("plain instance");
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(EarlierHostPolicy),
+        Arc::new(rewriting),
+        Arc::new(plain),
+    ];
+    let (mut request, mut headers) = clone_path_request();
+
+    let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+        &plugins,
+        &mut request,
+        &mut headers,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(request.route_override_upstream_id.as_deref(), Some("other"));
+    assert!(request.route_override_authority.is_none());
+    assert_eq!(
+        headers.get("host").map(String::as_str),
+        Some("tenant-a.internal"),
+        "the stale dispatcher rewrite is undone back to the Host that was live before it"
+    );
+}
+
+#[tokio::test]
+async fn matched_rule_publishes_index_and_name_metadata() {
+    use ferrum_edge::plugins::mesh_route_dispatch::{
+        RULE_INDEX_METADATA_KEY, RULE_NAME_METADATA_KEY,
+    };
+    use ferrum_edge::plugins::utils::metadata_redaction::metadata_value_is_redacted_with;
+
+    let plugin = MeshRouteDispatch::new(&json!({"rules": [
+        {
+            "name": "canary",
+            "match": {"headers": {"x-canary": "1"}},
+            "destination": {"upstream_id": "canary"}
+        },
+        {"match": {"methods": ["GET"]}, "destination": {"upstream_id": "stable"}}
+    ]}))
+    .expect("named rules");
+
+    let mut request = ctx();
+    let mut headers = HashMap::from([("x-canary".to_string(), "1".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut request, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        request
+            .metadata
+            .get(RULE_INDEX_METADATA_KEY)
+            .map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        request
+            .metadata
+            .get(RULE_NAME_METADATA_KEY)
+            .map(String::as_str),
+        Some("canary")
+    );
+
+    // A later unnamed match replaces the index and withdraws the stale name.
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut request, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        request
+            .metadata
+            .get(RULE_INDEX_METADATA_KEY)
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(!request.metadata.contains_key(RULE_NAME_METADATA_KEY));
+
+    // Both keys are reviewed log fields, not redacted by default.
+    for key in [RULE_INDEX_METADATA_KEY, RULE_NAME_METADATA_KEY] {
+        assert!(!metadata_value_is_redacted_with(key, &[], &[]), "{key}");
+    }
+}
+
+#[tokio::test]
+async fn redirect_carries_match_metadata_but_a_node_waypoint_veto_does_not() {
+    use ferrum_edge::plugins::mesh_route_dispatch::{
+        RULE_INDEX_METADATA_KEY, RULE_NAME_METADATA_KEY,
+    };
+
+    let redirect = MeshRouteDispatch::new(&json!({"rules": [{
+        "name": "moved",
+        "match": {"methods": ["GET"]},
+        "redirect": {"uri": "/new", "redirect_code": 302}
+    }]}))
+    .expect("redirect rule");
+    let mut redirected = ctx();
+    assert!(matches!(
+        redirect
+            .before_proxy(&mut redirected, &mut HashMap::new())
+            .await,
+        PluginResult::Reject {
+            status_code: 302,
+            ..
+        }
+    ));
+    assert_eq!(
+        redirected
+            .metadata
+            .get(RULE_NAME_METADATA_KEY)
+            .map(String::as_str),
+        Some("moved")
+    );
+
+    let vetoed = MeshRouteDispatch::new(&json!({"rules": [{
+        "name": "canary",
+        "match": {"methods": ["GET"]},
+        "destination": {"upstream_id": "canary"}
+    }]}))
+    .expect("vetoed rule");
+    let mut denied = ctx();
+    denied.metadata.insert(
+        "mesh_authz.node_waypoint_authorized_upstream_id".to_string(),
+        "stable".to_string(),
+    );
+    assert!(matches!(
+        vetoed.before_proxy(&mut denied, &mut HashMap::new()).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert!(!denied.metadata.contains_key(RULE_INDEX_METADATA_KEY));
+    assert!(!denied.metadata.contains_key(RULE_NAME_METADATA_KEY));
+}
+
+#[test]
+fn rule_name_is_a_bounded_printable_token() {
+    let named = |name: serde_json::Value| {
+        json!({"rules": [{
+            "name": name,
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "api"}
+        }]})
+    };
+    for bad in [json!(""), json!("has space"), json!("x".repeat(129))] {
+        let err = MeshRouteDispatch::new(&named(bad.clone()))
+            .expect_err(&format!("name {bad} must be refused"));
+        assert!(err.contains("rules[0].name"), "{bad}: {err}");
+    }
+    MeshRouteDispatch::new(&named(json!("ns/vs:route-1"))).expect("printable label");
+}
+
+#[tokio::test]
+async fn matched_rule_shares_its_compiled_tls_and_retry_policy() {
+    // mesh_route_dispatch-CLAUDE-3: a match publishes the policy compiled at
+    // load (a refcount bump), never a per-request deep clone.
+    let plugin = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {
+            "backend_host": "api.internal",
+            "backend_port": 443,
+            "backend_tls": {"sni": "api.internal", "san_allow_list": ["api.internal"]}
+        },
+        "retry": {"max_retries": 2, "retryable_status_codes": [503]}
+    }]}))
+    .expect("tls + retry rule");
+
+    let mut first = ctx();
+    let mut second = ctx();
+    let _ = plugin.before_proxy(&mut first, &mut HashMap::new()).await;
+    let _ = plugin.before_proxy(&mut second, &mut HashMap::new()).await;
+
+    let (Some(first_tls), Some(second_tls)) = (
+        first.route_override_resolved_tls.as_ref(),
+        second.route_override_resolved_tls.as_ref(),
+    ) else {
+        panic!("both requests must publish the rule TLS");
+    };
+    assert!(Arc::ptr_eq(first_tls, second_tls));
+    let first_retry = first
+        .route_override_retry
+        .clone()
+        .flatten()
+        .expect("first retry");
+    let second_retry = second
+        .route_override_retry
+        .clone()
+        .flatten()
+        .expect("second retry");
+    assert!(Arc::ptr_eq(&first_retry, &second_retry));
+
+    // The baked effective proxy still carries the policy by value.
+    let effective = first.apply_route_overrides(test_proxy());
+    assert_eq!(effective.resolved_tls.sni.as_deref(), Some("api.internal"));
+    assert_eq!(
+        effective.retry.as_ref().map(|retry| retry.max_retries),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn without_headers_vetoes_only_a_present_matching_header() {
+    let plugin = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {
+            "methods": ["GET"],
+            "without_headers": {
+                "X-Legacy": {"regex": ".*"},
+                "x-env": "prod"
+            }
+        },
+        "destination": {"upstream_id": "modern"}
+    }]}))
+    .expect("without_headers rule");
+
+    for (headers, routed) in [
+        (vec![], true),
+        (vec![("x-env", "dev")], true),
+        (vec![("x-legacy", "")], false),
+        (vec![("x-legacy", "1")], false),
+        (vec![("x-env", "prod")], false),
+    ] {
+        let mut request = ctx();
+        let mut headers: HashMap<String, String> = headers
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let _ = plugin.before_proxy(&mut request, &mut headers).await;
+        assert_eq!(
+            request.route_override_upstream_id.is_some(),
+            routed,
+            "{headers:?}"
+        );
+    }
+
+    let err = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"without_headers": {"x bad": "1"}},
+        "destination": {"upstream_id": "modern"}
+    }]}))
+    .expect_err("an invalid negated header name can never be evaluated");
+    assert!(err.contains("match.without_headers"), "got {err}");
+}
+
+#[tokio::test]
+async fn query_param_string_match_supports_prefix_and_full_regex() {
+    let plugin = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"query_params": {
+            "tier": {"prefix": "gold"},
+            "build": {"regex": "v[0-9]+"},
+            "lang": "en"
+        }},
+        "destination": {"upstream_id": "matched"}
+    }]}))
+    .expect("query StringMatch rule");
+    for (query, routed) in [
+        ("tier=gold-1&build=v12&lang=en", true),
+        ("tier=silver&build=v12&lang=en", false),
+        ("tier=gold&build=v12x&lang=en", false),
+        ("tier=gold&build=v1&lang=fr", false),
+        ("tier=gold&lang=en", false),
+    ] {
+        let mut request = ctx();
+        request.set_raw_query_string(query.to_string());
+        let _ = plugin.before_proxy(&mut request, &mut HashMap::new()).await;
+        assert_eq!(
+            request.route_override_upstream_id.is_some(),
+            routed,
+            "{query}"
+        );
+    }
+
+    let err = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"query_params": {"tier": {"prefix": ""}}},
+        "destination": {"upstream_id": "matched"}
+    }]}))
+    .expect_err("an empty query prefix would match every value");
+    assert!(err.contains("match.query_params"), "got {err}");
+}
+
+#[tokio::test]
+async fn port_predicate_reads_only_trusted_port_provenance() {
+    let plugin = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"port": 8080},
+        "destination": {"upstream_id": "port-8080"}
+    }]}))
+    .expect("port rule");
+
+    let mut listener = ctx();
+    listener.frontend_listen_port = Some(8080);
+    let _ = plugin
+        .before_proxy(&mut listener, &mut HashMap::new())
+        .await;
+    assert_eq!(
+        listener.route_override_upstream_id.as_deref(),
+        Some("port-8080")
+    );
+
+    // Capture rewrote the accept socket: the original destination wins.
+    let mut captured = ctx();
+    captured.frontend_listen_port = Some(15001);
+    captured.orig_dst = Some("10.0.0.7:8080".parse().expect("socket addr"));
+    let _ = plugin
+        .before_proxy(&mut captured, &mut HashMap::new())
+        .await;
+    assert_eq!(
+        captured.route_override_upstream_id.as_deref(),
+        Some("port-8080")
+    );
+
+    // A Host header naming the port is not port provenance.
+    let mut spoofed = ctx();
+    spoofed.frontend_listen_port = Some(9090);
+    let mut headers = HashMap::from([("host".to_string(), "api.example:8080".to_string())]);
+    let _ = plugin.before_proxy(&mut spoofed, &mut headers).await;
+    assert!(spoofed.route_override_upstream_id.is_none());
+
+    let mut unknown = ctx();
+    let _ = plugin.before_proxy(&mut unknown, &mut HashMap::new()).await;
+    assert!(unknown.route_override_upstream_id.is_none());
+
+    let err = MeshRouteDispatch::new(&json!({"rules": [{
+        "match": {"port": 0},
+        "destination": {"upstream_id": "port-8080"}
+    }]}))
+    .expect_err("port 0 can never be addressed");
+    assert!(err.contains("match.port"), "got {err}");
+}
+
+#[test]
+fn redirect_uri_query_admits_only_printable_ascii() {
+    // PR6821-SOL-3: a raw control byte in the redirect's own query passed
+    // admission and made the response silently drop `Location`.
+    for uri in [
+        "/new?x=\u{0}",
+        "/new?x=\u{7}",
+        "/new?x=\u{7f}",
+        "/new?x=caf\u{e9}",
+    ] {
+        let err = MeshRouteDispatch::new(&redirect_rule(json!({"uri": uri})))
+            .expect_err(&format!("{uri:?} must be refused"));
+        assert!(
+            err.contains("redirect.uri` must contain only printable ASCII"),
+            "{uri:?}: {err}"
+        );
+    }
+    MeshRouteDispatch::new(&redirect_rule(json!({"uri": "/new?x=%00&name=caf%C3%A9"})))
+        .expect("percent-encoded query text is kept verbatim");
 }

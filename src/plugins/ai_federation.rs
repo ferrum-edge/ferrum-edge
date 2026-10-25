@@ -8132,7 +8132,7 @@ impl AiFederation {
             // inherited `Proxy.dns_override` explicitly.
             ctx.route_override_dns_policy = super::RouteOverrideDnsPolicy::ClearInherited;
             ctx.route_override_resolved_tls = if target.scheme == BackendScheme::Https {
-                Some(BackendTlsConfig::default_verify())
+                Some(Arc::new(BackendTlsConfig::default_verify()))
             } else {
                 // Plaintext provider: no committed TLS configuration at all,
                 // pinned so the witness cannot be satisfied by a later plugin

@@ -214,7 +214,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "spiffe_identity",
         classification: BuiltinPluginClassification::Public,
         priority: 940,
-        active_phases: "on_request_received, on_stream_connect",
+        active_phases: "on_request_received, before_proxy, on_stream_connect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Extracts SPIFFE IDs from TLS/DTLS client certificates",
     },

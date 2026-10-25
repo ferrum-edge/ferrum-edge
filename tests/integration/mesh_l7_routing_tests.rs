@@ -3036,3 +3036,198 @@ fn mesh_l4_virtual_service_preserves_double_digit_match_declaration_order() {
         "double-digit match moved lexicographically: {ids:?}"
     );
 }
+
+fn virtual_service_with_match(match_entry: Value) -> K8sObject {
+    object(
+        "VirtualService",
+        serde_json::json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "match": [match_entry],
+                "route": [{"destination": {"host": "beta.default.svc.cluster.local", "port": {"number": 9090}}}]
+            }]
+        }),
+    )
+}
+
+fn gated_request(
+    query: &str,
+    port: u16,
+    headers: &[(&str, &str)],
+) -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/search".to_string(),
+    );
+    ctx.set_raw_query_string(query.to_string());
+    ctx.frontend_listen_port = Some(port);
+    let headers = headers
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    (ctx, headers)
+}
+
+#[tokio::test]
+async fn mesh_l7_routing_istio_without_headers_query_regex_and_port_are_routed() {
+    // mesh_route_dispatch-CLAUDE-5: these Istio match fields used to be
+    // classified unsupported and blackholed with `request_termination`.
+    let result = translate_k8s_objects(
+        &[virtual_service_with_match(serde_json::json!({
+            "withoutHeaders": {"X-Legacy": {}, "x-env": {"exact": "prod"}},
+            "queryParams": {
+                "variant": {"regex": "beta-[0-9]+"},
+                "tier": {"prefix": "gold"}
+            },
+            "port": 8080
+        }))],
+        options(),
+    )
+    .expect("translation succeeds");
+    assert!(
+        result
+            .config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.plugin_name != "request_termination"),
+        "supported predicates must not fail closed"
+    );
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("~.*"))
+        .expect("URI-less catch-all proxy");
+    let plugin_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let rule_match = &plugin_config.config["rules"][0]["match"];
+    assert_eq!(
+        rule_match["without_headers"],
+        serde_json::json!({"x-legacy": {"regex": ".*"}, "x-env": "prod"})
+    );
+    assert_eq!(
+        rule_match["query_params"],
+        serde_json::json!({"variant": {"regex": "beta-[0-9]+"}, "tier": {"prefix": "gold"}})
+    );
+    assert_eq!(rule_match["port"].as_u64(), Some(8080));
+    assert_eq!(
+        plugin_config.config["reject_unmatched"].as_bool(),
+        Some(true)
+    );
+
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+
+    let (mut ctx, mut headers) =
+        gated_request("variant=beta-7&tier=gold-1", 8080, &[("x-env", "dev")]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("beta.default.svc.cluster.local")
+    );
+
+    for (query, port, headers) in [
+        ("variant=beta-7&tier=gold-1", 8080, vec![("x-legacy", "1")]),
+        ("variant=beta-7&tier=gold-1", 8080, vec![("x-env", "prod")]),
+        ("variant=stable&tier=gold-1", 8080, vec![]),
+        ("variant=beta-7&tier=silver", 8080, vec![]),
+        ("variant=beta-7&tier=gold-1", 9090, vec![]),
+    ] {
+        let (mut ctx, mut headers) = gated_request(query, port, headers.as_slice());
+        assert!(
+            matches!(
+                dispatch.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Reject {
+                    status_code: 404,
+                    ..
+                }
+            ),
+            "{query} port={port} headers={headers:?} must miss the gated route"
+        );
+    }
+}
+
+#[test]
+fn mesh_l7_routing_istio_uncompilable_new_match_fields_fail_closed() {
+    for match_entry in [
+        serde_json::json!({"queryParams": {"variant": {"regex": "("}}}),
+        serde_json::json!({"queryParams": {"variant": {"prefix": ""}}}),
+        serde_json::json!({"withoutHeaders": {"x bad": {"exact": "1"}}}),
+        serde_json::json!({"withoutHeaders": {"X-A": {}, "x-a": {"exact": "1"}}}),
+        serde_json::json!({"withoutHeaders": {}}),
+        serde_json::json!({"port": 0}),
+        serde_json::json!({"port": "8080"}),
+    ] {
+        let result = translate_k8s_objects(
+            &[virtual_service_with_match(match_entry.clone())],
+            options(),
+        )
+        .expect("an unsupported predicate is a route-scoped fail-closed, not an error");
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.plugin_name != "mesh_route_dispatch"),
+            "{match_entry}: an unrepresentable predicate must not emit a dispatch rule"
+        );
+        assert!(
+            result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "request_termination"),
+            "{match_entry}: an unrepresentable predicate must fail closed"
+        );
+    }
+}
+
+#[test]
+fn mesh_l7_routing_istio_malformed_redirect_and_rewrite_operands_are_refused() {
+    // mesh_route_dispatch-CLAUDE-1: refused as this VirtualService's failure
+    // rather than a dispatch plugin that fails construction for the whole
+    // chain (or composes a corrupted `Location`).
+    for (http, needle) in [
+        (
+            serde_json::json!({
+                "match": [{"uri": {"prefix": "/old"}}],
+                "redirect": {"uri": "new"}
+            }),
+            "redirect.uri must be an absolute path",
+        ),
+        (
+            serde_json::json!({
+                "match": [{"uri": {"prefix": "/old"}}],
+                "redirect": {"uri": "/new?x=\u{0}"}
+            }),
+            "redirect.uri must contain only printable ASCII",
+        ),
+        (
+            serde_json::json!({
+                "match": [{"uri": {"prefix": "/old"}}],
+                "redirect": {"uri": "/new", "authority": "evil.example/x"}
+            }),
+            "redirect.authority must be `host` or `host:port`",
+        ),
+        (
+            serde_json::json!({
+                "match": [{"uri": {"prefix": "/api"}}],
+                "rewrite": {"authority": "user@backend"},
+                "route": [{"destination": {"host": "beta.default.svc.cluster.local", "port": {"number": 9090}}}]
+            }),
+            "rewrite.authority (or headers.request.set host) must be `host` or `host:port`",
+        ),
+    ] {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({"hosts": ["api.example.com"], "http": [http]}),
+            )],
+            options(),
+        )
+        .expect_err("a malformed operand must fail the resource closed");
+        assert!(err.to_string().contains(needle), "{needle}: {err}");
+    }
+}

@@ -725,7 +725,10 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
         || is_proxy_owned_forwarding_header(name, true)
         || name.starts_with("grpc-")
         || is_consumer_assertion_header(name)
-        || name.starts_with("x-ferrum-")
+        // Folded like the other gateway-owned prefixes: a CGI-style backend
+        // reads `x_ferrum_peer_spiffe_id` as the gateway's
+        // `x-ferrum-peer-spiffe-id` (`spiffe_identity` `forward_identity`).
+        || has_backend_folded_prefix(name, b"x-ferrum-")
         || is_path_param_assertion_header(name)
         // `via` and `early-data` are deliberately asymmetric with the header
         // boundary, and that asymmetry is the point:

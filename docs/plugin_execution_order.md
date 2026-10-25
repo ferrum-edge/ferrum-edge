@@ -186,8 +186,14 @@ Request In
 `on_request_received` is therefore a post-route, post-allowed-method hook, not
 a pre-routing receipt hook. Once it runs, `ctx.matched_proxy` is populated and
 the plugin list is the resolved view for that proxy: applicable global plugins
-plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run neither
-global nor scoped hooks because there is no proxy view to select. Matched 405
+plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run no
+ordinary request hook, global or scoped, because there is no proxy view to
+select. They do emit one terminal transaction summary to every global
+`stdout_logging` instance that carries no execution trigger (no proxy,
+backend, or consumer; `metadata.rejection_phase = "route_not_found"`), on
+HTTP/1.1, HTTP/2, and HTTP/3 alike, so scanner and stale-route traffic reaches
+the access log. Other sinks and trigger-gated instances do not receive it, and a
+generation with no such logger keeps the allocation-free route-miss path. Matched 405
 responses also return before either kind of ordinary request hook runs, but
 they still emit one terminal transaction summary from the protocol-filtered
 plugin-cache view (`metadata.rejection_phase = "allowed_methods"`) without
@@ -205,10 +211,12 @@ A matched request using a different method is rejected at its protocol
 admission gate before either kind of hook, even if `allowed_methods` permits
 that method. H1, H2, and H3 share the ordinary-hook blind spots for unmatched
 404 and gRPC non-POST admission; matched-proxy `allowed_methods` 405 responses
-are included in transaction logs. Unmatched-route 404s (and mesh
-`REGISTRY_ONLY` route-miss refusals) are still counted on `/metrics` by the
-shared route-miss path as `ferrum_unmatched_requests_total`, independent of any
-plugin. Terminal transaction logging is separate from
+are included in transaction logs, unmatched 404 responses reach global
+`stdout_logging` as described above, and gRPC non-POST refusals are not yet
+logged. Unmatched-route 404s (and mesh `REGISTRY_ONLY` route-miss refusals) are
+also counted on `/metrics` by the shared route-miss path as
+`ferrum_unmatched_requests_total`, independent of any plugin. Terminal
+transaction logging is separate from
 ordinary request hooks; whether a terminal summary exists must not be inferred
 from whether `on_request_received` ran.
 
@@ -965,7 +973,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
 | `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. Istio `AuthorizationPolicy` is a destination-side contract, so the plugin evaluates policy only on **inbound** mesh legs; the Sidecar/Ambient outbound capture leg is not judged and egress scoping is enforced there by `mesh_outbound_registry` instead (see [mesh.md](mesh.md#which-leg-enforces-which-policy-family-issue-4158)). An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)). An allowed check's `headersToUpstreamOnAllow` result is applied later, in this plugin's own `before_proxy` hook at 2075 (before `mesh_route_dispatch` and every request transformer), and its `headersToDownstreamOnAllow` result in its `after_proxy` / WebSocket handshake hook |
-| `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP; UDP/DTLS attachment is rejected |
+| `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP (native IPv6 grouped to `ipv6_prefix`, default `/64`); IP keys sit under the accept-time `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` bound, which runs first; UDP/DTLS attachment is rejected |
 | `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
 | `waf` | ✓ | | Inspects TCP first bytes before the backend is dialed when a `stream` block is configured |
@@ -1684,7 +1692,7 @@ priority overrides that interleave another plugin between dispatch instances.
 
 When a `mesh_route_dispatch` rule matches on query params, the predicate reads the shared canonical query view rather than the lossy single-value `ctx.query_params` map. Every frontend (HTTP/1.1, HTTP/2, and HTTP/3) materializes that map percent-decoded, so other plugins on the proxy see the same values regardless of protocol or of which plugins are configured (issue #6580).
 
-Matched VirtualService `headers.request` / `headers.response` transforms are published onto `RequestContext` as shared route-override lists. Every enabled `request_transformer` / `response_transformer` instance applies only its **static** header rules in configured (stable or priority-overridden) order. Proxy core then applies each matched route list **exactly once** after the last eligible enabled transformer in that chain — the authoritative route-header final phase — so a later static add/update/remove/rename cannot recreate or overwrite a field the matched route removed or set (GHSA-3xxr-xhhj-9962). A disabled RTDS transformer instance is not eligible and neither consumes nor suppresses the shared list. The same finalization runs on ordinary H1/H2/H3 responses, synthetic/rejection `after_proxy` paths, header-capability simulation, and deadline provenance rebuilds. Query and body transform ordering is unchanged. When the chain has no eligible consumer, the published list remains unused (the VirtualService translator auto-emits an `apply_route_overrides` consumer when route header transforms are configured). That translator-owned empty consumer composes with a same-name global transformer, preserving global static rules before the matched route list is finalized; ordinary operator-authored proxy-scoped transformers retain the normal proxy-overrides-global behavior.
+Matched VirtualService `headers.request` / `headers.response` transforms are published onto `RequestContext` as shared route-override lists. Every enabled `request_transformer` / `response_transformer` instance applies only its **static** header rules in configured (stable or priority-overridden) order. Proxy core then applies each matched route list **exactly once** after the last eligible enabled transformer in that chain — the authoritative route-header final phase — so a later static add/update/remove/rename cannot recreate or overwrite a field the matched route removed or set (GHSA-3xxr-xhhj-9962). The request list's boundary is the LATER of that consumer and the last `mesh_route_dispatch` instance, so a consumer a priority override places ahead of the dispatcher cannot finalize an empty slot and drop the list the dispatcher publishes afterwards. A disabled RTDS transformer instance is not eligible and neither consumes nor suppresses the shared list. The same finalization runs on ordinary H1/H2/H3 responses, synthetic/rejection `after_proxy` paths, header-capability simulation, and deadline provenance rebuilds. Query and body transform ordering is unchanged. When the chain has no eligible consumer, the published list remains unused (the VirtualService translator auto-emits an `apply_route_overrides` consumer when route header transforms are configured); a chain whose dispatch rules carry route transforms but that has no configured transformer for that direction at all is refused at plugin-cache construction and admin admission. That translator-owned empty consumer composes with a same-name global transformer, preserving global static rules before the matched route list is finalized; ordinary operator-authored proxy-scoped transformers retain the normal proxy-overrides-global behavior.
 
 A `mesh_route_dispatch` rule may also carry a per-rule `fault` action (`{delay, abort}`) that runs as soon as the rule matches and BEFORE any route override is applied. The fault uses the shared `FaultRoller` (`src/plugins/utils/fault_roll.rs`) so a static-percentage rule uses the same 64-bit threshold math as the proxy-scoped `fault_injection` plugin. When delay and abort both trigger, the delay runs first; the abort then short-circuits dispatch and the route override is skipped. An earlier proxy-scoped fault marks the request so the route-local surface does not stack; a route-local fault writes a private source marker so a priority-overridden later proxy-scoped fault also no-ops. Ordinary sibling `fault_injection` instances do not suppress one another: each independently decides until an abort short-circuits the chain.
 
@@ -1706,7 +1714,7 @@ Given all built-in plugins enabled, the execution order is:
 | 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body, response_stream_inspector |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
 | 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
-| 13 | `spiffe_identity` | 940 | on_request_received, on_stream_connect |
+| 13 | `spiffe_identity` | 940 | on_request_received, before_proxy, on_stream_connect |
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate, before_proxy |
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |

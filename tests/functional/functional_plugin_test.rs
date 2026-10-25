@@ -1972,6 +1972,25 @@ async fn test_plugin_bot_detection() {
         resp.text().await.expect("bot rejection body"),
         r#"{"error":"Forbidden"}"#
     );
+
+    // A present User-Agent carrying a non-UTF-8 obs-text byte is omitted from
+    // the materialized header map. The plugin reads the raw wire block and
+    // fails closed instead of treating it as a missing (allowed) header.
+    let resp = client
+        .get(format!("{}/botdetect/test", harness.proxy_base_url))
+        .header(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_bytes(b"Mozilla/5.0 (x\xFF)")
+                .expect("obs-text header value"),
+        )
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        451,
+        "a non-UTF-8 User-Agent must not take the missing-header allow path"
+    );
 }
 
 // ============================================================================

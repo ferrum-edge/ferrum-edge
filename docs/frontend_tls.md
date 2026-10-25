@@ -1339,6 +1339,8 @@ These are two different mechanisms and this document does not conflate them:
 
 Certificate expiry is a time bound on an admitted credential. Trust retirement is an operator withdrawing authority. They compose: a session can be ended by whichever fires first. A refused reload candidate keeps the previous verifier, generation, and live sessions.
 
+The two "Enforced" trust rows above apply to the gateway's own proxy frontends. Mesh inbound listeners (Sidecar inbound, waypoint HTTP) are a separate trust plane: a mesh trust-bundle withdrawal or mesh inbound CRL publication applies to new handshakes and to HBONE CONNECTs and tunnels, but an already-established ordinary inbound HTTP connection keeps its admitted SPIFFE principal until the leaf's `notAfter`. See [mesh.md — SPIFFE Identity](mesh.md#spiffe-identity).
+
 ### Per-Proxy CA Filtering with `mtls_auth`
 
 The global `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` applies to all connections on the HTTPS listener — the TLS handshake happens before routing, so the gateway cannot know which proxy a request targets until after the handshake completes. The same source controls terminated TCP+TLS; UDP+DTLS uses the separate `FERRUM_DTLS_CLIENT_CA_CERT_PATH` / `_SOURCE`. When the client-CA source for a frontend is configured, Ferrum requires every client to present a certificate that validates to it. Without that source, the frontend does not request a client certificate, so an `mtls_auth` plugin will not have a certificate to authenticate.
