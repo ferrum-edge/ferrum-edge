@@ -1663,7 +1663,7 @@ Given all built-in plugins enabled, the execution order is:
 | 7 | `geo_restriction` | 175 | on_request_received, on_stream_connect |
 | 8 | `bot_detection` | 200 | on_request_received |
 | 9 | `spec_expose` | 210 | on_request_received, after_proxy |
-| 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
+| 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body, response_stream_inspector |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
 | 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
 | 13 | `spiffe_identity` | 940 | on_request_received, on_stream_connect |

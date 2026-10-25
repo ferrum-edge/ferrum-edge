@@ -44,7 +44,17 @@
 //!    is also where the `text/event-stream` label is published. Synthetic
 //!    responses (a `response_mock` reply, a serverless terminate reply, a cache
 //!    hit) skip this plugin's `after_proxy`, so they are never framed under the
-//!    producer's own media type.
+//!    producer's own media type, and a decision is dropped once gateway policy
+//!    replaces the response it was made for.
+//!
+//! 5. **`response_stream_inspector`** — With `retry_ms` set, writes the
+//!    `retry: <ms>` field once ahead of the first bytes of a streamed, genuine
+//!    origin `text/event-stream`. The field is a line of its own with no blank
+//!    line after it, so it dispatches no event and leaves the client's last
+//!    event ID untouched; a `retry:` the backend sends later still wins. A
+//!    leading UTF-8 BOM is dropped so the field stays at the start of the
+//!    decoded stream. No keep-alive comments are generated: inspectors run only
+//!    when the backend sends bytes.
 //!
 //! ## Representations wrapping declines
 //!
@@ -93,6 +103,7 @@
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
 use tracing::debug;
@@ -100,7 +111,10 @@ use tracing::debug;
 use super::utils::policy_digest;
 use super::utils::sse::accept_includes_event_stream;
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
-use super::{BoundedResponseBodyConstruction, PluginResult, RequestContext};
+use super::{
+    BoundedResponseBodyConstruction, PluginResult, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector,
+};
 use crate::util::http_headers::headers_have_cache_control_directive;
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -154,6 +168,9 @@ pub struct SsePlugin {
     retry_ms_text: Option<String>,
     /// Pre-built `retry: <ms>\n` field used when wrapping responses.
     retry_field: Option<Vec<u8>>,
+    /// The same field as shared bytes, cloned into each genuine-stream
+    /// inspector without copying.
+    retry_stream_prefix: Option<Bytes>,
     /// Force `Content-Type: text/event-stream` even if the backend returns
     /// a different content type. Default: false.
     force_sse_content_type: bool,
@@ -210,6 +227,8 @@ impl SsePlugin {
             field
         });
 
+        let retry_stream_prefix = retry_field.as_deref().map(Bytes::copy_from_slice);
+
         // Digest the accepted configuration as a whole. Every knob that shapes
         // the wrapped client representation (`wrap_non_sse_responses`,
         // `retry_ms`, `force_sse_content_type`) is in here by construction.
@@ -247,6 +266,7 @@ impl SsePlugin {
             strip_content_length,
             retry_ms_text,
             retry_field,
+            retry_stream_prefix,
             force_sse_content_type,
             wrap_non_sse_responses,
             static_policy_digest,
@@ -394,6 +414,23 @@ impl SsePlugin {
             || Self::wrap_refused_for_representation(ctx, response_headers)
     }
 
+    /// Whether the response now being streamed is the backend's own event
+    /// stream: the pristine stamp records an origin `text/event-stream`, no
+    /// `sse` instance relabelled it, and gateway policy has not replaced it.
+    /// An unstamped response is gateway-authored and is left alone.
+    fn streamed_response_is_origin_event_stream(ctx: &RequestContext) -> bool {
+        let metadata = &ctx.metadata;
+        metadata.contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY)
+            && metadata
+                .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+                .map(String::as_str)
+                .is_some_and(is_text_event_stream_media_type)
+            && !metadata
+                .get(RELABELLED_NON_SSE_METADATA_KEY)
+                .is_some_and(|value| value == "1")
+            && !ctx.response_replaced_by_gateway()
+    }
+
     /// Frame a body whose wrapping was already selected, under this response's
     /// retained ceiling.
     fn frame_selected_body(
@@ -427,6 +464,59 @@ impl SsePlugin {
             );
         }
         construction.into_transform_option(ctx)
+    }
+}
+
+/// UTF-8 byte-order mark. An EventSource decoder strips one at the very start
+/// of the stream, so a field written ahead of it would turn the BOM into part
+/// of the backend's first field name.
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// Writes the configured `retry:` field once, ahead of the first bytes of a
+/// genuine origin event stream, then forwards every chunk unchanged.
+///
+/// Only the leading bytes that could still be a split UTF-8 BOM are held
+/// (at most two), so the stream is never buffered.
+struct SseRetryPrefixInspector {
+    /// `retry: <ms>\n`, shared with the plugin instance.
+    retry_field: Bytes,
+    /// Leading backend bytes not yet released. `None` once the field has been
+    /// written.
+    pending: Option<Vec<u8>>,
+}
+
+impl SseRetryPrefixInspector {
+    /// Release the field followed by the held leading bytes, minus a complete
+    /// leading BOM.
+    fn release_prefix(&mut self) -> Bytes {
+        let held = self.pending.take().unwrap_or_default();
+        let backend = held.strip_prefix(UTF8_BOM).unwrap_or(held.as_slice());
+        let mut out = Vec::with_capacity(self.retry_field.len() + backend.len());
+        out.extend_from_slice(&self.retry_field);
+        out.extend_from_slice(backend);
+        Bytes::from(out)
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for SseRetryPrefixInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let Some(held) = self.pending.as_mut() else {
+            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+        };
+        held.extend_from_slice(chunk);
+        if held.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(held.as_slice()) {
+            // Still possibly a BOM split across chunks: hold it.
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        ResponseStreamAction::Forward(self.release_prefix())
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        if self.pending.is_none() {
+            return ResponseStreamAction::Forward(Bytes::new());
+        }
+        ResponseStreamAction::Forward(self.release_prefix())
     }
 }
 
@@ -759,6 +849,31 @@ impl super::Plugin for SsePlugin {
         super::ResponseTrailerPolicy::Names(&self.trailer_policy_names)
     }
 
+    /// Only an instance with `retry_ms` has anything to write into a genuine
+    /// stream, so only it opts into the streaming inspector path.
+    fn requires_response_stream_hooks(&self) -> bool {
+        self.retry_stream_prefix.is_some()
+    }
+
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        let retry_field = self.retry_stream_prefix.as_ref()?;
+        if !(200..300).contains(&response_status)
+            || !content_type.is_some_and(Self::is_sse_content_type)
+            || !Self::streamed_response_is_origin_event_stream(ctx)
+        {
+            return None;
+        }
+        Some(Box::new(SseRetryPrefixInspector {
+            retry_field: retry_field.clone(),
+            pending: Some(Vec::new()),
+        }))
+    }
+
     // ── Phase 1: Validate inbound SSE client request ─────────────────────
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -966,7 +1081,8 @@ impl super::Plugin for SsePlugin {
             response_headers.remove("content-length");
         }
 
-        // Store retry hint in metadata for transform_response_body.
+        // Record the retry hint. The wire field comes from the wrapper or the
+        // genuine-stream inspector, not from this metadata.
         if let Some(retry) = &self.retry_ms_text {
             ctx.metadata
                 .insert("sse:retry_ms".to_string(), retry.clone());
@@ -1011,6 +1127,15 @@ impl super::Plugin for SsePlugin {
             return None;
         }
         ctx.metadata.remove(RELABELLED_NON_SSE_METADATA_KEY);
+
+        // The decision belongs to the response `after_proxy` saw. Once gateway
+        // policy replaced it (an `on_response_body` rejection, a terminal), the
+        // replacement carries its own media type and must not be framed. The
+        // marker is already consumed above, so a later instance cannot pick it
+        // up either.
+        if ctx.response_replaced_by_gateway() {
+            return None;
+        }
 
         self.frame_selected_body(ctx, body, response_headers)
     }

@@ -149,10 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `wrap_non_sse_responses` frames a body only when this plugin's
     `after_proxy` selected it and published `text/event-stream`. A
     `response_mock` reply, terminate-mode `serverless_function` reply, or
-    cache hit no longer gets `data:` framing under `application/json`.
+    cache hit no longer gets `data:` framing under `application/json`. A
+    wrap decision is also dropped when gateway policy replaces the response
+    it was made for, such as an `on_response_body` rejection.
   - `force_sse_content_type` no longer relabels `206`/`226` or content-coded
     responses when wrapping is off. They were already declined when wrapping
     was on.
+  - `retry_ms` now also reaches a streamed genuine backend event stream:
+    `retry: <ms>` is written once ahead of the first backend bytes, as its
+    own line so it dispatches no event. A later backend `retry:` overrides it.
   - Docs now say that only the `Last-Event-ID` request header is forwarded
     (a query-parameter cursor is not converted), and which idle timeouts
     affect long-lived event streams.

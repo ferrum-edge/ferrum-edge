@@ -187,7 +187,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "sse",
         classification: BuiltinPluginClassification::Public,
         priority: 250,
-        active_phases: "on_request_received, before_proxy, after_proxy, transform_response_body",
+        active_phases: "on_request_received, before_proxy, after_proxy, transform_response_body, response_stream_inspector",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "SSE is HTTP-only (text/event-stream over chunked transfer)",
     },

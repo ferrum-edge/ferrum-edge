@@ -1,11 +1,12 @@
 use super::plugin_utils::create_test_proxy;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    finalize_synthetic_response_for_test,
+    finalize_plugin_rejection_parts_for_test, finalize_synthetic_response_for_test,
     install_pending_buffered_response_capacity_refusal_for_test,
     refine_stream_response_for_content_type_for_test, retry_response_decision_context_for_test,
     stamp_original_response_metadata_for_test,
     take_buffered_response_capacity_refusal_pending_for_test,
+    transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::sse::{
     LAST_EVENT_ID_METADATA_KEY, MAX_LAST_EVENT_ID_BYTES, SsePlugin, redact_sse_log_metadata,
@@ -13,7 +14,10 @@ use ferrum_edge::plugins::sse::{
 use ferrum_edge::plugins::utils::metadata_redaction::{
     REDACTED_PLACEHOLDER, is_sensitive_metadata_key_with_extras, serialize_redacted_metadata,
 };
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector, priority,
+};
 use ferrum_edge::proxy::headers::{
     apply_response_headers, strip_client_response_hop_by_hop_headers,
 };
@@ -2071,4 +2075,206 @@ async fn test_query_parameter_cursor_is_not_promoted_to_header() {
     let mut headers = HashMap::new();
     assert_continue(&plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(!headers.contains_key("last-event-id"));
+}
+
+// ── Fix round 1: stale wrap decisions and genuine-stream retry ────────────────
+
+const GUARD_REJECTION_BODY: &[u8] = br#"{"error":"response rejected by policy"}"#;
+
+/// Run the normal header phase over a complete JSON 200, then replace the
+/// response with a gateway JSON rejection exactly as an `on_response_body`
+/// rejection does. Returns the rejection the client would receive.
+async fn wrap_selected_then_rejected(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) -> (u16, Bytes, HashMap<String, String>) {
+    let mut headers = json_response_headers();
+    stamp_original_response_metadata_for_test(ctx, 200, &headers);
+    for plugin in plugins {
+        assert_continue(&plugin.after_proxy(ctx, 200, &mut headers).await);
+    }
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+    assert_eq!(
+        ctx.metadata.get("sse:wrap_non_sse").map(String::as_str),
+        Some("1")
+    );
+
+    let (status, body, headers) = finalize_plugin_rejection_parts_for_test(
+        plugins,
+        ctx,
+        502,
+        Bytes::from_static(GUARD_REJECTION_BODY),
+        HashMap::new(),
+    )
+    .await;
+    assert_eq!(content_type_of(&headers), Some("application/json"));
+    (status, body, headers)
+}
+
+/// PR6831-SOL-1: a wrap decision belongs to the response `after_proxy` saw.
+/// Once gateway policy replaced that response, the transform must not frame
+/// the replacement's JSON error.
+#[tokio::test]
+async fn test_wrap_decision_is_dropped_when_the_response_is_replaced() {
+    let plugin: Arc<dyn Plugin> = Arc::new(make_plugin(json!({"wrap_non_sse_responses": true})));
+    let plugins = vec![Arc::clone(&plugin)];
+    let mut ctx = make_sse_ctx();
+    let (_, body, headers) = wrap_selected_then_rejected(&plugins, &mut ctx).await;
+
+    let wrapped = plugin
+        .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &headers)
+        .await;
+    assert!(wrapped.is_none(), "the replacement must not be framed");
+    assert!(
+        !ctx.metadata.contains_key("sse:wrap_non_sse"),
+        "the stale decision is consumed so no later instance can use it"
+    );
+}
+
+/// PR6831-SOL-1 through the shared buffered transform phase, with one and two
+/// wrapping instances: the client receives the rejection as valid JSON.
+#[tokio::test]
+async fn test_replaced_response_stays_valid_json_through_the_transform_phase() {
+    let config = json!({"wrap_non_sse_responses": true, "retry_ms": 2500});
+    for instances in [1usize, 2] {
+        let plugins: Vec<Arc<dyn Plugin>> = (0..instances)
+            .map(|_| Arc::new(make_plugin(config.clone())) as Arc<dyn Plugin>)
+            .collect();
+        let mut ctx = make_sse_ctx();
+        let (mut status, mut body, mut headers) =
+            wrap_selected_then_rejected(&plugins, &mut ctx).await;
+
+        transform_buffered_response_body_with_deadline_full_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(status, 502, "instances={instances}");
+        assert_eq!(
+            content_type_of(&headers),
+            Some("application/json"),
+            "instances={instances}"
+        );
+        assert_eq!(&body[..], GUARD_REJECTION_BODY, "instances={instances}");
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap_or_else(|error| panic!("instances={instances}: invalid JSON: {error}"));
+    }
+}
+
+fn forwarded(action: ResponseStreamAction) -> Vec<u8> {
+    match action {
+        ResponseStreamAction::Forward(bytes) => bytes.to_vec(),
+        other => panic!("expected Forward, got {other:?}"),
+    }
+}
+
+/// A genuine origin event stream after the normal header phase, plus the
+/// inspector this plugin attaches to it.
+async fn genuine_stream_inspector(
+    config: serde_json::Value,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    let plugin = make_plugin(config);
+    let (mut ctx, mut headers) = stamped_origin("text/event-stream");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    plugin.response_stream_inspector(&ctx, 200, content_type_of(&headers))
+}
+
+#[test]
+fn test_only_retry_configured_instances_request_stream_hooks() {
+    assert!(make_plugin(json!({"retry_ms": 2500})).requires_response_stream_hooks());
+    assert!(!make_plugin(json!({})).requires_response_stream_hooks());
+    assert!(!make_plugin(json!({"wrap_non_sse_responses": true})).requires_response_stream_hooks());
+}
+
+/// PR6831-SOL-2: `retry:` is written once, ahead of the first backend bytes,
+/// as its own line (no blank line, so no event dispatch), and every later
+/// chunk passes through unchanged.
+#[tokio::test]
+async fn test_retry_field_is_written_once_at_the_start_of_a_genuine_stream() {
+    let mut inspector = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("a genuine event stream gets the retry inspector");
+
+    let first = forwarded(inspector.on_chunk(b"id: 7\ndata: a\n\n").await);
+    assert_eq!(first, b"retry: 2500\nid: 7\ndata: a\n\n");
+    let second = forwarded(inspector.on_chunk(b"data: b\n\n").await);
+    assert_eq!(second, b"data: b\n\n");
+    let end = forwarded(inspector.on_end().await);
+    assert!(end.is_empty(), "nothing is held at the end");
+}
+
+/// A backend BOM split across chunks is held, then dropped, so the decoded
+/// stream still starts with the field rather than a BOM-prefixed field name.
+#[tokio::test]
+async fn test_retry_field_is_written_ahead_of_a_split_backend_bom() {
+    let mut inspector = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("inspector");
+
+    let held = forwarded(inspector.on_chunk(&[0xEF]).await);
+    assert!(held.is_empty(), "a possible BOM prefix is held");
+    let released = forwarded(inspector.on_chunk(b"\xBB\xBFdata: a\n\n").await);
+    assert_eq!(released, b"retry: 2500\ndata: a\n\n");
+}
+
+/// Bytes that only looked like a BOM start are released unchanged after the
+/// field, and a stream that ends before any byte still carries the field.
+#[tokio::test]
+async fn test_retry_field_releases_non_bom_bytes_and_empty_streams() {
+    let mut inspector = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("inspector");
+    assert!(forwarded(inspector.on_chunk(&[0xEF]).await).is_empty());
+    let released = forwarded(inspector.on_chunk(b"x").await);
+    assert_eq!(released, b"retry: 2500\n\xEFx");
+
+    let mut empty = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("inspector");
+    assert_eq!(forwarded(empty.on_end().await), b"retry: 2500\n");
+}
+
+/// The inspector attaches only to a 2xx genuine origin event stream on an
+/// instance that configured `retry_ms`.
+#[tokio::test]
+async fn test_retry_inspector_declines_non_genuine_streams() {
+    assert!(genuine_stream_inspector(json!({})).await.is_none());
+
+    let plugin = make_plugin(json!({"retry_ms": 2500, "force_sse_content_type": true}));
+    let (mut ctx, mut headers) = stamped_origin("application/json");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, content_type_of(&headers))
+            .is_none(),
+        "a relabelled non-SSE response is not the origin's event stream"
+    );
+
+    let plugin = make_plugin(json!({"retry_ms": 2500}));
+    let unstamped = make_sse_ctx();
+    assert!(
+        plugin
+            .response_stream_inspector(&unstamped, 200, Some("text/event-stream"))
+            .is_none(),
+        "a gateway-authored stream has no origin stamp"
+    );
+
+    let (ctx, _) = stamped_origin("text/event-stream");
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 503, Some("text/event-stream"))
+            .is_none()
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("text/plain"))
+            .is_none()
+    );
 }
