@@ -19,10 +19,15 @@
 //!    responses are checked independently of the body-hook scheduling gate.
 //!
 //! Unknown-length streaming responses are always bounded frame by frame by the
-//! core ceiling. Set `require_buffered_check: true` only when the policy must
-//! prove the complete final post-transform size before committing a response;
-//! this adds route-bounded buffering overhead and refuses indefinite SSE streams
-//! whose complete size cannot be proven.
+//! core ceiling, and response rewrites that change the byte count (streaming
+//! inspectors/normalizers, gRPC-Web translation, the gateway-generated
+//! aggregate MCP SSE listener) are charged on the bytes the client receives.
+//! Set `require_buffered_check: true` only when the policy must prove the
+//! complete final post-transform size before committing a response; this adds
+//! route-bounded buffering overhead and refuses indefinite SSE streams whose
+//! complete size cannot be proven. An event stream whose backend declared one
+//! exact, in-limit `Content-Length` has proven its size and is admitted, unless
+//! a streaming response inspector on the route can rewrite its bytes.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -38,10 +43,17 @@ use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
 };
 use super::{Plugin, PluginResult, RequestContext};
+use crate::util::body_limit::{ContentLength, declared_content_length};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `response_size_limiting` configuration keys.
 const RESPONSE_SIZE_LIMITING_CONFIG_KEYS: &[&str] = &["max_bytes", "require_buffered_check"];
+
+/// Fixed refusal for a strict-mode response whose complete size cannot be
+/// proven before commit: a genuine backend event stream without an exact
+/// declared length, and the gateway-generated aggregate MCP SSE listener.
+pub(crate) const UNVERIFIABLE_STREAM_SIZE_ERROR: &str =
+    "Streaming response size cannot be verified";
 
 pub struct ResponseSizeLimiting {
     max_bytes: u64,
@@ -67,6 +79,58 @@ impl ResponseSizeLimiting {
             max_bytes,
             require_buffered_check,
         })
+    }
+}
+
+impl ResponseSizeLimiting {
+    /// Whether a strict-mode event stream proves its complete size before
+    /// commit: it declares exactly one agreed `Content-Length` within
+    /// `max_bytes`, that is the length the BACKEND sent, and nothing on this
+    /// route can change the byte count after this hook.
+    ///
+    /// A streaming response inspector (an `sse` `retry_ms` prefix, an `ai_*`
+    /// stream inspector) rewrites the stream only after headers commit, so the
+    /// backend length no longer describes what the client receives. Whether
+    /// the route can attach one is precomputed at plugin-cache build
+    /// (`RequestContext::route_may_rewrite_response_stream`); an unstamped
+    /// context counts as "may rewrite". Such a route keeps the pre-commit
+    /// refusal. Buffered body transforms do not apply here: the event stream is
+    /// released to stream.
+    ///
+    /// The live header map is hook-writable, so on a backend response the
+    /// declared length must equal the pristine snapshot captured before any
+    /// `after_proxy` hook ran; a hook can neither invent a length for an
+    /// indefinite stream nor shrink one. Absent, ambiguous, and over-limit
+    /// declarations never prove anything (the latter two were already refused
+    /// by the fast path). The admitted stream keeps its backend-observed
+    /// length, so the core forwards it under that decoder-enforced length.
+    fn event_stream_size_is_proven(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if ctx.route_may_rewrite_response_stream != Some(false) {
+            return false;
+        }
+        let Some(ContentLength::Exact(declared)) = declared_content_length(response_headers) else {
+            return false;
+        };
+        if self.exceeds_limit(u128::from(declared)) {
+            return false;
+        }
+        if !ctx
+            .metadata
+            .contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY)
+        {
+            // Synthetic responses carry no backend snapshot; their live map is
+            // the representation (the same rule `original_response_is_event_stream`
+            // applies to the media type).
+            return true;
+        }
+        ctx.metadata
+            .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(declared)
     }
 }
 
@@ -119,6 +183,16 @@ impl Plugin for ResponseSizeLimiting {
     ///    independently activate the response body-hook gate.
     fn enforced_response_body_limit(&self) -> Option<u64> {
         self.is_enabled().then_some(self.max_bytes)
+    }
+
+    /// A strict whole-body instance cannot prove the size of the
+    /// gateway-generated aggregate MCP SSE listener (an indefinite stream behind
+    /// an empty placeholder), so the core refuses it before commit exactly as
+    /// this plugin refuses a genuine backend event stream. A default instance
+    /// returns `None`: the core carries its ceiling into the live body instead.
+    fn refuses_unprovable_response_stream(&self, ctx: &RequestContext) -> Option<u64> {
+        self.should_buffer_response_body(ctx)
+            .then_some(self.max_bytes)
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
@@ -218,16 +292,15 @@ impl Plugin for ResponseSizeLimiting {
         if self.require_buffered_check
             && !synthetic_response_omits_body(&ctx.method, response_status)
             && original_response_is_event_stream(ctx, response_headers)
+            && !self.event_stream_size_is_proven(ctx, response_headers)
         {
             // The strict route limit is a whole-body policy. Until it has an
             // event-aware streaming counter, fail before committing headers
             // rather than silently fall back to the generally larger global
-            // streaming ceiling or collect an unbounded event stream.
-            return reject_with_limit(
-                502,
-                "Streaming response size cannot be verified",
-                self.max_size_bytes(),
-            );
+            // streaming ceiling or collect an unbounded event stream. A finite
+            // stream whose backend declared an exact in-limit length has
+            // already proven its complete size and is admitted above.
+            return reject_with_limit(502, UNVERIFIABLE_STREAM_SIZE_ERROR, self.max_size_bytes());
         }
 
         PluginResult::Continue

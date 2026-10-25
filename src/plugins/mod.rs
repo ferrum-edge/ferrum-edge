@@ -281,19 +281,44 @@ pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
 /// (health-neutral).
 pub const ROUTE_REQUEST_TIMEOUT_METADATA_KEY: &str = "route_request_timeout";
 
-/// Parser-level limits contributed by a WebSocket size-policy plugin.
-///
-/// The relay combines every applicable instance before either peer is read,
-/// so the strictest frame and reassembled-message ceilings are enforced by
-/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+/// Parser-level limits for one WebSocket relay direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WebSocketSizeLimits {
+pub struct WebSocketDirectionSizeLimits {
     /// Maximum payload bytes accepted in any one wire frame.
     pub max_frame_bytes: usize,
     /// Maximum payload bytes accepted after continuation reassembly.
     pub max_message_bytes: usize,
     /// RFC 6455 Close reason paired with code 1009 on either violation.
     pub close_reason: Arc<str>,
+}
+
+/// Parser-level limits contributed by a WebSocket size-policy plugin.
+///
+/// The relay combines every applicable instance before either peer is read,
+/// so the strictest frame and reassembled-message ceilings are enforced by
+/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+/// Each direction is combined independently: `client_to_backend` bounds the
+/// client-side framer (frames the client sends), `backend_to_client` bounds
+/// the backend-side framer (frames the backend sends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSizeLimits {
+    /// Limits applied to frames read from the client.
+    pub client_to_backend: WebSocketDirectionSizeLimits,
+    /// Limits applied to frames read from the backend.
+    pub backend_to_client: WebSocketDirectionSizeLimits,
+}
+
+impl WebSocketSizeLimits {
+    /// The limits that bound frames travelling in `direction`.
+    pub fn for_direction(
+        &self,
+        direction: WebSocketFrameDirection,
+    ) -> &WebSocketDirectionSizeLimits {
+        match direction {
+            WebSocketFrameDirection::ClientToBackend => &self.client_to_backend,
+            WebSocketFrameDirection::BackendToClient => &self.backend_to_client,
+        }
+    }
 }
 
 /// gRPC-only (single protocol).
@@ -3388,6 +3413,16 @@ pub struct RequestContext {
     /// or `None` when no matched plugin enforces one. Same fold-at-use contract
     /// as [`Self::route_request_body_limit_bytes`].
     pub route_response_body_limit_bytes: Option<u64>,
+    /// Whether this request's matched plugin view can attach a streaming
+    /// response inspector that rewrites the client-visible bytes after
+    /// `after_proxy` (`PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS`, e.g. an
+    /// `sse` `retry_ms` prefix or an `ai_*` stream inspector). Precomputed at
+    /// plugin-cache build and stamped with the route body ceilings by
+    /// `PluginCacheRequestView::stamp_route_body_policy`. `None` means the
+    /// context was never stamped and must be read as "may rewrite": a strict
+    /// whole-body policy then cannot treat a backend `Content-Length` as a
+    /// proof of the final size.
+    pub route_may_rewrite_response_stream: Option<bool>,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -4698,6 +4733,7 @@ impl RequestContext {
             inbound_request_body_may_follow: None,
             route_request_body_limit_bytes: None,
             route_response_body_limit_bytes: None,
+            route_may_rewrite_response_stream: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_request_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_response_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6356,6 +6392,7 @@ impl RequestContext {
             // cannot silently fall back to the global allowance.
             route_request_body_limit_bytes: self.route_request_body_limit_bytes,
             route_response_body_limit_bytes: self.route_response_body_limit_bytes,
+            route_may_rewrite_response_stream: self.route_may_rewrite_response_stream,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             grpc_request_messages_observed: Arc::clone(&self.grpc_request_messages_observed),
             grpc_response_messages_observed: Arc::clone(&self.grpc_response_messages_observed),
@@ -6489,6 +6526,15 @@ impl RequestContext {
             .as_deref()
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// Shared handle to the same configured credential header list, for the
+    /// late request-trailer boundaries that outlive this context (streaming
+    /// request-body adapters and HTTP/3 upload pumps). One reference-count
+    /// increment, and `None` when the route configures no credential header,
+    /// so an unauthenticated route carries nothing into its body adapter.
+    pub(crate) fn request_trailer_credential_header_names(&self) -> Option<Arc<Vec<String>>> {
+        self.request_headers_to_redact.clone()
     }
 
     /// Retain one credential-query digest outside public metadata.
@@ -11667,6 +11713,23 @@ pub trait Plugin: Any + Send + Sync {
     /// is checked against it without depending on another plugin to activate the
     /// response body-hook gate (`GHSA-xrfj-852f-645j`).
     fn enforced_response_body_limit(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whole-body response ceiling this plugin must PROVE before an
+    /// indefinite-length, gateway-generated response stream commits, in bytes.
+    /// `None` (the default) means the plugin accepts such a stream under the
+    /// incremental ceiling it publishes through
+    /// [`Plugin::enforced_response_body_limit`].
+    ///
+    /// The aggregate MCP SSE listener is staged behind an empty `200`
+    /// placeholder, so neither the backend `after_proxy` refusal of a genuine
+    /// event stream nor the synthetic byte check can see its body. The core
+    /// asks this predicate at that one adoption boundary, before either the
+    /// H1/H2 or the native H3 writer commits the stream, and refuses the
+    /// listener with a `502` naming the returned limit when any active
+    /// instance answers `Some`.
+    fn refuses_unprovable_response_stream(&self, _ctx: &RequestContext) -> Option<u64> {
         None
     }
 

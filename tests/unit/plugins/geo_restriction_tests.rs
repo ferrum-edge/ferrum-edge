@@ -682,7 +682,13 @@ async fn later_instances_preserve_an_earlier_authoritative_assertion() {
     }))
     .unwrap();
 
-    for later in [&non_injecting, &fail_open] {
+    // (later instance, final geo.decision / geo.country pair). The metadata
+    // pair always describes the LAST evaluation, while the private assertion
+    // and its header keep the earlier authoritative value.
+    for (later, expected_metadata) in [
+        (&non_injecting, (Some("allowed"), Some("SE"))),
+        (&fail_open, (Some("db_not_loaded_allowed"), None)),
+    ] {
         let mut ctx = materialized_spoofed_context("89.160.20.112");
         assert!(matches!(
             authoritative.on_request_received(&mut ctx).await,
@@ -697,6 +703,62 @@ async fn later_instances_preserve_an_earlier_authoritative_assertion() {
             ctx.headers.get("x-geo-country").map(String::as_str),
             Some("SE"),
             "a later non-authoritative instance must not erase an earlier assertion"
+        );
+        assert_eq!(ctx.backend_geo_country(), Some("SE"));
+        let (decision, country) = request_geo_metadata(&ctx);
+        assert_eq!(
+            (decision.as_deref(), country.as_deref()),
+            expected_metadata,
+            "the final metadata pair must describe the last evaluation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn later_stream_instances_record_the_last_evaluation_metadata_pair() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let resolving = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let also_resolving = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let fail_open = GeoRestriction::new(&json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+
+    for (later, expected_metadata) in [
+        (&also_resolving, (Some("allowed"), Some("SE"))),
+        (&fail_open, (Some("db_not_loaded_allowed"), None)),
+    ] {
+        let mut stream = geo_stream_context("89.160.20.112");
+        assert!(matches!(
+            resolving.on_stream_connect(&mut stream).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            stream_geo_metadata(&stream),
+            (Some("allowed".to_string()), Some("SE".to_string()))
+        );
+        assert!(matches!(
+            later.on_stream_connect(&mut stream).await,
+            PluginResult::Continue
+        ));
+        let (decision, country) = stream_geo_metadata(&stream);
+        assert_eq!(
+            (decision.as_deref(), country.as_deref()),
+            expected_metadata,
+            "the final stream metadata pair must describe the last evaluation"
         );
     }
 }
@@ -1548,4 +1610,315 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             );
         }
     }
+}
+
+// ── Decision metadata (geo.decision / geo.country) ─────────────────────────
+
+fn request_geo_metadata(ctx: &RequestContext) -> (Option<String>, Option<String>) {
+    use ferrum_edge::plugins::geo_restriction::{
+        GEO_COUNTRY_METADATA_KEY, GEO_DECISION_METADATA_KEY,
+    };
+    (
+        ctx.metadata.get(GEO_DECISION_METADATA_KEY).cloned(),
+        ctx.metadata.get(GEO_COUNTRY_METADATA_KEY).cloned(),
+    )
+}
+
+fn stream_geo_metadata(ctx: &StreamConnectionContext) -> (Option<String>, Option<String>) {
+    use ferrum_edge::plugins::geo_restriction::{
+        GEO_COUNTRY_METADATA_KEY, GEO_DECISION_METADATA_KEY,
+    };
+    let metadata = ctx.metadata.as_ref();
+    (
+        metadata.and_then(|metadata| metadata.get(GEO_DECISION_METADATA_KEY).cloned()),
+        metadata.and_then(|metadata| metadata.get(GEO_COUNTRY_METADATA_KEY).cloned()),
+    )
+}
+
+#[test]
+fn geo_decision_metadata_keys_are_allowlisted_for_logs() {
+    use ferrum_edge::plugins::geo_restriction::{
+        GEO_COUNTRY_METADATA_KEY, GEO_DECISION_METADATA_KEY,
+    };
+    use ferrum_edge::plugins::utils::metadata_redaction::metadata_value_is_redacted_with;
+
+    assert_eq!(GEO_DECISION_METADATA_KEY, "geo.decision");
+    assert_eq!(GEO_COUNTRY_METADATA_KEY, "geo.country");
+    for key in [GEO_DECISION_METADATA_KEY, GEO_COUNTRY_METADATA_KEY] {
+        assert!(
+            !metadata_value_is_redacted_with(key, &[], &[]),
+            "{key}: the fixed-grammar geo decision must reach log sinks unredacted"
+        );
+    }
+}
+
+/// 89.160.20.112 resolves to SE in the fixture; 214.1.1.1 resolves to a record
+/// that carries only `traits` (no `country`, no `registered_country`), so it
+/// exercises the lazy registered-country decode and the "no usable code" arm.
+#[tokio::test]
+async fn every_http_and_stream_decision_records_its_reason_and_country() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let allow_se_deny_miss = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let allow_us_allow_miss = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["US"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+    let deny_se = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+
+    let cases = [
+        (
+            &allow_se_deny_miss,
+            "89.160.20.112",
+            true,
+            "allowed",
+            Some("SE"),
+        ),
+        (
+            &allow_us_allow_miss,
+            "89.160.20.112",
+            false,
+            "country_not_allowed",
+            Some("SE"),
+        ),
+        (
+            &deny_se,
+            "89.160.20.112",
+            false,
+            "country_denied",
+            Some("SE"),
+        ),
+        (
+            &allow_se_deny_miss,
+            "214.1.1.1",
+            false,
+            "lookup_failed_denied",
+            None,
+        ),
+        (
+            &allow_us_allow_miss,
+            "214.1.1.1",
+            true,
+            "lookup_failed_allowed",
+            None,
+        ),
+    ];
+    for (plugin, client_ip, admitted, decision, country) in cases {
+        let mut ctx = request_context(client_ip);
+        let result = plugin.on_request_received(&mut ctx).await;
+        assert_eq!(
+            matches!(result, PluginResult::Continue),
+            admitted,
+            "HTTP {client_ip} {decision}"
+        );
+        assert_eq!(
+            request_geo_metadata(&ctx),
+            (Some(decision.to_string()), country.map(str::to_string)),
+            "HTTP {client_ip}"
+        );
+
+        let mut stream = geo_stream_context(client_ip);
+        let result = plugin.on_stream_connect(&mut stream).await;
+        assert_eq!(
+            matches!(result, PluginResult::Continue),
+            admitted,
+            "stream {client_ip} {decision}"
+        );
+        assert_eq!(
+            stream_geo_metadata(&stream),
+            (Some(decision.to_string()), country.map(str::to_string)),
+            "stream {client_ip}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unloaded_database_records_the_db_not_loaded_decision() {
+    let missing = "/nonexistent/path/to/GeoLite2-Country.mmdb";
+    let deny = GeoRestriction::new(&json!({
+        "db_path": missing,
+        "allow_countries": ["US"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let allow = GeoRestriction::new(&json!({
+        "db_path": missing,
+        "allow_countries": ["US"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+
+    for (plugin, admitted, decision) in [
+        (&deny, false, "db_not_loaded_denied"),
+        (&allow, true, "db_not_loaded_allowed"),
+    ] {
+        let mut ctx = request_context("89.160.20.112");
+        assert_eq!(
+            matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ),
+            admitted,
+            "{decision}"
+        );
+        assert_eq!(
+            request_geo_metadata(&ctx),
+            (Some(decision.to_string()), None),
+            "{decision}"
+        );
+        let mut stream = geo_stream_context("89.160.20.112");
+        assert_eq!(
+            matches!(
+                plugin.on_stream_connect(&mut stream).await,
+                PluginResult::Continue
+            ),
+            admitted,
+            "stream {decision}"
+        );
+        assert_eq!(
+            stream_geo_metadata(&stream),
+            (Some(decision.to_string()), None),
+            "stream {decision}"
+        );
+    }
+}
+
+/// A database older than the staleness threshold is reported at `warn` at
+/// construction, with its build epoch and age — and never its source path.
+/// The pinned upstream fixture was built in February 2026.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stale_database_is_reported_at_construction_without_its_path() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(
+        &directory,
+        "GEO_FRESHNESS_PATH_CANARY.mmdb",
+        &country_mmdb_bytes(),
+    );
+    let (logs, _guard) = super::plugin_utils::capture_logs();
+    let _plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let output = logs.contents();
+    let warning = output
+        .lines()
+        .find(|line| line.contains("MaxMind database is stale"))
+        .expect("an old fixture must be reported as stale");
+    assert!(warning.trim_start().starts_with("WARN "), "{output}");
+    for expected in [
+        "plugin=\"geo_restriction\"",
+        "database_type=GeoIP2-Country",
+        "build_epoch=1770245369",
+        "stale_after_days=30",
+    ] {
+        assert!(warning.contains(expected), "missing {expected:?}: {output}");
+    }
+    assert!(!output.contains("GEO_FRESHNESS_PATH_CANARY"), "{output}");
+}
+
+// ── Initial assertion refresh ownership (no whole-map clone) ───────────────
+
+/// A GeoIP-only request (no authenticated principal) must not clone the whole
+/// request header map just to re-assert the two-byte country: the refresh
+/// runs in place on `ctx.headers`, every unrelated header keeps its original
+/// buffer, and a plugin-written underscore alias is still scrubbed.
+#[tokio::test]
+async fn geo_only_assertion_refresh_mutates_in_place_without_cloning_headers() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "inject_headers": true,
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let mut ctx = request_context("89.160.20.112");
+    for index in 0..32 {
+        ctx.headers.insert(
+            format!("x-app-{index}"),
+            format!("value-{index}-{}", "v".repeat(64)),
+        );
+    }
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    // A later hook forged an underscore alias of the gateway assertion.
+    ctx.headers
+        .insert("x_geo_country".to_string(), "US".to_string());
+    let buffer_before = ctx.headers["x-app-7"].as_ptr();
+
+    let mut owned = None;
+    ferrum_edge::_test_support::refresh_initial_backend_gateway_assertion_headers_for_test(
+        &mut ctx, &mut owned,
+    );
+
+    assert!(
+        owned.is_none(),
+        "a GeoIP-only refresh must not materialize an owned copy of the header map"
+    );
+    assert_eq!(
+        ctx.headers["x-app-7"].as_ptr(),
+        buffer_before,
+        "unrelated header values must keep their original buffers"
+    );
+    assert_eq!(
+        ctx.headers.get("x-geo-country").map(String::as_str),
+        Some("SE")
+    );
+    assert!(
+        !ctx.headers.contains_key("x_geo_country"),
+        "a forged underscore alias must still be scrubbed"
+    );
+    assert!(
+        (0..32).all(|index| ctx.headers.contains_key(&format!("x-app-{index}"))),
+        "every application header must survive the refresh"
+    );
+}
+
+/// An authenticated principal keeps the owned outbound copy it always had, so
+/// `ctx.headers` never carries the injected consumer identity.
+#[tokio::test]
+async fn principal_assertion_refresh_keeps_the_owned_outbound_copy() {
+    let mut ctx = request_context("89.160.20.112");
+    ctx.headers.insert("x-app".to_string(), "keep".to_string());
+    ctx.identified_consumer = Some(Arc::new(ferrum_edge::config::types::Consumer {
+        labels: Default::default(),
+        id: "geo-owner".to_string(),
+        namespace: default_namespace(),
+        username: "geo-alice".to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }));
+
+    let mut owned = None;
+    ferrum_edge::_test_support::refresh_initial_backend_gateway_assertion_headers_for_test(
+        &mut ctx, &mut owned,
+    );
+
+    let owned = owned.expect("a principal assertion is written into an owned outbound copy");
+    assert_eq!(
+        owned.get("x-consumer-username").map(String::as_str),
+        Some("geo-alice")
+    );
+    assert_eq!(owned.get("x-app").map(String::as_str), Some("keep"));
+    assert!(!ctx.headers.contains_key("x-consumer-username"));
 }

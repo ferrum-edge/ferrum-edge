@@ -3695,6 +3695,10 @@ impl Http3ConnectionPool {
         // timeout (a stalled client — neutral for backend health) from a header-wait
         // timeout (a slow backend — a real read-timeout fault).
         upload_complete: Arc<AtomicBool>,
+        // The route's configured credential header locations, removed from the
+        // client's request trailers after the static late-boundary filter
+        // (`RequestContext::request_trailer_credential_header_names`).
+        trailer_credential_header_names: &[String],
         auth: H3Authorization<'_>,
     ) -> H3PoolResult<H3StreamingResponse> {
         let uri: http::Uri = backend_url
@@ -3804,6 +3808,10 @@ impl Http3ConnectionPool {
                 // forwarding. HTTP/3 header names are always lowercase, so exact
                 // lowercase comparisons suffice.
                 sanitize_backend_request_trailers(&mut trailers);
+                crate::proxy::headers::strip_configured_credential_request_trailers(
+                    &mut trailers,
+                    trailer_credential_header_names,
+                );
                 // Only forward a still-non-empty block; an all-reserved trailer set
                 // collapses to nothing and must not emit an empty trailer frame.
                 if !trailers.is_empty() {
@@ -4356,6 +4364,9 @@ impl Http3ConnectionPool {
         // stream is FINished; lets the dispatch separate an upload-phase stall (client
         // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
         upload_complete: Arc<AtomicBool>,
+        // Route-configured credential header locations stripped from request
+        // trailers. Forwarded verbatim to `do_request_streaming_body`.
+        trailer_credential_header_names: &[String],
         auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
@@ -4389,6 +4400,7 @@ impl Http3ConnectionPool {
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
+                trailer_credential_header_names,
                 auth,
             )
             .await
@@ -4463,6 +4475,7 @@ impl Http3ConnectionPool {
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
+            trailer_credential_header_names,
             auth,
         )
         .await
@@ -4659,6 +4672,9 @@ impl Http3ConnectionPool {
         // stream is FINished; lets the dispatch separate an upload-phase stall (client
         // fault) from a header-wait timeout (backend fault). Forwarded verbatim.
         upload_complete: Arc<AtomicBool>,
+        // Route-configured credential header locations stripped from request
+        // trailers. Forwarded verbatim to `do_request_streaming_body`.
+        trailer_credential_header_names: &[String],
         auth: H3Authorization<'_>,
         tls_config_fn: impl FnOnce() -> TlsFut,
     ) -> H3PoolResult<H3StreamingResponse>
@@ -4692,6 +4708,7 @@ impl Http3ConnectionPool {
                 header_read_timeout_ms,
                 Arc::clone(&stream_opened),
                 Arc::clone(&upload_complete),
+                trailer_credential_header_names,
                 auth,
             )
             .await
@@ -4775,6 +4792,7 @@ impl Http3ConnectionPool {
             header_read_timeout_ms,
             stream_opened,
             upload_complete,
+            trailer_credential_header_names,
             auth,
         )
         .await

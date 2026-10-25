@@ -3319,6 +3319,31 @@ and contain no whitespace; query names and values use the same percent-decoded
 representation on HTTP/1.1, HTTP/2, and HTTP/3. Unknown configuration fields
 are rejected.
 
+**`;` sub-parameter aliases (query locations).** Ferrum splits the query on `&`
+only, while some backends also split on `;`, so `?carrier=;api_key=k` is one
+`carrier` parameter to Ferrum but an `api_key` to such a backend. A request
+whose configured query name also appears as a `;`-separated sub-parameter
+(matched by raw spelling or any percent/form decoding, and including a name
+such as `api_key;x`) is **ambiguous** and is refused with `401`
+`{"error":"Ambiguous API key query parameter"}` — the alias never
+authenticates, whichever spelling holds a valid key. When another mechanism
+authenticates the request instead, the alias is still marked for policy
+redaction and, with `hide_credentials`, the whole carrying `&` segment is
+removed from the forwarded query. A `;` inside a value (`api_key=k;x=1`) is
+part of that value, not an alias.
+
+**Request trailers.** A configured `header:<name>` location is also removed
+from the client's request trailers on every protocol path (HTTP/1.1, HTTP/2,
+HTTP/3, native gRPC, gRPC-Web), whatever `hide_credentials` says: trailers are
+never a credential location, so a client cannot re-send the key after the
+initial header block was authenticated and stripped. See
+[Backend Request Trailers](plugin_execution_order.md#backend-request-trailers).
+
+The authenticate hook borrows the key from the request (a single header field
+line, or the decoded query map) instead of copying it, so a lookup allocates
+nothing for the credential itself; only a repeated header field line that must
+be folded allocates.
+
 **Consumer credential** (`keyauth`) — array:
 ```yaml
 credentials:
@@ -3348,6 +3373,8 @@ Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `
 | `hide_credentials` | Boolean | `true` | Remove the `Authorization` field carrying the `Basic` scheme before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable password. |
 
 Basic encodes a **reusable** username and password in reversible Base64: an upstream that receives the field recovers the password and can replay it on any other gateway route that consumer can reach. The credential is therefore removed by default on every HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web, and WebSocket handshake path, and it is removed even when a different mechanism authenticated the request — a mixed chain must not forward Alice's password to a backend the gateway is telling `x-consumer-username: bob`. Only the `Basic` scheme is removed; a `Bearer` or other `Authorization` scheme another policy needs is left in place. Consumer identity injection and the `401` challenge are unchanged.
+
+**One `Authorization` credential per request.** `Authorization` is a single credential (RFC 9110 §11.6.2), not a list. The gateway's ingress protocol guard — on HTTP/1.1, HTTP/2, HTTP/3, and WebSocket upgrades alike, before routing and before any authentication plugin runs — refuses with `400` a request that sends `Authorization` as more than one field line (`{"error":"Request contains multiple Authorization headers"}`), or whose single value carries a second credential after a top-level comma, such as `Bearer x, Basic …` (`{"error":"Authorization header contains more than one credential"}`). Without that refusal, `Authorization: Bearer x` followed by `Authorization: Basic <password>` folds to one value whose first scheme is `Bearer`, and a request authenticated by `key_auth` would forward the Basic password. The scan is quote-aware: `auth-param` lists (`Digest username="a", realm="r"`, AWS SigV4 `Credential=…, SignedHeaders=…, Signature=…`) are unaffected, and a comma inside a quoted string separates nothing. The refusal applies to every route, with or without `basic_auth`.
 
 Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
 
@@ -4748,8 +4775,14 @@ Restricts access based on the geographic location of the client IP address using
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
 
-Country code matches are O(1) and allocation-free on the default request path: codes are decoded as borrowed MMDB strings, packed into two bytes, and matched against precomputed bitsets. A `String` is created only when `inject_headers: true` emits an authoritative value.
+Country code matches are O(1): codes are decoded as borrowed MMDB strings, packed into two bytes, and matched against precomputed bitsets. A record's `registered_country` is decoded only when it has no direct `country`, and a failed lookup formats no error. The request path allocates only the two decision-metadata entries below and, when `inject_headers: true` emits an authoritative value, that header. A GeoIP-only request (no authenticated principal) re-asserts `x-geo-country` at the dispatch boundary in place, without copying the request header map.
 IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 before lookup, so both forms receive the same GeoIP decision.
+
+**Decision metadata.** Every HTTP request and stream session the plugin evaluates writes `geo.decision` with one of seven fixed values — `allowed`, `country_not_allowed`, `country_denied`, `lookup_failed_allowed`, `lookup_failed_denied`, `db_not_loaded_allowed`, `db_not_loaded_denied` — and, when a country was resolved (admitted or rejected), `geo.country` with its ISO 3166-1 alpha-2 code. Both keys are on the built-in metadata allowlist, so transaction-log sinks emit them unredacted; this is the per-request record of which requests a fail-open policy admitted and why. When several geo instances evaluate one request, the pair always describes the last one to run: a later instance that resolves no country removes an earlier `geo.country` (the private `x-geo-country` assertion an earlier injecting instance produced is unaffected).
+
+**Database freshness.** Each construction (startup and every reload) logs the loaded database's `database_type`, `build_epoch`, and `age_days`: at `debug` for a database up to 30 days old, and as a `warn` ("MaxMind database is stale") beyond that. The source path is not logged.
+
+**Request trailers.** `x-geo-country` and its underscore spellings (`x_geo_country`, `x_geo-country`, `x-geo_country`) are removed from client request trailers on every protocol path, with the same folded match the initial header block uses, so a trailing block cannot restate a country a CGI-style backend would fold onto the gateway's assertion.
 
 **Loading.** The `.mmdb` file is read into an owned immutable byte buffer at plugin startup, with metadata and bounded-read checks rejecting files larger than 512 MiB before parsing. Non-regular paths (including FIFOs and devices) are rejected by path metadata before open; Unix also opens non-blocking so a regular path raced to a special file cannot wedge startup or reload, then verifies the opened handle's type and identity.
 
@@ -6865,13 +6898,29 @@ Configuration must be a top-level object. The only accepted keys are `max_bytes`
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_bytes` | u64 | — (required, > 0) | Maximum allowed response body size in bytes. The plugin errors at construction if absent or zero. |
-| `require_buffered_check` | bool | `false` | Force route-bounded whole-body buffering so the complete final post-transform size is proven before response headers are committed. Unknown-length streams are already bounded frame by frame when this is false. Enabling it adds memory overhead and rejects indefinite SSE streams whose complete size cannot be proven. |
+| `require_buffered_check` | bool | `false` | Force route-bounded whole-body buffering so the complete final post-transform size is proven before response headers are committed. Unknown-length streams are already bounded frame by frame when this is false. Enabling it adds memory overhead and rejects indefinite SSE streams whose complete size cannot be proven, including the gateway-generated `mcp_gateway` aggregate SSE listener. An event stream whose backend declared one exact `Content-Length` within `max_bytes` has proven its size and is admitted, unless a streaming response inspector on the route (for example an `sse` `retry_ms` prefix or an `ai_*` stream inspector) can rewrite it. |
 
 Enforcement happens in four places:
 - **The effective collection/streaming ceiling.** The configured `max_bytes` is published to the proxy core and folded into the bound of every response path across H1/H2, native H3 and the H3 cross-protocol bridge, buffered and streaming gRPC, retry replays, the response coalescers, mesh mTLS, and HBONE. Buffered collection **aborts at this ceiling** rather than retaining up to the generally larger global allowance and only then failing the final check, so concurrent requests cannot amplify retained gateway memory toward the global allowance each. Unknown-length streaming paths engage the size-limited (frame-by-frame) adapter at this ceiling; known-length paths reject an over-limit declaration before forwarding the body. A representation `Content-Length` on a bodyless response (`HEAD`, `1xx`, `204`/`205`/`304`) is not compared against this ceiling on any of those dispatch paths.
 - **Already-buffered synthetic responses.** A body produced by a gateway short-circuit (mock, serverless, cache, federation, dedup replay) is checked against the ceiling regardless of whether any plugin activated the response body-hook gate. Previously a default (non-buffering) instance had no hook on that path unless some *other* plugin independently elected response buffering. The check runs after any body transform, so a transform expansion cannot escape the ceiling either.
 - `after_proxy` rejects oversized `Content-Length` via the fast path when the response can transfer a body (no body buffering required). Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a representation `Content-Length` while transferring zero body bytes and are not rejected on that declaration alone; body-bearing responses (including `206`) keep exact-boundary enforcement (`Content-Length == max_bytes` passes).
 - `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
+
+**Streaming rewrites are charged on the bytes the client receives.** A response
+rewrite that changes the byte count while streaming cannot use an in-limit
+source to deliver more than the effective ceiling. Every streaming
+response-inspector driver counts every released `Forward` window, every
+`Terminate` payload, and the end-of-stream flush. That covers the H1/H2 reqwest
+path, the direct-H2 proxy-body path, the native HTTP/3 frontend relay, and the
+HTTP/3 cross-protocol relay. Incremental gRPC-Web translation counts base64 text
+expansion and the generated trailer frame, on the H1/H2 funnels and the native-H3
+cross-protocol relay alike. The gateway-generated `mcp_gateway` aggregate SSE
+listener counts its greeting, every replayed or live event, and every keepalive
+comment. The backend's own bytes stay bounded by the source adapters as before.
+The frame that would cross the ceiling is never sent. The response headers are
+already committed, so the body ends with the `ResponseBodyTooLarge` stream
+error: an HTTP/1.1 abort, or an HTTP/2 or HTTP/3 stream reset. The boundary is
+inclusive, so exactly `max_bytes` bytes are delivered.
 
 **Interaction with the global limit.** The effective ceiling is the strictest
 *active* (nonzero) bound of `max_bytes` and
@@ -6901,6 +6950,25 @@ it. A pristine backend `text/event-stream` response is rejected with HTTP 502
 before headers are committed because the complete route-bounded size cannot be
 proven without collecting an unbounded stream; the generally larger global
 streaming ceiling is not silently substituted for the configured route limit.
+The one exception is an event stream that already proves its size. Its backend
+declared exactly one agreed `Content-Length` within `max_bytes`; agreeing
+repeated members such as `512, 512` count as one length. The declaration matches
+the pristine backend snapshot taken before any `after_proxy` hook ran, so a hook
+can neither invent nor shrink it. And no streaming response inspector on the
+route can change the byte count after headers commit. That last condition is
+precomputed at plugin-cache build from the route's plugin capabilities: an `sse`
+instance with `retry_ms` (its `retry:` prefix) or any `ai_*` stream inspector
+disqualifies the route. Such a stream is admitted and forwarded under its
+decoder-enforced length. An absent, ambiguous, or over-limit declaration, or a
+route that can rewrite the stream, is still refused.
+
+The `mcp_gateway` aggregate SSE listener (`GET` with `sessions.sse_multiplexing`)
+is an indefinite stream the gateway itself generates behind an empty `200`
+placeholder. A strict instance refuses it with the same HTTP 502
+`Streaming response size cannot be verified` body, before the stream commits,
+on H1/H2 and native H3 alike, and the session's single-listener slot is released
+so the client can reattach. A default instance admits the listener and bounds
+its cumulative bytes by the effective ceiling as described above.
 
 ### `response_caching`
 
@@ -10111,11 +10179,26 @@ individual frame is within that limit and the message remains within
 `max_message_bytes`. Fragmented Text keeps tungstenite's incremental UTF-8
 validation, and interleaved Ping/Pong frames do not reset message state.
 
+**Ping/Pong count against `max_frame_bytes`.** Only Close bypasses the
+configured frame ceiling. Ping and Pong payloads are checked against it like
+data frames, so a `max_frame_bytes` (or a direction's override) below 125 — the
+RFC 6455 control-frame maximum — closes the connection with 1009 on an
+ordinary heartbeat whose payload is larger than the configured value. Keep the
+frame ceiling at 125 or more unless every peer's keepalive payload is known to
+fit.
+
 On either violation the gateway publishes cancellation before attempting
 bounded polite-close writes and sends close code **1009 (Message Too Big)**
 with the configured reason to both client and backend when their sinks remain
 writable. The same behavior applies in both relay directions and on H1, H2,
-and H3 WebSocket frontends.
+and H3 WebSocket frontends. Under `websocket_permessage_deflate: terminate`
+the inflate adapter enforces the same ceilings on the compressed wire frame
+and on the inflated frame and message; when the violated ceiling is this
+plugin's, the Close carries the configured reason too. A fault at an
+independent ceiling (the global `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` frame
+limit or a stricter `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`)
+keeps the adapter's fixed reason (`compressed frame too large`,
+`decompressed frame too large`, `decompressed message too large`).
 
 **Priority:** 2810
 
@@ -10123,11 +10206,25 @@ and H3 WebSocket frontends.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. |
-| `max_message_bytes` | u64 | `4 × max_frame_bytes` | Maximum reassembled Text/Binary message payload. Must be greater than or equal to `max_frame_bytes`. This separately bounds continuation accumulation without treating the whole message as one frame. |
-| `close_reason` | String | `"Message too large"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
+| `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes, the default for both directions. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. Applies to Text, Binary, continuation, Ping, and Pong frames (Close bypasses it), so values below 125 close the connection on heartbeat Ping/Pong traffic larger than the value. |
+| `max_message_bytes` | u64 | `4 × max_frame_bytes` | Maximum reassembled Text/Binary message payload, the default for both directions. Must be greater than or equal to `max_frame_bytes`. This separately bounds continuation accumulation without treating the whole message as one frame. |
+| `close_reason` | String | `"Message too large"` | Close-frame reason text, the default for both directions (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
+| `client_to_backend` | object | *(none)* | Optional override for frames the **client** sends (the client-side parser). Accepts `max_frame_bytes`, `max_message_bytes`, and `close_reason` with the same rules as the top-level fields. |
+| `backend_to_client` | object | *(none)* | Optional override for frames the **backend** sends (the backend-side parser). Accepts the same three fields. |
 
-Configuration must be a top-level object. The only accepted keys are `max_frame_bytes`, `max_message_bytes`, and `close_reason`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions, so a typo such as `max_frame_bytez` cannot silently leave frames unbounded. Registration is `FailClosed`.
+**Directional overrides.** The top-level fields are the default for both
+directions; `client_to_backend` / `backend_to_client` replace any of them for
+one direction, so a tight bound on untrusted client input can coexist with
+larger backend snapshots or pushes. A field an override omits is inherited from
+the top level, except that when `max_message_bytes` is set at neither level the
+direction defaults it to four times its own effective `max_frame_bytes`. Each
+direction's resolved values must satisfy `max_message_bytes >= max_frame_bytes`;
+an inherited explicit top-level `max_message_bytes` below an override's raised
+`max_frame_bytes` is rejected with a diagnostic that names the direction, so
+set `max_message_bytes` in the override too. Both directions are resolved once
+at construction; the relay reads the precomputed values once per session.
+
+Configuration must be a top-level object. The only accepted keys are `max_frame_bytes`, `max_message_bytes`, `close_reason`, `client_to_backend`, and `backend_to_client`; an override object accepts only `max_frame_bytes`, `max_message_bytes`, and `close_reason`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions (for example `config.backend_to_client.max_frame_bytez`), so a typo cannot silently leave frames unbounded. Registration is `FailClosed`.
 
 ```yaml
 plugin_name: ws_message_size_limiting
@@ -10136,11 +10233,36 @@ config:
   max_message_bytes: 262144
 ```
 
+Asymmetric limits — 4 KiB client frames and 16 KiB client messages, with
+64 KiB backend frames:
+
+```yaml
+plugin_name: ws_message_size_limiting
+config:
+  max_frame_bytes: 4096
+  max_message_bytes: 16384
+  close_reason: "client payload limit"
+  backend_to_client:
+    max_frame_bytes: 65536
+    max_message_bytes: 262144
+    close_reason: "backend payload limit"
+```
+
 With multiple applicable limiter instances, the relay uses the smallest frame
-ceiling and the smallest message ceiling independently; ties retain configured
-plugin order, including the corresponding close reason. The plugin opts the
-connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode, so both peer
-parsers receive the effective limits before their first frame read.
+ceiling and the smallest message ceiling independently, per direction; ties
+retain configured plugin order, including the corresponding close reason. The
+plugin opts the connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode,
+so both peer parsers receive the effective limits before their first frame
+read.
+
+**Metrics:** Every session this plugin closes with 1009 increments
+`ferrum_ws_message_size_limit_rejected_total{direction}` once, where
+`direction` is `client_to_backend` (the client sent the oversized input) or
+`backend_to_client`. That includes terminated `permessage-deflate` faults at
+this plugin's ceiling. A rejection at the global
+`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` ceiling (empty 1009 reason) is not this
+plugin's decision and is not counted. The counter is process-wide and always
+exported, so alerting does not require `ws_frame_logging` or sampled logs.
 
 ### `ws_rate_limiting`
 

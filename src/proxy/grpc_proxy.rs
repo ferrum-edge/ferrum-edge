@@ -255,6 +255,11 @@ pub enum GrpcBody {
         /// `RequestContext.grpc_request_messages_observed`.
         grpc_messages: Option<Arc<AtomicU64>>,
         grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
+        /// The route's configured credential header locations, removed from
+        /// the client's request TRAILERS frame in addition to the static late
+        /// request-trailer boundary `UploadSource` applies
+        /// (`crate::proxy::body::strip_configured_credential_trailer_frame`).
+        trailer_credential_header_names: Option<Arc<Vec<String>>>,
     },
     /// Streaming body sourced from a channel rather than a hyper `Incoming`.
     ///
@@ -404,6 +409,7 @@ impl http_body::Body for GrpcBody {
                 grpc_scanner,
                 auth_deadline,
                 rpc_deadline,
+                trailer_credential_header_names,
                 ..
             } => {
                 if let Some(deadline) = auth_deadline
@@ -428,7 +434,12 @@ impl http_body::Body for GrpcBody {
                     return Poll::Ready(Some(Err(GRPC_UPLOAD_RPC_DEADLINE_MESSAGE.into())));
                 }
                 let polled = loop {
-                    match incoming.poll_frame(cx) {
+                    match incoming.poll_frame_with_trailer_credentials(
+                        cx,
+                        crate::proxy::body::trailer_credential_names(
+                            trailer_credential_header_names,
+                        ),
+                    ) {
                         // A zero-length DATA frame carries no message content;
                         // forwarding it would put an empty DATA frame without
                         // END_STREAM on the backend connection, which h2 peers
@@ -5439,6 +5450,9 @@ pub async fn proxy_grpc_request_streaming(
     grpc_request_messages: Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap>,
     request_bytes: Option<GrpcUploadByteAccounting>,
     auth: Option<&crate::proxy::RequestAuthLifetimePlan>,
+    // The route's configured credential header locations, stripped from the
+    // client's request trailers (`RequestContext::request_trailer_credential_header_names`).
+    trailer_credential_header_names: Option<Arc<Vec<String>>>,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
     // The tap's scanner reads the upload's own framing (a pass-through
@@ -5480,6 +5494,7 @@ pub async fn proxy_grpc_request_streaming(
         upload_observer,
         grpc_messages,
         grpc_scanner,
+        trailer_credential_header_names,
     };
     proxy_grpc_streaming_dispatch(
         parts.method,

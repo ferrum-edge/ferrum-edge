@@ -11,24 +11,43 @@
 //! Default key location: `header:X-API-Key`. Configurable via `key_location`
 //! in the plugin config (e.g., `"query:api_key"` for query parameter extraction).
 //! Location values are whitespace-sensitive and are never trimmed.
+//!
+//! A `query:<name>` credential that also appears as a `;`-separated
+//! sub-parameter (`?carrier=;api_key=k`) is ambiguous: Ferrum's `&`-only query
+//! parser and a `;`-splitting backend disagree about which value is the key.
+//! Such a request is refused (`401`, never authenticated), and the sub-pair is
+//! still marked for removal and policy redaction so a chain won by another
+//! mechanism cannot forward it.
+//!
+//! The authenticate hook borrows the key straight from the request (the
+//! single-field-line header case and the decoded query map), so a successful
+//! lookup allocates nothing for the credential itself.
+
+use std::borrow::Cow;
 
 use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Value;
+use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::RequestContext;
-use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
+use super::utils::auth_flow::{
+    self, AuthMechanism, CredentialRejection, ExtractedCredential, VerifyOutcome,
+};
 use super::utils::header_extract::{ConfiguredUtf8HeaderLookup, lookup_configured_header_utf8};
 use super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX;
+use super::{PluginResult, RequestContext};
 
 const INVALID_API_KEY_FORMAT_BODY: &str = r#"{"error":"Invalid API key format"}"#;
+const AMBIGUOUS_QUERY_API_KEY_BODY: &str = r#"{"error":"Ambiguous API key query parameter"}"#;
 
-enum HeaderCredentialExtract {
+/// One extraction of the configured key location, borrowing from the request
+/// whenever the representation allows it.
+enum KeyLookup<'a> {
     Missing,
-    Present(String),
-    InvalidFormat,
+    Present(Cow<'a, str>),
+    InvalidFormat(&'static str),
 }
 
 pub struct KeyAuth {
@@ -150,33 +169,140 @@ impl KeyAuth {
         })
     }
 
-    fn extract_key_credential(&self, ctx: &RequestContext) -> HeaderCredentialExtract {
-        if let Some(ref lower) = self.header_name_lower {
+    /// Read the configured key location. Borrowed for a single header field
+    /// line and for the decoded query map; only a repeated header field line
+    /// that needs folding allocates.
+    fn lookup_key<'a>(&'a self, ctx: &'a RequestContext) -> KeyLookup<'a> {
+        if let Some(lower) = self.header_name_lower.as_deref() {
             let original = self.header_name_original.as_deref();
-            let lookup = lookup_configured_header_utf8(ctx, lower.as_str(), original);
-            utf8_header_lookup_to_extract(lookup)
-        } else if let Some(ref param) = self.query_param_name {
-            match ctx.query_params.get(param.as_str()) {
-                Some(key) => HeaderCredentialExtract::Present(key.clone()),
-                None => HeaderCredentialExtract::Missing,
+            utf8_header_lookup_to_key(lookup_configured_header_utf8(ctx, lower, original))
+        } else if let Some(param) = self.query_param_name.as_deref() {
+            // An alias behind `;` makes the credential ambiguous; refuse it
+            // before the decoded map can authenticate either spelling.
+            if query_has_semicolon_credential_alias(ctx.raw_query_string(), param) {
+                return KeyLookup::InvalidFormat(AMBIGUOUS_QUERY_API_KEY_BODY);
+            }
+            match ctx.query_params.get(param) {
+                Some(key) => KeyLookup::Present(Cow::Borrowed(key.as_str())),
+                None => KeyLookup::Missing,
             }
         } else {
-            let lookup = lookup_configured_header_utf8(ctx, "x-api-key", Some("X-API-Key"));
-            utf8_header_lookup_to_extract(lookup)
+            utf8_header_lookup_to_key(lookup_configured_header_utf8(
+                ctx,
+                "x-api-key",
+                Some("X-API-Key"),
+            ))
+        }
+    }
+
+    /// Whether the configured query credential is present in any spelling a
+    /// backend may read: the decoded map entry, or a `;`-separated sub-pair.
+    fn query_credential_present(&self, ctx: &RequestContext) -> bool {
+        self.query_param_name.as_deref().is_some_and(|name| {
+            ctx.query_params.contains_key(name)
+                || query_has_semicolon_credential_alias(ctx.raw_query_string(), name)
+        })
+    }
+
+    /// Arm the shared outbound-query strip for the configured query name. The
+    /// strip funnel (`query_string_after_plugin_strips`) is `;`-aware, so the
+    /// marker also removes a sub-pair spelling.
+    fn mark_query_credential_for_stripping(&self, ctx: &mut RequestContext) {
+        if let Some(metadata_key) = &self.strip_query_metadata_key {
+            ctx.metadata
+                .insert(metadata_key.clone(), "true".to_string());
         }
     }
 }
 
-fn utf8_header_lookup_to_extract(
-    lookup: ConfiguredUtf8HeaderLookup<'_>,
-) -> HeaderCredentialExtract {
+fn utf8_header_lookup_to_key(lookup: ConfiguredUtf8HeaderLookup<'_>) -> KeyLookup<'_> {
     match lookup {
-        ConfiguredUtf8HeaderLookup::Value(key) => {
-            HeaderCredentialExtract::Present(key.into_owned())
+        ConfiguredUtf8HeaderLookup::Value(key) => KeyLookup::Present(key),
+        ConfiguredUtf8HeaderLookup::Absent => KeyLookup::Missing,
+        ConfiguredUtf8HeaderLookup::InvalidUtf8 => {
+            KeyLookup::InvalidFormat(INVALID_API_KEY_FORMAT_BODY)
         }
-        ConfiguredUtf8HeaderLookup::Absent => HeaderCredentialExtract::Missing,
-        ConfiguredUtf8HeaderLookup::InvalidUtf8 => HeaderCredentialExtract::InvalidFormat,
     }
+}
+
+/// Whether `raw_query` carries `name` as a `;`-separated sub-parameter that
+/// Ferrum's `&`-only parser does not see as that name (issue #6579 shape):
+/// `carrier=;api_key=k`, or `api_key;x=1` whose Ferrum name is `api_key;x`.
+///
+/// A sub-pair name matches by its raw spelling or by any decoding
+/// [`crate::plugins::utils::query::query_name_decodings`] reports, the same
+/// raw-or-decoded contract the outbound strip uses. The leading sub-pair of a
+/// segment is the segment's own parameter, already represented in the decoded
+/// map, unless the segment's NAME itself holds the `;`. Allocation-free unless
+/// the query contains a raw `;`.
+fn query_has_semicolon_credential_alias(raw_query: Option<&str>, name: &str) -> bool {
+    let Some(raw_query) = raw_query else {
+        return false;
+    };
+    if !raw_query.contains(';') {
+        return false;
+    }
+    raw_query.split('&').any(|segment| {
+        if !segment.contains(';') {
+            return false;
+        }
+        let ferrum_name = segment
+            .split_once('=')
+            .map_or(segment, |(pair_name, _)| pair_name);
+        let skip_leading = usize::from(!ferrum_name.contains(';'));
+        segment.split(';').skip(skip_leading).any(|sub_pair| {
+            let sub_name = sub_pair
+                .split_once('=')
+                .map_or(sub_pair, |(sub_name, _)| sub_name);
+            sub_name == name
+                || crate::plugins::utils::query::query_name_decodings(sub_name)
+                    .iter()
+                    .any(|decoded| decoded == name)
+        })
+    })
+}
+
+/// The shared key verification: blank keys never reach the index.
+fn verify_api_key(api_key: &str, consumer_index: &ConsumerIndex) -> VerifyOutcome {
+    // Reject empty / whitespace-only keys before hitting the index. This
+    // prevents a misconfigured consumer (with an empty `key` value) from
+    // accidentally matching every request that sends a blank header, and
+    // gives clients a clearer error than a generic "Invalid API key".
+    if api_key.trim().is_empty() {
+        return VerifyOutcome::Invalid(r#"{"error":"Missing API key"}"#.into());
+    }
+
+    match consumer_index.find_by_api_key(api_key) {
+        Some(consumer) => VerifyOutcome::consumer(consumer),
+        None => VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid API key"}"#.into()),
+    }
+}
+
+/// `key_auth`'s authenticate hook: the shared [`auth_flow::run_auth`]
+/// contract, with the key borrowed from the request instead of copied into an
+/// owned [`ExtractedCredential::ApiKey`]. Commit and rejection mapping are the
+/// shared [`auth_flow::finish_verified_auth_attempt`], so outcomes, bodies,
+/// and challenges are identical to the generic flow.
+async fn run_key_auth(
+    mechanism: &KeyAuth,
+    ctx: &mut RequestContext,
+    consumer_index: &ConsumerIndex,
+) -> PluginResult {
+    let outcome = match mechanism.lookup_key(ctx) {
+        KeyLookup::Missing => {
+            debug!("{}: no credential present", mechanism.mechanism_name());
+            return PluginResult::Continue;
+        }
+        KeyLookup::InvalidFormat(body) => {
+            return auth_flow::auth_rejection(
+                401,
+                body.to_string(),
+                mechanism.rejection_challenge(CredentialRejection::InvalidFormat),
+            );
+        }
+        KeyLookup::Present(key) => verify_api_key(&key, consumer_index),
+    };
+    auth_flow::finish_verified_auth_attempt(mechanism, ctx, outcome, false)
 }
 
 #[async_trait]
@@ -190,12 +316,10 @@ impl AuthMechanism for KeyAuth {
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
-        match self.extract_key_credential(ctx) {
-            HeaderCredentialExtract::Present(key) => ExtractedCredential::ApiKey(key),
-            HeaderCredentialExtract::Missing => ExtractedCredential::Missing,
-            HeaderCredentialExtract::InvalidFormat => {
-                ExtractedCredential::InvalidFormat(INVALID_API_KEY_FORMAT_BODY.into())
-            }
+        match self.lookup_key(ctx) {
+            KeyLookup::Present(key) => ExtractedCredential::ApiKey(key.into_owned()),
+            KeyLookup::Missing => ExtractedCredential::Missing,
+            KeyLookup::InvalidFormat(body) => ExtractedCredential::InvalidFormat(body.into()),
         }
     }
 
@@ -207,19 +331,7 @@ impl AuthMechanism for KeyAuth {
         let ExtractedCredential::ApiKey(api_key) = credential else {
             return VerifyOutcome::NotApplicable;
         };
-
-        // Reject empty / whitespace-only keys before hitting the index. This
-        // prevents a misconfigured consumer (with an empty `key` value) from
-        // accidentally matching every request that sends a blank header, and
-        // gives clients a clearer error than a generic "Invalid API key".
-        if api_key.trim().is_empty() {
-            return VerifyOutcome::Invalid(r#"{"error":"Missing API key"}"#.into());
-        }
-
-        match consumer_index.find_by_api_key(&api_key) {
-            Some(consumer) => VerifyOutcome::consumer(consumer),
-            None => VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid API key"}"#.into()),
-        }
+        verify_api_key(&api_key, consumer_index)
     }
 }
 
@@ -228,18 +340,20 @@ auth_flow::impl_auth_plugin!(
     "key_auth",
     super::priority::KEY_AUTH,
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
-    auth_flow::run_auth;
+    run_key_auth;
 
+    /// Mark the configured query credential — in the decoded map or behind a
+    /// `;` — for policy redaction and, with `hide_credentials`, for removal
+    /// from the forwarded query. Runs for every auth instance before the
+    /// chain can short-circuit, so a sub-pair spelling is hidden even when
+    /// another mechanism authenticates the request.
     fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {
         if let Some(name) = self.query_param_name.as_deref()
-            && ctx.query_params.contains_key(name)
+            && self.query_credential_present(ctx)
         {
             crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
-            if self.hide_credentials
-                && let Some(metadata_key) = &self.strip_query_metadata_key
-            {
-                ctx.metadata
-                    .insert(metadata_key.clone(), "true".to_string());
+            if self.hide_credentials {
+                self.mark_query_credential_for_stripping(ctx);
             }
         }
     }
@@ -280,12 +394,11 @@ auth_flow::impl_auth_plugin!(
                 headers.remove(original);
             }
         }
-        if let Some(name) = self.query_param_name.as_deref()
-            && ctx.query_params.remove(name).is_some()
-            && let Some(metadata_key) = &self.strip_query_metadata_key
-        {
-            ctx.metadata
-                .insert(metadata_key.clone(), "true".to_string());
+        if let Some(name) = self.query_param_name.as_deref() {
+            let sub_pair_alias = query_has_semicolon_credential_alias(ctx.raw_query_string(), name);
+            if ctx.query_params.remove(name).is_some() || sub_pair_alias {
+                self.mark_query_credential_for_stripping(ctx);
+            }
         }
         crate::plugins::PluginResult::Continue
     }

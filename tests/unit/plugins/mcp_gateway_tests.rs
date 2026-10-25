@@ -18976,3 +18976,178 @@ fn malformed_template_resource_deny_keys_are_refused() {
         assert!(create_plugin("mcp_gateway", &config).is_err(), "{key}");
     }
 }
+
+// ---- aggregate SSE listener under route response-size policy (SOL-2) ----
+
+/// Aggregate plugin with the session `GET` listener enabled and a one-second
+/// keepalive, so a cumulative ceiling is reachable without a long wait.
+fn mcp_plugin_with_fast_keepalive() -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["sessions"] = json!({ "sse_multiplexing": true, "sse_keepalive_seconds": 1 });
+    create_plugin("mcp_gateway", &config).unwrap().unwrap()
+}
+
+fn response_size_limiter(config: Value) -> Arc<dyn ferrum_edge::plugins::Plugin> {
+    create_plugin("response_size_limiting", &config)
+        .unwrap()
+        .unwrap()
+}
+
+/// A strict whole-body policy refuses the gateway-generated listener exactly as
+/// it refuses a genuine backend event stream: a fixed `502` before any stream
+/// commits, through the finalizer the H1/H2 and native H3 writers share, and
+/// the session's single-listener slot is released so the client can reattach.
+#[tokio::test]
+async fn strict_response_size_limit_refuses_the_aggregate_sse_listener_before_commit() {
+    let plugin = mcp_plugin();
+    let plugins = vec![
+        Arc::clone(&plugin),
+        response_size_limiter(json!({"max_bytes": 1024, "require_buffered_check": true})),
+    ];
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    let (mut status, body, mut response_headers) =
+        reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert!(mcp_aggregate_sse_listener_is_staged_for_test(&ctx));
+    let mut body = Bytes::from(body);
+    ferrum_edge::_test_support::finalize_synthetic_response_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut response_headers,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(status, 502, "a strict route limit must refuse the listener");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("Streaming response size cannot be verified") && body.contains("1024"),
+        "{body}"
+    );
+    assert!(
+        !reject_headers_select_event_stream_for_test(&response_headers),
+        "the refusal must not keep the event-stream representation"
+    );
+    assert!(
+        !mcp_aggregate_sse_listener_is_staged_for_test(&ctx),
+        "the refusal must drop the listener lease"
+    );
+
+    // The slot is free while the refused request is still alive.
+    let (mut retry_ctx, mut retry_headers) = sse_get(&session_id);
+    let retried = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    assert_eq!(
+        reject_raw(retried).0,
+        200,
+        "the client must be able to reattach"
+    );
+}
+
+/// A default (non-strict) instance does not refuse the listener; the core
+/// instead carries the effective route ceiling into the live body. The 11-byte
+/// greeting alone crosses a 5-byte ceiling, so the adopted H1/H2 stream ends
+/// with the response-size error before releasing it, and dropping the body
+/// frees the listener slot.
+#[tokio::test]
+async fn route_response_ceiling_bounds_the_adopted_aggregate_sse_body() {
+    let plugin = mcp_plugin();
+    let plugins = vec![
+        Arc::clone(&plugin),
+        response_size_limiter(json!({"max_bytes": 5})),
+    ];
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    // The H1/H2 and H3 handlers stamp the plugin cache's folded route ceiling
+    // on the request before any request hook runs.
+    ctx.route_response_body_limit_bytes = plugins[1].enforced_response_body_limit();
+    assert_eq!(ctx.route_response_body_limit_bytes, Some(5));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (parts, mut response_body) =
+        ferrum_edge::_test_support::finalize_and_build_plugin_reject_response_for_test(
+            &plugins, &mut ctx, result,
+        )
+        .await;
+    assert_eq!(
+        parts.status.as_u16(),
+        200,
+        "a default instance streams the listener"
+    );
+    assert!(!parts.headers.contains_key("content-length"));
+
+    let window = std::time::Duration::from_secs(2);
+    let first = tokio::time::timeout(window, response_body.frame())
+        .await
+        .expect("the bounded listener must answer promptly");
+    match first {
+        Some(Err(error)) => assert!(
+            error
+                .to_string()
+                .contains("response body exceeds maximum size"),
+            "{error}"
+        ),
+        other => panic!("the greeting must not cross the 5-byte ceiling: {other:?}"),
+    }
+
+    drop(response_body);
+    let (mut retry_ctx, mut retry_headers) = sse_get(&session_id);
+    let retried = plugin
+        .before_proxy(&mut retry_ctx, &mut retry_headers)
+        .await;
+    assert_eq!(
+        reject_raw(retried).0,
+        200,
+        "a size-terminated listener frees its slot"
+    );
+}
+
+/// The ceiling is cumulative and inclusive: the greeting exactly fills an
+/// 11-byte ceiling and is delivered, and the first keepalive comment that would
+/// cross it ends the stream instead of being released.
+#[tokio::test]
+async fn aggregate_sse_ceiling_counts_greeting_and_keepalives_cumulatively() {
+    let plugin = mcp_plugin_with_fast_keepalive();
+    let plugins = vec![
+        Arc::clone(&plugin),
+        response_size_limiter(json!({"max_bytes": 11})),
+    ];
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = sse_get(&session_id);
+    ctx.route_response_body_limit_bytes = plugins[1].enforced_response_body_limit();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let (_, mut response_body) =
+        ferrum_edge::_test_support::finalize_and_build_plugin_reject_response_for_test(
+            &plugins, &mut ctx, result,
+        )
+        .await;
+
+    let window = std::time::Duration::from_secs(3);
+    let greeting = tokio::time::timeout(window, response_body.frame())
+        .await
+        .expect("greeting");
+    match greeting {
+        Some(Ok(frame)) => {
+            assert_eq!(frame.into_data().unwrap().as_ref(), b": mcp-sse\n\n");
+        }
+        other => panic!("the greeting fits the ceiling exactly: {other:?}"),
+    }
+
+    let next = tokio::time::timeout(window, response_body.frame())
+        .await
+        .expect("the keepalive tick must arrive within the window");
+    match next {
+        Some(Err(error)) => assert!(
+            error
+                .to_string()
+                .contains("response body exceeds maximum size"),
+            "{error}"
+        ),
+        other => panic!("the first keepalive must not cross the ceiling: {other:?}"),
+    }
+}

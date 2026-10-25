@@ -4865,16 +4865,32 @@ impl Plugin for GrpcWebPlugin {
                     data_len = frame.data_end,
                     "Converted gRPC-Web request trailer frame to native gRPC trailers"
                 );
-                let RequestTrailerFrame { data_end, trailers } = frame;
+                let RequestTrailerFrame {
+                    data_end,
+                    mut trailers,
+                } = frame;
+                // A route-configured credential header location (a `key_auth`
+                // `header:<name>`, a custom JWT header) is per-route, so the
+                // static trailer predicate cannot know it. Drop it here, the
+                // same late-boundary rule every native trailer relay applies
+                // (`strip_configured_credential_request_trailers`).
+                let received_entries = trailers.len();
+                trailers.retain(|(name, _)| !ctx.request_header_requires_redaction(name));
+                let carried_only_credentials = received_entries > 0 && trailers.is_empty();
                 // The trailer frame is about to leave the body for good, so the
                 // validated block goes into request-private TYPED state that
                 // dispatch reads directly — not into plugin-writable metadata,
-                // where a later hook could delete or rewrite the only copy.
-                let Some(staged) = StagedRequestTrailers::from_validated_pairs(trailers) else {
-                    self.latch_request_translation_error(ctx, ERR_TRAILER_STAGING_FAILED);
-                    return None;
-                };
-                ctx.grpc_web_request_trailers = staged;
+                // where a later hook could delete or rewrite the only copy. A
+                // block that carried only credential locations stages nothing;
+                // every other block (an empty one included) keeps the staging
+                // validation.
+                if !carried_only_credentials {
+                    let Some(staged) = StagedRequestTrailers::from_validated_pairs(trailers) else {
+                        self.latch_request_translation_error(ctx, ERR_TRAILER_STAGING_FAILED);
+                        return None;
+                    };
+                    ctx.grpc_web_request_trailers = staged;
+                }
                 Some(framed[..data_end].to_vec())
             }
             None => None,

@@ -242,7 +242,7 @@ use crate::plugins::utils::openai_error::{
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
-    WebSocketFrameDirection, WebSocketSizeLimits, is_builtin_plugin,
+    WebSocketDirectionSizeLimits, WebSocketFrameDirection, is_builtin_plugin,
     mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
@@ -699,9 +699,11 @@ pub(crate) fn stamp_original_response_metadata(
     }
     ctx.metadata
         .remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
-    if let Some(content_length) = response_headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
+    // The canonical folded-field parser: agreeing repeats (`512, 512`) are one
+    // exact length, while disagreeing, malformed, or signed members are no
+    // length at all, exactly as every size decision reads the field.
+    if let Some(crate::util::body_limit::ContentLength::Exact(content_length)) =
+        crate::util::body_limit::declared_content_length(response_headers)
     {
         ctx.metadata.insert(
             ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
@@ -16470,10 +16472,13 @@ async fn handle_websocket_request_authenticated(
     // constrains neither the client-side nor the backend-side framer (issue
     // #3734). The decision is memoized on the upgrade context, so the later
     // frame/disconnect collection reuses it rather than re-evaluating.
+    // The backend framer reads backend frames, so it takes the
+    // backend->client direction's ceilings.
     let ws_size_limit_plugins = collect_websocket_size_limit_plugins(&plugins, &mut ctx);
     let ws_size_limits = EffectiveWsSizeLimits::from_plugins(
         state.max_websocket_frame_size_bytes,
         &ws_size_limit_plugins,
+        WebSocketFrameDirection::BackendToClient,
     );
     // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
     // derived from it (the egress route is `preserve_host_header`) so the peer's
@@ -18393,6 +18398,48 @@ fn request_integrity_retirement_applies(
         .keys()
         .any(|name| is_body_bound_request_integrity_header(name))
         && request_body_rules_may_rewrite(&ctx.method, headers)
+}
+
+/// The initial dispatch-boundary gateway-assertion refresh shared by the H1/H2
+/// ladder and the native HTTP/3 frontend.
+///
+/// Strip plugin-controlled gateway assertions and inject only the
+/// authenticated principal and the private GeoIP result. The common
+/// no-assertion request returns after one scan of the header names.
+///
+/// When no plugin has materialized an owned outbound map, `ctx.headers` IS the
+/// outbound map (every later stage — the hop-limit and `Max-Forwards`
+/// re-assertions, the deferred `before_proxy` passes — writes it in place), so
+/// a request that carries no principal is refreshed in place through
+/// `mem::take` instead of cloning every header name and value. A GeoIP-only
+/// request is exactly that case: `geo_restriction` already wrote the verified
+/// country into `ctx.headers`, so copying the whole map to re-assert two bytes
+/// was pure waste. A request with a resolved principal keeps the owned copy
+/// it always had, leaving `ctx.headers` without the injected identity.
+pub(crate) fn refresh_initial_backend_gateway_assertion_headers(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    let has_principal =
+        ctx.backend_consumer_username().is_some() || ctx.backend_authenticated_identity().is_some();
+    let source_has_reserved_assertion = owned_proxy_headers
+        .as_ref()
+        .unwrap_or(&ctx.headers)
+        .keys()
+        .any(|name| headers_mod::is_gateway_assertion_header(name));
+    if !has_principal && ctx.backend_geo_country().is_none() && !source_has_reserved_assertion {
+        return;
+    }
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        refresh_backend_gateway_assertion_headers(ctx, headers);
+    } else if has_principal {
+        let headers = owned_proxy_headers.insert(ctx.headers.clone());
+        refresh_backend_gateway_assertion_headers(ctx, headers);
+    } else {
+        let mut headers = std::mem::take(&mut ctx.headers);
+        refresh_backend_gateway_assertion_headers(ctx, &mut headers);
+        ctx.headers = headers;
+    }
 }
 
 fn refresh_effective_backend_gateway_assertion_headers(
@@ -20539,18 +20586,29 @@ pub(crate) fn collect_websocket_disconnect_plugins(
 }
 
 impl EffectiveWsSizeLimits {
-    pub(crate) fn from_plugins(global_frame_bytes: usize, plugins: &[Arc<dyn Plugin>]) -> Self {
+    /// Combine the applicable instances' limits for the framer that reads
+    /// frames travelling in `direction`. Called once per session and
+    /// direction, never per frame: the client-side framer takes
+    /// `ClientToBackend`, every backend-side framer `BackendToClient`.
+    pub(crate) fn from_plugins(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: WebSocketFrameDirection,
+    ) -> Self {
         let mut plugin_frame: Option<WsSizeLimitRule> = None;
         let mut plugin_message: Option<WsSizeLimitRule> = None;
 
         for plugin in plugins {
-            let Some(WebSocketSizeLimits {
+            let Some(limits) = plugin.websocket_size_limits() else {
+                continue;
+            };
+            let WebSocketDirectionSizeLimits {
                 max_frame_bytes,
                 max_message_bytes,
                 close_reason,
-            }) = plugin.websocket_size_limits()
-            else {
-                continue;
+            } = match direction {
+                WebSocketFrameDirection::ClientToBackend => limits.client_to_backend,
+                WebSocketFrameDirection::BackendToClient => limits.backend_to_client,
             };
 
             if plugin_frame
@@ -20593,7 +20651,7 @@ impl EffectiveWsSizeLimits {
         }
     }
 
-    fn plugin_close_for_error(
+    pub(crate) fn plugin_close_for_error(
         &self,
         error: &tokio_tungstenite::tungstenite::Error,
     ) -> Option<(CloseFrame, &'static str, usize, usize)> {
@@ -20624,6 +20682,47 @@ impl EffectiveWsSizeLimits {
             size,
             max_size,
         ))
+    }
+
+    /// The Close for a terminated `permessage-deflate` read fault on this
+    /// direction, and whether a size-policy plugin supplied the violated
+    /// ceiling.
+    ///
+    /// The inflate adapter beneath the framer enforces the same frame and
+    /// message ceilings as the parser, so a size fault whose limit is exactly
+    /// the binding plugin rule keeps that plugin's configured reason, as the
+    /// equivalent uncompressed violation would. An independent ceiling (the
+    /// global frame limit or a stricter
+    /// `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`) and corrupt
+    /// compressed data keep the adapter's fixed, non-secret reason.
+    pub(crate) fn permessage_deflate_fault_close(
+        &self,
+        fault: ws_permessage_deflate::PermessageDeflateFault,
+    ) -> (CloseFrame, bool) {
+        use ws_permessage_deflate::PermessageDeflateFault;
+
+        let rule = match fault {
+            PermessageDeflateFault::CompressedFrameTooLarge { max, .. }
+            | PermessageDeflateFault::DecompressedFrameTooLarge { max } => self
+                .plugin_frame
+                .as_ref()
+                .filter(|rule| self.max_frame_bytes == max && rule.max_bytes == max),
+            PermessageDeflateFault::DecompressedMessageTooLarge { max } => self
+                .plugin_message
+                .as_ref()
+                .filter(|rule| self.max_message_bytes == max && rule.max_bytes == max),
+            PermessageDeflateFault::InvalidCompressedData => None,
+        };
+        match rule {
+            Some(rule) => (
+                CloseFrame {
+                    code: CloseCode::Size,
+                    reason: rule.close_reason.as_ref().to_owned().into(),
+                },
+                true,
+            ),
+            None => (fault.close_frame(), false),
+        }
     }
 
     /// Global frame/message capacity overflow Close when no plugin rule supplied
@@ -21331,6 +21430,7 @@ where
         let client_limits = EffectiveWsSizeLimits::from_plugins(
             max_websocket_frame_size_bytes,
             &ws_framing_plugins,
+            WebSocketFrameDirection::ClientToBackend,
         );
         let streams = permessage_deflate
             .wrap(
@@ -21659,13 +21759,23 @@ where
         return Ok(());
     }
 
-    let effective_size_limits = Arc::new(EffectiveWsSizeLimits::from_plugins(
+    // Each direction is combined independently, once per session. The client
+    // framer below reads client frames (client->backend ceilings); the backend
+    // framer was born at connect time with the backend->client ceilings, which
+    // `size_limits_btc` reproduces for Close-reason attribution.
+    let size_limits_ctb = EffectiveWsSizeLimits::from_plugins(
         max_websocket_frame_size_bytes,
         &ws_framing_plugins,
-    ));
+        WebSocketFrameDirection::ClientToBackend,
+    );
+    let size_limits_btc = EffectiveWsSizeLimits::from_plugins(
+        max_websocket_frame_size_bytes,
+        &ws_framing_plugins,
+        WebSocketFrameDirection::BackendToClient,
+    );
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
-    ws_config.max_message_size = Some(effective_size_limits.max_message_bytes);
+    ws_config.max_frame_size = Some(size_limits_ctb.max_frame_bytes);
+    ws_config.max_message_size = Some(size_limits_ctb.max_message_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
     // RFC 6455 §5.1: a server MUST close the connection on an unmasked
     // client frame. RFC 8441 / RFC 9220 Extended CONNECT bootstrap the
@@ -21757,8 +21867,6 @@ where
     // framers, so mid-message read progress also refreshes the watermark.
     let ws_idle_tracker_ctb = ws_idle_tracker.clone();
     let ws_idle_tracker_btc = ws_idle_tracker;
-    let size_limits_ctb = Arc::clone(&effective_size_limits);
-    let size_limits_btc = effective_size_limits;
     let overload_ctb = Arc::clone(&overload);
     let overload_btc = Arc::clone(&overload);
     let shutdown_rx_ctb = shutdown_rx.clone();
@@ -22069,6 +22177,10 @@ where
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
                                 );
+                                crate::plugins::prometheus_metrics::global_registry()
+                                    .record_ws_message_size_limit_rejection(
+                                        WebSocketFrameDirection::ClientToBackend,
+                                    );
                                 // Cancellation precedes the bounded polite write so policy
                                 // teardown cannot be held by a non-reading destination.
                                 observe_ws_policy_close(
@@ -22146,7 +22258,18 @@ where
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );
-                                let close = fault.close_frame();
+                                // A size fault at the binding plugin ceiling keeps
+                                // the plugin's configured reason and counts as a
+                                // size-policy rejection, exactly like the
+                                // uncompressed parser violation.
+                                let (close, plugin_bound) =
+                                    size_limits_ctb.permessage_deflate_fault_close(fault);
+                                if plugin_bound {
+                                    crate::plugins::prometheus_metrics::global_registry()
+                                        .record_ws_message_size_limit_rejection(
+                                            WebSocketFrameDirection::ClientToBackend,
+                                        );
+                                }
                                 observe_ws_policy_close(
                                     &ctb_plugins,
                                     &proxy_id_ctb,
@@ -22462,6 +22585,10 @@ where
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
                                 );
+                                crate::plugins::prometheus_metrics::global_registry()
+                                    .record_ws_message_size_limit_rejection(
+                                        WebSocketFrameDirection::BackendToClient,
+                                    );
                                 observe_ws_policy_close(
                                     &btc_plugins,
                                     &proxy_id_btc,
@@ -22537,7 +22664,18 @@ where
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );
-                                let close = fault.close_frame();
+                                // A size fault at the binding plugin ceiling keeps
+                                // the plugin's configured reason and counts as a
+                                // size-policy rejection, exactly like the
+                                // uncompressed parser violation.
+                                let (close, plugin_bound) =
+                                    size_limits_btc.permessage_deflate_fault_close(fault);
+                                if plugin_bound {
+                                    crate::plugins::prometheus_metrics::global_registry()
+                                        .record_ws_message_size_limit_rejection(
+                                            WebSocketFrameDirection::BackendToClient,
+                                        );
+                                }
                                 observe_ws_policy_close(
                                     &btc_plugins,
                                     &proxy_id_btc,
@@ -26486,6 +26624,19 @@ fn enforce_synthetic_response_body_limit(
     if ctx.gateway_capacity_response_selected() || ctx.gateway_representation_response_selected() {
         return false;
     }
+    // A staged aggregate MCP SSE listener is the one synthetic response whose
+    // real body is an indefinite, gateway-generated event stream behind an
+    // EMPTY placeholder, so the byte check below can never see it. A strict
+    // whole-body policy (`response_size_limiting` with
+    // `require_buffered_check: true`) refuses a genuine backend event stream
+    // before commit because its complete size cannot be proven; the same
+    // policy refuses this one here, BEFORE the reject-path `after_proxy` chain
+    // and before either the H1/H2 or the native H3 writer could adopt the
+    // lease. Dropping the lease releases the session's single-listener slot.
+    // A non-strict ceiling is instead carried into the adopted live body.
+    if refuse_unprovable_aggregate_sse_listener(plugins, ctx, status, headers, body) {
+        return true;
+    }
     if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
         return false;
     }
@@ -26526,6 +26677,60 @@ fn enforce_synthetic_response_body_limit(
             body: Bytes::from(crate::plugins::utils::size_limit::rejection_body(
                 "Response body too large",
                 limit as u128,
+            )),
+            headers: HashMap::new(),
+        },
+    );
+    true
+}
+
+/// Refuse a staged aggregate MCP SSE listener under a strict whole-body
+/// response-size policy (see [`enforce_synthetic_response_body_limit`]).
+///
+/// Applies only while the response is still the gateway-authored listener
+/// placeholder: status `200`, an empty body, a `text/event-stream`
+/// representation, and a staged lease. The refusal is the same fixed `502`
+/// `Streaming response size cannot be verified` body the policy returns for a
+/// genuine backend event stream, attributed to the enforcing instance's limit.
+fn refuse_unprovable_aggregate_sse_listener(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    headers: &mut HashMap<String, String>,
+    body: &mut Bytes,
+) -> bool {
+    if ctx.mcp_aggregate_sse.is_none()
+        || *status != 200
+        || !body.is_empty()
+        || !response_headers_select_event_stream(headers)
+    {
+        return false;
+    }
+    let request: &RequestContext = ctx;
+    let Some((plugin_name, limit)) = plugins.iter().find_map(|plugin| {
+        plugin
+            .refuses_unprovable_response_stream(request)
+            .map(|limit| (plugin.name(), limit))
+    }) else {
+        return false;
+    };
+    // Drop the lease first: the session's single-listener slot is free again
+    // whatever the rest of the rejection lifecycle does.
+    ctx.mcp_aggregate_sse = None;
+    debug!(
+        plugin = plugin_name,
+        max_bytes = limit,
+        "Aggregate MCP SSE listener refused: strict response size cannot be verified"
+    );
+    *body = rebuild_plugin_rejection_response_headers(
+        ctx,
+        status,
+        headers,
+        RejectedResponseParts {
+            status_code: 502,
+            body: Bytes::from(crate::plugins::utils::size_limit::rejection_body(
+                crate::plugins::response_size_limiting::UNVERIFIABLE_STREAM_SIZE_ERROR,
+                u128::from(limit),
             )),
             headers: HashMap::new(),
         },
@@ -28172,7 +28377,21 @@ pub(crate) struct NormalizedRejectResponse {
     /// once and selects [`headers_mod::ClientResponseFraming::Streaming`], so
     /// no `Content-Length` is published for an event stream whose bytes have
     /// not been written yet.
-    pub(crate) aggregate_sse: Option<crate::plugins::mcp_aggregate_sse::AggregateSseListener>,
+    pub(crate) aggregate_sse: Option<AdoptedAggregateSse>,
+}
+
+/// An aggregate MCP SSE listener lease adopted at the reject boundary,
+/// together with the adopting request's effective response ceiling.
+///
+/// The listener's bytes are gateway-generated, so no backend collector or
+/// streaming size adapter ever counts them. The ceiling is captured here, where
+/// the request context is still available, and handed to the live body when
+/// [`build_response_from_normalized_reject`] claims it (see
+/// [`crate::plugins::mcp_aggregate_sse::AggregateSseBody::with_response_byte_ceiling`]).
+pub(crate) struct AdoptedAggregateSse {
+    pub(crate) listener: crate::plugins::mcp_aggregate_sse::AggregateSseListener,
+    /// `ctx.effective_max_response_body_size_bytes()` (`0` = unlimited).
+    pub(crate) response_byte_ceiling: usize,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -29139,10 +29358,14 @@ pub(crate) fn build_response_from_normalized_reject(
     // Claim the multiplexed SSE body exactly once. The claim is a one-shot
     // compare-and-swap inside the listener lease, so even if a context clone
     // still holds a handle it can never produce a second body for this session.
-    let aggregate_sse_body = reject
-        .aggregate_sse
-        .as_ref()
-        .and_then(crate::plugins::mcp_aggregate_sse::AggregateSseListener::take_body);
+    // The adopting request's effective response ceiling bounds the live body
+    // from its first byte (the greeting) on.
+    let aggregate_sse_body = reject.aggregate_sse.as_ref().and_then(|adopted| {
+        adopted
+            .listener
+            .take_body()
+            .map(|body| body.with_response_byte_ceiling(adopted.response_byte_ceiling))
+    });
     let mut headers = reject.headers;
     // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
     // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
@@ -31970,7 +32193,7 @@ async fn run_backend_path_plugins_or_build_reject(
     None
 }
 
-async fn finalize_reject_response_with_after_proxy_hooks(
+pub(crate) async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
@@ -32055,12 +32278,19 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     // replaced the status or the representation gets an ordinary body, and
     // dropping the lease here releases the session's single-listener slot so
     // the client can reattach instead of being locked out.
+    //
+    // A strict `require_buffered_check` policy already refused the listener in
+    // `enforce_synthetic_response_body_limit`; an adopted one carries the
+    // effective route/global response ceiling into its live body.
     if let Some(listener) = ctx.mcp_aggregate_sse.take()
         && normalized.http_status == StatusCode::OK
         && normalized.body.is_empty()
         && response_headers_select_event_stream(&normalized.headers)
     {
-        normalized.aggregate_sse = Some(listener);
+        normalized.aggregate_sse = Some(AdoptedAggregateSse {
+            listener,
+            response_byte_ceiling: ctx.effective_max_response_body_size_bytes(),
+        });
     }
     normalized
 }
@@ -35911,8 +36141,9 @@ async fn handle_proxy_request_inner(
     // than the global one bounds unbuffered uploads and buffered responses
     // instead of only being checked in a body hook that a streaming request
     // never reaches (`GHSA-xrfj-852f-645j`).
-    ctx.route_request_body_limit_bytes = plugin_cache_view.enforced_request_body_limit();
-    ctx.route_response_body_limit_bytes = plugin_cache_view.enforced_response_body_limit();
+    // The same stamp records whether a streaming response inspector may
+    // rewrite this route's client-visible bytes after `after_proxy`.
+    plugin_cache_view.stamp_route_body_policy(&mut ctx);
     // Folded once per request for this handler's own dispatch/collection sites.
     // `0` still means unlimited, and an absent route ceiling leaves each global
     // knob exactly as configured.
@@ -37446,19 +37677,10 @@ async fn handle_proxy_request_inner(
 
     // Strip plugin-controlled gateway assertions and inject only the
     // authenticated principal and private GeoIP result. The common
-    // no-assertion path avoids materializing an owned header map.
-    let effective_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
-    let source_has_reserved_assertion = effective_headers
-        .keys()
-        .any(|name| headers_mod::is_gateway_assertion_header(name));
-    if ctx.backend_consumer_username().is_some()
-        || ctx.backend_authenticated_identity().is_some()
-        || ctx.backend_geo_country().is_some()
-        || source_has_reserved_assertion
-    {
-        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        refresh_backend_gateway_assertion_headers(&ctx, headers);
-    }
+    // no-assertion path avoids materializing an owned header map, and a
+    // GeoIP-only request refreshes `ctx.headers` in place. The native HTTP/3
+    // frontend makes the same call at the same point — keep both in sync.
+    refresh_initial_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
     // Stale request digests: decided over the final outbound headers, after
     // every `before_proxy` hook and the route-header finalizer. The native
     // HTTP/3 frontend does the same at the same point — keep both in sync.
@@ -39873,6 +40095,7 @@ async fn handle_proxy_request_inner(
                             // the fully-streamed upload gets the gateway-owned pump
                             // instead of a bounded collect.
                             grpc_buffered_upload_auth_deadline.as_ref(),
+                            ctx.request_trailer_credential_header_names(),
                         )
                     });
                     tokio::pin!(attempt);
@@ -41685,6 +41908,7 @@ async fn handle_proxy_request_inner(
                             crate::plugins::grpc_web::response_entity_is_unframed_backend_error(
                                 &ctx,
                             ),
+                            effective_max_response_body_size_bytes,
                         )
                     } else if let Some(framing) = grpc_web_passthrough_framing {
                         // Pass-through: forward the backend's gRPC-Web body and
@@ -46556,11 +46780,15 @@ async fn handle_proxy_request_inner(
         flavor == HttpFlavor::Grpc,
     );
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
+        // The translated representation (base64 text expansion plus the
+        // generated trailer frame) is charged against the same effective
+        // ceiling the backend body already is.
         body.into_grpc_web_streaming(
             &content_type,
             response_status,
             Some(initial_terminal_metadata),
             crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
+            effective_max_response_body_size_bytes,
         )
     } else if let Some(framing) = grpc_web_passthrough_framing {
         // Pass-through gRPC-Web: the backend's body and its own trailer frame
@@ -53236,7 +53464,10 @@ async fn proxy_to_backend_direct_h1(
                         Arc::clone(&body_size_exceeded),
                         Arc::clone(ctx_bytes_sent_observed),
                     )
-                    .with_h2_end_stream_required(require_end_stream);
+                    .with_h2_end_stream_required(require_end_stream)
+                    .with_trailer_credential_header_names(
+                        request_ctx.request_trailer_credential_header_names(),
+                    );
                     let (limited, pump) = install_streaming_upload_authorization(
                         limited,
                         upload_auth_deadline.as_ref(),
@@ -53252,7 +53483,10 @@ async fn proxy_to_backend_direct_h1(
                         incoming,
                         Arc::clone(ctx_bytes_sent_observed),
                     )
-                    .with_h2_end_stream_required(require_end_stream);
+                    .with_h2_end_stream_required(require_end_stream)
+                    .with_trailer_credential_header_names(
+                        request_ctx.request_trailer_credential_header_names(),
+                    );
                     let (counting, pump) = install_counting_upload_authorization(
                         counting,
                         upload_auth_deadline.as_ref(),
@@ -55128,6 +55362,20 @@ pub fn check_host_authority_consistency(
 ///    the only permitted value is "trailers"; any other value (or an empty list element
 ///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
 ///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
+///
+/// 6. **One `Authorization` credential** (all HTTP versions, WebSocket upgrades and
+///    Extended CONNECT included): RFC 9110 §11.6.2 defines `Authorization` as a single
+///    `credentials` production, not a list, so repeated field lines are malformed.
+///    Ferrum folds repeated lines into one comma-joined value before authentication,
+///    and credential hiding (`basic_auth` / `ldap_auth` `hide_credentials`) reasons
+///    about the folded value's FIRST scheme only, so `Authorization: Bearer x` followed
+///    by `Authorization: Basic <password>` would forward the Basic password to the
+///    backend whenever another mechanism authenticated the request. Rejecting the
+///    ambiguous shape here — before any authentication short-circuit — closes that for
+///    every protocol at once. A single field line whose value carries a second
+///    credential after a top-level comma (`Bearer x, Basic <password>`) is the same
+///    ambiguity and is rejected too; the scan is quote-aware, so `auth-param` lists
+///    such as `Digest username="a, b", realm="r"` are unaffected.
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
@@ -55299,7 +55547,104 @@ fn check_protocol_headers_with_wire_framing(
         }
     }
 
+    // 6. Exactly one Authorization credential (all HTTP versions).
+    check_single_authorization_credential(headers)
+}
+
+/// Check 6 of [`check_protocol_headers`]: the request carries at most one
+/// `Authorization` field line, and that line carries one credential.
+///
+/// Allocation-free: one `get_all` walk plus, only when the value holds a comma,
+/// one bounded byte scan of it.
+fn check_single_authorization_credential(headers: &hyper::HeaderMap) -> Option<&'static str> {
+    let mut values = headers.get_all(hyper::header::AUTHORIZATION).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return Some(r#"{"error":"Request contains multiple Authorization headers"}"#);
+    }
+    if authorization_value_has_additional_credential(first.as_bytes()) {
+        return Some(r#"{"error":"Authorization header contains more than one credential"}"#);
+    }
     None
+}
+
+/// Whether an `Authorization` value carries a second `credentials` production
+/// after a top-level comma (RFC 9110 §11.6.2 / §11.4).
+///
+/// A comma inside a quoted string never separates anything. After a top-level
+/// comma, an `auth-param` (`token BWS "=" ...`) continues the same credential,
+/// while a bare token followed by anything other than `=` begins a new
+/// `auth-scheme`. Empty list elements are ignored.
+fn authorization_value_has_additional_credential(value: &[u8]) -> bool {
+    if !value.contains(&b',') {
+        return false;
+    }
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, &byte) in value.iter().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+        } else if byte == b','
+            && authorization_list_element_starts_credential(value.get(index + 1..).unwrap_or(&[]))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the list element that follows a top-level comma in an
+/// `Authorization` value begins a new `credentials` production rather than an
+/// `auth-param`.
+fn authorization_list_element_starts_credential(rest: &[u8]) -> bool {
+    let rest = trim_leading_ows(rest);
+    let token_len = rest
+        .iter()
+        .take_while(|&&byte| is_authorization_tchar(byte))
+        .count();
+    if token_len == 0 {
+        return false;
+    }
+    let after_token = trim_leading_ows(rest.get(token_len..).unwrap_or(&[]));
+    after_token.first() != Some(&b'=')
+}
+
+fn trim_leading_ows(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|&byte| byte != b' ' && byte != b'\t')
+        .unwrap_or(bytes.len());
+    bytes.get(start..).unwrap_or(&[])
+}
+
+/// RFC 9110 §5.6.2 `tchar`.
+fn is_authorization_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// `401` for a request on a connection whose client-certificate trust was
@@ -59443,7 +59788,10 @@ async fn proxy_to_backend_hbone_after_ready(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             )
-            .with_h2_end_stream_required(require_end_stream);
+            .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            );
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
@@ -60578,7 +60926,10 @@ async fn proxy_to_backend_unix(
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
             )
-            .with_h2_end_stream_required(require_end_stream);
+            .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            );
             // Full upload lifecycle for the UPLOAD direction (#3815): the
             // adapter deadline plus a gateway-owned pump, so the bound still
             // fires while this pooled connection task is parked and not
@@ -62265,7 +62616,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     Arc::clone(&body_size_exceeded),
                     Arc::clone(ctx_bytes_sent_observed),
                 )
-                .with_h2_end_stream_required(require_end_stream);
+                .with_h2_end_stream_required(require_end_stream)
+                .with_trailer_credential_header_names(
+                    request_ctx.request_trailer_credential_header_names(),
+                );
                 // Full upload lifecycle for the UPLOAD direction (#3815). With an
                 // authorization lifetime: the adapter deadline plus a
                 // gateway-owned pump, so the bound still fires while this pooled
@@ -63320,7 +63674,10 @@ async fn proxy_to_backend_http2(
                 completion_tx,
                 cancel_rx,
             )
-            .with_h2_end_stream_required(require_end_stream);
+            .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            );
             if let Some(tap) = observe_grpc {
                 body = body.with_grpc_message_tap(tap);
             }
@@ -63353,6 +63710,9 @@ async fn proxy_to_backend_http2(
             )
             .with_cancel(cancel_rx)
             .with_h2_end_stream_required(require_end_stream)
+            .with_trailer_credential_header_names(
+                ctx.and_then(|ctx| ctx.request_trailer_credential_header_names()),
+            )
             .with_grpc_message_tap(tap);
             // No auth plan on this arm, but a live `backend_write_timeout_ms`
             // still needs its watermark (issue #4055): the adapter exists
@@ -63402,6 +63762,8 @@ async fn proxy_to_backend_http2(
                     published: false,
                     latch,
                     require_end_stream,
+                    trailer_credential_header_names: ctx
+                        .and_then(|ctx| ctx.request_trailer_credential_header_names()),
                 },
                 None,
                 None,

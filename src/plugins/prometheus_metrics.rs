@@ -896,6 +896,17 @@ const RESPONSE_CACHE_LOOKUP_STATUSES: [(&str, &str); 5] = [
     ("PREDICTED-BYPASS", "predicted_bypass"),
 ];
 
+/// `direction` label values of `ferrum_ws_message_size_limit_rejected_total`,
+/// indexed by [`ws_message_size_limit_direction_index`].
+const WS_MESSAGE_SIZE_LIMIT_DIRECTIONS: [&str; 2] = ["client_to_backend", "backend_to_client"];
+
+fn ws_message_size_limit_direction_index(direction: super::WebSocketFrameDirection) -> usize {
+    match direction {
+        super::WebSocketFrameDirection::ClientToBackend => 0,
+        super::WebSocketFrameDirection::BackendToClient => 1,
+    }
+}
+
 /// `adaptive_concurrency` admission decisions exported as
 /// `ferrum_adaptive_concurrency_decisions_total{proxy_id, decision}`.
 ///
@@ -1083,6 +1094,11 @@ pub struct MetricsRegistry {
     /// [`RESPONSE_CACHE_LOOKUP_STATUSES`] classes. Each slot is padded onto its
     /// own cache line because every cache-eligible request increments one.
     response_cache_lookups: [CachePadded<AtomicU64>; 5],
+    /// WebSocket sessions closed with 1009 because a `ws_message_size_limiting`
+    /// ceiling was exceeded, by the fixed [`WS_MESSAGE_SIZE_LIMIT_DIRECTIONS`]
+    /// of the rejected input. Incremented once per terminal policy Close, never
+    /// per frame.
+    ws_message_size_limit_rejections: [AtomicU64; 2],
     /// `adaptive_concurrency` decisions by proxy_id, one map per
     /// [`AdaptiveConcurrencyDecision`] (indexed by `AdaptiveConcurrencyDecision::index`).
     /// Keyed by the configured proxy id only, so cardinality is bounded by the
@@ -1376,6 +1392,7 @@ impl MetricsRegistry {
             }),
             oauth2_introspection_cache_cleanup_work: AtomicU64::new(0),
             response_cache_lookups: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
+            ws_message_size_limit_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
             adaptive_concurrency_decisions: std::array::from_fn(|_| {
                 DashMap::with_shard_amount(shards)
             }),
@@ -2092,6 +2109,28 @@ impl MetricsRegistry {
         };
         self.response_cache_lookups[index].fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Record one WebSocket session closed by a `ws_message_size_limiting`
+    /// ceiling, by the direction of the rejected input.
+    pub fn record_ws_message_size_limit_rejection(
+        &self,
+        direction: super::WebSocketFrameDirection,
+    ) {
+        self.ws_message_size_limit_rejections[ws_message_size_limit_direction_index(direction)]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Current `ferrum_ws_message_size_limit_rejected_total` value for one
+    /// direction (test-crate reader).
+    #[allow(dead_code)]
+    pub fn ws_message_size_limit_rejections_total(
+        &self,
+        direction: super::WebSocketFrameDirection,
+    ) -> u64 {
+        self.ws_message_size_limit_rejections[ws_message_size_limit_direction_index(direction)]
+            .load(Ordering::Relaxed)
     }
 
     /// Record one `adaptive_concurrency` decision for `proxy_id`. Allocates the
@@ -4880,6 +4919,17 @@ impl MetricsRegistry {
             let value = self.response_cache_lookups[index].load(Ordering::Relaxed);
             output.push_str(&format!(
                 "ferrum_response_cache_lookups_total{{status=\"{label}\"{ns_label}}} {value}\n"
+            ));
+        }
+
+        output.push_str(
+            "# HELP ferrum_ws_message_size_limit_rejected_total WebSocket sessions closed with 1009 because a ws_message_size_limiting frame or message ceiling was exceeded, by direction of the rejected input.\n",
+        );
+        output.push_str("# TYPE ferrum_ws_message_size_limit_rejected_total counter\n");
+        for (index, label) in WS_MESSAGE_SIZE_LIMIT_DIRECTIONS.iter().enumerate() {
+            let value = self.ws_message_size_limit_rejections[index].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_ws_message_size_limit_rejected_total{{direction=\"{label}\"{ns_label}}} {value}\n"
             ));
         }
 

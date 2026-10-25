@@ -1297,9 +1297,37 @@ pub mod _test_support {
             failed_websocket_handshake: false,
             body_disposition: disposition,
             grpc_trailers: HashMap::new(),
-            aggregate_sse: Some(listener),
+            aggregate_sse: Some(crate::proxy::AdoptedAggregateSse {
+                listener,
+                response_byte_ceiling: 0,
+            }),
         };
         crate::proxy::build_response_from_normalized_reject(reject).into_parts()
+    }
+
+    /// Run a plugin rejection through the production H1/H2 reject lifecycle
+    /// (`finalize_reject_response_with_after_proxy_hooks`: the shared synthetic
+    /// finalizer, the reject-path hooks, and the aggregate SSE adoption gate)
+    /// and build the client response exactly as the H1/H2 writer does.
+    pub async fn finalize_and_build_plugin_reject_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> (http::response::Parts, crate::proxy::body::ProxyBody) {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            panic!("finalize_and_build_plugin_reject_response_for_test needs a rejection");
+        };
+        let status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        let normalized = crate::proxy::finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            status,
+            parts.body,
+            parts.headers,
+            false,
+        )
+        .await;
+        crate::proxy::build_response_from_normalized_reject(normalized).into_parts()
     }
 
     /// Whether a finalized reject header map still selects the gateway-authored
@@ -1366,6 +1394,18 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
     ) -> crate::plugins::RequestContext {
         ctx.clone_for_final_request_body_hooks()
+    }
+
+    /// Run the initial dispatch-boundary gateway-assertion refresh the H1/H2
+    /// ladder and the native HTTP/3 frontend share
+    /// (`crate::proxy::refresh_initial_backend_gateway_assertion_headers`),
+    /// so ownership tests can observe whether it materialized an owned copy
+    /// of the request header map.
+    pub fn refresh_initial_backend_gateway_assertion_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<std::collections::HashMap<String, String>>,
+    ) {
+        crate::proxy::refresh_initial_backend_gateway_assertion_headers(ctx, owned_proxy_headers);
     }
 
     /// Install the route's precomputed credential-header registry so external
@@ -5754,6 +5794,46 @@ pub mod _test_support {
         client_to_backend: bool,
     ) -> crate::retry::ErrorClass {
         crate::proxy::ws_capacity_error_class(size, client_to_backend)
+    }
+
+    /// Effective parser ceilings `(max_frame_bytes, max_message_bytes)` the
+    /// relay installs in the framer reading frames that travel in `direction`.
+    pub fn effective_ws_size_limits_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+    ) -> (usize, usize) {
+        let limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
+            global_frame_bytes,
+            plugins,
+            direction,
+        );
+        (limits.max_frame_bytes, limits.max_message_bytes)
+    }
+
+    /// Plugin-attributed 1009 Close the relay publishes for a parser capacity
+    /// error read in `direction`; `None` when no plugin rule binds.
+    pub fn ws_plugin_capacity_close_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+        error: &WsError,
+    ) -> Option<CloseFrame> {
+        crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins, direction)
+            .plugin_close_for_error(error)
+            .map(|(close, _, _, _)| close)
+    }
+
+    /// Close the relay publishes for a terminated `permessage-deflate` read
+    /// fault in `direction`, and whether a size-policy plugin rule bound it.
+    pub fn ws_permessage_deflate_fault_close_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+        fault: crate::proxy::ws_permessage_deflate::PermessageDeflateFault,
+    ) -> (CloseFrame, bool) {
+        crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins, direction)
+            .permessage_deflate_fault_close(fault)
     }
 
     /// Global capacity-overflow Close selection used when no plugin rule binds.
@@ -14770,6 +14850,7 @@ pub mod _test_support {
             upload_observer: None,
             grpc_messages: None,
             grpc_scanner: None,
+            trailer_credential_header_names: None,
         });
         let first = std::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx)).await;
         drop(join);
@@ -15061,7 +15142,33 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, false)
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            false,
+            0,
+        )
+    }
+
+    /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
+    /// request's effective response ceiling (`0` = unlimited) charged against
+    /// the translated bytes the client receives, exactly as the H1/H2 response
+    /// funnels install it.
+    pub fn proxy_body_into_grpc_web_streaming_with_response_limit_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+        max_response_body_size_bytes: usize,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            false,
+            max_response_body_size_bytes,
+        )
     }
 
     /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
@@ -15073,7 +15180,13 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            true,
+            0,
+        )
     }
 
     /// Wrap a body in the pass-through gRPC-Web relay, exactly as the H1/H2
@@ -15334,6 +15447,31 @@ pub mod _test_support {
             tx,
             0,
             crate::proxy::LoadBalancerConnectionGuard::new(None, None),
+        ));
+        crate::proxy::body::inspected_streaming_body(rx)
+    }
+
+    /// Drive the PRODUCTION reqwest response-inspection task
+    /// (`run_response_inspection`, the H1/H2 inspect path) over a scripted
+    /// backend body of `chunks`, with the request's effective response ceiling
+    /// `max_response_body_size_bytes` (`0` = unlimited), and return the
+    /// client-visible inspected body.
+    pub fn reqwest_inspected_response_body_for_test(
+        chunks: &[&'static [u8]],
+        inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+        max_response_body_size_bytes: usize,
+    ) -> crate::proxy::ProxyBody {
+        let response = reqwest_response_with_trailers_for_test(chunks, &[]);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(crate::proxy::body::run_response_inspection(
+            response,
+            inspector,
+            tx,
+            max_response_body_size_bytes,
+            0,
+            None,
+            crate::proxy::LoadBalancerConnectionGuard::new(None, None),
+            crate::proxy::body::ReqwestResponseTrailers::drop_all(),
         ));
         crate::proxy::body::inspected_streaming_body(rx)
     }
@@ -16217,6 +16355,29 @@ pub mod _test_support {
         }
     }
 
+    /// The trailer block the backend would observe after the native HTTP/3
+    /// relays' late boundary: the static filter
+    /// (`sanitize_backend_request_trailers`) followed by the route's configured
+    /// credential header locations
+    /// (`strip_configured_credential_request_trailers`), exactly the two calls
+    /// the H3 client relay, the H3 gRPC upload pump, and the H3-to-H2 bridge
+    /// make.
+    ///
+    /// Sorted by `(name, value)`.
+    pub fn sanitized_backend_request_trailers_for_route(
+        trailers: &[(&str, &str)],
+        credential_header_names: &[&str],
+    ) -> Vec<(String, String)> {
+        let names: Vec<String> = credential_header_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let mut map = request_trailer_probe_map(trailers);
+        crate::proxy::headers::sanitize_backend_request_trailers(&mut map);
+        crate::proxy::headers::strip_configured_credential_request_trailers(&mut map, &names);
+        sorted_trailer_entries(&map)
+    }
+
     /// A DATA frame must cross the late request-trailer boundary byte-for-byte:
     /// the sanitizer is a trailer-only filter, never a body rewriter.
     pub fn sanitize_backend_request_trailer_frame_preserves_data(payload: &'static [u8]) -> bool {
@@ -16267,6 +16428,50 @@ pub mod _test_support {
         }
         // Dropping the join disarms cancellation (a dropped sender is not a
         // cancellation), so the pump is never torn down mid-relay.
+        drop(join);
+        forwarded_trailers.sort();
+        (forwarded_data, forwarded_trailers)
+    }
+
+    /// [`h1_h2_upload_source_forwarded_frames`] with a route's configured
+    /// credential header locations, driven through
+    /// `UploadSource::poll_frame_with_trailer_credentials` — the seam
+    /// `SizeLimitedIncoming`, `CountingIncoming`, and `GrpcBody::Streaming`
+    /// poll with the list `RequestContext::request_trailer_credential_header_names`
+    /// hands them.
+    pub async fn h1_h2_upload_source_forwarded_frames_for_route(
+        payload: &'static [u8],
+        trailers: &[(&str, &str)],
+        credential_header_names: &[&str],
+    ) -> (Vec<u8>, Vec<(String, String)>) {
+        let names: Vec<String> = credential_header_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let body = RequestTrailerProbeBody {
+            data: Some(bytes::Bytes::from_static(payload)),
+            trailers: Some(request_trailer_probe_map(trailers)),
+        };
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(body, None, 0, false);
+        let mut source = crate::proxy::body::UploadSource::Pumped(source);
+        let mut forwarded_data = Vec::new();
+        let mut forwarded_trailers = Vec::new();
+        loop {
+            let next =
+                std::future::poll_fn(|cx| source.poll_frame_with_trailer_credentials(cx, &names))
+                    .await;
+            match next {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => forwarded_data.extend_from_slice(data.as_ref()),
+                    Err(frame) => match frame.into_trailers() {
+                        Ok(map) => forwarded_trailers.extend(sorted_trailer_entries(&map)),
+                        Err(_) => panic!("unexpected non-data non-trailer frame"),
+                    },
+                },
+                Some(Err(e)) => panic!("probe upload failed: {e}"),
+                None => break,
+            }
+        }
         drop(join);
         forwarded_trailers.sort();
         (forwarded_data, forwarded_trailers)

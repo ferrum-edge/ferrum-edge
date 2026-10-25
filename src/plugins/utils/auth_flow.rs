@@ -1106,42 +1106,59 @@ async fn run_auth_impl<M: AuthMechanism>(
             mechanism.rejection_challenge(CredentialRejection::InvalidFormat),
         ),
         credential => {
-            let mut attempt = AuthenticationAttempt::new();
-            if let Some(authority) = mechanism.identity_realm_authority() {
-                attempt.stage_identity_realm_authority(authority);
-            }
-            match commit_authentication_attempt(
-                ctx,
-                attempt,
-                mechanism.verify(credential, consumer_index).await,
-                mechanism.mechanism_name(),
-                allow_external_identity,
-            ) {
-                Ok(_) => PluginResult::Continue,
-                Err(VerifyOutcome::InvalidFormat(body)) => auth_rejection(
-                    401,
-                    body,
-                    mechanism.rejection_challenge(CredentialRejection::InvalidFormat),
-                ),
-                Err(VerifyOutcome::Invalid(body))
-                | Err(VerifyOutcome::ConsumerNotFound(body))
-                | Err(VerifyOutcome::VerificationFailed(body)) => auth_rejection(
-                    401,
-                    body,
-                    mechanism.rejection_challenge(CredentialRejection::InvalidCredential),
-                ),
-                // Neither carries a challenge: a 403 refuses an authenticated
-                // principal and a 500 is a gateway fault.
-                Err(VerifyOutcome::Forbidden(body)) => {
-                    auth_rejection(403, body, mechanism.authentication_challenge())
-                }
-                Err(VerifyOutcome::Internal(body)) => {
-                    auth_rejection(500, body, mechanism.authentication_challenge())
-                }
-                Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
-                    PluginResult::Continue
-                }
-            }
+            let outcome = mechanism.verify(credential, consumer_index).await;
+            finish_verified_auth_attempt(mechanism, ctx, outcome, allow_external_identity)
+        }
+    }
+}
+
+/// Commit one verified outcome and map it onto the shared authentication
+/// result — the `verify` → `commit_authentication_attempt` → rejection step of
+/// [`run_auth`].
+///
+/// Public to the crate so a mechanism with its own allocation-free extraction
+/// (`key_auth` borrows its credential straight from the request) keeps the
+/// identical commit and rejection contract instead of restating it.
+pub(crate) fn finish_verified_auth_attempt<M: AuthMechanism>(
+    mechanism: &M,
+    ctx: &mut RequestContext,
+    outcome: VerifyOutcome,
+    allow_external_identity: bool,
+) -> PluginResult {
+    let mut attempt = AuthenticationAttempt::new();
+    if let Some(authority) = mechanism.identity_realm_authority() {
+        attempt.stage_identity_realm_authority(authority);
+    }
+    match commit_authentication_attempt(
+        ctx,
+        attempt,
+        outcome,
+        mechanism.mechanism_name(),
+        allow_external_identity,
+    ) {
+        Ok(_) => PluginResult::Continue,
+        Err(VerifyOutcome::InvalidFormat(body)) => auth_rejection(
+            401,
+            body,
+            mechanism.rejection_challenge(CredentialRejection::InvalidFormat),
+        ),
+        Err(VerifyOutcome::Invalid(body))
+        | Err(VerifyOutcome::ConsumerNotFound(body))
+        | Err(VerifyOutcome::VerificationFailed(body)) => auth_rejection(
+            401,
+            body,
+            mechanism.rejection_challenge(CredentialRejection::InvalidCredential),
+        ),
+        // Neither carries a challenge: a 403 refuses an authenticated
+        // principal and a 500 is a gateway fault.
+        Err(VerifyOutcome::Forbidden(body)) => {
+            auth_rejection(403, body, mechanism.authentication_challenge())
+        }
+        Err(VerifyOutcome::Internal(body)) => {
+            auth_rejection(500, body, mechanism.authentication_challenge())
+        }
+        Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
+            PluginResult::Continue
         }
     }
 }

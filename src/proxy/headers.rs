@@ -719,12 +719,18 @@ pub fn strip_backend_request_headers_for_grpc(headers: &mut http::HeaderMap) {
 /// call parameters. `Forwarded` is rejected unconditionally because this late
 /// boundary has no route-level `add_forwarded_header` context and failing
 /// closed prevents protocol-path-dependent identity shape.
+///
+/// Gateway assertions are matched with [`is_gateway_assertion_header`], the
+/// SAME folded predicate the initial header block uses, so the underscore
+/// spellings a CGI-style backend folds onto the gateway's own value
+/// (`x_geo_country`, `x_geo-country`, `x-geo_country`, `x_consumer_username`)
+/// cannot ride a trailer block past the scrub the header path applies.
 #[inline]
 pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
     is_backend_request_strip_header(name)
         || is_proxy_owned_forwarding_header(name, true)
         || name.starts_with("grpc-")
-        || is_consumer_assertion_header(name)
+        || is_gateway_assertion_header(name)
         // Folded like the other gateway-owned prefixes: a CGI-style backend
         // reads `x_ferrum_peer_spiffe_id` as the gateway's
         // `x-ferrum-peer-spiffe-id` (`spiffe_identity` `forward_identity`).
@@ -760,7 +766,6 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
                 | "authorization"
                 | "cookie"
                 | "x-api-key"
-                | "x-geo-country"
         )
 }
 
@@ -776,6 +781,34 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
         .collect();
     for name in strip {
         trailers.remove(name);
+    }
+}
+
+/// Remove request trailers that restate one of the route's configured
+/// credential header locations (a `key_auth` `header:<name>`, a custom
+/// `jwt_auth` / `jwks_auth` / `oauth2_introspection` token header, ...).
+///
+/// [`sanitize_backend_request_trailers`] knows only the fixed credential names
+/// (`authorization`, `cookie`, `x-api-key`). A custom credential location is
+/// per-route configuration, so every late request-trailer boundary applies
+/// this right after the static filter with the route's precomputed list
+/// (`RequestContext::request_headers_requiring_redaction`, built once with the
+/// plugin cache). Removal is unconditional: trailers are never a legitimate
+/// credential location, and `hide_credentials: false` governs only the
+/// initial header block the plugin authenticated.
+///
+/// Allocation-free: one case-insensitive `HeaderMap::remove` per configured
+/// name, and nothing at all when the route configures none.
+#[inline]
+pub(crate) fn strip_configured_credential_request_trailers(
+    trailers: &mut http::HeaderMap,
+    credential_header_names: &[String],
+) {
+    if trailers.is_empty() {
+        return;
+    }
+    for name in credential_header_names {
+        trailers.remove(name.as_str());
     }
 }
 

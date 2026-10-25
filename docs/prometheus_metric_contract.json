@@ -5526,6 +5526,19 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_ws_message_size_limit_rejected_total",
+    "type": "counter",
+    "help": "WebSocket sessions closed with 1009 because a ws_message_size_limiting frame or message ceiling was exceeded, by direction of the rejected input.",
+    "labels": [
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "ws_message_size_limiting",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_xds_active_node_ids",
     "type": "gauge",
     "help": "Distinct node state keys with at least one active ADS stream.",
