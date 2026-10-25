@@ -6713,7 +6713,7 @@ Enforces per-proxy request body size limits. Rejects with HTTP 413.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | — (required, > 0) | Maximum allowed request body size in bytes. The plugin errors at construction if absent or zero. |
+| `max_bytes` | u64 | — (required, > 0) | Maximum allowed request body size in bytes. The plugin errors at construction if it is absent or `null` (`is required`), `0` (`must be greater than zero`), negative (`must not be negative`), fractional or written in exponent form such as `1048576.0` (`must be written as an integer`), or a non-number such as `"1048576"` (`must be an integer, not a string`). Diagnostics name the field and the JSON type, never the supplied value. |
 
 Configuration must be a top-level object. The only accepted key is `max_bytes`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions instead of falling back to defaults, so a typo such as `max_bytez` cannot silently leave the route unbounded. Registration is `FailClosed`.
 
@@ -6722,6 +6722,65 @@ Enforcement happens in four places:
 - `on_request_received` rejects oversized `Content-Length` headers without reading the body.
 - `before_proxy` checks the buffered raw body when another plugin already needed early body access.
 - `on_final_request_body` re-checks the final buffered body after request transforms, so body-rewriting plugins cannot expand the request past the configured limit before it reaches the backend.
+
+The streaming ceiling applies to every method. An HTTP/2 client may send DATA
+on a `GET`, `HEAD`, or `OPTIONS` request without `Content-Length`; the
+HTTP/1.1 dispatchers (the direct HTTP/1.1 pool and the reqwest fallback) decide
+body presence from the request body itself, not only from the method and
+framing headers, so that body is forwarded through the size-limited adapter: a
+payload at or under `max_bytes` reaches the backend intact and a larger one is
+refused with `413`. Because hyper's HTTP/1.1 client would otherwise send an
+unknown-length `GET`/`HEAD` body as zero-length, such a request is sent upstream
+with an explicit `Transfer-Encoding: chunked` (only on a dispatch known to be
+HTTP/1.1; HTTP/2 and HTTP/3 requests never carry it, and an exact-length body
+keeps `Content-Length`). One residual case remains. When an HTTPS backend has
+HTTP/2 enabled but its target has no classified HTTP/2 capability yet, the
+reqwest dispatch is not known to be HTTP/1.1 and gets no explicit `chunked`.
+This happens, for example, when pool warmup is off, when a target was added
+dynamically, or on the first requests before the capability probe classifies
+the target. If that dispatch then negotiates HTTP/1.1 through ALPN, an
+unknown-length `GET`/`HEAD` upload can still be sent bodyless until the target
+is classified. `FERRUM_POOL_WARMUP_ENABLED=true` (the default) classifies
+configured targets up front with real capability probes at startup. Only a body
+the transport has already proven empty (no
+HTTP/1.1 framing, END_STREAM on the HTTP/2 HEADERS frame, or an empty buffered
+body) takes the empty-body fast path and reaches the backend with no framing.
+
+**One 413 body.** Every `413` for this policy carries the gateway's shared
+request-body-size body, `{"error":"Request body exceeds maximum size"}`, whether
+the plugin refused a declared `Content-Length`, a buffered body, or the final
+body, or the proxy core refused a chunked or unknown-length upload that overran
+the published ceiling while streaming (H1/H2, native H3, and the H3 bridge). The
+body does not disclose the limit, so clients see one contract regardless of how
+the upload was framed. gRPC callers get `RESOURCE_EXHAUSTED`.
+
+**Rejection metadata.** When the plugin refuses a request it records, in request
+metadata (and from there in the transaction log), fixed-cardinality fields that
+identify the refusal without echoing any body bytes:
+
+| Key | Value |
+|---|---|
+| `request_size_limiting.reason` | `content_length_over_limit`, `content_length_ambiguous`, `buffered_body_over_limit`, or `final_body_over_limit` |
+| `request_size_limiting.instance` | The rejecting instance's plugin-config id (`standalone` for an instance built without one) |
+| `request_size_limiting.limit_bytes` | The instance's `max_bytes` |
+| `request_size_limiting.observed_bytes` | The declared `Content-Length`, or the buffered/final body length; absent for an ambiguous `Content-Length` |
+
+The `Content-Length` and buffered-body refusals always record these fields. The
+final-body refusal (`final_body_over_limit`) records them only when its hook is
+handed a request context, on every protocol. The paths that always supply one are
+the native HTTP/3 preparation paths (request-body finalization ahead of dispatch)
+and the HTTP/3 cross-protocol bridge. Elsewhere, meaning the HTTP/1.1 and HTTP/2
+ladders and the native HTTP/3 buffered ladder, a context is supplied only when
+another plugin on the same route requests the final-body context
+(`needs_final_request_body_context`, for example a context-aware body transform
+or AI policy plugin). `request_size_limiting` does not request it, so that it
+never adds a per-request context clone. When no context is supplied, a
+post-transform overrun is still refused with the same `413` and is visible in
+the transaction log as status `413` with `rejection_phase` `on_final_request_body`,
+but it carries no `request_size_limiting.*` metadata. A streaming overrun refused by the proxy
+core is not a plugin decision and records no plugin metadata; it is identified by
+its `413` status and `request_body_too_large` error class. There is no
+monitor/dry-run mode.
 
 **Interaction with the global limit.** The effective ceiling is the strictest
 *active* (nonzero) bound of `max_bytes` and `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`.
@@ -6741,8 +6800,8 @@ those repeats with `", "`. Every folded member is parsed and must agree, so
 to parse and skipping the check. A declared length that cannot be reduced to one
 agreed value (disagreeing members, a non-`1*DIGIT` member such as `+2048`, an
 empty member, or a value wider than `u64`) is refused **fail-closed** with HTTP
-400 and `{"error":"Request Content-Length is ambiguous"}` instead of being treated
-as an absent length.
+400 and `{"error":"Request Content-Length is ambiguous"}` (no `limit` field)
+instead of being treated as an absent length.
 
 ### `response_size_limiting`
 

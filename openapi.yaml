@@ -31963,7 +31963,27 @@ components:
         Repeated identical Content-Length values (RFC 9110 §8.6, which arrive
         comma-folded in plugin-facing header maps) are parsed per member and
         compared against the limit. A declared length that cannot be reduced to
-        one agreed value fails closed with HTTP 400.
+        one agreed value fails closed with HTTP 400 and
+        `{"error":"Request Content-Length is ambiguous"}`.
+        The ceiling applies to every method: an HTTP/2 GET, HEAD, or OPTIONS
+        request carrying DATA without Content-Length is forwarded through the
+        size-limited adapter, not replaced by an empty backend body (residual:
+        an HTTPS backend with HTTP/2 enabled whose target is not yet
+        capability-classified can negotiate HTTP/1.1 via ALPN and send an
+        unknown-length GET/HEAD bodyless until classified; pool warmup,
+        FERRUM_POOL_WARMUP_ENABLED, classifies targets up front).
+        Every 413 for this policy, from any plugin hook or from the proxy core's
+        streaming overrun, carries the one shared body
+        `{"error":"Request body exceeds maximum size"}` without the limit. A
+        Content-Length or buffered-body refusal by the plugin records
+        `request_size_limiting.reason`, `request_size_limiting.instance` (the
+        plugin-config id), `request_size_limiting.limit_bytes`, and (except for
+        an ambiguous Content-Length) `request_size_limiting.observed_bytes` in
+        request metadata. A final-body refusal records them only when its hook
+        receives a request context, on any protocol: always on the native
+        HTTP/3 preparation and HTTP/3 bridge paths, and elsewhere only when
+        another plugin on the route requests the final-body context. A
+        streaming overrun refused by the proxy core records none of them.
       required:
         - max_bytes
       properties:
@@ -31974,8 +31994,10 @@ components:
           maximum: 18446744073709551615
           description: >-
             Maximum allowed request body size in bytes. Required and must be
-            greater than zero — the gateway rejects plugin creation when
-            missing or 0.
+            a positive JSON integer — the gateway rejects plugin creation when
+            it is missing or null, 0, negative, fractional or in exponent form
+            (for example 1048576.0), or not a number (for example "1048576"),
+            with a diagnostic naming that fault class.
 
     WafPluginConfig:
       type: object

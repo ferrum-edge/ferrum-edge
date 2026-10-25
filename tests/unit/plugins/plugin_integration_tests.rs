@@ -2267,7 +2267,10 @@ async fn test_request_size_limiting_checks_transformed_body() {
     let (status_code, body, _) =
         reject_parts(result).expect("expected transformed request body to be rejected");
     assert_eq!(status_code, 413);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(parsed["error"], "Request body too large");
-    assert_eq!(parsed["limit"], 20);
+    // The plugin's 413 is the proxy core's shared request-body-size body, so
+    // the limit is not disclosed in it.
+    assert_eq!(
+        body,
+        ferrum_edge::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY.as_bytes()
+    );
 }

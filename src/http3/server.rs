@@ -514,7 +514,7 @@ const H3_REQUEST_BUFFER_CAPACITY_REFUSAL: H3DispatchBodyRefusal = H3DispatchBody
 /// The upload exceeded the drain's retained ceiling.
 const H3_REQUEST_BODY_TOO_LARGE_REFUSAL: H3DispatchBodyRefusal = H3DispatchBodyRefusal {
     status: StatusCode::PAYLOAD_TOO_LARGE,
-    body: r#"{"error":"Request body exceeds maximum size"}"#,
+    body: crate::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY,
     grpc_status: crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
     grpc_message: "Request body exceeds maximum size",
 };

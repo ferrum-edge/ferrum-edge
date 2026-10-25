@@ -4989,6 +4989,57 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
     }
 }
 
+/// Whether an HTTP/1.1-speaking dispatcher (the direct HTTP/1.1 pool and the
+/// reqwest fallback) must attach the request body to this backend request.
+///
+/// [`request_may_have_body`] is only a method/header heuristic. It is right for
+/// HTTP/1.1, where a `GET`/`HEAD`/`OPTIONS` without `Content-Length` or
+/// `Transfer-Encoding` has no body, but an HTTP/2 client may leave the stream
+/// open after HEADERS and send DATA with no `Content-Length` on any method.
+/// Treating such a request as bodyless substituted an empty backend body: a
+/// permitted upload lost its payload, and an oversized one never passed through
+/// the size-limited adapter, so the route's request-body ceiling
+/// (`request_size_limiting`) never produced its `413`. The body representation
+/// itself is therefore consulted as well. A streaming body is skipped only when
+/// hyper has already proven end-of-stream (no HTTP/1.1 framing, or END_STREAM
+/// on the HTTP/2 HEADERS frame), and a buffered body only when it holds no
+/// bytes, so an empty `GET` keeps its zero-cost empty-body fast path.
+fn dispatch_request_body_may_be_present(
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: &ClientRequestBody,
+) -> bool {
+    request_may_have_body(method, headers) || !client_request_body_proven_empty(client_request_body)
+}
+
+/// Whether an outbound HTTP/1.1 request must carry an explicit
+/// `Transfer-Encoding: chunked` for its body to be sent at all.
+///
+/// Hyper's HTTP/1.1 client encoder (`Client::set_length` in the vendored
+/// `proto/h1/role.rs`) frames an unknown-length body on a `GET`, `HEAD`, or
+/// `CONNECT` with no `Content-Length` / `Transfer-Encoding` as zero-length, and
+/// the dispatcher then drops the body without polling it. Other methods get
+/// `chunked` automatically. The proxy strips the client's framing fields from
+/// every outbound map and lets the body's size hint decide, so an HTTP/2
+/// `GET`/`HEAD` upload without `Content-Length` (or an HTTP/1.1 chunked `GET`)
+/// would reach the backend bodyless and never pass through the size-limited
+/// adapter, even with the body attached.
+///
+/// True only when the body is genuinely unknown-length and not already ended: a
+/// proven-empty body keeps the bodyless request with no `Transfer-Encoding`, and
+/// an exact-length body (a declared `Content-Length`, a buffered or retained
+/// body) keeps hyper's own `Content-Length`. Callers apply it only on a request
+/// already known to be sent as HTTP/1.1, never on HTTP/2 or HTTP/3, and never
+/// when the outbound map already carries framing.
+pub(crate) fn h1_request_requires_explicit_chunked_framing<B>(method: &str, body: &B) -> bool
+where
+    B: http_body::Body + ?Sized,
+{
+    matches!(method, "GET" | "HEAD")
+        && !http_body::Body::is_end_stream(body)
+        && http_body::Body::size_hint(body).exact().is_none()
+}
+
 /// Publish the transport's proof that a WebSocket HANDSHAKE carries no request
 /// body, so integrity-verifying authentication plugins can verify a signature
 /// over the empty body (issue #5000).
@@ -50947,7 +50998,11 @@ async fn proxy_to_backend(
     // `backend_url`, which names the real backend target the socket reaches.
     // Direct HTTP/1.1 pool (issue #5588): where reqwest would speak HTTP/1.1
     // anyway, dispatch on Ferrum's own exclusive-checkout hyper connections.
-    let direct_h1_has_body = request_may_have_body(method, headers);
+    // Consult the body itself, not only method/headers: an HTTP/2 GET/HEAD/
+    // OPTIONS can carry DATA without `Content-Length`, and that body must reach
+    // the size-limited adapter rather than being replaced by an empty one.
+    let direct_h1_has_body =
+        dispatch_request_body_may_be_present(method, headers, &client_request_body);
     if sni_reqwest_dial.is_none()
         && direct_h1_dispatch_eligible(
             state,
@@ -51204,7 +51259,10 @@ async fn proxy_to_backend(
         );
     }
 
-    let has_body = request_may_have_body(method, headers);
+    // Same body-presence decision as the direct HTTP/1.1 pool above, so turning
+    // that pool off cannot reopen the empty-body substitution for an HTTP/2
+    // GET/HEAD/OPTIONS upload without `Content-Length`.
+    let has_body = dispatch_request_body_may_be_present(method, headers, &client_request_body);
 
     // Shared flag for detecting size-limit exceeded during streaming.
     // Only allocated when we actually stream a request body.
@@ -51364,6 +51422,19 @@ async fn proxy_to_backend(
                 // EOF need not update `is_end_stream()`.
                 let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
                 let incoming = (*original_req).into_body();
+                // Hyper would encode an unknown-length GET/HEAD body as
+                // zero-length and drop it unpolled, so the size-limited adapter
+                // below would never see it. Only when this reqwest dispatch is
+                // known to speak HTTP/1.1: HTTP/2 frames the body itself and
+                // must never carry `Transfer-Encoding`.
+                if reqwest_dispatch_is_http1_only(state, proxy, upstream_target)
+                    && h1_request_requires_explicit_chunked_framing(method, &incoming)
+                {
+                    req_builder = req_builder.header(
+                        reqwest::header::TRANSFER_ENCODING,
+                        reqwest::header::HeaderValue::from_static("chunked"),
+                    );
+                }
                 // Authorization lifetime for the UPLOAD direction (#3815). A
                 // client-streaming or bidirectional upload whose backend
                 // withholds response headers has no response body to bound, so
@@ -53277,6 +53348,28 @@ async fn proxy_to_backend_direct_h1(
     *backend_req.uri_mut() = origin_form_uri;
     *backend_req.version_mut() = hyper::Version::HTTP_11;
     *backend_req.headers_mut() = out_headers;
+    // This request is always HTTP/1.1, and its map carries no framing fields
+    // (they are stripped above). Without explicit `chunked`, hyper would send
+    // an unknown-length GET/HEAD body as zero-length and drop it unpolled, so
+    // the size-limited adapter would never see it. Set after the map is
+    // installed, so no hop-by-hop strip runs after it; an idle-race replay
+    // resends this same request head.
+    if !backend_req
+        .headers()
+        .contains_key(hyper::header::CONTENT_LENGTH)
+        && !backend_req
+            .headers()
+            .contains_key(hyper::header::TRANSFER_ENCODING)
+        && h1_request_requires_explicit_chunked_framing(
+            backend_req.method().as_str(),
+            backend_req.body(),
+        )
+    {
+        backend_req.headers_mut().insert(
+            hyper::header::TRANSFER_ENCODING,
+            hyper::header::HeaderValue::from_static("chunked"),
+        );
+    }
 
     // ── Send under the response-header, client and authorization bounds ──
     // `handoff_bound` (composed above, before the first checkout) carries all
@@ -55289,7 +55382,7 @@ fn build_request_body_too_large_response(
     }
     build_response(
         StatusCode::PAYLOAD_TOO_LARGE,
-        r#"{"error":"Request body exceeds maximum size"}"#,
+        crate::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY,
     )
 }
 

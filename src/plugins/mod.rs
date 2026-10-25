@@ -13781,7 +13781,8 @@ pub fn create_plugin_with_http_client(
 /// instances publish accepted-generation
 /// status/metrics under that stable identity, `proxy_alerts` scopes its
 /// `${incident_key}` receiver correlation key to it, while `request_mirror`
-/// records attribute each shadow destination. Pass `None` for config-validation and
+/// records attribute each shadow destination, and `request_size_limiting` names
+/// the rejecting instance in its rejection metadata (a blank id is refused). Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
 /// (uses the plugin's standalone default id). Blank ids fail closed when
 /// supplied.
@@ -14001,7 +14002,10 @@ pub fn create_plugin_with_http_client_and_config_id(
             Ok(Some(Arc::new(plugin)))
         }
         "request_size_limiting" => Ok(Some(Arc::new(
-            request_size_limiting::RequestSizeLimiting::new(config)?,
+            request_size_limiting::RequestSizeLimiting::new_with_config_id(
+                config,
+                plugin_config_id,
+            )?,
         ))),
         "waf" => Ok(Some(Arc::new(waf::Waf::new_with_config_id(
             config,

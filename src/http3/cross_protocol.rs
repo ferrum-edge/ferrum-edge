@@ -13416,7 +13416,7 @@ where
         ),
         BridgeUploadRefusal::TooLarge => (
             StatusCode::PAYLOAD_TOO_LARGE,
-            r#"{"error":"Request body too large"}"#,
+            crate::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY,
             grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
             "Request body exceeds maximum size",
         ),
