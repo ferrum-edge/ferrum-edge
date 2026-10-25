@@ -379,6 +379,32 @@ impl Drop for AbortPumpOnDrop {
     }
 }
 
+/// Ownership of a client-RPC-deadline pump task, held by the CLIENT-FACING
+/// `ProxyBody` rather than by the adapter that reads the pump.
+///
+/// The RPC pump's post-deadline transport-close grace must outlive every
+/// intermediate reader: an outer authorization pump (or any adapter) can
+/// consume the RPC terminal and drop the RPC adapter while hyper is still
+/// parked on a client that grants no credit and has not received that
+/// terminal. Aborting the pump there would cancel the only timer that closes
+/// the stalled connection. Holding the abort at the outermost body ties it to
+/// the one event that proves settlement — hyper dropping the response body —
+/// while the pump's streaming phase still ends promptly on its own when its
+/// receiver goes away (`Sender::closed`).
+pub(crate) struct ResponsePumpGuard {
+    _pump: AbortPumpOnDrop,
+    /// An earlier RPC pump on the same body, kept alive with this one.
+    _earlier: Option<Box<ResponsePumpGuard>>,
+}
+
+impl ResponsePumpGuard {
+    /// Keep `earlier` alive for as long as this guard.
+    pub(crate) fn retaining(mut self, earlier: Option<ResponsePumpGuard>) -> Self {
+        self._earlier = earlier.map(Box::new);
+        self
+    }
+}
+
 /// Why the pump stopped. Only [`PumpExit::Expired`] is an authorization
 /// termination.
 enum PumpExit {
@@ -421,8 +447,9 @@ pub struct AuthorizationCancellableBody {
     fired: Arc<AtomicBool>,
     /// Compiled-in message for the defensive released terminal.
     released_message: &'static str,
-    /// Held only for its `Drop`.
-    _pump: AbortPumpOnDrop,
+    /// Held only for its `Drop`. `None` for the client RPC deadline, whose
+    /// pump is owned by the client-facing body instead ([`ResponsePumpGuard`]).
+    _pump: Option<AbortPumpOnDrop>,
 }
 
 /// The fixed terminal for a body whose pump ended without delivering one.
@@ -470,10 +497,13 @@ async fn run_response_pump<B>(
             },
         };
         // Same bias for the read itself: the upstream must not be able to hand
-        // over a frame that is already past the credential's lifetime.
+        // over a frame that is already past the credential's lifetime. A
+        // receiver that went away while the upstream is idle ends the pump at
+        // once (the client RPC deadline's pump is not aborted by its reader).
         let frame = tokio::select! {
             biased;
             () = &mut expiry => break PumpExit::Expired,
+            () = sender.closed() => break PumpExit::DownstreamGone,
             frame = inner.frame() => frame,
         };
         match frame {
@@ -600,7 +630,7 @@ impl AuthorizationCancellableBody {
     where
         B: http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + Unpin + 'static,
     {
-        Self::spawn(
+        let (mut body, pump) = Self::spawn(
             inner,
             deadline.at,
             Some(AuthorizationAccounting {
@@ -611,7 +641,9 @@ impl AuthorizationCancellableBody {
             RELEASED_MESSAGE,
             fired,
             closer,
-        )
+        );
+        body._pump = Some(pump);
+        body
     }
 
     /// Move `inner` into a gateway-owned pump bounded by the request's absolute
@@ -624,22 +656,33 @@ impl AuthorizationCancellableBody {
     /// termination is recorded: `fired` is the client RPC deadline's own flag,
     /// which keeps deferred accounting health-neutral when the transport close
     /// finally drops `ProxyBody`.
+    ///
+    /// The returned [`ResponsePumpGuard`] owns the pump task and MUST be held
+    /// by the client-facing `ProxyBody`: dropping this body only ends the
+    /// pump's streaming phase, never its post-deadline close grace.
     pub(crate) fn for_client_rpc_deadline<B>(
         inner: B,
         deadline_at: tokio::time::Instant,
         fired: Arc<AtomicBool>,
         closer: Option<AuthorizationConnectionCloser>,
-    ) -> Self
+    ) -> (Self, ResponsePumpGuard)
     where
         B: http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + Unpin + 'static,
     {
-        Self::spawn(
+        let (body, pump) = Self::spawn(
             inner,
             deadline_at,
             None,
             RPC_DEADLINE_RELEASED_MESSAGE,
             fired,
             closer,
+        );
+        (
+            body,
+            ResponsePumpGuard {
+                _pump: pump,
+                _earlier: None,
+            },
         )
     }
 
@@ -650,7 +693,7 @@ impl AuthorizationCancellableBody {
         released_message: &'static str,
         fired: Arc<AtomicBool>,
         closer: Option<AuthorizationConnectionCloser>,
-    ) -> Self
+    ) -> (Self, AbortPumpOnDrop)
     where
         B: http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + Unpin + 'static,
     {
@@ -669,17 +712,20 @@ impl AuthorizationCancellableBody {
             terminal.clone(),
             closer,
         ));
-        Self {
-            receiver,
-            settled,
-            finished: false,
-            released,
-            terminal,
-            accounting,
-            fired,
-            released_message,
-            _pump: AbortPumpOnDrop(handle),
-        }
+        (
+            Self {
+                receiver,
+                settled,
+                finished: false,
+                released,
+                terminal,
+                accounting,
+                fired,
+                released_message,
+                _pump: None,
+            },
+            AbortPumpOnDrop(handle),
+        )
     }
 
     /// The ONE terminal owner, for the protocol adapter that wraps this body.

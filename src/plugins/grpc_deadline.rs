@@ -342,18 +342,28 @@ pub fn prepare_request_deadline(
     for plugin in plugins {
         match plugin.prepare_grpc_deadline(ctx) {
             PluginResult::Continue => {}
-            reject => return reject,
+            reject => {
+                // A later instance's refusal must not erase a budget an
+                // earlier instance already established (for example a
+                // default ahead of `reject_no_deadline`).
+                record_preflight_adjusted_metadata(ctx);
+                return reject;
+            }
         }
     }
-    if !plugins.is_empty()
-        && let Some(budget_ms) = ctx.grpc_deadline_budget_ms
-    {
+    if !plugins.is_empty() {
         // `before_proxy` refines this to the remaining budget when
         // `subtract_gateway_processing` is enabled.
-        record_adjusted_deadline_metadata(ctx, budget_ms);
+        record_preflight_adjusted_metadata(ctx);
     }
     ctx.grpc_deadline_preflight_complete = true;
     PluginResult::Continue
+}
+
+fn record_preflight_adjusted_metadata(ctx: &mut RequestContext) {
+    if let Some(budget_ms) = ctx.grpc_deadline_budget_ms {
+        record_adjusted_deadline_metadata(ctx, budget_ms);
+    }
 }
 
 /// Returns a header map with `content-type: application/grpc`.

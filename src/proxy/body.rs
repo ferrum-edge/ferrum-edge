@@ -31,7 +31,9 @@ pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 use crate::plugins::grpc_web::{PassthroughFraming, PassthroughGrpcStatus};
 use crate::proxy::auth_lifetime::AUTHORIZATION_EXPIRED_GRPC_STATUS_HEADER;
 use crate::proxy::auth_lifetime::AuthorizationConnectionCloser;
-use crate::proxy::response_watchdog::{AuthorizationCancellableBody, AuthorizationTerminalOwner};
+use crate::proxy::response_watchdog::{
+    AuthorizationCancellableBody, AuthorizationTerminalOwner, ResponsePumpGuard,
+};
 
 /// Authorization-lifetime state carried on a client-visible response body.
 ///
@@ -85,6 +87,13 @@ pub struct ProxyBody {
     /// terminal deadline frame (or abort after partial DATA). Deferred backend
     /// accounting uses this signal to keep a client-chosen expiry neutral.
     client_grpc_deadline_fired: Option<Arc<AtomicBool>>,
+    /// The client RPC deadline's gateway-owned response pump, held HERE — on
+    /// the body hyper owns — rather than by the adapter that reads it, so its
+    /// post-deadline transport-close grace survives an outer authorization
+    /// pump or adapter consuming the deadline terminal before the stalled
+    /// client has drained it. Dropping this body (hyper finished or abandoned
+    /// the stream) is what cancels it.
+    client_grpc_deadline_pump: Option<ResponsePumpGuard>,
     /// Set by the NON-gRPC route request deadline wrapper
     /// ([`Self::with_route_request_deadline`]) when it cuts the body. The cut
     /// is the route's own total-duration policy, not evidence about the
@@ -858,6 +867,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
@@ -906,6 +916,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
@@ -1329,17 +1340,32 @@ impl ProxyBody {
         let deadline = ClientGrpcResponseDeadline::new(deadline, closer);
         let placeholder = ProxyBodyKind::Full(Full::default());
         let previous = std::mem::replace(&mut self.kind, placeholder);
-        self.kind = match previous {
-            ProxyBodyKind::Stream(body) => ProxyBodyKind::Stream(Box::pin(
-                client_grpc_deadline_body(body, deadline, deadline_frame, Arc::clone(&fired)),
-            )),
-            ProxyBodyKind::Tracked(body) => ProxyBodyKind::Stream(Box::pin(
-                client_grpc_deadline_body(body, deadline, deadline_frame, Arc::clone(&fired)),
-            )),
-            full @ ProxyBodyKind::Full(_) => full,
+        let (kind, pump) = match previous {
+            ProxyBodyKind::Stream(body) => {
+                let (timed, pump) =
+                    client_grpc_deadline_body(body, deadline, deadline_frame, Arc::clone(&fired));
+                (ProxyBodyKind::Stream(Box::pin(timed)), pump)
+            }
+            ProxyBodyKind::Tracked(body) => {
+                let (timed, pump) =
+                    client_grpc_deadline_body(body, deadline, deadline_frame, Arc::clone(&fired));
+                (ProxyBodyKind::Stream(Box::pin(timed)), pump)
+            }
+            full @ ProxyBodyKind::Full(_) => (full, None),
         };
+        self.kind = kind;
         self.client_grpc_deadline_fired = Some(fired);
+        self.retain_client_grpc_deadline_pump(pump);
         self
+    }
+
+    /// Hold a client RPC deadline pump on this (client-facing) body. An
+    /// earlier pump on the same body is kept alive with it, never dropped.
+    fn retain_client_grpc_deadline_pump(&mut self, pump: Option<ResponsePumpGuard>) {
+        if let Some(pump) = pump {
+            let earlier = self.client_grpc_deadline_pump.take();
+            self.client_grpc_deadline_pump = Some(pump.retaining(earlier));
+        }
     }
 
     /// Bound a NON-gRPC streaming response by the matched route rule's total
@@ -1403,8 +1429,13 @@ impl ProxyBody {
         self
     }
 
-    fn with_client_grpc_deadline_fired_flag(mut self, fired: Arc<AtomicBool>) -> Self {
+    fn with_client_grpc_deadline_state(
+        mut self,
+        fired: Arc<AtomicBool>,
+        pump: Option<ResponsePumpGuard>,
+    ) -> Self {
         self.client_grpc_deadline_fired = Some(fired);
+        self.retain_client_grpc_deadline_pump(pump);
         self
     }
 
@@ -1666,6 +1697,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            client_grpc_deadline_pump: None,
             route_request_deadline_fired: None,
             stream_auth_deadline: None,
             grpc_web_terminal_status: None,
@@ -5737,12 +5769,21 @@ where
 /// socket) parks hyper BEFORE it polls the response body, so a body-side timer
 /// alone can never fire. There the upstream is moved into the gateway-owned
 /// response pump (`response_watchdog::AuthorizationCancellableBody::
-/// for_client_rpc_deadline`), which releases the backend stream AT the deadline
-/// and, after a bounded grace in which the client may still drain the
+/// for_client_rpc_deadline`), which releases the backend response AT the
+/// deadline and, after a bounded grace in which the client may still drain the
 /// `DEADLINE_EXCEEDED` terminal, closes the client connection so the request
-/// accounting held by `ProxyBody` is released too. `None` keeps the inline
-/// body-side timer: frontends without a closer own and bound their own
-/// downstream writes (the native HTTP/3 relays).
+/// accounting held by `ProxyBody` is released too. The pump task is owned by
+/// the client-facing `ProxyBody` (see `ProxyBody::client_grpc_deadline_pump`),
+/// so an outer adapter or authorization pump consuming the terminal cannot
+/// cancel that grace. `None` keeps the inline body-side timer: frontends
+/// without a closer own and bound their own downstream writes (the native
+/// HTTP/3 relays).
+///
+/// Dropping the backend RESPONSE alone does not reset an HTTP/2 stream whose
+/// UPLOAD half is still open (hyper's request pipe keeps a stream reference);
+/// the native-gRPC streaming upload therefore carries the same absolute
+/// deadline itself (`GrpcBody::Streaming::rpc_deadline`), and its error makes
+/// hyper reset the whole backend stream.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientGrpcResponseDeadline {
     at: tokio::time::Instant,
@@ -5780,12 +5821,18 @@ type ClientGrpcDeadlineSource<B> = http_body_util::Either<B, AuthorizationCancel
 /// moved into the pump: the pump reports `is_end_stream() == false` until it
 /// delivers a terminal, which would change the response's framing, and there
 /// is no remaining frame to bound.
+///
+/// The returned [`ResponsePumpGuard`] (present only when a pump was installed)
+/// must be stored on the client-facing `ProxyBody`.
 fn client_grpc_deadline_body<B>(
     body: B,
     deadline: ClientGrpcResponseDeadline,
     deadline_frame: Option<Frame<Bytes>>,
     fired: Arc<AtomicBool>,
-) -> TotalDeadlineBody<ClientGrpcDeadlineSource<B>>
+) -> (
+    TotalDeadlineBody<ClientGrpcDeadlineSource<B>>,
+    Option<ResponsePumpGuard>,
+)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<BoxError>,
@@ -5796,27 +5843,31 @@ where
     match closer {
         Some(closer) if !http_body::Body::is_end_stream(&body) => {
             let owned = body.map_err(|error| -> BoxError { error.into() });
-            let pumped = AuthorizationCancellableBody::for_client_rpc_deadline(
+            let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
                 owned,
                 at,
                 Arc::clone(&fired),
                 Some(closer),
             );
             let owner = pumped.terminal_owner();
-            TotalDeadlineBody::with_deadline_frame(
+            let timed = TotalDeadlineBody::with_deadline_frame(
                 http_body_util::Either::Right(pumped),
                 // No timer here: the pump's shared terminal owner settles it.
                 None,
                 deadline_frame,
                 fired,
             )
-            .with_authorization_terminal_owner(owner)
+            .with_authorization_terminal_owner(owner);
+            (timed, Some(pump))
         }
-        _ => TotalDeadlineBody::with_deadline_frame(
-            http_body_util::Either::Left(body),
-            Some(at),
-            deadline_frame,
-            fired,
+        _ => (
+            TotalDeadlineBody::with_deadline_frame(
+                http_body_util::Either::Left(body),
+                Some(at),
+                deadline_frame,
+                fired,
+            ),
+            None,
         ),
     }
 }
@@ -6463,9 +6514,9 @@ where
 {
     if let Some(deadline) = total_deadline {
         let fired = Arc::new(AtomicBool::new(false));
-        let timed = client_grpc_deadline_body(body, deadline, None, Arc::clone(&fired));
+        let (timed, pump) = client_grpc_deadline_body(body, deadline, None, Arc::clone(&fired));
         let held = FlushBeforeTerminalError::new(timed);
-        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_fired_flag(fired)
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_state(fired, pump)
     } else {
         wrap_idle_read_timeout_and_error_hold(body, read_timeout_ms)
     }
@@ -6576,10 +6627,10 @@ where
     // deadline.
     if let Some(deadline) = total_deadline {
         let fired = Arc::new(AtomicBool::new(false));
-        let timed = client_grpc_deadline_body(direct, deadline, None, Arc::clone(&fired));
+        let (timed, pump) = client_grpc_deadline_body(direct, deadline, None, Arc::clone(&fired));
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
         let held = FlushBeforeTerminalError::new(stripped);
-        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_fired_flag(fired)
+        ProxyBody::streaming(Box::pin(held)).with_client_grpc_deadline_state(fired, pump)
     } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
         let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);

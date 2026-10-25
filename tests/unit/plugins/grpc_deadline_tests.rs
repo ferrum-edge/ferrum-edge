@@ -6674,48 +6674,225 @@ async fn rpc_deadline_never_delivers_a_backend_frame_queued_behind_a_stalled_cli
     assert!(body.frame().await.is_none());
 }
 
-#[tokio::test(start_paused = true)]
-async fn an_rpc_that_completes_before_its_deadline_keeps_its_trailers_and_its_connection() {
+fn grpc_ok_trailers() -> http::HeaderMap {
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+    trailers
+}
+
+const GRPC_MESSAGE: &[u8] = b"\x00\x00\x00\x00\x01x";
+
+/// A response whose backend trailers the pump read BEFORE the deadline keeps
+/// them, and its connection, however late the parked client drains them.
+async fn assert_trailers_read_before_the_deadline_survive_a_late_drain(
+    install: impl FnOnce(
+        ferrum_edge::proxy::ProxyBody,
+        ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> ferrum_edge::proxy::ProxyBody,
+) {
     use ferrum_edge::_test_support::{
         authorization_transport_close_grace, proxy_body_streaming_for_test,
-        proxy_body_with_client_grpc_deadline_and_closer_for_test,
     };
     use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
     use http_body_util::BodyExt;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    let mut trailers = http::HeaderMap::new();
-    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+    let dropped = Arc::new(AtomicBool::new(false));
     let closer = AuthorizationConnectionCloser::new();
     let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
         frames: std::collections::VecDeque::from([
-            http_body::Frame::data(bytes::Bytes::from_static(b"\x00\x00\x00\x00\x01x")),
-            http_body::Frame::trailers(trailers),
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::trailers(grpc_ok_trailers()),
         ]),
-        dropped: Arc::new(AtomicBool::new(false)),
+        dropped: Arc::clone(&dropped),
     }));
-    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+    let mut body = install(backend, closer.clone());
+
+    let data = body.frame().await.expect("data frame").expect("data ok");
+    assert_eq!(data.data_ref().map(|bytes| &bytes[..]), Some(GRPC_MESSAGE));
+    // Barrier: the pump reads the backend trailers and, claiming them as the
+    // upstream's own terminal, releases the finished backend — all before the
+    // deadline, while the client reads nothing more.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the pump must settle the backend's trailers as completion before the deadline"
+    );
+
+    // The client stays parked well past the deadline and the close grace.
+    tokio::time::sleep(Duration::from_secs(5) + authorization_transport_close_grace() * 2).await;
+    let terminal = body.frame().await.expect("trailers").expect("trailers ok");
+    assert_eq!(
+        grpc_status_of(&terminal).as_deref(),
+        Some("0"),
+        "a response that completed before its deadline must keep its own grpc-status"
+    );
+    assert!(body.frame().await.is_none());
+    assert!(
+        !closer.close_requested(),
+        "a response that finished before its deadline must never cost the client its \
+         connection"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_rpc_that_completes_before_its_deadline_keeps_its_trailers_and_its_connection() {
+    assert_trailers_read_before_the_deadline_survive_a_late_drain(|backend, closer| {
+        ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_and_closer_for_test(
+            backend,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            None,
+            closer,
+        )
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_authorized_stream_that_completes_before_expiry_keeps_its_trailers() {
+    use ferrum_edge::proxy::auth_lifetime::{
+        StreamAuthDeadline, StreamAuthProtocolFamily, StreamAuthTermination,
+        StreamAuthTerminationLatch,
+    };
+    assert_trailers_read_before_the_deadline_survive_a_late_drain(|backend, closer| {
+        ferrum_edge::_test_support::proxy_body_with_authorization_deadline_and_closer_for_test(
+            backend,
+            StreamAuthDeadline {
+                at: tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                termination: StreamAuthTermination::CredentialExpired,
+            },
+            StreamAuthProtocolFamily::Grpc,
+            Some(StreamAuthTerminationLatch::default()),
+            closer,
+        )
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_outer_authorization_pump_cannot_cancel_the_rpc_deadline_transport_close() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_streaming_for_test,
+        proxy_body_with_authorization_deadline_and_closer_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{
+        AuthorizationConnectionCloser, StreamAuthDeadline, StreamAuthProtocolFamily,
+        StreamAuthTermination, StreamAuthTerminationLatch,
+    };
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([http_body::Frame::data(
+            bytes::Bytes::from_static(GRPC_MESSAGE),
+        )]),
+        dropped: Arc::clone(&dropped),
+    }));
+    // Production stacking: the RPC deadline inside, the (much later)
+    // authorization lifetime outside, one connection closer.
+    let body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
         backend,
-        tokio::time::Instant::now() + Duration::from_secs(5),
+        tokio::time::Instant::now() + Duration::from_secs(1),
         None,
         closer.clone(),
     );
-
-    let data = body.frame().await.expect("data frame").expect("data ok");
-    assert_eq!(
-        data.data_ref().map(|bytes| &bytes[..]),
-        Some(b"\x00\x00\x00\x00\x01x".as_slice())
+    let mut body = proxy_body_with_authorization_deadline_and_closer_for_test(
+        body,
+        StreamAuthDeadline {
+            at: tokio::time::Instant::now() + Duration::from_secs(3_600),
+            termination: StreamAuthTermination::CredentialExpired,
+        },
+        StreamAuthProtocolFamily::Grpc,
+        Some(StreamAuthTerminationLatch::default()),
+        closer.clone(),
     );
-    let terminal = body.frame().await.expect("trailers").expect("trailers ok");
-    assert_eq!(grpc_status_of(&terminal).as_deref(), Some("0"));
-    assert!(body.frame().await.is_none());
-    drop(body);
 
-    tokio::time::sleep(Duration::from_secs(5) + authorization_transport_close_grace() * 2).await;
+    // hyper takes one DATA frame and then parks on a client that grants no
+    // credit: nothing below polls the client-facing body again.
+    let data = body.frame().await.expect("data frame").expect("data ok");
+    assert_eq!(data.data_ref().map(|bytes| &bytes[..]), Some(GRPC_MESSAGE));
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(
-        !closer.close_requested(),
-        "a response that finished before its RPC deadline must never cost the client its \
-         connection"
+        dropped.load(Ordering::SeqCst),
+        "the backend must be released at the RPC deadline"
+    );
+    assert!(!closer.close_requested());
+
+    // The outer authorization pump has meanwhile consumed the RPC terminal as
+    // its upstream's own completion. That must not cancel the RPC deadline's
+    // close grace: the client still has not received the terminal.
+    tokio::time::sleep(authorization_transport_close_grace() + Duration::from_secs(1)).await;
+    assert!(
+        closer.close_requested(),
+        "the stalled client must have its connection closed after the RPC grace even when \
+         an outer authorization pump consumed the terminal, or the response body's request, \
+         per-IP, admission, and load-balancer accounting is held indefinitely"
+    );
+    drop(body);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rpc_deadline_resets_a_still_open_streaming_upload() {
+    use std::time::Duration;
+
+    let started = tokio::time::Instant::now();
+    let first =
+        ferrum_edge::_test_support::grpc_streaming_upload_first_item_under_rpc_deadline_for_test(
+            Some(started + Duration::from_secs(1)),
+        )
+        .await;
+    match first {
+        Some(Err(message)) => assert!(
+            message.contains("RPC deadline exceeded"),
+            "unexpected upload terminal: {message}"
+        ),
+        other => panic!(
+            "an upload still open at the RPC deadline must end in an error (hyper resets the \
+             backend stream, ending both halves), got {other:?}"
+        ),
+    }
+    assert!(started.elapsed() >= Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_streaming_upload_without_an_rpc_deadline_is_not_cut() {
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(3_600),
+        ferrum_edge::_test_support::grpc_streaming_upload_first_item_under_rpc_deadline_for_test(
+            None,
+        ),
+    )
+    .await;
+    assert!(outcome.is_err(), "no deadline, no cut: {outcome:?}");
+}
+
+#[test]
+fn a_composed_preflight_rejection_keeps_the_established_budget() {
+    let default = deadline_plugin(json!({"default_deadline_ms": 5000}));
+    let required = deadline_plugin(json!({"reject_no_deadline": true}));
+    let mut ctx = create_grpc_context_with_timeout(Some("banana"));
+    assert_reject(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+            &[default, required],
+            &mut ctx,
+        ),
+        Some(400),
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_timeout_invalid").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("grpc_adjusted_deadline_ms")
+            .map(String::as_str),
+        Some("5000"),
+        "the rejection log must still carry the budget the earlier instance established"
     );
 }

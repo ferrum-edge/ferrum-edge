@@ -14111,6 +14111,36 @@ pub mod _test_support {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, Some(closer))
     }
 
+    /// Poll a native-gRPC streaming upload (`GrpcBody::Streaming`, the body
+    /// hyper's HTTP/2 request pipe reads) whose client never ends the upload,
+    /// under an optional client RPC deadline, and report its first item.
+    /// `Some(Err(message))` means the deadline ended the upload in an error,
+    /// which hyper turns into RST_STREAM on the backend stream.
+    pub async fn grpc_streaming_upload_first_item_under_rpc_deadline_for_test(
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<Result<(), String>> {
+        let client = http_body_util::StreamBody::new(futures_util::stream::pending::<
+            Result<http_body::Frame<bytes::Bytes>, std::io::Error>,
+        >());
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(client, None, 0, false);
+        let mut body = Box::pin(crate::proxy::grpc_proxy::GrpcBody::Streaming {
+            require_end_stream: false,
+            incoming: crate::proxy::body::UploadSource::Pumped(source),
+            auth_deadline: None,
+            rpc_deadline: crate::proxy::grpc_proxy::streaming_upload_rpc_deadline(deadline),
+            bytes_seen: 0,
+            max_bytes: 0,
+            exceeded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_bytes: None,
+            upload_observer: None,
+            grpc_messages: None,
+            grpc_scanner: None,
+        });
+        let first = std::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx)).await;
+        drop(join);
+        first.map(|item| item.map(|_| ()).map_err(|error| error.to_string()))
+    }
+
     /// Parse a Gateway API Duration (GEP-2257) exactly as the HTTPRoute
     /// `timeouts` admission does.
     pub fn parse_gateway_api_duration_ms_for_test(value: &str) -> Option<u64> {

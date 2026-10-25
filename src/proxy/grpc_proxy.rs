@@ -228,6 +228,16 @@ pub enum GrpcBody {
         /// hyper stops polling, while this guard prevents a frame already in
         /// the bounded bridge from crossing the authorization deadline.
         auth_deadline: Option<crate::proxy::body::UploadAuthDeadline>,
+        /// The request's absolute client RPC deadline (`grpc-timeout` /
+        /// `grpc_deadline` budget), armed once. Dropping the backend RESPONSE
+        /// at the deadline does not reset an HTTP/2 stream whose upload half is
+        /// still open — hyper's request pipe holds its own stream reference and
+        /// h2 only cancels a stream once every reference is gone — so a
+        /// client- or bidirectional-streaming upload would otherwise keep the
+        /// backend exchange alive past the RPC budget. At the deadline this
+        /// body ends in an ERROR, so hyper sends RST_STREAM and both halves of
+        /// the backend stream end. `None` without a deadline.
+        rpc_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -289,6 +299,20 @@ pub enum GrpcBody {
         grpc_messages: Option<Arc<AtomicU64>>,
         grpc_scanner: Option<crate::plugins::mesh::prometheus_helpers::GrpcLengthPrefixedScanner>,
     },
+}
+
+/// Terminal error of a native-gRPC streaming upload cut by the client RPC
+/// deadline. A compiled-in literal; hyper turns it into RST_STREAM.
+const GRPC_UPLOAD_RPC_DEADLINE_MESSAGE: &str =
+    "gRPC request upload ended: client RPC deadline exceeded";
+
+/// Arm [`GrpcBody::Streaming`]'s client RPC deadline. One timer per
+/// deadline-bearing streaming upload; it is dropped with the body as soon as
+/// the upload completes.
+pub(crate) fn streaming_upload_rpc_deadline(
+    deadline: Option<tokio::time::Instant>,
+) -> Option<Pin<Box<tokio::time::Sleep>>> {
+    deadline.map(|at| Box::pin(tokio::time::sleep_until(at)))
 }
 
 impl Drop for GrpcBody {
@@ -363,6 +387,7 @@ impl http_body::Body for GrpcBody {
                 grpc_messages,
                 grpc_scanner,
                 auth_deadline,
+                rpc_deadline,
                 ..
             } => {
                 if let Some(deadline) = auth_deadline
@@ -374,6 +399,17 @@ impl http_body::Body for GrpcBody {
                         accounting.publish(*bytes_seen as u64);
                     }
                     return Poll::Ready(Some(Err(deadline.message().into())));
+                }
+                // The client RPC deadline ends a still-open upload the same way:
+                // an error here makes hyper reset the backend stream, which is
+                // the only way to end BOTH halves of a duplex exchange.
+                if let Some(deadline) = rpc_deadline.as_mut()
+                    && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
+                {
+                    if let Some(accounting) = request_bytes.as_mut() {
+                        accounting.publish(*bytes_seen as u64);
+                    }
+                    return Poll::Ready(Some(Err(GRPC_UPLOAD_RPC_DEADLINE_MESSAGE.into())));
                 }
                 let polled = loop {
                     match incoming.poll_frame(cx) {
@@ -5418,6 +5454,7 @@ pub async fn proxy_grpc_request_streaming(
         require_end_stream,
         incoming: body,
         auth_deadline,
+        rpc_deadline: streaming_upload_rpc_deadline(grpc_deadline_at),
         bytes_seen: 0,
         max_bytes: max_grpc_recv_size_bytes,
         exceeded: Arc::clone(&body_size_exceeded),
@@ -6003,6 +6040,17 @@ async fn proxy_grpc_streaming_dispatch(
                         "gRPC backend write watermark expired before response headers"
                     );
                     return grpc_backend_write_timeout_error(proxy.backend_write_timeout_ms);
+                }
+                // The upload's own RPC deadline (`GrpcBody::Streaming::
+                // rpc_deadline`) resets the stream at the same instant the
+                // header wait's `timeout_at` expires; whichever hyper reports
+                // first, a failure at/after the deadline is that deadline, not
+                // a backend fault.
+                if grpc_deadline_at.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                {
+                    return GrpcProxyError::ClientDeadlineExceeded(
+                        GrpcDeadlinePhase::StreamingResponseHeaders,
+                    );
                 }
                 // Streaming / channel uploads are unreplayable — keep post-wire
                 // classification even when hyper reports `is_canceled`, but still
