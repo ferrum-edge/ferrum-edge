@@ -1328,7 +1328,10 @@ fn test_access_control_file_reload_refuses_rename_of_referenced_consumer() {
     use ferrum_edge::plugins::access_control::consumer_rename_conflicts;
 
     let namespace = ferrum_edge::config::types::default_namespace();
-    let mallory = make_consumer_with_groups("mallory", vec![]);
+    // An id that shares no text with either username, so the assertion below
+    // can tell a leaked username from the (expected) consumer id.
+    let mut mallory = make_consumer_with_groups("mallory", vec![]);
+    mallory.id = "acl-rename-subject".to_string();
     let mut renamed = mallory.clone();
     renamed.username = "m.reyes".to_string();
     let deny = access_control_plugin_config(
@@ -1345,6 +1348,7 @@ fn test_access_control_file_reload_refuses_rename_of_referenced_consumer() {
     );
     assert_eq!(conflicts.len(), 1, "{conflicts:?}");
     assert!(conflicts[0].contains("acl-deny"), "{conflicts:?}");
+    assert!(conflicts[0].contains("acl-rename-subject"), "{conflicts:?}");
     assert!(
         !conflicts[0].contains("mallory") && !conflicts[0].contains("m.reyes"),
         "diagnostics name resource ids, not usernames: {conflicts:?}"
