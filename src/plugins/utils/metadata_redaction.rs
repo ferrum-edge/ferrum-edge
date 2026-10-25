@@ -472,6 +472,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "ratelimit_remaining",
     "ratelimit_window",
     "rejection_phase",
+    "replay_rejected_consumer",
     "request_body_size_bytes",
     "request_deduplication.publishing_external_operation_tombstone",
     "request_deduplication.replayed",

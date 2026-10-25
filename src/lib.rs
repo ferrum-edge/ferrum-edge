@@ -425,6 +425,24 @@ pub mod _test_support {
         crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
     }
 
+    /// Record buffered-body metadata exactly as the H1/H2/H3 body ladders do,
+    /// so tests can pin which body digest snapshots are computed.
+    pub fn store_request_body_metadata_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        body: &[u8],
+        needs_body_text: bool,
+        needs_body_bytes: bool,
+        needs_body_digests: bool,
+    ) {
+        crate::proxy::store_request_body_metadata(
+            ctx,
+            body,
+            needs_body_text,
+            needs_body_bytes,
+            needs_body_digests,
+        );
+    }
+
     /// Answer an inbound CONNECT relay-synthesis refusal exactly as the
     /// dispatcher's route-miss arm does (issue #5763), delivering the
     /// transaction line to `plugins` in place of the epoch's global chain.

@@ -4814,8 +4814,17 @@ pub(crate) fn store_request_body_metadata(
         && (ctx.request_body_sha256.is_none() || ctx.request_body_sha512.is_none())
     {
         use crate::fips::approved::{Sha256, Sha512};
-        ctx.request_body_sha256 = Some(Sha256::digest(body));
-        ctx.request_body_sha512 = Some(Sha512::digest(body));
+        // Hash only for the algorithms the client's digest field presented;
+        // the consumer refuses a presented algorithm whose snapshot is absent,
+        // so skipping an unrequested one never weakens verification.
+        let (wants_sha256, wants_sha512) =
+            crate::plugins::hmac_auth::presented_body_digest_algorithms(ctx);
+        if wants_sha256 && ctx.request_body_sha256.is_none() {
+            ctx.request_body_sha256 = Some(Sha256::digest(body));
+        }
+        if wants_sha512 && ctx.request_body_sha512.is_none() {
+            ctx.request_body_sha512 = Some(Sha512::digest(body));
+        }
     }
 }
 

@@ -819,6 +819,63 @@ fn expiration_triggers_reclamation_after_o1_refusals() {
     );
 }
 
+/// Sustained traffic on a full lane with staggered expirations makes nearly
+/// every admission reclaim a tiny due batch. Each of those reclamation passes
+/// must examine only the due markers (the time-bucketed expiry index), not the
+/// whole retained population: a full map walk per pass would examine the cap
+/// every time.
+#[test]
+fn staggered_expiry_reclamation_examines_due_markers_not_the_whole_lane() {
+    const CAP: usize = 4_000;
+    const STEPS: u64 = 200;
+    let sub = "staggered-expiry-index";
+    let authority = process_authority(sub, CAP);
+    let lane = process_lane(&authority).expect("process lane");
+    let retention_ms = u64::try_from(RETENTION.as_millis()).expect("retention fits u64");
+
+    // Fill the lane with markers admitted 100 ms apart, so their expiries are
+    // staggered across 400 seconds of index buckets.
+    for idx in 0..CAP as u64 {
+        let marker = lane_marker(sub, &format!("fill-{idx}"));
+        assert_eq!(
+            admit_process_at(&authority, &marker, idx * 100),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    let scans_before = lane.prune_scans();
+    let examined_before = lane.prune_entries_examined_for_tests();
+
+    // Step just past each successive expiry: every new admission finds the
+    // lane full and reclaims exactly one newly expired marker.
+    for step in 0..STEPS {
+        let now = retention_ms + step * 100 + 1;
+        let marker = lane_marker(sub, &format!("new-{step}"));
+        assert_eq!(
+            admit_process_at(&authority, &marker, now),
+            Some(ReplayAdmission::Admitted),
+            "an expired slot must be reclaimed at step {step}"
+        );
+    }
+
+    let scans = lane.prune_scans() - scans_before;
+    let examined = lane.prune_entries_examined_for_tests() - examined_before;
+    assert!(
+        scans >= STEPS / 2,
+        "the scenario must actually drive repeated reclamation passes ({scans})"
+    );
+    assert!(
+        examined < scans * (CAP as u64) / 10,
+        "{scans} reclamation passes examined {examined} markers; a full-lane walk per pass \
+         would examine ~{CAP} each"
+    );
+    // Live markers were never evicted to make room.
+    let still_live = lane_marker(sub, &format!("fill-{}", CAP as u64 - 1));
+    assert_eq!(
+        admit_process_at(&authority, &still_live, retention_ms + STEPS * 100),
+        Some(ReplayAdmission::Replay)
+    );
+}
+
 /// Concurrent insertion while a due prune recomputes the earliest bound must
 /// not drop a still-live marker or treat it as expired.
 #[test]

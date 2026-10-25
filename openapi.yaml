@@ -25032,11 +25032,15 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
-        mandatory request-body integrity protection. RFC 9530 defines
-        Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
-        must include exactly one of Digest or Content-Digest matching the
-        original body. Sending both headers is refused as ambiguous;
+        Plugin: hmac_auth — versioned HMAC request authentication with
+        mandatory request-body integrity protection. The Ferrum profiles
+        (`ferrum-hmac-v2`, `ferrum-hmac-v1`) use `Authorization: hmac` and a
+        Ferrum signing base; the `rfc9421` profile verifies RFC 9421 HTTP
+        Message Signatures (`Signature-Input` / `Signature`, `hmac-sha256`,
+        key looked up by `keyid` among the Consumers' `hmac_auth` secrets).
+        RFC 9530 defines Content-Digest. Requests must include exactly one of
+        Digest or Content-Digest matching the original body (`rfc9421`
+        requires Content-Digest and must cover it). Sending both headers is refused as ambiguous;
         unsupported algorithms and malformed members fail closed. The signing
         base's FIRST field is the profile version, so a signature produced
         under one profile can never verify under another.
@@ -25048,7 +25052,8 @@ components:
         retry is therefore a replay and is rejected; safe retries send a fresh
         nonce with a recomputed signature. HBONE CONNECT and
         request-body-transformer compositions fail closed. The
-        pre-authentication body path has a 10 MiB hard ceiling. A WebSocket
+        pre-authentication body path is bounded by max_body_bytes (default
+        10 MiB). A WebSocket
         handshake (HTTP/1.1 Upgrade, HTTP/2 and HTTP/3 Extended CONNECT) is
         signed over the EMPTY body: tunnel DATA is never drained as a request
         body, so the transport proves the handshake's empty representation from
@@ -25069,12 +25074,23 @@ components:
             captured valid request stays replayable.
         signing_profile:
           type: string
-          enum: [ferrum-hmac-v2, ferrum-hmac-v1]
+          enum: [ferrum-hmac-v2, rfc9421, ferrum-hmac-v1]
           default: ferrum-hmac-v2
           description: >-
             Versioned signing profile. 'ferrum-hmac-v2' requires a client nonce
             in the Authorization parameters, binds it into the signature, and
-            makes each signed request single-use. 'ferrum-hmac-v1' is
+            makes each signed request single-use. 'rfc9421' verifies (never
+            signs) exactly one RFC 9421 HTTP Message Signature with alg
+            'hmac-sha256' (an absent alg means hmac-sha256; any other is
+            refused). Covered components must include @method, @authority,
+            @path, @query, content-digest, every signed_headers entry, and
+            every required_components entry; 'created', 'keyid', and 'nonce'
+            are required, 'expires' is enforced when sent, 'created' must be
+            within clock_skew_seconds, and the nonce is claimed single-use like
+            v2 (in its own replay domain). Unknown algorithms, components,
+            component parameters, and signature parameters are refused.
+            Supported derived components are @method, @authority, @path,
+            @query, and @request-target. 'ferrum-hmac-v1' is
             freshness-only — a captured valid request can be replayed verbatim
             for the whole clock_skew_seconds window — and additionally requires
             allow_unsafe_replayable_v1 true. v1 rejects a nonce parameter
@@ -25093,8 +25109,8 @@ components:
           type: string
           enum: [process, shared]
           description: >-
-            Required for ferrum-hmac-v2 and rejected for ferrum-hmac-v1; there is
-            no default. Use 'shared' together with sync_mode 'redis' for any
+            Required for ferrum-hmac-v2 and rfc9421 and rejected for
+            ferrum-hmac-v1; there is no default. Use 'shared' together with sync_mode 'redis' for any
             deployment running more than one gateway replica: every replica then
             claims each nonce through one atomic Redis SET NX EX. Use 'process'
             to declare a single-process deployment whose replay protection is
@@ -25106,15 +25122,62 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 10000000
           default: 100000
           description: >-
             Capacity this process-scoped authority enforces against the shared
-            replay lane. At capacity only expired markers are reclaimed; if none
-            can be, the request is refused (503) rather than a live marker
-            evicted. Repeated full-live refusals are O(1) until an expiry is
-            actually due. An equivalent reload applies the new cap without
-            forgetting live markers. Ignored for 'shared'.
+            replay lane (at most 10,000,000; use replay_scope 'shared' for more).
+            At capacity only expired markers are reclaimed; if none can be, the
+            request is refused (503) rather than a live marker evicted.
+            Repeated full-live refusals are O(1) until an expiry is actually
+            due, and a due reclamation visits only markers whose expiry bucket
+            has started, never the whole lane. An equivalent reload applies the
+            new cap without forgetting live markers. Ignored for 'shared';
+            rejected with ferrum-hmac-v1, which has no replay state.
+        signed_headers:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: "^[a-z0-9!#$%&'*+.^_`|~-]+$"
+            not:
+              enum: [authorization, signature, signature-input, host, connection, keep-alive, proxy-connection, te, trailer, transfer-encoding, upgrade]
+          description: >-
+            Lowercase request header names every accepted signature must cover,
+            for all profiles. Under the Ferrum profiles each is appended to the
+            signing base, in this order, as one '\n{name}:{value}' line after
+            the nonce (v2) or digest (v1), where value is the RFC 9421 section
+            2.1 canonical value (each field line trimmed, joined by ', '). Under
+            rfc9421 each must appear in the covered components. A configured
+            header missing from the request is refused (401). Signature
+            carriers and connection-specific fields cannot be named. Omitted or
+            empty leaves the signing base unchanged.
+        required_components:
+          type: array
+          maxItems: 5
+          uniqueItems: true
+          items:
+            type: string
+            enum: ['@method', '@authority', '@path', '@query', '@request-target']
+          description: >-
+            rfc9421 only (rejected with the Ferrum profiles): additional derived
+            components every signature must cover beyond the mandatory
+            @method, @authority, @path, @query, and content-digest. Require
+            header fields with signed_headers.
+        max_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 268435456
+          default: 10485760
+          description: >-
+            Pre-authentication request-body ceiling in bytes (at most 256 MiB).
+            Only a request whose signature already verified is buffered, and
+            the stricter of this, the route, and the global request-body limits
+            applies; a larger signed body is refused (413).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -25184,14 +25247,24 @@ components:
               sync_mode:
                 const: local
             not:
-              required: [replay_scope]
+              anyOf:
+                - required: [replay_scope]
+                - required: [replay_max_entries]
           else:
-            # ferrum-hmac-v2 (the default) has no default replay scope, and the
-            # unsafe acknowledgement is only meaningful with v1.
+            # ferrum-hmac-v2 (the default) and rfc9421 have no default replay
+            # scope, and the unsafe acknowledgement is only meaningful with v1.
             required: [replay_scope]
             properties:
               allow_unsafe_replayable_v1:
                 const: false
+        # `required_components` is an RFC 9421 policy.
+        - if:
+            required: [required_components]
+          then:
+            required: [signing_profile]
+            properties:
+              signing_profile:
+                const: rfc9421
         - if:
             required: [replay_scope]
             properties:

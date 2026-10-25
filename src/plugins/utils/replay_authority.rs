@@ -60,7 +60,11 @@
 //! by generating unique proofs. Capacity degrades into refusal, never into
 //! silent unprotection. Repeated refusals while every retained marker is still
 //! live are O(1): a conservative earliest-expiry lower bound skips the map walk
-//! until an expiry is actually due. Ordinary admission publishes that bound
+//! until an expiry is actually due. A due reclamation pass is itself bounded:
+//! every marker is indexed in a time bucket of its expiry, and the pass visits
+//! only buckets whose window has started, so staggered expirations under
+//! sustained traffic near capacity cost the due markers, not the whole lane.
+//! Ordinary admission publishes that bound
 //! only earlier (`fetch_min`) under a lock-free active-writer count plus a
 //! completed-revision counter; prune may store a later bound only after a scan
 //! that observed no active writer and no missed completed revision. An even/odd
@@ -147,6 +151,28 @@ const SHARED_MARKER_RECORD: &[u8] = b"ferrum-replay-marker-v1";
 /// Redis key component that separates replay markers from any other keyspace
 /// sharing a configured prefix.
 const SHARED_KEY_COMPONENT: &str = "replay";
+
+/// Width of one process-lane expiry-index bucket, in milliseconds.
+///
+/// Reclamation visits only due buckets, so its work per prune is bounded by
+/// the markers that are due (plus the one partially due bucket), never by the
+/// whole retained population.
+const EXPIRY_BUCKET_MILLIS: u64 = 1_000;
+
+/// Stripes per expiry bucket. Every admission inside one bucket window would
+/// otherwise contend on one index shard; the stripe is taken from the marker
+/// digest, which is uniformly distributed.
+const EXPIRY_INDEX_STRIPES: u8 = 8;
+
+/// `(expiry bucket, stripe)`.
+type ExpiryIndexKey = (u64, u8);
+
+fn expiry_index_key(digest: &[u8; 32], expires_at_millis: u64) -> ExpiryIndexKey {
+    (
+        expires_at_millis / EXPIRY_BUCKET_MILLIS,
+        digest[0] % EXPIRY_INDEX_STRIPES,
+    )
+}
 
 /// Process-relative monotonic base. Markers store an expiry in milliseconds
 /// since this instant so an entry is 8 bytes and no `Instant` is retained.
@@ -477,8 +503,18 @@ pub struct ProcessReplayLane {
     /// Prune snapshots this before the scan and refuses a later store if it
     /// changed.
     completed_revisions: AtomicU64,
-    /// How many times the capacity path actually walked the map (test support).
+    /// Time-bucketed index of every retained marker by its stored expiry.
+    /// Each entry is indexed exactly once, under the bucket of its current
+    /// expiry: an in-place refresh moves it. Reclamation walks only due
+    /// buckets instead of the whole marker map (lock order is always
+    /// `entries` then `expiry_index`; nothing holds an index guard while
+    /// taking an entry guard).
+    expiry_index: DashMap<ExpiryIndexKey, Vec<[u8; 32]>>,
+    /// How many times the capacity path actually ran a reclamation pass (test
+    /// support).
     prune_scans: AtomicU64,
+    /// Indexed markers reclamation examined, in total (test support).
+    prune_entries_examined: AtomicU64,
     /// Serializes the capacity-pressure prune so concurrent saturated requests
     /// do not each walk the map. Never taken on the ordinary admission path.
     prune_lock: Mutex<()>,
@@ -500,7 +536,9 @@ impl ProcessReplayLane {
             earliest_expiry_millis: AtomicU64::new(u64::MAX),
             active_writers: AtomicUsize::new(0),
             completed_revisions: AtomicU64::new(0),
+            expiry_index: DashMap::with_shard_amount(shard_amount),
             prune_scans: AtomicU64::new(0),
+            prune_entries_examined: AtomicU64::new(0),
             prune_lock: Mutex::new(()),
         })
     }
@@ -554,6 +592,7 @@ impl ProcessReplayLane {
                     // charged to the presenting principal even when the stale
                     // entry is still stored under another one.
                     if let Some(refreshed) = self.refresh_expired_entry(
+                        &key,
                         existing.get_mut(),
                         principal_digest,
                         expires_at,
@@ -578,6 +617,7 @@ impl ProcessReplayLane {
                             expires_at_millis: expires_at,
                             principal_digest: *principal_digest,
                         });
+                        self.index_expiry(&key, expires_at);
                         self.finish_expiry_write(expires_at);
                         return ReplayAdmission::Admitted;
                     } else {
@@ -628,6 +668,7 @@ impl ProcessReplayLane {
     /// expired marker.
     fn refresh_expired_entry(
         &self,
+        digest: &[u8; 32],
         entry: &mut ProcessReplayEntry,
         principal_digest: &[u8; 32],
         expires_at: u64,
@@ -646,16 +687,44 @@ impl ProcessReplayLane {
         } else if self.principal_count(principal_digest) > principal_limit {
             return None;
         }
-        let refreshed = entry.expires_at_millis.max(expires_at);
+        let previous_expiry = entry.expires_at_millis;
+        let refreshed = previous_expiry.max(expires_at);
         self.begin_expiry_write();
         *entry = ProcessReplayEntry {
             expires_at_millis: refreshed,
             principal_digest: *principal_digest,
         };
+        // Still under this entry's shard guard (entries -> index lock order).
+        if expiry_index_key(digest, previous_expiry) != expiry_index_key(digest, refreshed) {
+            self.unindex_expiry(digest, previous_expiry);
+            self.index_expiry(digest, refreshed);
+        }
         if moves_principal {
             self.release_principal(&previous_principal);
         }
         Some(refreshed)
+    }
+
+    /// Index `digest` under the bucket of `expires_at_millis`.
+    fn index_expiry(&self, digest: &[u8; 32], expires_at_millis: u64) {
+        self.expiry_index
+            .entry(expiry_index_key(digest, expires_at_millis))
+            .or_default()
+            .push(*digest);
+    }
+
+    /// Remove `digest` from the bucket of `expires_at_millis`, dropping the
+    /// bucket once it is empty. A digest a concurrent prune already took out
+    /// of that bucket is simply not found.
+    fn unindex_expiry(&self, digest: &[u8; 32], expires_at_millis: u64) {
+        let index_key = expiry_index_key(digest, expires_at_millis);
+        if let Some(mut digests) = self.expiry_index.get_mut(&index_key)
+            && let Some(position) = digests.iter().position(|existing| existing == digest)
+        {
+            digests.swap_remove(position);
+        }
+        self.expiry_index
+            .remove_if(&index_key, |_, digests| digests.is_empty());
     }
 
     fn note_expiry(&self, expires_at: u64) {
@@ -762,10 +831,14 @@ impl ProcessReplayLane {
     /// Reclaim **expired** entries only. Returns how many were reclaimed.
     ///
     /// Serialized by [`Self::prune_lock`] so a burst of saturated requests pays
-    /// for at most one concurrent walk. Bounded by the lane's retained entries,
-    /// and reached only when the calling authority is already at its cap.
-    /// Repeated refusals while the conservative earliest-expiry bound is still
-    /// in the future return immediately without walking the map.
+    /// for at most one concurrent pass, and reached only when the calling
+    /// authority is already at its cap. Repeated refusals while the
+    /// conservative earliest-expiry bound is still in the future return
+    /// immediately. A due pass visits only the expiry-index buckets whose
+    /// window has started — fully due buckets plus the one containing `now` —
+    /// so its work is bounded by the due markers rather than by every
+    /// retained marker, even when expirations are staggered and arrive
+    /// continuously under sustained traffic near capacity.
     fn prune_expired(&self, now_millis: u64) -> usize {
         self.prune_expired_at(now_millis, || {})
     }
@@ -783,42 +856,72 @@ impl ProcessReplayLane {
         }
 
         self.prune_scans.fetch_add(1, Ordering::Relaxed);
-        // Snapshot before the scan so a writer that inserts on an already
-        // visited shard and completes before publication is visible as a
+        // Snapshot before the pass so a writer that inserts into an already
+        // visited bucket and completes before publication is visible as a
         // revision change. Load order is owned by [`Self::writer_epoch`].
         let epoch = self.writer_epoch();
 
-        let mut expired: Vec<[u8; 32]> = Vec::new();
+        // Bucket keys only: bounded by retention / bucket width × stripes,
+        // independent of how many markers each bucket holds. No index guard
+        // is held past this loop.
+        let now_bucket = now_millis / EXPIRY_BUCKET_MILLIS;
+        let mut due: Vec<ExpiryIndexKey> = Vec::new();
         let mut live_min = u64::MAX;
-        for entry in self.entries.iter() {
-            let expires_at = entry.value().expires_at_millis;
-            if expires_at <= now_millis {
-                expired.push(*entry.key());
+        for bucket in self.expiry_index.iter() {
+            let index_key = *bucket.key();
+            if index_key.0 <= now_bucket {
+                due.push(index_key);
             } else {
-                live_min = live_min.min(expires_at);
+                // Every marker indexed in a later bucket expires at or after
+                // that bucket's start, which is after `now`.
+                live_min = live_min.min(index_key.0.saturating_mul(EXPIRY_BUCKET_MILLIS));
             }
         }
+
         let mut reclaimed = 0usize;
-        for key in expired {
-            // Re-check the expiry under the shard guard: a concurrent request
-            // may have refreshed this marker between the scan and the removal,
-            // and removing it then would drop a live claim.
-            match self
-                .entries
-                .remove_if(&key, |_, entry| entry.expires_at_millis <= now_millis)
-            {
-                Some((_, entry)) => {
-                    self.entry_count.fetch_sub(1, Ordering::AcqRel);
-                    self.release_principal(&entry.principal_digest);
-                    reclaimed += 1;
-                }
-                None => {
-                    if let Some(current) = self.entries.get(&key) {
-                        live_min = live_min.min(current.expires_at_millis);
+        let mut examined = 0u64;
+        for index_key in due {
+            let Some((_, digests)) = self.expiry_index.remove(&index_key) else {
+                continue;
+            };
+            let mut still_live: Vec<[u8; 32]> = Vec::new();
+            for key in digests {
+                examined += 1;
+                // Re-check the expiry under the shard guard: a concurrent
+                // request may have refreshed this marker, and removing it then
+                // would drop a live claim.
+                match self
+                    .entries
+                    .remove_if(&key, |_, entry| entry.expires_at_millis <= now_millis)
+                {
+                    Some((_, entry)) => {
+                        self.entry_count.fetch_sub(1, Ordering::AcqRel);
+                        self.release_principal(&entry.principal_digest);
+                        reclaimed += 1;
+                    }
+                    None => {
+                        let current = self.entries.get(&key).map(|entry| entry.expires_at_millis);
+                        if let Some(expires_at) = current {
+                            live_min = live_min.min(expires_at);
+                            // A refresh already re-indexed it elsewhere;
+                            // otherwise it is a live marker of the partially
+                            // due bucket and stays indexed here.
+                            if expiry_index_key(&key, expires_at) == index_key {
+                                still_live.push(key);
+                            }
+                        }
                     }
                 }
             }
+            if !still_live.is_empty() {
+                self.expiry_index
+                    .entry(index_key)
+                    .or_default()
+                    .extend(still_live);
+            }
         }
+        self.prune_entries_examined
+            .fetch_add(examined, Ordering::Relaxed);
 
         after_scan();
         self.try_publish_later_bound(live_min, epoch);
@@ -840,10 +943,16 @@ impl ProcessReplayLane {
         self.entry_count.load(Ordering::Acquire)
     }
 
-    /// How many times the capacity path walked the map (test support).
+    /// How many times the capacity path ran a reclamation pass (test support).
     #[allow(dead_code)] // exercised by external unit tests
     pub fn prune_scans(&self) -> u64 {
         self.prune_scans.load(Ordering::Acquire)
+    }
+
+    /// Total indexed markers reclamation passes have examined (test support).
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn prune_entries_examined_for_tests(&self) -> u64 {
+        self.prune_entries_examined.load(Ordering::Acquire)
     }
 
     /// Conservative earliest-expiry bound currently published (test support).
@@ -883,6 +992,7 @@ impl ProcessReplayLane {
                     return Err(ReplayAdmission::Replay);
                 }
                 if let Some(refreshed) = self.refresh_expired_entry(
+                    &marker.digest,
                     existing.get_mut(),
                     &marker.principal_digest,
                     expires_at,
@@ -907,6 +1017,7 @@ impl ProcessReplayLane {
                         expires_at_millis: expires_at,
                         principal_digest: marker.principal_digest,
                     });
+                    self.index_expiry(&marker.digest, expires_at);
                     self.publish_written_expiry(expires_at);
                     return Ok(HeldExpiryWrite {
                         lane: self,
