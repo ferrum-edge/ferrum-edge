@@ -11233,6 +11233,36 @@ pub mod _test_support {
         )
     }
 
+    /// The client RPC deadline's pump guard, held by the client-facing body
+    /// in production. Opaque: a test only keeps it alive or drops it.
+    pub struct RpcDeadlinePumpGuardForTest(
+        #[allow(dead_code)] crate::proxy::response_watchdog::ResponsePumpGuard,
+    );
+
+    /// Move one body into the client RPC deadline's response pump, as
+    /// `ProxyBody::with_client_grpc_deadline` does on an H1/H2 frontend, and
+    /// return the pump's intermediate reader separately from its guard, so a
+    /// test can drive that reader's own expiry acknowledgement while the
+    /// client-facing guard stays alive.
+    pub fn rpc_deadline_cancellable_body_for_test(
+        inner: crate::proxy::ProxyBody,
+        deadline_at: tokio::time::Instant,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> (
+        crate::proxy::response_watchdog::AuthorizationCancellableBody,
+        RpcDeadlinePumpGuardForTest,
+    ) {
+        let (body, guard) =
+            crate::proxy::response_watchdog::AuthorizationCancellableBody::for_client_rpc_deadline(
+                inner,
+                deadline_at,
+                fired,
+                Some(closer),
+            );
+        (body, RpcDeadlinePumpGuardForTest(guard))
+    }
+
     /// Which owner settled one authenticated streaming response (issue #3815).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum AuthorizationTerminalOwnershipForTest {
@@ -14517,7 +14547,51 @@ pub mod _test_support {
         deadline: tokio::time::Instant,
         grpc_web_response_content_type: Option<&str>,
     ) -> crate::proxy::ProxyBody {
-        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, None)
+    }
+
+    /// [`proxy_body_with_client_grpc_deadline_for_test`] on a hyper-driven
+    /// HTTP/1.1 / HTTP/2 frontend connection: the upstream moves into the
+    /// gateway-owned response pump, so the client RPC deadline releases the
+    /// backend and, after the bounded grace, requests `closer` even while
+    /// nothing polls the client-visible body.
+    pub fn proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+        grpc_web_response_content_type: Option<&str>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> crate::proxy::ProxyBody {
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, Some(closer))
+    }
+
+    /// Poll a native-gRPC streaming upload (`GrpcBody::Streaming`, the body
+    /// hyper's HTTP/2 request pipe reads) whose client never ends the upload,
+    /// under an optional client RPC deadline, and report its first item.
+    /// `Some(Err(message))` means the deadline ended the upload in an error,
+    /// which hyper turns into RST_STREAM on the backend stream.
+    pub async fn grpc_streaming_upload_first_item_under_rpc_deadline_for_test(
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<Result<(), String>> {
+        let client = http_body_util::StreamBody::new(futures_util::stream::pending::<
+            Result<http_body::Frame<bytes::Bytes>, std::io::Error>,
+        >());
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(client, None, 0, false);
+        let mut body = Box::pin(crate::proxy::grpc_proxy::GrpcBody::Streaming {
+            require_end_stream: false,
+            incoming: crate::proxy::body::UploadSource::Pumped(source),
+            auth_deadline: None,
+            rpc_deadline: crate::proxy::grpc_proxy::streaming_upload_rpc_deadline(deadline),
+            bytes_seen: 0,
+            max_bytes: 0,
+            exceeded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_bytes: None,
+            upload_observer: None,
+            grpc_messages: None,
+            grpc_scanner: None,
+        });
+        let first = std::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx)).await;
+        drop(join);
+        first.map(|item| item.map(|_| ()).map_err(|error| error.to_string()))
     }
 
     /// Parse a Gateway API Duration (GEP-2257) exactly as the HTTPRoute
@@ -18687,7 +18761,10 @@ pub mod _test_support {
                 http_body_util::StreamBody::new(backend),
                 None,
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h2_coalescing" => coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -18703,7 +18780,10 @@ pub mod _test_support {
                 None,
                 default_coalesce_target_bytes(),
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h3_direct" => direct_streaming_h3_body(

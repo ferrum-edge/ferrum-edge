@@ -35558,14 +35558,21 @@ components:
         Plugin: grpc_deadline — Manages the grpc-timeout metadata header.
         Supports all gRPC timeout units (H, M, S, m, u, n). At least one
         effective rule is required. When both deadline values are configured,
-        default_deadline_ms must be less than or equal to max_deadline_ms;
-        runtime validation enforces this cross-field relationship. Malformed or
-        zero client values never pass through verbatim: an enforced fallback
-        deadline is rewritten onto the outbound header and invalid client values
-        set bounded transaction-log metadata grpc_timeout_invalid=true.
+        default_deadline_ms must be less than or equal to max_deadline_ms, and
+        headroom_ms must be less than max_deadline_ms; runtime validation
+        enforces these cross-field relationships. Caps compose across
+        instances independently of their order: a default injected by one
+        instance is still clamped by another instance's max_deadline_ms.
+        Malformed or zero client values never pass through verbatim: an
+        enforced fallback deadline is rewritten onto the outbound header and
+        invalid client values set bounded transaction-log metadata
+        grpc_timeout_invalid=true. That metadata and grpc_adjusted_deadline_ms
+        are recorded at request receipt, so they are present even when the
+        request is rejected before the backend hook runs.
       anyOf:
         - required: [max_deadline_ms]
         - required: [default_deadline_ms]
+        - required: [headroom_ms]
         - required: [subtract_gateway_processing]
           properties:
             subtract_gateway_processing:
@@ -35587,6 +35594,20 @@ components:
           minimum: 1
           maximum: 18446744073709551615
           description: Inject grpc-timeout when client omits it
+        headroom_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
+          description: >-
+            Fixed margin (milliseconds) reserved from a client-supplied
+            grpc-timeout after every cap. Both the gateway's own RPC deadline
+            and the forwarded grpc-timeout end this much earlier than the
+            client's, so the gateway's DEADLINE_EXCEEDED reaches the client
+            before the client's own deadline cancels the call. The remaining
+            budget is floored at 1 ms. An injected default_deadline_ms is not
+            reduced. Multiple instances reserve the largest configured value
+            once. Must be less than max_deadline_ms when both are set.
         subtract_gateway_processing:
           type: boolean
           default: false

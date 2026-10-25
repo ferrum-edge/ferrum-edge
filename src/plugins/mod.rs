@@ -2613,6 +2613,18 @@ pub struct RequestContext {
     /// policy has applied its default/cap decision. Kept separate from the
     /// relative header forwarded upstream so retries never re-arm the budget.
     pub(crate) grpc_deadline_budget_ms: Option<u64>,
+    /// The policy budget BEFORE any `headroom_ms` reservation: the client
+    /// deadline (or injected default) after every cap applied so far. Each
+    /// `grpc_deadline` instance recomputes from this value, so the headroom is
+    /// reserved exactly once and composition does not depend on instance order.
+    pub(crate) grpc_deadline_policy_budget_ms: Option<u64>,
+    /// The tightest `max_deadline_ms` any `grpc_deadline` instance has applied
+    /// to this request. Kept in typed state so a default injected by a LATER
+    /// instance is still clamped by an earlier instance's ceiling.
+    pub(crate) grpc_deadline_ceiling_ms: Option<u64>,
+    /// The largest `headroom_ms` any `grpc_deadline` instance requested for
+    /// this request. Reserved once from a client-supplied deadline.
+    pub(crate) grpc_deadline_headroom_ms: u64,
     /// Single monotonic absolute deadline shared by request phases, backend
     /// attempts, retry backoff, and streaming response bodies.
     pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
@@ -4498,6 +4510,9 @@ impl RequestContext {
             grpc_deadline_received_at: tokio::time::Instant::now(),
             grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
+            grpc_deadline_policy_budget_ms: None,
+            grpc_deadline_ceiling_ms: None,
+            grpc_deadline_headroom_ms: 0,
             grpc_deadline_at: None,
             route_request_deadline_at: None,
             route_attempt_timeout: None,
@@ -5031,6 +5046,7 @@ impl RequestContext {
         }
         self.grpc_deadline_initialized = true;
         self.grpc_deadline_had_valid_client_timeout = budget_ms.is_some();
+        self.grpc_deadline_policy_budget_ms = budget_ms;
         self.set_grpc_deadline_budget(budget_ms);
     }
 
@@ -6040,6 +6056,9 @@ impl RequestContext {
             grpc_deadline_received_at: self.grpc_deadline_received_at,
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
+            grpc_deadline_policy_budget_ms: self.grpc_deadline_policy_budget_ms,
+            grpc_deadline_ceiling_ms: self.grpc_deadline_ceiling_ms,
+            grpc_deadline_headroom_ms: self.grpc_deadline_headroom_ms,
             grpc_deadline_at: self.grpc_deadline_at,
             route_request_deadline_at: self.route_request_deadline_at,
             route_attempt_timeout: self.route_attempt_timeout,

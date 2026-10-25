@@ -41176,6 +41176,18 @@ async fn handle_proxy_request_inner(
                             grpc_streaming_unbounded_trailer_policy,
                         ));
                 }
+                // The RPC deadline carries this client connection's close
+                // signal (`Some` on the hyper-driven H1/H2 frontends), so the
+                // adapter moves the backend body into the gateway-owned
+                // response pump: a client that withholds response credit parks
+                // hyper before it polls the body, and only a gateway-scheduled
+                // timer can then release the backend stream at the deadline.
+                let grpc_response_deadline = grpc_total_deadline.map(|at| {
+                    crate::proxy::body::ClientGrpcResponseDeadline::new(
+                        at,
+                        ctx.authorization_connection_closer.clone(),
+                    )
+                });
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && effective_max_response_body_size_bytes == 0
                 {
@@ -41183,7 +41195,7 @@ async fn handle_proxy_request_inner(
                         grpc_streaming.body,
                         advertised_content_length,
                         grpc_read_timeout_ms,
-                        grpc_total_deadline,
+                        grpc_response_deadline,
                         grpc_streaming_trailer_governor.take(),
                     )
                 } else if effective_max_response_body_size_bytes > 0 {
@@ -41197,7 +41209,7 @@ async fn handle_proxy_request_inner(
                         advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
-                        grpc_total_deadline,
+                        grpc_response_deadline,
                         grpc_streaming_trailer_governor.take(),
                     )
                 } else {
@@ -41206,7 +41218,7 @@ async fn handle_proxy_request_inner(
                         advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
-                        grpc_total_deadline,
+                        grpc_response_deadline,
                         grpc_streaming_trailer_governor.take(),
                     )
                 };
@@ -45562,8 +45574,11 @@ async fn handle_proxy_request_inner(
                     );
                 }
                 if let Some(deadline) = ctx.grpc_deadline_at() {
-                    inspected = inspected
-                        .with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+                    inspected = inspected.with_client_grpc_deadline(
+                        deadline,
+                        grpc_web_response_content_type,
+                        ctx.authorization_connection_closer.clone(),
+                    );
                 }
                 inspected
             } else {
@@ -45681,7 +45696,11 @@ async fn handle_proxy_request_inner(
                     base
                 };
                 if let Some(deadline) = ctx.grpc_deadline_at() {
-                    base.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+                    base.with_client_grpc_deadline(
+                        deadline,
+                        grpc_web_response_content_type,
+                        ctx.authorization_connection_closer.clone(),
+                    )
                 } else {
                     base
                 }
@@ -45909,7 +45928,11 @@ async fn handle_proxy_request_inner(
             // returning empty Forward; only bytes yielded by this outer body
             // are client-visible for the clean-status-4 versus reset decision.
             if let Some(deadline) = h2_total_deadline {
-                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+                body = body.with_client_grpc_deadline(
+                    deadline,
+                    grpc_web_response_content_type,
+                    ctx.authorization_connection_closer.clone(),
+                );
             }
             // Deferred admission/dispatch outcomes stay on the client-visible
             // body. The least-connections guard moves into the inspection task
@@ -46072,7 +46095,11 @@ async fn handle_proxy_request_inner(
                 body.with_lb_connection_guard(lb_connection_guard)
             };
             if let Some(deadline) = grpc_request_deadline {
-                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+                body = body.with_client_grpc_deadline(
+                    deadline,
+                    grpc_web_response_content_type,
+                    ctx.authorization_connection_closer.clone(),
+                );
             }
             body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
@@ -61927,6 +61954,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     if let Some(write_timeout) = pipe_write_timeout.as_ref() {
         parts.extensions.insert(write_timeout.clone());
     }
+    // Same client RPC upload deadline as the native gRPC streaming dispatch:
+    // hyper's body pipe resets a still-open upload at the deadline even while
+    // parked on backend flow control (hyper patch 007).
+    grpc_proxy::attach_grpc_upload_deadline(&mut parts.extensions, client_grpc_deadline_at);
     parts.uri = tunneled_uri;
     parts.version = hyper::Version::HTTP_2;
     parts.method = match parse_hyper_method(method) {
@@ -62255,6 +62286,24 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                             resolved_ip,
                         )
                     },
+                    None,
+                    None,
+                );
+            }
+            // hyper's body pipe resets the stream at the client RPC deadline
+            // (hyper patch 007), the instant the header wait expires: a failure
+            // at or after it is that deadline, not a backend fault.
+            if is_grpc_flavored
+                && grpc_send_deadline_is_client
+                && client_grpc_deadline_at
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return (
+                    client_grpc_deadline_exceeded_response_for_request(
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -63105,6 +63154,9 @@ async fn proxy_to_backend_http2(
     if let Some(write_timeout) = passthrough_write_timeout.as_ref() {
         parts.extensions.insert(write_timeout.clone());
     }
+    // A gRPC upload relayed over direct H2 carries the same client RPC upload
+    // deadline as the native gRPC dispatch (hyper patch 007).
+    grpc_proxy::attach_grpc_upload_deadline(&mut parts.extensions, grpc_deadline_at);
     let backend_req = Request::from_parts(parts, body);
 
     // Post-EOS transport-drain bound (issue #4411): publish the backend socket
