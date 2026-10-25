@@ -3372,6 +3372,29 @@ mod virtual_service_cors {
             "{errors:?}"
         );
 
+        // The shared per-list entry and per-token byte bounds apply at this
+        // boundary too, so an over-budget list cannot fail plugin
+        // construction on the data plane.
+        let mut too_many = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        too_many.cors.exposed_headers = (0..129).map(|i| format!("x-h{i}")).collect();
+        let errors = validate(vec![too_many]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("exposed_headers") && error.contains("at most 128")),
+            "{errors:?}"
+        );
+
+        let mut too_long = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
+        too_long.cors.allowed_headers = vec!["x".repeat(257)];
+        let errors = validate(vec![too_long]);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("at most 256 bytes")),
+            "{errors:?}"
+        );
+
         // Valid token lists pass unchanged through the shared plugin
         // admission gate.
         let mut ok = policy(vec![MeshCorsOriginMatch::Exact("https://a.example".into())]);
