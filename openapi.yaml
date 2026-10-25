@@ -32635,9 +32635,13 @@ components:
         backends are ready. Rule paths are relative to a prefix listen_path
         with trailing slashes trimmed before stripping;
         exact (`=`), regex (`~`), root (`/`), and host-only scopes match the
-        full request path. Supports HTTP and WebSocket upgrade handshakes only:
-        a match short-circuits only the HTTP handshake response and does not
-        establish or mock an upgraded WebSocket frame stream. Native gRPC
+        full request path. Rules are evaluated in order (first match wins);
+        an optional per-rule `match` adds exact request header / query
+        parameter conditions. Supports HTTP and WebSocket upgrade handshakes
+        only: a match short-circuits only the HTTP handshake response and does
+        not establish or mock an upgraded WebSocket frame stream, so a 2xx
+        rule that matches a WebSocket handshake fails closed with 500 on every
+        frontend (H1/H2/H3). Native gRPC
         (`application/grpc` on H2/H3) is unsupported — the plugin is not
         selected for that protocol because Reject results normalize to
         trailers-only gRPC errors that discard configured bodies. Unknown
@@ -32648,10 +32652,11 @@ components:
         `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case
         variants); the gateway derives Content-Length from the mock
         body/status/method and strips connection/framing fields at the final
-        H1/H2/H3 response boundary. Status codes must be final (200–599) or
-        101 for a synthetic WebSocket handshake; other informational statuses
-        are rejected. A configured 101 fails closed with 500 when the matching
-        request is not an actual WebSocket handshake. HEAD omits content bytes
+        H1/H2/H3 response boundary. Status codes must be final (200–599);
+        informational statuses, including 101, are rejected. `delay_ms` runs
+        under the shared fault-delay bounds (one-minute ceiling,
+        FERRUM_MAX_CONCURRENT_FAULT_DELAYS budget, shutdown and HTTP/3 peer
+        cancellation). HEAD omits content bytes
         while keeping representation Content-Length; 204/205/304 omit body and
         Content-Length on every frontend (H1/H2/H3). Runtime construction and
         request-flavor enforcement are the authoritative final boundaries.
@@ -32662,6 +32667,7 @@ components:
           type: array
           description: Mock rules evaluated in order (first match wins)
           minItems: 1
+          maxItems: 1024
           items:
             type: object
             additionalProperties: false
@@ -32688,28 +32694,73 @@ components:
                   regex (`~`), root (`/`), and host-only proxies, use the full
                   request path. Regex rule paths use a ~ prefix (auto-anchored).
                   Full Rust regex compilation remains a runtime-only check.
+              match:
+                type: [object, "null"]
+                additionalProperties: false
+                minProperties: 1
+                description: >-
+                  Optional extra request conditions; every listed condition
+                  must hold. A rule whose conditions do not hold is skipped and
+                  evaluation continues with the next rule. Omitted or null adds
+                  no conditions.
+                properties:
+                  headers:
+                    type: object
+                    minProperties: 1
+                    maxProperties: 16
+                    propertyNames:
+                      type: string
+                      minLength: 1
+                      pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+                    additionalProperties:
+                      type: string
+                      maxLength: 8192
+                    description: >-
+                      1–16 header name → exact value pairs. Matches when every
+                      named header is present on the client-sent request with
+                      a field line byte-for-byte equal to the value (names
+                      case-insensitive and unique ignoring case, values
+                      case-sensitive). Gateway-asserted names (`x-consumer-*`,
+                      the private GeoIP header, path-param headers) are
+                      rejected. Values must be valid HTTP header values of at
+                      most 8192 bytes and are redacted in non-admin config
+                      projections.
+                  query_params:
+                    type: object
+                    minProperties: 1
+                    maxProperties: 16
+                    propertyNames:
+                      type: string
+                      minLength: 1
+                      maxLength: 256
+                    additionalProperties:
+                      type: string
+                      maxLength: 8192
+                    description: >-
+                      1–16 query parameter name → exact value pairs, compared
+                      against the percent-decoded query (last occurrence wins;
+                      a bare `?flag` has the value ""). Names are 1–256 bytes,
+                      values at most 8192 bytes. Values are redacted in
+                      non-admin config projections.
               status_code:
                 description: >-
                   HTTP status code to return (default 200). Must be a final
-                  status 200–599, or 101 for a synthetic WebSocket handshake
-                  response. Other informational statuses (100, 102–199) and
-                  values outside 100–599 are rejected at construction rather
-                  than coerced. Status 101 on an HTTP/1.1 WebSocket upgrade, or
-                  a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
-                  still only a synthetic HTTP handshake response; it does not
-                  create an upgraded frame stream. A 101 rule that matches an
-                  ordinary HTTP request fails closed with status 500. Omitted
-                  or null selects 200.
+                  status 200–599. Informational statuses (100–199, including
+                  101) and values outside 100–599 are rejected at construction
+                  rather than coerced: a mock never upgrades the connection,
+                  and HTTP/2 / HTTP/3 cannot carry 101. A 2xx rule that matches
+                  a WebSocket handshake fails closed with status 500 on every
+                  frontend instead of claiming an established WebSocket.
+                  Omitted or null selects 200.
                 default: 200
                 oneOf:
                   - type: "null"
-                  - type: integer
-                    const: 101
                   - type: integer
                     minimum: 200
                     maximum: 599
               headers:
                 type: [object, "null"]
+                maxProperties: 64
                 propertyNames:
                   type: string
                   minLength: 1
@@ -32718,9 +32769,11 @@ components:
                     pattern: "^([Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$"
                 additionalProperties:
                   type: string
+                  maxLength: 8192
                   pattern: '^[\u0009\u0020-\u007E]*$'
                 description: >-
-                  Response headers (default content-type application/json).
+                  Response headers (default content-type application/json),
+                  at most 64 entries with values of at most 8192 bytes.
                   Omitted or null selects that default. Names must be HTTP
                   field-name tokens. Protocol-managed hop-by-hop and framing
                   names (`connection`, `content-length`, `keep-alive`,
@@ -32730,9 +32783,10 @@ components:
                   values (HTAB and printable ASCII).
               body:
                 type: [string, "null"]
+                maxLength: 262144
                 description: >-
-                  Response body string (default empty). Omitted or null
-                  selects empty. On the wire, HEAD responses omit content bytes
+                  Response body string (default empty), at most 262144 UTF-8
+                  bytes. Omitted or null selects empty. On the wire, HEAD responses omit content bytes
                   while keeping representation Content-Length. Statuses 204, 205,
                   and 304 omit both the body and Content-Length even when this
                   field is non-empty. Shared synthetic-response finalization
@@ -32741,13 +32795,19 @@ components:
                 type: [integer, "null"]
                 format: uint64
                 minimum: 0
-                maximum: 3600000
+                maximum: 60000
                 default: 0
                 description: >-
                   Simulated latency in milliseconds (default 0). Omitted or
-                  null selects 0. Must be an unsigned integer 0–3600000
-                  (1 hour); negative values and values above the cap are
-                  rejected at config validation.
+                  null selects 0. Must be an unsigned integer 0–60000
+                  (1 minute, the shared fault-delay ceiling); negative values
+                  and values above the cap are rejected at config validation.
+                  The delay counts against the process-wide
+                  FERRUM_MAX_CONCURRENT_FAULT_DELAYS budget (shared with
+                  fault_injection): an exhausted budget or gateway shutdown
+                  serves the mock immediately, and a client that is gone
+                  (HTTP/3 connection close) ends the delay with 499. A
+                  non-completing delay records `fault_delay_outcome`.
         passthrough_on_no_match:
           type: [boolean, "null"]
           default: false

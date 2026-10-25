@@ -5112,11 +5112,24 @@ config:
 
 ### `response_mock`
 
-Returns configurable mock responses without proxying to the backend. Supports matching by HTTP method and path pattern (exact or regex), with configurable status codes, headers, body, and optional latency simulation. Useful for early API testing before backends are ready, contract testing, and local development.
+Returns configurable mock responses without proxying to the backend. Supports matching by HTTP method, path pattern (exact or regex), and optional exact request header / query parameter conditions, with configurable status codes, headers, body, and optional latency simulation. Useful for early API testing before backends are ready, contract testing, and local development.
 
 **Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP and WebSocket handshake (native gRPC unsupported)
 
-Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). Omitted or explicit `null` on `method`, `status_code`, `headers`, `body`, `delay_ms`, and `passthrough_on_no_match` selects the documented default. The free-form `headers` map accepts ordinary string-valued response headers but **rejects protocol-managed hop-by-hop and framing names** (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case variants). The gateway derives `Content-Length` from the mock body/status/method and strips connection/framing fields at the final H1/H2/H3 response boundary after every mutable hook. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Registered standard methods are matched case-insensitively (`get` matches `GET`). Extension methods are case-sensitive per RFC 9110 §9.1 and match the configured spelling exactly: a rule written as `Foo` matches a request method `Foo` and never `FOO`. Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. `delay_ms` is an unsigned integer `0`–`3600000` (1 hour); omit or `null` selects `0`. A configured `101` that matches an ordinary HTTP request fails closed with `500`; only a request already classified as a WebSocket handshake may receive it. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
+Configuration must be a top-level object. Unknown top-level, per-rule, and `match` keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). Omitted or explicit `null` on `method`, `match`, `status_code`, `headers`, `body`, `delay_ms`, and `passthrough_on_no_match` selects the documented default. The free-form `headers` map accepts ordinary string-valued response headers but **rejects protocol-managed hop-by-hop and framing names** (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case variants). The gateway derives `Content-Length` from the mock body/status/method and strips connection/framing fields at the final H1/H2/H3 response boundary after every mutable hook. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599`. Registered standard methods are matched case-insensitively (`get` matches `GET`). Extension methods are case-sensitive per RFC 9110 §9.1 and match the configured spelling exactly: a rule written as `Foo` matches a request method `Foo` and never `FOO`. Informational statuses (`100`–`199`, including `101`) are rejected — a mock cannot emit a 1xx as a final response or upgrade the connection, and HTTP/2 / HTTP/3 cannot carry `101` at all. `delay_ms` is an unsigned integer `0`–`60000` (1 minute, the shared fault-delay ceiling); omit or `null` selects `0`. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
+
+**Bounds:** at most 1024 `rules`; per rule at most 64 response `headers` with values of at most 8192 bytes, a `body` of at most 262144 UTF-8 bytes, and at most 16 conditions in each of `match.headers` and `match.query_params`. A config over any bound is rejected at construction (startup, reload, and admin API writes) with an error naming the rule index.
+
+**Request conditions (`match`):** an optional per-rule object whose conditions must all hold, in addition to `method` and `path`. A rule whose conditions do not hold is skipped and evaluation continues with the next rule, so a conditioned rule placed before an unconditioned one selects a variant (an empty list for `x-scenario: empty`, page two for `?page=2`) while every other request gets the default.
+
+| Field | Type | Description |
+|---|---|---|
+| `match.headers` | Object (1–16 entries) | Header name → exact value. Matches when every named header is present on the client-sent request with a field line byte-for-byte equal to the value (names case-insensitive and unique ignoring case, values case-sensitive). Gateway-asserted names (`x-consumer-*`, the private GeoIP header, path-param headers) are rejected. Matching reads the client's pristine field lines, so an earlier plugin's header rewrite neither adds nor removes a match. |
+| `match.query_params` | Object (1–16 entries) | Query parameter name (1–256 bytes) → exact value, compared against the percent-decoded query (last occurrence wins; a bare `?flag` has the value `""`). |
+
+Condition values are at most 8192 bytes and are redacted in non-admin plugin-config projections, since operators may target with a shared secret or a credential-bearing header. There is no templating or binary body support; a mock body is a static string.
+
+**Delayed-work retention bounds:** `delay_ms` parks a live request, so it runs through the same shared machinery as `fault_injection` delays rather than a bare timer: the one-minute ceiling, the process-wide `FERRUM_MAX_CONCURRENT_FAULT_DELAYS` budget (default 256, shared with every `fault_injection` instance and `mesh_route_dispatch` route-local fault; `0` disables delays), and cancellation on gateway shutdown drain and on HTTP/3 QUIC connection close. An exhausted budget skips the delay and a shutdown drain ends it early; either way the mock is served immediately. A delay cut short because the client transport is gone answers `499` with no body. Any non-completing delay records the reason in request metadata as `fault_delay_outcome` (`admission_exhausted`, `shutdown`, or `peer_gone`). HTTP/1.1 and HTTP/2 have no peer-departure side channel, so there only the budget and shutdown cancellation apply.
 
 **Status / body wire semantics (H1, H2, and H3):** A configured `body` is the representation the mock would return for a GET. Shared synthetic-response finalization then aligns every frontend:
 
@@ -5142,13 +5155,21 @@ Configuration must be a top-level object. Unknown top-level and per-rule keys ar
 # Proxy with listen_path: /api/v1  (prefix — relative rule paths)
 config:
   rules:
+    - method: GET                        # earlier rule wins: a variant selected by request conditions
+      path: /users
+      match:
+        headers:
+          x-scenario: empty              # exact, case-sensitive value
+        query_params:
+          page: "2"                      # percent-decoded, last occurrence wins
+      body: '{"users": []}'
     - method: GET                        # optional — omit to match all methods
       path: /users                       # matches /api/v1/users
       status_code: 200
       headers:
         content-type: application/json
-      body: '{"users": []}'
-      delay_ms: 50                       # optional; omit/null = 0, max 3600000 ms
+      body: '{"users": [{"id": 1}]}'
+      delay_ms: 50                       # optional; omit/null = 0, max 60000 ms
     - path: "~/users/[0-9]+"             # regex path (~ prefix, auto-anchored)
       status_code: 200                   # matches /api/v1/users/42
       body: '{"id": 1, "name": "Mock User"}'
@@ -5167,9 +5188,9 @@ config:
       body: exact-root-mock
 ```
 
-Rules are evaluated in order — first match wins. Regex rule paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. For **prefix** listen paths only, a request exactly equal to the listen path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
+Rules are evaluated in order — first match wins. Exact rule paths are served from a hash index built at construction and regex rule paths are prefiltered by one combined regex pass, so a request does not walk every rule; the winner is always the one an in-order scan would pick. Regex rule paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. For **prefix** listen paths only, a request exactly equal to the listen path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
 
-**WebSocket handshake contract:** Upgrade requests are classified as `WebSocket` and therefore select this plugin. A matching rule returns a synthetic HTTP handshake response and never establishes an upgraded frame stream — including a `101` response on HTTP/1.1 or a success-like `200` response on HTTP/2 / HTTP/3 Extended CONNECT. An unmatched upgrade with `passthrough_on_no_match: false` (default) returns the same terminal `404` mock and blocks backend upgrade handling; set `passthrough_on_no_match: true` to let unmatched upgrades continue to the WebSocket backend. Frame-level mocking belongs to WebSocket frame plugins, not `response_mock`. The same handshake short-circuit applies for HTTP/1.1 Upgrade and HTTP/2 / HTTP/3 Extended CONNECT frontends because protocol selection uses `ProxyProtocol::WebSocket` for all of them.
+**WebSocket handshake contract:** Upgrade requests are classified as `WebSocket` and therefore select this plugin. A matching rule returns a synthetic HTTP handshake response and never establishes an upgraded frame stream, so it must not claim a successful handshake: a `2xx` rule that matches a WebSocket handshake fails closed with `500` (`{"error":"response_mock cannot mock a successful WebSocket handshake; configure a non-2xx status_code"}`) on HTTP/1.1, HTTP/2, and HTTP/3 alike. On HTTP/2 / HTTP/3 Extended CONNECT a `2xx` means the tunnel is established (and HTTP/2 resets a `2xx` CONNECT response that carries a body), so refusing on every frontend keeps one rule set behaving identically everywhere. Mock a refused handshake with a non-`2xx` status such as `401`, `403`, `418`, or `503`. An unmatched upgrade with `passthrough_on_no_match: false` (default) returns the same terminal `404` mock and blocks backend upgrade handling; set `passthrough_on_no_match: true` to let unmatched upgrades continue to the WebSocket backend. Frame-level mocking belongs to WebSocket frame plugins, not `response_mock`. The same handshake short-circuit applies for HTTP/1.1 Upgrade and HTTP/2 / HTTP/3 Extended CONNECT frontends because protocol selection uses `ProxyProtocol::WebSocket` for all of them.
 
 ### `spec_expose`
 
