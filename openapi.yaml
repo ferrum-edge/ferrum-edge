@@ -30687,7 +30687,11 @@ components:
         is rejected; an allow-list alone is not enforcement. The User-Agent is
         client-controlled and spoofable, so this is a coarse filter, not strong
         bot verification. Pattern entry whitespace follows Rust `str::trim`
-        Unicode `White_Space` semantics. HTTP-family only.
+        Unicode `White_Space` semantics. A User-Agent whose every field line is
+        empty or only spaces/tabs is treated as missing. A present User-Agent
+        field line that is not valid UTF-8 cannot be matched, so the request is
+        rejected with `custom_response_code` regardless of `allow_list` and
+        `allow_missing_user_agent`. HTTP-family only.
       properties:
         blocked_patterns:
           type: [array, "null"]
@@ -30732,10 +30736,12 @@ components:
           type: [boolean, "null"]
           default: true
           description: >-
-            When true (default), requests with no User-Agent header pass — this
-            keeps health-check and load-balancer probes working. Set to false
-            to reject them with `custom_response_code`. `null` is the same as
-            omission and selects `true`.
+            When true (default), requests with no User-Agent header, or only
+            empty/whitespace-only User-Agent values, pass — this keeps
+            health-check and load-balancer probes working. Set to false to
+            reject them with `custom_response_code`. A non-UTF-8 User-Agent is
+            not treated as missing and is rejected either way. `null` is the
+            same as omission and selects `true`.
         custom_response_code:
           type: [integer, "null"]
           format: uint16

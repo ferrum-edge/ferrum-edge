@@ -410,6 +410,180 @@ async fn test_missing_user_agent_returns_forbidden_body() {
     }
 }
 
+// ── Empty / whitespace-only user-agent ──────────────────────────────────
+// An empty or whitespace-only value does not identify the client, so it must
+// take the missing-header path instead of slipping past the strict reject.
+
+fn strict_missing_ua_plugin() -> BotDetection {
+    BotDetection::new(&json!({
+        "blocked_patterns": [],
+        "allow_missing_user_agent": false
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_empty_user_agent_rejected_when_missing_user_agent_rejected() {
+    let plugin = strict_missing_ua_plugin();
+    let mut ctx = make_ctx_with_ua("");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_whitespace_only_user_agent_rejected_when_missing_user_agent_rejected() {
+    let plugin = strict_missing_ua_plugin();
+    for blank in ["   ", "\t", " \t "] {
+        let mut ctx = make_ctx_with_ua(blank);
+        let result = plugin.on_request_received(&mut ctx).await;
+        plugin_utils::assert_reject(result, Some(403));
+    }
+}
+
+#[tokio::test]
+async fn test_blank_raw_user_agent_lines_rejected_when_missing_user_agent_rejected() {
+    let plugin = strict_missing_ua_plugin();
+    // HPACK / QPACK deliver surrounding whitespace verbatim, and repeated
+    // blank lines fold to a bare `, ` in the materialized map.
+    let cases: [&[&[u8]]; 3] = [&[b""], &[b" \t "], &[b"", b"  "]];
+    for lines in cases {
+        let mut ctx = plugin_utils::context_with_materialized_raw_header_lines("user-agent", lines);
+        let result = plugin.on_request_received(&mut ctx).await;
+        plugin_utils::assert_reject(result, Some(403));
+    }
+}
+
+#[tokio::test]
+async fn test_blank_user_agent_with_default_blocked_patterns_and_strict_missing_rejected() {
+    let plugin = BotDetection::new(&json!({
+        "allow_missing_user_agent": false
+    }))
+    .unwrap();
+    let mut ctx = make_ctx_with_ua("   ");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_strict_missing_user_agent_still_passes_real_browser() {
+    let plugin = strict_missing_ua_plugin();
+    let mut ctx = make_ctx_with_ua(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    );
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+
+    let mut ctx = plugin_utils::context_with_materialized_raw_header_lines(
+        "user-agent",
+        &[b"  Mozilla/5.0 "],
+    );
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+// ── Raw (pre-materialization) user-agent field lines ────────────────────
+// The materialized header map omits field lines that are not valid UTF-8. A
+// present-but-unreadable User-Agent must never be mistaken for an absent one.
+
+#[tokio::test]
+async fn test_non_utf8_user_agent_with_blocked_token_rejected_by_default() {
+    let plugin = BotDetection::new(&json!({})).unwrap();
+    let mut ctx =
+        plugin_utils::context_with_materialized_raw_header_bytes("user-agent", b"curl/8.0 (x\xFF)");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_non_utf8_user_agent_fails_closed_under_defaults() {
+    // Unmatchable bytes are unidentifiable, not absent: fail closed even when
+    // no blocked token is visible in the representable prefix.
+    let plugin = BotDetection::new(&json!({})).unwrap();
+    let mut ctx = plugin_utils::context_with_materialized_raw_header_bytes(
+        "user-agent",
+        b"Mozilla/5.0 (\xFF)",
+    );
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_non_utf8_user_agent_uses_custom_response_code() {
+    let plugin = BotDetection::new(&json!({
+        "blocked_patterns": [],
+        "allow_missing_user_agent": false,
+        "custom_response_code": 429
+    }))
+    .unwrap();
+    let mut ctx =
+        plugin_utils::context_with_materialized_raw_header_bytes("user-agent", b"agent \xC3\x28");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_non_utf8_user_agent_line_not_hidden_by_benign_sibling() {
+    let plugin = BotDetection::new(&json!({
+        "allow_missing_user_agent": false
+    }))
+    .unwrap();
+    let mut ctx = plugin_utils::context_with_materialized_raw_header_lines(
+        "user-agent",
+        &[b"curl/8.0 (x\xFF)", b"Mozilla/5.0"],
+    );
+    assert_eq!(
+        ctx.headers.get("user-agent").map(String::as_str),
+        Some("Mozilla/5.0"),
+        "the materialized map keeps only the representable sibling line"
+    );
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_allow_list_cannot_admit_request_with_non_utf8_user_agent_line() {
+    let plugin = BotDetection::new(&json!({
+        "allow_list": ["Googlebot"]
+    }))
+    .unwrap();
+    let mut ctx = plugin_utils::context_with_materialized_raw_header_lines(
+        "user-agent",
+        &[b"Googlebot/2.1", b"curl/8.0 (x\xFF)"],
+    );
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_valid_utf8_non_ascii_user_agent_is_matched_normally() {
+    let plugin = BotDetection::new(&json!({})).unwrap();
+    let mut ctx = plugin_utils::context_with_materialized_raw_header(
+        "user-agent",
+        "Mozilla/5.0 (ユニコード)",
+    );
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+
+    let mut ctx =
+        plugin_utils::context_with_materialized_raw_header("user-agent", "curl/8.0 (ユニコード)");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_absent_raw_user_agent_keeps_configured_missing_behavior() {
+    let plugin = BotDetection::new(&json!({})).unwrap();
+    let mut ctx = plugin_utils::context_with_materialized_raw_header_lines("user-agent", &[]);
+    assert!(ctx.has_raw_headers());
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+
+    let plugin = strict_missing_ua_plugin();
+    let mut ctx = plugin_utils::context_with_materialized_raw_header_lines("user-agent", &[]);
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
 // ── Custom response code configuration ──────────────────────────────────
 
 #[tokio::test]
