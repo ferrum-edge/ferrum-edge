@@ -14113,8 +14113,11 @@ components:
         Configuration for the `udp_rate_limiting` plugin. Rate limits UDP
         datagrams per resolved client IP using a fixed-window algorithm with
         atomic counters. Excess datagrams are silently dropped (standard UDP
-        flood mitigation). Operates on both client→backend and backend→client
-        datagrams within the same window per client IP. `datagrams_per_second`
+        flood mitigation). By default (`direction: both`) client→backend and
+        backend→client datagrams share the same window per client IP; IPv6
+        clients are grouped by `ipv6_prefix`. A proxy- or proxy-group-scoped
+        attachment must reach only UDP/DTLS proxies (a TCP or HTTP-family
+        target is refused at admission). `datagrams_per_second`
         and `bytes_per_second` are per-second rates; the effective per-window
         cap is `rate × window_seconds`. `sync_mode` is parsed case-insensitively
         (`LOCAL`, `Redis`); `redis` requires `redis_url`. Unknown top-level keys
@@ -14143,10 +14146,10 @@ components:
           maximum: 18446744073709551615
           description: >-
             Sustained datagram rate per second per client IP. The effective
-            per-window cap is `datagrams_per_second × window_seconds`. Both
-            client→backend and backend→client datagrams count against the same
-            cap. At least one of `datagrams_per_second` or `bytes_per_second` is
-            required.
+            per-window cap is `datagrams_per_second × window_seconds`. With the
+            default `direction: both`, client→backend and backend→client
+            datagrams count against the same cap. At least one of
+            `datagrams_per_second` or `bytes_per_second` is required.
         bytes_per_second:
           type: integer
           format: uint64
@@ -14155,9 +14158,10 @@ components:
           description: >-
             Sustained payload-byte rate per second per client IP (sum of datagram
             payload sizes). The effective per-window cap is
-            `bytes_per_second × window_seconds`. Both directions count against
-            the same cap. At least one of `datagrams_per_second` or
-            `bytes_per_second` is required.
+            `bytes_per_second × window_seconds`. With the default
+            `direction: both`, both directions count against the same cap. At
+            least one of `datagrams_per_second` or `bytes_per_second` is
+            required.
         window_seconds:
           type: integer
           format: uint64
@@ -14170,6 +14174,24 @@ components:
             activity-retention horizon (`window_seconds × 2`) cannot wrap. The
             effective per-window cap is `datagrams_per_second × window_seconds`
             (and similarly for bytes).
+        ipv6_prefix:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 64
+          description: >-
+            IPv6 prefix length used to group client addresses into one budget
+            (for example 56 or 48 to stop rotation across a delegated prefix).
+            IPv4 and IPv4-mapped IPv6 clients remain host-specific.
+        direction:
+          type: string
+          enum: [both, client_to_backend, backend_to_client]
+          default: both
+          description: >-
+            Which datagrams are counted and limited. `both` (default) charges
+            client→backend and backend→client datagrams to one combined budget;
+            `client_to_backend` or `backend_to_client` limits only that
+            direction and neither counts nor drops the other.
         sync_mode:
           type: string
           pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"

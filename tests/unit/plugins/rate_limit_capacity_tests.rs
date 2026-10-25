@@ -345,6 +345,7 @@ async fn udp_capacity_deny_preserves_existing_client_budgets() {
         let client_addr = std::net::SocketAddr::new(ip, 5353);
         let ctx = UdpDatagramContext {
             client_ip: ferrum_edge::proxy::udp_proxy::udp_session_client_ip(client_addr),
+            client_ip_addr: ferrum_edge::proxy::udp_proxy::udp_session_client_addr(client_addr),
             proxy_id: Arc::from("proxy-1"),
             proxy_name: Some(Arc::from("test-proxy")),
             listen_port: 5353,

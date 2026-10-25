@@ -6298,8 +6298,7 @@ pub mod _test_support {
         }
 
         pub fn seed_udp(&self, ip: &str, now: std::time::Instant) {
-            self.udp
-                .seed_client_at_for_test(std::sync::Arc::<str>::from(ip), 1, now);
+            self.udp.seed_client_at_for_test(ip, 1, now);
         }
 
         pub fn seed_udp_with_cap(
@@ -6308,12 +6307,8 @@ pub mod _test_support {
             now: std::time::Instant,
             max_entries: usize,
         ) -> bool {
-            self.udp.seed_client_at_with_cap_for_test(
-                std::sync::Arc::<str>::from(ip),
-                1,
-                now,
-                max_entries,
-            )
+            self.udp
+                .seed_client_at_with_cap_for_test(ip, 1, now, max_entries)
         }
 
         pub fn arm_udp_periodic(&self) {
@@ -6329,8 +6324,7 @@ pub mod _test_support {
         }
 
         pub fn udp_contains(&self, ip: &str) -> bool {
-            self.udp
-                .contains_client_for_test(&std::sync::Arc::<str>::from(ip))
+            self.udp.contains_client_for_test(ip)
         }
 
         pub fn udp_tracked(&self) -> Option<usize> {
@@ -6616,7 +6610,78 @@ pub mod _test_support {
         datagram_size: u64,
         now: std::time::Instant,
     ) {
-        plugin.seed_client_at_for_test(std::sync::Arc::<str>::from(client_ip), datagram_size, now);
+        plugin.seed_client_at_for_test(client_ip, datagram_size, now);
+    }
+
+    /// Seed one client through the production atomic capacity gate with an
+    /// explicit cap. False for a previously unseen client at that cap.
+    pub fn udp_rate_limiting_seed_client_at_with_cap_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        client_ip: &str,
+        now: std::time::Instant,
+        max_entries: usize,
+    ) -> bool {
+        plugin.seed_client_at_with_cap_for_test(client_ip, 1, now, max_entries)
+    }
+
+    /// Run the production sampled/cooldown/at-cap cleanup path with an
+    /// explicit cap, WITHOUT arming the periodic sample.
+    pub fn udp_rate_limiting_maybe_evict_at_with_cap_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        now: std::time::Instant,
+        max_entries: usize,
+    ) -> bool {
+        plugin.maybe_evict_at_with_cap_for_test(now, max_entries)
+    }
+
+    pub fn udp_rate_limiting_contains_client_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        client_ip: &str,
+    ) -> bool {
+        plugin.contains_client_for_test(client_ip)
+    }
+
+    /// Exclusive `DashMap::entry` acquisitions on the local/fallback map
+    /// (always 0 without `debug_assertions`).
+    pub fn udp_rate_limiting_exclusive_entry_calls_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> usize {
+        plugin.exclusive_entry_calls_for_test()
+    }
+
+    /// Opaque handle over the datagram-hook policy fence an established
+    /// UDP/DTLS session carries.
+    pub struct UdpDatagramPolicyFenceForTest(crate::proxy::udp_proxy::UdpDatagramPolicyFence);
+
+    impl UdpDatagramPolicyFenceForTest {
+        /// Whether a session admitted when this fence was built may keep
+        /// running its admitted datagram hooks.
+        pub fn is_current(&self) -> bool {
+            self.0.is_current()
+        }
+    }
+
+    /// Build the fence a UDP/DTLS session admitted NOW on
+    /// `(namespace, proxy_id)` would carry: the store's current epoch and that
+    /// proxy's current UDP plugin list.
+    pub fn udp_datagram_policy_fence_for_test(
+        store: &std::sync::Arc<crate::request_epoch::RequestEpochStore>,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> UdpDatagramPolicyFenceForTest {
+        let epoch = store.load();
+        let plugins = epoch.plugin_cache.plugins_for_protocol(
+            namespace,
+            proxy_id,
+            crate::plugins::ProxyProtocol::Udp,
+        );
+        UdpDatagramPolicyFenceForTest(crate::proxy::udp_proxy::UdpDatagramPolicyFence::new(
+            std::sync::Arc::clone(store),
+            &epoch,
+            namespace,
+            proxy_id,
+            plugins,
+        ))
     }
 
     pub fn udp_rate_limiting_maybe_evict_at_for_test(
@@ -11648,6 +11713,7 @@ pub mod _test_support {
     ) -> DtlsReplyDatagramCommitForTest {
         let ctx = crate::plugins::UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
+            client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_id: Arc::from("dtls-proxy"),
             proxy_name: None,
             listen_port: 5301,
@@ -11918,6 +11984,7 @@ pub mod _test_support {
     ) -> UdpReplyDatagramCommitForTest {
         let ctx = crate::plugins::UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
+            client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_id: Arc::from("udp-proxy"),
             proxy_name: None,
             listen_port: 5300,

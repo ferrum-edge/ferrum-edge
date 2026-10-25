@@ -1562,6 +1562,7 @@ mod udp_datagram_faults {
     ) -> UdpDatagramContext<'a> {
         UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
+            client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_id: Arc::from("udp-proxy"),
             proxy_name: Some(Arc::from("udp")),
             listen_port: 9000,

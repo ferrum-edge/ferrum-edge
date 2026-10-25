@@ -22,6 +22,7 @@ fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext<'static
     let client_addr = std::net::SocketAddr::new(client_ip, 5353);
     UdpDatagramContext {
         client_ip: ferrum_edge::proxy::udp_proxy::udp_session_client_ip(client_addr),
+        client_ip_addr: ferrum_edge::proxy::udp_proxy::udp_session_client_addr(client_addr),
         proxy_id: Arc::from("proxy-1"),
         proxy_name: Some(Arc::from("test-proxy")),
         listen_port: 5353,
@@ -1069,4 +1070,375 @@ fn shared_window_bound_keeps_udp_plugin_and_field_when_rendered() {
         "{rendered}"
     );
     assert!(!rendered.contains(&value.to_string()), "{rendered}");
+}
+
+// ── Production-launch review fixes ─────────────────────────────────────
+
+/// SOL-1: admission never lets the map grow PAST the cap, so a map that is
+/// exactly full of clients that have all gone idle must reopen through the
+/// ordinary per-datagram cleanup path — without waiting for (or arming) the
+/// 100,000-hook periodic sample.
+#[test]
+fn full_map_of_expired_clients_reopens_without_a_periodic_sample() {
+    use ferrum_edge::_test_support::RateLimitCleanupHarness;
+    use std::time::Duration;
+
+    let h = RateLimitCleanupHarness::new();
+    let epoch = h.udp_epoch_base();
+    let cap = 2;
+    assert!(h.seed_udp_with_cap("10.0.0.1", epoch, cap));
+    assert!(h.seed_udp_with_cap("10.0.0.2", epoch, cap));
+    assert!(
+        !h.seed_udp_with_cap("10.0.0.3", epoch, cap),
+        "a full map refuses a previously unseen client"
+    );
+
+    // Idle threshold is max(window_seconds * 2, 10) == 10s for window=1.
+    let idle = epoch + Duration::from_secs(11);
+    let _ = h.maybe_evict_udp_at_with_cap(idle, cap);
+    assert_eq!(
+        h.udp_tracked(),
+        Some(0),
+        "a full map of expired clients must be reclaimed at the cap, not only above it"
+    );
+    assert!(
+        h.seed_udp_with_cap("10.0.0.3", idle, cap),
+        "a new client is admitted once the stale entries are reclaimed"
+    );
+}
+
+/// SOL-1 control: at the cap, live budgets are never force-evicted.
+#[test]
+fn full_map_of_active_clients_stays_closed_to_new_clients() {
+    use ferrum_edge::_test_support::RateLimitCleanupHarness;
+    use std::time::Duration;
+
+    let h = RateLimitCleanupHarness::new();
+    let epoch = h.udp_epoch_base();
+    let cap = 2;
+    let active = epoch + Duration::from_secs(20);
+    assert!(h.seed_udp_with_cap("10.0.0.1", active, cap));
+    assert!(h.seed_udp_with_cap("10.0.0.2", active, cap));
+
+    let _ = h.maybe_evict_udp_at_with_cap(active + Duration::from_secs(1), cap);
+    assert_eq!(h.udp_tracked(), Some(2));
+    assert!(h.udp_contains("10.0.0.1"));
+    assert!(h.udp_contains("10.0.0.2"));
+    assert!(!h.seed_udp_with_cap("10.0.0.3", active, cap));
+}
+
+/// SOL-1 on the Redis-fallback map, which shares the admission and cleanup
+/// path.
+#[tokio::test]
+async fn full_redis_fallback_map_of_expired_clients_reopens() {
+    use ferrum_edge::_test_support::{
+        udp_rate_limiting_contains_client_for_test, udp_rate_limiting_epoch_base_for_test,
+        udp_rate_limiting_maybe_evict_at_with_cap_for_test,
+        udp_rate_limiting_seed_client_at_with_cap_for_test,
+    };
+    use std::time::Duration;
+
+    let plugin = make_plugin(json!({
+        "datagrams_per_second": 1_000,
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:9/0",
+        "redis_health_check_interval_seconds": 1,
+        "redis_failure_policy": "local_fallback"
+    }));
+    let epoch = udp_rate_limiting_epoch_base_for_test(&plugin);
+    let cap = 2;
+    assert!(udp_rate_limiting_seed_client_at_with_cap_for_test(
+        &plugin, "10.0.0.1", epoch, cap
+    ));
+    assert!(udp_rate_limiting_seed_client_at_with_cap_for_test(
+        &plugin, "10.0.0.2", epoch, cap
+    ));
+    assert!(!udp_rate_limiting_seed_client_at_with_cap_for_test(
+        &plugin, "10.0.0.3", epoch, cap
+    ));
+
+    let idle = epoch + Duration::from_secs(11);
+    let _ = udp_rate_limiting_maybe_evict_at_with_cap_for_test(&plugin, idle, cap);
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    assert!(!udp_rate_limiting_contains_client_for_test(
+        &plugin, "10.0.0.1"
+    ));
+    assert!(udp_rate_limiting_seed_client_at_with_cap_for_test(
+        &plugin, "10.0.0.3", idle, cap
+    ));
+}
+
+/// SOL-2: steady in-window admission of an existing client decides through a
+/// shared shard reference; only the first insert takes the exclusive entry
+/// guard. (The counter is compiled only with `debug_assertions`; in a release
+/// test build it reads zero and the assertion is vacuous.)
+#[tokio::test]
+async fn steady_existing_client_admission_skips_the_exclusive_entry_guard() {
+    use ferrum_edge::_test_support::udp_rate_limiting_exclusive_entry_calls_for_test;
+
+    // One long window so the loop cannot cross a rollover.
+    let plugin = make_plugin(json!({"datagrams_per_second": 1_000, "window_seconds": 3_600}));
+    let ctx = make_ctx("10.0.0.1", 64);
+    assert_eq!(
+        plugin.on_udp_datagram(&ctx).await,
+        UdpDatagramVerdict::Forward
+    );
+    let after_insert = udp_rate_limiting_exclusive_entry_calls_for_test(&plugin);
+    for _ in 0..1_000 {
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+    assert_eq!(
+        udp_rate_limiting_exclusive_entry_calls_for_test(&plugin),
+        after_insert,
+        "steady occupied-key admission must not take the exclusive shard guard"
+    );
+}
+
+/// SOL-2: the shared fast path keeps exact accounting under concurrency, and a
+/// window rollover reached by many threads at once resets exactly once.
+#[test]
+fn concurrent_same_client_admission_and_rollover_never_over_admit() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        LocalLimiter, UdpRateLimitAlgorithm, UdpRateLimitOp,
+    };
+    use std::time::{Duration, Instant};
+
+    let epoch = Instant::now();
+    let limit = 100u64;
+    let limiter = Arc::new(LocalLimiter::new(
+        UdpRateLimitAlgorithm::new(Some(limit), None, 10, epoch),
+        4,
+    ));
+    let op = UdpRateLimitOp { datagram_size: 1 };
+    let window_zero = epoch + Duration::from_secs(1);
+    let window_one = epoch + Duration::from_secs(11);
+
+    let run = |at: Instant| -> u64 {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let limiter = Arc::clone(&limiter);
+                std::thread::spawn(move || {
+                    (0..50)
+                        .filter(|_| limiter.check_at("10.0.0.1".to_string(), &op, at).allowed)
+                        .count() as u64
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker joins"))
+            .sum()
+    };
+
+    assert_eq!(
+        run(window_zero),
+        limit,
+        "400 concurrent attempts in one window admit exactly the limit"
+    );
+    assert_eq!(
+        run(window_one),
+        limit,
+        "a rollover raced by every thread resets once and admits exactly the limit"
+    );
+}
+
+/// M5: `ipv6_prefix` widens IPv6 grouping; the default stays `/64`.
+#[tokio::test]
+async fn ipv6_prefix_groups_addresses_across_a_wider_prefix() {
+    // 3600-byte window budget, one 3600-byte datagram per client: a second
+    // datagram on the same budget is dropped.
+    let base = json!({"bytes_per_second": 1, "window_seconds": 3_600});
+    let mut wide = base.clone();
+    wide["ipv6_prefix"] = json!(56);
+
+    let default_prefix = make_plugin(base);
+    let wide_prefix = make_plugin(wide);
+    // Same /56, different /64.
+    let first = make_ctx("2001:db8:0:1::1", 3_600);
+    let second = make_ctx("2001:db8:0:2::1", 3_600);
+
+    assert_eq!(
+        default_prefix.on_udp_datagram(&first).await,
+        UdpDatagramVerdict::Forward
+    );
+    assert_eq!(
+        default_prefix.on_udp_datagram(&second).await,
+        UdpDatagramVerdict::Forward,
+        "default /64 grouping keeps distinct /64s independent"
+    );
+
+    assert_eq!(
+        wide_prefix.on_udp_datagram(&first).await,
+        UdpDatagramVerdict::Forward
+    );
+    assert_eq!(
+        wide_prefix.on_udp_datagram(&second).await,
+        UdpDatagramVerdict::Drop,
+        "ipv6_prefix: 56 folds both /64s into one budget"
+    );
+    assert_eq!(wide_prefix.tracked_keys_count(), Some(1));
+
+    // IPv4 stays host-keyed regardless of the IPv6 prefix.
+    assert_eq!(
+        wide_prefix
+            .on_udp_datagram(&make_ctx("192.0.2.1", 3_600))
+            .await,
+        UdpDatagramVerdict::Forward
+    );
+    assert_eq!(
+        wide_prefix
+            .on_udp_datagram(&make_ctx("192.0.2.2", 3_600))
+            .await,
+        UdpDatagramVerdict::Forward
+    );
+}
+
+/// M4: the session hands hooks a typed canonical address computed once, so a
+/// mapped IPv4 peer and its native form are one typed identity.
+#[test]
+fn session_typed_client_address_is_canonical() {
+    let mapped: std::net::SocketAddr = "[::ffff:192.0.2.10]:5353".parse().unwrap();
+    assert_eq!(
+        ferrum_edge::proxy::udp_proxy::udp_session_client_addr(mapped),
+        "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
+    );
+    let native: std::net::SocketAddr = "[2001:db8::10]:5353".parse().unwrap();
+    assert_eq!(
+        ferrum_edge::proxy::udp_proxy::udp_session_client_addr(native),
+        "2001:db8::10".parse::<std::net::IpAddr>().unwrap()
+    );
+}
+
+/// M8: a one-direction policy limits that direction and neither counts nor
+/// drops the other; the default still shares one budget.
+#[tokio::test]
+async fn direction_scopes_what_is_counted_and_limited() {
+    let ingress = make_plugin(json!({
+        "datagrams_per_second": 2,
+        "window_seconds": 3_600,
+        "direction": "client_to_backend"
+    }));
+    let mut reply = make_ctx("10.0.0.1", 10);
+    reply.direction = UdpDatagramDirection::BackendToClient;
+    for _ in 0..20_000 {
+        assert_eq!(
+            ingress.on_udp_datagram(&reply).await,
+            UdpDatagramVerdict::Forward,
+            "replies are outside a client_to_backend budget"
+        );
+    }
+    assert_eq!(
+        ingress.tracked_keys_count(),
+        Some(0),
+        "an out-of-scope direction creates no state"
+    );
+    let request = make_ctx("10.0.0.1", 10);
+    for _ in 0..7_200 {
+        assert_eq!(
+            ingress.on_udp_datagram(&request).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+    assert_eq!(
+        ingress.on_udp_datagram(&request).await,
+        UdpDatagramVerdict::Drop,
+        "requests are still limited"
+    );
+    assert_eq!(
+        ingress.on_udp_datagram(&reply).await,
+        UdpDatagramVerdict::Forward,
+        "an exhausted request budget never drops replies"
+    );
+
+    let egress = make_plugin(json!({
+        "datagrams_per_second": 1,
+        "window_seconds": 3_600,
+        "direction": "backend_to_client"
+    }));
+    for _ in 0..3_600 {
+        assert_eq!(
+            egress.on_udp_datagram(&reply).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+    assert_eq!(
+        egress.on_udp_datagram(&reply).await,
+        UdpDatagramVerdict::Drop
+    );
+    assert_eq!(
+        egress.on_udp_datagram(&request).await,
+        UdpDatagramVerdict::Forward
+    );
+}
+
+#[test]
+fn ipv6_prefix_and_direction_admission_rules() {
+    for config in [
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 0}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 129}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": "64"}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": null}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": -1}),
+        json!({"datagrams_per_second": 1, "direction": "inbound"}),
+        json!({"datagrams_per_second": 1, "direction": "BOTH"}),
+        json!({"datagrams_per_second": 1, "direction": null}),
+        json!({"datagrams_per_second": 1, "direction": 1}),
+    ] {
+        assert!(
+            ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+                &config,
+                PluginHttpClient::default(),
+            )
+            .is_err(),
+            "must be rejected: {config}"
+        );
+    }
+    for config in [
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 1}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 128}),
+        json!({"datagrams_per_second": 1, "direction": "both"}),
+        json!({"datagrams_per_second": 1, "direction": "client_to_backend"}),
+        json!({"datagrams_per_second": 1, "direction": "backend_to_client"}),
+    ] {
+        assert!(
+            ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+                &config,
+                PluginHttpClient::default(),
+            )
+            .is_ok(),
+            "must be accepted: {config}"
+        );
+    }
+}
+
+/// M7: under the default `fail_closed` policy a Redis outage drop is counted on
+/// the dedicated enforcement-unavailable counter, never as a client over-limit.
+#[tokio::test]
+async fn fail_closed_outage_drop_is_counted_as_enforcement_unavailable() {
+    let plugin = make_plugin(json!({
+        "datagrams_per_second": 1_000,
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:9/0",
+        "redis_connect_timeout_seconds": 1,
+        "redis_health_check_interval_seconds": 1
+    }));
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry
+        .rate_limit_unavailable_denials
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        plugin.on_udp_datagram(&make_ctx("10.0.0.1", 10)).await,
+        UdpDatagramVerdict::Drop,
+        "an unreachable store fails closed"
+    );
+    assert!(
+        registry
+            .rate_limit_unavailable_denials
+            .load(Ordering::Relaxed)
+            > before,
+        "the outage drop must be counted"
+    );
 }

@@ -2403,18 +2403,61 @@ fn validate_tcp_connection_throttle_attachment(
     }
 }
 
-/// Validate protocol attachment semantics for every enabled TCP throttle in a
+/// `udp_rate_limiting` runs only as a UDP/DTLS datagram hook. A proxy or
+/// proxy-group attachment that reaches a TCP or HTTP-family proxy would be
+/// filtered out of every protocol view that proxy runs — protection that
+/// looks configured but never enforces — so it fails visibly, the mirror of
+/// [`validate_tcp_connection_throttle_attachment`]. A global policy keeps the
+/// ordinary per-protocol filtering, so a mixed deployment applies it to its
+/// UDP/DTLS listeners only.
+fn validate_udp_rate_limiting_attachment(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+) -> Result<(), String> {
+    if !pc.enabled || !matches!(pc.scope, PluginScope::Proxy | PluginScope::ProxyGroup) {
+        return Ok(());
+    }
+    let unsupported: Vec<String> = gateway_config
+        .proxies
+        .iter()
+        .filter(|proxy| scoped_plugin_config_applies_to_proxy(pc, proxy))
+        .filter(|proxy| {
+            !matches!(
+                proxy.effective_scheme(),
+                BackendScheme::Udp | BackendScheme::Dtls
+            )
+        })
+        .map(|proxy| format!("{:?} ({})", proxy.id, proxy.effective_scheme()))
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "udp_rate_limiting: plugin config {:?} is attached to unsupported TCP or HTTP-family proxy/proxies {}; only UDP/DTLS is supported (use tcp_connection_throttle for TCP connection admission or rate_limiting for HTTP-family requests)",
+        pc.id,
+        unsupported.join(", ")
+    ))
+}
+
+/// Validate protocol attachment semantics for every enabled stream-only
+/// protection — `tcp_connection_throttle` and `udp_rate_limiting` — in a
 /// complete candidate graph. Admin admission and config-source validation use
 /// this before persistence/publication so unsupported protection is never
-/// accepted only to be silently filtered from a UDP/DTLS or HTTP plugin list.
+/// accepted only to be silently filtered from another protocol's plugin list.
 pub(crate) fn validate_tcp_connection_throttle_attachments(
     gateway_config: &GatewayConfig,
 ) -> Result<(), Vec<String>> {
     let errors: Vec<String> = gateway_config
         .plugin_configs
         .iter()
-        .filter(|pc| pc.enabled && pc.plugin_name == "tcp_connection_throttle")
-        .filter_map(|pc| validate_tcp_connection_throttle_attachment(pc, gateway_config).err())
+        .filter(|pc| pc.enabled)
+        .filter_map(|pc| match pc.plugin_name.as_str() {
+            "tcp_connection_throttle" => {
+                validate_tcp_connection_throttle_attachment(pc, gateway_config).err()
+            }
+            "udp_rate_limiting" => validate_udp_rate_limiting_attachment(pc, gateway_config).err(),
+            _ => None,
+        })
         .collect();
     if errors.is_empty() {
         Ok(())

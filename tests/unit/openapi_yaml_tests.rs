@@ -3585,6 +3585,11 @@ fn udp_rate_limiting_schema_matches_constructor_admission() {
             "bytes_per_second": 1048576,
             "window_seconds": 4
         }),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 1}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 128}),
+        json!({"datagrams_per_second": 1, "direction": "both"}),
+        json!({"datagrams_per_second": 1, "direction": "client_to_backend"}),
+        json!({"datagrams_per_second": 1, "direction": "backend_to_client"}),
     ];
     for config in &accepted {
         assert_schema_and_constructor(
@@ -3606,6 +3611,11 @@ fn udp_rate_limiting_schema_matches_constructor_admission() {
         json!({"datagrams_per_second": 1, "redis_health_check_interval_seconds": -1}),
         json!({"datagrams_per_second": 1, "window_seconds": 2678401}),
         json!({"datagrams_per_second": 1, "sync_mdoe": "redis"}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 0}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": 129}),
+        json!({"datagrams_per_second": 1, "ipv6_prefix": null}),
+        json!({"datagrams_per_second": 1, "direction": "inbound"}),
+        json!({"datagrams_per_second": 1, "direction": null}),
     ];
     for config in &rejected {
         assert_schema_and_constructor(

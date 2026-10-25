@@ -1845,13 +1845,16 @@ fn multiple_cors_instances_must_remain_contiguous() {
 
 #[test]
 fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
+    // A WebSocket-only plugin is attachable to an HTTP proxy but runs in no
+    // HTTP/gRPC chain. (`udp_rate_limiting` used to play this role; a
+    // proxy-scoped attachment of it to an HTTP proxy is now refused.)
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["cors-a", "udp", "cors-b"])],
         vec![
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
-                "udp_rate_limiting",
+                "ws_rate_limiting",
                 PluginScope::Proxy,
                 Some("p1"),
                 true,
@@ -1873,13 +1876,11 @@ fn stream_only_interloper_is_ignored_by_cors_contiguity_on_full_rebuild() {
             vec!["cors", "cors", "__cors_finalizer"]
         );
     }
-    assert_eq!(
+    assert!(
         cache
-            .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Udp)
+            .get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket)
             .iter()
-            .map(|plugin| plugin.name())
-            .collect::<Vec<_>>(),
-        vec!["udp_rate_limiting"]
+            .any(|plugin| plugin.name() == "ws_rate_limiting")
     );
 }
 
@@ -1891,7 +1892,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
-                "udp_rate_limiting",
+                "ws_rate_limiting",
                 PluginScope::Proxy,
                 Some("p1"),
                 true,
@@ -1907,7 +1908,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             cors_config("cors-a", &["GET"], &["X-Test"], Some(100), None),
             make_plugin_config_with_priority(
                 "udp",
-                "udp_rate_limiting",
+                "ws_rate_limiting",
                 PluginScope::Proxy,
                 Some("p1"),
                 true,
@@ -1934,7 +1935,7 @@ fn cors_delta_reload_ignores_stream_interloper_and_rejects_http_interloper() {
             .iter()
             .map(|plugin| plugin.name())
             .collect::<Vec<_>>(),
-        vec!["cors", "udp_rate_limiting", "cors", "__cors_finalizer"]
+        vec!["cors", "ws_rate_limiting", "cors", "__cors_finalizer"]
     );
 
     let http_interleaved = make_config(
@@ -11228,7 +11229,7 @@ fn test_tcp_only_plugin_excluded_from_http() {
 fn test_udp_only_plugin_included_for_udp_excluded_from_others() {
     // udp_rate_limiting supports UDP_ONLY_PROTOCOLS
     let config = make_config(
-        vec![make_proxy("p1", "/udp-svc", vec!["ps1"])],
+        vec![make_udp_proxy("p1", vec!["ps1"], BackendScheme::Udp)],
         vec![make_plugin_config(
             "ps1",
             "udp_rate_limiting",
@@ -11305,9 +11306,11 @@ fn test_all_protocols_plugin_included_for_all_protocol_types() {
 #[test]
 fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
     // tcp_connection_throttle = TCP_ONLY, udp_rate_limiting = UDP_ONLY,
-    // cors = HTTP_ONLY, stdout_logging = ALL_PROTOCOLS
+    // cors = HTTP_ONLY, stdout_logging = ALL_PROTOCOLS. The UDP limiter is a
+    // global policy: a proxy-scoped attachment to this TCP proxy is refused
+    // visibly, while a global one is filtered per protocol view.
     let config = make_config(
-        vec![make_tcp_proxy("p1", vec!["ps1", "ps2", "ps3", "ps4"])],
+        vec![make_tcp_proxy("p1", vec!["ps1", "ps3", "ps4"])],
         vec![
             make_plugin_config(
                 "ps1",
@@ -11316,13 +11319,7 @@ fn test_mixed_protocol_plugins_filtered_correctly_per_protocol() {
                 Some("p1"),
                 true,
             ),
-            make_plugin_config(
-                "ps2",
-                "udp_rate_limiting",
-                PluginScope::Proxy,
-                Some("p1"),
-                true,
-            ),
+            make_plugin_config("ps2", "udp_rate_limiting", PluginScope::Global, None, true),
             make_plugin_config("ps3", "cors", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config(
                 "ps4",
@@ -11412,6 +11409,71 @@ fn test_tcp_connection_throttle_rejects_udp_and_dtls_attachments() {
         .err()
         .expect("HTTP-family attachment must fail visibly");
     assert!(error.contains("HTTP-family"), "{error}");
+}
+
+/// `udp_rate_limiting` is a datagram hook only. A proxy/proxy-group attachment
+/// to a TCP or HTTP-family proxy would be filtered out of every protocol view
+/// that proxy runs — configured protection that never enforces — so it must
+/// fail visibly, the mirror of `tcp_connection_throttle`'s rule. Globals keep
+/// per-protocol filtering.
+#[test]
+fn test_udp_rate_limiting_rejects_tcp_and_http_attachments() {
+    for (label, proxy) in [
+        ("http", make_proxy("p1", "/api", vec!["udp-rl"])),
+        ("tcp", make_tcp_proxy("p1", vec!["udp-rl"])),
+    ] {
+        let config = make_config(
+            vec![proxy],
+            vec![make_plugin_config(
+                "udp-rl",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            )],
+        );
+        let error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: non-UDP attachment must fail visibly"));
+        assert!(error.contains("udp_rate_limiting"), "{label}: {error}");
+        assert!(
+            error.contains("only UDP/DTLS is supported"),
+            "{label}: {error}"
+        );
+
+        let mut disabled = config.clone();
+        disabled.plugin_configs[0].enabled = false;
+        PluginCache::new(&disabled)
+            .unwrap_or_else(|error| panic!("{label}: a disabled attachment is inert: {error}"));
+    }
+
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls] {
+        let config = make_config(
+            vec![make_udp_proxy("p1", vec!["udp-rl"], scheme)],
+            vec![make_plugin_config(
+                "udp-rl",
+                "udp_rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            )],
+        );
+        PluginCache::new(&config)
+            .unwrap_or_else(|error| panic!("{scheme:?} attachment is supported: {error}"));
+    }
+
+    let global_over_http = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "udp-rl",
+            "udp_rate_limiting",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    PluginCache::new(&global_over_http)
+        .expect("a global UDP limiter keeps per-protocol filtering in a mixed deployment");
 }
 
 #[test]
@@ -12570,7 +12632,7 @@ fn test_request_transformer_query_rules_do_not_declare_query_predicates() {
 fn test_requires_udp_datagram_hooks_flag_with_udp_rate_limiting() {
     // udp_rate_limiting returns true for requires_udp_datagram_hooks()
     let config = make_config(
-        vec![make_proxy("p1", "/udp-svc", vec!["ps1"])],
+        vec![make_udp_proxy("p1", vec!["ps1"], BackendScheme::Udp)],
         vec![make_plugin_config(
             "ps1",
             "udp_rate_limiting",
@@ -14477,9 +14539,9 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
     // under both input orders.
     for (middle_name, middle_priority, expect_ok) in [
         ("ip_restriction", 100, true),
-        ("udp_rate_limiting", 100, true),
+        ("ws_rate_limiting", 100, true),
         ("ip_restriction", 150, false),
-        ("udp_rate_limiting", 150, true),
+        ("ws_rate_limiting", 150, true),
     ] {
         let last_priority = if middle_priority == 100 { 100 } else { 200 };
         let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);

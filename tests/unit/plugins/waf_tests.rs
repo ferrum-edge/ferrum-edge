@@ -7551,6 +7551,7 @@ fn stream_ctx(first_bytes: &[u8], kind: StreamBytesKind) -> StreamConnectionCont
 fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
     UdpDatagramContext {
         client_ip: Arc::from("203.0.113.10"),
+        client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10)),
         proxy_id: Arc::from("udp-proxy"),
         proxy_name: Some(Arc::from("UDP Proxy")),
         listen_port: 9000,

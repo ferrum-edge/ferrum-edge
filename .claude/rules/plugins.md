@@ -517,7 +517,12 @@ BEFORE the session's capability set exists, so a skipped instance forces neither
 framing nor a parser ceiling and cannot pull a session off the raw tunnel path;
 UDP/DTLS decisions filter the session's datagram-hook list ONCE at first-datagram
 admission (`plugins::admitted_datagram_plugins`), so nothing is evaluated,
-allocated, hashed, or locked per packet. Carriers are non-serialized,
+allocated, hashed, or locked per packet. The session also carries a
+`UdpDatagramPolicyFence` (`src/proxy/udp_proxy.rs`): one atomic load of the
+published config generation per check; when it moves, the proxy's current UDP
+datagram-hook instances are compared by `Arc` identity and a changed set ENDS
+the session (never swaps hooks in place — trigger decisions belong to the
+admission generation), so the next datagram is re-admitted under the new policy. Carriers are non-serialized,
 crate-constructed, keyed by the compiled gate's process-local token (never chain
 position, load order, plugin name, or plugin-writable metadata), and owned by the
 plugin generation that minted the gate. Explicit `false` skips, explicit `true`

@@ -1358,6 +1358,11 @@ pub struct UdpDatagramContext<'a> {
     /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
     /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
+    /// The same canonical client identity as a typed address, computed once
+    /// per session alongside [`Self::client_ip`], so a hook that keys or masks
+    /// by address (for example `udp_rate_limiting`'s IPv6 prefix grouping)
+    /// never re-parses or re-allocates per datagram.
+    pub client_ip_addr: std::net::IpAddr,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
