@@ -329,6 +329,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`ai_tool_governor` closes several fail-open parser and policy gaps.**
+  A governed response that is well-formed JSON but nested past the inspection
+  parser's 128-level limit (or carrying an out-of-range number) is now
+  uninspectable — 502 / stream cut in enforce — on buffered JSON, the final
+  re-check, buffered and live SSE, and held JSON-shaped streams, instead of
+  being forwarded as call-free; malformed JSON is still forwarded. An SSE
+  event that is not valid UTF-8 (even in a comment line) cuts the stream
+  instead of being forwarded as data-free. `redact_args` binds its skip state
+  to the exact body `on_response_body` governed, so a call a transform injected
+  or renamed before the redaction is governed by the final re-check.
+  `blocked_arg_patterns` also match the JSON-decoded view of escaped string
+  arguments (a match that raw-text redaction cannot remove denies). The
+  unknown-shape backstop also covers a tool-call marker in a location no
+  extractor read when other calls were extracted, and its scan budget now
+  covers every value a 4 MiB body can hold, so large embeddings or numeric
+  bodies are no longer rejected for size alone. Approval decisions and the
+  webhook payload carry an authority-qualified `principal` (Consumer namespace
+  + id, or external subject + realm), so equal subjects from different
+  authorities never share a cached approval. `approval.endpoint_url` admits
+  `http://` only to a loopback IP literal unless `approval.allow_plaintext:
+  true` (breaking for non-loopback cleartext approval endpoints).
+- **`ai_tool_governor` adds tool globs, caller scopes, approval headers,
+  concurrent approvals, and Responses streaming.** `tools` keys may be `*`
+  globs (exact key wins, then the most literal glob); per-tool
+  `allowed_consumers` / `denied_consumers` / `allowed_groups` /
+  `denied_groups` scope a policy to mapped Consumers; `approval.headers`
+  sends literal or `${FERRUM_PLUGIN_SECRET_<NAME>}` headers resolved at the
+  first call; a batch resolves approvals with up to 8 webhook calls in flight
+  (identical cacheable calls share one resolution); and OpenAI Responses
+  event streams are accumulated, with every `.done` / `response.completed`
+  restatement required to match the deltas exactly. SSE framing and the
+  stream shape sniff resume across chunks instead of rescanning a long
+  partial event from its first byte.
+
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

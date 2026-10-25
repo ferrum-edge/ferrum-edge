@@ -6818,31 +6818,49 @@ provider sets, so read them separately.
 | --- | --- |
 | Buffered request tool definitions | OpenAI `tools[].function.name` and legacy `functions[].name`, Anthropic `tools[].name`, Google `tools[].functionDeclarations[].name`, Bedrock `toolConfig.tools[].toolSpec.name` |
 | Buffered response tool calls | OpenAI Chat Completions `choices[].message.tool_calls[]` and legacy `function_call`, OpenAI Responses `output[]` `type: "function_call"` items, Anthropic `content[]` `tool_use` blocks, Google `candidates[].content.parts[].functionCall`, Cohere v2 `message.tool_calls[]`, Bedrock Converse `output.message.content[].toolUse` |
-| Streaming SSE tool-call deltas | OpenAI Chat Completions `choices[].delta.tool_calls` and legacy `delta.function_call`, Anthropic `content_block_start` / `input_json_delta`, Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall` — **these four only** |
+| Streaming SSE tool-call deltas | OpenAI Chat Completions `choices[].delta.tool_calls` and legacy `delta.function_call`, OpenAI Responses `response.output_item.added` / `response.function_call_arguments.delta` (every `.done` / `response.completed` restatement must match the accumulated call exactly), Anthropic `content_block_start` / `input_json_delta`, Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall` — **these five only** |
 
-**OpenAI Responses streaming events and Amazon Bedrock streaming are not
-accumulated.** There is no Responses event state machine and no
-`application/vnd.amazon.eventstream` parser in this plugin. A Responses SSE
-frame that carries a tool-call marker is not a silent allow — it is an
-unreadable shape and takes the `unknown_shape_action` posture below. Bedrock's
-binary event stream is never parsed as SSE at all; Bedrock Converse delivered
-as a buffered JSON body is governed normally. See the guide's
-[limitations](plugins/ai_tool_governor.md#limitations-mvp) for the exact
-handling of each.
+**Amazon Bedrock streaming is not accumulated.** There is no
+`application/vnd.amazon.eventstream` parser in this plugin: Bedrock's binary
+event stream is never parsed as SSE at all, while Bedrock Converse delivered as
+a buffered JSON body is governed normally. See the guide's
+[limitations](plugins/ai_tool_governor.md#limitations-mvp).
+
+**Policy keys and callers.** `tools` keys are exact tool names or `*` globs
+(`github.*`, `*delete*`); an exact key always wins, and among matching globs the
+one with the most literal bytes wins (then fewer wildcards, then byte order). A
+policy can be scoped with `allowed_consumers` / `denied_consumers` /
+`allowed_groups` / `denied_groups` against the mapped Consumer; a deny entry
+wins, and with any scope configured a request without a mapped Consumer is
+denied. `blocked_arg_patterns` also match the JSON-decoded view of string
+arguments, so an escaped spelling cannot hide a match (`redact_args` denies a
+match it cannot redact in place). The approval webhook receives an
+authority-qualified `principal` (mapped Consumer namespace + id, or external
+subject + realm mechanism + opaque authority digest) that also keys the approval
+cache, resolves a batch with at most 8 calls in flight, accepts
+`approval.headers` (literals or `${FERRUM_PLUGIN_SECRET_<NAME>}` references
+resolved at the first call), and admits `http://` only to a loopback IP literal
+unless `approval.allow_plaintext: true`. See the guide's
+[actions](plugins/ai_tool_governor.md#actions) and
+[approval](plugins/ai_tool_governor.md#approval-required-production-writes)
+sections.
 
 **Mode semantics.** `mode: enforce` is the only mode that rejects or cuts; it
 fails closed on governed, uninspectable cases where the configured posture
 requires it, within the configured inspection surfaces and supported
 extraction scope. That is not unconditional: a JSON-labelled plaintext
-response that fails to parse is forwarded (see the guide's
-[limitations](plugins/ai_tool_governor.md#limitations-mvp)),
+response that is malformed JSON is forwarded (see the guide's
+[limitations](plugins/ai_tool_governor.md#limitations-mvp)) — well-formed JSON
+beyond the inspection parser's nesting/numeric limits, and an SSE event that is
+not valid UTF-8, fail closed instead —
 [`approval.fail_on_error`](plugins/ai_tool_governor.md#approval)`=warn`/`allow`
 deliberately fails open on an approval endpoint error (the default `reject`
 fails closed), and
 `unknown_shape_action=allow` is the documented opt-out for a marker-bearing
-payload from which no call was extracted — a backstop that applies only when
-no supported call was extracted, not a guarantee that every unreadable sibling
-in a mixed body is detected. `mode: dry_run` never rejects
+payload the extractors cannot fully read — a backstop that applies when no
+supported call was extracted and, when calls were extracted, to a marker in
+any location the extractors did not read. It keys on the documented marker
+names, so a dialect with no recognizable marker is still out of scope. `mode: dry_run` never rejects
 and never calls the approval webhook — it evaluates policy, records what
 enforce *would* have done, and forwards — so it is the safe rollout/observe
 posture. Global dry-run **preserves the would-be policy label** rather than

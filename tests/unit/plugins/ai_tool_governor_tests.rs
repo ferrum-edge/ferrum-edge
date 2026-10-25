@@ -9024,9 +9024,12 @@ async fn governable_call_limit_fails_closed_before_approvals() {
 }
 
 /// After an enforce-mode approval denial, remaining unique calls must not each
-/// wait out another webhook timeout (GHSA-pcv8).
+/// wait out another webhook timeout (GHSA-pcv8). Approvals resolve with bounded
+/// concurrency, so the first wave (`max_concurrent_approvals`) is already in
+/// flight when the denial arrives; no further webhook call is started.
 #[tokio::test]
 async fn approval_stops_fanout_after_enforce_block() {
+    let wave = AiToolGovernor::max_concurrent_approvals();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/approve"))
@@ -9035,7 +9038,7 @@ async fn approval_stops_fanout_after_enforce_block() {
                 .set_body_json(json!({ "decision": "deny" }))
                 .set_delay(std::time::Duration::from_millis(50)),
         )
-        .expect(1)
+        .expect(wave as u64)
         .mount(&server)
         .await;
 
@@ -9049,7 +9052,7 @@ async fn approval_stops_fanout_after_enforce_block() {
         }
     }));
 
-    let tool_calls: Vec<Value> = (0..5)
+    let tool_calls: Vec<Value> = (0..wave + 4)
         .map(|i| {
             json!({
                 "id": format!("call_{i}"),
@@ -9084,15 +9087,19 @@ async fn approval_stops_fanout_after_enforce_block() {
             .await,
         Some(403),
     );
+    server.verify().await;
 }
 
-/// Sequential unique approvals share one cumulative 30s batch budget
+/// Unique approvals share one cumulative 30s batch budget
 /// (GHSA-pcv8-f48c-mppw). Later webhook calls must not dispatch after the
 /// budget is exhausted. The test-only approval clock advances by the
 /// production ceiling on the first webhook response so hosted CI never sleeps
-/// 30 seconds; public config / OpenAPI stay unchanged.
+/// 30 seconds; public config / OpenAPI stay unchanged. The first concurrent
+/// wave started inside the budget; every call started after it is refused
+/// without a webhook dispatch.
 #[tokio::test]
 async fn approval_batch_deadline_stops_later_webhook_fanout() {
+    let wave = AiToolGovernor::max_concurrent_approvals();
     let server = MockServer::start().await;
     let plugin = std::sync::Arc::new(make(json!({
         "default_action": "require_approval",
@@ -9119,11 +9126,11 @@ async fn approval_batch_deadline_stops_later_webhook_fanout() {
             clock.advance_approval_clock_for_tests(AiToolGovernor::max_approval_batch_deadline());
             ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" }))
         })
-        .expect(1)
+        .expect(wave as u64)
         .mount(&server)
         .await;
 
-    let tool_calls: Vec<Value> = (0..3)
+    let tool_calls: Vec<Value> = (0..wave + 3)
         .map(|i| {
             json!({
                 "id": format!("call_{i}"),
@@ -12431,9 +12438,9 @@ fn approval_endpoint_scheme_case_matches_runtime_url_normalization() {
     };
 
     for url in [
-        "http://approval.example/decide",
+        "http://127.0.0.1/decide",
         "https://approval.example/decide",
-        "HTTP://approval.example/decide",
+        "HTTP://127.0.0.1/decide",
         "HTTPS://approval.example/decide",
         "HtTpS://approval.example/decide",
     ] {
@@ -12984,5 +12991,1137 @@ async fn approval_call_carries_the_proxy_hop_count() {
             .map(|value| value.to_str().unwrap())
             .collect();
         assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes (ai_tool_governor-SOL-1..4, CLAUDE-2..12)
+// ---------------------------------------------------------------------------
+
+mod launch_review {
+    use super::*;
+    use ferrum_edge::config::types::Consumer;
+    use ferrum_edge::plugins::utils::auth_attempt::AuthenticationAttempt;
+    use ferrum_edge::plugins::utils::auth_flow::{VerifyOutcome, commit_authentication_attempt};
+
+    /// `depth` nested arrays around a scalar: valid, duplicate-free JSON deeper
+    /// than `serde_json`'s 128-level recursion limit but inside the governed
+    /// scanner's 256-level budget.
+    fn deep_padding(depth: usize) -> String {
+        format!("{}0{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    /// An Anthropic `tool_use` block whose `input` carries deep padding, so the
+    /// denied call sits at normal depth inside a document `serde_json` cannot
+    /// materialize.
+    fn deep_anthropic_body(name: &str) -> Vec<u8> {
+        format!(
+            r#"{{"type":"message","role":"assistant","content":[{{"type":"tool_use","id":"c1","name":"{name}","input":{{"padding":{}}}}}]}}"#,
+            deep_padding(200)
+        )
+        .into_bytes()
+    }
+
+    fn deny_by_default() -> Value {
+        json!({
+            "default_action": "deny",
+            "tools": { "safe": { "action": "allow" } },
+            "inspect": { "response_tool_calls": true }
+        })
+    }
+
+    fn deny_by_default_streaming() -> Value {
+        json!({
+            "default_action": "deny",
+            "tools": { "safe": { "action": "allow" } },
+            "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+        })
+    }
+
+    async fn drive(plugin: &AiToolGovernor, chunks: &[&[u8]]) -> (Vec<u8>, bool) {
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        drive_stream(&mut inspector, chunks).await
+    }
+
+    fn openai_chunk_frame(name: &str, extra: &str) -> String {
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"c1","function":{{"name":"{name}","arguments":"{{}}"}}}}]}},"finish_reason":"tool_calls"}}]{extra}}}"#
+        ) + "\n\n"
+    }
+
+    // --- SOL-1: well-formed JSON past serde's depth limit ------------------
+
+    #[tokio::test]
+    async fn deep_well_formed_response_fails_closed_in_enforce() {
+        let plugin = make(deny_by_default());
+        let body = deep_anthropic_body("danger");
+        assert!(
+            serde_json::from_slice::<Value>(&body).is_err(),
+            "fixture must exceed serde_json's recursion limit"
+        );
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+            Some(502),
+        );
+        // The post-transform re-check applies the same posture.
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+                .await,
+            Some(502),
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_well_formed_response_is_forwarded_in_dry_run() {
+        let mut config = deny_by_default();
+        config["mode"] = json!("dry_run");
+        let plugin = make(config);
+        let body = deep_anthropic_body("danger");
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_response_keeps_forwarding() {
+        let plugin = make(deny_by_default());
+        let body = br#"{"choices":[{"message":{"tool_calls":[{"function":{"name":"danger""#;
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), body)
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_well_formed_sse_frame_cuts_the_stream() {
+        let plugin = make(deny_by_default_streaming());
+        let frame = openai_chunk_frame("danger", &format!(r#","padding":{}"#, deep_padding(200)));
+        let (out, terminated) = drive(&plugin, &[frame.as_bytes()]).await;
+        assert!(
+            terminated,
+            "an unmaterializable SSE frame must cut the stream"
+        );
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+        // Buffered SSE takes the same posture.
+        let plugin = make(deny_by_default());
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut sse_headers(), frame.as_bytes())
+                .await,
+            Some(502),
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_well_formed_json_shaped_stream_is_cut() {
+        let plugin = make(deny_by_default_streaming());
+        let body = deep_anthropic_body("danger");
+        let (out, terminated) = drive(&plugin, &[body.as_slice()]).await;
+        assert!(
+            terminated,
+            "a held JSON-shaped stream past the parser limit must be cut"
+        );
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+    }
+
+    // --- SOL-2: invalid UTF-8 inside an SSE event ---------------------------
+
+    fn comment_with_invalid_byte_then(frame: &str) -> Vec<u8> {
+        let mut event = b": ".to_vec();
+        event.push(0xFF);
+        event.push(b'\n');
+        event.extend_from_slice(frame.as_bytes());
+        event
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_comment_cannot_hide_a_streamed_tool_call() {
+        let plugin = make(deny_by_default_streaming());
+        let event = comment_with_invalid_byte_then(&openai_chunk_frame("danger", ""));
+        let (out, terminated) = drive(&plugin, &[event.as_slice()]).await;
+        assert!(
+            terminated,
+            "an uninspectable event must cut the stream in enforce"
+        );
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+        // Split across transport chunks, and after a valid first event.
+        let mut body =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_vec();
+        body.extend_from_slice(&event);
+        let chunks: Vec<&[u8]> = body.chunks(7).collect();
+        let (out, terminated) = drive(&plugin, &chunks).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_trailing_event_is_cut_at_end_of_stream() {
+        let plugin = make(deny_by_default_streaming());
+        let mut event = comment_with_invalid_byte_then(&openai_chunk_frame("danger", ""));
+        // No terminating blank line: the event is flushed by `on_end`.
+        event.truncate(event.len() - 2);
+        let (out, terminated) = drive(&plugin, &[event.as_slice()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_event_is_forwarded_unchanged_in_dry_run() {
+        let mut config = deny_by_default_streaming();
+        config["mode"] = json!("dry_run");
+        let plugin = make(config);
+        let event = comment_with_invalid_byte_then(&openai_chunk_frame("danger", ""));
+        let (out, terminated) = drive(&plugin, &[event.as_slice()]).await;
+        assert!(!terminated, "dry-run must never disrupt traffic");
+        assert_eq!(out, event);
+    }
+
+    // --- SOL-3: redaction skip state is bound to the governed input ---------
+
+    fn two_call_body(second: &str) -> Vec<u8> {
+        json!({
+            "id": "1", "object": "chat.completion", "model": "gpt-4o",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": Value::Null, "tool_calls": [
+                { "id": "c1", "type": "function", "function": { "name": "filesystem.write", "arguments": "{\"value\":\"secret\"}" } },
+                { "id": "c2", "type": "function", "function": { "name": second, "arguments": "{}" } }
+            ] }, "finish_reason": "tool_calls" }]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn redact_config() -> Value {
+        json!({
+            "default_action": "deny",
+            "tools": {
+                "safe": { "action": "allow" },
+                "danger": { "action": "deny" },
+                "filesystem.write": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{ "name": "secret", "regex": "secret" }]
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn call_injected_before_redaction_is_still_governed() {
+        let plugin = make(redact_config());
+        let original = two_call_body("safe");
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
+                .await,
+        );
+        // A transform ordered before the governor's redaction renamed the
+        // allowed sibling into a denied tool.
+        let injected = two_call_body("danger");
+        let rewritten = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &injected,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .expect("redaction still runs");
+        assert!(String::from_utf8_lossy(&rewritten).contains("danger"));
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &rewritten)
+                .await,
+            Some(403),
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_input_redaction_still_skips_the_final_recheck() {
+        let plugin = make(redact_config());
+        let original = two_call_body("safe");
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
+                .await,
+        );
+        let rewritten = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .expect("redacted body");
+        assert!(!String::from_utf8_lossy(&rewritten).contains("\\\"secret\\\""));
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &rewritten)
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_call_injected_before_redaction_contacts_the_webhook() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .and(body_string_contains("\"tool_name\":\"deploy\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "deny" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = redact_config();
+        config["tools"]["deploy"] = json!({ "action": "require_approval" });
+        config["approval"] =
+            json!({ "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 });
+        let plugin = make(config);
+        let original = two_call_body("safe");
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &original)
+                .await,
+        );
+        let injected = two_call_body("deploy");
+        let rewritten = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &injected,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .expect("redaction still runs");
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &rewritten)
+                .await,
+            Some(403),
+        );
+        server.verify().await;
+    }
+
+    // --- SOL-4: incremental framing -----------------------------------------
+
+    #[test]
+    fn fragmented_event_scan_work_is_linear() {
+        let mut event = b"data: ".to_vec();
+        event.extend(std::iter::repeat_n(b'x', 64 * 1024));
+        event.extend_from_slice(b"\r\n\r\n");
+        let chunks: Vec<&[u8]> = event.chunks(1).collect();
+        let (work, ends) = AiToolGovernor::sse_event_scan_work_for_tests(&chunks);
+        assert_eq!(
+            ends,
+            vec![event.len()],
+            "exactly one event, ending at the blank line"
+        );
+        assert!(
+            work <= 4 * event.len(),
+            "scan examined {work} bytes for a {}-byte event",
+            event.len()
+        );
+    }
+
+    #[test]
+    fn resumed_scan_finds_every_terminator_form() {
+        for body in [
+            b"data: a\n\ndata: b\r\rdata: c\r\n\r\n".as_slice(),
+            b"data: a\r\n\r\n".as_slice(),
+        ] {
+            let whole = AiToolGovernor::sse_event_scan_work_for_tests(&[body]).1;
+            let split: Vec<&[u8]> = body.chunks(1).collect();
+            let resumed = AiToolGovernor::sse_event_scan_work_for_tests(&split).1;
+            assert_eq!(
+                whole, resumed,
+                "byte-at-a-time framing must match one-shot framing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_at_a_time_stream_is_still_governed() {
+        let plugin = make(deny_by_default_streaming());
+        // A long colonless prelude (resumable sniff) then a denied call
+        // delivered one byte at a time (resumable framing).
+        let mut body = "x".repeat(4096).into_bytes();
+        body.extend_from_slice(b"\n");
+        body.extend_from_slice(openai_chunk_frame("danger", "").as_bytes());
+        let chunks: Vec<&[u8]> = body.chunks(1).collect();
+        let (out, terminated) = drive(&plugin, &chunks).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+        let mut allowed = b"   \n".to_vec();
+        allowed.extend_from_slice(openai_chunk_frame("safe", "").as_bytes());
+        let chunks: Vec<&[u8]> = allowed.chunks(1).collect();
+        let (out, terminated) = drive(&plugin, &chunks).await;
+        assert!(!terminated);
+        assert_eq!(out, allowed);
+    }
+
+    // --- CLAUDE-2: blocked patterns see JSON-decoded arguments --------------
+
+    /// `{"api<escape>key":"..."}` where the underscore is spelled as a JSON
+    /// unicode escape, built at runtime so the source holds no escape literal.
+    fn escaped_key_arguments() -> String {
+        format!(r#"{{"api{}u005fkey":"AKIAIOSFODNN7EXAMPLE"}}"#, '\\')
+    }
+
+    fn secret_pattern_config(action: &str) -> Value {
+        json!({
+            "default_action": "deny",
+            "tools": { "http.post": {
+                "action": action,
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "(?i)(api[_-]?key|password|token)" }]
+            } },
+            "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+        })
+    }
+
+    #[tokio::test]
+    async fn escaped_secret_in_string_arguments_is_denied() {
+        let plugin = make(secret_pattern_config("allow"));
+        let body = response_with_tool_call("http.post", &escaped_key_arguments());
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+            Some(403),
+        );
+
+        // Streaming twin.
+        let frame = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"http.post","arguments": escaped_key_arguments()}}]},"finish_reason":"tool_calls"}]})
+        );
+        let (out, terminated) = drive(&plugin, &[frame.as_bytes()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("AKIA"));
+    }
+
+    #[tokio::test]
+    async fn object_argument_twin_is_denied_the_same_way() {
+        let plugin = make(secret_pattern_config("allow"));
+        let body = json!({
+            "type": "message", "role": "assistant",
+            "content": [{ "type": "tool_use", "id": "t1", "name": "http.post",
+                "input": { "api_key": "AKIAIOSFODNN7EXAMPLE" } }]
+        })
+        .to_string()
+        .into_bytes();
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+            Some(403),
+        );
+    }
+
+    #[tokio::test]
+    async fn escaped_secret_under_redact_args_fails_closed() {
+        let plugin = make(json!({
+            "default_action": "deny",
+            "tools": { "http.post": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "aws", "regex": "AKIA[0-9A-Z]{16}" }]
+            } }
+        }));
+        // The secret's first letter after the prefix is escaped, so only the
+        // decoded view carries a match that raw-text redaction cannot remove.
+        let args = format!(r#"{{"k":"AKI{}u0041IOSFODNN7EXAMPLE"}}"#, '\\');
+        let body = response_with_tool_call("http.post", &args);
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+            Some(403),
+        );
+        // An unescaped secret is still redacted normally.
+        let plain = response_with_tool_call("http.post", r#"{"k":"AKIAIOSFODNN7EXAMPLE"}"#);
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &plain)
+                .await,
+        );
+    }
+
+    // --- CLAUDE-3: large bodies without a tool surface ----------------------
+
+    #[tokio::test]
+    async fn large_numeric_array_is_not_rejected_for_size_alone() {
+        let plugin = make(deny_by_default());
+        let mut body = String::from("[");
+        for index in 0..300_000 {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push('0');
+        }
+        body.push(']');
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), body.as_bytes())
+                .await,
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_tool_governor.uninspectable_reason")
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_batch_is_not_rejected_for_size_alone() {
+        let plugin = make(deny_by_default());
+        let vector: Vec<f64> = vec![0.1; 1536];
+        let data: Vec<Value> = (0..200)
+            .map(|index| json!({ "object": "embedding", "index": index, "embedding": vector }))
+            .collect();
+        let body = json!({ "object": "list", "model": "text-embedding-3-small", "data": data })
+            .to_string()
+            .into_bytes();
+        assert!(
+            body.len() < 4 * 1024 * 1024,
+            "fixture must fit the parse window"
+        );
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+        );
+    }
+
+    // --- CLAUDE-4: approval identity is authority-qualified ----------------
+
+    fn external_principal_ctx(subject: &str, authority: [u8; 32]) -> RequestContext {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = None;
+        ctx.authenticated_identity = None;
+        let mut attempt = AuthenticationAttempt::new();
+        attempt.stage_identity_realm_authority(authority);
+        commit_authentication_attempt(
+            &mut ctx,
+            attempt,
+            VerifyOutcome::success(None, Some(subject.to_string()), None),
+            "jwks_auth",
+            true,
+        )
+        .expect("attempt commits");
+        ctx
+    }
+
+    #[tokio::test]
+    async fn same_subject_from_different_authorities_never_shares_an_approval() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let plugin = make(approval_config(&format!("{}/approve", server.uri())));
+        let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+        for authority in [[1u8; 32], [2u8; 32], [1u8; 32]] {
+            let mut ctx = external_principal_ctx("alice", authority);
+            assert_continue(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                    .await,
+            );
+        }
+        // Issuer A twice (cached), issuer B once: two webhook calls.
+        server.verify().await;
+        let received = server.received_requests().await.unwrap_or_default();
+        let principals: Vec<Value> = received
+            .iter()
+            .map(|request| {
+                request.body_json::<Value>().expect("approval body is JSON")["principal"].clone()
+            })
+            .collect();
+        assert_eq!(principals.len(), 2);
+        assert_eq!(principals[0]["subject"], json!("alice"));
+        assert_eq!(principals[0]["mechanism"], json!("jwks_auth"));
+        assert_ne!(
+            principals[0]["authority"], principals[1]["authority"],
+            "the webhook must be able to tell the two tenants apart"
+        );
+    }
+
+    // --- CLAUDE-6: concurrent approvals ------------------------------------
+
+    fn distinct_deploy_calls(count: usize) -> Vec<u8> {
+        let tool_calls: Vec<Value> = (0..count)
+            .map(|index| {
+                json!({
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": { "name": "deploy", "arguments": format!(r#"{{"n":{index}}}"#) }
+                })
+            })
+            .collect();
+        json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "model": "gpt-4o",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": null,
+                "tool_calls": tool_calls }, "finish_reason": "tool_calls" }]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn batch_approvals_are_resolved_concurrently() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "decision": "allow" }))
+                    .set_delay(std::time::Duration::from_millis(400)),
+            )
+            .expect(4)
+            .mount(&server)
+            .await;
+        let plugin = make(json!({
+            "default_action": "require_approval",
+            "approval": {
+                "endpoint_url": format!("{}/approve", server.uri()),
+                "cache_ttl_seconds": 0,
+                "timeout_ms": 5000
+            }
+        }));
+        let body = distinct_deploy_calls(4);
+        let mut ctx = create_test_context();
+        let started = std::time::Instant::now();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "four 400ms approvals took {elapsed:?}; sequential resolution needs 1600ms"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_tool_governor.decision")
+                .map(String::as_str),
+            Some("approved")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn identical_calls_in_one_batch_share_one_cacheable_approval() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let plugin = make(approval_config(&format!("{}/approve", server.uri())));
+        let call = json!({ "id": "c", "type": "function",
+            "function": { "name": "deploy", "arguments": "{\"env\":\"prod\"}" } });
+        let body = json!({
+            "id": "1", "object": "chat.completion", "model": "gpt-4o",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": null,
+                "tool_calls": [call.clone(), call] }, "finish_reason": "tool_calls" }]
+        })
+        .to_string()
+        .into_bytes();
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+        );
+        server.verify().await;
+    }
+
+    // --- CLAUDE-5: unread marker beside an extracted call -------------------
+
+    #[tokio::test]
+    async fn unread_tool_call_beside_a_readable_one_fails_closed() {
+        let plugin = make(deny_by_default());
+        let mut body: Value =
+            serde_json::from_slice(&response_with_tool_call("safe", "{}")).unwrap();
+        body["tool_call"] = json!({ "name": "danger", "arguments": "{}" });
+        let (result, ctx) = govern_buffered(&plugin, body.clone()).await;
+        assert_reject(result, Some(502));
+        assert_eq!(
+            ctx.metadata
+                .get("ai_tool_governor.uninspectable_reason")
+                .map(String::as_str),
+            Some("unrecognized_tool_call_shape")
+        );
+
+        let mut config = deny_by_default();
+        config["unknown_shape_action"] = json!("allow");
+        let (result, ctx) = govern_buffered(&make(config), body).await;
+        assert_continue(result);
+        assert_eq!(
+            ctx.metadata
+                .get("ai_tool_governor.uninspectable_reason")
+                .map(String::as_str),
+            Some("unrecognized_tool_call_shape")
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_names_inside_a_read_call_are_not_flagged() {
+        let plugin = make(deny_by_default());
+        let body = json!({
+            "type": "message", "role": "assistant",
+            "content": [{ "type": "tool_use", "id": "t1", "name": "safe",
+                "input": { "tool_calls": [{ "type": "function_call" }] } }]
+        });
+        let (result, ctx) = govern_buffered(&plugin, body).await;
+        assert_continue(result);
+        assert!(
+            !ctx.metadata
+                .contains_key("ai_tool_governor.uninspectable_reason")
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_unread_marker_beside_a_readable_delta_is_cut() {
+        let plugin = make(deny_by_default_streaming());
+        let frame = openai_chunk_frame("safe", r#","toolCall":{"name":"danger"}"#);
+        let (out, terminated) = drive(&plugin, &[frame.as_bytes()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+    }
+
+    // --- CLAUDE-8: OpenAI Responses event streams ---------------------------
+
+    fn responses_event(kind: &str, data: Value) -> String {
+        format!("event: {kind}\ndata: {data}\n\n")
+    }
+
+    fn responses_stream(name: &str, deltas: &[&str], done_arguments: &str) -> String {
+        let mut body = responses_event(
+            "response.created",
+            json!({"type":"response.created","response":{"id":"resp_1","output":[]}}),
+        );
+        body += &responses_event(
+            "response.output_item.added",
+            json!({"type":"response.output_item.added","output_index":0,
+                "item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":name,"arguments":""}}),
+        );
+        for delta in deltas {
+            body += &responses_event(
+                "response.function_call_arguments.delta",
+                json!({"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":delta}),
+            );
+        }
+        body += &responses_event(
+            "response.function_call_arguments.done",
+            json!({"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":0,"arguments":done_arguments}),
+        );
+        body += &responses_event(
+            "response.output_item.done",
+            json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":name,"arguments":done_arguments}}),
+        );
+        body += &responses_event(
+            "response.completed",
+            json!({"type":"response.completed","response":{"id":"resp_1","status":"completed",
+                "output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":name,"arguments":done_arguments}]}}),
+        );
+        body
+    }
+
+    #[tokio::test]
+    async fn responses_stream_allowed_call_is_released_byte_identical() {
+        let plugin = make(deny_by_default_streaming());
+        let body = responses_stream("safe", &["{\"ci", "ty\":\"NYC\"}"], "{\"city\":\"NYC\"}");
+        let (first, second) = body.as_bytes().split_at(body.len() / 3);
+        let (out, terminated) = drive(&plugin, &[first, second]).await;
+        assert!(
+            !terminated,
+            "an allowed Responses call must not cut the stream"
+        );
+        assert_eq!(out, body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn responses_stream_denied_call_is_cut_before_release() {
+        let plugin = make(deny_by_default_streaming());
+        let body = responses_stream("danger", &["{}"], "{}");
+        let (out, terminated) = drive(&plugin, &[body.as_bytes()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_blocked_pattern_needs_reassembled_deltas() {
+        let plugin = make(json!({
+            "default_action": "deny",
+            "tools": { "safe": { "action": "allow",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-secret-[0-9]+" }] } },
+            "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+        }));
+        let body = responses_stream(
+            "safe",
+            &["{\"k\":\"sk-sec", "ret-42\"}"],
+            "{\"k\":\"sk-secret-42\"}",
+        );
+        let (out, terminated) = drive(&plugin, &[body.as_bytes()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("secret-42"));
+    }
+
+    #[tokio::test]
+    async fn responses_restatement_that_differs_from_the_deltas_fails_closed() {
+        let plugin = make(deny_by_default_streaming());
+        // Deltas build an allowed document; the `.done` restatement a client
+        // may act on carries different arguments.
+        let body = responses_stream("safe", &["{}"], "{\"rm\":\"-rf\"}");
+        let (out, terminated) = drive(&plugin, &[body.as_bytes()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("-rf"));
+    }
+
+    #[tokio::test]
+    async fn responses_call_only_in_the_completed_event_is_governed() {
+        let plugin = make(deny_by_default_streaming());
+        let body = responses_event(
+            "response.completed",
+            json!({"type":"response.completed","response":{"id":"resp_1",
+                "output":[{"type":"function_call","call_id":"call_1","name":"danger","arguments":"{}"}]}}),
+        );
+        let (out, terminated) = drive(&plugin, &[body.as_bytes()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+    }
+
+    // --- CLAUDE-9: per-tool caller identity scopes --------------------------
+
+    fn consumer_with(username: &str, groups: &[&str]) -> Arc<Consumer> {
+        let mut consumer = super::super::plugin_utils::create_test_consumer();
+        consumer.username = username.to_string();
+        consumer.acl_groups = groups.iter().map(|group| group.to_string()).collect();
+        Arc::new(consumer)
+    }
+
+    async fn govern_as(
+        plugin: &AiToolGovernor,
+        consumer: Option<Arc<Consumer>>,
+        name: &str,
+    ) -> (PluginResult, RequestContext) {
+        let mut ctx = create_test_context();
+        ctx.identified_consumer = consumer;
+        let body = response_with_tool_call(name, "{}");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await;
+        (result, ctx)
+    }
+
+    #[tokio::test]
+    async fn allowed_groups_scope_a_tool_to_its_callers() {
+        let plugin = make(json!({
+            "default_action": "allow",
+            "tools": { "kubectl.apply": { "action": "allow", "allowed_groups": ["sre"] } }
+        }));
+        let (result, _) = govern_as(
+            &plugin,
+            Some(consumer_with("ana", &["sre"])),
+            "kubectl.apply",
+        )
+        .await;
+        assert_continue(result);
+        let (result, ctx) = govern_as(
+            &plugin,
+            Some(consumer_with("bob", &["support"])),
+            "kubectl.apply",
+        )
+        .await;
+        assert_reject(result, Some(403));
+        assert_eq!(
+            ctx.metadata
+                .get("ai_tool_governor.policy_ids")
+                .map(String::as_str),
+            Some("kubectl.apply")
+        );
+        let (result, _) = govern_as(&plugin, None, "kubectl.apply").await;
+        assert_reject(result, Some(403));
+        // Other tools are untouched by the scope.
+        let (result, _) = govern_as(&plugin, Some(consumer_with("bob", &[])), "github.read").await;
+        assert_continue(result);
+    }
+
+    #[tokio::test]
+    async fn denied_consumers_win_over_allowed_groups() {
+        let plugin = make(json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "allow",
+                "allowed_groups": ["sre"], "denied_consumers": ["mallory"] } }
+        }));
+        let (result, _) =
+            govern_as(&plugin, Some(consumer_with("mallory", &["sre"])), "deploy").await;
+        assert_reject(result, Some(403));
+        let (result, _) = govern_as(&plugin, Some(consumer_with("ana", &["sre"])), "deploy").await;
+        assert_continue(result);
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_tool_definitions_are_refused() {
+        let plugin = make(json!({
+            "default_action": "deny",
+            "tools": { "get_weather": { "action": "allow", "allowed_consumers": ["someone-else"] } },
+            "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+        }));
+        let body =
+            json!({ "tools": [{ "type": "function", "function": { "name": "get_weather" } }] });
+        assert_reject(govern_request_definitions(&plugin, body).await, Some(403));
+    }
+
+    #[test]
+    fn caller_scope_lists_are_validated() {
+        for scope in [
+            json!([]),
+            json!("sre"),
+            json!([7]),
+            json!([""]),
+            json!(["x".repeat(513)]),
+        ] {
+            let error = try_make(json!({
+                "tools": { "deploy": { "action": "allow", "allowed_groups": scope } }
+            }))
+            .err()
+            .expect("invalid scope must be rejected");
+            assert!(error.contains("allowed_groups"), "{error}");
+        }
+    }
+
+    // --- CLAUDE-10: glob tool keys -------------------------------------------
+
+    #[tokio::test]
+    async fn glob_keys_govern_tool_families() {
+        let plugin = make(json!({
+            "default_action": "deny",
+            "tools": {
+                "github.*": { "action": "allow" },
+                "github.delete*": { "action": "deny" },
+                "github.read_secret": { "action": "deny" },
+                "*delete*": { "action": "deny" }
+            }
+        }));
+        let (result, ctx) = govern_as(&plugin, None, "github.create_pr").await;
+        assert_continue(result);
+        assert_eq!(
+            ctx.metadata
+                .get("ai_tool_governor.policy_ids")
+                .map(String::as_str),
+            Some("github.*"),
+            "policy ids name the glob key that governed the call"
+        );
+        // More literal bytes win among globs; an exact key beats every glob.
+        for denied in [
+            "github.delete_repo",
+            "github.read_secret",
+            "repo/delete_all",
+            "gitlab.merge",
+        ] {
+            let (result, _) = govern_as(&plugin, None, denied).await;
+            assert_reject(result, Some(403));
+        }
+    }
+
+    #[test]
+    fn glob_keys_are_bounded() {
+        let error = try_make(json!({
+            "tools": { format!("{}*", "a".repeat(256)): { "action": "allow" } }
+        }))
+        .err()
+        .expect("oversized glob key");
+        assert!(error.contains("glob"), "{error}");
+    }
+
+    // --- CLAUDE-12: approval channel authentication and transport -----------
+
+    fn approval_with(endpoint: &str, extra: Value) -> Value {
+        let mut approval = json!({ "endpoint_url": endpoint });
+        if let (Some(target), Some(extra)) = (approval.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": approval
+        })
+    }
+
+    #[test]
+    fn cleartext_approval_endpoint_requires_loopback_or_opt_in() {
+        let validator = openapi_config_validator();
+        for (endpoint, extra, admitted) in [
+            ("http://approval.example/decide", json!({}), false),
+            ("HTTP://approval.example/decide", json!({}), false),
+            ("http://10.1.2.3/decide", json!({}), false),
+            (
+                "http://approval.example/decide",
+                json!({ "allow_plaintext": true }),
+                true,
+            ),
+            ("http://127.0.0.1:9000/decide", json!({}), true),
+            ("http://[::1]:9000/decide", json!({}), true),
+            ("https://approval.example/decide", json!({}), true),
+        ] {
+            assert_admission_parity(
+                &validator,
+                &approval_with(endpoint, extra),
+                admitted,
+                endpoint,
+            );
+        }
+    }
+
+    #[test]
+    fn approval_headers_are_validated_at_admission() {
+        for headers in [
+            json!({ "Content-Type": "text/plain" }),
+            json!({ "X-Ferrum-Hops": "1" }),
+            json!({ "Bad Name": "x" }),
+            json!({ "X-Token": "line\nbreak" }),
+            json!({ "X-Token": "" }),
+            json!({ "X-Token": 7 }),
+            json!({ "X-Token": "${PATH}" }),
+            json!({ "X-Token": "${FERRUM_ADMIN_JWT_SECRET}" }),
+            json!({ "X-Tenant": "a", "x-tenant": "b" }),
+        ] {
+            let config = approval_with(
+                "https://approval.example/decide",
+                json!({ "headers": headers }),
+            );
+            let error = try_make(config.clone())
+                .err()
+                .unwrap_or_else(|| panic!("must reject {headers}"));
+            assert!(error.contains("approval.headers"), "{error}");
+            assert!(
+                !error.contains("line\nbreak"),
+                "values are never echoed: {error}"
+            );
+        }
+        assert!(
+            try_make(approval_with(
+                "https://approval.example/decide",
+                json!({ "headers": {
+                    "X-Tenant": "acme",
+                    "Authorization": "${FERRUM_PLUGIN_SECRET_GOVERNOR_APPROVAL_TOKEN}"
+                } }),
+            ))
+            .is_ok(),
+            "a namespaced reference is admitted without the live secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_headers_are_sent_with_secrets_resolved_lazily() {
+        let env = crate::unit::env_lock::EnvGuard::new(&[]);
+        env.set(
+            "FERRUM_PLUGIN_SECRET_GOVERNOR_APPROVAL_TOKEN",
+            "Bearer governor-approval-token",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let plugin = make(approval_with(
+            &format!("{}/approve", server.uri()),
+            json!({ "headers": {
+                "X-Tenant": "acme",
+                "Authorization": "${FERRUM_PLUGIN_SECRET_GOVERNOR_APPROVAL_TOKEN}"
+            } }),
+        ));
+        let body = response_with_tool_call("deploy", "{}");
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+        );
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1);
+        let header = |name: &str| {
+            received[0]
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(header("x-tenant").as_deref(), Some("acme"));
+        assert_eq!(
+            header("authorization").as_deref(),
+            Some("Bearer governor-approval-token")
+        );
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn missing_header_secret_fails_through_fail_on_error() {
+        let env = crate::unit::env_lock::EnvGuard::new(&[]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let plugin = make(approval_with(
+            &format!("{}/approve", server.uri()),
+            json!({ "headers": {
+                "Authorization": "${FERRUM_PLUGIN_SECRET_GOVERNOR_MISSING_TOKEN}"
+            } }),
+        ));
+        let body = response_with_tool_call("deploy", "{}");
+        let mut ctx = create_test_context();
+        match plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await
+        {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(
+                    !body.contains("GOVERNOR_MISSING_TOKEN"),
+                    "the reference name is never echoed: {body}"
+                );
+            }
+            other => panic!("expected fail-closed reject, got {other:?}"),
+        }
+        server.verify().await;
+        drop(env);
     }
 }

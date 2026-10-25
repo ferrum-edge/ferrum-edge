@@ -36419,7 +36419,7 @@ components:
 
     AiToolGovernorConfig:
       type: object
-      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions across every provider shape (OpenAI tools[].function.name / functions[].name, Anthropic tools[].name, Google tools[].functionDeclarations[].name, Bedrock toolConfig.tools[].toolSpec.name), buffered response tool calls (OpenAI choices[].message.tool_calls[] and legacy function_call, OpenAI Responses output[] function_call items, Anthropic content[] tool_use blocks, Google candidates[].content.parts[].functionCall, Cohere v2 message.tool_calls[], Bedrock Converse output.message.content[].toolUse), streaming SSE tool-call deltas in the OpenAI, Anthropic (content_block_start / input_json_delta), Cohere v2 (tool-call-start / tool-call-delta), and Google shapes (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. A payload carrying a tool-call marker this plugin cannot read is ungovernable and fails closed in enforce mode by default (see unknown_shape_action). Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
+      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions across every provider shape (OpenAI tools[].function.name / functions[].name, Anthropic tools[].name, Google tools[].functionDeclarations[].name, Bedrock toolConfig.tools[].toolSpec.name), buffered response tool calls (OpenAI choices[].message.tool_calls[] and legacy function_call, OpenAI Responses output[] function_call items, Anthropic content[] tool_use blocks, Google candidates[].content.parts[].functionCall, Cohere v2 message.tool_calls[], Bedrock Converse output.message.content[].toolUse), streaming SSE tool-call deltas in the OpenAI Chat Completions, OpenAI Responses (response.output_item.added / response.function_call_arguments.delta, with every .done / response.completed restatement required to match the accumulated call exactly), Anthropic (content_block_start / input_json_delta), Cohere v2 (tool-call-start / tool-call-delta), and Google shapes (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. A payload carrying a tool-call marker this plugin cannot read is ungovernable and fails closed in enforce mode by default (see unknown_shape_action). Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, a JSON response that is well-formed but beyond the inspection parser's nesting/numeric limits is rejected (malformed JSON is still forwarded), an SSE event that is not valid UTF-8 or carries such JSON cuts the stream, and streaming holds past the 4 MiB cap cut the stream. Configuration is strict: unknown root, inspect, tool-policy, blocked-pattern, approval, response, and observability properties are rejected (with path-qualified diagnostics). The free-form `tools` name map and arbitrary per-tool `json_schema` document remain open. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
       properties:
         enabled:
           type: boolean
@@ -36477,6 +36477,10 @@ components:
                         max_arg_bytes: true
                         required_args: true
                         json_schema: true
+                        allowed_consumers: true
+                        denied_consumers: true
+                        allowed_groups: true
+                        denied_groups: true
                         blocked_arg_patterns:
                           if:
                             type: array
@@ -36500,6 +36504,8 @@ components:
                     cache_ttl_seconds: true
                     fail_on_error: true
                     include_arguments: true
+                    headers: true
+                    allow_plaintext: true
               response:
                 if:
                   type: object
@@ -36624,7 +36630,7 @@ components:
           type: string
           enum: [deny, allow]
           default: deny
-          description: "Posture for a governed payload that carries a live tool-call marker (tool_calls / toolCalls / tool_use / toolUse / function_call / functionCall member names, or a block tagged type: tool_use / function_call / tool-call) from which no call could be extracted — a provider tool-call shape this plugin cannot read. deny (default) treats it as ungovernable: enforce rejects the body or cuts the stream, dry_run forwards. allow forwards it as if no tool call were present. BOTH settings record the fixed ai_tool_governor.uninspectable_reason=unrecognized_tool_call_shape observation without claiming a decision, so an unreadable shape is never silently permitted. Payloads with no tool-call marker at all (ordinary REST JSON on a shared proxy, embeddings/moderations responses, content-only completions) are out of scope under both settings."
+          description: "Posture for a governed payload that carries a live tool-call marker (tool_calls / toolCalls / tool_use / toolUse / function_call / functionCall member names, or a block tagged type: tool_use / function_call / tool-call) from which no call could be extracted — a provider tool-call shape this plugin cannot read — or, when calls WERE extracted, a marker outside every location the extractors read (a second call a normalizing client may honor; markers inside an extracted call's own arguments never count). deny (default) treats it as ungovernable: enforce rejects the body or cuts the stream, dry_run forwards. allow forwards it as if no tool call were present. BOTH settings record the fixed ai_tool_governor.uninspectable_reason=unrecognized_tool_call_shape observation without claiming a decision, so an unreadable shape is never silently permitted. Payloads with no tool-call marker at all (ordinary REST JSON on a shared proxy, embeddings/moderations responses, content-only completions) are out of scope under both settings."
         inspect:
           type: object
           additionalProperties: false
@@ -36654,7 +36660,11 @@ components:
           type: object
           propertyNames:
             minLength: 1
-          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name). When composed with mcp_gateway aggregate_router, keys remain the public namespaced names: a trusted public-to-upstream rewrite is remapped for the final-body recheck only when the final wire name exactly matches that staged upstream alias; final arguments are still re-evaluated and unrelated name changes fail closed. The tool-name map is intentionally free-form; each policy object is closed."
+            if:
+              pattern: '\*'
+            then:
+              maxLength: 256
+          description: "Per-tool policy, keyed by a non-empty tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name) or by a glob containing `*` (e.g. github.*, *delete*). `*` matches any run of characters including none (it crosses `.`, `/`, and `_`), anchored at both ends. Precedence: an exact key always wins; among matching globs the one with the most literal (non-`*`) bytes wins, then fewer wildcards, then byte order of the key. At most 256 glob keys, each at most 256 UTF-8 bytes; globs are never A2A aliases. policy_ids metadata records the governing key. When composed with mcp_gateway aggregate_router, keys remain the public namespaced names: a trusted public-to-upstream rewrite is remapped for the final-body recheck only when the final wire name exactly matches that staged upstream alias; final arguments are still re-evaluated and unrelated name changes fail closed. The tool-name map is intentionally free-form; each policy object is closed."
           additionalProperties:
             type: object
             additionalProperties: false
@@ -36706,35 +36716,57 @@ components:
                     regex:
                       type: string
                       minLength: 1
-                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted. Patterns that match empty input are rejected at config load; contextual zero-length matches fail closed at runtime."
+                      description: "Regex matched against the raw arguments string and, when the raw text contains a JSON escape, also against its JSON-decoded views (the canonical re-serialization and every decoded string, member names included), so an escaped spelling such as a unicode-escaped underscore cannot hide a match. Under a non-redact action a match in any view denies; under redact_args a raw match is redacted, and a match visible only in a decoded view (which raw-text redaction cannot remove) denies instead. Patterns that match empty input are rejected at config load; contextual zero-length matches fail closed at runtime."
                 description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args. At most 32 patterns per tool; every append is checked before allocation and redacted output is capped at the 4 MiB inspectable body limit."
               json_schema:
                 type: object
                 description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny. Intentionally open — arbitrary JSON Schema keywords are allowed; do not set additionalProperties: false here."
+              allowed_consumers:
+                $ref: "#/components/schemas/AiToolGovernorCallerScopeList"
+              denied_consumers:
+                $ref: "#/components/schemas/AiToolGovernorCallerScopeList"
+              allowed_groups:
+                $ref: "#/components/schemas/AiToolGovernorCallerScopeList"
+              denied_groups:
+                $ref: "#/components/schemas/AiToolGovernorCallerScopeList"
         approval:
           type: object
           additionalProperties: false
           description: "Approval webhook, required when any policy can reach require_approval."
           required: [endpoint_url]
+          allOf:
+            # Cleartext to anything but a loopback IP literal needs the opt-in.
+            - if:
+                required: [endpoint_url]
+                properties:
+                  endpoint_url:
+                    pattern: '^[hH][tT][tT][pP]:'
+                    not:
+                      pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:[/?#]|$)'
+              then:
+                required: [allow_plaintext]
+                properties:
+                  allow_plaintext:
+                    const: true
           properties:
             endpoint_url:
               type: string
               minLength: 1
               format: uri
               pattern: '^[Hh][Tt][Tt][Pp][Ss]?://(?:[^/?#]*@)?(?:\[[^\]]+\]|[^/?#:@]+)(?::[0-9]+)?(?:[/?#]|$)'
-              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). The URI scheme is case-insensitive (runtime parsing normalizes it before the http/https check), so HTTPS://host/path is admitted exactly like https://host/path. Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id. Response bodies are capped at 64 KiB."
+              description: "http/https URL POSTed with request_id, consumer, principal (the authority-qualified caller: {kind: consumer, namespace, id} for a mapped Consumer, or {kind: external, subject, mechanism, authority} where authority is the opaque hex digest of the verifying authority), proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). An http:// URL is admitted only to a loopback IP literal written as a dotted-quad 127.d.d.d or [::1] unless allow_plaintext is true, because a cleartext channel lets a man-in-the-middle forge allow verdicts. The URI scheme is case-insensitive (runtime parsing normalizes it before the http/https check), so HTTPS://host/path is admitted exactly like https://host/path. Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id. Response bodies are capped at 64 KiB."
             timeout_ms:
               type: integer
               minimum: 1
               maximum: 30000
               default: 1500
-              description: "Per-request approval webhook timeout (max 30000). A whole batch of approvals is also capped at 30s cumulative wait; after an enforce-mode block, further webhook calls in that batch are skipped. At most 64 concrete tool calls are governed per request/response/SSE batch. Dropping the governing future (client cancel) cancels any in-flight approval HTTP call."
+              description: "Per-request approval webhook timeout (max 30000). A batch resolves its approvals with at most 8 webhook calls in flight and the whole batch is capped at 30s of approval wait; after an enforce-mode block, no further webhook call in that batch is started (calls already in flight complete). Calls identical in name and arguments within one batch share one resolution when cache_ttl_seconds > 0. At most 64 concrete tool calls are governed per request/response/SSE batch. Dropping the governing future (client cancel) cancels any in-flight approval HTTP call."
             cache_ttl_seconds:
               type: integer
               minimum: 0
               maximum: 2592000
               default: 300
-              description: "TTL for caching an approval decision keyed by consumer+proxy+model+provider+tool+arguments. 0 disables caching. The cache is bounded (4096 entries); at capacity expired entries are purged and new decisions are not cached rather than growing memory."
+              description: "TTL for caching an approval decision keyed by consumer+principal+proxy+model+provider+tool+arguments, so equal subject strings verified by different authorities never share a decision. 0 disables caching. The cache is bounded (4096 entries); at capacity expired entries are purged and new decisions are not cached rather than growing memory."
             fail_on_error:
               type: string
               enum: [reject, warn, allow]
@@ -36744,6 +36776,20 @@ components:
               type: boolean
               default: false
               description: "Include the raw tool arguments in the approval request body. Off by default so secrets are not sent."
+            headers:
+              type: object
+              maxProperties: 32
+              propertyNames:
+                minLength: 1
+              additionalProperties:
+                type: string
+                minLength: 1
+                maxLength: 8192
+              description: "Extra request headers for the approval call (for example an Authorization credential). A value is a literal, or a whole-value ${FERRUM_PLUGIN_SECRET_<NAME>} reference resolved from the process environment at the first approval call (an unset or invalid secret is an approval endpoint error handled by fail_on_error; config validation does not need the live secret). Names must be valid HTTP header names, unique case-insensitively, and may not be content-type, content-length, host, transfer-encoding, connection, keep-alive, proxy-connection, te, trailer, upgrade, or X-Ferrum-Hops; values must be valid header values. Runtime admission additionally enforces the reference namespace and a stricter 8192 UTF-8 byte value cap (OpenAPI maxLength counts Unicode characters). Values are never logged or echoed in diagnostics."
+            allow_plaintext:
+              type: boolean
+              default: false
+              description: "Admit an http:// endpoint_url whose host is not a loopback IP literal. Verdicts, any headers credential, and (with include_arguments) raw arguments then cross the network in clear."
         response:
           type: object
           additionalProperties: false
@@ -36780,6 +36826,16 @@ components:
               minimum: 0
               default: 0
               description: "When > 0, log up to this many bytes of a blocked call's raw arguments at debug for audit. 0 keeps raw arguments out of logs entirely."
+
+    AiToolGovernorCallerScopeList:
+      type: array
+      minItems: 1
+      maxItems: 256
+      items:
+        type: string
+        minLength: 1
+        maxLength: 512
+      description: "Per-tool caller-identity scope (ai_tool_governor allowed_consumers / denied_consumers by Consumer username, allowed_groups / denied_groups by Consumer acl_groups). Evaluated after a per-tool deny or dry_run and before argument checks and approval. A denied_* match denies; with any allowed_* list configured the caller must match an allowed consumer or group; with any scope configured, a request without a mapped Consumer is denied. A tool definition outside the caller's scope is refused like a denied tool. Runtime admission enforces a stricter 512 UTF-8 byte entry cap (OpenAPI maxLength counts Unicode characters)."
 
     AiFederationConfig:
       type: object
