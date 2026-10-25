@@ -27063,8 +27063,10 @@ components:
             pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
           description: |
             Custom tags populated from request headers (`tag_name ->
-            header_name`). Credential-bearing source headers and reserved or
-            sensitive destination names are rejected; runtime values over 1024
+            header_name`). Credential-bearing source headers (including a
+            `pat` segment such as `x-pat` and a terminal `auth` segment such
+            as `x-basic-auth`) and reserved or sensitive destination names
+            are rejected; runtime values over 1024
             bytes are omitted. Fail closed: a source header not declared in
             `safe_tag_sources` is copied as `[REDACTED]`, never verbatim. This
             map, `custom_tags`, and `custom_env_tags` may contain at most
@@ -27090,8 +27092,10 @@ components:
             metadata redactor's credential classes such as session
             identifiers, passphrases/passcodes, PINs and one-time codes, JWTs,
             signatures, private/signing key material and bearer assertions,
-            database connection locations, client credential identifiers, and
-            operator-configured sensitive metadata names) are rejected.
+            database connection locations, client credential identifiers, a
+            `PAT` segment such as `GITHUB_PAT`, a terminal `AUTH` segment such
+            as `BASIC_AUTH`, and operator-configured sensitive metadata names)
+            are rejected.
             Non-UTF-8 or >1024-byte values fail construction closed. Values of
             variables declared in `safe_tag_sources` are emitted as custom
             transaction and trace metadata; any other variable is emitted as
@@ -27144,7 +27148,11 @@ components:
                     type: string
                     description: |
                       Tag name to override. Accepts Istio names such as
-                      `source_workload` and Ferrum `mesh.*` label names.
+                      `source_workload` and `grpc_response_status`, and Ferrum
+                      `mesh.*` label names. TCP families never render
+                      `response_code` or `grpc_response_status`. A
+                      `response_code` value that is a status's canonical
+                      decimal spelling shares that status's series.
                   operation:
                     type: object
                     required: [type]
@@ -27256,7 +27264,16 @@ components:
             Per-provider tracing exporters surfaced from the Istio Telemetry
             CRD via the mesh slice. Also enables trace-context propagation
             when span reporting is disabled. Present null or [] disables
-            exporters and overrides the singular fallback.
+            exporters and overrides the singular fallback. A `zipkin`
+            provider also injects the active span as B3 (`x-b3-traceid`,
+            `x-b3-spanid`, `x-b3-parentspanid`, `x-b3-sampled`) beside W3C
+            `traceparent`; B3 is likewise refreshed from the active span
+            whenever the backend request still carries B3 headers, and the
+            single-header `b3` form is written when the request used it.
+            Spans an exporter refuses at enqueue or discards at delivery
+            (`reason="export_failed"`) are counted on
+            `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` with
+            fixed labels only.
         tracing_provider:
           description: |
             Singular tracing exporter fallback. Ignored when
