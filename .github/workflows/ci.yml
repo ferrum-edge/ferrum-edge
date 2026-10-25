@@ -1325,6 +1325,7 @@ jobs:
               integration::h3_backend_retirement_tests
               integration::mesh_h3_plain_ws_bridge_tests
               integration::grpc_proxy_tests
+              integration::h2_request_body_deadline_tests
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
               integration::backend_timeout_enforcement_tests

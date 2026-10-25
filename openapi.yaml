@@ -23904,6 +23904,13 @@ components:
         a different issuer are never tried. At most 64 providers are allowed,
         and for every issuer the providers sharing it plus the providers
         without an issuer must total at most 8 (at most 8 may omit issuer).
+        A provider without an issuer never authenticates a token whose
+        verified iss is the issuer of a provider in the same instance that
+        requires DPoP or mTLS binding, so it cannot strip that realm's sender
+        constraint. Verified algorithms: RS256/RS384/RS512,
+        PS256/PS384/PS512, ES256/ES384, and EdDSA (Ed25519 OKP keys; refused
+        while FIPS mode is enforced). ES512 is not supported. Verification is
+        bound to the selected JWK's alg (an RSA JWK without alg is RS256).
       required: [providers]
       properties:
         providers:
@@ -23951,6 +23958,10 @@ components:
                   from a different origin than discovery, configure jwks_uri
                   directly instead. HTTPS is required except for literal
                   loopback or localhost endpoints. URL userinfo is rejected.
+                  After the first successful resolution, discovery is re-run
+                  every jwks_refresh_interval_secs; a changed jwks_uri is
+                  adopted once its key set has usable keys, otherwise the
+                  last-known-good store is retained.
               jwks:
                 oneOf:
                   - type: string
@@ -24031,8 +24042,8 @@ components:
                   so the enforced expiry is never later than the token states.
                   nbf presence and validation are delegated to the JWT
                   validation layer; Ferrum does not normalize a fractional nbf.
-                  JWT exp/nbf use zero clock leeway; DPoP skew is a separate
-                  proof contract.
+                  JWT exp/nbf use the effective clock_skew_seconds leeway
+                  (default 0); DPoP skew is a separate proof contract.
               required_scopes:
                 type: array
                 items:
@@ -24072,7 +24083,11 @@ components:
               consumer_identity_claim:
                 type: string
                 pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-                description: Per-provider override for consumer identity claim (falls back to global); a dot path with no empty segments
+                description: >-
+                  Per-provider override for the external authenticated identity
+                  claim (falls back to global); a dot path with no empty
+                  segments. The identity is never resolved to a gateway
+                  Consumer.
               consumer_header_claim:
                 type: string
                 pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
@@ -24149,7 +24164,15 @@ components:
               require_mtls_binding:
                 type: boolean
                 default: false
-                description: Require cnf.x5t#S256 to match the frontend client certificate
+                description: >-
+                  Require cnf.x5t#S256 to match the frontend client
+                  certificate. A provider without an issuer never
+                  authenticates a token whose iss is this provider's issuer.
+                  A provider that sets this without an issuer is admitted
+                  only when every provider in the instance also sets it;
+                  otherwise the configuration is rejected, because an
+                  unbound sibling could accept its tokens without the
+                  certificate.
               require_dpop:
                 type: boolean
                 default: false
@@ -24163,10 +24186,16 @@ components:
                   only against providers that set this flag. Validated proof
                   claims are htm, htu, iat, jti and ath (RFC 9449 4.2); exp is
                   not an RFC 9449 proof claim and is not required, but a proof
-                  that carries one is rejected once it has passed. Equivalent
+                  that carries one is rejected once it has passed. The proof
+                  htu path is canonicalized exactly like the request path
+                  (percent-encoded pchar escapes decoded), so a proof bound to
+                  the URI the client sent matches. Proofs may be signed with
+                  ES256/ES384, RS256/RS384/RS512, PS256/PS384/PS512, or EdDSA
+                  (Ed25519; refused while FIPS mode is enforced). Equivalent
                   providers that share one exact issuer must agree on this
                   flag; matching order would otherwise let a sibling skip the
-                  proof.
+                  proof. A provider without an issuer never authenticates a
+                  token whose iss is this provider's issuer.
               dpop_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -24224,6 +24253,15 @@ components:
                   inline jwks provider is rejected. jwks_refresh_interval_secs
                   must not exceed this value — a cross-field rule JSON Schema
                   cannot express, enforced at config load.
+              clock_skew_seconds:
+                type: integer
+                format: uint64
+                minimum: 0
+                maximum: 300
+                description: >-
+                  Per-provider JWT exp/nbf clock leeway in seconds; overrides
+                  the plugin-level clock_skew_seconds. The authenticated-stream
+                  deadline is exp plus this leeway.
           description: Array of identity provider configurations
         scope_claim:
           type: string
@@ -24239,7 +24277,12 @@ components:
           type: string
           default: sub
           pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-          description: JWT claim for consumer lookup; a dot path with no empty segments
+          description: >-
+            JWT claim used as the external authenticated identity; a dot path
+            with no empty segments. The identity is scoped to the provider that
+            verified it and is never resolved to a gateway Consumer (not by
+            username, id, or custom_id), so Consumer-scoped policy does not
+            apply to jwks_auth principals.
         consumer_header_claim:
           type: string
           pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
@@ -24297,6 +24340,17 @@ components:
           type: boolean
           default: true
           description: Global default for requiring an exp claim
+        clock_skew_seconds:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 300
+          default: 0
+          description: >-
+            JWT exp/nbf clock leeway in seconds for every provider without its
+            own clock_skew_seconds. The authenticated-stream deadline is exp
+            plus the effective leeway, never later. DPoP proof skew is the
+            separate dpop_clock_skew_secs.
         jwks_refresh_interval_secs:
           type: integer
           format: uint64
@@ -24305,7 +24359,8 @@ components:
           default: 900
           description: >-
             JWKS key refresh interval in seconds. Must not exceed the effective
-            jwks_max_stale_seconds for any remote provider.
+            jwks_max_stale_seconds for any remote provider. discovery_url
+            providers also re-run OIDC discovery at this interval.
         jwks_max_stale_seconds:
           type: integer
           format: uint64
@@ -25889,6 +25944,13 @@ components:
         rejected at admission rather than dropped, because every misspelling in
         an authorization grammar removes a restriction. See `docs/mesh.md` →
         "MeshPolicy" and "Rule Matching".
+
+        Matchers that could never match are rejected at plugin construction
+        too — for the flat `mesh_policies` form and an embedded `mesh_slice`
+        alike, with the same diagnostics as the native mesh validator: an
+        empty `name` / `namespace`, an empty `from[{}]` or `to[{}]` entry, a
+        `to.headers` pseudo-header, an invalid `hosts` / `not_hosts` pattern,
+        and an inadmissible `port_patterns` / `not_port_patterns` entry.
       required: [name, namespace, scope]
       additionalProperties: false
       properties:
@@ -26163,7 +26225,13 @@ components:
             type: string
           description: |
             Header name (case-insensitive, lowercased at config load) to glob
-            value pattern.
+            value pattern. The pseudo-header names `:path`, `:method`,
+            `:authority`, and `:scheme` are rejected (they are not in the
+            request header map; use `paths` / `methods` / `hosts`, or a
+            `when: request.headers[:path]` condition). A header sent as several
+            field lines is matched as ONE value — every line joined with `, `
+            (`; ` for `cookie`) — the same reading `when: request.headers[...]`
+            conditions and CUSTOM forwarded headers use.
     MeshAuthzConditionMatch:
       type: object
       description: |
@@ -26353,7 +26421,20 @@ components:
             admitted by the runtime deserializer instead, which fails the whole
             plugin generation on a malformed slice so the previous valid
             generation keeps serving. Its `mesh_policies` member follows the
-            same closed policy grammar modelled below.
+            same closed policy grammar modelled below, including the
+            never-match matcher refusals.
+
+            Its `ext_authz_providers` entries may declare
+            `headers_to_upstream_on_allow` (provider response headers that
+            replace the backend request's same-named headers on an allowed
+            CUSTOM check, applied in this plugin's `before_proxy`; client copies
+            are always removed) and `headers_to_downstream_on_allow` (added to
+            the allowed response in `after_proxy`, `Set-Cookie` appended).
+            Gateway identity assertions (`x-consumer-*`, `x-path-param-*`, …),
+            `content-*`, and (upstream) `set-cookie` are refused there. Every
+            check carries `x-ferrum-source-principal`,
+            `x-ferrum-source-namespace`, `x-ferrum-source-service-account`, and
+            `x-ferrum-request-principal`.
         mesh_policies:
           type: array
           description: |
@@ -28194,9 +28275,54 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Malformed XML returns HTTP 400 with a fixed parser category; document names, positions, and raw parser details are never returned or logged. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Every evaluated xsd:dateTime (Timestamp Created/Expires, PasswordDigest Created, SAML Conditions and SubjectConfirmationData bounds) must carry a Z or ±hh:mm zone designator; a zoneless value is rejected rather than read as UTC. Both signature paths settle TRUST FIRST: certificate fingerprint match (plus the matched certificate's notBefore/notAfter window) and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed. Every element value the gateway acts on is read once and returned UNCHANGED: only xsd:dateTime instants and xsd:base64Binary payloads are whitespace-collapsed, so a NameID, Issuer, Audience, Username, or PasswordText value with significant leading/trailing spaces is matched byte for byte against the bytes the signature covered and against configuration. Canonicalization charges the per-message work budget BEFORE each emitted run, so a refused canonical form is never fully allocated. username_token.remove_credential (default false) deletes the verified UsernameToken — or the whole wsse:Security header when it holds only the credential — from the backend-visible message; it is admitted only for an enabled PasswordText policy with no enabled x509_signature or saml and no explicit content_type.allow_mtom=true, its final-body proof binds the sanitized representation, and a signed envelope (400) or an unspliceable UTF-16/MTOM representation (415) is refused rather than forwarded with the credential intact. The schema's conditionals mirror those admission rules, so a configuration this component accepts is one the constructor accepts."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Malformed XML returns HTTP 400 with a fixed parser category; document names, positions, and raw parser details are never returned or logged. A document type (or any other markup) declaration in the prolog is refused with 400; the same characters inside CDATA, comments, or character data are ordinary text, and a declaration after the prolog is malformed XML. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes the SOAP principal as an EXTERNAL authenticated_identity (backend header X-Authenticated-Identity). It never sets identified_consumer: a same-named Consumer is not bound (issue #6082), so Consumer ACL groups and Consumer-specific policy do not apply and access_control admits a SOAP principal only through allow_authenticated_identity; identity-keyed rate limiting, logging, retries, and chargeback observe the one SOAP identity. require_mechanisms (default 'all') selects whether every enabled identity mechanism must be presented and verify, or ('any', at least two enabled) whether they are alternatives of which at least one must be presented and every presented one must verify. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Every evaluated xsd:dateTime (Timestamp Created/Expires, PasswordDigest Created, SAML Conditions and SubjectConfirmationData bounds) must carry a Z or ±hh:mm zone designator; a zoneless value is rejected rather than read as UTC. Both signature paths settle TRUST FIRST: certificate fingerprint match (plus the matched certificate's notBefore/notAfter window) and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget plus a separate namespace-resolution allowance charged scanned entries x compared prefix bytes plus the length of every compared namespace URI (32 x decoded body length, floor 4194304) so inherited namespace declarations, long prefixes, long inherited URIs, and canonical attribute ordering cannot multiply pre-verification CPU. Fixed raw-markup ceilings are enforced before parsing: a start tag with more than 64 attributes (namespace declarations included), an attribute name over 128 bytes, a namespace declaration name over 70 bytes, a namespace URI over 2048 bytes, more than 256 namespace declarations in scope at one element (scope tracked with nesting, so sibling redeclarations do not accumulate), more than 256 distinct (prefix, URI) bindings per envelope, or accumulated parser comparison work (duplicate-attribute, prefix-resolution, and inherited-scope merge) beyond 32 x envelope length (floor 1048576) is refused with 400. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body; References may resolve inside any block of the namespace-correct SOAP Header (the Security header or, e.g., WS-Addressing blocks) or the Body, never the Header element itself or anything outside them; and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, no Conditions child other than AudienceRestriction and at most one each of OneTimeUse and ProxyRestriction, each in its standard shape (an xsi:type must resolve to that element's own standard SAML type, and no extension attribute or non-Audience child is admitted; an unsupported, derived, or extended condition makes the assertion indeterminate and is rejected, SAML Core 2.0 sections 2.5.1.1 and 7.1), exactly one qualifying SubjectConfirmation (a confirmation that does not name the configured recipient with its own bounded NotOnOrAfter and no InResponseTo is skipped, not fatal), exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed, and every shared-replay connection must prove a non-evicting Redis memory policy (maxmemory 0 or maxmemory_policy noeviction) before it carries a claim. Every element value the gateway acts on is read once and returned UNCHANGED: only xsd:dateTime instants and xsd:base64Binary payloads are whitespace-collapsed, so a NameID, Issuer, Audience, Username, or PasswordText value with significant leading/trailing spaces is matched byte for byte against the bytes the signature covered and against configuration. Canonicalization charges the per-message work budget BEFORE each emitted run, so a refused canonical form is never fully allocated. username_token.remove_credential (default false) deletes the verified UsernameToken — or the whole wsse:Security header when it holds only the credential — from the backend-visible message; it is admitted only for an enabled PasswordText policy with no enabled x509_signature or saml and no explicit content_type.allow_mtom=true, its final-body proof binds the sanitized representation, and a signed envelope (400) or an unspliceable UTF-16/MTOM representation (415) is refused rather than forwarded with the credential intact. The schema's conditionals mirror those admission rules, so a configuration this component accepts is one the constructor accepts."
       additionalProperties: false
       allOf:
+        # require_mechanisms=any needs at least two enabled identity
+        # mechanisms; with one it would read as optional authentication.
+        - if:
+            properties:
+              require_mechanisms:
+                const: any
+            required: [require_mechanisms]
+          then:
+            anyOf:
+              - required: [username_token, x509_signature]
+                properties:
+                  username_token:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  x509_signature:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+              - required: [username_token, saml]
+                properties:
+                  username_token:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  saml:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+              - required: [x509_signature, saml]
+                properties:
+                  x509_signature:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  saml:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
         # At least one security feature must be enabled. timestamp.require
         # defaults to true, so this only bites when it is explicitly false and
         # no mechanism is enabled.
@@ -28429,6 +28555,23 @@ components:
                     const: shared
                 required: [replay_scope]
       properties:
+        require_mechanisms:
+          type: string
+          enum: [all, any]
+          default: all
+          description: |
+            How the enabled identity mechanisms (username_token,
+            x509_signature, saml) combine. 'all' (default): every enabled
+            mechanism must be presented and must verify. 'any':
+            WS-SecurityPolicy-style alternatives — a mechanism runs only when
+            its token is presented (a wsse:UsernameToken or message ds:Signature
+            as a direct child of the selected Security header, or a SAML
+            Assertion anywhere in the message); at least one enabled mechanism
+            must be presented (otherwise 401), and EVERY presented token must
+            verify, so a failing token rejects the message even beside a valid
+            one. 'any' requires at least two enabled identity mechanisms and is
+            refused at admission otherwise. The published principal is the first
+            verified mechanism in the order UsernameToken, X.509, SAML.
         reject_missing_security_header:
           type: boolean
           default: true
@@ -28621,7 +28764,7 @@ components:
                     type: string
                     minLength: 1
                     pattern: '\S'
-              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with a username and password that each contain at least one non-whitespace character; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins. Values are matched EXACTLY, including any leading or trailing spaces — the gateway compares the credential the client sent byte for byte and never trims it. Required and non-empty when `enabled` is true.
+              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with a username and password that each contain at least one non-whitespace character; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins. Values are matched EXACTLY, including any leading or trailing spaces — the gateway compares the credential the client sent byte for byte and never trims it. A `password` of exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is resolved once at admission from that process environment variable (populated directly or through the _FILE/_VAULT/_AWS/_AZURE/_GCP secret suffixes); a `${...}` reference to any other variable, or an unset, empty, or whitespace-only value, is refused at admission without echoing the name or value, and the variable must be set on every node that constructs the plugin. Required and non-empty when `enabled` is true.
             created_max_age_seconds:
               type: integer
               format: uint64
@@ -28656,7 +28799,7 @@ components:
                 from the message the BACKEND receives, so a reusable PasswordText
                 secret is not handed to every system behind the gateway. The
                 authenticated identity is still published normally
-                (`authenticated_identity`, `identified_consumer`,
+                (`authenticated_identity`,
                 `ctx.metadata["soap_ws_username"]`).
 
                 Off by default, because a backend may legitimately read the
@@ -28751,8 +28894,17 @@ components:
               6. Validate Issuer (must match `trusted_issuers`), the MANDATORY bounded
                  Conditions window (both NotBefore and NotOnOrAfter required, span capped
                  by `max_assertion_lifetime_seconds`, `clock_skew_seconds` tolerance), the
-                 service `audience` on every AudienceRestriction, and one supported
-                 SubjectConfirmation naming `recipient`.
+                 service `audience` on every AudienceRestriction, and every other
+                 Conditions child: at most one OneTimeUse and at most one
+                 ProxyRestriction are accepted, each standard condition only in its
+                 standard shape (an `xsi:type` must resolve to its own standard SAML
+                 type; no extension attributes or non-Audience children), and any
+                 other condition (a `saml:Condition` extension, a derived or extended
+                 standard condition, or a foreign element) makes the assertion
+                 indeterminate and is rejected (SAML Core 2.0 section 2.5.1.1) before
+                 its id is claimed. Exactly one SubjectConfirmation must qualify by
+                 naming `recipient`; a non-qualifying confirmation is skipped, and
+                 none or more than one qualifying is rejected.
               7. Resolve exactly one namespace-correct, nonblank Subject NameID.
                  This happens before replay state is consumed, so an otherwise
                  valid assertion that authenticates nobody fails with 401
@@ -28766,7 +28918,7 @@ components:
                  is a single-replica declaration and makes NO cross-replica claim;
                  multi-replica SAML deployments must use 'shared'.
               9. Publish the Subject NameID as the request principal
-                 (authenticated_identity plus a namespace-correct identified_consumer) and
+                 (an external authenticated_identity, never mapped to a Consumer) and
                  mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
             On any failure the request is rejected with HTTP 401. Rejections never echo
             the issuer, audience, recipient, subject, or assertion id. Unsupported
@@ -28979,10 +29131,16 @@ components:
                 redis_health_check_interval_seconds without a reload (a
                 literal-IP egress-policy denial is the exception and is a
                 configuration fix; hostname denials re-screen because DNS
-                answers can change). Claim durability is Redis's own: run the
-                replay keyspace
-                with maxmemory-policy noeviction and consistent failover, since
-                a lost claim key makes its nonce claimable again. Admission
+                answers can change). Because SET NX cannot tell an evicted claim
+                from an unused nonce or assertion, every shared-replay
+                connection (first dial and recovery probe) runs INFO MEMORY and
+                must prove maxmemory 0 or maxmemory_policy noeviction before it
+                carries a claim: a proven evicting policy is terminal for the
+                plugin generation, an unprovable answer is a recoverable outage,
+                and both fail closed like any other shared-backend outage.
+                Durability across failover is Redis's own: run the replay
+                keyspace with consistent failover, since a lost claim key makes
+                its nonce claimable again. Admission
                 enforces the pairing in both directions: shared without
                 sync_mode=redis is rejected, and sync_mode=redis without shared
                 is rejected.
@@ -30880,16 +31038,18 @@ components:
     CompressionConfig:
       type: [object, "null"]
       additionalProperties: false
-      description: "Plugin: compression — Null or an empty object uses defaults. On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool acquired only immediately before the blocking worker, while response buffering for compression is admitted by an independent bounded response-buffer semaphore reserved in before_proxy and held across the encode (with ineligible owners leaving the slot on the context for sibling handoff), so a slow backend cannot starve request decompression; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total and ferrum_compression_response_buffer_{admitted,saturated}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths when identity remains acceptable, or replaces the response with 406 when the client excluded identity, rather than emitting mislabeled or explicitly refused plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. That decode runs on the shared strict, budget-charged decoder: br refuses Large Window Brotli, and the decoder's own heap plus every output growth (and, on a stacked chain, the previous pass's still-resident buffer) is reserved against FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES before allocation, so an aggregate-budget refusal is a gateway 503 rather than a client 400. Normalization happens exactly once per request on every frontend: H1/H2 dispatch now receives the ownership context the native H3 path always had, so an already-normalized upload is never decoded a second time. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. That refusal is taken only after every effective instance in the chain has declined, so an earlier instance whose algorithms or content_types cannot serve this response never pre-empts a later sibling that can, and a committed coding is never turned back into a 406. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Response buffering is only forced for responses this instance could actually encode: already-encoded origin responses and responses whose known Content-Length is below min_content_length stream instead of being collected. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
+      description: "Plugin: compression — Null or an empty object uses defaults. On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli, and opt-in zstd) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool acquired only immediately before the blocking worker, while response buffering for compression is admitted by an independent bounded response-buffer semaphore reserved in before_proxy and held across the encode (with ineligible owners leaving the slot on the context for sibling handoff), so a slow backend cannot starve request decompression; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total and ferrum_compression_response_buffer_{admitted,saturated}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths when identity remains acceptable, or replaces the response with 406 when the client excluded identity, rather than emitting mislabeled or explicitly refused plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. That decode runs on the shared strict, budget-charged decoder: br refuses Large Window Brotli, and the decoder's own heap plus every output growth (and, on a stacked chain, the previous pass's still-resident buffer) is reserved against FERRUM_REQUEST_DECODE_MAX_TOTAL_BYTES before allocation, so an aggregate-budget refusal is a gateway 503 rather than a client 400. Normalization happens exactly once per request on every frontend: H1/H2 dispatch now receives the ownership context the native H3 path always had, so an already-normalized upload is never decoded a second time. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. That refusal is taken only after every effective instance in the chain has declined, so an earlier instance whose algorithms or content_types cannot serve this response never pre-empts a later sibling that can, and a committed coding is never turned back into a 406. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Negotiation reads the client's own Accept-Encoding captured at request init, so a request_transformer rule that rewrites or removes the backend-facing header cannot select a coding the client refused or erase an identity;q=0. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation), unless weaken_strong_etag opts into compressing with a weak validator. When FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES (or the route ceiling) is unlimited or above 32 MiB, compression is length-gated: only a response whose backend declares a Content-Length within min(32 MiB, the buffered-response fallback) is buffered and encoded, other responses stream identity (406 when identity is refused), and plugin construction logs a warning. A later hook relabeling a committed Content-Encoding to a coding the instance cannot produce aborts the encode to identity (or 406). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Response buffering is only forced for responses this instance could actually encode: already-encoded origin responses and responses whose known Content-Length is below min_content_length stream instead of being collected. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
       properties:
         algorithms:
           type: [array, "null"]
           minItems: 1
+          maxItems: 3
+          uniqueItems: true
           items:
             type: string
-            enum: [gzip, br, brotli]
+            enum: [gzip, br, brotli, zstd]
           default: [gzip, br]
-          description: "Enabled compression algorithms in server preference order. An empty array is rejected at construction, as is an array left with no usable codec after the process-wide FERRUM_COMPRESSION_* gates. Null selects the default."
+          description: "Enabled compression algorithms in server preference order (ties in client q-value go to the earlier entry). `zstd` (RFC 9659) is opt-in and never part of the default; it has no process-wide gate, and listing it also enables zstd request decompression when decompress_request is true. Each algorithm may appear once (`brotli` is an alias of `br`, so the pair is a repeat and is rejected at construction). An empty array is rejected at construction, as is an array left with no usable codec after the process-wide FERRUM_COMPRESSION_* gates. Null selects the default."
         min_content_length:
           type: [integer, "null"]
           format: uint64
@@ -30900,11 +31060,13 @@ components:
         content_types:
           type: array
           minItems: 1
+          maxItems: 64
+          uniqueItems: true
           items:
             type: string
             minLength: 1
-            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
-          description: "Content-type whitelist. Defaults to 10 common text/application types. Every entry must be a bare ASCII type/subtype media type with no surrounding whitespace and no parameters; an empty array, an empty entry, a non-ASCII entry, and a parameter-bearing or whitespace-only entry are all rejected at construction, because the matcher could never equal such a rule. Explicit null is rejected (unlike the other optional fields) — omit the key for the defaults. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive); response parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
+            pattern: "^[!#$%&'+.^_`|~0-9A-Za-z-]+/([!#$%&'+.^_`|~0-9A-Za-z-]+|\\*)$"
+          description: "Content-type whitelist (at most 64 rules). Defaults to 10 common text/application types. Every entry must be a bare ASCII type/subtype media type, or a type/* range covering every subtype of one top-level type, with no surrounding whitespace and no parameters; an empty array, an empty entry, a non-ASCII entry, a parameter-bearing or whitespace-only entry, any other `*` (*/*, */json, application/vnd.*+json), and a repeat of an earlier entry (compared case-insensitively) are all rejected at construction, because the matcher could never equal such a rule. Explicit null is rejected (unlike the other optional fields) — omit the key for the defaults. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive), or by top-level type for a type/* rule; response parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
         max_decompressed_request_size:
           type: [integer, "null"]
           format: uint64
@@ -30928,10 +31090,20 @@ components:
           maximum: 11
           default: 4
           description: "Brotli quality (0=fastest, 11=best). Null selects the default."
+        zstd_level:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 19
+          default: 3
+          description: "Zstandard compression level for the opt-in `zstd` algorithm (1=fastest, 19=best). Capped at 19 because higher levels use a window above the 8 MB RFC 9659 allows for the zstd content coding. Null selects the default."
+        weaken_strong_etag:
+          type: [boolean, "null"]
+          default: false
+          description: "Opt-in. When false (default), a response carrying a strong ETag is never compressed, so the validator is preserved. When true, such a response is compressed and the coded variant carries the weak form of the validator (W/\"…\"); an origin weak validator is kept as is, and an aborted encode restores the origin validator on the identity body. An ETag with no weak form (unquoted, list-valued, or containing invalid characters) and a strong ETag a later hook adds still keep the response uncoded. Null selects the default."
         decompress_request:
           type: [boolean, "null"]
           default: false
-          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed). Each gzip/x-gzip layer must contain exactly one complete member with a valid trailer and no remaining bytes; additional members (even empty ones), padding, and trailing data fail closed with 400. The shared request representation gate applies the same rule; a claimed response representation rejects these forms with its existing 502 inspection error (gRPC INTERNAL). Unclaimed encoded responses retain their existing pass-through behavior. Null selects the default."
+          description: "Enable decompression of gzip/brotli request Content-Encoding lists (plus zstd when `algorithms` lists it; one complete frame per layer, window capped at 8 MB, trailing bytes refused) (OWS-tolerant ordered chains; malformed/unsupported members fail closed). Each gzip/x-gzip layer must contain exactly one complete member with a valid trailer and no remaining bytes; additional members (even empty ones), padding, and trailing data fail closed with 400. The shared request representation gate applies the same rule; a claimed response representation rejects these forms with its existing 502 inspection error (gRPC INTERNAL). Unclaimed encoded responses retain their existing pass-through behavior. Null selects the default."
 
     SseConfig:
       type: object
@@ -32406,12 +32578,48 @@ components:
         validates the resulting plaintext before any byte reaches the backend,
         so a valid gzip JSON/XML upload succeeds while an undecodable coding is
         still refused. Representation-gap diagnostics are fixed strings and
-        never echo body bytes. Every constraint below mirrors a runtime
-        admission rule, so a configuration this schema accepts is one
-        BodyValidator::new accepts, except for two dependencies that are
-        node-local and cannot be expressed statically: protobuf_descriptor_path
-        must name a readable FileDescriptorSet, and every configured message
-        type must resolve inside it.
+        never echo body bytes. gRPC protobuf validation covers native gRPC and
+        gRPC-Web (binary and text) framing in both directions, including a
+        translated gRPC-Web response after the grpc_web plugin re-framed it;
+        only methods a configured descriptor applies to are buffered, so
+        unenrolled streaming RPCs keep streaming. Protobuf decoding is bounded
+        before reflection (message, value, and 32-level depth budgets, for every
+        descriptor pool) and its decompressed and reflected working set is
+        charged to the aggregate decode budget; a budget refusal is a 503 /
+        RESOURCE_EXHAUSTED capacity terminal. Response validation applies only
+        to response_status_codes (default 2XX) and never to 206/226 fragments;
+        an empty synthetic success (for example an empty response_mock body)
+        is validated like an empty backend response. Every constraint below
+        mirrors a runtime admission rule, so a configuration this schema
+        accepts is one BodyValidator::new accepts, except for two dependencies
+        that are node-local and cannot be expressed statically:
+        protobuf_descriptor_path must name a readable FileDescriptorSet, and
+        every configured message type must resolve inside it (and
+        reject_unsupported_media_types paired only with response-direction
+        protobuf_method_messages entries is refused at runtime).
+      allOf:
+        - if:
+            required: [reject_unsupported_media_types]
+            properties:
+              reject_unsupported_media_types:
+                const: true
+          then:
+            anyOf:
+              - required: [json_schema]
+              - required: [required_fields]
+                properties:
+                  required_fields:
+                    minItems: 1
+              - required: [validate_xml]
+                properties:
+                  validate_xml:
+                    const: true
+              - required: [required_xml_elements]
+                properties:
+                  required_xml_elements:
+                    minItems: 1
+              - required: [protobuf_descriptor_path, protobuf_request_type]
+              - required: [protobuf_descriptor_path, protobuf_method_messages]
       anyOf:
         - required: [json_schema]
         - required: [required_fields]
@@ -32538,18 +32746,30 @@ components:
             rather than counted as safe.
         content_types:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
-          default: ["application/json", "application/xml", "text/xml"]
+          default:
+            - application/json
+            - application/*+json
+            - application/xml
+            - application/*+xml
+            - text/xml
           description: >-
             Request media types to validate. Matching uses the Content-Type
             type/subtype essence only (parameters stripped, OWS trimmed, ASCII
-            case-insensitive). Distinct neighbors such as application/json-seq
-            and parameter values that merely contain a configured string do not
-            match. Empty or parameter-only entries are rejected; malformed
-            actual headers do not match and are skipped.
+            case-insensitive). An entry of the form type/*+suffix is an RFC
+            6838 structured-suffix pattern matching any type/name+suffix with a
+            non-empty name (for example application/problem+json), except the
+            gRPC-family types application/grpc+*, application/grpc-web+*, and
+            application/grpc-web-text+*. Distinct neighbors such as
+            application/json-seq and parameter values that merely contain a
+            configured string do not match. An empty list is rejected (omit the
+            field for the defaults), as are empty or parameter-only entries;
+            malformed actual headers do not match and are skipped (or refused
+            with 415 under reject_unsupported_media_types).
         response_json_schema:
           type: object
           minProperties: 1
@@ -32587,15 +32807,67 @@ components:
             required_xml_elements.
         response_content_types:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
-          default: ["application/json", "application/xml", "text/xml"]
+          default:
+            - application/json
+            - application/*+json
+            - application/xml
+            - application/*+xml
+            - text/xml
           description: >-
-            Response media types to validate. Same exact type/subtype matching
-            semantics as content_types (parameters stripped; neighbors and
-            parameter collisions and malformed headers do not match).
+            Response media types to validate. Same type/subtype and
+            structured-suffix pattern matching semantics as content_types
+            (parameters stripped; neighbors, parameter collisions, and
+            malformed headers do not match). An empty list is rejected.
+        response_status_codes:
+          type: array
+          minItems: 1
+          items:
+            oneOf:
+              - type: integer
+                minimum: 100
+                maximum: 599
+              - type: string
+                pattern: "^[1-5][Xx][Xx]$"
+          default: ["2XX"]
+          description: >-
+            Upstream response statuses response validation applies to: exact
+            integer statuses and/or status classes 1XX-5XX (case-insensitive X).
+            Defaults to 2XX, so a backend error document (404, 422, 500, ...)
+            keeps its own status and body instead of being judged against the
+            success schema and replaced by a 502. Partial (206) and delta (226)
+            responses are fragments and are never validated. An empty list is
+            rejected.
+        enforcement_mode:
+          type: string
+          enum: [block, log_only]
+          default: block
+          description: >-
+            block rejects violations (400 request, 415 unsupported request
+            media type, 502 response). log_only evaluates every configured
+            rule but always continues, never claims the shared representation
+            gates (so a content-coded body is recorded as uninspected), and
+            records the would-be outcome. In both modes a violation is
+            published in transaction metadata as
+            body_validator.request_outcome / body_validator.response_outcome
+            (rejected, would_reject, uninspected, or capacity_refused) with the
+            matching _status and payload-free _detail keys.
+        reject_unsupported_media_types:
+          type: boolean
+          default: false
+          description: >-
+            Refuse with 415 a request that carries a body no configured request
+            rule inspects: a missing, malformed, or comma-joined Content-Type,
+            a media type outside content_types, an allowlisted type no rule can
+            inspect, or a gRPC request when no protobuf request rule is
+            configured. Bodyless requests (proven by Content-Length 0 or by the
+            buffered transport), CONNECT requests, and frontend-classified
+            WebSocket handshakes are unaffected; a bare Upgrade header is not.
+            Requires at least one request validation rule.
         protobuf_descriptor_path:
           type: string
           minLength: 1
@@ -32646,7 +32918,14 @@ components:
             selected by the exact method lookup, so it is rejected rather than
             admitted as an inert rule. Each entry accepts only 'request' and
             'response', must set at least one of them, and any other key
-            rejects the configuration.
+            rejects the configuration. An entry is direction-authoritative: a
+            direction it omits is not validated for that method, rather than
+            falling back to protobuf_request_type / protobuf_response_type. The
+            method is the trailing /Service/Method of the bound
+            backend-effective path, else (request side) the synthetic :path the
+            native gRPC ladder injects, else grpc_full_method, else the request
+            path, so prefixes and backend base paths cannot change which entry
+            applies and per-method rules apply on HTTP/3 and every dispatcher.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
@@ -32655,7 +32934,11 @@ components:
             the top level and inside every present nested, repeated, map-value,
             oneof, and extension message value, in both directions, under the
             same bounded 32-level / 50000-message walk as the initialization
-            check. The rejection carries a count only, never a field number or
+            check. A closed (proto2) enum is judged per wire occurrence: any
+            occurrence outside the declared set is an unknown field (refused in
+            either order, including packed, map-value, and extension values),
+            and a required closed-enum field with only undeclared occurrences
+            is unset; open proto3 enums keep any number. The rejection carries a count only, never a field number or
             payload byte. This is independent of proto2 required-field
             initialization, which is always enforced: a decoded message that
             omits any proto2 required field, at the top level or inside a
@@ -35374,14 +35657,21 @@ components:
         Plugin: grpc_deadline — Manages the grpc-timeout metadata header.
         Supports all gRPC timeout units (H, M, S, m, u, n). At least one
         effective rule is required. When both deadline values are configured,
-        default_deadline_ms must be less than or equal to max_deadline_ms;
-        runtime validation enforces this cross-field relationship. Malformed or
-        zero client values never pass through verbatim: an enforced fallback
-        deadline is rewritten onto the outbound header and invalid client values
-        set bounded transaction-log metadata grpc_timeout_invalid=true.
+        default_deadline_ms must be less than or equal to max_deadline_ms, and
+        headroom_ms must be less than max_deadline_ms; runtime validation
+        enforces these cross-field relationships. Caps compose across
+        instances independently of their order: a default injected by one
+        instance is still clamped by another instance's max_deadline_ms.
+        Malformed or zero client values never pass through verbatim: an
+        enforced fallback deadline is rewritten onto the outbound header and
+        invalid client values set bounded transaction-log metadata
+        grpc_timeout_invalid=true. That metadata and grpc_adjusted_deadline_ms
+        are recorded at request receipt, so they are present even when the
+        request is rejected before the backend hook runs.
       anyOf:
         - required: [max_deadline_ms]
         - required: [default_deadline_ms]
+        - required: [headroom_ms]
         - required: [subtract_gateway_processing]
           properties:
             subtract_gateway_processing:
@@ -35403,6 +35693,20 @@ components:
           minimum: 1
           maximum: 18446744073709551615
           description: Inject grpc-timeout when client omits it
+        headroom_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 18446744073709551615
+          description: >-
+            Fixed margin (milliseconds) reserved from a client-supplied
+            grpc-timeout after every cap. Both the gateway's own RPC deadline
+            and the forwarded grpc-timeout end this much earlier than the
+            client's, so the gateway's DEADLINE_EXCEEDED reaches the client
+            before the client's own deadline cancels the call. The remaining
+            budget is floored at 1 ms. An injected default_deadline_ms is not
+            reduced. Multiple instances reserve the largest configured value
+            once. Must be less than max_deadline_ms when both are set.
         subtract_gateway_processing:
           type: boolean
           default: false
@@ -38684,7 +38988,7 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini requests are translated to Gemini/streamGenerateContent (Vertex-compatible) and provider SSE/JSON streams are normalized to OpenAI chat.completion.chunk SSE. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, but the claim commits its own egress policy rather than inheriting the proxy's: an https provider endpoint is verified against the system trust store unless that provider sets inherit_backend_tls: true, and any dns_override inherited from the matched proxy is explicitly revoked so the provider host resolves through provider DNS."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 4057, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips every canonical client credential header (Authorization, Proxy-Authorization, Cookie, X-API-Key, API-Key, APIKey, X-Goog-Api-Key, X-Access-Token, X-Auth-Token, X-Amz-Security-Token, X-Forwarded-Authorization — case-insensitive and with `_` treated as `-`), the route's own configured authentication header locations, and provider-protocol headers, then injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini requests are translated to the Gemini/streamGenerateContent body shape and provider SSE/JSON streams are normalized to OpenAI chat.completion.chunk SSE (authentication is the x-goog-api-key header only; Vertex AI OAuth2 is not supported). OpenAI request parameters are mapped exactly or refused with an OpenAI-shaped 400, never silently dropped: response_format (Gemini responseMimeType/responseJsonSchema; refused for Anthropic), n (Gemini candidateCount; n > 1 refused for Anthropic), presence_penalty/frequency_penalty/seed (Gemini; non-zero/any refused for Anthropic), parallel_tool_calls false (Anthropic disable_parallel_tool_use; refused for Gemini with callable tools), and logit_bias/logprobs/top_logprobs (refused for both). Anthropic extended thinking (thinking.type enabled or adaptive) with callable tools or a tool-result continuation is refused because signed thinking blocks cannot round-trip through the OpenAI representation. A strict Gemini json_schema must use only keywords Gemini enforces or it is refused. Gemini thought signatures round-trip through tool_calls[].extra_content.google.thought_signature. Base64 data-URL image_url parts (image/jpeg, image/png, image/gif, image/webp) in user messages translate to native image parts; remote image URLs are refused. A claimed normalizing 2xx response whose Content-Type is not a supported stream media type fails closed for both translated providers. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, but the claim commits its own egress policy rather than inheriting the proxy's: an https provider endpoint is verified against the built-in public trust roots only — never the global FERRUM_TLS_CA_BUNDLE_PATH, never disabled by FERRUM_TLS_NO_VERIFY, and never presenting the global backend client certificate — unless that provider sets inherit_backend_tls: true, and any dns_override inherited from the matched proxy is explicitly revoked so the provider host resolves through provider DNS."
       required: [providers]
       properties:
         enabled:
@@ -38707,6 +39011,24 @@ components:
           type: [boolean, "null"]
           default: true
           description: Normalize provider-native SSE (e.g. Anthropic Messages API events) to OpenAI chat.completion.chunk SSE. Disabling forwards provider-native SSE verbatim.
+        max_stream_bytes:
+          type: [integer, "null"]
+          minimum: 1048576
+          maximum: 268435456
+          default: 8388608
+          description: Cumulative provider plaintext bytes one Anthropic/Gemini response normalizer accepts before it fails closed with an upstream_error frame. A residual provider Content-Encoding is still decoded under the fixed 8 MiB per-layer residual-decode limit. An explicit null means omission.
+        max_stream_events:
+          type: [integer, "null"]
+          minimum: 1000
+          maximum: 10000000
+          default: 100000
+          description: Complete provider stream events one Anthropic/Gemini response normalizer accepts before it fails closed. An explicit null means omission.
+        max_normalized_stream_bytes:
+          type: [integer, "null"]
+          minimum: 1048576
+          maximum: 536870912
+          default: 16777216
+          description: Cumulative OpenAI-shaped output bytes one Anthropic/Gemini response normalizer may emit before it fails closed. A buffered normalization is additionally bounded by the response's retained ceiling. An explicit null means omission.
         providers:
           type: array
           minItems: 1
@@ -38725,18 +39047,19 @@ components:
                 enum:
                   - openai
                   - openai_compatible
+                  - azure_openai
                   - anthropic
                   - google_gemini
-                description: "Provider wire format. openai/openai_compatible pass through; anthropic and google_gemini are translated + normalized to OpenAI chat.completion.chunk SSE."
+                description: "Provider wire format. openai/openai_compatible/azure_openai pass through (azure_openai authenticates with the api-key header); anthropic and google_gemini are translated + normalized to OpenAI chat.completion.chunk SSE."
               endpoint:
                 type: string
                 minLength: 1
                 pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
-                description: "Full https (or http with allow_plaintext) provider streaming endpoint URL, e.g. https://api.openai.com/v1/chat/completions, https://api.anthropic.com/v1/messages, or https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent. May contain a literal {model} path placeholder (required for typical Gemini/Vertex model routing). An endpoint query string (e.g. an Azure-style ?api-version=...) is preserved and merged with the client's own query using '&'. IPv6 literal hosts are bracketed in the forwarded authority."
+                description: "Full https (or http with allow_plaintext) provider streaming endpoint URL, e.g. https://api.openai.com/v1/chat/completions, https://api.anthropic.com/v1/messages, or https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent. May contain a literal {model} path placeholder. A google_gemini endpoint without {model} is admitted only when model_patterns is the single exact model name the endpoint path names (.../models/<model>:...), because Gemini routes the model only through the URL. An endpoint query string (e.g. an Azure-style ?api-version=...) is preserved and merged with the client's own query using '&'. Embedded userinfo (user:password@) and a #fragment are rejected. IPv6 literal hosts are bracketed in the forwarded authority."
               api_key:
                 type: string
                 minLength: 1
-                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a whole-value ${FERRUM_PLUGIN_SECRET_<NAME>} reference resolved from the process environment at construction; a ${...} reference to any other variable, including every other FERRUM_* setting, is refused at admission with a 400. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic, x-goog-api-key for google_gemini."
+                description: "Provider API key. The resolved value must be a valid HTTP header value (no CR, LF, NUL, or other control byte) or construction fails. Supports a whole-value ${FERRUM_PLUGIN_SECRET_<NAME>} reference resolved from the process environment at construction; a ${...} reference to any other variable, including every other FERRUM_* setting, is refused at admission with a 400. Injected as Authorization: Bearer for openai(-compatible), api-key for azure_openai, x-api-key for anthropic, x-goog-api-key for google_gemini."
               model_patterns:
                 type: array
                 minItems: 1
@@ -38759,12 +39082,18 @@ components:
                 description: "Permit an http:// endpoint. Plaintext provider egress is rejected by default, so this is the required opt-in for an internal HTTP-compatible provider. It has no effect on an https endpoint and does not relax runtime TLS/FIPS policy. An explicit null means omission."
               anthropic_version:
                 type: [string, "null"]
+                minLength: 1
                 default: "2023-06-01"
-                description: "anthropic-version header value sent to Anthropic providers. Must be a valid HTTP header value; an explicit null means omission and keeps the default."
+                description: "anthropic-version header value sent to Anthropic providers. Must be a non-empty valid HTTP header value; an explicit null means omission and keeps the default."
+              default_max_tokens:
+                type: [integer, "null"]
+                minimum: 1
+                maximum: 4294967295
+                description: "anthropic providers only (a non-null value on any other provider_type is rejected, by this schema and at admission; when omitted on an anthropic provider the router forwards 4096): Anthropic max_tokens forwarded when the OpenAI request sets neither max_tokens nor max_completion_tokens. A present non-null client max_tokens / max_completion_tokens must be a positive integer or the request is rejected with 400. An explicit null means omission."
               inherit_backend_tls:
                 type: [boolean, "null"]
                 default: false
-                description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints. An explicit null means omission."
+                description: "By default an https provider endpoint is verified against the built-in public trust roots only, isolated from every gateway-global backend TLS fallback: the global FERRUM_TLS_CA_BUNDLE_PATH is not used, FERRUM_TLS_NO_VERIFY cannot disable verification, and the global backend client certificate (FERRUM_BACKEND_TLS_CLIENT_CERT_PATH / _KEY_PATH) is never presented. Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate, including the gateway-global fallbacks that resolution normally inherits — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints. An explicit null means omission."
             allOf:
               # Plaintext provider egress is opt-in: an http:// endpoint without
               # allow_plaintext: true is refused by the constructor.
@@ -38778,6 +39107,18 @@ components:
                   properties:
                     allow_plaintext:
                       const: true
+              # default_max_tokens is an Anthropic-only control: the constructor
+              # refuses a non-null value on every other provider_type.
+              - if:
+                  required: [provider_type]
+                  properties:
+                    provider_type:
+                      not:
+                        const: anthropic
+                then:
+                  properties:
+                    default_max_tokens:
+                      type: "null"
 
     A2aGatewayConfig:
       type: object
@@ -41568,7 +41909,7 @@ components:
               redis_username: false
               redis_password: false
               on_redis_unavailable: false
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Gateway-authored dispatch errors are not completed responses: proven pre-wire failures release the matching owner token at finalization, while any possible execution retains the in-flight lease until inflight_ttl_seconds. Real backend error responses remain replayable; provenance is independent of HTTP status. Logical keys are scoped by stable plugin-config identity, matched proxy namespace and ID, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, and matched proxy namespaces remain isolated even when an explicit Redis prefix is shared, while the same configured instance shares keys across gateways. Per-request completion ownership (logical key, fingerprint, local owner token, and optional Redis lock token) is held in an instance-keyed private structure rather than shared public metadata, so multiple scoped instances with distinct headers mark and token-release independently on the same request. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, effective outbound query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A synthetic short-circuit whose own execution performed the protected external operation — a terminate-mode serverless_function invocation or an ai_federation provider call — declares that provenance and never releases its ownership. What is published once every response decision is final depends on whether that finalized response can be retained. A terminate-mode serverless_function response that fits the entry/total limits and carries an establishable presentation policy is published as an ordinary REPLAYABLE completion through the fenced transition: an identical retry receives the cached status and body with X-Idempotent-Replayed: true for ttl_seconds and the function is invoked exactly once. Every other outcome — a response too large to retain, an unprovable or straddled presentation policy, a streamed fallthrough, an interrupted delivery, and every ai_federation-marked provider call, whose synthetic body was never a backend response and is never stored — publishes a durable non-replayable 409 completion tombstone under the key instead, so an identical idempotency-key retry cannot repeat the billable operation when inflight_ttl_seconds elapses. That tombstone is retained for max(ttl_seconds, inflight_ttl_seconds): it replaces an in-flight marker that blocked duplicates for inflight_ttl_seconds, so a deployment with inflight_ttl_seconds greater than ttl_seconds never becomes re-executable sooner than a bare marker left it, while ordinary replayable completions keep ttl_seconds. Externally executed synthetic plugins that do not declare this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication. The Redis endpoint must be deployed with maxmemory-policy noeviction (or no maxmemory limit at all): a deduplication record is the control rather than a cache copy, so an evicting endpoint would silently drop a live in-flight or completed record mid-lease and let a retry execute the operation a second time while Redis stayed reachable. Every newly established connection — first dial, dedicated transaction connection, and background recovery probe — is screened with INFO MEMORY and used only when the server proves maxmemory:0 or maxmemory_policy:noeviction; a proven allkeys-*/volatile-* policy is terminal for that client generation and an unproven screen is a recoverable outage, after which on_redis_unavailable governs (fail-closed by default). Redis mode stores ownership and completion in ONE versioned operation record per logical key: acquisition is a token-owned SET NX before backend dispatch, and publication is a compare-and-set fenced on that still-current token, so publication and the ownership transition are atomic. An owner whose inflight_ttl_seconds lease expired can neither overwrite a successor's completed response nor publish while a successor owns the operation; its local completion is discarded instead. Current-version records with a missing or empty in-flight owner token, impossible state-dependent fields, or mismatched inner/outer replay fingerprints fail closed as unknown writer state. When a completed response cannot be represented within max_entry_size_bytes, a small non-replayable completion tombstone is published so peers receive a deterministic 409 for max(ttl_seconds, inflight_ttl_seconds) instead of becoming free to re-execute when the raw lease expires; a record published without a replay payload never expires sooner than the lease it replaced. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v6 logical keys plus the versioned record format are not backward-compatible with earlier versions. When Redis cannot be consulted, on_redis_unavailable decides between a fail-closed 503 (default) and an explicitly opted-in process-local fallback. Unknown top-level keys are rejected, and Redis-only keys are rejected outside sync_mode='redis'. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to a fixed-size execution barrier that inherits the completion's original insertion time and retention while peers remain blocked. Persistent per-key execution barriers are hard-capped at max_entries; overflow extends one fixed process-global deadline and returns 503 for applicable idempotency-key requests rather than allocating unbounded key state or failing open. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Every retained response, local or Redis, is stamped with the response-side presentation policy it was produced under: a content digest of the published response_transformer RTDS gate map plus a content digest of the effective static presentation rules of the proxy (response_transformer, sse, and a2a_gateway in its configured-public-base mode), folded in configured execution order. A stored response replays only while both digests still match the live policy; a stamp that no longer matches, a record written without provenance, and a record with malformed provenance all return 409 rather than replaying under a superseded policy or re-executing a possibly completed side effect. A response whose request straddled a gate publication, or whose effective presentation policy could not be established, is retained for replay neither in Redis nor locally, while in-flight ownership is kept until its TTL. The non-replayable external-operation completion tombstone is the one exception: its bytes are a fixed 409 refusal that asserts no presentation policy, so it is published even under an unprovable or straddled policy rather than leaving an already-performed operation executable again when inflight_ttl_seconds elapses. Only fixed-size digests are stored, never rule text or header values. The built-in priority 3010 runs after route dispatch and request_transformer header/query rules but before terminate-mode serverless execution. Admission rejects every same-protocol request header/query mutator at or after deduplication (including priority overrides), and rejects any deferred request-body transformer whose final bytes were not already established by pre-before_proxy normalization. request_deduplication cannot be composed with mcp_gateway on the same proxy: admission rejects the pair with 400 (fatal in file mode, rejected update in DP) because an MCP public-URI rewrite is derived from live upstream discovery state that no persisted digest can witness. It also cannot be composed with an a2a_gateway instance that derives its public base from the request - discovery.public_base_url unset while discovery.trust_forwarded_headers is true - because the rewritten Agent Card origin then depends on per-request forwarded headers and the connection's transport security, neither of which the fingerprint binds; that refusal is per instance, so a configured-public-base a2a_gateway composes normally."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Gateway-authored dispatch errors are not completed responses: proven pre-wire failures release the matching owner token at finalization, while any possible execution retains the in-flight lease until inflight_ttl_seconds. Real backend error responses remain replayable; provenance is independent of HTTP status. Logical keys are scoped by stable plugin-config identity, matched proxy namespace and ID, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, and matched proxy namespaces remain isolated even when an explicit Redis prefix is shared, while the same configured instance shares keys across gateways. Per-request completion ownership (logical key, fingerprint, local owner token, and optional Redis lock token) is held in an instance-keyed private structure rather than shared public metadata, so multiple scoped instances with distinct headers mark and token-release independently on the same request. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, effective outbound query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A synthetic short-circuit whose own execution performed the protected external operation — a terminate-mode serverless_function invocation or an ai_federation provider call — declares that provenance and never releases its ownership. What is published once every response decision is final depends on whether that finalized response can be retained. A terminate-mode serverless_function response that fits the entry/total limits and carries an establishable presentation policy is published as an ordinary REPLAYABLE completion through the fenced transition: an identical retry receives the cached status and body with X-Idempotent-Replayed: true for ttl_seconds and the function is invoked exactly once. Every other outcome — a response too large to retain, an unprovable or straddled presentation policy, a streamed fallthrough, an interrupted delivery, and every ai_federation-marked provider call, whose synthetic body was never a backend response and is never stored — publishes a durable non-replayable 409 completion tombstone under the key instead, so an identical idempotency-key retry cannot repeat the billable operation when inflight_ttl_seconds elapses. That tombstone is retained for max(ttl_seconds, inflight_ttl_seconds): it replaces an in-flight marker that blocked duplicates for inflight_ttl_seconds, so a deployment with inflight_ttl_seconds greater than ttl_seconds never becomes re-executable sooner than a bare marker left it, while ordinary replayable completions keep ttl_seconds. Externally executed synthetic plugins that do not declare this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication. The Redis endpoint must be deployed with maxmemory-policy noeviction (or no maxmemory limit at all): a deduplication record is the control rather than a cache copy, so an evicting endpoint would silently drop a live in-flight or completed record mid-lease and let a retry execute the operation a second time while Redis stayed reachable. Every newly established connection — first dial, dedicated transaction connection, and background recovery probe — is screened with INFO MEMORY and used only when the server proves maxmemory:0 or maxmemory_policy:noeviction; a proven allkeys-*/volatile-* policy is terminal for that client generation and an unproven screen is a recoverable outage, after which on_redis_unavailable governs (fail-closed by default). Redis mode stores ownership and completion in ONE versioned operation record per logical key: acquisition is a token-owned SET NX before backend dispatch, and publication is a compare-and-set fenced on that still-current token, so publication and the ownership transition are atomic. An owner whose inflight_ttl_seconds lease expired can neither overwrite a successor's completed response nor publish while a successor owns the operation; its local completion is discarded instead. Current-version records with a missing or empty in-flight owner token, impossible state-dependent fields, or mismatched inner/outer replay fingerprints fail closed as unknown writer state. When a completed response cannot be represented within max_entry_size_bytes, a small non-replayable completion tombstone is published so peers receive a deterministic 409 for max(ttl_seconds, inflight_ttl_seconds) instead of becoming free to re-execute when the raw lease expires; a record published without a replay payload never expires sooner than the lease it replaced. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v7 logical keys plus the versioned record format are not backward-compatible with earlier versions. The matched route's response-header policy (a mesh_route_dispatch response_transform) is bound into the request fingerprint rather than the logical key: it changes how a result is presented, not which operation an identical retry executes, so a response-header-only route reload returns 409 for a same-key retry instead of addressing a fresh key and executing the operation again. A request whose idempotency header, authority, or framing/coding header is present under case-variant spellings with different values is refused with 400 rather than resolved by map iteration order. When Redis cannot be consulted, on_redis_unavailable decides between a fail-closed 503 (default) and an explicitly opted-in process-local fallback. Unknown top-level keys are rejected, and Redis-only keys are rejected outside sync_mode='redis'. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to a fixed-size execution barrier that inherits the completion's original insertion time and retention while peers remain blocked. Persistent per-key execution barriers are hard-capped at max_entries; overflow extends one fixed process-global deadline and returns 503 for applicable idempotency-key requests rather than allocating unbounded key state or failing open. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Every retained response, local or Redis, is stamped with the response-side presentation policy it was produced under: a content digest of the published response_transformer RTDS gate map plus a content digest of the effective static presentation rules of the proxy (response_transformer, sse, and a2a_gateway in its configured-public-base mode), folded in configured execution order. A stored response replays only while both digests still match the live policy; a stamp that no longer matches, a record written without provenance, and a record with malformed provenance all return 409 rather than replaying under a superseded policy or re-executing a possibly completed side effect. A response whose request straddled a gate publication, or whose effective presentation policy could not be established, is retained for replay neither in Redis nor locally, while in-flight ownership is kept until its TTL. The non-replayable external-operation completion tombstone is the one exception: its bytes are a fixed 409 refusal that asserts no presentation policy, so it is published even under an unprovable or straddled policy rather than leaving an already-performed operation executable again when inflight_ttl_seconds elapses. Only fixed-size digests are stored, never rule text or header values. The built-in priority 3010 runs after route dispatch and request_transformer header/query rules but before terminate-mode serverless execution. Admission rejects every same-protocol request header/query mutator at or after deduplication (including priority overrides), and rejects any deferred request-body transformer whose final bytes were not already established by pre-before_proxy normalization. request_deduplication cannot be composed with mcp_gateway on the same proxy: admission rejects the pair with 400 (fatal in file mode, rejected update in DP) because an MCP public-URI rewrite is derived from live upstream discovery state that no persisted digest can witness. It also cannot be composed with an a2a_gateway instance that derives its public base from the request - discovery.public_base_url unset while discovery.trust_forwarded_headers is true - because the rewritten Agent Card origin then depends on per-request forwarded headers and the connection's transport security, neither of which the fingerprint binds; that refusal is per instance, so a configured-public-base a2a_gateway composes normally."
       properties:
         header_name:
           type: string
@@ -41599,7 +41940,12 @@ components:
           minimum: 1
           maximum: 18446744073709551615
           default: 10000
-          description: Maximum number of tracked local deduplication entries and hard maximum number of persistent per-key execution barriers. Active in-flight work is never evicted while live and may temporarily exceed the entry target. If completed external operations fill the per-key barrier budget, additional barriers collapse into one fixed process-global deadline and applicable idempotency-key requests receive 503 until it expires.
+          description: Maximum number of tracked local deduplication entries and hard maximum number of persistent per-key execution barriers. Active in-flight work is never evicted while live and may temporarily exceed the entry target, up to the separate hard max_inflight_entries ceiling. If completed external operations fill the per-key barrier budget, additional barriers collapse into one fixed process-global deadline and applicable idempotency-key requests receive 503 until it expires.
+        max_inflight_entries:
+          type: integer
+          minimum: 1
+          maximum: 18446744073709551615
+          description: Hard ceiling on live local in-flight markers per policy identity, counted exactly and reserved by a single atomic compare-and-swap — requests currently executing plus interrupted or ambiguous requests (for example a client that reset a streamed response) whose markers are retained until inflight_ttl_seconds. Defaults to max_entries when omitted. A request with a new idempotency key that cannot reserve a slot is refused with 503 and any Redis ownership it acquired is released; requests for keys that are already tracked still replay or conflict, and live ownership is never evicted to admit new work. Execution barriers are bounded separately by max_entries. Must be greater than zero and representable as an unsigned 64-bit integer.
         max_entry_size_bytes:
           type: integer
           minimum: 1
@@ -41623,12 +41969,46 @@ components:
         scope_by_consumer:
           type: boolean
           default: true
-          description: Additionally include the authenticated consumer's display identity in the deduplication key. Caller isolation no longer depends on this flag — every logical key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented) plus the effective destination, so two credentials resolving to one display subject with different scopes can never claim or replay one another's operation.
+          description: Additionally include the authenticated consumer's display identity in the deduplication key. Caller isolation no longer depends on this flag — every logical key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented, unless caller_partition is authenticated_identity) plus the effective destination, so two credentials resolving to one display subject with different scopes can never claim or replay one another's operation under the default caller_partition.
         anonymous_caller_scope:
           type: string
           enum: ["caller_address", "caller-address", "shared"]
           default: "caller_address"
           description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed is refused rather than keyed incompletely. shared is an explicit operator attestation that the origin does not vary its result by caller address on this route — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins. It applies to anonymous callers only: an authenticated caller always binds its canonical peer address, because the backend receives Ferrum's regenerated forwarding identity for that caller too and may vary policy or content by it. Explicit null is rejected (`'anonymous_caller_scope' must be a string`); omit the field to select the default. The runtime parser trims surrounding whitespace and is case-insensitive, and `_`/`-` are interchangeable (`\" SHARED \"`, `\"caller-address\"` are accepted); the enum lists only canonical and alias forms because JSON Schema cannot express case-insensitivity, so strict schema validators may reject mixed-case or padded inputs the gateway itself accepts."
+        caller_partition:
+          type: string
+          enum: [credential, authenticated_identity]
+          default: credential
+          description: >-
+            How the caller dimension of the logical key is bound. `credential`
+            (default) binds the full caller-authorization partition: mechanism,
+            resolved identity and consumer, peer SPIFFE identity, SHA-256
+            digests of every presented credential header (pristine and live
+            views), and the canonical peer address — so a refreshed token, a
+            per-request signature (hmac_auth, SigV4), or a new client address is
+            a different caller and a retry executes again.
+            `authenticated_identity` is an operator opt-in for clients whose
+            credentials or addresses change between retries: when the gateway
+            verified a principal (a resolved Consumer, a peer SPIFFE identity,
+            or an external identity committed with its verified realm through
+            the authentication boundary) the key binds that principal only —
+            no credential digests and no peer address — and the request
+            fingerprint binds the presence but not the values of credential
+            headers, of credential query parameters an authentication plugin
+            captured from its configured query location, and of the
+            signature-context headers `date`, `x-amz-date`,
+            `x-amz-content-sha256`, `amz-sdk-invocation-id`, `amz-sdk-request`,
+            `digest`, and `content-digest` (exactly this list) that an
+            hmac_auth or SigV4 re-signature or an AWS SDK retry attempt
+            regenerates. A credential header or query parameter renamed by an
+            earlier request_transformer keeps that classification under its
+            current name; every other header and
+            query pair stays value-bound. Two credentials of one principal with different scopes
+            then share an operation, so scope-level distinction rests on the
+            authorization plugins that ran before deduplication. Requests
+            without a verified principal fall back to `credential`. The mode is
+            framed into the key, so changing it never reuses retained state.
+            Matched exactly (no case or whitespace normalization).
         enforce_required:
           type: boolean
           default: false

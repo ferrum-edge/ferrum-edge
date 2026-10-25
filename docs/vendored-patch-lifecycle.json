@@ -964,6 +964,36 @@
       ]
     },
     {
+      "id": "hyper-007-h2-request-body-deadline",
+      "label": "hyper HTTP/2 client resets a request body at an absolute deadline",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/007-h2-request-body-deadline/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 client sends a request body from its own pipe task, which outlives the response; dropping the response does not reset a stream whose upload is open, and a pipe parked on backend flow control polls nothing else, so a gRPC upload could outlive the client RPC deadline. hyper::ext::Http2BodyDeadline arms one timer in that pipe task and resets the stream with CANCEL when the absolute deadline passes (#6870).",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "hyper exposes a way to reset an HTTP/2 client stream, or to bound its request body by an absolute instant, from outside the body pipe; or Ferrum's HTTP/2 client moves off hyper.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/h2_request_body_deadline_tests.rs"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",

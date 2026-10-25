@@ -1,0 +1,147 @@
+diff --git a/src/ext/h2_body_deadline.rs b/src/ext/h2_body_deadline.rs
+new file mode 100644
+index 0000000..088788c
+--- /dev/null
++++ b/src/ext/h2_body_deadline.rs
+@@ -0,0 +1,37 @@
++//! FERRUM PATCH 007: an absolute deadline for an HTTP/2 client request body.
++
++use std::time::Instant;
++
++/// Request extension that ends an HTTP/2 client request body at an absolute
++/// instant, whatever the body pipe is waiting on.
++///
++/// Insert it into a request sent on an HTTP/2 client connection
++/// (`hyper::client::conn::http2`) that was built with a
++/// [`Timer`](crate::rt::Timer). The request body pipe runs in its own task,
++/// which outlives the response future. While it holds a chunk the peer has
++/// granted no window for, it polls neither the body nor anything the caller
++/// owns, so a deadline enforced in the body or by the caller cannot fire. This
++/// extension arms one timer in the pipe task itself. If the deadline passes
++/// before the body has finished, the stream is reset with `CANCEL`: both
++/// halves of the exchange end, whether the pipe was waiting on the body or on
++/// peer flow control.
++///
++/// The extension is removed from the request before it is sent. On a
++/// connection built without a timer there is nothing to arm it with, and it is
++/// ignored.
++#[derive(Clone, Copy, Debug)]
++pub struct Http2BodyDeadline {
++    deadline: Instant,
++}
++
++impl Http2BodyDeadline {
++    /// End the request body at `deadline`.
++    pub fn new(deadline: Instant) -> Self {
++        Self { deadline }
++    }
++
++    /// The absolute deadline.
++    pub fn deadline(&self) -> Instant {
++        self.deadline
++    }
++}
+diff --git a/src/ext/mod.rs b/src/ext/mod.rs
+index 8690f25..a2d93cc 100644
+--- a/src/ext/mod.rs
++++ b/src/ext/mod.rs
+@@ -59,6 +59,11 @@ mod h2_body_write_timeout;
+ #[cfg(feature = "http2")]
+ pub use h2_body_write_timeout::Http2BodyWriteTimeout;
+ 
++#[cfg(feature = "http2")]
++mod h2_body_deadline;
++#[cfg(feature = "http2")]
++pub use h2_body_deadline::Http2BodyDeadline;
++
+ #[cfg(all(feature = "http2", feature = "server"))]
+ mod h2_stream_termination;
+ #[cfg(all(feature = "http2", feature = "server"))]
+diff --git a/src/proto/h2/client.rs b/src/proto/h2/client.rs
+index 0fa6c99..4e0a232 100644
+--- a/src/proto/h2/client.rs
++++ b/src/proto/h2/client.rs
+@@ -421,6 +421,8 @@ where
+     cb: Callback<Request<B>, Response<IncomingBody>>,
+     // FERRUM PATCH 004: the request's `Http2BodyWriteTimeout`, if any.
+     write_timeout: Option<crate::ext::Http2BodyWriteTimeout>,
++    // FERRUM PATCH 007: the request's `Http2BodyDeadline`, if any.
++    body_deadline: Option<crate::ext::Http2BodyDeadline>,
+ }
+ 
+ impl<B: Body> Unpin for FutCtx<B> {}
+@@ -473,6 +475,8 @@ pin_project! {
+         #[pin]
+         ping: Option<Recorder>,
+         cancel_rx: Option<oneshot::Receiver<()>>,
++        // FERRUM PATCH 007: the request's absolute body deadline, if any.
++        deadline: Option<Pin<Box<dyn crate::rt::Sleep>>>,
+     }
+ }
+ 
+@@ -506,6 +510,19 @@ where
+             Some(Poll::Pending) | None => {}
+         }
+ 
++        // FERRUM PATCH 007: the request's absolute body deadline. Polled here,
++        // ahead of the pipe, so it fires whatever the pipe is parked on: the
++        // body, or peer flow control with a chunk it cannot yet send.
++        if let Some(deadline) = this.deadline.as_mut() {
++            if deadline.as_mut().poll(cx).is_ready() {
++                debug!("client request body deadline elapsed, resetting stream");
++                this.pipe.as_mut().send_reset(h2::Reason::CANCEL);
++                drop(this.conn_drop_ref.take().expect("Future polled twice"));
++                drop(this.ping.take().expect("Future polled twice"));
++                return Poll::Ready(());
++            }
++        }
++
+         match Pin::new(&mut this.pipe).poll(cx) {
+             Poll::Ready(result) => {
+                 if let Err(_e) = result {
+@@ -560,11 +577,23 @@ where
+                         // still sending...
+                         let ping = ping.clone();
+ 
++                        // FERRUM PATCH 007: arm the body deadline from the
++                        // connection's timer. Extraction already dropped it on
++                        // a connection without one.
++                        let deadline = f.body_deadline.map(|deadline| {
++                            self.timer.sleep(
++                                deadline
++                                    .deadline()
++                                    .saturating_duration_since(self.timer.now()),
++                            )
++                        });
++
+                         let pipe = PipeMap {
+                             pipe,
+                             conn_drop_ref: Some(conn_drop_ref),
+                             ping: Some(ping),
+                             cancel_rx: Some(cancel_rx),
++                            deadline,
+                         };
+                         // Clear send task
+                         self.executor
+@@ -764,6 +793,13 @@ where
+                         continue;
+                     }
+ 
++                    // FERRUM PATCH 007: an absolute body deadline is armed from
++                    // the connection's timer; without one it is ignored.
++                    let body_deadline = req
++                        .extensions_mut()
++                        .remove::<crate::ext::Http2BodyDeadline>()
++                        .filter(|_| !matches!(self.timer, Time::Empty));
++
+                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
+                         Ok(ok) => ok,
+                         Err(err) => {
+@@ -784,6 +820,7 @@ where
+                         body,
+                         cb,
+                         write_timeout,
++                        body_deadline,
+                     };
+ 
+                     // Check poll_ready() again.
