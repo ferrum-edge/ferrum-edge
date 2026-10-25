@@ -147,6 +147,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **NodeWaypoint capture relays evaluate the destination pod's own
+  AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
+  for an enrolled pod in another namespace stamped that pod's exact policy
+  scope but received only its own namespace's `AuthorizationPolicy` set, so a
+  `DENY` (or an `ALLOW`'s implicit deny) declared in the destination's
+  namespace was not enforced. The slice now carries a dedicated
+  `node_waypoint_capture_mesh_policies` inventory — exactly the policies that
+  apply to a captured destination, authorized by the same CP scope / bearer
+  `ns` bounds as the destinations — over native MeshSubscribe, the file source,
+  and a new `NodeWaypointCaptureMeshPoliciesCarrier` ECDS carrier, and
+  `mesh_authz` evaluates it under per-pod scoping. The ordinary `mesh_policies`
+  view is unchanged. Scoped destination policies also count toward the
+  missing-scope fail-closed rule. The inventory carries explicit completeness
+  evidence (`node_waypoint_capture_mesh_policies_resolved`; over xDS, the
+  carrier is emitted even when empty), and a slice with capture destinations
+  but no such evidence is refused (startup builds no capture-serving
+  generation; reload keeps the previous one), so a control plane that predates
+  this inventory cannot serve captured destinations without their policies.
+  Authenticated inbound HBONE relays to those destinations now resolve the
+  destination's scope from the same inventory, which takes precedence over any
+  ordinary record for the same address, so their policies are evaluated instead
+  of the relay being refused for a missing scope. The transparent capture
+  resolver now compares destination addresses canonically, matching the relay
+  guard. The inventory is only certified complete when it was derived from the
+  authoritative, pre-narrowing configuration: the control plane records that it
+  resolved the inventory (including an empty answer) before narrowing, and a
+  slice is never rebuilt from a narrowed or Sidecar-widened routing view. Those
+  destination policies make a missing scope fail closed only for connections to
+  the captured destinations; unattributed UDP/DTLS sessions keep the previous
+  source-scope behaviour. A body-inspecting CUSTOM rule carried only by that
+  inventory buffers (and size-limits) only requests whose scope its policy
+  selects.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder
@@ -337,7 +369,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`waf` inspects gRPC bodies message by message.** A framed gRPC or
+- **BREAKING — `waf` inspects gRPC bodies message by message** (issue n/a,
+  PR #6813). A framed gRPC or
   gRPC-Web body the WAF scans (the `+json` codecs by default) was scanned as
   one stream, so every `body_json_path` rule saw invalid JSON and passed an
   ordinary `application/grpc+json` call, and a `grpc-encoding`-compressed
@@ -358,7 +391,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream is skipped now; a relabeled body is judged by the scan scope of the
   origin media type, and the representation claim uses the same origin type
   so an origin `Content-Encoding` is decoded (or refused) before the scan.
-- **`waf` governs request bodies on every method.** Bodies were buffered and
+- **BREAKING — `waf` governs request bodies on every method** (issue n/a,
+  PR #6813). Bodies were buffered and
   scanned only for `body_methods`, so a payload an enforcing rule refused on
   `POST` reached a body-parsing backend unscanned as `GET`/`SEARCH`/`PROPFIND`.
   A request on any method (except `CONNECT`) is now governed whenever a body
@@ -374,7 +408,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `on_unlisted_response_content_type`, and `on_scan_timeout: block` (HTTP
   and WebSocket), matching the
   rule hits and `fail_closed` decisions it already suppressed.
-- **`waf` rejects non-canonical `global_exemptions.paths`** exact and `prefix*`
+- **BREAKING — `waf` rejects non-canonical `global_exemptions.paths`** (issue
+  n/a, PR #6813): exact and `prefix*`
   entries at construction, as `conditions.paths` already did; such an entry
   could never match the canonical request path and silently exempted nothing.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
@@ -483,8 +518,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escapes read as `\uFFFD` (escaped backslashes are left literal), and the
   JSON-path rules run on that reading with duplicate members preserved. Bodies
   the strict parse accepts are still read in place without a copy. A reading
-  that still does not parse remains outside `body_json_path` inspection; see
-  `docs/waf.md`.
+  that still does not parse now fails closed (next entry).
+- **WAF `body_json_path` rules fail closed on JSON they cannot parse.** A
+  body that neither the strict nor the lenient parse accepts — a number
+  beyond the `f64` range, nesting deeper than 128 levels, `NaN` / `Infinity`,
+  a comment, a trailing comma, an unquoted name or value, a leading form feed
+  or NBSP, the `)]}'` prefix, or text after the document, all of which some
+  backend parsers accept — used to switch every JSON-path rule off for that
+  request while the bytes were forwarded. Every applicable `body_json_path`
+  rule now records a hit, and its own action and anomaly score decide
+  exactly as for a match, when a part that cannot be read opens like a JSON
+  object or array (after the whitespace, comments and prefix lenient parsers
+  skip), or when no reading can be read completely and the `Content-Type`
+  declares JSON (`*/json`, `+json`) or the part opens like JSON once NULs
+  are skipped. Whitespace-separated documents (NDJSON, a leading scalar
+  followed by an object, a document followed by another) are now all
+  inspected; after a document that cannot be read, reading resumes at the
+  next token or container, and every document read around such a part is
+  inspected. All lenient readings of one body share a work budget of four
+  times its length plus 64 KiB, and a body that exhausts it fails closed. A
+  body that parses as a gRPC / gRPC-Web (binary or base64 text) / Connect
+  stream is read as its uncompressed `+json` messages, a compressed `+json`
+  message fails closed, and a binary stream's raw bytes (as sent and with NULs
+  removed) are judged like any other reading, so a genuine stream whose
+  envelope bytes assemble a refused JSON container (for example a 91-byte
+  message, whose length byte is `[`) fails closed and needs `conditions`
+  scoping. A UTF-16 / UTF-32 reading vouches for the raw bytes only when the
+  body starts with a byte-order mark or the whole `Content-Type` is exactly
+  `type/subtype; charset=<utf-16|utf-16le|utf-16be|utf-32|utf-32le|utf-32be>`;
+  otherwise (including a BOM-less signature, an extra or empty parameter, or
+  an alias label) the NUL-skipping reading a UTF-8 backend takes is read as
+  well, so undeclared, BOM-less wide JSON whose code units
+  hold a control byte, `"` or `\` (for example most of U+0100–U+1FFF) needs a
+  canonical `charset` or a byte-order mark. A body scanned only up to
+  `max_scan_bytes` is not judged this way, a declared or BOM-marked UTF-16 /
+  UTF-32 body is unaffected, and valid JSON bodies take the same single parse
+  as before.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,

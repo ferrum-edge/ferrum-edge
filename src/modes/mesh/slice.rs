@@ -387,6 +387,43 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
+    /// AuthorizationPolicy (`MeshPolicy`) entries applicable to
+    /// [`Self::node_waypoint_capture_destinations`].
+    ///
+    /// `mesh_policies` is narrowed to the subscription namespace (and this
+    /// proxy's own identity), so a policy declared in a CAPTURED pod's own
+    /// namespace never reaches a NodeWaypoint deployed elsewhere. The capture
+    /// relay stamps that destination's exact policy scope, and the per-pod
+    /// evaluator can only filter the policies it was given — so without this
+    /// inventory a destination DENY (or a destination ALLOW's implicit-deny
+    /// floor) was silently absent and the connection was admitted.
+    ///
+    /// Carries exactly the policies the evaluator would apply to one of those
+    /// destinations (mesh-wide/root-namespace, namespace-scoped, and
+    /// selector-scoped entries matching a destination's own namespace and
+    /// labels) and nothing else. `mesh_authz` unions it into its per-pod
+    /// candidate set under NodeWaypoint per-pod scoping; it is never folded into
+    /// `mesh_policies` on the wire or in the slice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub node_waypoint_capture_mesh_policies: Vec<MeshPolicy>,
+    /// Completeness evidence for [`Self::node_waypoint_capture_mesh_policies`]:
+    /// `true` exactly when the producer of THIS slice generation resolved the
+    /// destination AuthorizationPolicy inventory (the slice builder sets it for
+    /// every capture-scoped request, including when the resolved inventory is
+    /// empty).
+    ///
+    /// An empty inventory is otherwise indistinguishable from a producer that
+    /// never resolved one, and evaluating a captured destination against an
+    /// unresolved inventory silently drops that destination's own DENY/ALLOW.
+    /// [`Self::validate_node_waypoint_capture_inventory`] therefore refuses a
+    /// slice that carries capture destinations (or capture policies) without
+    /// this marker, so the candidate is rejected and the previous complete
+    /// generation keeps serving. Over xDS the marker is the presence of the
+    /// `NodeWaypointCaptureMeshPoliciesCarrier`, which is emitted whenever this
+    /// is `true`, even for an empty inventory.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub node_waypoint_capture_mesh_policies_resolved: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub services: Vec<MeshService>,
@@ -778,6 +815,43 @@ pub(crate) fn node_waypoint_capture_peer_authentications_for_destinations<'a>(
         .collect()
 }
 
+/// AuthorizationPolicy (`MeshPolicy`) entries applicable to `destinations`.
+///
+/// Uses the canonical [`policy_scope_applies_to_workload`] predicate — the one
+/// `PolicyScopeCache::policy_applies` evaluates per connection — against each
+/// destination workload's OWN namespace and labels, so mesh-wide/root-namespace,
+/// namespace-scoped, and selector-scoped policies are kept exactly when the
+/// scoped evaluator would apply them to that destination. Everything else is
+/// dropped: a policy in a namespace with no captured destination, or a
+/// selector that matches no captured destination, never rides this inventory.
+/// `targetRefs` policies are never kept: Istio attaches them at waypoint
+/// proxies only, and the per-pod evaluator never applies them on a
+/// NodeWaypoint.
+///
+/// Returns an empty vec for an empty destination set: with no destination there
+/// is nothing to authorize and carrying policy would only leak it.
+pub(crate) fn node_waypoint_capture_mesh_policies_for_destinations<'a>(
+    mesh_policies: impl IntoIterator<Item = &'a MeshPolicy>,
+    destinations: &[Workload],
+) -> Vec<MeshPolicy> {
+    if destinations.is_empty() {
+        return Vec::new();
+    }
+    mesh_policies
+        .into_iter()
+        .filter(|policy| {
+            destinations.iter().any(|workload| {
+                policy_scope_applies_to_workload(
+                    policy,
+                    &workload.namespace,
+                    &workload.selector.labels,
+                )
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// PeerAuthentication set that governs a generated NodeWaypoint DTLS listener.
 ///
 /// The NodeWaypoint's own inbound view (`peer_authentications`) is filtered to
@@ -812,6 +886,40 @@ pub fn node_waypoint_destination_peer_authentications(
 }
 
 impl MeshSlice {
+    /// Refuse a slice whose NodeWaypoint capture inventory is incomplete.
+    ///
+    /// A slice that names capture destinations must also prove that their
+    /// AuthorizationPolicy inventory was resolved for this generation
+    /// ([`Self::node_waypoint_capture_mesh_policies_resolved`]). Without that
+    /// proof the capture relay would authorize a captured connection against
+    /// the destination's exact scope but without the destination's own
+    /// policies, which admits what those policies refuse. Capture policies
+    /// without the proof are refused too: they are incoherent with this
+    /// generation's producer. Cold path (slice conversion / xDS recovery); the
+    /// diagnostic names fields only, never slice content.
+    pub fn validate_node_waypoint_capture_inventory(&self) -> Result<(), String> {
+        if self.node_waypoint_capture_mesh_policies_resolved {
+            return Ok(());
+        }
+        if !self.node_waypoint_capture_destinations.is_empty() {
+            return Err(
+                "mesh slice carries `node_waypoint_capture_destinations` without \
+                 `node_waypoint_capture_mesh_policies_resolved`: the captured destinations' \
+                 AuthorizationPolicy inventory was not resolved by the producer, so captured \
+                 connections cannot be authorized against it; refusing the slice"
+                    .to_string(),
+            );
+        }
+        if !self.node_waypoint_capture_mesh_policies.is_empty() {
+            return Err(
+                "mesh slice carries `node_waypoint_capture_mesh_policies` without \
+                 `node_waypoint_capture_mesh_policies_resolved`; refusing the incoherent slice"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Compare mesh-slice content while ignoring the transport version stamp.
     ///
     /// MeshSubscribe uses this to suppress no-op updates. Keep the comparison
@@ -860,6 +968,15 @@ impl MeshSlice {
             && self.node_waypoint_capture_destinations == other.node_waypoint_capture_destinations
             && self.node_waypoint_capture_peer_authentications
                 == other.node_waypoint_capture_peer_authentications
+            // A captured destination's AuthorizationPolicy moves independently
+            // of `mesh_policies` (it lives in ANOTHER namespace). Omitting it
+            // would let dedupe keep serving the old destination policy set —
+            // e.g. still admitting a connection after the operator added a
+            // DENY in the captured pod's namespace.
+            && self.node_waypoint_capture_mesh_policies
+                == other.node_waypoint_capture_mesh_policies
+            && self.node_waypoint_capture_mesh_policies_resolved
+                == other.node_waypoint_capture_mesh_policies_resolved
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
             && self.local_inbound_workloads == other.local_inbound_workloads
@@ -1241,40 +1358,71 @@ impl MeshSlice {
         } else {
             mesh.node_waypoint_assertors.clone()
         };
-        // NodeWaypoint transparent-inbound-capture inventory (issue #3287).
-        // Computed from the PRE-narrowing view on purpose: an enrolled pod this
-        // NodeWaypoint captures for can live in another namespace, so deriving it
-        // after the `workloads` narrowing below would silently drop exactly the
-        // cross-namespace destinations whose PeerAuthentication posture must be
-        // enforced. When the CP already resolved it (`filter_mesh_config_to_request`
-        // runs BEFORE its own namespace retains and applies scope/bearer
-        // authorization), that authoritative value wins; the `is_empty` fallback
-        // covers the file/local source and any CP that resolved nothing, and can
-        // only ever yield a SUBSET of the authorized inventory — never a widening.
-        let (node_waypoint_capture_destinations, node_waypoint_capture_peer_authentications) =
-            if request.node_waypoint_capture_scoping {
-                let destinations = if mesh.node_waypoint_capture_destinations.is_empty() {
-                    node_waypoint_capture_destinations_from_workloads(
-                        mesh.workloads.iter(),
-                        request.workload_spiffe_id.as_deref(),
-                    )
-                } else {
-                    mesh.node_waypoint_capture_destinations.clone()
-                };
-                let candidates = if mesh.node_waypoint_capture_peer_authentications.is_empty() {
-                    &mesh.peer_authentications
-                } else {
-                    &mesh.node_waypoint_capture_peer_authentications
-                };
-                let peer_authentications =
-                    node_waypoint_capture_peer_authentications_for_destinations(
-                        candidates.iter(),
+        // NodeWaypoint transparent-inbound-capture inventory (issue #3287):
+        // capture destinations, their PeerAuthentication candidates, and their
+        // AuthorizationPolicy. Derived ONLY from an authoritative, pre-narrowing
+        // source, chosen by the config's explicit provenance — never inferred
+        // from whether the dedicated fields happen to be empty:
+        //
+        // * `Unfiltered` (file/local source, stock-xDS baseline, an unfiltered
+        //   snapshot): derive all three from the whole document.
+        // * `Resolved` (the CP filter resolved the inventory before narrowing
+        //   under CP scope + bearer bounds, or a DP back-projected a resolved
+        //   slice): the dedicated fields are authoritative EVEN WHEN EMPTY.
+        //   Destinations are re-narrowed to this exact NodeWaypoint identity
+        //   (the CP may hold an identity-agnostic candidate set), and the
+        //   candidates are re-narrowed to exactly those destinations. Nothing is
+        //   rebuilt from `workloads` / `peer_authentications` / `mesh_policies`,
+        //   which are narrowed (or Sidecar-widened) routing views here.
+        // * `NotResolved` (narrowed without an inventory): an empty inventory
+        //   WITHOUT completeness evidence, so captured connections resolve
+        //   nothing and the DP refuses capture policies — fail closed.
+        //
+        // The completeness marker is stamped only for the first two, i.e. only
+        // when the inventory really was derived from the authoritative source.
+        let (
+            node_waypoint_capture_destinations,
+            node_waypoint_capture_peer_authentications,
+            node_waypoint_capture_mesh_policies,
+            node_waypoint_capture_mesh_policies_resolved,
+        ) = if !request.node_waypoint_capture_scoping {
+            (Vec::new(), Vec::new(), Vec::new(), false)
+        } else {
+            use crate::modes::mesh::config::NodeWaypointCaptureInventoryState;
+            let identity = request.workload_spiffe_id.as_deref();
+            let sources = match mesh.node_waypoint_capture_inventory_state {
+                NodeWaypointCaptureInventoryState::Unfiltered => Some((
+                    &mesh.workloads,
+                    &mesh.peer_authentications,
+                    &mesh.mesh_policies,
+                )),
+                NodeWaypointCaptureInventoryState::Resolved => Some((
+                    &mesh.node_waypoint_capture_destinations,
+                    &mesh.node_waypoint_capture_peer_authentications,
+                    &mesh.node_waypoint_capture_mesh_policies,
+                )),
+                NodeWaypointCaptureInventoryState::NotResolved => None,
+            };
+            match sources {
+                None => (Vec::new(), Vec::new(), Vec::new(), false),
+                Some((workloads, peer_authentications, mesh_policies)) => {
+                    let destinations = node_waypoint_capture_destinations_from_workloads(
+                        workloads.iter(),
+                        identity,
+                    );
+                    let peer_authentications =
+                        node_waypoint_capture_peer_authentications_for_destinations(
+                            peer_authentications.iter(),
+                            &destinations,
+                        );
+                    let mesh_policies = node_waypoint_capture_mesh_policies_for_destinations(
+                        mesh_policies.iter(),
                         &destinations,
                     );
-                (destinations, peer_authentications)
-            } else {
-                (Vec::new(), Vec::new())
-            };
+                    (destinations, peer_authentications, mesh_policies, true)
+                }
+            }
+        };
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -1946,8 +2094,11 @@ impl MeshSlice {
         // narrowing is a projection of what the policy set already named, so
         // it can never remove a provider a retained policy needs.
         let ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider> = {
+            // The NodeWaypoint capture-destination inventory is evaluated beside
+            // `mesh_policies`, so a provider only it references must ride too.
             let referenced: BTreeSet<&str> = mesh_policies
                 .iter()
+                .chain(node_waypoint_capture_mesh_policies.iter())
                 .flat_map(|policy| policy.rules.iter())
                 .filter_map(|rule| rule.action.custom_provider())
                 .collect();
@@ -1999,6 +2150,8 @@ impl MeshSlice {
             node_waypoint_assertors,
             node_waypoint_capture_destinations,
             node_waypoint_capture_peer_authentications,
+            node_waypoint_capture_mesh_policies,
+            node_waypoint_capture_mesh_policies_resolved,
             services,
             local_inbound_services,
             local_inbound_workloads,
@@ -5003,6 +5156,8 @@ mod tests {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
+            node_waypoint_capture_mesh_policies_resolved: false,
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,

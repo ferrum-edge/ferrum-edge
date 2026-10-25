@@ -40,6 +40,9 @@ pub(super) const MAX_INSPECTED_GRPC_MESSAGES: usize = 1024;
 /// `grpc-encoding`.
 const FLAG_COMPRESSED: u8 = 0x01;
 
+/// Bit 7 of the frame flag: a gRPC-Web trailer frame.
+const FLAG_TRAILER: u8 = 0x80;
+
 /// Why a framed gRPC body cannot be fully inspected message by message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GrpcUninspectable {
@@ -66,14 +69,37 @@ impl GrpcUninspectable {
     }
 }
 
+/// One inspectable message of a framed gRPC body.
+#[derive(Clone, Copy)]
+pub(super) struct GrpcPayload<'m> {
+    /// The message payload (frame header stripped).
+    pub(super) bytes: &'m [u8],
+    /// A gRPC-Web trailer frame (`0x80`): header text, not a message document.
+    pub(super) trailer: bool,
+    /// False only for the final message the WAF's own `max_scan_bytes` window
+    /// cut short: its retained prefix is scanned as text, but it is not a
+    /// complete document.
+    pub(super) complete: bool,
+}
+
+/// A retained message: its payload range and how it may be read.
+struct MessageRange {
+    range: Range<usize>,
+    trailer: bool,
+    complete: bool,
+}
+
 /// The message payloads of one framed gRPC body.
 pub(super) struct GrpcMessages<'a> {
     /// The bytes the frames were parsed from: the body itself, or the decoded
     /// transport of a gRPC-Web text body.
     source: Cow<'a, [u8]>,
-    /// Payload ranges of the inspectable (uncompressed, non-empty) messages.
-    ranges: Vec<Range<usize>>,
+    /// The inspectable (uncompressed, non-empty) messages, in wire order.
+    messages: Vec<MessageRange>,
     uninspectable: Option<GrpcUninspectable>,
+    /// A gRPC-Web text body: its wire bytes are base64, which no backend reads
+    /// as JSON.
+    text: bool,
 }
 
 impl GrpcMessages<'_> {
@@ -82,11 +108,22 @@ impl GrpcMessages<'_> {
         self.uninspectable
     }
 
-    /// Each inspectable message payload, in wire order.
-    pub(super) fn payloads(&self) -> impl Iterator<Item = &[u8]> + '_ {
-        self.ranges
-            .iter()
-            .filter_map(move |range| self.source.get(range.clone()))
+    /// Whether the wire body is gRPC-Web text (base64).
+    pub(super) fn is_text(&self) -> bool {
+        self.text
+    }
+
+    /// Each inspectable message, in wire order.
+    pub(super) fn payloads(&self) -> impl Iterator<Item = GrpcPayload<'_>> + '_ {
+        self.messages.iter().filter_map(move |message| {
+            self.source
+                .get(message.range.clone())
+                .map(|bytes| GrpcPayload {
+                    bytes,
+                    trailer: message.trailer,
+                    complete: message.complete,
+                })
+        })
     }
 }
 
@@ -108,43 +145,46 @@ pub(super) fn split_messages<'a>(
         return None;
     }
     let grpc_web = crate::plugins::grpc_web::is_grpc_web_content_type(content_type);
-    let source: Cow<'a, [u8]> = if crate::plugins::grpc_web::is_grpc_web_text(content_type) {
+    let text = crate::plugins::grpc_web::is_grpc_web_text(content_type);
+    let source: Cow<'a, [u8]> = if text {
         // A retained prefix may end inside a 4-character base64 group; only
         // whole groups are decodable, and the cut group is past the window.
-        let text = if truncated {
+        let encoded = if truncated {
             let whole = body.len() - body.len() % 4;
             body.get(..whole).unwrap_or(body)
         } else {
             body
         };
-        match crate::plugins::grpc_web::decode_grpc_web_text_body(text) {
+        match crate::plugins::grpc_web::decode_grpc_web_text_body(encoded) {
             Some(decoded) => Cow::Owned(decoded),
-            None if text.is_empty() => Cow::Borrowed(&[]),
+            None if encoded.is_empty() => Cow::Borrowed(&[]),
             None => {
                 return Some(GrpcMessages {
                     source: Cow::Borrowed(&[]),
-                    ranges: Vec::new(),
+                    messages: Vec::new(),
                     uninspectable: Some(GrpcUninspectable::MalformedFraming),
+                    text,
                 });
             }
         }
     } else {
         Cow::Borrowed(body)
     };
-    let (ranges, uninspectable) = frame_ranges(&source, grpc_web, truncated);
+    let (messages, uninspectable) = frame_ranges(&source, grpc_web, truncated);
     Some(GrpcMessages {
         source,
-        ranges,
+        messages,
         uninspectable,
+        text,
     })
 }
 
-type FrameRanges = (Vec<Range<usize>>, Option<GrpcUninspectable>);
+type FrameRanges = (Vec<MessageRange>, Option<GrpcUninspectable>);
 
 /// Parse frames from the start of `data`, keeping every complete message that
 /// precedes the first defect. The first uninspectable reason found wins.
 fn frame_ranges(data: &[u8], grpc_web: bool, truncated: bool) -> FrameRanges {
-    let mut ranges = Vec::new();
+    let mut messages = Vec::new();
     let mut uninspectable: Option<GrpcUninspectable> = None;
     let mut pos = 0usize;
     while pos < data.len() {
@@ -176,17 +216,24 @@ fn frame_ranges(data: &[u8], grpc_web: bool, truncated: bool) -> FrameRanges {
             .and_then(|length| header_end.checked_add(length));
         match end {
             Some(end) if end <= data.len() => {
-                push_message(&mut ranges, &mut uninspectable, flag, header_end..end);
+                push_message(
+                    &mut messages,
+                    &mut uninspectable,
+                    flag,
+                    header_end..end,
+                    true,
+                );
                 pos = end;
             }
             _ if truncated => {
                 // The message runs past the retained window: inspect what was
                 // retained of it, exactly as a prefix scan inspects a body.
                 push_message(
-                    &mut ranges,
+                    &mut messages,
                     &mut uninspectable,
                     flag,
                     header_end..data.len(),
+                    false,
                 );
                 break;
             }
@@ -196,23 +243,28 @@ fn frame_ranges(data: &[u8], grpc_web: bool, truncated: bool) -> FrameRanges {
             }
         }
     }
-    (ranges, uninspectable)
+    (messages, uninspectable)
 }
 
 /// Keep one message payload for inspection, or record why it cannot be.
 fn push_message(
-    ranges: &mut Vec<Range<usize>>,
+    messages: &mut Vec<MessageRange>,
     uninspectable: &mut Option<GrpcUninspectable>,
     flag: u8,
     range: Range<usize>,
+    complete: bool,
 ) {
     if range.is_empty() {
         return;
     }
     if flag & FLAG_COMPRESSED != 0 {
         note(uninspectable, GrpcUninspectable::CompressedMessage);
-    } else if ranges.len() < MAX_INSPECTED_GRPC_MESSAGES {
-        ranges.push(range);
+    } else if messages.len() < MAX_INSPECTED_GRPC_MESSAGES {
+        messages.push(MessageRange {
+            range,
+            trailer: flag & FLAG_TRAILER != 0,
+            complete,
+        });
     } else {
         note(uninspectable, GrpcUninspectable::TooManyMessages);
     }

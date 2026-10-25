@@ -328,7 +328,7 @@ These plugin fields are now refused at admission above a hard ceiling:
 
 An omitted `body_validator` value inherited from a larger `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` is clamped to the ceiling instead of refused. Lower any configured value above its ceiling before upgrading; otherwise the plugin config is rejected (`400` on the Admin API, startup failure in file mode).
 
-### `waf` governs bodies on every method and inspects gRPC per message
+### `waf` governs bodies on every method and inspects gRPC per message (PR #6813)
 
 - Request bodies are no longer gated by `body_methods`: a request on any
   method except `CONNECT` is buffered and scanned whenever a body may follow

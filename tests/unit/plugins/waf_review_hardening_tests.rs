@@ -337,16 +337,29 @@ async fn a_malformed_suffix_does_not_hide_the_complete_messages_before_it() {
     clean.extend_from_slice(&[0x7f, 0, 0, 0, 1, b'x']);
     let headers = [("content-type", "application/grpc+json")];
 
-    // Enforcing: the defect itself is refused, whatever precedes it.
+    // Enforcing: the defect is refused whatever precedes it. Hits decide
+    // first, and a JSON-path rule fails closed on the unreadable remainder
+    // (#6807), so the refusal is the rule's own.
     let plugin = waf(json_path_bio_rule()).unwrap();
     for body in [&forbidden, &clean] {
         let (result, request) = final_request_body(&plugin, "POST", &headers, body).await;
         assert!(is_reject(&result));
-        assert_eq!(
-            meta(&request, "waf.body_uninspected"),
-            Some("grpc_malformed_framing")
-        );
+        assert_eq!(meta(&request, "waf.rule_hits"), Some("BIO"));
     }
+
+    // With no JSON-path rule to fail closed, the framing defect itself is the
+    // refusal.
+    let plugin = waf(enforcing_body_text_rule("enforce")).unwrap();
+    let (result, request) = final_request_body(&plugin, "POST", &headers, &clean).await;
+    assert!(is_reject(&result));
+    assert_eq!(
+        meta(&request, "waf.block_reason"),
+        Some("grpc_message_uninspectable")
+    );
+    assert_eq!(
+        meta(&request, "waf.body_uninspected"),
+        Some("grpc_malformed_framing")
+    );
 
     // Observing: the complete message before the defect is still scanned
     // rather than the stream being read as one invalid document.
@@ -545,21 +558,22 @@ fn json_path_only_policies_return_before_whole_body_text_views() {
         .nth(1)
         .expect("scan_body_rules exists");
     let body = body
-        .split("\n    pub(super) fn ")
+        .split("\n    fn ")
         .next()
         .expect("scan_body_rules body");
     let guard = body
         .find("if !text_views_active {\n            return outcome;\n        }")
         .expect("the text-view guard returns before any whole-body view");
-    let first_lossy = body
-        .find("String::from_utf8_lossy(body)")
-        .expect("the raw text view is still built for text rules");
-    let first_text_view = body
-        .find("self.scan_body_text_view(")
+    let first_text_pass = body
+        .find("self.scan_body_text_rules(")
         .expect("text views are still scanned for text rules");
     assert!(
-        guard < first_lossy && guard < first_text_view,
+        guard < first_text_pass,
         "whole-body normalization must sit behind `text_views_active`"
+    );
+    assert!(
+        !body[..guard].contains("String::from_utf8_lossy(body)"),
+        "no whole-body text view may be built before the guard"
     );
 }
 

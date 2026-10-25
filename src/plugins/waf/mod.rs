@@ -41,7 +41,7 @@ use self::rules::{
     CompiledRule, CompiledRules, ParanoiaLevels, RuleAction, RuleHit, RuleTarget, Severity,
     WafRule, compile_rules, parse_custom_rule, parse_rule_action, parse_rule_overrides,
 };
-use self::scan::ScanOutcome;
+use self::scan::{BodyExtent, ScanOutcome};
 use self::stream::{
     StreamWafConfig, TLS_CLIENT_HELLO_MIN_PREFIX, looks_like_tls_client_hello, parse_stream_config,
 };
@@ -983,6 +983,30 @@ impl Waf {
             );
         }
         Err(self.reject())
+    }
+
+    /// Apply the uninspectable-gRPC decision AFTER the scan: hits always
+    /// decide first (a matched rule, or a JSON-path rule failing closed on an
+    /// unreadable message, keeps its own `waf.block_reason`), and a body the
+    /// scan let through is then refused or recorded for the part of it the
+    /// WAF could not read.
+    fn finish_grpc_body(
+        &self,
+        ctx: &mut RequestContext,
+        direction: BodyDirection,
+        grpc_messages: Option<&grpc::GrpcMessages<'_>>,
+        result: PluginResult,
+    ) -> PluginResult {
+        if !matches!(result, PluginResult::Continue) {
+            return result;
+        }
+        match grpc_messages.and_then(|messages| messages.uninspectable()) {
+            Some(reason) => match self.decide_uninspectable_grpc_body(ctx, direction, reason) {
+                Ok(()) => result,
+                Err(refusal) => refusal,
+            },
+            None => result,
+        }
     }
 
     /// Run the body/message scan under the scan budget.
@@ -2151,19 +2175,18 @@ impl Plugin for Waf {
         };
         let content_type = headers.get("content-type").map(String::as_str);
         // A framed gRPC / gRPC-Web body is inspected message by message (see
-        // `waf::grpc`); a message the WAF cannot read is decided first.
+        // `waf::grpc`); a part the WAF cannot read is decided after the scan
+        // (`finish_grpc_body`).
         let grpc_messages = grpc::split_messages(body, content_type, truncated);
-        if let Some(reason) = grpc_messages
-            .as_ref()
-            .and_then(|messages| messages.uninspectable())
-            && let Err(result) =
-                self.decide_uninspectable_grpc_body(ctx, BodyDirection::Request, reason)
-        {
-            return result;
-        }
         let mut outcome = self
             .run_body_scan_with_budget(|| {
-                self.run_request_body_scan(ctx, body, content_type, grpc_messages.as_ref())
+                self.run_request_body_scan(
+                    ctx,
+                    body,
+                    content_type,
+                    BodyExtent::of(truncated),
+                    grpc_messages.as_ref(),
+                )
             })
             .await;
         outcome.truncated = truncated;
@@ -2173,7 +2196,8 @@ impl Plugin for Waf {
         // decides a clean body whose scan missed its deadline (issue #5528).
         let timeout_enforces =
             outcome.timed_out && self.request_body_policy_enforces(ctx, headers, body);
-        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, timeout_enforces)
+        let result = self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, timeout_enforces);
+        self.finish_grpc_body(ctx, BodyDirection::Request, grpc_messages.as_ref(), result)
     }
 
     async fn after_proxy(
@@ -2500,14 +2524,6 @@ impl Plugin for Waf {
         // relabeled body: a header-only relabel leaves the origin bytes as
         // they were.
         let grpc_messages = grpc::split_messages(body, scope_content_type, truncated);
-        if let Some(reason) = grpc_messages
-            .as_ref()
-            .and_then(|messages| messages.uninspectable())
-            && let Err(result) =
-                self.decide_uninspectable_grpc_body(ctx, BodyDirection::Response, reason)
-        {
-            return result;
-        }
         let mut outcome = self
             .run_body_scan_with_budget(|| {
                 self.run_response_body_scan(ctx, body, scope_content_type, grpc_messages.as_ref())
@@ -2518,12 +2534,13 @@ impl Plugin for Waf {
         // only on the timeout path.
         let timeout_enforces =
             outcome.timed_out && self.response_body_policy_enforces(ctx, scope_content_type);
-        self.finish_scan(
+        let result = self.finish_scan(
             ctx,
             outcome,
             WafScorePhase::FinalResponseBody,
             timeout_enforces,
-        )
+        );
+        self.finish_grpc_body(ctx, BodyDirection::Response, grpc_messages.as_ref(), result)
     }
 
     /// Preserve the established final-body hook contract for direct callers.
