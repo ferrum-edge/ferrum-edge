@@ -568,7 +568,7 @@ fn is_builtin_named(plugin: &Arc<dyn Plugin>, name: &str) -> bool {
 
 /// The built-in `opa` instance behind `plugin`, looking through cache wrappers.
 /// Keyed on the concrete type, never the reported name.
-fn builtin_opa(plugin: &(dyn Plugin + 'static)) -> Option<&crate::plugins::opa::Opa> {
+fn builtin_opa<'a>(plugin: &'a (dyn Plugin + 'static)) -> Option<&'a crate::plugins::opa::Opa> {
     let any: &dyn std::any::Any = plugin;
     if let Some(opa) = any.downcast_ref::<crate::plugins::opa::Opa>() {
         return Some(opa);
