@@ -23882,6 +23882,13 @@ components:
         a different issuer are never tried. At most 64 providers are allowed,
         and for every issuer the providers sharing it plus the providers
         without an issuer must total at most 8 (at most 8 may omit issuer).
+        A provider without an issuer never authenticates a token whose
+        verified iss is the issuer of a provider in the same instance that
+        requires DPoP or mTLS binding, so it cannot strip that realm's sender
+        constraint. Verified algorithms: RS256/RS384/RS512,
+        PS256/PS384/PS512, ES256/ES384, and EdDSA (Ed25519 OKP keys; refused
+        while FIPS mode is enforced). ES512 is not supported. Verification is
+        bound to the selected JWK's alg (an RSA JWK without alg is RS256).
       required: [providers]
       properties:
         providers:
@@ -23929,6 +23936,10 @@ components:
                   from a different origin than discovery, configure jwks_uri
                   directly instead. HTTPS is required except for literal
                   loopback or localhost endpoints. URL userinfo is rejected.
+                  After the first successful resolution, discovery is re-run
+                  every jwks_refresh_interval_secs; a changed jwks_uri is
+                  adopted once its key set has usable keys, otherwise the
+                  last-known-good store is retained.
               jwks:
                 oneOf:
                   - type: string
@@ -24009,8 +24020,8 @@ components:
                   so the enforced expiry is never later than the token states.
                   nbf presence and validation are delegated to the JWT
                   validation layer; Ferrum does not normalize a fractional nbf.
-                  JWT exp/nbf use zero clock leeway; DPoP skew is a separate
-                  proof contract.
+                  JWT exp/nbf use the effective clock_skew_seconds leeway
+                  (default 0); DPoP skew is a separate proof contract.
               required_scopes:
                 type: array
                 items:
@@ -24050,7 +24061,11 @@ components:
               consumer_identity_claim:
                 type: string
                 pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-                description: Per-provider override for consumer identity claim (falls back to global); a dot path with no empty segments
+                description: >-
+                  Per-provider override for the external authenticated identity
+                  claim (falls back to global); a dot path with no empty
+                  segments. The identity is never resolved to a gateway
+                  Consumer.
               consumer_header_claim:
                 type: string
                 pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
@@ -24127,7 +24142,15 @@ components:
               require_mtls_binding:
                 type: boolean
                 default: false
-                description: Require cnf.x5t#S256 to match the frontend client certificate
+                description: >-
+                  Require cnf.x5t#S256 to match the frontend client
+                  certificate. A provider without an issuer never
+                  authenticates a token whose iss is this provider's issuer.
+                  A provider that sets this without an issuer is admitted
+                  only when every provider in the instance also sets it;
+                  otherwise the configuration is rejected, because an
+                  unbound sibling could accept its tokens without the
+                  certificate.
               require_dpop:
                 type: boolean
                 default: false
@@ -24141,10 +24164,16 @@ components:
                   only against providers that set this flag. Validated proof
                   claims are htm, htu, iat, jti and ath (RFC 9449 4.2); exp is
                   not an RFC 9449 proof claim and is not required, but a proof
-                  that carries one is rejected once it has passed. Equivalent
+                  that carries one is rejected once it has passed. The proof
+                  htu path is canonicalized exactly like the request path
+                  (percent-encoded pchar escapes decoded), so a proof bound to
+                  the URI the client sent matches. Proofs may be signed with
+                  ES256/ES384, RS256/RS384/RS512, PS256/PS384/PS512, or EdDSA
+                  (Ed25519; refused while FIPS mode is enforced). Equivalent
                   providers that share one exact issuer must agree on this
                   flag; matching order would otherwise let a sibling skip the
-                  proof.
+                  proof. A provider without an issuer never authenticates a
+                  token whose iss is this provider's issuer.
               dpop_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -24202,6 +24231,15 @@ components:
                   inline jwks provider is rejected. jwks_refresh_interval_secs
                   must not exceed this value — a cross-field rule JSON Schema
                   cannot express, enforced at config load.
+              clock_skew_seconds:
+                type: integer
+                format: uint64
+                minimum: 0
+                maximum: 300
+                description: >-
+                  Per-provider JWT exp/nbf clock leeway in seconds; overrides
+                  the plugin-level clock_skew_seconds. The authenticated-stream
+                  deadline is exp plus this leeway.
           description: Array of identity provider configurations
         scope_claim:
           type: string
@@ -24217,7 +24255,12 @@ components:
           type: string
           default: sub
           pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
-          description: JWT claim for consumer lookup; a dot path with no empty segments
+          description: >-
+            JWT claim used as the external authenticated identity; a dot path
+            with no empty segments. The identity is scoped to the provider that
+            verified it and is never resolved to a gateway Consumer (not by
+            username, id, or custom_id), so Consumer-scoped policy does not
+            apply to jwks_auth principals.
         consumer_header_claim:
           type: string
           pattern: "^\\s*[^.\\s][^.]*(\\.[^.]+)*\\s*$"
@@ -24275,6 +24318,17 @@ components:
           type: boolean
           default: true
           description: Global default for requiring an exp claim
+        clock_skew_seconds:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 300
+          default: 0
+          description: >-
+            JWT exp/nbf clock leeway in seconds for every provider without its
+            own clock_skew_seconds. The authenticated-stream deadline is exp
+            plus the effective leeway, never later. DPoP proof skew is the
+            separate dpop_clock_skew_secs.
         jwks_refresh_interval_secs:
           type: integer
           format: uint64
@@ -24283,7 +24337,8 @@ components:
           default: 900
           description: >-
             JWKS key refresh interval in seconds. Must not exceed the effective
-            jwks_max_stale_seconds for any remote provider.
+            jwks_max_stale_seconds for any remote provider. discovery_url
+            providers also re-run OIDC discovery at this interval.
         jwks_max_stale_seconds:
           type: integer
           format: uint64

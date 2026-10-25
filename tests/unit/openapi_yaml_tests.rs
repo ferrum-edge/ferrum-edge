@@ -5765,6 +5765,18 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         schema["properties"]["providers"]["items"]["properties"]["dpop_clock_skew_secs"]["maximum"],
         json!(ferrum_edge::plugins::utils::dpop::MAX_DPOP_CLOCK_SKEW_SECS)
     );
+    assert_eq!(
+        schema["properties"]["clock_skew_seconds"]["default"],
+        json!(0)
+    );
+    assert_eq!(
+        schema["properties"]["clock_skew_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_JWT_CLOCK_SKEW_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["clock_skew_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_JWT_CLOCK_SKEW_SECONDS)
+    );
     // The removed replay knobs must not reappear: retention is a fixed horizon
     // derived from the clock-skew ceiling, not a configured value.
     assert!(
@@ -18221,6 +18233,8 @@ fn jwks_auth_schema_matches_runtime_admission() {
         remote(json!({"required_scopes": ["admin"], "scope_claim": "realm.scope"})),
         remote(json!({"jwks_max_stale_seconds": 600})),
         remote(json!({"output_claim_headers": [{"header": "x-claim", "claim": "sub"}]})),
+        remote(json!({"clock_skew_seconds": 300})),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "clock_skew_seconds": 30}),
         local(json!({})),
         json!({"providers": [{"discovery_url": DISCOVERY_URL}]}),
         json!({"providers": [{"jwks_uri": "http://127.0.0.1:9000/jwks"}]}),
@@ -18255,6 +18269,8 @@ fn jwks_auth_schema_matches_runtime_admission() {
         local(json!({"dpop_replay_scope": "process"})),
         json!({"providers": [{"jwks_uri": JWKS_URI}], "scope_claim": "a..b"}),
         json!({"providers": [{"jwks_uri": JWKS_URI}], "claim_headers_separator": ""}),
+        remote(json!({"clock_skew_seconds": 301})),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "clock_skew_seconds": 301}),
     ];
     for config in &rejected {
         assert_component_validity(&spec, "JwksAuthConfig", config, false);
