@@ -3818,6 +3818,12 @@ pub(crate) struct PluginRequestState {
     /// its media type. Only byte-identical output may reuse the verification;
     /// later semantic changes still require a fresh detection pass. Never logged.
     pub(crate) ai_response_guard_verified_redactions: HashMap<u64, [u8; 32]>,
+    /// Per-instance digest of the exact representation (status, media type,
+    /// gRPC message encoding, bytes) `ai_response_guard` inspected in
+    /// `on_response_body` and decided completely, with no deferral and no
+    /// pending redaction. The final client-visible phase skips a second parse
+    /// and scan only for that identical representation. Never logged.
+    pub(crate) ai_response_guard_inspected_clean: HashMap<u64, [u8; 32]>,
     /// `ai_tool_governor` equivalent of
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
