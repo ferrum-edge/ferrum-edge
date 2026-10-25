@@ -31203,6 +31203,13 @@ components:
         log_to_metadata:
           type: [boolean, "null"]
           default: true
+          description: >-
+            Write waf.* decision metadata into transaction logs, including
+            waf.matched_fields: the query:, header:, cookie:, and
+            response_header: field NAMES matched hits came from
+            (percent-encoded, at most 16 per scan, each cut at 128 bytes) —
+            never a matched value. Detection-only (paranoia band) hits list
+            theirs in waf.detection_matched_fields.
         log_to_stdout:
           type: [boolean, "null"]
           default: false
@@ -31305,14 +31312,19 @@ components:
             fail_closed (default) rejects it when an enforcing request-body
             policy applies to the request, and records it otherwise; block
             rejects every such body while mode is enforce. Scope: HTTP request bodies only (HTTP/1.1, HTTP/2, HTTP/3,
-            native gRPC, and gRPC-Web), and only on methods listed in
-            body_methods, on requests no global exemption short-circuits, and
+            native gRPC, and gRPC-Web), on every method once the request
+            declares a body (see body_methods), on requests no global
+            exemption short-circuits, and
             when this instance's request-body hook runs (request_inspection and
             request_body_inspection on, with an active request-body rule or
             FE-ENCODING-001/002). Response bodies and WebSocket messages are
             never governed by it. gRPC and gRPC-Web bodies are unlisted by
             default, except the +json codecs (application/grpc+json,
-            application/grpc-web+json), which the suffix mapping scans as JSON.
+            application/grpc-web+json), which the suffix mapping scans as JSON,
+            one length-prefixed message at a time; a grpc-encoding-compressed
+            message is refused when an enforcing request-body policy applies
+            (waf.block_reason=grpc_message_uninspectable) and recorded as
+            waf.body_uninspected=grpc_compressed otherwise.
             A refusing configuration buffers the body and decides over the
             finalized headers and actual bytes, so an empty body always passes
             and the rejection (reject_status_code) arrives at end of stream.
@@ -31320,9 +31332,9 @@ components:
             waf.body_uninspected=content_type; recorded-but-allowed bodies set
             waf.body_uninspected=content_type. Under mode enforce, block is a
             reachable admission enforcement path when the request-body hook can
-            run (as above), body_methods is not empty, and at least one content
-            type is left unscanned (not both inspect_multipart and
-            inspect_binary_body); fail_closed is not.
+            run (as above) and at least one content type is left unscanned (not
+            both inspect_multipart and inspect_binary_body); fail_closed is
+            not.
         on_unlisted_response_content_type:
           type: [string, "null"]
           enum: [allow, fail_closed, block, null]
@@ -31563,14 +31575,18 @@ components:
             minLength: 1
           default: [POST, PUT, PATCH, DELETE]
           description: >-
-            HTTP methods whose request bodies are buffered and scanned, and
-            governed by on_unlisted_content_type. DELETE is included by default
-            because it may carry content that backends parse; list GET or other
-            methods explicitly if your backends read their bodies. WebSocket messages ignore it.
-            An empty list turns off HTTP request-body scanning, so
-            on_unlisted_content_type: block no longer satisfies mode: enforce
-            admission; on_body_too_large: block still does while WebSocket
-            client messages can be inspected.
+            HTTP methods whose request bodies are always buffered and scanned.
+            Body governance is not a method allowlist: a request on any other
+            method (except CONNECT) is buffered, scanned, and governed by
+            on_unlisted_content_type whenever a body may follow its head — it
+            carries a Content-Type, declares HTTP/1.1 framing (Content-Length
+            greater than zero or Transfer-Encoding), is an HTTP/2 request whose
+            HEADERS frame lacked END_STREAM, or is any HTTP/3 request — and any
+            non-empty finalized body is decided whatever the method. DELETE is
+            included by default because it may carry content that backends
+            parse. WebSocket messages ignore it. An empty list therefore does
+            not turn off request-body scanning for requests that may carry a
+            body.
         body_content_types:
           type: [array, "null"]
           items:
@@ -31916,7 +31932,11 @@ components:
             `prefix*` is a prefix match, and `~regex` is a start-anchored regex
             (implicit `^(?:...)` wrapper so every alternation branch is
             anchored). Use `~.*pattern` for a floating substring match. Keep entries tight — an over-broad pattern silently disables
-            the WAF on unintended routes.
+            the WAF on unintended routes. Exact and `prefix*` entries are
+            matched against the canonical request path, so one that is not
+            itself canonical (a percent escape, a backslash, a dot segment, or
+            `//`) is rejected at construction; `~regex` entries are not checked
+            this way.
           items:
             type: string
             minLength: 1
@@ -31950,7 +31970,11 @@ components:
           description: >-
             Header name to shared-secret value. When a request carries one of
             these headers with exactly the configured value (compared in
-            constant time), every rule is suppressed for that request. Clients
+            constant time), every rule is suppressed for that request, and so
+            are the fail_closed and block dispositions of on_body_too_large,
+            on_unlisted_content_type, on_unlisted_response_content_type, and
+            on_scan_timeout.
+            Clients
             choose their own headers, so presence-only (null) entries are not
             admitted and each value must be a secret of at least 16 characters
             that only a trusted hop in front of the gateway injects. Header

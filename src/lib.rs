@@ -10560,6 +10560,17 @@ pub mod _test_support {
         ctx.set_request_http_flavor(flavor);
     }
 
+    /// Record the transport's request end-of-stream evidence exactly as the
+    /// H1/H2 (`!Incoming::is_end_stream()`) and H3 (always `Some(true)`)
+    /// frontends do, so body-governance decisions can be exercised for a head
+    /// that omits `Content-Length` / `Content-Type`.
+    pub fn set_inbound_request_body_may_follow_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        may_follow: Option<bool>,
+    ) {
+        ctx.inbound_request_body_may_follow = may_follow;
+    }
+
     /// Stamp the authoritative client-visible wire transport a frontend would
     /// record, so trigger `protocol:` predicates can be exercised without
     /// standing up an H1/H2/H3 listener.
