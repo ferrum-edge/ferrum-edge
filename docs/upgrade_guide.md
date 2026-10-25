@@ -28,27 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### WebSocket decision observers and `ws_frame_logging` records (#6862)
+### `cors` method and header lists are bounded (#6844)
 
-Custom plugins that implement `Plugin::prepare_ws_frame_delivery` must add the
-new `connection_id: u64` and `direction: WebSocketFrameDirection` parameters
-before `message`. Custom plugins that return `true` from
-`observes_ws_frame_decisions()` and recorded the terminal Close from
-`on_ws_frame` must move that logic to the new `on_ws_policy_close(proxy_id,
-connection_id, direction, close)` hook. The relay no longer invokes any plugin,
-observers included, for a message after a terminal Close. It reports the final
-decision to every observer exactly once, also for fragment-budget and parser
-rejections. Observers still receive ordinary messages through `on_ws_frame`.
-
-`ws_frame_logging` configs need no change. Log consumers will see:
-
-- a new `plugin_id` field on every record;
-- a new `termination_reason` field on disconnect records;
-- `outcome=policy_close` for parser, fragment, and priority-reordered
-  rejections that previously produced no record.
-
-The new `sample_rate`, `direction`, and `max_records_per_connection` options
-default to the previous behavior (everything is logged).
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
@@ -183,6 +173,36 @@ A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
 answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
+
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
 
 ### Backend idle connections: higher default ceiling (#6793)
 
