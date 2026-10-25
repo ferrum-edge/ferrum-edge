@@ -22148,7 +22148,9 @@ components:
         are rejected. Body capture is opt-in and default off. It never forces an
         ineligible message to buffer: a body is sampled only when the message
         declares an identity Content-Encoding, a Content-Length that fits inside
-        the configured cap, and a capturable textual Content-Type
+        the configured cap (or, with the explicit capture_body_prefix opt-in, a
+        text/plain or form Content-Length up to 1048576 bytes), and a
+        capturable textual Content-Type
         (application/json, +json, text/json,
         application/x-www-form-urlencoded, text/plain). gRPC
         (application/grpc*), SSE (text/event-stream), WebSocket upgrades

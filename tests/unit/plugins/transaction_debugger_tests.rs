@@ -3225,3 +3225,170 @@ async fn test_prefix_mode_renders_complete_redacted_units_marked_truncated() {
     assert!(logs.contains("reason=over_capture_limit"), "got: {logs}");
     assert!(!logs.contains("yyyy"), "got: {logs}");
 }
+
+// ---------------------------------------------------------------------------
+// PR #6851 review round 1
+// ---------------------------------------------------------------------------
+
+/// A compact JWS whose protected header carries `leading` JSON-whitespace
+/// bytes before `{ "alg": "HS256" }` (RFC 7515 permits them).
+fn leading_whitespace_jwt(leading: usize) -> String {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut header = vec![b' '; leading];
+    header.extend_from_slice(br#"{ "alg": "HS256" }"#);
+    format!(
+        "{}.{}.{}",
+        engine.encode(&header),
+        engine.encode(br#"{ "sub": "alice", "exp": 2000000000 }"#),
+        engine.encode(b"not-a-real-signature-but-shaped-like-one"),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_jwt_with_leading_whitespace_past_the_decode_window_is_redacted() {
+    let plugin = capture_plugin();
+    // 47/48 decoded bytes straddle the 64-character window; 60 and 200 put the
+    // opener entirely beyond it.
+    for leading in [0usize, 30, 47, 48, 60, 200] {
+        let token = leading_whitespace_jwt(leading);
+        assert!(
+            !token.to_ascii_lowercase().contains("eyj"),
+            "fixture must avoid the literal prefix"
+        );
+        let signature = token.rsplit('.').next().unwrap().to_string();
+
+        let json_body = serde_json::to_vec(&json!({"note": token})).unwrap();
+        let json = plugin.render_captured_body(&json_body, BodyKind::Json, 1024);
+        assert!(
+            !json.rendered.contains(&signature),
+            "leading={leading}: {}",
+            json.rendered
+        );
+
+        let form_body = format!("note={token}&keep=yes");
+        let form = plugin.render_captured_body(form_body.as_bytes(), BodyKind::Form, 1024);
+        assert!(
+            !form.rendered.contains(&signature),
+            "leading={leading}: {}",
+            form.rendered
+        );
+        assert!(form.rendered.contains("keep=yes"), "{}", form.rendered);
+
+        let text_body = format!("line one is fine\n{token}\nline three is fine");
+        let text = plugin.render_captured_body(text_body.as_bytes(), BodyKind::Text, 1024);
+        assert!(
+            !text.rendered.contains(&signature),
+            "leading={leading}: {}",
+            text.rendered
+        );
+
+        // Both header-dump directions.
+        let header_plugin = TransactionDebugger::new(&json!({})).unwrap();
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("x-trace-copy".to_string(), token.clone());
+        let mut response_headers = HashMap::from([("x-upstream-copy".to_string(), token.clone())]);
+        let logs = capture_debug_logs_during(|| async {
+            let _ = header_plugin.on_request_received(&mut ctx).await;
+            let _ = header_plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await;
+        })
+        .await;
+        assert!(logs.contains("Incoming request"), "got: {logs}");
+        assert!(logs.contains("Backend response"), "got: {logs}");
+        assert!(
+            !logs.contains(&signature),
+            "leading={leading} leaked: {logs}"
+        );
+    }
+
+    // Short whitespace-only segments are not a header.
+    let rendered = plugin.render_captured_body(br#"{"v":"ICAg.ICAg.ICAg"}"#, BodyKind::Json, 512);
+    assert!(
+        rendered.rendered.contains("ICAg.ICAg.ICAg"),
+        "{}",
+        rendered.rendered
+    );
+}
+
+/// Run `before_proxy` the way core does when no plugin modifies request
+/// headers: `ctx.headers` is moved into the hook map and restored afterwards.
+async fn before_proxy_with_moved_headers(plugin: &TransactionDebugger, ctx: &mut RequestContext) {
+    let mut moved = std::mem::take(&mut ctx.headers);
+    let _ = plugin.before_proxy(ctx, &mut moved).await;
+    ctx.headers = moved;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_selected_request_is_captured_when_core_moves_headers_for_before_proxy() {
+    let plugin = targeted_plugin(json!({
+        "capture_request_header": "x-debug-capture",
+        "capture_request_header_value": "incident-42",
+    }));
+    let headers = body_headers("application/json", 16);
+    let body = br#"{"user":"alice"}"#;
+
+    // Full lifecycle: the selector is memoized in `on_request_received`.
+    let mut ctx = capturable_ctx();
+    ctx.headers
+        .insert("x-debug-capture".to_string(), "incident-42".to_string());
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut ctx).await;
+        assert!(plugin.should_buffer_request_body(&ctx));
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+    assert!(logs.contains("alice"), "got: {logs}");
+    assert!(!logs.contains("not_selected"), "got: {logs}");
+
+    // Without a memo, `before_proxy` reads the selector from the hook map.
+    let mut ctx = capturable_ctx();
+    ctx.headers
+        .insert("x-debug-capture".to_string(), "incident-42".to_string());
+    let logs = capture_debug_logs_during(|| async {
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+
+    // The memo is the original client view: a later rewrite of the selector
+    // does not change the decision for this request.
+    let mut ctx = capturable_ctx();
+    ctx.headers
+        .insert("x-debug-capture".to_string(), "incident-42".to_string());
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut ctx).await;
+        ctx.headers.remove("x-debug-capture");
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+
+    // An unselected request still reports exactly one omission.
+    let mut ctx = capturable_ctx();
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut ctx).await;
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("reason=not_selected"), "got: {logs}");
+    assert!(!logs.contains("alice"), "got: {logs}");
+}

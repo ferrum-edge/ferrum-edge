@@ -366,10 +366,16 @@ pub struct CapturedBody {
 /// record first sets that direction's flag, and every later hook for the same
 /// direction is a no-op, so a flip yields exactly one record instead of zero or
 /// two. Content-free by construction: nothing here describes the body.
+///
+/// `header_selected` memoizes the `capture_request_header` decision from the
+/// original client headers in `on_request_received`. Core moves `ctx.headers`
+/// out of the context while it runs header-preserving `before_proxy` hooks, so
+/// a later hook must not re-read the selector from the live map.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CaptureRecordState {
     pub(crate) request_emitted: bool,
     pub(crate) response_emitted: bool,
+    pub(crate) header_selected: Option<bool>,
 }
 
 /// Direction of one capture record.
@@ -697,19 +703,30 @@ impl TransactionDebugger {
     /// request's receive time, so a request admitted just before the deadline
     /// is still captured in both directions.
     fn capture_selection_skip(&self, ctx: &RequestContext) -> Option<&'static str> {
+        self.capture_selection_skip_with(ctx, &ctx.headers)
+    }
+
+    /// [`Self::capture_selection_skip`] with an explicit request-header view
+    /// for the selector, used only when `on_request_received` did not memoize
+    /// the selector decision. `before_proxy` passes the hook header map, which
+    /// is where core keeps the request headers while `ctx.headers` is moved
+    /// out for header-preserving hooks.
+    fn capture_selection_skip_with(
+        &self,
+        ctx: &RequestContext,
+        selector_headers: &HashMap<String, String>,
+    ) -> Option<&'static str> {
         if self
             .capture_expires_at
             .is_some_and(|expires_at| ctx.timestamp_received >= expires_at)
         {
             return Some("capture_expired");
         }
-        if let Some(name) = self.capture_request_header.as_deref() {
-            let Some(value) = header_value(&ctx.headers, name) else {
-                return Some("not_selected");
-            };
-            if let Some(expected) = self.capture_request_header_value.as_deref()
-                && !constant_time_eq(value.trim().as_bytes(), expected.as_bytes())
-            {
+        if self.capture_request_header.is_some() {
+            let selected = self
+                .memoized_header_selection(ctx)
+                .unwrap_or_else(|| self.header_selects(selector_headers));
+            if !selected {
                 return Some("not_selected");
             }
         }
@@ -719,6 +736,31 @@ impl TransactionDebugger {
             return Some("not_selected");
         }
         None
+    }
+
+    /// Whether `headers` carries the configured selector header (and, when
+    /// configured, its exact value). `true` when no selector is configured.
+    fn header_selects(&self, headers: &HashMap<String, String>) -> bool {
+        let Some(name) = self.capture_request_header.as_deref() else {
+            return true;
+        };
+        let Some(value) = header_value(headers, name) else {
+            return false;
+        };
+        self.capture_request_header_value
+            .as_deref()
+            .is_none_or(|expected| constant_time_eq(value.trim().as_bytes(), expected.as_bytes()))
+    }
+
+    /// The selector decision `on_request_received` memoized for this request.
+    fn memoized_header_selection(&self, ctx: &RequestContext) -> Option<bool> {
+        ctx.plugin_state()
+            .and_then(|state| {
+                state
+                    .transaction_debugger_capture_records
+                    .get(&self.instance_id)
+            })
+            .and_then(|records| records.header_selected)
     }
 
     /// Whether targeting is configured. Targeting is judged from the request
@@ -756,16 +798,19 @@ impl TransactionDebugger {
         }
     }
 
-    /// Request-direction decision including targeting.
+    /// Request-direction decision including targeting. `selector_headers` is
+    /// the request-header view the selector falls back to when no decision was
+    /// memoized (see [`Self::capture_selection_skip_with`]).
     fn request_capture_decision_for(
         &self,
         ctx: &RequestContext,
+        selector_headers: &HashMap<String, String>,
         headers: &HashMap<String, String>,
     ) -> BodyCaptureDecision {
         if !self.log_request_body {
             return BodyCaptureDecision::Skip("disabled");
         }
-        if let Some(reason) = self.capture_selection_skip(ctx) {
+        if let Some(reason) = self.capture_selection_skip_with(ctx, selector_headers) {
             return BodyCaptureDecision::Skip(reason);
         }
         self.request_body_capture_decision(headers)
@@ -1375,7 +1420,7 @@ impl TransactionDebugger {
     /// an admitted body — and captures nothing when targeting is configured.
     fn capture_final_request_body(
         &self,
-        mut ctx: Option<&mut RequestContext>,
+        ctx: Option<&mut RequestContext>,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
@@ -1387,7 +1432,7 @@ impl TransactionDebugger {
                 if self.capture_record_emitted(hook_ctx, CaptureDirection::Request) {
                     return PluginResult::Continue;
                 }
-                self.request_capture_decision_for(hook_ctx, headers)
+                self.request_capture_decision_for(hook_ctx, &hook_ctx.headers, headers)
             }
             None => {
                 if self.capture_targeting_configured() {
@@ -1417,7 +1462,7 @@ impl TransactionDebugger {
             record,
             sample.as_ref(),
         );
-        if let Some(hook_ctx) = ctx.as_deref_mut() {
+        if let Some(hook_ctx) = ctx {
             self.mark_capture_record_emitted(hook_ctx, CaptureDirection::Request);
         }
         PluginResult::Continue
@@ -1484,6 +1529,20 @@ impl Plugin for TransactionDebugger {
         if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
             let safe_headers = self.redact_headers(ctx, &ctx.headers);
             tracing::debug!(target: "transaction_debug", method = %ctx.method, path = %ctx.path, client_ip = %ctx.client_ip, headers = ?safe_headers, "Incoming request");
+            // Memoize the selector decision from the original client headers:
+            // core moves `ctx.headers` out while header-preserving
+            // `before_proxy` hooks run, and a request transformer may rewrite
+            // the selector later. Every capture hook reuses this answer.
+            if self.capture_request_header.is_some()
+                && (self.log_request_body || self.log_response_body)
+            {
+                let selected = self.header_selects(&ctx.headers);
+                ctx.plugin_state_mut()
+                    .transaction_debugger_capture_records
+                    .entry(self.instance_id)
+                    .or_default()
+                    .header_selected = Some(selected);
+            }
         }
         PluginResult::Continue
     }
@@ -1496,7 +1555,7 @@ impl Plugin for TransactionDebugger {
         self.log_request_body
             && capture_output_enabled()
             && self
-                .request_capture_decision_for(ctx, &ctx.headers)
+                .request_capture_decision_for(ctx, &ctx.headers, &ctx.headers)
                 .is_capture()
     }
 
@@ -1572,7 +1631,15 @@ impl Plugin for TransactionDebugger {
             && capture_output_enabled()
             && !self.capture_record_emitted(ctx, CaptureDirection::Request)
         {
-            let decision = self.request_capture_decision_for(ctx, headers);
+            // Header-preserving hooks run with `ctx.headers` moved into the
+            // hook map, so an empty live map means `headers` is the request
+            // view the selector must read.
+            let selector_headers = if ctx.headers.is_empty() {
+                &*headers
+            } else {
+                &ctx.headers
+            };
+            let decision = self.request_capture_decision_for(ctx, selector_headers, headers);
             if decision.skip_reason().is_some() {
                 self.emit_body_capture(
                     CaptureDirection::Request,
@@ -2676,8 +2743,10 @@ const fn base64url_sextet(byte: u8) -> Option<u8> {
 
 /// Whether a base64url segment decodes to the start of a JSON object: optional
 /// JSON whitespace, `{`, optional JSON whitespace, `"`. Decodes at most
-/// [`MAX_JOSE_HEADER_PREFIX_CHARS`] characters; a window that is exhausted
-/// while still inside whitespace after `{` fails closed (treated as a header).
+/// [`MAX_JOSE_HEADER_PREFIX_CHARS`] characters. A window that is exhausted
+/// while still inside JSON whitespace — before *or* after `{` — fails closed
+/// (treated as a header): RFC 7515 permits arbitrary whitespace there, so a
+/// bounded scan must not let a padded header decide the answer.
 fn segment_decodes_to_json_object_start(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     let window = &bytes[..bytes.len().min(MAX_JOSE_HEADER_PREFIX_CHARS)];
@@ -2702,7 +2771,10 @@ fn segment_decodes_to_json_object_start(segment: &str) -> bool {
             }
         }
     }
-    opened && window.len() == MAX_JOSE_HEADER_PREFIX_CHARS
+    // Reaching here means every decoded byte was JSON whitespace or the one
+    // `{`. A full window cannot rule out a header; a shorter segment ended
+    // without ever reaching a member name.
+    window.len() == MAX_JOSE_HEADER_PREFIX_CHARS
 }
 
 /// Deterministic per-request sample point for `capture_sample_rate`.
