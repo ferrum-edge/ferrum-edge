@@ -392,7 +392,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — `opa` binds external identities to their realm and screens
-  repeated headers** (#6860). `input.consumer` for an external identity now
+  repeated headers** (issue n/a, PR #6860). `input.consumer` for an external identity now
   carries `realm: {mechanism, authority}` (an opaque, stable hex digest of
   the verifying authority, committed with the identity by the authentication
   boundary; `null` when none was committed), so two accepted issuers' equal
