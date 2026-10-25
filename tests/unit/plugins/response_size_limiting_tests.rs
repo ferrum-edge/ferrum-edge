@@ -727,3 +727,373 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+// === Strict mode: an event stream that proves its size is admitted ===
+
+fn strict_limiter(max_bytes: u64) -> ResponseSizeLimiting {
+    ResponseSizeLimiting::new(&json!({"max_bytes": max_bytes, "require_buffered_check": true}))
+        .unwrap()
+}
+
+fn sse_headers_with_length(content_length: Option<&str>) -> HashMap<String, String> {
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    if let Some(content_length) = content_length {
+        headers.insert("content-length".to_string(), content_length.to_string());
+    }
+    headers
+}
+
+fn assert_unverifiable_stream_refusal(result: PluginResult, limit: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(
+                body.contains("Streaming response size cannot be verified"),
+                "{body}"
+            );
+            assert!(body.contains(limit), "{body}");
+        }
+        other => panic!("expected the strict event-stream refusal, got {other:?}"),
+    }
+}
+
+/// A finite event stream whose backend declared one exact, in-limit length has
+/// already proven its complete size, so strict mode admits it instead of
+/// refusing every known-length SSE response (DEEPSEEK-FLASH-1).
+#[tokio::test]
+async fn strict_sse_with_exact_in_limit_content_length_is_admitted() {
+    let plugin = strict_limiter(1024);
+    for declared in ["512", "1024"] {
+        let mut headers = sse_headers_with_length(Some(declared));
+        // A backend response: the pristine snapshot carries the same length.
+        let mut ctx = make_ctx();
+        ferrum_edge::_test_support::stamp_original_response_metadata_for_test(
+            &mut ctx, 200, &headers,
+        );
+        assert!(
+            matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "a backend event stream declaring {declared} <= 1024 bytes proves its size"
+        );
+        // A synthetic response has no backend snapshot; its live map is the
+        // representation.
+        let mut ctx = make_ctx();
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+/// Only an exact, in-limit, BACKEND-declared length proves anything: an absent
+/// length, an ambiguous or over-limit one, and a length an earlier
+/// `after_proxy` hook authored over an indefinite backend stream all keep the
+/// pre-commit refusal.
+#[tokio::test]
+async fn strict_sse_without_a_provable_backend_length_is_still_refused() {
+    let plugin = strict_limiter(1024);
+
+    let mut absent = sse_headers_with_length(None);
+    let mut ctx = make_ctx();
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &absent);
+    assert_unverifiable_stream_refusal(
+        plugin.after_proxy(&mut ctx, 200, &mut absent).await,
+        "1024",
+    );
+
+    // The backend sent no length; a hook then wrote one into the live map.
+    let mut ctx = make_ctx();
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &absent);
+    let mut hook_authored = sse_headers_with_length(Some("10"));
+    assert_unverifiable_stream_refusal(
+        plugin.after_proxy(&mut ctx, 200, &mut hook_authored).await,
+        "1024",
+    );
+
+    // The backend declared one length; a hook shrank it in the live map.
+    let backend = sse_headers_with_length(Some("900"));
+    let mut ctx = make_ctx();
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &backend);
+    let mut shrunk = sse_headers_with_length(Some("10"));
+    assert_unverifiable_stream_refusal(
+        plugin.after_proxy(&mut ctx, 200, &mut shrunk).await,
+        "1024",
+    );
+
+    // Ambiguous and over-limit declarations are refused by the fast path.
+    for declared in ["512, 513", "2048"] {
+        let mut headers = sse_headers_with_length(Some(declared));
+        let mut ctx = make_ctx();
+        match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+            other => panic!("{declared}: expected a fast-path refusal, got {other:?}"),
+        }
+    }
+}
+
+/// The strict instance declares the whole-body proof it cannot obtain from a
+/// gateway-generated indefinite stream; a default instance does not.
+#[test]
+fn only_a_strict_instance_refuses_unprovable_gateway_streams() {
+    let ctx = make_ctx();
+    assert_eq!(
+        strict_limiter(1024).refuses_unprovable_response_stream(&ctx),
+        Some(1024)
+    );
+    let default = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    assert_eq!(default.refuses_unprovable_response_stream(&ctx), None);
+    // No body is transferred for HEAD, so there is nothing to prove.
+    let head = make_ctx_with_method("HEAD");
+    assert_eq!(
+        strict_limiter(1024).refuses_unprovable_response_stream(&head),
+        None
+    );
+}
+
+// === Output-side ceiling: rewrites that expand the stream (SOL-1) ===
+
+/// Releases every chunk twice: a stand-in for a streaming normalizer that wraps
+/// each small provider delta in a larger envelope.
+struct DoublingInspector;
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::ResponseStreamInspector for DoublingInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ferrum_edge::plugins::ResponseStreamAction {
+        let mut out = Vec::with_capacity(chunk.len() * 2);
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(chunk);
+        ferrum_edge::plugins::ResponseStreamAction::Forward(Bytes::from(out))
+    }
+}
+
+/// Holds every chunk and releases it, doubled, from `on_end()`.
+struct ExpandAtEnd(Vec<u8>);
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::ResponseStreamInspector for ExpandAtEnd {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ferrum_edge::plugins::ResponseStreamAction {
+        self.0.extend_from_slice(chunk);
+        ferrum_edge::plugins::ResponseStreamAction::Forward(Bytes::new())
+    }
+
+    async fn on_end(&mut self) -> ferrum_edge::plugins::ResponseStreamAction {
+        let mut out = self.0.clone();
+        out.extend_from_slice(&self.0);
+        ferrum_edge::plugins::ResponseStreamAction::Forward(Bytes::from(out))
+    }
+}
+
+/// Ends the stream on its first chunk with a terminal event larger than the
+/// chunk itself.
+struct TerminateWithLargeEvent;
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::ResponseStreamInspector for TerminateWithLargeEvent {
+    async fn on_chunk(&mut self, _chunk: &[u8]) -> ferrum_edge::plugins::ResponseStreamAction {
+        ferrum_edge::plugins::ResponseStreamAction::Terminate(Some(Bytes::from_static(
+            b"event: error\ndata: {\"error\":\"cut\"}\n\n",
+        )))
+    }
+}
+
+/// Drain a client-visible body: the DATA it delivered and its terminal error.
+async fn drain_client_body<B>(mut body: B) -> (Vec<u8>, Option<String>)
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    use http_body_util::BodyExt;
+
+    let mut delivered = Vec::new();
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    delivered.extend_from_slice(&data);
+                }
+            }
+            Err(error) => return (delivered, Some(error.to_string())),
+        }
+    }
+    (delivered, None)
+}
+
+fn assert_size_terminated(error: Option<String>) {
+    let error = error.expect("the stream must end with the response-size body error");
+    assert!(
+        error.contains("response body exceeds maximum size"),
+        "unexpected terminal error: {error}"
+    );
+}
+
+/// The H1/H2 reqwest inspect path charges what the inspector RELEASES, not
+/// only what the backend sent: an 8-byte backend body fits a 12-byte ceiling,
+/// but its doubled representation does not.
+#[tokio::test]
+async fn reqwest_inspector_expansion_cannot_cross_the_response_ceiling() {
+    use ferrum_edge::_test_support::reqwest_inspected_response_body_for_test;
+
+    let chunks: &[&'static [u8]] = &[b"abcd", b"efgh"];
+    let body = reqwest_inspected_response_body_for_test(chunks, Box::new(DoublingInspector), 12);
+    let (delivered, error) = drain_client_body(body).await;
+    assert_eq!(delivered, b"abcdabcd", "the crossing release is never sent");
+    assert_size_terminated(error);
+
+    // Exact boundary: 16 released bytes fit a 16-byte ceiling.
+    let body = reqwest_inspected_response_body_for_test(chunks, Box::new(DoublingInspector), 16);
+    let (delivered, error) = drain_client_body(body).await;
+    assert_eq!(delivered, b"abcdabcdefghefgh");
+    assert_eq!(error, None);
+
+    // `0` is unlimited.
+    let body = reqwest_inspected_response_body_for_test(chunks, Box::new(DoublingInspector), 0);
+    let (delivered, error) = drain_client_body(body).await;
+    assert_eq!(delivered.len(), 16);
+    assert_eq!(error, None);
+}
+
+/// The `on_end()` flush and a `Terminate` payload are client-visible DATA too.
+#[tokio::test]
+async fn reqwest_inspector_terminal_releases_are_charged_against_the_ceiling() {
+    use ferrum_edge::_test_support::reqwest_inspected_response_body_for_test;
+
+    let chunks: &[&'static [u8]] = &[b"abcd", b"efgh"];
+    let body =
+        reqwest_inspected_response_body_for_test(chunks, Box::new(ExpandAtEnd(Vec::new())), 12);
+    let (delivered, error) = drain_client_body(body).await;
+    assert!(
+        delivered.is_empty(),
+        "the oversized end-of-stream flush is withheld"
+    );
+    assert_size_terminated(error);
+
+    let body =
+        reqwest_inspected_response_body_for_test(chunks, Box::new(TerminateWithLargeEvent), 12);
+    let (delivered, error) = drain_client_body(body).await;
+    assert!(
+        delivered.is_empty(),
+        "the oversized terminal event is withheld"
+    );
+    assert_size_terminated(error);
+}
+
+fn native_grpc_source(message: &'static [u8]) -> ferrum_edge::proxy::ProxyBody {
+    use futures_util::stream;
+    use http::{HeaderMap, HeaderValue};
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    let source = StreamBody::new(stream::iter(vec![
+        Ok::<_, ferrum_edge::proxy::body::ProxyBodyError>(Frame::data(Bytes::from_static(message))),
+        Ok(Frame::trailers(trailers)),
+    ]));
+    ferrum_edge::_test_support::proxy_body_streaming_for_test(Box::pin(source))
+}
+
+/// gRPC-Web translation is charged on the representation the client receives:
+/// base64 text expansion of an in-limit message, and the generated trailer
+/// frame after an in-limit binary body, both end the stream at the ceiling.
+#[tokio::test]
+async fn grpc_web_translation_cannot_expand_past_the_response_ceiling() {
+    use ferrum_edge::_test_support::proxy_body_into_grpc_web_streaming_with_response_limit_for_test as translate;
+
+    // 30 source bytes fit a 30-byte ceiling; their 40-byte base64 text does not.
+    // A 5-byte gRPC frame header plus a 25-byte message: 30 bytes.
+    const MESSAGE: &[u8] = b"\x00\x00\x00\x00\x19abcdefghijklmnopqrstuvwxy";
+    let body = translate(
+        native_grpc_source(MESSAGE),
+        "application/grpc-web-text",
+        200,
+        None,
+        30,
+    );
+    let (delivered, error) = drain_client_body(body).await;
+    assert!(delivered.is_empty(), "the expanded text frame is withheld");
+    assert_size_terminated(error);
+
+    // Binary mode: measure the complete translation, then show the exact total
+    // is accepted and one byte less refuses the generated trailer frame.
+    let unlimited = translate(
+        native_grpc_source(MESSAGE),
+        "application/grpc-web+proto",
+        200,
+        None,
+        0,
+    );
+    let (complete, error) = drain_client_body(unlimited).await;
+    assert_eq!(error, None);
+    assert!(
+        complete.len() > MESSAGE.len(),
+        "binary mode appends a trailer frame"
+    );
+
+    let exact = translate(
+        native_grpc_source(MESSAGE),
+        "application/grpc-web+proto",
+        200,
+        None,
+        complete.len(),
+    );
+    let (delivered, error) = drain_client_body(exact).await;
+    assert_eq!(error, None);
+    assert_eq!(delivered, complete);
+
+    let short = translate(
+        native_grpc_source(MESSAGE),
+        "application/grpc-web+proto",
+        200,
+        None,
+        complete.len() - 1,
+    );
+    let (delivered, error) = drain_client_body(short).await;
+    assert_eq!(
+        delivered, MESSAGE,
+        "the in-limit message is delivered unchanged"
+    );
+    assert_size_terminated(error);
+}
+
+/// The native-H3 cross-protocol gRPC-Web relay writes straight to the QUIC
+/// stream, so its output-side ceiling is pinned structurally: every translated
+/// write and the generated terminal frame go through the shared boundary.
+#[test]
+fn h3_cross_protocol_grpc_web_relay_charges_translated_output() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let relay = source
+        .split("async fn stream_hyper_incoming<S>(")
+        .nth(1)
+        .expect("H3 cross-protocol gRPC relay")
+        .split("fn should_finish_h3_stream_without_trailers(")
+        .next()
+        .expect("bounded relay body");
+    let encodes = relay.matches("encode_streaming_data(").count();
+    let charges = relay
+        .matches("if output_exceeds_ceiling!(out.len())")
+        .count();
+    assert!(encodes >= 4, "relay encode sites moved: {encodes}");
+    assert_eq!(
+        charges, encodes,
+        "every translated relay write must be charged against the response ceiling"
+    );
+    let terminal = source
+        .split("async fn handle_h3_grpc_streaming_response<S>(")
+        .nth(1)
+        .expect("H3 gRPC streaming response")
+        .split("build_streaming_trailer_data(")
+        .nth(1)
+        .expect("translated terminal frame")
+        .split("stream.send_data(terminal_data)")
+        .next()
+        .expect("terminal write");
+    assert!(
+        terminal.contains("response_output_crosses_ceiling("),
+        "the generated gRPC-Web terminal frame must be charged before it is written"
+    );
+}

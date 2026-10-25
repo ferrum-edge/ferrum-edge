@@ -2318,6 +2318,8 @@ impl AggregateSseListener {
             keepalive: lease.keepalive,
             timer: Box::pin(tokio::time::sleep_until(first_wake)),
             finished: false,
+            response_byte_ceiling: 0,
+            emitted_bytes: 0,
         })
     }
 }
@@ -2335,6 +2337,12 @@ pub struct AggregateSseBody {
     keepalive: Duration,
     timer: Pin<Box<tokio::time::Sleep>>,
     finished: bool,
+    /// Effective client-facing response ceiling of the request that adopted
+    /// this listener (`0` = unlimited). See
+    /// [`AggregateSseBody::with_response_byte_ceiling`].
+    response_byte_ceiling: usize,
+    /// Greeting, event, and keepalive bytes released to the transport so far.
+    emitted_bytes: u64,
 }
 
 impl fmt::Debug for AggregateSseBody {
@@ -2354,6 +2362,41 @@ impl AggregateSseBody {
     /// write instead of relying on the poll.
     pub fn deadline(&self) -> tokio::time::Instant {
         self.deadline
+    }
+
+    /// Bound the bytes this listener may release by the adopting request's
+    /// effective response ceiling (`0` = unlimited).
+    ///
+    /// The listener is gateway-generated, so no backend collector or streaming
+    /// size adapter ever sees its bytes, and the synthetic-response check sees
+    /// only the empty placeholder. The core adoption boundaries on both the
+    /// H1/H2 and the native H3 writer therefore hand the route/global ceiling
+    /// to the body itself: the greeting, every replayed or live event, and
+    /// every keepalive comment are charged, and the frame that would cross the
+    /// ceiling is never released. The stream instead ends with the shared
+    /// `response body exceeds maximum size` error, which the writers turn into
+    /// a post-commit abort/reset, and dropping the body releases the session's
+    /// listener slot so the client can reattach.
+    pub fn with_response_byte_ceiling(mut self, max_bytes: usize) -> Self {
+        self.response_byte_ceiling = max_bytes;
+        self
+    }
+
+    /// Release `data` under the response ceiling, or end the stream with the
+    /// size error when it would cross.
+    fn release(&mut self, data: Bytes) -> Poll<Option<SseFrameResult>> {
+        if crate::proxy::body::response_output_crosses_ceiling(
+            self.response_byte_ceiling,
+            self.emitted_bytes,
+            data.len(),
+        ) {
+            self.finished = true;
+            return Poll::Ready(Some(Err(
+                crate::proxy::body::response_body_too_large_error(),
+            )));
+        }
+        self.emitted_bytes = self.emitted_bytes.saturating_add(data.len() as u64);
+        Poll::Ready(Some(Ok(Frame::data(data))))
     }
 
     /// Retained payload bytes still owned by this body's session. External
@@ -2384,7 +2427,7 @@ impl futures_util::Stream for AggregateSseBody {
                 this.finished = true;
                 return Poll::Ready(None);
             }
-            NextFrame::Frame(framed) => return Poll::Ready(Some(Ok(Frame::data(framed)))),
+            NextFrame::Frame(framed) => return this.release(framed),
             NextFrame::Idle => {}
         }
         // Idle: the timer is what bounds an otherwise silent stream. It ends
@@ -2409,7 +2452,7 @@ impl futures_util::Stream for AggregateSseBody {
         let next_wake = this.deadline.min(now + this.keepalive);
         this.timer.as_mut().reset(next_wake);
         let keepalive = Bytes::from_static(SSE_KEEPALIVE);
-        Poll::Ready(Some(Ok(Frame::data(keepalive))))
+        this.release(keepalive)
     }
 }
 

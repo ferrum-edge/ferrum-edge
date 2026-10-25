@@ -20028,6 +20028,10 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
     // stream and no gateway terminal replaced it. Anything else drops the lease,
     // which releases the session's single-listener slot so the client can
     // reattach, and falls through to the ordinary buffered writers.
+    //
+    // A strict `require_buffered_check` policy already refused the listener in
+    // the shared synthetic finalizer; an adopted one is bounded by this
+    // request's effective route/global response ceiling, exactly as on H1/H2.
     if let Some(listener) = ctx.mcp_aggregate_sse.take() {
         let representation_intact = matches!(flavor, HttpFlavor::Plain)
             && grpc_web_response_content_type.is_none()
@@ -20035,7 +20039,12 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             && http_status == StatusCode::OK
             && body.is_empty()
             && crate::proxy::response_headers_select_event_stream(headers);
-        if representation_intact && let Some(sse_body) = listener.take_body() {
+        let response_byte_ceiling = ctx.effective_max_response_body_size_bytes();
+        if representation_intact
+            && let Some(sse_body) = listener
+                .take_body()
+                .map(|sse_body| sse_body.with_response_byte_ceiling(response_byte_ceiling))
+        {
             return send_h3_aggregate_sse_response(stream, ctx, headers, sse_body, halt_recv).await;
         }
     }
@@ -20291,11 +20300,15 @@ async fn send_h3_aggregate_sse_response(
         }
     }
 
+    // The body's only error is its response-size ceiling: the next frame would
+    // cross the adopting request's effective limit. The head is committed, so
+    // that ends in a stream reset below rather than a clean FIN that would
+    // read as a complete event stream.
+    let mut body_failed = false;
     let pump = async {
         while let Some(frame) = body.next().await {
             let Ok(frame) = frame else {
-                // The broker never produces a body error; ending the stream is
-                // still preferable to inventing an event for the client.
+                body_failed = true;
                 break;
             };
             let Ok(data) = frame.into_data() else {
@@ -20337,6 +20350,11 @@ async fn send_h3_aggregate_sse_response(
     // blocked past that grace resets.
     if let Some(termination) = aggregate_sse_bound.expired_authorization() {
         ctx.record_authorization_termination_once(termination, auth_family);
+        crate::http3::stream_util::abort_response_stream(stream);
+    } else if body_failed {
+        warn!(
+            "Aggregate MCP SSE listener reached the response size limit; resetting the H3 stream"
+        );
         crate::http3::stream_util::abort_response_stream(stream);
     } else {
         match crate::http3::stream_util::await_post_deadline_terminal_response_write(

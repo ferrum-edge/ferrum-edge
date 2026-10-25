@@ -1536,6 +1536,13 @@ impl Plugin for PluginInstanceWrapper {
     fn enforced_response_body_limit(&self) -> Option<u64> {
         self.inner.enforced_response_body_limit()
     }
+    fn refuses_unprovable_response_stream(&self, ctx: &RequestContext) -> Option<u64> {
+        // A skipped instance enforces nothing.
+        if !self.runs_cached(ctx) {
+            return None;
+        }
+        self.inner.refuses_unprovable_response_stream(ctx)
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

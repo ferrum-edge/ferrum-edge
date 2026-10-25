@@ -26219,6 +26219,19 @@ fn enforce_synthetic_response_body_limit(
     if ctx.gateway_capacity_response_selected() || ctx.gateway_representation_response_selected() {
         return false;
     }
+    // A staged aggregate MCP SSE listener is the one synthetic response whose
+    // real body is an indefinite, gateway-generated event stream behind an
+    // EMPTY placeholder, so the byte check below can never see it. A strict
+    // whole-body policy (`response_size_limiting` with
+    // `require_buffered_check: true`) refuses a genuine backend event stream
+    // before commit because its complete size cannot be proven; the same
+    // policy refuses this one here, BEFORE the reject-path `after_proxy` chain
+    // and before either the H1/H2 or the native H3 writer could adopt the
+    // lease. Dropping the lease releases the session's single-listener slot.
+    // A non-strict ceiling is instead carried into the adopted live body.
+    if refuse_unprovable_aggregate_sse_listener(plugins, ctx, status, headers, body) {
+        return true;
+    }
     if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
         return false;
     }
@@ -26259,6 +26272,60 @@ fn enforce_synthetic_response_body_limit(
             body: Bytes::from(crate::plugins::utils::size_limit::rejection_body(
                 "Response body too large",
                 limit as u128,
+            )),
+            headers: HashMap::new(),
+        },
+    );
+    true
+}
+
+/// Refuse a staged aggregate MCP SSE listener under a strict whole-body
+/// response-size policy (see [`enforce_synthetic_response_body_limit`]).
+///
+/// Applies only while the response is still the gateway-authored listener
+/// placeholder: status `200`, an empty body, a `text/event-stream`
+/// representation, and a staged lease. The refusal is the same fixed `502`
+/// `Streaming response size cannot be verified` body the policy returns for a
+/// genuine backend event stream, attributed to the enforcing instance's limit.
+fn refuse_unprovable_aggregate_sse_listener(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: &mut u16,
+    headers: &mut HashMap<String, String>,
+    body: &mut Bytes,
+) -> bool {
+    if ctx.mcp_aggregate_sse.is_none()
+        || *status != 200
+        || !body.is_empty()
+        || !response_headers_select_event_stream(headers)
+    {
+        return false;
+    }
+    let request: &RequestContext = ctx;
+    let Some((plugin_name, limit)) = plugins.iter().find_map(|plugin| {
+        plugin
+            .refuses_unprovable_response_stream(request)
+            .map(|limit| (plugin.name(), limit))
+    }) else {
+        return false;
+    };
+    // Drop the lease first: the session's single-listener slot is free again
+    // whatever the rest of the rejection lifecycle does.
+    ctx.mcp_aggregate_sse = None;
+    debug!(
+        plugin = plugin_name,
+        max_bytes = limit,
+        "Aggregate MCP SSE listener refused: strict response size cannot be verified"
+    );
+    *body = rebuild_plugin_rejection_response_headers(
+        ctx,
+        status,
+        headers,
+        RejectedResponseParts {
+            status_code: 502,
+            body: Bytes::from(crate::plugins::utils::size_limit::rejection_body(
+                crate::plugins::response_size_limiting::UNVERIFIABLE_STREAM_SIZE_ERROR,
+                u128::from(limit),
             )),
             headers: HashMap::new(),
         },
@@ -27905,7 +27972,21 @@ pub(crate) struct NormalizedRejectResponse {
     /// once and selects [`headers_mod::ClientResponseFraming::Streaming`], so
     /// no `Content-Length` is published for an event stream whose bytes have
     /// not been written yet.
-    pub(crate) aggregate_sse: Option<crate::plugins::mcp_aggregate_sse::AggregateSseListener>,
+    pub(crate) aggregate_sse: Option<AdoptedAggregateSse>,
+}
+
+/// An aggregate MCP SSE listener lease adopted at the reject boundary,
+/// together with the adopting request's effective response ceiling.
+///
+/// The listener's bytes are gateway-generated, so no backend collector or
+/// streaming size adapter ever counts them. The ceiling is captured here, where
+/// the request context is still available, and handed to the live body when
+/// [`build_response_from_normalized_reject`] claims it (see
+/// [`crate::plugins::mcp_aggregate_sse::AggregateSseBody::with_response_byte_ceiling`]).
+pub(crate) struct AdoptedAggregateSse {
+    pub(crate) listener: crate::plugins::mcp_aggregate_sse::AggregateSseListener,
+    /// `ctx.effective_max_response_body_size_bytes()` (`0` = unlimited).
+    pub(crate) response_byte_ceiling: usize,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -28872,10 +28953,14 @@ pub(crate) fn build_response_from_normalized_reject(
     // Claim the multiplexed SSE body exactly once. The claim is a one-shot
     // compare-and-swap inside the listener lease, so even if a context clone
     // still holds a handle it can never produce a second body for this session.
-    let aggregate_sse_body = reject
-        .aggregate_sse
-        .as_ref()
-        .and_then(crate::plugins::mcp_aggregate_sse::AggregateSseListener::take_body);
+    // The adopting request's effective response ceiling bounds the live body
+    // from its first byte (the greeting) on.
+    let aggregate_sse_body = reject.aggregate_sse.as_ref().and_then(|adopted| {
+        adopted
+            .listener
+            .take_body()
+            .map(|body| body.with_response_byte_ceiling(adopted.response_byte_ceiling))
+    });
     let mut headers = reject.headers;
     // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
     // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
@@ -31703,7 +31788,7 @@ async fn run_backend_path_plugins_or_build_reject(
     None
 }
 
-async fn finalize_reject_response_with_after_proxy_hooks(
+pub(crate) async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
@@ -31788,12 +31873,19 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     // replaced the status or the representation gets an ordinary body, and
     // dropping the lease here releases the session's single-listener slot so
     // the client can reattach instead of being locked out.
+    //
+    // A strict `require_buffered_check` policy already refused the listener in
+    // `enforce_synthetic_response_body_limit`; an adopted one carries the
+    // effective route/global response ceiling into its live body.
     if let Some(listener) = ctx.mcp_aggregate_sse.take()
         && normalized.http_status == StatusCode::OK
         && normalized.body.is_empty()
         && response_headers_select_event_stream(&normalized.headers)
     {
-        normalized.aggregate_sse = Some(listener);
+        normalized.aggregate_sse = Some(AdoptedAggregateSse {
+            listener,
+            response_byte_ceiling: ctx.effective_max_response_body_size_bytes(),
+        });
     }
     normalized
 }
@@ -41374,6 +41466,7 @@ async fn handle_proxy_request_inner(
                             crate::plugins::grpc_web::response_entity_is_unframed_backend_error(
                                 &ctx,
                             ),
+                            effective_max_response_body_size_bytes,
                         )
                     } else if let Some(framing) = grpc_web_passthrough_framing {
                         // Pass-through: forward the backend's gRPC-Web body and
@@ -46221,11 +46314,15 @@ async fn handle_proxy_request_inner(
         flavor == HttpFlavor::Grpc,
     );
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
+        // The translated representation (base64 text expansion plus the
+        // generated trailer frame) is charged against the same effective
+        // ceiling the backend body already is.
         body.into_grpc_web_streaming(
             &content_type,
             response_status,
             Some(initial_terminal_metadata),
             crate::plugins::grpc_web::response_entity_is_unframed_backend_error(&ctx),
+            effective_max_response_body_size_bytes,
         )
     } else if let Some(framing) = grpc_web_passthrough_framing {
         // Pass-through gRPC-Web: the backend's body and its own trailer frame

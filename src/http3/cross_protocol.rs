@@ -7993,7 +7993,7 @@ where
         mut bytes_streamed,
         body_completed,
         client_disconnected,
-        body_error_class,
+        mut body_error_class,
         trailers,
         mut client_deadline_expired,
         mut auth_termination,
@@ -8121,66 +8121,85 @@ where
                 streaming.status,
                 text_mode,
             );
-        grpc_trailer_status = Some(pristine_trailer_status.unwrap_or(terminal_status));
-        let terminal_len = terminal_data.len() as u64;
-        let terminal_write = if gateway_terminal_selected {
-            crate::http3::stream_util::await_terminal_response_write_before_deadline(
-                terminal_write_bound.deadline(),
-                stream.send_data(terminal_data),
-            )
-            .await
+        // The generated terminal frame is client-visible DATA: charge it
+        // against the same effective ceiling as the translated message bytes,
+        // so an in-limit body cannot carry its trailer frame past the limit.
+        // The headers are committed, so the cut is a stream reset.
+        if crate::proxy::body::response_output_crosses_ceiling(
+            max_resp_bytes,
+            bytes_streamed,
+            terminal_data.len(),
+        ) {
+            warn!(
+                "Translated gRPC-Web terminal frame would exceed the {} byte response limit; \
+                 resetting the cross-protocol H3 stream",
+                max_resp_bytes
+            );
+            crate::http3::stream_util::abort_response_stream(stream);
+            body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+            final_body_completed = false;
         } else {
-            crate::http3::stream_util::await_response_write_before_deadline(
-                terminal_write_bound.deadline(),
-                stream.send_data(terminal_data),
-            )
-            .await
-        };
-        let terminal_and_finish = match terminal_write {
-            Ok(()) if gateway_terminal_selected => {
-                bytes_streamed += terminal_len;
+            grpc_trailer_status = Some(pristine_trailer_status.unwrap_or(terminal_status));
+            let terminal_len = terminal_data.len() as u64;
+            let terminal_write = if gateway_terminal_selected {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
                     terminal_write_bound.deadline(),
-                    stream.finish(),
+                    stream.send_data(terminal_data),
                 )
                 .await
-            }
-            Ok(()) => {
-                bytes_streamed += terminal_len;
+            } else {
                 crate::http3::stream_util::await_response_write_before_deadline(
                     terminal_write_bound.deadline(),
-                    stream.finish(),
+                    stream.send_data(terminal_data),
                 )
                 .await
-            }
-            Err(error) => Err(error),
-        };
-        if let Err(error) = terminal_and_finish {
-            if matches!(
-                error,
-                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
-            ) {
-                // Attribute the composed terminal bound. Authorization wins a
-                // tie, matching every relay's biased select ordering, and the
-                // fixed-cardinality counter is recorded only when the relay
-                // itself did not already record one for this stream.
-                match terminal_write_bound.expired_authorization() {
-                    Some(termination) if auth_termination.is_none() => {
-                        ctx.record_authorization_termination_once(
-                            termination,
-                            terminal_auth_family,
-                        );
-                        auth_termination = Some(termination);
-                    }
-                    Some(_) => {}
-                    None => client_deadline_expired = true,
+            };
+            let terminal_and_finish = match terminal_write {
+                Ok(()) if gateway_terminal_selected => {
+                    bytes_streamed += terminal_len;
+                    crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                        terminal_write_bound.deadline(),
+                        stream.finish(),
+                    )
+                    .await
                 }
-                crate::http3::stream_util::abort_response_stream(stream);
-            } else {
-                final_client_disconnected = true;
-                warn!("H3 gRPC-Web streaming terminal frame write failed");
+                Ok(()) => {
+                    bytes_streamed += terminal_len;
+                    crate::http3::stream_util::await_response_write_before_deadline(
+                        terminal_write_bound.deadline(),
+                        stream.finish(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = terminal_and_finish {
+                if matches!(
+                    error,
+                    crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
+                ) {
+                    // Attribute the composed terminal bound. Authorization wins a
+                    // tie, matching every relay's biased select ordering, and the
+                    // fixed-cardinality counter is recorded only when the relay
+                    // itself did not already record one for this stream.
+                    match terminal_write_bound.expired_authorization() {
+                        Some(termination) if auth_termination.is_none() => {
+                            ctx.record_authorization_termination_once(
+                                termination,
+                                terminal_auth_family,
+                            );
+                            auth_termination = Some(termination);
+                        }
+                        Some(_) => {}
+                        None => client_deadline_expired = true,
+                    }
+                    crate::http3::stream_util::abort_response_stream(stream);
+                } else {
+                    final_client_disconnected = true;
+                    warn!("H3 gRPC-Web streaming terminal frame write failed");
+                }
+                final_body_completed = false;
             }
-            final_body_completed = false;
         }
     } else if body_completed && let Some(mut trailers) = trailers {
         grpc_trailer_status = trailers.get("grpc-status").map(|value| {
@@ -12257,6 +12276,31 @@ where
             }
         }};
     }
+    // Output-side response ceiling. `total_streamed` bounds the backend's own
+    // DATA; translated gRPC-Web text mode base64-expands it, so the bytes the
+    // client receives are charged separately before every write. Untranslated
+    // output equals its input and can never trip this first. `true` means the
+    // stream was reset and the caller must leave the relay loop.
+    macro_rules! output_exceeds_ceiling {
+        ($len:expr) => {{
+            if crate::proxy::body::response_output_crosses_ceiling(
+                max_response_body_size_bytes,
+                bytes_offered,
+                $len,
+            ) {
+                warn!(
+                    "Translated response exceeded {} byte limit during cross-protocol H3 gRPC stream",
+                    max_response_body_size_bytes
+                );
+                coalesce_buf.clear();
+                crate::http3::stream_util::abort_response_stream(stream);
+                body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
+                true
+            } else {
+                false
+            }
+        }};
+    }
 
     'outer: loop {
         if just_received_backend_frame
@@ -12386,6 +12430,9 @@ where
                                 } else {
                                     data
                                 };
+                                if output_exceeds_ceiling!(out.len()) {
+                                    break 'outer;
+                                }
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out), out_len) {
                                     break 'outer;
@@ -12410,6 +12457,9 @@ where
                                 } else {
                                     metric_data.clone()
                                 };
+                                if output_exceeds_ceiling!(out.len()) {
+                                    break 'outer;
+                                }
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out), out_len) {
                                     break 'outer;
@@ -12448,6 +12498,9 @@ where
                 } else {
                     metric_data.clone()
                 };
+                if output_exceeds_ceiling!(out.len()) {
+                    break 'outer;
+                }
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out), out_len) {
                     break 'outer;
@@ -12476,6 +12529,9 @@ where
                 } else {
                     metric_data.clone()
                 };
+                if output_exceeds_ceiling!(out.len()) {
+                    break 'outer;
+                }
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out), out_len) {
                     break 'outer;

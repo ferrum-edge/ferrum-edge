@@ -11603,6 +11603,23 @@ pub trait Plugin: Any + Send + Sync {
         None
     }
 
+    /// Whole-body response ceiling this plugin must PROVE before an
+    /// indefinite-length, gateway-generated response stream commits, in bytes.
+    /// `None` (the default) means the plugin accepts such a stream under the
+    /// incremental ceiling it publishes through
+    /// [`Plugin::enforced_response_body_limit`].
+    ///
+    /// The aggregate MCP SSE listener is staged behind an empty `200`
+    /// placeholder, so neither the backend `after_proxy` refusal of a genuine
+    /// event stream nor the synthetic byte check can see its body. The core
+    /// asks this predicate at that one adoption boundary, before either the
+    /// H1/H2 or the native H3 writer commits the stream, and refuses the
+    /// listener with a `502` naming the returned limit when any active
+    /// instance answers `Some`.
+    fn refuses_unprovable_response_stream(&self, _ctx: &RequestContext) -> Option<u64> {
+        None
+    }
+
     /// Returns `true` if this plugin may require the request body to be
     /// buffered instead of streamed for at least some requests.
     ///
