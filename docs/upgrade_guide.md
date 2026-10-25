@@ -28,29 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `soap_ws_security`: `${...}` passwords, evicting shared Redis, SAML conditions (#6820)
+### `cors` method and header lists are bounded (#6844)
 
-- A `username_token.credentials[].password` of exactly
-  `${FERRUM_PLUGIN_SECRET_<NAME>}` is now resolved from that environment
-  variable at admission. A literal password of the shape `${...}`, or a
-  reference to any other variable, is refused at admission. Change such a
-  literal password, or move the secret into a `FERRUM_PLUGIN_SECRET_<NAME>`
-  variable (directly or through `_FILE` / `_VAULT` / `_AWS` / `_AZURE` /
-  `_GCP`) set on every node that constructs the plugin, CP included.
-- `nonce.replay_scope: shared` now requires a Redis that cannot evict claims:
-  `maxmemory: 0` or `maxmemory_policy: noeviction`, proven with `INFO MEMORY`
-  (grant `INFO` to the ACL user). An evicting endpoint fails every SOAP replay
-  claim closed (`401`) until its policy is fixed and the plugin is reloaded.
-- SAML assertions carrying a condition other than a standard-shape
-  `AudienceRestriction`, `OneTimeUse`, or `ProxyRestriction` (including
-  `xsi:type`-derived or extended standard conditions) are now rejected.
-- Governed envelopes with more than 64 attributes on one element, an
-  attribute name over 128 bytes, a namespace declaration name over 70 bytes,
-  a namespace URI over 2048 bytes, more than 256 namespace declarations in
-  scope at one element, more than 256 distinct namespace bindings, or parser
-  comparison work beyond 32 × envelope length
-  are now refused with
-  `400` (`xml_namespace_bounds`) before parsing.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 

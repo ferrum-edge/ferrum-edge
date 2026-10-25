@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -391,71 +427,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `soap_ws_security` UsernameToken passwords shaped `${...}` are
-  environment references** (issue #6820). A `username_token.credentials[].password`
-  of exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is resolved at admission; any
-  other `${...}` value (a literal password of that shape, or a reference to a
-  variable outside the plugin-secret namespace) is refused at admission.
-  Shared replay scope also now refuses an evicting Redis (`maxmemory_policy`
-  other than `noeviction` with a finite `maxmemory`) and needs `INFO`.
-- **`soap_ws_security` hardening.**
-  - **Shared replay claims refuse an evicting Redis.** `nonce.replay_scope:
-    shared` now uses the retention-authority Redis client, so every
-    connection must prove `maxmemory: 0` or `maxmemory_policy: noeviction`
-    (`INFO MEMORY`) before it carries a PasswordDigest nonce or SAML
-    assertion-id claim. `SET NX EX` cannot tell an evicted claim from an unused
-    credential, so an evicting endpoint used to re-admit a captured token. An
-    evicting policy is terminal for the generation and an unprovable one is a
-    recoverable outage; both fail closed (`401`). The ACL user needs `INFO`.
-  - **SAML `Conditions` are evaluated exhaustively** (SAML Core 2.0
-    §2.5.1.1). Besides `AudienceRestriction`, at most one `OneTimeUse` and one
-    `ProxyRestriction` are accepted, each only in its standard shape (an
-    `xsi:type` must resolve to its own standard SAML type; no extension
-    attributes or non-`Audience` children). Any other condition — a
-    `saml:Condition` extension, a derived (SAML Core §7.1) or extended standard
-    condition, or a foreign element — rejects the assertion before its id is
-    claimed instead of being ignored.
-  - **Namespace resolution is charged to a per-message allowance** (scanned
-    entries × compared prefix bytes, plus the length of every compared
-    namespace URI; 32 × decoded body, floor 4 194 304), so inherited
-    declarations, long prefixes, long inherited URIs, and canonical attribute
-    ordering (the sort's examined bytes are charged) cannot multiply
-    canonicalization CPU on `SignedInfo` before the signature is checked.
-  - **Fixed raw markup ceilings on governed envelopes**, enforced before the
-    XML parser runs: at most 64 attributes per start tag (namespace
-    declarations included), 128-byte attribute names, 70-byte namespace
-    declaration names, 2048-byte namespace URIs, 256 namespace declarations
-    in scope at any element, and 256 distinct `(prefix, URI)` bindings per
-    envelope, plus a document-wide allowance on
-    the parser's duplicate-attribute, prefix-resolution, and inherited-scope
-    merge comparison work (32 × envelope length, floor 1 048 576). Scope is
-    tracked with element nesting, so wide sibling collections that each
-    redeclare a namespace are unaffected; declarations are classified exactly
-    as the parser does, including `prefix:xmlns` pseudo-declarations. Larger markup is refused with `400`
-    (`xml_namespace_bounds`), and a start tag, comment, CDATA section,
-    processing instruction, or quote that never terminates is refused as
-    malformed by the same pre-parse scan.
-  - **Linear-time MTOM boundary search** (`memchr::memmem`) replaces a
-    window search that was O(body × boundary) on near-match payloads.
-- **`soap_ws_security` correctness and interop.**
-  - Only a markup declaration in the prolog is refused as a DTD; `<!DOCTYPE`
-    / `<!ENTITY` text inside CDATA, comments, or character data is accepted,
-    and a declaration after the prolog still fails as malformed XML.
-  - A `SubjectConfirmation` that does not qualify (another recipient, expired,
-    `InResponseTo`) is skipped, so a later qualifying one is accepted; none or
-    more than one qualifying is still rejected.
-  - X.509 References may resolve inside any SOAP Header block (for example
-    WS-Addressing `wsa:Action` / `wsa:To`), not only the Security header and
-    the Body.
-  - New `require_mechanisms: all | any` (default `all`). `any` makes the
-    enabled identity mechanisms alternatives: at least one must be presented
-    and every presented token must verify. It needs two enabled mechanisms.
-  - A UsernameToken `password` of exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is
-    resolved at admission from that environment variable (breaking for literal
-    `${...}` passwords; see below).
-  - Docs and OpenAPI no longer promise a Consumer mapping: a SOAP principal
-    is an external `authenticated_identity` only (issue #6082), so Consumer
-    ACL groups do not apply to it.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
