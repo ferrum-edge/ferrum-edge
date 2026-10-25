@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `request_transformer` admission, WebSocket handshakes, and
+  request digests** (issue #6858). Configs that load today can be refused:
+  header add/update/rename destinations in the router's `x-path-param-*`
+  namespace, and `_` spellings of gateway-owned destinations
+  (`X_Forwarded_For`, `content_length`, …), are rejected; body `key` /
+  `new_key` paths with an empty dot-segment (`""`, `user.`, `.user`, `a..b`)
+  are rejected for `request_transformer` and `response_transformer`; and a
+  header/query `value` containing `$(` is now a request-variable template
+  (`$(consumer.username)`, `$(client_ip)`, `$(request_id)`,
+  `$(header.<name>)`, `$(query.<name>)`), so an unknown variable fails to load
+  — write `$$(` for a literal `$(`. Behaviour changes too: header/query rules
+  and route-header finalization now also run on WebSocket handshakes, and an
+  instance whose body rules may rewrite a JSON request removes the client's
+  `Content-Digest`, `Repr-Digest`, `Digest`, and `Content-MD5` before dispatch.
+  Unapplied rules and body passes record `request_transformer.rule_skipped` /
+  `request_transformer.body_skipped` metadata.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +155,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- `request_transformer` body rewrites keep the client's JSON number lexemes
+  byte for byte. Integers outside the 64-bit range, high-precision decimals,
+  `1.50`, exponents, and `-0` were previously rounded through `f64` whenever
+  any field was rewritten (issue #6858).
+- A `request_transformer` generation disabled through its RTDS gate no longer
+  advertises query mutation, so a disabled instance cannot trip the
+  later-than-deduplication/cache composition refusals (issue #6858).
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

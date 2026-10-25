@@ -28,6 +28,37 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `request_transformer`: stricter admission, WebSocket handshakes, request digests (#6858)
+
+Check every `request_transformer` config with `ferrum-edge validate` before
+upgrading:
+
+- Header add/update/rename destinations under `x-path-param-*` are refused, and
+  so are `_` spellings of gateway-owned destinations (`X_Forwarded_For`,
+  `x_forwarded_proto`, `content_length`, `transfer_encoding`, …). Remove those
+  rules; the router owns path captures and the gateway owns forwarding
+  identity and framing.
+- Body `key` / `new_key` paths with an empty dot-segment (`""`, `user.`,
+  `.user`, `a..b`) are refused in `request_transformer` and
+  `response_transformer`. Fix the typo, or escape a literal dot as `\.`.
+- A header or query `value` containing `$(` is now a template. Replace a
+  literal `$(` with `$$(`; an unknown variable is refused at load.
+
+Behaviour changes that need no config edit but may matter downstream:
+
+- Header and query rules, and `mesh_route_dispatch` route-header transforms,
+  now apply to WebSocket upgrade handshakes on the same route. A transformer
+  meant only for plain HTTP requests needs a route that does not serve
+  WebSocket.
+- An instance with body rules removes `Content-Digest`, `Repr-Digest`,
+  `Digest`, and `Content-MD5` from any request with a JSON (or absent)
+  `Content-Type` that may carry a body — even when the rules end up not
+  changing it. A backend that requires request digests cannot sit behind body
+  rules.
+- Transaction logs gain `request_transformer.rule_skipped` and
+  `request_transformer.body_skipped` metadata when a rule or body pass did not
+  apply.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
