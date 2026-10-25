@@ -28,6 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `stdout_logging`: keep-last-known-good, unsatisfiable filters, route-miss logging (#6863)
+
+`stdout_logging` is now registered `KeepLastKnownGood`. An enabled config the
+constructor refuses (for example a typo such as `filtr:`) fails file-mode
+startup and `ferrum-edge validate`, and a reload carrying it is refused while
+the previous generation keeps serving. It is no longer omitted with a
+warning, and database mode no longer quarantines the row. Fix or disable such
+rows before upgrading. Status-code bounds now accept `0..=999`, and a filter
+that can never match is refused: an `and` conjunction in `filter.expression`
+whose `status_code_min` exceeds its `status_code_max`, or a mesh Telemetry
+`accessLogging.filter.expression` with a `response.code` bound above 999 or
+crossed bounds (the Telemetry resource becomes invalid). A global
+`stdout_logging` without an execution trigger, including the mesh-injected
+`__mesh_access_log`, now also logs route-miss `404`s
+(`metadata.rejection_phase = "route_not_found"`). Add a `filter` or the new
+`sampling` block if that volume is unwanted. On the WebSocket session-end line,
+latency fields other than `latency_total_ms` are now `-1.0` instead of `0.0`.
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now

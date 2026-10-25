@@ -138,6 +138,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be opened by 9.0, so remove the old volume (`docker compose down -v`)
   before upgrading a compose stack.
 
+- **BREAKING — `stdout_logging` is `KeepLastKnownGood` and refuses filters
+  that can never match** (#6863). An invalid enabled `stdout_logging` config
+  now fails file-mode startup and `validate`, and a reload that cannot
+  construct it is refused while the previous generation keeps serving.
+  Database mode no longer quarantines such a row. Before, the instance was
+  silently omitted and the gateway ran with no access log. Status-code bounds
+  (flat `filter.status_code_min` / `status_code_max` and `expression` atoms)
+  accept `0..=999`. A filter that can never match is refused: crossed flat
+  bounds (already refused), or an `and` conjunction anywhere in an
+  `expression` whose `status_code_min` exceeds its `status_code_max`. Mesh
+  Telemetry `accessLogging.filter.expression` translation refuses the same
+  shapes and `response.code` bounds above 999.
+- **`stdout_logging` access log coverage and controls** (#6863).
+  - A global `stdout_logging` instance without an execution trigger now also
+    records route-miss `404`s on HTTP/1.1, HTTP/2, and HTTP/3: no proxy, and
+    `metadata.rejection_phase = "route_not_found"`. The mesh-injected
+    `__mesh_access_log` is such an instance. A generation without one keeps
+    the allocation-free route-miss path.
+  - The WebSocket session-end line now reports `-1.0` for every `latency_*`
+    field except `latency_total_ms` (the session duration), instead of `0.0`
+    or the duration relabelled as gateway processing. It also adds
+    `metadata["websocket.timestamp_disconnected"]`.
+  - New optional `sampling: {rate, always_log_errors}` keeps an exact, evenly
+    spaced fraction of the records the filter admits.
+  - Access-record sink outcomes are counted on
+    `ferrum_plugin_log_sink_records_accepted_total{plugin="stdout_logging"}`
+    and `ferrum_plugin_log_sink_records_dropped_total{plugin="stdout_logging",reason}`,
+    separately from runtime tracing records that share the stdout queue.
 ### Fixed
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
