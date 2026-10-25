@@ -3269,6 +3269,23 @@ pub struct RequestContext {
     /// H3 request handlers; a default-constructed context leaves it `0`, which
     /// falls back to the gate's own hard ceiling.
     pub max_response_body_size_bytes: usize,
+    /// Transport evidence about whether request DATA may follow the head,
+    /// recorded once by the frontend that built this context.
+    ///
+    /// * `Some(false)` — the transport PROVED the request ends with its head:
+    ///   an HTTP/1.1 request with no body framing (or `Content-Length: 0`), or
+    ///   an HTTP/2 HEADERS frame carrying END_STREAM.
+    /// * `Some(true)` — a body may follow: declared HTTP/1.1 framing, an
+    ///   HTTP/2 stream left open after HEADERS, and every HTTP/3 request (the
+    ///   `h3` request stream exposes no end-of-stream signal before the first
+    ///   read).
+    /// * `None` — no transport evidence (synthetic and test contexts); body
+    ///   governance falls back to the declared `Content-Length` /
+    ///   `Transfer-Encoding` framing.
+    ///
+    /// Read by request-body policies that must not let an omitted
+    /// `Content-Length` / `Content-Type` stand in for proof of an empty body.
+    pub(crate) inbound_request_body_may_follow: Option<bool>,
     /// Strictest active *route-scoped* request-body ceiling enforced by this
     /// request's matched plugin set (`Plugin::enforced_request_body_limit`),
     /// or `None` when no matched plugin enforces one.
@@ -4455,6 +4472,7 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: 0,
+            inbound_request_body_may_follow: None,
             route_request_body_limit_bytes: None,
             route_response_body_limit_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6082,6 +6100,7 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: self.max_response_body_size_bytes,
+            inbound_request_body_may_follow: self.inbound_request_body_may_follow,
             // Route ceilings are request-scoped policy, not per-phase state:
             // the final-body hooks must hold the same bound the streaming and
             // buffering paths were admitted under, so a post-transform check

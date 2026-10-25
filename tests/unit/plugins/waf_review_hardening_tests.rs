@@ -13,11 +13,17 @@
 //! * `global_exemptions.paths` literals must be canonical (M11).
 
 use base64::Engine;
-use ferrum_edge::_test_support::stamp_original_response_metadata_for_test;
+use ferrum_edge::_test_support::{
+    BufferedRepresentationOutcome, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES,
+    ResponseBufferBudgetProbe, set_inbound_request_body_may_follow_for_test,
+    stamp_original_response_metadata_for_test,
+};
 use ferrum_edge::plugins::waf::Waf;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
 
 const BYPASS_HEADER: &str = "x-trusted-hop";
 const BYPASS_SECRET: &str = "trusted-hop-shared-secret";
@@ -323,7 +329,146 @@ async fn grpc_response_messages_are_inspected_and_compression_fails_closed() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
+#[tokio::test]
+async fn a_malformed_suffix_does_not_hide_the_complete_messages_before_it() {
+    let mut forbidden = grpc_frame(0, br#"{"user":{"bio":"forbidden-canary"}}"#);
+    forbidden.push(0x00);
+    let mut clean = grpc_frame(0, br#"{"user":{"bio":"hello"}}"#);
+    clean.extend_from_slice(&[0x7f, 0, 0, 0, 1, b'x']);
+    let headers = [("content-type", "application/grpc+json")];
+
+    // Enforcing: the defect itself is refused, whatever precedes it.
+    let plugin = waf(json_path_bio_rule()).unwrap();
+    for body in [&forbidden, &clean] {
+        let (result, request) = final_request_body(&plugin, "POST", &headers, body).await;
+        assert!(is_reject(&result));
+        assert_eq!(
+            meta(&request, "waf.body_uninspected"),
+            Some("grpc_malformed_framing")
+        );
+    }
+
+    // Observing: the complete message before the defect is still scanned
+    // rather than the stream being read as one invalid document.
+    let mut monitor = json_path_bio_rule();
+    monitor["mode"] = json!("monitor");
+    let plugin = waf(monitor).unwrap();
+    let (result, request) = final_request_body(&plugin, "POST", &headers, &forbidden).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&request, "waf.rule_hits"), Some("BIO"));
+    assert_eq!(
+        meta(&request, "waf.body_uninspected"),
+        Some("grpc_malformed_framing")
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_suffix_does_not_erase_a_compressed_message_refusal() {
+    let plugin = waf(enforcing_body_text_rule("enforce")).unwrap();
+    let mut body = grpc_frame(1, b"opaque");
+    body.extend_from_slice(&[0, 0, 0]);
+
+    let (result, request) = final_request_body(
+        &plugin,
+        "POST",
+        &[("content-type", "application/grpc+json")],
+        &body,
+    )
+    .await;
+
+    assert!(is_reject(&result));
+    assert_eq!(
+        meta(&request, "waf.body_uninspected"),
+        Some("grpc_compressed")
+    );
+}
+
+#[tokio::test]
+async fn the_scan_window_edge_is_not_a_framing_defect() {
+    // Message 1 sits inside the 64-byte window; message 2 runs past it.
+    let mut config = json_path_bio_rule();
+    config["max_scan_bytes"] = json!(64);
+    config["on_body_too_large"] = json!("scan_truncated");
+    let plugin = waf(config).unwrap();
+    let padding = vec![b'p'; 200];
+    let headers = [("content-type", "application/grpc+json")];
+
+    let mut forbidden = grpc_frame(0, br#"{"user":{"bio":"forbidden-canary"}}"#);
+    forbidden.extend(grpc_frame(0, &padding));
+    let (result, request) = final_request_body(&plugin, "POST", &headers, &forbidden).await;
+    assert!(
+        is_reject(&result),
+        "a forbidden message inside the inspected window must be scanned"
+    );
+    assert_eq!(meta(&request, "waf.block_reason"), Some("rule"));
+
+    let mut clean = grpc_frame(0, br#"{"user":{"bio":"hello"}}"#);
+    clean.extend(grpc_frame(0, &padding));
+    let (result, request) = final_request_body(&plugin, "POST", &headers, &clean).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(meta(&request, "waf.scan_truncated"), Some("true"));
+    assert_eq!(meta(&request, "waf.body_uninspected"), None);
+}
+
 // ── waf-SOL-2: bounded bodies relabeled as SSE ─────────────────────────────
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("gzip write");
+    encoder.finish().expect("gzip finish")
+}
+
+/// The production representation gate, then the final body phase, for a gzip
+/// `text/plain` origin whose `Content-Type` a header-only hook relabeled
+/// `text/event-stream` (the body and its coding left as the origin sent them).
+async fn gate_then_finalize_relabeled_gzip(
+    plain: &[u8],
+) -> (BufferedRepresentationOutcome, PluginResult) {
+    let plugin = Arc::new(waf(enforcing_response_rule()).unwrap());
+    let as_plugin: Arc<dyn Plugin> = plugin.clone();
+    let plugins = vec![as_plugin];
+    let mut request = ctx("GET", "/events");
+    let origin = HashMap::from([
+        ("content-type".to_string(), "text/plain".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    stamp_original_response_metadata_for_test(&mut request, 200, &origin);
+    let mut headers = origin.clone();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let mut body = bytes::Bytes::from(gzip(plain));
+    let budget = ResponseBufferBudgetProbe::new(
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES,
+        64 * RESPONSE_BUFFER_RESERVATION_UNIT_BYTES,
+    );
+
+    let outcome = budget.admit_buffered_representation(
+        &plugins,
+        &mut request,
+        true,
+        200,
+        &mut headers,
+        &mut body,
+    );
+    let result = plugin
+        .finalize_client_visible_response_body(&mut request, 200, &headers, &body)
+        .await;
+    (outcome, result)
+}
+
+#[tokio::test]
+async fn a_compressed_body_relabeled_as_sse_is_decoded_before_the_scan() {
+    let (outcome, result) = gate_then_finalize_relabeled_gzip(b"data: secret\n\n").await;
+    assert_eq!(
+        outcome,
+        BufferedRepresentationOutcome::Decoded,
+        "the claim must follow the origin type, so the origin coding is decoded"
+    );
+    assert!(is_reject(&result), "the decoded plaintext is scanned");
+
+    let (outcome, result) = gate_then_finalize_relabeled_gzip(b"data: hello\n\n").await;
+    assert_eq!(outcome, BufferedRepresentationOutcome::Decoded);
+    assert!(matches!(result, PluginResult::Continue));
+}
 
 async fn finalize_relabeled_event_stream(
     plugin: &Waf,
@@ -487,6 +632,34 @@ async fn a_body_on_a_method_outside_body_methods_is_scanned() {
 }
 
 #[tokio::test]
+async fn a_head_without_framing_headers_is_governed_when_the_transport_says_a_body_may_follow() {
+    let plugin = waf(enforcing_body_text_rule("enforce")).unwrap();
+
+    // An HTTP/2 stream left open after HEADERS, or any HTTP/3 request.
+    let mut open = ctx("GET", "/search");
+    set_inbound_request_body_may_follow_for_test(&mut open, Some(true));
+    assert!(
+        plugin.should_buffer_request_body(&open),
+        "omitting Content-Length and Content-Type is not proof of an empty body"
+    );
+    let headers = open.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut open, &headers, b"needle")
+        .await;
+    assert!(is_reject(&result));
+
+    // END_STREAM on HEADERS (or HTTP/1.1 without framing) proves no body.
+    let mut ended = ctx("GET", "/search");
+    set_inbound_request_body_may_follow_for_test(&mut ended, Some(false));
+    assert!(!plugin.should_buffer_request_body(&ended));
+
+    // A CONNECT tunnel is never buffered as a request body.
+    let mut tunnel = ctx("CONNECT", "/");
+    set_inbound_request_body_may_follow_for_test(&mut tunnel, Some(true));
+    assert!(!plugin.should_buffer_request_body(&tunnel));
+}
+
+#[tokio::test]
 async fn an_empty_body_methods_list_still_governs_declared_bodies() {
     let mut config = enforcing_body_text_rule("enforce");
     config["body_methods"] = json!([]);
@@ -591,6 +764,51 @@ async fn matched_field_names_are_encoded_and_bounded() {
         fields.iter().any(|field| *field == truncated),
         "an over-long name is cut and marked: {fields:?}"
     );
+}
+
+#[tokio::test]
+async fn detection_band_hits_record_their_field_names_separately() {
+    let plugin = waf(json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "paranoia_level": 1,
+        "detection_paranoia_level": 2,
+        "custom_rules": [
+            {
+                "id": "Q-BAND",
+                "name": "band query",
+                "category": "custom",
+                "target": "query_values",
+                "match_kind": "contains",
+                "pattern": "needle",
+                "paranoia_min": 2
+            },
+            {
+                "id": "C-NEEDLE",
+                "name": "cookie",
+                "category": "custom",
+                "target": "cookies",
+                "match_kind": "contains",
+                "pattern": "needle"
+            }
+        ]
+    }))
+    .unwrap();
+    let mut request = ctx("GET", "/search");
+    request.set_raw_query_string("q=needle".into());
+    request
+        .headers
+        .insert("cookie".into(), "pref=needle".into());
+
+    let _ = plugin.authorize(&mut request).await;
+
+    assert_eq!(meta(&request, "waf.detection_rule_hits"), Some("Q-BAND"));
+    assert_eq!(
+        meta(&request, "waf.detection_matched_fields"),
+        Some("query:q")
+    );
+    assert_eq!(meta(&request, "waf.rule_hits"), Some("C-NEEDLE"));
+    assert_eq!(meta(&request, "waf.matched_fields"), Some("cookie:pref"));
 }
 
 // ── M8: header_present suppresses the strict `block` dispositions ─────────
@@ -699,6 +917,42 @@ async fn header_present_suppresses_the_strict_unlisted_response_block() {
             .await;
         assert_eq!(is_reject(&result), expect_reject, "trusted={trusted}");
     }
+}
+
+#[tokio::test]
+async fn header_present_suppresses_the_scan_timeout_block() {
+    // One scan of a 1 MB body cannot finish inside a 1 ms budget (the same
+    // premise the WebSocket timeout tests use); the body itself is clean.
+    let mut config = with_bypass_secret(enforcing_body_text_rule("enforce"));
+    config["scan_budget_ms"] = json!(1);
+    config["max_scan_bytes"] = json!(2_000_000);
+    config["on_scan_timeout"] = json!("block");
+    let plugin = waf(config).unwrap();
+    let body = "a".repeat(1_000_000);
+
+    let mut trusted = exempt(ctx("POST", "/upload"));
+    trusted
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = trusted.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut trusted, &headers, body.as_bytes())
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a trusted hop's clean but late scan is not refused"
+    );
+
+    let mut untrusted = ctx("POST", "/upload");
+    untrusted
+        .headers
+        .insert("content-type".into(), "text/plain".into());
+    let headers = untrusted.headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut untrusted, &headers, body.as_bytes())
+        .await;
+    assert!(is_reject(&result));
+    assert_eq!(meta(&untrusted, "waf.block_reason"), Some("scan_timeout"));
 }
 
 // ── M11: canonical global_exemptions.paths ─────────────────────────────────

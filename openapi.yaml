@@ -30555,7 +30555,8 @@ components:
             waf.matched_fields: the query:, header:, cookie:, and
             response_header: field NAMES matched hits came from
             (percent-encoded, at most 16 per scan, each cut at 128 bytes) —
-            never a matched value.
+            never a matched value. Detection-only (paranoia band) hits list
+            theirs in waf.detection_matched_fields.
         log_to_stdout:
           type: [boolean, "null"]
           default: false
@@ -30921,18 +30922,18 @@ components:
             minLength: 1
           default: [POST, PUT, PATCH, DELETE]
           description: >-
-            HTTP methods whose request bodies are always buffered and scanned,
-            including an HTTP/2 or HTTP/3 body sent without Content-Length.
+            HTTP methods whose request bodies are always buffered and scanned.
             Body governance is not a method allowlist: a request on any other
-            method is buffered, scanned, and governed by
-            on_unlisted_content_type once it declares a body (Content-Length
-            greater than zero, any Transfer-Encoding, or a Content-Type), and
-            any non-empty finalized body is decided whatever the method. List a
-            method only to also cover its bodies that declare neither length
-            nor type. DELETE is included by default because it may carry
-            content that backends parse. WebSocket messages ignore it. An
-            empty list therefore does not turn off request-body scanning for
-            requests that declare a body.
+            method (except CONNECT) is buffered, scanned, and governed by
+            on_unlisted_content_type whenever a body may follow its head — it
+            carries a Content-Type, declares HTTP/1.1 framing (Content-Length
+            greater than zero or Transfer-Encoding), is an HTTP/2 request whose
+            HEADERS frame lacked END_STREAM, or is any HTTP/3 request — and any
+            non-empty finalized body is decided whatever the method. DELETE is
+            included by default because it may carry content that backends
+            parse. WebSocket messages ignore it. An empty list therefore does
+            not turn off request-body scanning for requests that may carry a
+            body.
         body_content_types:
           type: [array, "null"]
           items:
@@ -31318,7 +31319,8 @@ components:
             these headers with exactly the configured value (compared in
             constant time), every rule is suppressed for that request, and so
             are the fail_closed and block dispositions of on_body_too_large,
-            on_unlisted_content_type, and on_unlisted_response_content_type.
+            on_unlisted_content_type, on_unlisted_response_content_type, and
+            on_scan_timeout.
             Clients
             choose their own headers, so presence-only (null) entries are not
             admitted and each value must be a secret of at least 16 characters

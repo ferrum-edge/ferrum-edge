@@ -453,7 +453,9 @@ impl WafWsSession {
             return None;
         }
         let block = match self.waf.config.on_scan_timeout {
-            TimeoutAction::Block => true,
+            // A `header_present`-exempt session is not closed on a clean but
+            // late message either, mirroring `Waf::finish_timeout`.
+            TimeoutAction::Block => !self.policy.suppressed_by_request,
             TimeoutAction::FailClosed => self.policy.timeout_enforces(body_direction(direction)),
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
         };

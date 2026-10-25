@@ -502,6 +502,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "waf.body_too_large_target",
     "waf.body_uninspected",
     "waf.body_uninspected_target",
+    "waf.detection_matched_fields",
     "waf.detection_paranoia",
     "waf.detection_rule_hits",
     "waf.first_blocking_rule",

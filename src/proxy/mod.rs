@@ -34124,6 +34124,11 @@ async fn handle_proxy_request_inner(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // Whether DATA may follow the head, from the transport itself: hyper
+    // reports end-of-stream for an HTTP/1.1 request without body framing and
+    // for an HTTP/2 HEADERS frame carrying END_STREAM. Body policies read this
+    // instead of trusting an omittable `Content-Length` / `Content-Type`.
+    ctx.inbound_request_body_may_follow = Some(!http_body::Body::is_end_stream(req.body()));
     let mut request_scheme = if is_tls { "https" } else { "http" };
     ctx.request_is_secure = is_tls;
     ctx.metadata.insert(

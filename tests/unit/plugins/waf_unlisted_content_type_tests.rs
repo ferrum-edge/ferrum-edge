@@ -467,14 +467,32 @@ fn an_oversize_block_stays_an_admission_path_without_body_methods() {
 #[tokio::test]
 async fn grpc_json_codecs_are_scanned_and_other_grpc_types_are_unlisted() {
     let plugin = recommended("block");
+    // The JSON codecs carry one JSON document per length-prefixed message.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut framed = vec![0u8];
+        framed.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        framed.extend_from_slice(payload);
+        framed
+    }
     for ct in ["application/grpc+json", "application/grpc-web+json"] {
-        let (_, result, ctx) = post(&plugin, Some(ct), br#"{"name":"widget"}"#).await;
+        let (_, result, ctx) = post(&plugin, Some(ct), &frame(br#"{"name":"widget"}"#)).await;
         assert!(matches!(result, PluginResult::Continue), "{ct}");
         assert_eq!(meta(&ctx, "waf.body_uninspected"), None, "{ct}");
 
-        let (_, result, ctx) = post(&plugin, Some(ct), SQLI_JSON).await;
+        let (_, result, ctx) = post(&plugin, Some(ct), &frame(SQLI_JSON)).await;
         assert!(is_reject(&result), "{ct}");
         assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"), "{ct}");
+
+        // An unframed document under a gRPC type is not an RPC a gRPC server
+        // accepts; under an enforcing body policy it is refused as malformed
+        // framing rather than scanned as one document.
+        let (_, result, ctx) = post(&plugin, Some(ct), br#"{"name":"widget"}"#).await;
+        assert!(is_reject(&result), "{ct}");
+        assert_eq!(
+            meta(&ctx, "waf.body_uninspected"),
+            Some("grpc_malformed_framing"),
+            "{ct}"
+        );
     }
     for ct in [
         "application/grpc",

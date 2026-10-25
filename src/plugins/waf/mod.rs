@@ -739,17 +739,36 @@ impl Waf {
     /// regardless of method (a servlet reading `getInputStream()` on `GET`, a
     /// search API taking `GET` with a JSON body, WebDAV `SEARCH` / `PROPFIND`)
     /// would otherwise receive a payload that an enforcing body rule refuses
-    /// on `POST`, by method choice alone. So a request is governed when its
-    /// method is in `body_methods` — always buffered, which also covers an
-    /// HTTP/2 or HTTP/3 body sent without `Content-Length` — OR when, on any
-    /// other method, it declares a representation: a non-zero
-    /// `Content-Length`, any `Transfer-Encoding`, or a `Content-Type`.
-    /// Cheapest tests first; the framing walk runs only for a method outside
-    /// `body_methods` that carries no `Content-Type`.
+    /// on `POST`, by method choice alone. And an omitted `Content-Length` /
+    /// `Content-Type` is not proof of an empty body: HTTP/2 and HTTP/3 carry
+    /// DATA without either. So a request is governed when its method is in
+    /// `body_methods`, when it carries a `Content-Type`, or when the TRANSPORT
+    /// could not prove that it ends with its head
+    /// (`RequestContext::inbound_request_body_may_follow`: an HTTP/2 stream
+    /// left open after HEADERS, every HTTP/3 request, declared HTTP/1.1
+    /// framing). Only a context with no transport evidence (synthetic or test
+    /// contexts) falls back to the declared `Content-Length` /
+    /// `Transfer-Encoding` framing.
+    ///
+    /// `CONNECT` is never governed this way: its "body" is a tunnel, not a
+    /// request representation, and buffering it would stall the tunnel.
+    ///
+    /// Every test here is an O(1) field or map lookup on the request path; the
+    /// raw-header framing walk runs only for evidence-free contexts.
     fn request_may_carry_governed_body(&self, ctx: &RequestContext) -> bool {
-        self.request_method_is_body_method(ctx)
-            || ctx.headers.contains_key("content-type")
-            || crate::proxy::inbound_request_declares_body(ctx)
+        if self.request_method_is_body_method(ctx) {
+            return true;
+        }
+        if ctx.method.eq_ignore_ascii_case("CONNECT") {
+            return false;
+        }
+        if ctx.headers.contains_key("content-type") {
+            return true;
+        }
+        match ctx.inbound_request_body_may_follow {
+            Some(may_follow) => may_follow,
+            None => crate::proxy::inbound_request_declares_body(ctx),
+        }
     }
 
     /// The same question once the finalized body is in hand: any non-empty
@@ -1284,6 +1303,15 @@ impl Waf {
             return;
         }
         ctx.merge_waf_metadata("waf.detection_rule_hits", &detection_ids.join(","));
+        // The detection band's field NAMES, kept apart from
+        // `waf.matched_fields` so each list names exactly the fields its own
+        // rule-hit list came from.
+        if !outcome.detection_matched_fields.is_empty() {
+            ctx.merge_waf_metadata(
+                "waf.detection_matched_fields",
+                &outcome.detection_matched_fields.join(","),
+            );
+        }
         ctx.set_waf_metadata(
             "waf.detection_paranoia",
             self.config.detection_paranoia_level.to_string(),
@@ -1456,7 +1484,11 @@ impl Waf {
     /// never starts blocking on a slow scan.
     fn finish_timeout(&self, ctx: &mut RequestContext, enforces: bool) -> PluginResult {
         let block = match self.config.on_scan_timeout {
-            TimeoutAction::Block => true,
+            // Unconditional except for a trusted hop: a matched
+            // `global_exemptions.header_present` secret suppresses every rule
+            // and every other refusing disposition, so a clean but late scan
+            // of its request is not refused either.
+            TimeoutAction::Block => !self.exemptions.suppresses_rule_for_request(ctx),
             TimeoutAction::FailClosed => enforces,
             TimeoutAction::Allow | TimeoutAction::LogAndAllow => false,
         };
@@ -2120,7 +2152,7 @@ impl Plugin for Waf {
         let content_type = headers.get("content-type").map(String::as_str);
         // A framed gRPC / gRPC-Web body is inspected message by message (see
         // `waf::grpc`); a message the WAF cannot read is decided first.
-        let grpc_messages = grpc::split_messages(body, content_type);
+        let grpc_messages = grpc::split_messages(body, content_type, truncated);
         if let Some(reason) = grpc_messages
             .as_ref()
             .and_then(|messages| messages.uninspectable())
@@ -2322,8 +2354,17 @@ impl Plugin for Waf {
         response_content_type: Option<&str>,
         _response_body: &[u8],
     ) -> bool {
-        self.response_body_policy_enforces(ctx, response_content_type)
-            && !response_content_type
+        // The claim must scope the body exactly as the final scan does: a
+        // finite origin body a later hook relabeled `text/event-stream` is
+        // scanned under its ORIGIN media type there, so it is claimed under
+        // that type here — otherwise the gate leaves an origin
+        // `Content-Encoding` in place and the scan reads compressed octets.
+        let scope_content_type = match relabeled_event_stream_origin(ctx, response_content_type) {
+            Some(origin) => origin,
+            None => response_content_type,
+        };
+        self.response_body_policy_enforces(ctx, scope_content_type)
+            && !scope_content_type
                 .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
             && ctx
                 .metadata
@@ -2429,19 +2470,17 @@ impl Plugin for Waf {
         // transformer — is a bounded buffer like any other, so it is judged
         // by the scan scope of the media type the ORIGIN selected rather than
         // escaping both the response-body rules and the unlisted disposition.
-        let relabeled_event_stream = content_type.is_some_and(is_text_event_stream_media_type)
-            && !original_response_is_event_stream(ctx, response_headers);
-        let origin_content_type: Option<String> = if relabeled_event_stream {
-            ctx.metadata
-                .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
-                .cloned()
-        } else {
-            None
-        };
-        let scope_content_type = if relabeled_event_stream {
-            origin_content_type.as_deref()
-        } else {
-            content_type
+        // `enforces_response_body_policy` scopes the representation claim by
+        // the same rule, so an origin `Content-Encoding` was decoded (or the
+        // response refused) under the origin type before this scan. The
+        // origin type is copied out because the scan below needs `&mut ctx`.
+        let origin_content_type: Option<Option<String>> =
+            relabeled_event_stream_origin(ctx, content_type)
+                .map(|origin| origin.map(str::to_owned));
+        let relabeled_event_stream = origin_content_type.is_some();
+        let scope_content_type: Option<&str> = match &origin_content_type {
+            Some(origin) => origin.as_deref(),
+            None => content_type,
         };
         if !self.response_body_eligible_for_scan(scope_content_type) {
             // A genuine origin event stream is never buffered for this policy
@@ -2457,7 +2496,10 @@ impl Plugin for Waf {
             Ok(value) => value,
             Err(result) => return result,
         };
-        let grpc_messages = grpc::split_messages(body, content_type);
+        // The origin media type also decides framing and charset for a
+        // relabeled body: a header-only relabel leaves the origin bytes as
+        // they were.
+        let grpc_messages = grpc::split_messages(body, scope_content_type, truncated);
         if let Some(reason) = grpc_messages
             .as_ref()
             .and_then(|messages| messages.uninspectable())
@@ -2468,7 +2510,7 @@ impl Plugin for Waf {
         }
         let mut outcome = self
             .run_body_scan_with_budget(|| {
-                self.run_response_body_scan(ctx, body, content_type, grpc_messages.as_ref())
+                self.run_response_body_scan(ctx, body, scope_content_type, grpc_messages.as_ref())
             })
             .await;
         outcome.truncated = truncated;
@@ -2497,6 +2539,33 @@ impl Plugin for Waf {
         self.finalize_client_visible_response_body(ctx, response_status, response_headers, body)
             .await
     }
+}
+
+/// When a later hook relabeled a finite origin body `text/event-stream`, the
+/// media type the ORIGIN selected (`Some(None)` when it sent none); `None` when
+/// the live type is not an event stream, or the pristine origin response was
+/// one itself. Only a stamped backend snapshot can prove a relabel; an
+/// unstamped (synthetic) response is taken at its live type, exactly as
+/// `original_response_is_event_stream` does.
+fn relabeled_event_stream_origin<'a>(
+    ctx: &'a RequestContext,
+    live_content_type: Option<&str>,
+) -> Option<Option<&'a str>> {
+    if !live_content_type.is_some_and(is_text_event_stream_media_type)
+        || !ctx
+            .metadata
+            .contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY)
+    {
+        return None;
+    }
+    let origin = ctx
+        .metadata
+        .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str);
+    if origin.is_some_and(is_text_event_stream_media_type) {
+        return None;
+    }
+    Some(origin)
 }
 
 fn proxy_id(ctx: &RequestContext) -> &str {

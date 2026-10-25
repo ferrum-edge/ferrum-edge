@@ -318,7 +318,9 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
      the governed body direction carries an enforcing body policy
      (`request_body_policy_enforces` / `response_body_policy_enforces`, which
      also count `on_body_too_large: block` while globally enforcing); `allow` is
-     the silent variant of the default; `block` rejects unconditionally and is
+     the silent variant of the default; `block` rejects unconditionally (except
+     a `global_exemptions.header_present`-exempt request, for which every rule
+     and refusing disposition is suppressed) and is
      the only setting that also covers the cheap metadata/header scans. Do not
      make a fail-closed timeout the default: it rejects traffic the WAF scanned
      and cleared.

@@ -42,19 +42,37 @@ pub(super) struct ScanOutcome {
     pub hits: Vec<RuleHit>,
     pub truncated: bool,
     pub timed_out: bool,
-    /// `<kind>:<name>` labels of the request/response fields accepted hits came
-    /// from (`query`, `header`, `cookie`, `response_header`). Names only — a
-    /// field VALUE is never recorded. Bounded by [`MAX_MATCHED_FIELDS`] and
-    /// [`MAX_MATCHED_FIELD_NAME_BYTES`]; see [`matched_field_label`].
+    /// `<kind>:<name>` labels of the request/response fields accepted
+    /// blocking-posture hits came from (`query`, `header`, `cookie`,
+    /// `response_header`). Names only — a field VALUE is never recorded.
+    /// Bounded by [`MAX_MATCHED_FIELDS`] and [`MAX_MATCHED_FIELD_NAME_BYTES`];
+    /// see [`matched_field_label`].
     pub matched_fields: Vec<String>,
-    /// Every accepted hit, including a repeat of an already-recorded rule, so
-    /// a scan can tell whether one field produced any hit at all.
+    /// The same labels for hits of detection-only (paranoia band) rules, kept
+    /// apart so each list names exactly the fields its published rule-hit list
+    /// came from.
+    pub detection_matched_fields: Vec<String>,
+    /// Every accepted blocking-posture hit, including a repeat of an
+    /// already-recorded rule, so a scan can tell whether one field produced
+    /// any hit at all.
     pub(super) accepted_hits: usize,
+    /// Detection-only counterpart of `accepted_hits`.
+    pub(super) accepted_detection_hits: usize,
 }
 
 impl ScanOutcome {
     pub fn push(&mut self, hit: RuleHit) {
-        self.accepted_hits = self.accepted_hits.saturating_add(1);
+        self.push_classified(hit, false);
+    }
+
+    /// Record an accepted hit; `detection_only` selects which counter (and,
+    /// for a named field, which field list) it belongs to.
+    fn push_classified(&mut self, hit: RuleHit, detection_only: bool) {
+        if detection_only {
+            self.accepted_detection_hits = self.accepted_detection_hits.saturating_add(1);
+        } else {
+            self.accepted_hits = self.accepted_hits.saturating_add(1);
+        }
         if !self
             .hits
             .iter()
@@ -66,13 +84,18 @@ impl ScanOutcome {
 
     /// Record the NAME of the field an accepted hit came from. Cold path: it
     /// runs only after a rule matched.
-    fn record_field(&mut self, kind: &str, name: &str) {
-        if self.matched_fields.len() >= MAX_MATCHED_FIELDS {
+    fn record_field(&mut self, kind: &str, name: &str, detection_only: bool) {
+        let fields = if detection_only {
+            &mut self.detection_matched_fields
+        } else {
+            &mut self.matched_fields
+        };
+        if fields.len() >= MAX_MATCHED_FIELDS {
             return;
         }
         let label = matched_field_label(kind, name);
-        if !self.matched_fields.contains(&label) {
-            self.matched_fields.push(label);
+        if !fields.contains(&label) {
+            fields.push(label);
         }
     }
 
@@ -80,26 +103,42 @@ impl ScanOutcome {
     /// recorded by `scan_query_pair`, which knows the name as the application
     /// reads it; whole-surface matches (path, method, URL, bodies) have no
     /// field name to report.
-    fn record_field_of(&mut self, field: Field<'_>) {
+    fn record_field_of(&mut self, field: Field<'_>, detection_only: bool) {
         let (kind, name) = match field {
             Field::Header(name) => ("header", name),
             Field::ResponseHeader(name) => ("response_header", name),
             Field::Cookie(name) => ("cookie", name),
             Field::QueryParam(_) | Field::Whole | Field::Url { .. } => return,
         };
-        self.record_field(kind, name);
+        self.record_field(kind, name, detection_only);
     }
 
     /// Fold one message's outcome into a whole-body outcome.
     fn absorb(&mut self, other: ScanOutcome) {
         for hit in other.hits {
-            self.push(hit);
-        }
-        for label in other.matched_fields {
-            if self.matched_fields.len() < MAX_MATCHED_FIELDS
-                && !self.matched_fields.contains(&label)
+            if !self
+                .hits
+                .iter()
+                .any(|existing| existing.rule_index == hit.rule_index)
             {
-                self.matched_fields.push(label);
+                self.hits.push(hit);
+            }
+        }
+        self.accepted_hits = self.accepted_hits.saturating_add(other.accepted_hits);
+        self.accepted_detection_hits = self
+            .accepted_detection_hits
+            .saturating_add(other.accepted_detection_hits);
+        for (fields, incoming) in [
+            (&mut self.matched_fields, other.matched_fields),
+            (
+                &mut self.detection_matched_fields,
+                other.detection_matched_fields,
+            ),
+        ] {
+            for label in incoming {
+                if fields.len() < MAX_MATCHED_FIELDS && !fields.contains(&label) {
+                    fields.push(label);
+                }
             }
         }
         self.truncated |= other.truncated;
@@ -452,7 +491,13 @@ impl Waf {
         if transcoded_views.uninspectable_charset()
             && let Some(rule_index) = self.specials.encoding
         {
-            self.push_special(&mut outcome, rule_index, text.as_ref(), subject);
+            self.push_special(
+                &mut outcome,
+                rule_index,
+                text.as_ref(),
+                subject,
+                Field::Whole,
+            );
         }
         // A declared charset adds coverage; it must not remove matches from
         // raw text or its transformations (including mixed representations).
@@ -799,7 +844,7 @@ impl Waf {
         key_is_decoded: bool,
         subject: ScanSubject<'_>,
     ) {
-        let accepted_before = outcome.accepted_hits;
+        let accepted_before = (outcome.accepted_hits, outcome.accepted_detection_hits);
         // One shared decode: split components are already isolated, then
         // `canonical_query_component_views` percent-decodes `%2f` and produces
         // the bounded layered variants. PATHTRAV/LFI (canonical_query_values)
@@ -835,13 +880,20 @@ impl Waf {
                 field,
             );
         }
-        if outcome.accepted_hits != accepted_before {
+        let blocking_hit = outcome.accepted_hits != accepted_before.0;
+        let detection_hit = outcome.accepted_detection_hits != accepted_before.1;
+        if blocking_hit || detection_hit {
             let label_name = if key_is_decoded {
                 Cow::Borrowed(raw_key)
             } else {
                 normalize::query_component_name(raw_key)
             };
-            outcome.record_field("query", &label_name);
+            if blocking_hit {
+                outcome.record_field("query", &label_name, false);
+            }
+            if detection_hit {
+                outcome.record_field("query", &label_name, true);
+            }
         }
     }
 
@@ -938,11 +990,14 @@ impl Waf {
                 && !rule.suppresses_text(value)
                 && self.field_permits(rule, field)
             {
-                outcome.push(RuleHit {
-                    rule_index,
-                    target_name: rule.target.log_target(),
-                });
-                outcome.record_field_of(field);
+                self.push_hit(
+                    outcome,
+                    RuleHit {
+                        rule_index,
+                        target_name: rule.target.log_target(),
+                    },
+                    field,
+                );
             }
         }
     }
@@ -962,13 +1017,13 @@ impl Waf {
                 || decode::has_percent_null_byte(&judged)
                 || decode::has_overlong_utf8_marker(&judged)
             {
-                self.push_special(outcome, rule_index, &judged, subject);
+                self.push_special(outcome, rule_index, &judged, subject, url);
             }
         }
         if let Some(rule_index) = self.specials.overlong_utf8 {
             let judged = self.url_for_rule(rule_index, value, url);
             if decode::has_overlong_utf8_marker(&judged) {
-                self.push_special(outcome, rule_index, &judged, subject);
+                self.push_special(outcome, rule_index, &judged, subject, url);
             }
         }
     }
@@ -1055,7 +1110,7 @@ impl Waf {
                     && (decode::has_double_encoded_marker(text)
                         || decode::has_percent_null_byte(text)));
             if flagged {
-                self.push_special(outcome, rule_index, text, subject);
+                self.push_special(outcome, rule_index, text, subject, Field::Whole);
             }
         }
         // The marker helpers all look for `%`-prefixed sequences, so skip their
@@ -1064,7 +1119,7 @@ impl Waf {
             && let Some(rule_index) = self.specials.overlong_utf8
             && decode::has_overlong_utf8_marker(text)
         {
-            self.push_special(outcome, rule_index, text, subject);
+            self.push_special(outcome, rule_index, text, subject, Field::Whole);
         }
     }
 
@@ -1106,7 +1161,7 @@ impl Waf {
                     None => Cow::Borrowed(raw_query),
                 };
                 if self.special_hit_allowed(rule_index, &judged, subject) {
-                    self.push_special(outcome, rule_index, &judged, subject);
+                    self.push_special(outcome, rule_index, &judged, subject, Field::Whole);
                     return;
                 }
             }
@@ -1117,7 +1172,13 @@ impl Waf {
                     .filter(kept)
                     .collect();
                 if decode::has_conflicting_duplicate_among(retained.iter().copied()) {
-                    self.push_special(outcome, rule_index, &retained.join("&"), subject);
+                    self.push_special(
+                        outcome,
+                        rule_index,
+                        &retained.join("&"),
+                        subject,
+                        Field::Whole,
+                    );
                 }
             }
         }
@@ -1136,7 +1197,7 @@ impl Waf {
                 .iter()
                 .any(|configured| configured.eq_ignore_ascii_case(method))
         {
-            self.push_special(outcome, rule_index, method, subject);
+            self.push_special(outcome, rule_index, method, subject, Field::Whole);
         }
     }
 
@@ -1155,7 +1216,13 @@ impl Waf {
                 Field::Header("x-http-method-override"),
             )
         {
-            self.push_special(outcome, rule_index, override_method, subject);
+            self.push_special(
+                outcome,
+                rule_index,
+                override_method,
+                subject,
+                Field::Header("x-http-method-override"),
+            );
         }
     }
 
@@ -1173,19 +1240,35 @@ impl Waf {
             && !rule.suppresses_text(value)
     }
 
+    /// Accept one hit and record the field it came from, classified by
+    /// whether the rule is detection-only.
+    fn push_hit(&self, outcome: &mut ScanOutcome, hit: RuleHit, field: Field<'_>) {
+        let detection_only = self.compiled.rules[hit.rule_index].detection_only;
+        outcome.push_classified(hit, detection_only);
+        outcome.record_field_of(field, detection_only);
+    }
+
+    /// `field` names the request field a special judged, when it judged one
+    /// (`x-http-method-override`); URL, body, and method specials pass
+    /// `Field::Whole` / `Field::Url`, which carry no field name.
     fn push_special(
         &self,
         outcome: &mut ScanOutcome,
         rule_index: usize,
         value: &str,
         subject: ScanSubject<'_>,
+        field: Field<'_>,
     ) {
         let rule = &self.compiled.rules[rule_index];
         if self.special_hit_allowed(rule_index, value, subject) {
-            outcome.push(RuleHit {
-                rule_index,
-                target_name: rule.target.log_target(),
-            });
+            self.push_hit(
+                outcome,
+                RuleHit {
+                    rule_index,
+                    target_name: rule.target.log_target(),
+                },
+                field,
+            );
         }
     }
 
@@ -1208,11 +1291,14 @@ impl Waf {
             && !rule.suppresses_text(value)
             && self.field_permits(rule, field)
         {
-            outcome.push(RuleHit {
-                rule_index: rule_ref.rule_index,
-                target_name: rule_ref.target_name,
-            });
-            outcome.record_field_of(field);
+            self.push_hit(
+                outcome,
+                RuleHit {
+                    rule_index: rule_ref.rule_index,
+                    target_name: rule_ref.target_name,
+                },
+                field,
+            );
         }
     }
 }
