@@ -31436,7 +31436,19 @@ components:
         Repeated identical Content-Length values (RFC 9110 §8.6, which arrive
         comma-folded in plugin-facing header maps) are parsed per member and
         compared against the limit. A declared length that cannot be reduced to
-        one agreed value fails closed with HTTP 400.
+        one agreed value fails closed with HTTP 400 and
+        `{"error":"Request Content-Length is ambiguous"}`.
+        The ceiling applies to every method: an HTTP/2 GET, HEAD, or OPTIONS
+        request carrying DATA without Content-Length is forwarded through the
+        size-limited adapter, not replaced by an empty backend body.
+        Every 413 for this policy, from any plugin hook or from the proxy core's
+        streaming overrun, carries the one shared body
+        `{"error":"Request body exceeds maximum size"}` without the limit. A
+        plugin refusal records `request_size_limiting.reason`,
+        `request_size_limiting.instance` (the plugin-config id),
+        `request_size_limiting.limit_bytes`, and (except for an ambiguous
+        Content-Length) `request_size_limiting.observed_bytes` in request
+        metadata.
       required:
         - max_bytes
       properties:
@@ -31447,8 +31459,10 @@ components:
           maximum: 18446744073709551615
           description: >-
             Maximum allowed request body size in bytes. Required and must be
-            greater than zero — the gateway rejects plugin creation when
-            missing or 0.
+            a positive JSON integer — the gateway rejects plugin creation when
+            it is missing or null, 0, negative, fractional or in exponent form
+            (for example 1048576.0), or not a number (for example "1048576"),
+            with a diagnostic naming that fault class.
 
     WafPluginConfig:
       type: object

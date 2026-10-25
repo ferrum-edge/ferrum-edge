@@ -154,7 +154,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({"max_frame_bytes": false}),
             "`max_frame_bytes`",
-            "must be greater than zero",
+            "must be an integer, not a boolean",
         ),
         (
             json!({"max_frame_bytes": 918273641, "max_message_bytes": 1}),
