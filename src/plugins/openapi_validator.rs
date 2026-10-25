@@ -1446,6 +1446,43 @@ impl OpenapiValidator {
         }
     }
 
+    /// Shared release vote. A bodyless status, and an original event stream
+    /// this validator will REFUSE in `after_proxy` (one the status-selected
+    /// response object does not declare), are released whatever the final
+    /// label: no body is admitted unvalidated either way. A DECLARED event
+    /// stream is admitted unvalidated, so it is released only while the
+    /// representation at this decision point is still `text/event-stream`, and
+    /// never for a label-independent (`label_independent`) release.
+    fn may_release_stream(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        label_independent: bool,
+    ) -> bool {
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+        if synthetic_response_omits_body(&ctx.method, response_status) {
+            return true;
+        }
+        if !original_response_is_event_stream(ctx, response_headers) {
+            return false;
+        }
+        let declared = self.operation_for_context(ctx).is_some_and(|matched| {
+            matched
+                .entry
+                .response_validators
+                .declares_event_stream(response_status)
+        });
+        if !declared {
+            return true;
+        }
+        !label_independent
+            && header_value(response_headers, "content-type")
+                .is_some_and(is_text_event_stream_media_type)
+    }
+
     /// Whether this response is an event stream (by its ORIGINAL
     /// representation — the pristine backend stamp, or the live headers of a
     /// synthetic response) that the status-selected response object of the
@@ -1712,20 +1749,22 @@ impl Plugin for OpenapiValidator {
         response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.should_buffer_response_body(ctx)
-            && (synthetic_response_omits_body(&ctx.method, response_status)
-                || original_response_is_event_stream(ctx, response_headers))
+        self.may_release_stream(ctx, response_status, response_headers, false)
     }
 
+    /// A label-INDEPENDENT release: true only when streaming stays safe even if
+    /// a later hook relabels the response. A declared event stream is admitted
+    /// unvalidated, so it can never qualify — a later `Content-Type` rewrite
+    /// (for example a header-only `response_transformer`) would otherwise turn
+    /// that admission into an unvalidated JSON body. The proxy's ordinary
+    /// relabel guard then keeps such a response buffered for final validation.
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
         response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.should_buffer_response_body(ctx)
-            && (synthetic_response_omits_body(&ctx.method, response_status)
-                || original_response_is_event_stream(ctx, response_headers))
+        self.may_release_stream(ctx, response_status, response_headers, true)
     }
 
     fn should_buffer_response_body_for_content_type(

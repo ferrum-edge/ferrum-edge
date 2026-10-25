@@ -1023,3 +1023,89 @@ async fn declared_event_stream_responses_are_released_while_undeclared_ones_fail
         Some(400),
     );
 }
+
+#[test]
+fn declared_event_stream_release_never_survives_a_later_content_type_relabel() {
+    use ferrum_edge::_test_support::{
+        refine_stream_response_for_content_type_for_test, retry_response_decision_context_for_test,
+        stamp_original_response_metadata_for_test,
+    };
+    use ferrum_edge::plugins::response_transformer::ResponseTransformer;
+    use std::sync::Arc;
+
+    let validator = |declared: bool| -> Arc<dyn Plugin> {
+        let mut ok = json!({"application/json": {"type": "object"}});
+        if declared {
+            ok["text/event-stream"] = json!({});
+        }
+        Arc::new(
+            OpenapiValidator::new(&json!({
+                "operations": [{
+                    "method": "GET", "path_template": "/events", "path_regex": "^/events$",
+                    "responses": {"200": ok}
+                }]
+            }))
+            .unwrap(),
+        )
+    };
+    // A header-only transformer that relabels the stream as JSON. It casts no
+    // buffering vote of its own.
+    let relabel: Arc<dyn Plugin> = Arc::new(
+        ResponseTransformer::new(&json!({"rules": [{
+            "operation": "update", "target": "header",
+            "key": "content-type", "value": "application/json"
+        }]}))
+        .unwrap(),
+    );
+    let proxy = super::plugin_utils::create_test_proxy();
+    let sse = content_type_headers("text/event-stream");
+    let ctx = ctx_for("GET", "/events");
+    let retry_ctx = retry_response_decision_context_for_test(&ctx);
+
+    for decision_ctx in [&ctx, &retry_ctx] {
+        // Declared SSE with nothing that can relabel it: streams, unvalidated.
+        assert!(refine_stream_response_for_content_type_for_test(
+            &proxy,
+            &[validator(true)],
+            decision_ctx,
+            200,
+            &sse,
+        ));
+        // Declared SSE that a later hook relabels to JSON: the declared-SSE
+        // admission must not release it, so it stays buffered and the final
+        // body is validated against the JSON contract.
+        assert!(
+            !refine_stream_response_for_content_type_for_test(
+                &proxy,
+                &[validator(true), relabel.clone()],
+                decision_ctx,
+                200,
+                &sse,
+            ),
+            "a relabeled declared event stream must stay buffered"
+        );
+    }
+
+    // Undeclared SSE keeps its label-independent release: it is refused in
+    // after_proxy whatever a later hook does to the label.
+    assert!(refine_stream_response_for_content_type_for_test(
+        &proxy,
+        &[validator(false), relabel],
+        &ctx,
+        200,
+        &sse,
+    ));
+
+    // The predicates themselves, over a backend response stamped as SSE.
+    let declared = validator(true);
+    let mut stamped = ctx_for("GET", "/events");
+    stamp_original_response_metadata_for_test(&mut stamped, 200, &sse);
+    assert!(
+        !declared.should_release_response_body_before_content_type_rewrite(&stamped, 200, &sse)
+    );
+    assert!(declared.should_release_response_body_under_retries(&stamped, 200, &sse));
+    // At a decision point where an earlier hook already relabeled the original
+    // event stream as JSON, the declared-SSE release is withheld.
+    let json_now = content_type_headers("application/json");
+    assert!(!declared.should_release_response_body_under_retries(&stamped, 200, &json_now));
+}
