@@ -4754,6 +4754,29 @@ pub mod _test_support {
             .shared_claim_retention_seconds_for_tests()
     }
 
+    /// Whether a constructed `soap_ws_security` instance's shared replay client
+    /// demands the no-eviction retention screen (`None` in process scope).
+    pub fn soap_shared_replay_requires_no_eviction_for_test(
+        config: &serde_json::Value,
+    ) -> Result<Option<bool>, String> {
+        Ok(
+            crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?
+                .shared_replay_requires_no_eviction_for_tests(),
+        )
+    }
+
+    /// One SAML assertion single-use claim against `plugin`'s configured replay
+    /// backend (process or shared), without minting a signed assertion.
+    pub async fn soap_claim_saml_assertion_for_test(
+        plugin: &crate::plugins::soap_ws_security::SoapWsSecurity,
+        issuer: &str,
+        assertion_id: &str,
+    ) -> Result<(), String> {
+        plugin
+            .claim_saml_assertion_for_tests(issuer, assertion_id)
+            .await
+    }
+
     /// One-shot proof that map/index drift cannot be recovered as a fresh
     /// admission. The inconsistent plugin never escapes this helper.
     pub fn soap_nonce_inconsistent_state_outcome_for_test(
