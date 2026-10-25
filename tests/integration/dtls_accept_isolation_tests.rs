@@ -26,6 +26,7 @@ use ferrum_edge::overload::OverloadState;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, UDP_ONLY_PROTOCOLS,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
 };
 use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_udp_listener};
 use ferrum_edge::request_epoch::RequestEpochStore;
@@ -96,6 +97,42 @@ impl Plugin for GatedFirstStreamConnect {
             .expect("first admission must own the release receiver");
         let _ = release.await;
         PluginResult::Continue
+    }
+}
+
+/// Records `UdpDatagramContext::admission_datagram` for every client→backend
+/// application datagram the DTLS relay hands to the datagram hook chain.
+#[derive(Default)]
+struct AdmissionFlagProbe {
+    flags: std::sync::Mutex<Vec<bool>>,
+}
+
+#[async_trait]
+impl Plugin for AdmissionFlagProbe {
+    fn name(&self) -> &str {
+        "test_dtls_admission_flag_probe"
+    }
+
+    fn priority(&self) -> u16 {
+        0
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        UDP_ONLY_PROTOCOLS
+    }
+
+    fn requires_udp_datagram_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
+        if ctx.direction == UdpDatagramDirection::ClientToBackend {
+            self.flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(ctx.admission_datagram);
+        }
+        UdpDatagramVerdict::Forward
     }
 }
 
@@ -216,6 +253,7 @@ async fn try_spawn_dtls_gateway(
     listen_port: u16,
     cert_path: &str,
     key_path: &str,
+    extra_probe: Option<Arc<dyn Plugin>>,
 ) -> Option<SpawnedDtlsGateway> {
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
@@ -237,6 +275,10 @@ async fn try_spawn_dtls_gateway(
         Arc::new(PluginCache::new(&gateway_config).expect("PluginCache builds with no plugins"));
     prepend_proxy_plugin_for_test(&plugin_cache, &proxy_namespace, PROXY_ID, gate)
         .expect("inject gated stream-connect plugin");
+    if let Some(probe) = extra_probe {
+        prepend_proxy_plugin_for_test(&plugin_cache, &proxy_namespace, PROXY_ID, probe)
+            .expect("inject DTLS datagram probe");
+    }
     let attached =
         plugin_cache.get_plugins_for_protocol(&proxy_namespace, PROXY_ID, ProxyProtocol::Udp);
     assert!(
@@ -345,14 +387,21 @@ async fn spawn_dtls_gateway_with_retry(
     backend_port: u16,
     cert_path: &str,
     key_path: &str,
+    extra_probe: Option<Arc<dyn Plugin>>,
 ) -> SpawnedDtlsGateway {
     let mut last_port = 0u16;
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_port().await.expect("reserve frontend port");
         let frontend_port = frontend.drop_and_take_port();
         last_port = frontend_port;
-        if let Some(handles) =
-            try_spawn_dtls_gateway(backend_port, frontend_port, cert_path, key_path).await
+        if let Some(handles) = try_spawn_dtls_gateway(
+            backend_port,
+            frontend_port,
+            cert_path,
+            key_path,
+            extra_probe.clone(),
+        )
+        .await
         {
             return handles;
         }
@@ -390,7 +439,7 @@ async fn dtls_accept_loop_progresses_while_first_stream_connect_is_blocked() {
         metrics,
         entered_rx,
         release_tx,
-    } = spawn_dtls_gateway_with_retry(backend_port, &cert_path, &key_path).await;
+    } = spawn_dtls_gateway_with_retry(backend_port, &cert_path, &key_path, None).await;
     let gateway_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listen_port));
 
     // Client 1: handshake completes, then blocks inside on_stream_connect.
@@ -459,6 +508,68 @@ async fn dtls_accept_loop_progresses_while_first_stream_connect_is_blocked() {
         .recv_datagram_with_timeout(Duration::from_millis(250))
         .await;
     blocked.close().await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(TEST_TIMEOUT, join).await;
+    echo.abort();
+}
+
+/// The accept-time `on_stream_connect` chain already admitted a terminating-DTLS
+/// session, so only its first application datagram is flagged as the admission
+/// datagram (a fault-injection abort is then decided once for first contact);
+/// every later datagram on the session is not.
+#[tokio::test]
+async fn dtls_only_the_first_application_datagram_is_flagged_as_admission() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let backend = reserve_udp_port().await.expect("reserve backend UDP port");
+    let backend_port = backend.port;
+    let backend_socket = Arc::new(backend.into_socket());
+    let echo = spawn_udp_echo_backend(backend_socket).await;
+
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let (cert_path, key_path) = write_frontend_dtls_material(&temp_dir);
+
+    let probe = Arc::new(AdmissionFlagProbe::default());
+    let probe_plugin: Arc<dyn Plugin> = probe.clone();
+    let SpawnedDtlsGateway {
+        listen_port,
+        shutdown_tx,
+        join,
+        release_tx,
+        ..
+    } = spawn_dtls_gateway_with_retry(backend_port, &cert_path, &key_path, Some(probe_plugin))
+        .await;
+    // This test does not exercise the admission gate: pre-release it so the
+    // first `on_stream_connect` continues immediately.
+    release_tx
+        .send(())
+        .expect("pre-release the gated first admission");
+    let gateway_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listen_port));
+
+    let client = DtlsClient::connect(gateway_addr)
+        .await
+        .expect("DTLS handshake");
+    for payload in [&b"first"[..], &b"second"[..], &b"third"[..]] {
+        client
+            .send_datagram(payload)
+            .await
+            .expect("send application datagram");
+        let echoed = client
+            .recv_datagram_with_timeout(TEST_TIMEOUT)
+            .await
+            .expect("application datagram must round-trip");
+        assert_eq!(echoed.as_slice(), payload);
+    }
+    client.close().await;
+
+    let flags = probe
+        .flags
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(flags, vec![true, false, false]);
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(TEST_TIMEOUT, join).await;

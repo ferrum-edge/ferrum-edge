@@ -17,6 +17,8 @@
 
 use std::borrow::Cow;
 
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use tracing::{debug, warn};
 
@@ -49,15 +51,21 @@ impl<'a> Iterator for PathSegments<'a> {
 struct CompiledPath {
     segments: Vec<String>,
     has_numeric_segment: bool,
+    /// `true` when any dot-delimited segment is empty: the empty path, a
+    /// leading or trailing unescaped `.`, or two adjacent unescaped dots.
+    /// Rule admission rejects such paths instead of mutating a `""` key.
+    has_empty_segment: bool,
 }
 
 impl CompiledPath {
     fn parse(path: &str) -> Self {
         let segments: Vec<String> = path_segments(path).map(Cow::into_owned).collect();
         let has_numeric_segment = segments.iter().any(|seg| seg.parse::<usize>().is_ok());
+        let has_empty_segment = segments.iter().any(String::is_empty);
         Self {
             segments,
             has_numeric_segment,
+            has_empty_segment,
         }
     }
 }
@@ -562,6 +570,26 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
         let key_path = CompiledPath::parse(&key);
         let new_key_path = new_key.as_deref().map(CompiledPath::parse);
 
+        // An empty dot-segment (`""`, `"user."`, `".user"`, `"a..b"`) is a
+        // typo in every realistic config: it would silently read or write a
+        // `""` member instead of the intended field. Reject it at load time,
+        // like every other malformed-rule class. A literal dot in a key is
+        // still expressible with the `\.` escape.
+        if key_path.has_empty_segment {
+            return Err(format!(
+                "`rule[{idx}]`: body `key` {key:?} has an empty path segment (empty path, or a leading, trailing, or doubled `.`); escape a literal dot as `\\.`"
+            ));
+        }
+        if new_key_path
+            .as_ref()
+            .is_some_and(|path| path.has_empty_segment)
+        {
+            return Err(format!(
+                "`rule[{idx}]`: body `new_key` {:?} has an empty path segment (empty path, or a leading, trailing, or doubled `.`); escape a literal dot as `\\.`",
+                new_key.as_deref().unwrap_or_default()
+            ));
+        }
+
         // Operation-specific required-field validation.
         match operation {
             BodyOperation::Add | BodyOperation::Update => {
@@ -629,15 +657,92 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
     Ok(rules)
 }
 
+/// Why a body-rule pass left a non-empty body unchanged.
+///
+/// Low-cardinality and value-free, so a request transformer can publish it as
+/// transaction metadata without leaking any part of the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyRulesSkipReason {
+    /// The body did not parse as one JSON document.
+    ParseError,
+    /// The document parsed, but no rule changed it (every targeted path was
+    /// absent, out of bounds, or crossed a non-container node).
+    NoRuleApplied,
+}
+
+impl BodyRulesSkipReason {
+    /// Stable metadata value for this reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseError => "parse_error",
+            Self::NoRuleApplied => "no_rule_applied",
+        }
+    }
+}
+
+/// Outcome of [`apply_request_body_rules`].
+#[derive(Debug)]
+pub enum RequestBodyRulesOutcome {
+    /// The rules rewrote the document; these are the replacement bytes.
+    Replaced(Vec<u8>),
+    /// A non-empty body was left unchanged for this reason.
+    Skipped(BodyRulesSkipReason),
+    /// Nothing to report: no rules, an empty body, or a rewrite that could not
+    /// be serialized.
+    Unchanged,
+}
+
+/// Internal result of one body-rule pass, before it is mapped onto the
+/// response (bounded-construction) or request (outcome) surface.
+enum BodyRulesPass {
+    Construction(crate::plugins::BoundedResponseBodyConstruction),
+    Skipped(BodyRulesSkipReason),
+}
+
 /// Apply body transformation rules to a JSON body.
 ///
 /// Parses `body` as JSON, applies rules in order, and returns the serialized
 /// result. Returns `None` if the body is not valid JSON, is empty, or no rule
 /// actually changed the body.
 ///
+/// Number lexemes the client sent are preserved exactly (see
+/// [`apply_request_body_rules`]).
+///
 /// Content-type is checked by the caller — this function assumes JSON input.
 pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
-    apply_body_rules_bounded(body, rules, usize::MAX).into_option()
+    match apply_request_body_rules(body, rules) {
+        RequestBodyRulesOutcome::Replaced(bytes) => Some(bytes),
+        RequestBodyRulesOutcome::Skipped(_) | RequestBodyRulesOutcome::Unchanged => None,
+    }
+}
+
+/// Request-side body-rule pass that reports why a body was left unchanged.
+///
+/// Rewriting a field re-serializes the whole document. `serde_json::Value`
+/// stores a number as `u64`, `i64`, or `f64`, so without care an integer
+/// outside the 64-bit range or a decimal with more precision than binary64
+/// would reach the backend silently rounded even though no rule named it. This
+/// pass therefore preserves every client number lexeme that is not an exactly
+/// representable 64-bit integer byte for byte (see
+/// [`rewrite_preserving_number_lexemes`]); the ordinary integer-only document
+/// pays nothing extra.
+///
+/// The request side keeps an unbounded construction ceiling; its bounds live
+/// on the request-body ceilings.
+pub fn apply_request_body_rules(body: &[u8], rules: &[BodyRule]) -> RequestBodyRulesOutcome {
+    use crate::plugins::BoundedResponseBodyConstruction;
+
+    match run_body_rules(body, rules, usize::MAX, true) {
+        BodyRulesPass::Construction(BoundedResponseBodyConstruction::Replaced(bytes)) => {
+            RequestBodyRulesOutcome::Replaced(bytes)
+        }
+        BodyRulesPass::Construction(
+            BoundedResponseBodyConstruction::Unchanged
+            | BoundedResponseBodyConstruction::CapacityRefused
+            | BoundedResponseBodyConstruction::SizeLimitExceeded(_),
+        ) => RequestBodyRulesOutcome::Unchanged,
+        BodyRulesPass::Skipped(reason) => RequestBodyRulesOutcome::Skipped(reason),
+    }
 }
 
 /// [`apply_body_rules`] with an explicit ceiling on the produced document.
@@ -657,20 +762,62 @@ pub(crate) fn apply_body_rules_bounded(
     rules: &[BodyRule],
     ceiling: usize,
 ) -> crate::plugins::BoundedResponseBodyConstruction {
+    match run_body_rules(body, rules, ceiling, false) {
+        BodyRulesPass::Construction(construction) => construction,
+        BodyRulesPass::Skipped(_) => crate::plugins::BoundedResponseBodyConstruction::Unchanged,
+    }
+}
+
+fn run_body_rules(
+    body: &[u8],
+    rules: &[BodyRule],
+    ceiling: usize,
+    preserve_number_lexemes: bool,
+) -> BodyRulesPass {
     use crate::plugins::BoundedResponseBodyConstruction;
 
     if rules.is_empty() || body.is_empty() {
-        return BoundedResponseBodyConstruction::Unchanged;
+        return BodyRulesPass::Construction(BoundedResponseBodyConstruction::Unchanged);
     }
 
     let mut json: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             debug!("body_transform: failed to parse body as JSON: {}", e);
-            return BoundedResponseBodyConstruction::Unchanged;
+            return BodyRulesPass::Skipped(BodyRulesSkipReason::ParseError);
         }
     };
 
+    if !apply_rules_to_document(&mut json, rules) {
+        return BodyRulesPass::Skipped(BodyRulesSkipReason::NoRuleApplied);
+    }
+
+    if preserve_number_lexemes {
+        let mut scan = DocumentNumberScan::default();
+        scan_document_numbers(&json, &mut scan);
+        // Only a document that still holds an `f64` can have lost a lexeme:
+        // every integer serde_json kept as `u64` / `i64` re-serializes exactly.
+        // The stand-in generation is one no string in the document already
+        // uses, so a client string can never be mistaken for a stand-in and a
+        // stand-in-shaped client string never disables the preservation.
+        if scan.has_float {
+            let spans = lossy_number_spans(body);
+            if !spans.is_empty()
+                && let Some(generation) =
+                    (0u64..).find(|candidate| !scan.used_stand_in_generations.contains(candidate))
+                && let Some(construction) =
+                    rewrite_preserving_number_lexemes(body, &spans, rules, ceiling, generation)
+            {
+                return BodyRulesPass::Construction(construction);
+            }
+        }
+    }
+
+    BodyRulesPass::Construction(serialize_document_bounded(&json, ceiling))
+}
+
+/// Apply every rule to `json` in order; `true` when any rule changed it.
+fn apply_rules_to_document(json: &mut Value, rules: &[BodyRule]) -> bool {
     let mut modified = false;
 
     for rule in rules {
@@ -678,8 +825,8 @@ pub(crate) fn apply_body_rules_bounded(
             BodyOperation::Add => {
                 // Only add if the field doesn't already exist.
                 if let Some(ref value) = rule.value
-                    && get_nested_value_compiled(&json, &rule.key_path).is_none()
-                    && set_nested_value_inner(&mut json, &rule.key_path, value.clone()).is_ok()
+                    && get_nested_value_compiled(json, &rule.key_path).is_none()
+                    && set_nested_value_inner(json, &rule.key_path, value.clone()).is_ok()
                 {
                     debug!("body_transform: added field {}", rule.key);
                     modified = true;
@@ -687,14 +834,14 @@ pub(crate) fn apply_body_rules_bounded(
             }
             BodyOperation::Update => {
                 if let Some(ref value) = rule.value
-                    && set_nested_value_inner(&mut json, &rule.key_path, value.clone()).is_ok()
+                    && set_nested_value_inner(json, &rule.key_path, value.clone()).is_ok()
                 {
                     debug!("body_transform: updated field {}", rule.key);
                     modified = true;
                 }
             }
             BodyOperation::Remove => {
-                if remove_nested_value_compiled(&mut json, &rule.key_path).is_some() {
+                if remove_nested_value_compiled(json, &rule.key_path).is_some() {
                     debug!("body_transform: removed field {}", rule.key);
                     modified = true;
                 }
@@ -702,7 +849,7 @@ pub(crate) fn apply_body_rules_bounded(
             BodyOperation::Rename => {
                 if let (Some(new_key), Some(new_key_path)) = (&rule.new_key, &rule.new_key_path)
                     && rename_nested_field_compiled(
-                        &mut json,
+                        json,
                         &rule.key_path,
                         new_key_path,
                         &rule.key,
@@ -716,26 +863,255 @@ pub(crate) fn apply_body_rules_bounded(
         }
     }
 
-    if modified {
-        let mut sink =
-            crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(ceiling);
-        let serialized = serde_json::to_writer(&mut sink, &json).is_ok();
-        if let Some(produced_bytes) = sink.size_refused_at() {
-            return BoundedResponseBodyConstruction::SizeLimitExceeded(produced_bytes);
+    modified
+}
+
+/// Serialize a rewritten document through the ceiling-bounded sink.
+fn serialize_document_bounded<T: Serialize + ?Sized>(
+    document: &T,
+    ceiling: usize,
+) -> crate::plugins::BoundedResponseBodyConstruction {
+    use crate::plugins::BoundedResponseBodyConstruction;
+
+    let mut sink =
+        crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(ceiling);
+    let serialized = serde_json::to_writer(&mut sink, document).is_ok();
+    if let Some(produced_bytes) = sink.size_refused_at() {
+        return BoundedResponseBodyConstruction::SizeLimitExceeded(produced_bytes);
+    }
+    match serialized.then(|| sink.finish()).flatten() {
+        Some(bytes) => BoundedResponseBodyConstruction::Replaced(bytes),
+        None => {
+            // A claimed rewrite that cannot fit the retained ceiling (or
+            // cannot serialize) is a capacity construction refusal, not an
+            // ordinary no-op — forwarding the original body would undo the
+            // policy-governed rewrite (GHSA-pwcm-6rh8-f2gh).
+            debug!("body_transform: transformed body was not serialized within its ceiling");
+            BoundedResponseBodyConstruction::CapacityRefused
         }
-        match serialized.then(|| sink.finish()).flatten() {
-            Some(bytes) => BoundedResponseBodyConstruction::Replaced(bytes),
-            None => {
-                // A claimed rewrite that cannot fit the retained ceiling (or
-                // cannot serialize) is a capacity construction refusal, not an
-                // ordinary no-op — forwarding the original body would undo the
-                // policy-governed rewrite (GHSA-pwcm-6rh8-f2gh).
-                debug!("body_transform: transformed body was not serialized within its ceiling");
-                BoundedResponseBodyConstruction::CapacityRefused
+    }
+}
+
+// ── Number-lexeme preservation ────────────────────────────────────────────
+
+/// Family prefix of the private JSON strings that stand in for preserved
+/// number lexemes while rules run. A stand-in is
+/// `"\u{0}ferrum-number-<generation>:<index>"`, where `<generation>` is chosen
+/// so that no string already in the document (client content or a rule value)
+/// starts with `"\u{0}ferrum-number-<generation>:"`. Every stand-in in the
+/// rewritten document is therefore one this module created.
+const NUMBER_STAND_IN_FAMILY: &str = "\u{0}ferrum-number-";
+
+#[derive(Default)]
+struct DocumentNumberScan {
+    has_float: bool,
+    /// Stand-in generations some string in the document already spells.
+    used_stand_in_generations: std::collections::HashSet<u64>,
+}
+
+/// The stand-in generation a string spells, if it starts with
+/// `NUMBER_STAND_IN_FAMILY` followed by decimal digits and `:`.
+fn stand_in_generation(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix(NUMBER_STAND_IN_FAMILY)?;
+    let (digits, _) = rest.split_once(':')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+fn scan_document_numbers(value: &Value, scan: &mut DocumentNumberScan) {
+    match value {
+        Value::Number(number) => scan.has_float |= number.is_f64(),
+        Value::String(text) => {
+            if let Some(generation) = stand_in_generation(text) {
+                scan.used_stand_in_generations.insert(generation);
             }
         }
-    } else {
-        BoundedResponseBodyConstruction::Unchanged
+        Value::Array(items) => {
+            for item in items {
+                scan_document_numbers(item, scan);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                scan_document_numbers(item, scan);
+            }
+        }
+        Value::Null | Value::Bool(_) => {}
+    }
+}
+
+/// Whether a JSON number token re-serializes byte-identically through
+/// `serde_json::Value`: an integer lexeme serde keeps as `u64` / `i64`.
+/// `-0` is excluded because serde_json stores it as the float `-0.0`.
+fn integer_lexeme_round_trips(token: &[u8]) -> bool {
+    if token.iter().any(|byte| matches!(byte, b'.' | b'e' | b'E')) {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(token) else {
+        return false;
+    };
+    text != "-0" && (text.parse::<u64>().is_ok() || text.parse::<i64>().is_ok())
+}
+
+/// Byte spans of every number token in a VALID JSON document whose lexeme
+/// would not survive a `serde_json::Value` round trip (fractions, exponents,
+/// out-of-range integers, `-0`). The caller has already parsed `body`, so the
+/// scan only has to tell string contents apart from tokens.
+fn lossy_number_spans(body: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while let Some(&byte) = body.get(index) {
+        match byte {
+            b'"' => {
+                index += 1;
+                while let Some(&inner) = body.get(index) {
+                    index += 1;
+                    match inner {
+                        // Skip the escaped byte (`\"`, `\\`, the `u` of `\uXXXX`).
+                        b'\\' => index += 1,
+                        b'"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = index;
+                while body.get(index).is_some_and(|candidate| {
+                    matches!(candidate, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                }) {
+                    index += 1;
+                }
+                if body
+                    .get(start..index)
+                    .is_some_and(|token| !integer_lexeme_round_trips(token))
+                {
+                    spans.push((start, index));
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    spans
+}
+
+/// Re-run the rules over a copy of `body` in which every lossy number token is
+/// replaced by a private stand-in string, then serialize the result with each
+/// surviving stand-in written back as its ORIGINAL lexeme.
+///
+/// The rules address documents by path only — they never read a number's
+/// value — so they behave identically on the stand-in document: a number a
+/// rule removed or overwrote is gone, one a rename moved keeps its exact
+/// spelling at the destination, and one no rule touched is unchanged. The
+/// caller picked a `generation` no existing string spells, so every stand-in
+/// in the result is one this function created. Returns `None` only on an
+/// internal failure (a span that is not a valid JSON number, or a stand-in
+/// document that does not re-parse), which the caller cannot reach for a body
+/// that already parsed.
+fn rewrite_preserving_number_lexemes(
+    body: &[u8],
+    spans: &[(usize, usize)],
+    rules: &[BodyRule],
+    ceiling: usize,
+    generation: u64,
+) -> Option<crate::plugins::BoundedResponseBodyConstruction> {
+    use std::io::Write as _;
+
+    let prefix = format!("{NUMBER_STAND_IN_FAMILY}{generation}:");
+    let json_prefix = format!("\"\\u0000ferrum-number-{generation}:");
+    let mut lexemes: Vec<Box<RawValue>> = Vec::with_capacity(spans.len());
+    let mut substituted: Vec<u8> =
+        Vec::with_capacity(body.len().saturating_add(spans.len().saturating_mul(32)));
+    let mut cursor = 0;
+    for (index, &(start, end)) in spans.iter().enumerate() {
+        let lexeme = std::str::from_utf8(body.get(start..end)?).ok()?;
+        lexemes.push(RawValue::from_string(lexeme.to_owned()).ok()?);
+        substituted.extend_from_slice(body.get(cursor..start)?);
+        substituted.extend_from_slice(json_prefix.as_bytes());
+        write!(substituted, "{index}\"").ok()?;
+        cursor = end;
+    }
+    substituted.extend_from_slice(body.get(cursor..)?);
+
+    let mut document: Value = serde_json::from_slice(&substituted).ok()?;
+    drop(substituted);
+    if !apply_rules_to_document(&mut document, rules) {
+        return None;
+    }
+    Some(serialize_document_bounded(
+        &LexemePreservingDocument {
+            value: &document,
+            prefix: &prefix,
+            lexemes: &lexemes,
+        },
+        ceiling,
+    ))
+}
+
+/// The preserved lexeme a stand-in string names, if `text` is one.
+fn preserved_lexeme<'a>(
+    text: &str,
+    prefix: &str,
+    lexemes: &'a [Box<RawValue>],
+) -> Option<&'a RawValue> {
+    let digits = text.strip_prefix(prefix)?;
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    lexemes.get(digits.parse::<usize>().ok()?).map(|raw| &**raw)
+}
+
+/// Serializes a stand-in document, writing each stand-in string back as the
+/// raw number lexeme it replaced and everything else exactly as
+/// `serde_json::Value` would.
+struct LexemePreservingDocument<'a> {
+    value: &'a Value,
+    /// This rewrite's stand-in prefix (`NUMBER_STAND_IN_FAMILY` + generation).
+    prefix: &'a str,
+    lexemes: &'a [Box<RawValue>],
+}
+
+impl Serialize for LexemePreservingDocument<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.value {
+            Value::String(text) => match preserved_lexeme(text, self.prefix, self.lexemes) {
+                Some(raw) => raw.serialize(serializer),
+                None => serializer.serialize_str(text),
+            },
+            Value::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(&LexemePreservingDocument {
+                        value: item,
+                        prefix: self.prefix,
+                        lexemes: self.lexemes,
+                    })?;
+                }
+                seq.end()
+            }
+            Value::Object(map) => {
+                let mut entries = serializer.serialize_map(Some(map.len()))?;
+                for (key, item) in map {
+                    entries.serialize_entry(
+                        key,
+                        &LexemePreservingDocument {
+                            value: item,
+                            prefix: self.prefix,
+                            lexemes: self.lexemes,
+                        },
+                    )?;
+                }
+                entries.end()
+            }
+            other => other.serialize(serializer),
+        }
     }
 }
 
