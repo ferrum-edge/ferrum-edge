@@ -5,6 +5,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -14,16 +15,23 @@ use uuid::Uuid;
 
 use super::utils::rate_limit::{
     LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
-    STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup,
-    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
-    validate_ws_frame_rate_params,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitKey, WsRateLimitOp,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    validate_ws_frame_rate_bounds, validate_ws_frame_rate_params,
 };
-use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use super::{
+    Plugin, PluginHttpClient, ProxyProtocol, RequestContext, WS_ONLY_PROTOCOLS,
+    WebSocketFrameDirection, WsDisconnectContext,
+};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// `ws_rate_limiting`-specific top-level config keys (excludes Redis fields).
-const WS_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
-    &["frames_per_second", "burst_size", "close_reason"];
+const WS_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &[
+    "frames_per_second",
+    "burst_size",
+    "close_reason",
+    "limit_by",
+];
 
 /// Closed top-level key set for `ws_rate_limiting` plugin config.
 ///
@@ -35,6 +43,7 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "frames_per_second",
     "burst_size",
     "close_reason",
+    "limit_by",
     // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_tls",
@@ -56,11 +65,55 @@ const EVICTION_CHECK_INTERVAL: u64 = 100_000;
 /// cardinality is enforced by atomic admission reservation.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 
+/// The `limit_by` budget dimension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WsLimitBy {
+    /// One budget per accepted WebSocket session (the default).
+    Connection,
+    /// One budget per authenticated identity (mapped Consumer username, else
+    /// the committed external identity); anonymous sessions share their client
+    /// IP's budget.
+    Consumer,
+    /// One budget per resolved client IP.
+    Ip,
+    /// One budget per proxy (the route / service the session was admitted on).
+    Service,
+}
+
+impl WsLimitBy {
+    /// Canonical rendering of the parsed dimension, recorded in the local-state
+    /// compatibility semantics.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Consumer => "consumer",
+            Self::Ip => "ip",
+            Self::Service => "service",
+        }
+    }
+
+    fn parse(config: &Value) -> Result<Self, String> {
+        match optional_string(config, "limit_by")? {
+            None | Some("connection") => Ok(Self::Connection),
+            Some("consumer") => Ok(Self::Consumer),
+            Some("ip") => Ok(Self::Ip),
+            Some("service") => Ok(Self::Service),
+            // Value-redacted: name the accepted set, never echo the input.
+            Some(_) => Err(
+                "ws_rate_limiting: `limit_by` must be one of `connection`, `consumer`, `ip`, \
+                 or `service`"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 pub struct WsRateLimiting {
     close_reason: String,
+    limit_by: WsLimitBy,
     frame_counter: AtomicU64,
     redis_instance_id: String,
-    limiter: RateLimitBackend<u64, WsFrameRateAlgorithm>,
+    limiter: RateLimitBackend<WsRateLimitKey, WsFrameRateAlgorithm>,
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
 }
@@ -126,13 +179,25 @@ impl WsRateLimiting {
 
         let frames_per_second = optional_positive_u64(config, "frames_per_second")?.unwrap_or(100);
         let burst_size = optional_positive_u64(config, "burst_size")?.unwrap_or(frames_per_second);
+        let limit_by = WsLimitBy::parse(config)?;
 
-        // Local token-bucket and Redis two-window enforcement must share the
-        // same sustained rate for every accepted config (including Redis
-        // failure/recovery). Reject values Redis cannot represent without
-        // over-admitting or under-admitting relative to the local policy
-        // (GHSA-cjcm-546w-696v).
-        validate_ws_frame_rate_params(frames_per_second, burst_size)?;
+        // With Redis sync, local token-bucket and Redis two-window enforcement
+        // must share the same sustained rate for every accepted config
+        // (including Redis failure/recovery), so values Redis cannot represent
+        // without over-admitting or under-admitting are rejected
+        // (GHSA-cjcm-546w-696v). A local-only policy runs the token bucket
+        // alone, which represents any capacity/refill pair, so it only needs
+        // the operational bounds. `sync_mode` itself is validated by the shared
+        // Redis config parser below; this mirrors its case-insensitive match.
+        let redis_sync = config
+            .get("sync_mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("redis"));
+        if redis_sync {
+            validate_ws_frame_rate_params(frames_per_second, burst_size)?;
+        } else {
+            validate_ws_frame_rate_bounds(frames_per_second, burst_size)?;
+        }
 
         let mut close_reason = optional_string(config, "close_reason")?
             .unwrap_or("Frame rate exceeded")
@@ -157,9 +222,11 @@ impl WsRateLimiting {
         let mut semantics = LocalStateSemantics::new();
         semantics.u64("frames_per_second", frames_per_second);
         semantics.u64("burst_size", burst_size);
+        semantics.text("limit_by", limit_by.as_str());
 
         Ok(Self {
             close_reason,
+            limit_by,
             frame_counter: AtomicU64::new(0),
             redis_instance_id: Uuid::new_v4().simple().to_string(),
             limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
@@ -225,16 +292,22 @@ impl WsRateLimiting {
         now: Instant,
     ) -> bool {
         self.limiter
-            .check_local_at(connection_id, &WsRateLimitOp::ONE, now)
+            .check_local_at(
+                WsRateLimitKey::Connection(connection_id),
+                &WsRateLimitOp::ONE,
+                now,
+            )
             .allowed
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_connection_at_for_test(&self, connection_id: u64, now: Instant) {
-        let _ = self
-            .limiter
-            .check_local_at(connection_id, &WsRateLimitOp::ONE, now);
+        let _ = self.limiter.check_local_at(
+            WsRateLimitKey::Connection(connection_id),
+            &WsRateLimitOp::ONE,
+            now,
+        );
     }
 
     /// Attempt to seed one local/fallback key through the production atomic
@@ -247,8 +320,19 @@ impl WsRateLimiting {
         max_entries: usize,
     ) -> bool {
         self.limiter
-            .check_local_at_with_capacity(connection_id, &WsRateLimitOp::ONE, now, max_entries)
+            .check_local_at_with_capacity(
+                WsRateLimitKey::Connection(connection_id),
+                &WsRateLimitOp::ONE,
+                now,
+                max_entries,
+            )
             .is_some()
+    }
+
+    /// The production hard cap on resident local/fallback keys. Test-only.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) const fn max_state_entries_for_test() -> usize {
+        MAX_STATE_ENTRIES
     }
 
     /// Arm the sampled periodic gate without spinning 100k frames. Test-only.
@@ -286,7 +370,44 @@ impl WsRateLimiting {
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn contains_connection_for_test(&self, connection_id: u64) -> bool {
-        self.limiter.contains_local_key(&connection_id)
+        self.limiter
+            .contains_local_key(&WsRateLimitKey::Connection(connection_id))
+    }
+
+    /// Centralized logical key for one local budget key.
+    ///
+    /// A connection budget is process-local (`connection_id` comes from a
+    /// per-process counter), so it is scoped by this instance's UUID and the
+    /// proxy. An aggregate budget names a portable identity, so it is used as
+    /// is: replicas of one policy share it under the policy's default
+    /// namespace/plugin/config-id prefix. Evaluated only on the Redis arm.
+    fn redis_scope_key(&self, proxy_id: &str, key: &WsRateLimitKey) -> String {
+        match key {
+            WsRateLimitKey::Connection(connection_id) => {
+                self.redis_connection_scope_key(proxy_id, *connection_id)
+            }
+            WsRateLimitKey::Aggregate(scope) => scope.to_string(),
+        }
+    }
+
+    /// Aggregate budget identity for one upgrade, or `None` in connection mode.
+    ///
+    /// Resolved once at admission from the authoritative upgrade context, so no
+    /// frame re-derives or allocates it.
+    fn aggregate_scope(&self, ctx: &RequestContext) -> Option<Arc<str>> {
+        let (prefix, value) = match self.limit_by {
+            WsLimitBy::Connection => return None,
+            WsLimitBy::Consumer => match ctx.effective_identity() {
+                Some(identity) => ("consumer:", identity),
+                None => ("ip:", ctx.client_ip.as_str()),
+            },
+            WsLimitBy::Ip => ("ip:", ctx.client_ip.as_str()),
+            WsLimitBy::Service => ("service:", ctx.matched_proxy.as_ref()?.id.as_str()),
+        };
+        let mut scope = String::with_capacity(prefix.len() + value.len());
+        scope.push_str(prefix);
+        scope.push_str(value);
+        Some(Arc::from(scope))
     }
 
     pub(crate) fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
@@ -314,6 +435,7 @@ impl WsRateLimiting {
         &self,
         proxy_id: &str,
         connection_id: u64,
+        key: &WsRateLimitKey,
         direction: WebSocketFrameDirection,
         op: WsRateLimitOp,
     ) -> Option<Message> {
@@ -321,8 +443,8 @@ impl WsRateLimiting {
         let Some(outcome) = self
             .limiter
             .check_with_redis_key_and_local_capacity(
-                connection_id,
-                || self.redis_connection_scope_key(proxy_id, connection_id),
+                key.clone(),
+                || self.redis_scope_key(proxy_id, key),
                 &op,
                 MAX_STATE_ENTRIES,
             )
@@ -339,10 +461,14 @@ impl WsRateLimiting {
         // A fail-closed refusal (centralized enforcement unavailable under
         // `redis_failure_policy: "fail_closed"`) closes the connection just like
         // an exceeded budget — a frame stream has no other refusal channel. It is
-        // not a budget overrun, so it neither increments `rate_limit_exceeded`
-        // nor logs here; the shared backend already emits the bounded
-        // once-per-outage warning.
+        // not a budget overrun, so it does not increment `rate_limit_exceeded`;
+        // it is counted in `ferrum_rate_limit_enforcement_unavailable_total`,
+        // the same per-decision signal `rate_limiting` uses for its `503`s, so an
+        // outage that mass-closes sessions moves a metric. It does not log here;
+        // the shared backend already emits the bounded once-per-outage warning.
         if outcome.enforcement_unavailable {
+            super::prometheus_metrics::global_registry()
+                .record_rate_limit_enforcement_unavailable();
             return Some(self.policy_close());
         }
 
@@ -376,18 +502,54 @@ impl WsRateLimiting {
         self.maybe_evict_at(Instant::now())
     }
 
+    /// Unbound charge on the shared instance.
+    ///
+    /// Connection mode needs no session binding. An aggregate `limit_by`
+    /// budget is resolved only through [`Plugin::bind_ws_session`], so reaching
+    /// here in that mode means a relay path collected frame hooks without
+    /// binding the session: there is no identity to charge, and silently
+    /// charging a per-connection budget instead would lift the configured
+    /// aggregate ceiling. Fail closed.
+    async fn charge_unbound(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        op: WsRateLimitOp,
+    ) -> Option<Message> {
+        if self.limit_by != WsLimitBy::Connection {
+            warn_sampled!(
+                plugin = "ws_rate_limiting",
+                proxy_id = %proxy_id,
+                connection_id,
+                limit_by = self.limit_by.as_str(),
+                "WebSocket session reached an aggregate frame budget without session binding, \
+                 closing connection"
+            );
+            return Some(self.policy_close());
+        }
+        let key = WsRateLimitKey::Connection(connection_id);
+        self.charge_frames(proxy_id, connection_id, &key, direction, op)
+            .await
+    }
+
     fn maybe_evict_at(&self, now: Instant) -> bool {
         let count = self.frame_counter.fetch_add(1, Ordering::Relaxed);
         let tracked_keys = self.limiter.tracked_keys_count();
-        let over_capacity = tracked_keys > MAX_STATE_ENTRIES;
+        // Pressure starts AT the cap. Atomic admission reservation never lets
+        // the map grow past `MAX_STATE_ENTRIES`, so a strict `>` was
+        // unreachable and a map filled with idle entries kept refusing every
+        // previously unseen key until a traffic-count-sampled sweep happened to
+        // run.
+        let at_capacity = tracked_keys >= MAX_STATE_ENTRIES;
 
-        // Over-cap pressure reclaims idle keys, single-flighted by the same
+        // Capacity pressure reclaims idle keys, single-flighted by the same
         // once-per-cooldown CAS gate `udp_rate_limiting` uses, so concurrent
-        // frames cannot each run a full retain while the map is over the cap.
+        // frames cannot each run a full retain while the map is at the cap.
         // Live budgets are never force-evicted; previously unseen keys fail
         // closed via atomic admission reservation, so a frame that loses the
         // gate still sees the capacity pressure.
-        if over_capacity {
+        if at_capacity {
             let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
             let last_sweep = self.last_periodic_sweep_secs.load(Ordering::Relaxed);
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
@@ -397,7 +559,7 @@ impl WsRateLimiting {
                     .is_ok()
             {
                 apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
-                return self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
+                return self.limiter.tracked_keys_count() >= MAX_STATE_ENTRIES;
             }
             return true;
         }
@@ -417,7 +579,7 @@ impl WsRateLimiting {
             }
         }
 
-        self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES
+        self.limiter.tracked_keys_count() >= MAX_STATE_ENTRIES
     }
 }
 
@@ -474,6 +636,36 @@ impl Plugin for WsRateLimiting {
         Some(self.limiter.tracked_keys_count())
     }
 
+    /// Bind an aggregate `limit_by` budget to one accepted session.
+    ///
+    /// The budget identity (consumer, client IP, or proxy) is resolved once,
+    /// here, from the finalized upgrade context, and the session-bound
+    /// instance charges that one shared key for every frame. Connection mode
+    /// keeps the shared instance (`None`), which keys on the frame's
+    /// `connection_id`.
+    fn bind_ws_session(self: Arc<Self>, ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
+        let scope = self.aggregate_scope(ctx)?;
+        Some(Arc::new(WsRateLimitingSession {
+            plugin: self,
+            key: WsRateLimitKey::Aggregate(scope),
+        }))
+    }
+
+    /// Connection budgets are keyed by a process-unique session id that is
+    /// never charged again once the session ends, so they are released at
+    /// teardown instead of occupying a capacity slot until an idle sweep.
+    /// Aggregate budgets outlive any one session and age out on the sweep.
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        self.limit_by == WsLimitBy::Connection
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        if self.limit_by == WsLimitBy::Connection {
+            self.limiter
+                .remove_local_key(&WsRateLimitKey::Connection(ctx.connection_id));
+        }
+    }
+
     async fn on_ws_frame(
         &self,
         proxy_id: &str,
@@ -491,7 +683,7 @@ impl Plugin for WsRateLimiting {
         // One reassembled message or control frame == one wire frame. The
         // fragments it was assembled from were already charged through
         // `on_ws_reassembly_frames`, so this never double-charges them.
-        self.charge_frames(proxy_id, connection_id, direction, WsRateLimitOp::ONE)
+        self.charge_unbound(proxy_id, connection_id, direction, WsRateLimitOp::ONE)
             .await
     }
 
@@ -509,12 +701,90 @@ impl Plugin for WsRateLimiting {
         // Text/Binary frame plus every intermediate continuation, including
         // zero-length ones. Charged as one batched op so the Redis path stays
         // at a single round trip (GHSA-qq94-2gv2-phh6).
-        self.charge_frames(
+        self.charge_unbound(
             proxy_id,
             connection_id,
             direction,
             WsRateLimitOp::frames(fragment_frames),
         )
         .await
+    }
+}
+
+/// One accepted WebSocket session bound to an aggregate `limit_by` budget.
+///
+/// Holds only the shared plugin instance and the session's precomputed budget
+/// key, so per-frame admission is the same allocation-free local path as
+/// connection mode (cloning the key is a reference-count bump).
+struct WsRateLimitingSession {
+    plugin: Arc<WsRateLimiting>,
+    key: WsRateLimitKey,
+}
+
+#[async_trait]
+impl Plugin for WsRateLimitingSession {
+    fn name(&self) -> &str {
+        "ws_rate_limiting"
+    }
+
+    fn priority(&self) -> u16 {
+        super::priority::WS_RATE_LIMITING
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        WS_ONLY_PROTOCOLS
+    }
+
+    /// The session is the bound `ws_rate_limiting` instance, so it carries the
+    /// built-in's declaration rather than the out-of-tree default (issue #6022).
+    fn response_body_production(&self) -> super::ResponseBodyProduction {
+        Plugin::response_body_production(&*self.plugin)
+    }
+
+    fn requires_ws_frame_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_frame(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        message: &Message,
+    ) -> Option<Message> {
+        // Same terminal-Close rule as the shared instance.
+        if matches!(message, Message::Close(_)) {
+            return None;
+        }
+        self.plugin
+            .charge_frames(
+                proxy_id,
+                connection_id,
+                &self.key,
+                direction,
+                WsRateLimitOp::ONE,
+            )
+            .await
+    }
+
+    async fn on_ws_reassembly_frames(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        fragment_frames: u64,
+    ) -> Option<Message> {
+        if fragment_frames == 0 {
+            return None;
+        }
+        self.plugin
+            .charge_frames(
+                proxy_id,
+                connection_id,
+                &self.key,
+                direction,
+                WsRateLimitOp::frames(fragment_frames),
+            )
+            .await
     }
 }

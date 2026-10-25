@@ -3306,6 +3306,15 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
             "redis_url": "redis://redis-host:6379/2"
         }),
         json!({"close_reason": "レート制限"}),
+        json!({"limit_by": "connection"}),
+        json!({"limit_by": "consumer"}),
+        json!({"limit_by": "ip"}),
+        json!({"limit_by": "service"}),
+        // A local-only token bucket represents any capacity/refill pair; the
+        // integer-multiple and refill-window relations bind Redis sync only.
+        json!({"frames_per_second": 3, "burst_size": 10}),
+        json!({"frames_per_second": 1000, "burst_size": 100}),
+        json!({"frames_per_second": 1, "burst_size": 4000, "sync_mode": "local"}),
     ];
     for config in &accepted {
         assert_schema_and_constructor(
@@ -3327,6 +3336,9 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
         json!({"frames_per_second": 0}),
         json!({"sync_mode": "mysql"}),
         json!({"frames_per_secod": 10}),
+        json!({"limit_by": "tenant"}),
+        json!({"limit_by": "Consumer"}),
+        json!({"limit_by": null}),
     ];
     for config in &rejected {
         assert_schema_and_constructor(
@@ -3339,12 +3351,18 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
         );
     }
 
-    // Integer-multiple / refill-window constraints stay constructor-only.
+    // Integer-multiple / refill-window constraints bind Redis sync only and
+    // stay constructor-only.
     assert_schema_and_constructor(
         &validator,
         "ws_rate_limiting",
         "non-integral burst residual",
-        &json!({"frames_per_second": 3, "burst_size": 10}),
+        &json!({
+            "frames_per_second": 3,
+            "burst_size": 10,
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
         true,
         false,
     );
@@ -3352,7 +3370,25 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
         &validator,
         "ws_rate_limiting",
         "refill window residual",
-        &json!({"frames_per_second": 1, "burst_size": 4000}),
+        &json!({
+            "frames_per_second": 1,
+            "burst_size": 4000,
+            "sync_mode": "Redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        true,
+        false,
+    );
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "burst below rate residual",
+        &json!({
+            "frames_per_second": 1000,
+            "burst_size": 100,
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
         true,
         false,
     );
@@ -3439,6 +3475,16 @@ fn ai_rate_limiter_schema_matches_constructor_admission() {
             "redis_url": "redis://cache.internal:6379/0",
             "redis_failure_policy": "fail_closed"
         }),
+        // Budget overrides and the per-media estimate (ai_rate_limiter-MUSE-6/7).
+        json!({
+            "token_limit": 100,
+            "consumer_limits": {"alice": 5000, "bob": 1},
+            "model_limits": {"o1": 2000},
+            "media_token_estimate": 765
+        }),
+        json!({"token_limit": 100, "limit_by": "ip", "model_limits": {"gpt-4o": 10}}),
+        json!({"token_limit": 100, "limit_by": "ip", "consumer_limits": {}}),
+        json!({"token_limit": 100, "media_token_estimate": 0}),
     ];
     for config in &accepted {
         assert_schema_and_constructor(
@@ -3466,6 +3512,14 @@ fn ai_rate_limiter_schema_matches_constructor_admission() {
         json!({"token_limit": 100, "redis_health_check_interval_seconds": -1}),
         json!({"token_limit": 100, "count_mode": "completion_token"}),
         json!({"token_limit": 100, "toke_limit": 100}),
+        json!({"token_limit": 100, "limit_by": "ip", "consumer_limits": {"alice": 5}}),
+        json!({"token_limit": 100, "consumer_limits": {"alice": 0}}),
+        json!({"token_limit": 100, "consumer_limits": {"": 5}}),
+        json!({"token_limit": 100, "consumer_limits": ["alice"]}),
+        json!({"token_limit": 100, "model_limits": {"o1": -1}}),
+        json!({"token_limit": 100, "model_limits": {"o1": "10"}}),
+        json!({"token_limit": 100, "media_token_estimate": 1000001}),
+        json!({"token_limit": 100, "media_token_estimate": -1}),
     ];
     for config in &rejected {
         assert_schema_and_constructor(
@@ -4855,6 +4909,101 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
         description.contains("response_normalization_failed"),
         "AiFederationConfig must state that a completed 2xx normalization failure is terminal"
     );
+}
+
+/// Plugin-review parity: the provider timeout ceiling, the optional `weight`,
+/// and `${FERRUM_PLUGIN_SECRET_<NAME>}` credential references are published
+/// exactly as the constructor enforces them.
+#[test]
+fn ai_federation_schema_publishes_timeout_ceiling_weight_and_secret_references() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiFederationConfig")
+        .expect("missing AiFederationConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiFederationConfig schema compiles");
+    let provider_properties = schema
+        .pointer("/properties/providers/items/properties")
+        .expect("missing provider properties");
+    for field in ["connect_timeout_seconds", "read_timeout_seconds"] {
+        assert_eq!(provider_properties[field]["minimum"], 1, "{field}");
+        assert_eq!(provider_properties[field]["maximum"], 86_400, "{field}");
+    }
+    assert_eq!(provider_properties["weight"]["minimum"], 1);
+    assert_eq!(provider_properties["weight"]["maximum"], 1000);
+    for field in [
+        "api_key",
+        "google_service_account_json",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    ] {
+        let description = provider_properties[field]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            description.contains("FERRUM_PLUGIN_SECRET_"),
+            "{field} must document plugin-secret references"
+        );
+    }
+
+    let provider = |extra: serde_json::Value| {
+        let mut provider = json!({"name": "p", "provider_type": "openai", "api_key": "test"});
+        for (key, value) in extra.as_object().expect("object") {
+            provider[key] = value.clone();
+        }
+        json!({"providers": [provider]})
+    };
+    for accepted in [
+        json!({"weight": 1}),
+        json!({"weight": 1000}),
+        json!({"read_timeout_seconds": 86_400, "connect_timeout_seconds": 86_400}),
+    ] {
+        let config = provider(accepted.clone());
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {accepted}"
+        );
+        assert!(
+            ferrum_edge::plugins::ai_federation::AiFederation::new(
+                &config,
+                ferrum_edge::plugins::PluginHttpClient::default(),
+            )
+            .is_ok(),
+            "constructor rejected {accepted}"
+        );
+    }
+    // A reference is an ordinary non-empty string to the schema; resolution
+    // (and refusal outside the namespace) happens at construction.
+    assert!(
+        validator
+            .validate(&provider(
+                json!({"api_key": "${FERRUM_PLUGIN_SECRET_OPENAI_KEY}"})
+            ))
+            .is_ok()
+    );
+    for rejected in [
+        json!({"weight": 0}),
+        json!({"weight": 1001}),
+        json!({"read_timeout_seconds": 86_401}),
+        json!({"connect_timeout_seconds": 86_401}),
+    ] {
+        let config = provider(rejected.clone());
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema accepted {rejected}"
+        );
+        assert!(
+            ferrum_edge::plugins::ai_federation::AiFederation::new(
+                &config,
+                ferrum_edge::plugins::PluginHttpClient::default(),
+            )
+            .is_err(),
+            "constructor accepted {rejected}"
+        );
+    }
 }
 
 #[test]
@@ -6667,6 +6816,59 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         }),
         false,
     );
+    for (config, valid) in [
+        (
+            json!({"provider": "aws_lambda", "aws_credentials": "default_chain"}),
+            true,
+        ),
+        (
+            json!({
+                "provider": "aws_lambda",
+                "aws_credentials": "default_chain",
+                "aws_access_key_id": "AKIAEXAMPLE"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "provider": "aws_lambda",
+                "aws_credentials": "default_chain",
+                "aws_session_token": "token"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "provider": "aws_lambda",
+                "payload_format": "aws_api_gateway_v2",
+                "mode": "terminate"
+            }),
+            true,
+        ),
+        (
+            json!({"provider": "aws_lambda", "payload_format": "aws_api_gateway_v2"}),
+            false,
+        ),
+        (
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://functions.example/run",
+                "payload_format": "aws_api_gateway_v2",
+                "mode": "terminate"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://functions.example/run",
+                "timeout_ms": 900_001
+            }),
+            false,
+        ),
+    ] {
+        assert_component_validity(&spec, "ServerlessFunctionConfig", &config, valid);
+    }
 
     for component in ["RequestTransformerConfig", "ResponseTransformerConfig"] {
         assert_component_validity(
@@ -7895,10 +8097,16 @@ fn kafka_logging_schema_matches_runtime_admission() {
         })),
         base(json!({
             "security_protocol": "sasl_ssl",
+            "sasl_mechanism": "PLAIN",
             "sasl_username": " padded ",
             "sasl_password": " padded ",
             "producer_config": {"sasl.kerberos.service.name": "kafka"}
         })),
+        base(json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "OAUTHBEARER"})),
+        base(json!({"key_field": "consumer_username"})),
+        base(json!({"producer_config": {"queue.buffering.max.ms": "5"}})),
+        base(json!({"acks": "all", "producer_config": {"enable.idempotence": "true"}})),
+        base(json!({"acks": "1", "producer_config": {"enable.idempotence": "false"}})),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
     }
@@ -7930,6 +8138,35 @@ fn kafka_logging_schema_matches_runtime_admission() {
         base(json!({"producer_config": {"message.max.bytes": "4194305"}})),
         base(json!({"producer_config": {"ssl.cipher.suites": "DEFAULT"}})),
         base(json!({"producer_config": {"sasl.kerberos.service.name": "kafka"}})),
+        // SASL mechanism/credential coherence (kafka_logging-CLAUDE-3).
+        base(json!({
+            "security_protocol": "sasl_ssl",
+            "sasl_username": "alice",
+            "sasl_password": "secret"
+        })),
+        base(json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "PLAIN"})),
+        base(json!({
+            "security_protocol": "sasl_plaintext",
+            "sasl_mechanism": "OAUTHBEARER",
+            "sasl_username": "alice",
+            "sasl_password": "secret"
+        })),
+        base(json!({
+            "security_protocol": "sasl_plaintext",
+            "sasl_mechanism": "plain",
+            "sasl_username": "alice",
+            "sasl_password": "secret"
+        })),
+        // Managed properties and duplicate spellings (kafka_logging-CLAUDE-1).
+        base(json!({"producer_config": {"acks": "0"}})),
+        base(json!({"producer_config": {"request.required.acks": "0"}})),
+        base(json!({"producer_config": {"delivery.timeout.ms": "1000"}})),
+        base(json!({"producer_config": {"compression.type": "gzip"}})),
+        base(json!({"producer_config": {"topic.acks": "0"}})),
+        base(json!({"producer_config": {"topic.message.max.bytes": "1024"}})),
+        base(json!({"producer_config": {"linger.ms": "5", "queue.buffering.max.ms": "50"}})),
+        // Idempotence requires acks all (kafka_logging-CLAUDE-2).
+        base(json!({"acks": "1", "producer_config": {"enable.idempotence": "true"}})),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
     }
@@ -13716,6 +13953,7 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
         BTreeSet::from([
             "audiences",
             "authorization_endpoint",
+            "authorization_params",
             "callback_path",
             "claim_headers",
             "client_auth",
@@ -13724,10 +13962,12 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
             "consumer_identity_claim",
             "discovery_url",
             "end_session_endpoint",
+            "forward_access_token",
             "id_token_clock_skew_secs",
             "issuer",
             "jwks_uri",
             "logout_path",
+            "max_age_secs",
             "post_logout_redirect_uri",
             "redirect_uri",
             "required_roles",
@@ -13818,8 +14058,8 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 #[test]
 fn transaction_debugger_schema_matches_closed_runtime_surface() {
     use ferrum_edge::plugins::transaction_debugger::{
-        DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, TRANSACTION_DEBUGGER_CONFIG_KEYS,
-        TransactionDebugger,
+        DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, MAX_CAPTURE_SELECTOR_VALUE_BYTES,
+        TRANSACTION_DEBUGGER_CONFIG_KEYS, TransactionDebugger,
     };
 
     let spec: serde_json::Value =
@@ -13851,9 +14091,29 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         );
         assert_eq!(schema["properties"][field]["minimum"], json!(1));
     }
-    for field in ["log_request_body", "log_response_body"] {
+    for field in [
+        "log_request_body",
+        "log_response_body",
+        "capture_body_prefix",
+    ] {
         assert_eq!(schema["properties"][field]["default"], json!(false));
     }
+    let sample_rate = &schema["properties"]["capture_sample_rate"];
+    assert_eq!(sample_rate["default"], json!(1));
+    assert_eq!(sample_rate["exclusiveMinimum"], json!(0));
+    assert_eq!(sample_rate["maximum"], json!(1));
+    assert_eq!(
+        schema["properties"]["capture_request_header"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+    assert_eq!(
+        schema["properties"]["capture_request_header_value"]["maxLength"],
+        json!(MAX_CAPTURE_SELECTOR_VALUE_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["capture_expires_at"]["format"],
+        json!("date-time")
+    );
     let header_items = &schema["properties"]["redacted_headers"]["items"];
     assert_eq!(header_items["minLength"], json!(1));
     assert_eq!(
@@ -13879,7 +14139,7 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
     let admission_rules = schema["allOf"]
         .as_array()
         .expect("TransactionDebuggerConfig admission allOf");
-    assert_eq!(admission_rules.len(), 5);
+    assert_eq!(admission_rules.len(), 10);
 
     let description = schema["description"]
         .as_str()
@@ -13925,6 +14185,11 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         "typed request provenance",
         "metadata: {mode: omit}",
         "default unprojected",
+        // Built-in inventories must list everything the code redacts.
+        "`last-event-id`",
+        "`embeddingkey`",
+        "not_selected",
+        "capture_expired",
     ] {
         assert!(
             plugin_docs.contains(contract),
@@ -13963,6 +14228,16 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
             "log_request_body": true,
             "redacted_body_fields": [padded_body_field]
         }),
+        json!({"capture_body_prefix": false}),
+        json!({
+            "log_response_body": true,
+            "capture_body_prefix": true,
+            "capture_sample_rate": 0.25,
+            "capture_request_header": "X-Debug-Capture",
+            "capture_request_header_value": "incident 42",
+            "capture_expires_at": "2026-12-31T23:59:59Z"
+        }),
+        json!({"log_request_body": true, "capture_sample_rate": 1}),
     ] {
         assert_component_validity(&spec, "TransactionDebuggerConfig", &valid, true);
         TransactionDebugger::new(&valid)
@@ -14000,6 +14275,25 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
             "log_request_body": true,
             "safe_text_fields": ["bad name"]
         }),
+        json!({"capture_body_prefix": true}),
+        json!({"capture_sample_rate": 0.5}),
+        json!({"capture_request_header": "x-debug"}),
+        json!({"capture_expires_at": "2026-12-31T23:59:59Z"}),
+        json!({"log_request_body": true, "capture_sample_rate": 0}),
+        json!({"log_request_body": true, "capture_sample_rate": 1.5}),
+        json!({"log_request_body": true, "capture_request_header": "bad header"}),
+        json!({"log_request_body": true, "capture_request_header_value": "x"}),
+        json!({
+            "log_request_body": true,
+            "capture_request_header": "x-debug",
+            "capture_request_header_value": " padded"
+        }),
+        json!({
+            "log_request_body": true,
+            "capture_request_header": "x-debug",
+            "capture_request_header_value": "x".repeat(MAX_CAPTURE_SELECTOR_VALUE_BYTES + 1)
+        }),
+        json!({"log_request_body": true, "capture_body_prefix": null}),
     ] {
         assert_component_validity(&spec, "TransactionDebuggerConfig", &invalid, false);
         assert!(
@@ -15587,11 +15881,47 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     let status_one_of = rule["properties"]["status_code"]["oneOf"]
         .as_array()
         .expect("status_code oneOf");
-    assert_eq!(status_one_of.len(), 3);
+    assert_eq!(status_one_of.len(), 2);
     assert_eq!(status_one_of[0]["type"], "null");
-    assert_eq!(status_one_of[1]["const"], 101);
-    assert_eq!(status_one_of[2]["minimum"], 200);
-    assert_eq!(status_one_of[2]["maximum"], 599);
+    assert_eq!(status_one_of[1]["minimum"], 200);
+    assert_eq!(status_one_of[1]["maximum"], 599);
+    assert_eq!(
+        schema["properties"]["rules"]["maxItems"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_RULES
+    );
+    assert_eq!(
+        rule["properties"]["body"]["maxLength"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_BODY_BYTES
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["maxProperties"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_HEADERS_PER_RULE
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["additionalProperties"]["maxLength"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES
+    );
+    let match_schema = &rule["properties"]["match"];
+    assert_eq!(match_schema["additionalProperties"], false);
+    let match_fields: BTreeSet<_> = match_schema["properties"]
+        .as_object()
+        .expect("ResponseMock match properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_match_fields: BTreeSet<_> =
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MATCH_KEYS
+            .iter()
+            .copied()
+            .collect();
+    assert_eq!(match_fields, runtime_match_fields);
+    for field in ["headers", "query_params"] {
+        assert_eq!(
+            match_schema["properties"][field]["maxProperties"],
+            ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_MATCH_CONDITIONS,
+            "{field}"
+        );
+    }
     assert_eq!(
         rule["properties"]["headers"]["type"],
         json!(["object", "null"])
@@ -15619,7 +15949,11 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         json!(["integer", "null"])
     );
     assert_eq!(rule["properties"]["delay_ms"]["minimum"], 0);
-    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 3600000);
+    assert_eq!(
+        rule["properties"]["delay_ms"]["maximum"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_DELAY_MS
+    );
+    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 60000);
     assert_eq!(
         schema["properties"]["passthrough_on_no_match"]["type"],
         json!(["boolean", "null"])
@@ -15645,16 +15979,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         .as_str()
         .expect("status_code description");
     assert!(
-        status_desc.contains("informational") && status_desc.contains("rejected"),
+        status_desc.contains("Informational statuses (100–199, including 101)")
+            && status_desc.contains("rejected"),
         "status_code must document informational rejection: {status_desc}"
     );
     assert!(
         status_desc.contains("101") && status_desc.contains("200–599"),
-        "status_code must document 101 + final range: {status_desc}"
+        "status_code must document 101 rejection + final range: {status_desc}"
     );
     assert!(
-        status_desc.contains("ordinary HTTP request") && status_desc.contains("500"),
-        "status_code must document the non-WebSocket 101 failure: {status_desc}"
+        status_desc.contains("WebSocket handshake") && status_desc.contains("500"),
+        "status_code must document the WebSocket 2xx refusal: {status_desc}"
     );
     let body_desc = rule["properties"]["body"]["description"]
         .as_str()
@@ -15685,12 +16020,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             "rules": [{
                 "method": "GET",
                 "path": "/users",
-                "status_code": 101,
+                "match": {
+                    "headers": {"x-scenario": "empty"},
+                    "query_params": {"page": "2"}
+                },
+                "status_code": 201,
                 "headers": {"x-mock": "true", "content-type": "text/plain"},
                 "body": "ok",
                 "delay_ms": 0
             }]
         }),
+        json!({"rules": [{"path": "/", "match": null}]}),
         json!({
             "passthrough_on_no_match": null,
             "rules": [{
@@ -15716,7 +16056,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "body": "must-not-be-sent"
             }]
         }),
-        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 60000}]}),
     ] {
         assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
         assert!(
@@ -15742,7 +16082,14 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         json!({"rules": [{"path": "/health", "status_code": 199, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
         json!({"rules": [{"path": "/", "delay_ms": -1}]}),
-        json!({"rules": [{"path": "/", "delay_ms": 3600001}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 60001}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
+        json!({"rules": [{"path": "/health", "status_code": 101, "body": ""}]}),
+        json!({"rules": [{"path": "/", "match": {}}]}),
+        json!({"rules": [{"path": "/", "match": {"headers": {}}}]}),
+        json!({"rules": [{"path": "/", "match": {"header": {"x-a": "1"}}}]}),
+        json!({"rules": [{"path": "/", "match": {"query_params": {"": "1"}}}]}),
+        json!({"rules": [{"path": "/", "body": "b".repeat(262_145)}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
         json!({}),
@@ -15777,11 +16124,12 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("Host-only"));
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
-    assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Unknown top-level, per-rule, and `match` keys are rejected"));
     assert!(guide.contains("Omitted or explicit `null`"));
-    assert!(guide.contains("0`–`3600000"));
+    assert!(guide.contains("0`–`60000"));
+    assert!(guide.contains("FERRUM_MAX_CONCURRENT_FAULT_DELAYS"));
     assert!(guide.contains("Status / body wire semantics"));
-    assert!(guide.contains("informational statuses"));
+    assert!(guide.contains("Informational statuses (`100`–`199`, including `101`) are rejected"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
 
@@ -17464,6 +17812,23 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
             "streaming_response": "inspect",
             "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "forward"}
         }),
+        // Provider concurrency/timeout ceilings and Azure-style credentials.
+        json!({
+            "provider": {
+                "type": "openai_compatible_embeddings",
+                "endpoint": ENDPOINT,
+                "request_timeout_ms": 60000,
+                "max_concurrent_requests": 1024,
+                "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS",
+                "auth_header": "api-key",
+                "auth_scheme": ""
+            }
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_bytes": 1048576, "max_inspections": 10000}
+        }),
     ];
     for config in &accepted {
         assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
@@ -17538,6 +17903,37 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
             "streaming_response": "inspect",
             "streaming": {"overlap_tokens": 32}
         }),
+        // Admission ceilings.
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_bytes": 1048577}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_inspections": 10001}
+        }),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "request_timeout_ms": 60001}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "max_concurrent_requests": 0}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "max_concurrent_requests": 1025}}),
+        json!({
+            "provider": provider,
+            "custom_rules": (0..65).map(|i| json!({"id": format!("r{i}"), "examples": ["a"]})).collect::<Vec<_>>()
+        }),
+        json!({
+            "provider": provider,
+            "custom_rules": [{"id": "a", "examples": (0..65).map(|i| format!("e{i}")).collect::<Vec<_>>()}]
+        }),
+        json!({"provider": provider, "custom_rules": [{"id": "a", "examples": ["x".repeat(2049)]}]}),
+        // auth_header / auth_scheme need a credential, and auth_header may not
+        // name a framing/routing header.
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "auth_header": "api-key"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "auth_scheme": ""}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": " ", "auth_header": "api-key"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS", "auth_header": "HOST"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS", "auth_header": "bad header"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS", "auth_scheme": "Bad Scheme"}}),
     ];
     for config in &rejected {
         assert_component_validity(&spec, "AiSemanticFirewallConfig", config, false);
@@ -17572,6 +17968,18 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
                 {"id": "dup", "examples": ["a"]},
                 {"id": "dup", "examples": ["b"]}
             ]
+        }),
+        // Every list and every rule is within its own ceiling, but the total
+        // (9 x 60 = 540) exceeds the 512-example cap.
+        json!({
+            "provider": provider,
+            "builtins": {},
+            "custom_rules": (0..9)
+                .map(|rule| json!({
+                    "id": format!("r{rule}"),
+                    "examples": (0..60).map(|i| format!("e{i}")).collect::<Vec<_>>()
+                }))
+                .collect::<Vec<_>>()
         }),
     ];
     for config in &constructor_only {
@@ -17610,6 +18018,9 @@ fn oauth2_introspection_schema_and_constructor_admit_the_same_configs() {
         "role_claim",
         "consumer_identity_claim",
         "consumer_header_claim",
+        "max_concurrent_introspections",
+        "discovery_refresh_interval_secs",
+        "accept_mtls_bound_tokens",
     ] {
         assert!(
             provider_properties.contains_key(field),
@@ -17793,6 +18204,94 @@ fn oauth2_introspection_schema_and_constructor_admit_the_same_configs() {
         (
             "unknown provider key",
             provider(json!({"introspection_endpoiint": loopback})),
+            false,
+        ),
+        (
+            "provider concurrency limit zero",
+            provider(json!({"max_concurrent_introspections": 0})),
+            false,
+        ),
+        (
+            "provider concurrency limit at maximum",
+            provider(json!({"max_concurrent_introspections": 1024})),
+            true,
+        ),
+        (
+            "provider concurrency limit above range",
+            provider(json!({"max_concurrent_introspections": 1025})),
+            false,
+        ),
+        (
+            "plugin concurrency limit in range",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "max_concurrent_introspections": 64}),
+            true,
+        ),
+        (
+            "plugin concurrency limit zero",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "max_concurrent_introspections": 0}),
+            false,
+        ),
+        (
+            "plugin concurrency limit above range",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "max_concurrent_introspections": 1025}),
+            false,
+        ),
+        (
+            "discovery refresh interval with discovery",
+            json!({"providers": [{
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "discovery_refresh_interval_secs": 60,
+                "client_auth": {"method": "none"}
+            }]}),
+            true,
+        ),
+        (
+            "discovery refresh interval zero",
+            json!({"providers": [{
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "discovery_refresh_interval_secs": 0,
+                "client_auth": {"method": "none"}
+            }]}),
+            false,
+        ),
+        (
+            "discovery refresh interval without discovery",
+            provider(json!({"discovery_refresh_interval_secs": 60})),
+            false,
+        ),
+        (
+            "certificate-bound tokens accepted",
+            provider(json!({"accept_mtls_bound_tokens": true})),
+            true,
+        ),
+        (
+            "certificate-bound flag of the wrong type",
+            provider(json!({"accept_mtls_bound_tokens": "yes"})),
+            false,
+        ),
+        (
+            "client assertion audience",
+            provider(json!({"client_auth": {
+                "method": "none",
+                "client_assertion_audience": "https://idp.example.com/"
+            }})),
+            true,
+        ),
+        (
+            "blank client assertion audience",
+            provider(json!({"client_auth": {
+                "method": "none",
+                "client_assertion_audience": "   "
+            }})),
             false,
         ),
         (
@@ -18244,15 +18743,27 @@ fn serverless_function_schema_matches_runtime_admission() {
     let pattern_for = |field: &str| compile_pattern(&properties[field]);
 
     // Issue #5177: `format: uint64` is not an assertion, so the ceiling the
-    // runtime can actually represent must be published as `maximum`.
-    for field in ["timeout_ms", "max_response_body_bytes"] {
+    // runtime enforces must be published as `maximum`: 15 minutes for the
+    // invocation timeout and 64 MiB for the buffered response.
+    for (field, ceiling) in [
+        ("timeout_ms", 900_000_u64),
+        ("max_response_body_bytes", 64 * 1024 * 1024),
+    ] {
         assert_eq!(
             properties[field]["maximum"].as_u64(),
-            Some(u64::MAX),
-            "{field} must publish the u64 ceiling"
+            Some(ceiling),
+            "{field} must publish the runtime ceiling"
         );
         assert_eq!(properties[field]["minimum"].as_u64(), Some(1), "{field}");
     }
+    assert_eq!(
+        properties["aws_credentials"]["enum"],
+        json!(["static", "default_chain"])
+    );
+    assert_eq!(
+        properties["payload_format"]["enum"],
+        json!(["ferrum", "aws_api_gateway_v2"])
+    );
 
     // Issue #5176: `forward_headers` entries are HTTP field-name tokens.
     let header_item = &properties["forward_headers"]["items"];
@@ -18265,7 +18776,13 @@ fn serverless_function_schema_matches_runtime_admission() {
     assert!(!header_pattern.is_match("bad:header"));
 
     // Issue #5189: a credential must be representable as an HTTP field value.
-    for field in ["azure_function_key", "gcp_bearer_token"] {
+    // The AWS key id and session token are header-bearing too.
+    for field in [
+        "azure_function_key",
+        "gcp_bearer_token",
+        "aws_access_key_id",
+        "aws_session_token",
+    ] {
         let pattern = pattern_for(field);
         assert!(pattern.is_match("ordinary-credential=="), "{field}");
         assert!(!pattern.is_match("audit\ncredential"), "{field}");
@@ -18354,6 +18871,13 @@ fn serverless_function_schema_matches_runtime_admission() {
         json!({"forward_headers": ["bad header"]}),
         json!({"azure_function_key": "audit\ncredential"}),
         json!({"gcp_bearer_token": "audit\ncredential"}),
+        json!({"aws_access_key_id": "audit\ncredential"}),
+        json!({"aws_session_token": "audit\ncredential"}),
+        json!({"timeout_ms": 900_001}),
+        json!({"max_response_body_bytes": 64 * 1024 * 1024 + 1}),
+        json!({"aws_credentials": "instance_profile"}),
+        json!({"payload_format": "aws_api_gateway_v1"}),
+        json!({"payload_format": "aws_api_gateway_v2"}),
         json!({"aws_function_name": "bad name"}),
         json!({"aws_qualifier": "not a qualifier"}),
         json!({"aws_endpoint_url": "https://example.com/lambda"}),

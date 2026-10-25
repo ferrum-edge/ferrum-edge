@@ -433,6 +433,9 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_ai_federation_circuits_closed_total` | counter | `namespace` | `ai` | `documented_only` | `always` | ai_federation provider circuit half-open recoveries. |
 | `ferrum_ai_federation_circuits_open` | gauge | `namespace` | `ai` | `documented_only` | `always` | Current ai_federation provider circuits in open or half-open recovery state. |
 | `ferrum_ai_federation_circuits_opened_total` | counter | `namespace` | `ai` | `documented_only` | `always` | ai_federation provider circuit closed-to-open transitions. |
+| `ferrum_ai_federation_provider_circuits_closed_total` | counter | `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | ai_federation circuit half-open recoveries, by configured provider name. |
+| `ferrum_ai_federation_provider_circuits_open` | gauge | `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Current ai_federation circuits in open or half-open recovery state, by configured provider name. |
+| `ferrum_ai_federation_provider_circuits_opened_total` | counter | `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | ai_federation circuit closed-to-open transitions, by configured provider name. |
 | `ferrum_ai_prompt_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Prompt tokens reported by AI providers. |
 | `ferrum_ai_rate_limit_local_accounting_tokens_total` | counter | `namespace` | `ai` | `documented_only` | `always` | AI tokens charged locally after centralized reconciliation failed. |
 | `ferrum_ai_rate_limit_unaccounted_tokens_total` | counter | `namespace` | `ai` | `documented_only` | `always` | AI tokens not charged because local reconciliation capacity was exhausted. |
