@@ -11472,6 +11472,131 @@ fn namespace_resolution_work_is_bounded_independently_of_bytes() {
     assert!(canonical.contains("xmlns:p1=\"urn:p1\""), "{canonical}");
 }
 
+// ── Namespace / attribute markup ceilings (raw, before parsing) ─────────────
+
+async fn timestamp_only_outcome_with_item(item: &str) -> PluginResult {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let body = wrap_soap(&fresh_timestamp()).replace("<Item>Widget</Item>", item);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    run_soap_request_policy(&plugin, &mut ctx, &mut headers).await
+}
+
+/// A namespace URI over 2048 bytes, more than 256 attributes on one element,
+/// or an attribute name (and so a declared prefix) over 256 bytes is refused
+/// over the raw envelope, before the parser or canonicalization runs.
+#[tokio::test]
+async fn oversized_namespace_markup_is_refused_before_parsing() {
+    let long_uri = format!("urn:{}", "A".repeat(3_000));
+    let many_attributes: String = (0..300).map(|index| format!(" a{index}=\"\"")).collect();
+    let long_prefix = "p".repeat(300);
+    for (label, item) in [
+        (
+            "long namespace URI",
+            format!(r#"<Item xmlns:p="{long_uri}">Widget</Item>"#),
+        ),
+        (
+            "long default namespace URI",
+            format!(r#"<Item xmlns="{long_uri}">Widget</Item>"#),
+        ),
+        (
+            "too many attributes",
+            format!("<Item{many_attributes}>Widget</Item>"),
+        ),
+        (
+            "long prefix",
+            format!(r#"<Item xmlns:{long_prefix}="urn:p">Widget</Item>"#),
+        ),
+    ] {
+        let result = timestamp_only_outcome_with_item(&item).await;
+        assert_eq!(reject_status(&result), 400, "{label}");
+        assert!(
+            reject_body(&result).contains("namespace and attribute bounds"),
+            "{label}: got {}",
+            reject_body(&result)
+        );
+    }
+}
+
+/// The ceilings sit far above real messages: a URI of exactly 2048 bytes and
+/// an element with exactly 256 attributes are still accepted, as is markup
+/// that merely looks oversized inside a comment or CDATA section.
+#[tokio::test]
+async fn namespace_markup_at_the_ceilings_is_accepted() {
+    let max_uri = format!("urn:{}", "A".repeat(2_044));
+    assert_eq!(max_uri.len(), 2_048);
+    let max_attributes: String = (0..256).map(|index| format!(" a{index}=\"\"")).collect();
+    let long_uri = format!("urn:{}", "A".repeat(3_000));
+    for (label, item) in [
+        (
+            "2048-byte URI",
+            format!(r#"<Item xmlns:p="{max_uri}">Widget</Item>"#),
+        ),
+        (
+            "256 attributes",
+            format!("<Item{max_attributes}>Widget</Item>"),
+        ),
+        (
+            "oversized text in a comment",
+            format!(r#"<Item><!-- <x xmlns:p="{long_uri}"/> -->Widget</Item>"#),
+        ),
+        (
+            "oversized text in CDATA",
+            format!(r#"<Item><![CDATA[<x xmlns:p="{long_uri}"/>]]></Item>"#),
+        ),
+    ] {
+        let result = timestamp_only_outcome_with_item(&item).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label}: {result:?}"
+        );
+    }
+}
+
+/// Canonical attribute order compares namespace URIs. Two near-equal URIs
+/// (inside the length ceiling) shared by many attributes on nested elements
+/// fit the byte budget, but the bytes the sort examines are charged to the
+/// namespace-resolution allowance and refused; ordinary URIs are unaffected.
+#[test]
+fn canonical_attribute_ordering_work_is_charged() {
+    fn nested_attribute_fixture(uri_p: &str, uri_q: &str) -> String {
+        let mut open = String::new();
+        let mut close = String::new();
+        for element in 0..10 {
+            open.push_str(&format!("<e{element}"));
+            for index in 0..250 {
+                let prefix = if index % 2 == 0 { "p" } else { "q" };
+                open.push_str(&format!(" {prefix}:a{index:03}=\"\""));
+            }
+            open.push('>');
+            close.insert_str(0, &format!("</e{element}>"));
+        }
+        format!(
+            "<root xmlns:p=\"{uri_p}\" xmlns:q=\"{uri_q}\"><SignedInfo>{open}{close}</SignedInfo></root>"
+        )
+    }
+
+    let shared = "A".repeat(2_036);
+    let near_equal = nested_attribute_fixture(&format!("urn:{shared}0"), &format!("urn:{shared}1"));
+    let error = soap_exclusive_canonicalize_element_for_test(&near_equal, "SignedInfo", "")
+        .expect_err("near-equal namespace URIs on many attributes must be charged");
+    assert!(
+        error.contains("namespace-resolution work budget"),
+        "got: {error}"
+    );
+
+    let ordinary = nested_attribute_fixture("urn:p", "urn:q");
+    let canonical = soap_exclusive_canonicalize_element_for_test(&ordinary, "SignedInfo", "")
+        .expect("ordinary attribute ordering fits the allowance");
+    // Canonical order: every `urn:p` attribute before every `urn:q` one.
+    let first_q = canonical.find(" q:a001").expect("q attribute rendered");
+    let last_p = canonical
+        .find("<e1")
+        .and_then(|end| canonical[..end].rfind(" p:a248"))
+        .expect("p attribute rendered");
+    assert!(last_p < first_q, "{canonical}");
+}
+
 // ── require_mechanisms: any ────────────────────────────────────────────────
 
 const PASSWORD_TEXT_ALICE_TOKEN: &str = r#"<wsse:UsernameToken><wsse:Username>alice</wsse:Username><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123</wsse:Password></wsse:UsernameToken>"#;

@@ -44,6 +44,10 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 - SAML assertions carrying a condition other than a standard-shape
   `AudienceRestriction`, `OneTimeUse`, or `ProxyRestriction` (including
   `xsi:type`-derived or extended standard conditions) are now rejected.
+- Governed envelopes with more than 256 attributes on one element, an
+  attribute name or namespace prefix over 256 bytes, or a namespace URI over
+  2048 bytes are now refused with `400` (`xml_namespace_bounds`) before
+  parsing.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 

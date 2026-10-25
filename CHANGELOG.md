@@ -418,8 +418,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Namespace resolution is charged to a per-message allowance** (scanned
     entries × compared prefix bytes, plus the length of every compared
     namespace URI; 32 × decoded body, floor 4 194 304), so inherited
-    declarations, long prefixes, and long inherited URIs cannot multiply
+    declarations, long prefixes, long inherited URIs, and canonical attribute
+    ordering (the sort's examined bytes are charged) cannot multiply
     canonicalization CPU on `SignedInfo` before the signature is checked.
+  - **Fixed raw markup ceilings on governed envelopes**, enforced before the
+    XML parser runs: at most 256 attributes per start tag (namespace
+    declarations included), 256-byte attribute names / namespace prefixes,
+    and 2048-byte namespace URIs. Larger markup is refused with `400`
+    (`xml_namespace_bounds`).
   - **Linear-time MTOM boundary search** (`memchr::memmem`) replaces a
     window search that was O(body × boundary) on near-match payloads.
 - **`soap_ws_security` correctness and interop.**

@@ -449,6 +449,25 @@ const NAMESPACE_SCAN_BUDGET_MULTIPLIER: usize = 32;
 /// room.
 const MIN_NAMESPACE_SCAN_BUDGET: usize = 4_194_304;
 
+/// Hard ceilings on governed-envelope markup that namespace processing scales
+/// with, enforced over the raw envelope before it is parsed (see
+/// [`raw_markup_within_namespace_bounds`]).
+///
+/// Every namespace prefix, namespace URI, and attribute name is
+/// caller-chosen, and the parser's own duplicate-attribute check and every
+/// later canonicalization step (prefix resolution, rendered-binding equality,
+/// canonical attribute ordering) compare them. Per-step accounting bounds what
+/// canonicalization does; these ceilings bound the input itself, so no single
+/// comparison is long and no single element carries enough attributes to
+/// square. Real WS-Security / SOAP / SAML namespace URIs are well under 200
+/// bytes and elements carry a handful of attributes.
+const MAX_NAMESPACE_URI_BYTES: usize = 2_048;
+/// Ceiling on any attribute name, which includes every `xmlns:prefix`
+/// declaration and therefore every namespace prefix in use.
+const MAX_ATTRIBUTE_NAME_BYTES: usize = 256;
+/// Ceiling on attributes (namespace declarations included) per start tag.
+const MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
+
 /// Bounds for MTOM/XOP (`multipart/related`) unpacking. The gateway only ever
 /// walks part *headers* looking for the SOAP root part; attachment payloads are
 /// skipped, never decoded, and never validated as XML.
@@ -5347,6 +5366,19 @@ impl SoapWsSecurity {
             ));
         }
 
+        // Namespace URI length, prefix / attribute-name length, and attributes
+        // per element are bounded over the raw bytes BEFORE the parser runs:
+        // the parser's own duplicate-attribute check is quadratic in a tag's
+        // attributes and compares their namespace URIs, so a ceiling applied
+        // after parsing would protect canonicalization but not the parse.
+        if !raw_markup_within_namespace_bounds(envelope) {
+            return Err(SoapRejection::new(
+                400,
+                "SOAP request exceeds the supported XML namespace and attribute bounds",
+                "xml_namespace_bounds",
+            ));
+        }
+
         // One bounded parse for the whole message. Every structural selection
         // below is namespace-qualified against this single document, so the
         // gateway and the backend cannot be steered to different elements
@@ -7068,6 +7100,13 @@ fn canonicalize_node<'a>(
     output.charge_namespace_scan(required_prefixes.len(), element_prefix.len())?;
     add_required_prefix(&mut required_prefixes, element_prefix, true);
 
+    // Bounded over the raw envelope before parsing; re-checked here so a
+    // caller that canonicalizes another document cannot sort an unbounded set.
+    if node.attributes().len() > MAX_ATTRIBUTES_PER_ELEMENT {
+        return Err(format!(
+            "WS-Security: an element carries more than {MAX_ATTRIBUTES_PER_ELEMENT} attributes"
+        ));
+    }
     let mut attributes = Vec::new();
     for attribute in node.attributes() {
         let qname_range = attribute.range_qname();
@@ -7127,7 +7166,23 @@ fn canonicalize_node<'a>(
         output.push('"')?;
     }
 
-    attributes.sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+    // Canonical attribute order compares namespace URIs, then local names. Both
+    // are caller-chosen, so the bytes the comparator actually examines are
+    // counted and charged to the namespace-resolution allowance. The element's
+    // attribute count and every name/URI length are already bounded, so the
+    // work one sort can do before its charge lands is bounded too; attributes
+    // that share one namespace binding compare by identity without reading it.
+    let mut compared_bytes = 0usize;
+    attributes.sort_by(|left, right| {
+        let (namespace_order, namespace_bytes) = counted_str_cmp(left.0, right.0);
+        compared_bytes = compared_bytes.saturating_add(namespace_bytes);
+        namespace_order.then_with(|| {
+            let (name_order, name_bytes) = counted_str_cmp(left.1, right.1);
+            compared_bytes = compared_bytes.saturating_add(name_bytes);
+            name_order
+        })
+    });
+    output.charge_namespace_scan(1, compared_bytes)?;
     for (_, _, qname, value) in attributes {
         output.push(' ')?;
         output.push_str(qname)?;
@@ -7184,6 +7239,27 @@ fn namespace_uris_equal(
     }
     output.charge_namespace_scan(1, resolved.len())?;
     Ok(resolved == rendered)
+}
+
+/// Byte-lexicographic `str` ordering (exactly `str::cmp`), plus the number of
+/// bytes examined to decide it. Two borrows of the same storage are equal
+/// without reading it.
+fn counted_str_cmp(left: &str, right: &str) -> (std::cmp::Ordering, usize) {
+    if std::ptr::eq(left.as_ptr(), right.as_ptr()) && left.len() == right.len() {
+        return (std::cmp::Ordering::Equal, 0);
+    }
+    let common = left
+        .bytes()
+        .zip(right.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let examined = common.saturating_add(1);
+    match (left.as_bytes().get(common), right.as_bytes().get(common)) {
+        (Some(a), Some(b)) => (a.cmp(b), examined),
+        (Some(_), None) => (std::cmp::Ordering::Greater, examined),
+        (None, Some(_)) => (std::cmp::Ordering::Less, examined),
+        (None, None) => (std::cmp::Ordering::Equal, examined),
+    }
 }
 
 fn add_required_prefix<'a>(prefixes: &mut Vec<(&'a str, bool)>, prefix: &'a str, required: bool) {
@@ -7344,6 +7420,67 @@ pub(crate) fn count_raw_id_occurrences(xml: &str, ids: &[&str]) -> Result<Vec<us
         search_from = tag_start + tag_end_rel + 1;
     }
     Ok(counts)
+}
+
+/// Whether every start tag in the raw envelope stays within
+/// [`MAX_ATTRIBUTES_PER_ELEMENT`] attributes, [`MAX_ATTRIBUTE_NAME_BYTES`] per
+/// attribute name, and — for an `xmlns` / `xmlns:prefix` declaration —
+/// [`MAX_NAMESPACE_URI_BYTES`] of declared URI.
+///
+/// One linear pass that recognizes start tags exactly as the id scan does
+/// (comments, CDATA, processing instructions, and declarations are skipped as
+/// non-element spans; attribute values are quote-aware). Lengths are raw
+/// bytes, which can only over-state a value that uses character references, so
+/// the ceiling is conservative. A construct this scan cannot frame (an
+/// unterminated tag, comment, CDATA section, or quote) ends the scan as
+/// "within bounds": the same bytes are not well-formed XML, so the parser that
+/// runs next refuses them with its own fixed category.
+fn raw_markup_within_namespace_bounds(xml: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(rel) = xml.get(search_from..).and_then(|rest| rest.find('<')) {
+        let tag_start = search_from + rel;
+        match xml.as_bytes().get(tag_start + 1) {
+            None => return true,
+            Some(b'/') => {
+                search_from = tag_start + 1;
+                continue;
+            }
+            Some(b'!') => {
+                let Ok(next) = skip_markup_declaration(xml, tag_start) else {
+                    return true;
+                };
+                search_from = next;
+                continue;
+            }
+            Some(b'?') => {
+                let Ok(next) = skip_processing_instruction(xml, tag_start) else {
+                    return true;
+                };
+                search_from = next;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let Some(tag_end_rel) = find_start_tag_end(xml, tag_start) else {
+            return true;
+        };
+        let Some(tag) = xml.get(tag_start + 1..tag_start + tag_end_rel) else {
+            return true;
+        };
+        let mut attributes = 0usize;
+        let exceeded = scan_tag_attributes(tag, |name, value| {
+            attributes += 1;
+            let declares_namespace = name == "xmlns" || name.starts_with("xmlns:");
+            attributes > MAX_ATTRIBUTES_PER_ELEMENT
+                || name.len() > MAX_ATTRIBUTE_NAME_BYTES
+                || (declares_namespace && value.len() > MAX_NAMESPACE_URI_BYTES)
+        });
+        if exceeded {
+            return false;
+        }
+        search_from = tag_start + tag_end_rel + 1;
+    }
+    true
 }
 
 fn skip_markup_declaration(xml: &str, tag_start: usize) -> Result<usize, String> {
