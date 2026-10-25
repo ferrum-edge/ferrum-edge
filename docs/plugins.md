@@ -2159,10 +2159,16 @@ the live generation stays in place, when the new configuration's overflow rows
 that do not exist yet need more than the registry's free space. Typically that
 is a repricing against a saturated registry. Raise `max_retained_bytes`, or let
 retained rows be collected and evicted first. Rows admitted between that check
-and the reload's publication are not counted. Creating an overflow row never
-waits for an eviction pass. Concurrent first creations of the same overflow row
-serialize, so they cannot each reserve its bytes and drop charges one row would
-hold. That
+and the reload's publication are not counted. A reload whose reserved overflow
+rows all exist already is never refused this way, so lowering the budget below
+current occupancy still just drains through eviction. This check runs where a
+node builds the plugin generation it will serve, so offline `validate` and
+control-plane validation cannot predict it. Creating an overflow row never
+waits for an eviction pass. A charge whose overflow row the running pass has
+unlinked is filed with the pass, which still holds that row and its reservation,
+instead of reserving a second copy; the pass then merges it back. Concurrent
+first creations of the same overflow row serialize, so they cannot each reserve
+its bytes and drop charges one row would hold. That
 sentinel lives in the digest-form
 billing-identity class (`~sha256:` marker, non-hex suffix), so
 `bounded_billing_identity` can never return it for a real authenticated claim
@@ -2181,10 +2187,12 @@ as fixed-cardinality, identity-free series
 `ferrum_api_chargeback_dropped_charges_total`,
 `ferrum_api_chargeback_uncollected_retained_entries`) and as the `registry`
 object in the JSON format. `dropped_charges_total` is the only genuine loss path: it can
-advance only for a charge outside the reserved matrix whose aggregate row cannot
-reserve bytes — traffic attributed to no configured proxy (`proxy_id`
-`unknown`), or a retired pricing generation's late completion once the reload
-headroom is spent.
+advance only when an aggregate row cannot reserve bytes. That covers a charge
+outside the reserved matrix: traffic attributed to no configured proxy
+(`proxy_id` `unknown`), or a retired pricing generation's late completion once
+the reload headroom is spent. It also covers a current-generation charge when
+rows admitted between a reload's fit check and its publication took the space
+its overflow rows needed.
 Because `/charges` renders the whole registry in one pass, render cost is
 bounded by `max_entries`; size it for the row cardinality you are willing to
 scrape. An uncached render runs on the blocking thread pool rather than an async

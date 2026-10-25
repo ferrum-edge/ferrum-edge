@@ -5526,6 +5526,100 @@ fn test_repeated_repricing_is_refused_once_retained_history_fills_the_budget() {
         .expect_err("generation C's overflow row no longer fits");
 }
 
+fn record_generation_b(registry: &ChargebackRegistry, consumer: &str) {
+    registry.record_http(
+        &scope(),
+        consumer,
+        "proxy-a",
+        "My API",
+        200,
+        0.00002,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+}
+
+/// PR6842-SOL-6: a current-generation charge that folds into an overflow row
+/// an eviction pass has unlinked (but still holds, with its reservation) is
+/// filed with the pass instead of reserving a second copy of the row, so it
+/// is kept even though no free space exists for a duplicate.
+#[test]
+fn test_charge_on_an_overflow_row_unlinked_by_eviction_is_kept() {
+    let budget = 4096;
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, budget);
+    registry.publish_overflow_reservations(&single_tier_config(0.00001));
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    registry.publish_overflow_reservations(&single_tier_config(0.00002));
+    record_generation_b(&registry, "after-b");
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+    let overflow_before = by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL);
+    let ordinary_rows = registry.reserved_entries_for_tests();
+
+    // Every row is idle and confirmed collected; the charge lands after the
+    // pass unlinked them and before it decides their fate.
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || {},
+        || record_generation_b(&registry, "during-eviction"),
+    );
+
+    assert_eq!(
+        by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL),
+        overflow_before + 1,
+        "the charge is merged into the restored overflow row"
+    );
+    assert_eq!(dropped_charges(&registry), 0);
+    assert_eq!(
+        evicted, ordinary_rows,
+        "the idle ordinary rows retire; the charged overflow group is kept"
+    );
+    assert!(registry.retained_bytes_for_tests() <= budget);
+}
+
+/// PR6842-MUSE-8 / MUSE-9: the live-registry fit check reads the candidate's
+/// own budget, refuses overflow rows that do not fit beside retained history,
+/// and does not refuse a budget lowered below occupancy when every reserved
+/// row already exists (that keeps draining through eviction).
+#[test]
+fn test_live_overflow_reservation_check_uses_the_candidate_budget() {
+    use ferrum_edge::plugins::api_chargeback::live_overflow_reservation_check;
+
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, 4096);
+    registry.publish_overflow_reservations(&single_tier_config(0.00001));
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+
+    let expanded = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00002}],
+            "max_retained_bytes": 4096
+        }),
+    );
+    live_overflow_reservation_check(&expanded, &registry)
+        .expect_err("the expanded matrix does not fit beside retained rows");
+
+    let lowered = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}],
+            "max_retained_bytes": 2048
+        }),
+    );
+    live_overflow_reservation_check(&lowered, &registry)
+        .expect("lowering the budget with every reserved row present is not refused");
+}
+
 /// PR6842-SOL-5: creating an aggregate overflow row never waits for an
 /// eviction pass. The record below runs while this thread holds the
 /// retirement lock exclusively; a blocking acquisition would never return.

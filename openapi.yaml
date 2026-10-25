@@ -38419,7 +38419,8 @@ components:
         the whole `pricing_tiers` array; `max_retained_bytes` must hold twice
         the configured overflow-row matrix, and a reload whose not-yet-created
         overflow rows do not fit beside the billing state the live registry
-        retains is refused; and `stale_entry_ttl_seconds` /
+        retains is refused when a node builds that generation (not by offline
+        validation); and `stale_entry_ttl_seconds` /
         `cleanup_interval_seconds` interact with the collection contract
         described in docs/plugins.md.
       allOf:

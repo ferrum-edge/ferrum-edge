@@ -617,6 +617,27 @@ impl ChargebackEntry {
         }
     }
 
+    /// A fresh row with this row's identity, pricing, metadata, and byte
+    /// reservation, and zero counters.
+    fn successor(&self, epoch: Instant) -> Self {
+        Self::new(
+            epoch,
+            Arc::clone(&self.consumer),
+            Arc::clone(&self.proxy_id),
+            Arc::clone(&self.proxy_namespace),
+            Arc::clone(&self.proxy_name),
+            self.status_code,
+            self.protocol_family,
+            self.call_price,
+            self.bw_price_sent,
+            self.bw_price_received,
+            Arc::clone(&self.currency),
+            Arc::clone(&self.namespace_label),
+            self.retained_bytes,
+            self.counts_against_identity_budget,
+        )
+    }
+
     fn record(&self, bytes_sent: u64, bytes_received: u64, count_call: bool, epoch: Instant) {
         if count_call {
             self.call_count.fetch_add(1, Ordering::Relaxed);
@@ -976,8 +997,7 @@ pub fn validate_composition(
         // The overflow fallback must always fit: refused identities fold into
         // reserved aggregate rows, and a pricing reload's next generation needs
         // its own rows while the retired generation drains.
-        let matrix = overflow_reservation_matrix(config);
-        let matrix_bytes: usize = matrix.values().sum();
+        let matrix_bytes: usize = overflow_reservation_matrix(config).values().sum();
         let required_bytes = matrix_bytes.saturating_mul(2);
         if required_bytes > reference_tunables.max_retained_bytes {
             errors.push(format!(
@@ -988,20 +1008,51 @@ pub fn validate_composition(
                 reference_tunables.max_retained_bytes
             ));
         }
-        // The matrix must also fit beside what the live registry already
-        // retains; reserving cannot free occupied bytes (PR #6842).
-        if let Some(registry) = try_global_registry()
-            && let Err(error) = registry
-                .check_overflow_reservation_fits(&matrix, reference_tunables.max_retained_bytes)
-        {
-            errors.push(error);
-        }
     }
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// Refuse a candidate configuration whose not-yet-created overflow rows do
+/// not fit beside the billing state `registry` already retains (see
+/// [`ChargebackRegistry::check_overflow_reservation_fits`]).
+///
+/// Kept apart from [`validate_composition`], which stays a pure function of
+/// the configuration: this rule depends on live registry state.
+pub fn live_overflow_reservation_check(
+    config: &crate::config::types::GatewayConfig,
+    registry: &ChargebackRegistry,
+) -> Result<(), String> {
+    let Some(reference) = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.enabled && plugin.plugin_name == "api_chargeback")
+    else {
+        return Ok(());
+    };
+    // `validate_composition` already required every enabled instance to agree
+    // on the shared tunables, so any one of them carries the budget.
+    let tunables = SharedRegistryTunables::from_config(&reference.config)?;
+    registry.check_overflow_reservation_fits(
+        &overflow_reservation_matrix(config),
+        tunables.max_retained_bytes,
+    )
+}
+
+/// [`live_overflow_reservation_check`] against the process-global registry,
+/// when one exists. Called only where the plugin cache builds a generation for
+/// publication, so offline and candidate configuration validation never
+/// depend on this process's live billing state.
+pub(crate) fn validate_live_overflow_reservation(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), String> {
+    match try_global_registry() {
+        Some(registry) => live_overflow_reservation_check(config, &registry),
+        None => Ok(()),
     }
 }
 
@@ -1023,6 +1074,52 @@ fn render_cache_reached_min_age(generated_at: Option<Instant>, min_age_nanos: u6
     match generated_at {
         Some(at) => at.elapsed().as_nanos() as u64 >= min_age_nanos,
         None => false,
+    }
+}
+
+/// Charges recorded onto an aggregate overflow row while an eviction pass has
+/// unlinked it (see [`ChargebackRegistry::evict_stale`]). The pass still holds
+/// the row and its byte reservation, so a recorder files the charge here,
+/// lock-free, instead of reserving a second copy of the row; the pass merges
+/// it back when it restores or retires the row.
+#[derive(Default)]
+struct PendingAggregateCharges {
+    calls: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    last_updated: AtomicU64,
+    recorded: AtomicBool,
+}
+
+impl PendingAggregateCharges {
+    fn record(&self, bytes_sent: u64, bytes_received: u64, count_call: bool, epoch: Instant) {
+        if count_call {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+        self.bytes_sent.fetch_add(bytes_sent, Ordering::Relaxed);
+        self.bytes_received
+            .fetch_add(bytes_received, Ordering::Relaxed);
+        self.last_updated
+            .fetch_max(epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.recorded.store(true, Ordering::Release);
+    }
+
+    fn has_activity(&self) -> bool {
+        self.recorded.load(Ordering::Acquire)
+    }
+
+    fn merge_into(&self, entry: &ChargebackEntry) {
+        entry
+            .call_count
+            .fetch_add(self.calls.load(Ordering::Relaxed), Ordering::Relaxed);
+        entry
+            .bytes_sent_total
+            .fetch_add(self.bytes_sent.load(Ordering::Relaxed), Ordering::Relaxed);
+        entry.bytes_received_total.fetch_add(
+            self.bytes_received.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        entry.publish_timestamp(self.last_updated.load(Ordering::Relaxed));
     }
 }
 
@@ -1162,6 +1259,10 @@ pub struct ChargebackRegistry {
     /// retired group. Never waited on by the recording path: aggregate-row
     /// creation only TRIES it (see `record_new_aggregate_row`).
     retirement_lock: std::sync::RwLock<()>,
+    /// Aggregate overflow rows the running eviction pass has unlinked (or is
+    /// about to), with the charges recorded onto them meanwhile. Empty outside
+    /// a pass.
+    retiring_aggregates: DashMap<String, PendingAggregateCharges>,
     /// Registry walks performed by `/charges` renders (diagnostics and tests).
     render_walks: AtomicUsize,
     /// Test hook: advance the proxy-metadata generation after every render
@@ -1239,6 +1340,7 @@ impl ChargebackRegistry {
             outstanding_overflow_reserve: AtomicUsize::new(0),
             overflow_reserve_headroom: AtomicUsize::new(0),
             retirement_lock: std::sync::RwLock::new(()),
+            retiring_aggregates: DashMap::with_shard_amount(EMPTY_CHARGES_RENDER_SHARD_AMOUNT),
             render_walks: AtomicUsize::new(0),
             invalidate_every_render_walk: AtomicBool::new(false),
             uncollected_retained_entries: AtomicUsize::new(0),
@@ -1285,8 +1387,8 @@ impl ChargebackRegistry {
     /// A reserved row created concurrently (aggregate-row creation never waits
     /// for the lock) may stay counted as outstanding — protecting more than
     /// needed — until the next eviction pass reconciles every flag.
-    /// [`validate_composition`] has already refused a matrix that does not fit
-    /// beside the retained rows ([`Self::check_overflow_reservation_fits`]).
+    /// The plugin cache has already refused a matrix that does not fit beside
+    /// the retained rows ([`live_overflow_reservation_check`]).
     #[doc(hidden)]
     pub fn publish_overflow_reservations(&self, config: &crate::config::types::GatewayConfig) {
         let matrix = overflow_reservation_matrix(config);
@@ -1329,9 +1431,12 @@ impl ChargebackRegistry {
     /// active series keeps its retired pricing generations), so a candidate
     /// whose overflow rows that do not exist yet need more than the free
     /// space would leave its own current-generation charges to be dropped.
-    /// [`validate_composition`] refuses such a candidate and the live
-    /// generation stays in place. Rows admitted between this check and the
-    /// candidate's publication are not counted.
+    /// [`live_overflow_reservation_check`] refuses such a candidate when the
+    /// plugin cache builds it, and the live generation stays in place. Rows
+    /// admitted between this check and the candidate's publication are not
+    /// counted. A candidate whose reserved rows all exist already is never
+    /// refused here, so lowering the budget below current occupancy still just
+    /// drains through eviction.
     #[doc(hidden)]
     pub fn check_overflow_reservation_fits(
         &self,
@@ -1343,6 +1448,12 @@ impl ChargebackRegistry {
             .filter(|(key, _)| !self.entries.contains_key(key.as_str()))
             .map(|(_, bytes)| *bytes)
             .sum();
+        if missing_bytes == 0 {
+            // Every reserved row already exists, so none is at risk. A budget
+            // lowered below current occupancy keeps its drain-by-eviction
+            // semantics: new rows are refused until occupancy falls.
+            return Ok(());
+        }
         let retained_bytes = self.retained_bytes.load(Ordering::Acquire);
         let required_bytes = retained_bytes.saturating_add(missing_bytes);
         if required_bytes > max_retained_bytes {
@@ -1965,6 +2076,18 @@ impl ChargebackRegistry {
             Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => None,
         };
+        // A running eviction pass may have unlinked this very row while still
+        // holding it and its byte reservation. File the charge with the pass
+        // instead of reserving a second copy of the row. Checked before the
+        // entries map is touched, so the pass (which finalizes a pending
+        // record under its lock and then inserts into the entries map) and
+        // this path never wait on each other's locks in opposite order.
+        if reservation_guard.is_none()
+            && let Some(pending) = self.retiring_aggregates.get(owned_key.as_str())
+        {
+            pending.record(bytes_sent, bytes_received, count_call, self.epoch);
+            return;
+        }
         let reservations = self.overflow_reservations.load_full();
         let reserved_slot = reservations.get(owned_key.as_str());
         let own_reserved_bytes = reserved_slot
@@ -2357,11 +2480,16 @@ impl ChargebackRegistry {
         // member is still active or holds uncollected counters.
         let mut uncollected = 0;
         let mut retained_groups: HashSet<EvictionGroupKey> = HashSet::new();
-        let mut candidates: Vec<(EvictionGroupKey, String)> = Vec::new();
+        // (group, key, whether the row is an aggregate overflow row)
+        let mut candidates: Vec<(EvictionGroupKey, String, bool)> = Vec::new();
         for entry in self.entries.iter() {
             let v = entry.value();
             if evictable(v) {
-                candidates.push((eviction_group_key(v), entry.key().clone()));
+                candidates.push((
+                    eviction_group_key(v),
+                    entry.key().clone(),
+                    !v.counts_against_identity_budget,
+                ));
                 continue;
             }
             if v.nanos_since_update(self.epoch) >= ttl_nanos {
@@ -2373,7 +2501,7 @@ impl ChargebackRegistry {
         }
         self.uncollected_retained_entries
             .store(uncollected, Ordering::Relaxed);
-        candidates.retain(|(group, _)| !retained_groups.contains(group));
+        candidates.retain(|(group, _, _)| !retained_groups.contains(group));
         if candidates.is_empty() {
             self.reconcile_overflow_reservations();
             return 0;
@@ -2384,10 +2512,21 @@ impl ChargebackRegistry {
         // each under its shard lock.
         let mut revived: HashSet<EvictionGroupKey> = HashSet::new();
         let mut removed: Vec<(EvictionGroupKey, String, ChargebackEntry)> = Vec::new();
-        for (group, key) in candidates {
+        for (group, key, aggregate) in candidates {
+            if aggregate {
+                // Published BEFORE the row is unlinked: a recorder that misses
+                // the row afterwards finds this and files its charge here
+                // rather than reserving a second copy of a row this pass still
+                // holds (PR #6842).
+                self.retiring_aggregates
+                    .insert(key.clone(), PendingAggregateCharges::default());
+            }
             match self.entries.remove_if(key.as_str(), |_, v| evictable(v)) {
                 Some((key, entry)) => removed.push((group, key, entry)),
                 None => {
+                    if aggregate {
+                        self.retiring_aggregates.remove(key.as_str());
+                    }
                     revived.insert(group);
                 }
             }
@@ -2396,7 +2535,8 @@ impl ChargebackRegistry {
         after_removal();
 
         // Pass 3: a removed group that now has any row (a refreshed member or a
-        // row created during pass 2) is live and must not shrink.
+        // row created during pass 2), or whose unlinked aggregate row received
+        // a charge, is live and must not shrink.
         let removed_groups: HashSet<EvictionGroupKey> =
             removed.iter().map(|(group, _, _)| group.clone()).collect();
         for entry in self.entries.iter() {
@@ -2405,10 +2545,27 @@ impl ChargebackRegistry {
                 revived.insert(group);
             }
         }
+        for (group, key, entry) in &removed {
+            if !entry.counts_against_identity_budget
+                && self
+                    .retiring_aggregates
+                    .get(key.as_str())
+                    .is_some_and(|pending| pending.has_activity())
+            {
+                revived.insert(group.clone());
+            }
+        }
 
         let mut evicted = 0;
         for (group, key, entry) in removed {
-            if revived.contains(&group) {
+            let revive = revived.contains(&group);
+            if !entry.counts_against_identity_budget {
+                if self.finalize_removed_aggregate(key, entry, revive) {
+                    evicted += 1;
+                }
+                continue;
+            }
+            if revive {
                 self.restore_entry(key, entry);
                 continue;
             }
@@ -2425,6 +2582,83 @@ impl ChargebackRegistry {
             self.json_cache.store(Arc::new(None));
         }
         evicted
+    }
+
+    /// Restore or retire an aggregate overflow row the pass unlinked, folding
+    /// in any charge recorded onto it meanwhile. Returns whether the row's
+    /// previous counters were retired.
+    ///
+    /// Runs while holding the row's pending record exclusively, so no recorder
+    /// can file another charge into it; once the pending record is gone a
+    /// recorder finds the restored (or successor) row, or — if the row was
+    /// retired with nothing pending — a released reservation it can reuse.
+    fn finalize_removed_aggregate(
+        &self,
+        key: String,
+        entry: ChargebackEntry,
+        revive: bool,
+    ) -> bool {
+        let mut removed_entry = Some(entry);
+        let mut retired = true;
+        self.retiring_aggregates
+            .remove_if(key.as_str(), |_, pending| {
+                if let Some(entry) = removed_entry.take() {
+                    retired = self.settle_removed_aggregate(&key, entry, pending, revive);
+                }
+                true
+            });
+        if let Some(entry) = removed_entry.take() {
+            // No pending record (it is published before the row is unlinked,
+            // so this is only reached defensively): nothing was filed.
+            retired = self.settle_removed_aggregate(
+                &key,
+                entry,
+                &PendingAggregateCharges::default(),
+                revive,
+            );
+        }
+        retired
+    }
+
+    fn settle_removed_aggregate(
+        &self,
+        key: &str,
+        entry: ChargebackEntry,
+        pending: &PendingAggregateCharges,
+        revive: bool,
+    ) -> bool {
+        if revive {
+            self.restore_entry(key.to_string(), entry);
+            if pending.has_activity()
+                && let Some(live) = self.entries.get(key)
+            {
+                pending.merge_into(&live);
+            }
+            return false;
+        }
+        if !pending.has_activity() {
+            self.release_reservation(entry.retained_bytes, entry.counts_against_identity_budget);
+            return true;
+        }
+        // The group retired as a whole; charges filed after it was decided
+        // start a new series in a successor row that inherits the retired
+        // row's byte reservation, so they need no second reservation.
+        match self.entries.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                pending.merge_into(occupied.get());
+                drop(occupied);
+                self.release_reservation(
+                    entry.retained_bytes,
+                    entry.counts_against_identity_budget,
+                );
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let successor = entry.successor(self.epoch);
+                pending.merge_into(&successor);
+                vacant.insert(successor);
+            }
+        }
+        true
     }
 
     /// Put back a member removed by [`Self::evict_stale`] whose group was

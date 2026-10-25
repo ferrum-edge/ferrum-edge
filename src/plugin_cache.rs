@@ -6961,6 +6961,7 @@ impl PluginCache {
         previous_lifecycle_generation_high_water: u64,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
+        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -7409,6 +7410,7 @@ impl PluginCache {
         country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
+        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);

@@ -42,7 +42,11 @@ budget if it appears. A reload is also refused when its new overflow rows do
 not fit beside the billing state the live registry already retains, for
 example a repricing while the registry is saturated. Raise
 `max_retained_bytes`, or let retained rows be collected and evicted, then
-retry. The reserved bytes are no longer available to per-identity rows. In the overflow row, bandwidth recorded at a status no tier
+retry. The check runs where each node builds the plugin generation it serves,
+so `ferrum-edge validate` and control-plane validation do not report it. A
+reload that only lowers `max_retained_bytes`, while every reserved overflow row
+already exists, is not refused; occupancy drains through eviction as before.
+The reserved bytes are no longer available to per-identity rows. In the overflow row, bandwidth recorded at a status no tier
 prices is filed under status `0`.
 
 An instance with nonzero `bandwidth_pricing` now forces its proxy's WebSocket

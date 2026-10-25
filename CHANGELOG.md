@@ -20,8 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than twice that matrix is refused at admission. A reload whose new overflow
   rows do not fit beside the billing state the registry already retains is
   refused too. Typically that is a repricing against a saturated registry, and
-  the live generation keeps serving. Creating an overflow row never waits for
-  an eviction pass. A
+  the live generation keeps serving. A budget lowered below occupancy is not
+  refused when every reserved row already exists. This check runs where a node
+  builds its plugin generation, not in offline `validate`. Creating an overflow
+  row never waits for an eviction pass. A charge whose overflow row that pass
+  has unlinked is filed with the pass rather than dropped. A
   bandwidth-priced instance now keeps its proxy's WebSocket sessions on the
   parsed relay. WebSocket bandwidth is billed on payload bytes even with
   `FERRUM_WEBSOCKET_TUNNEL_MODE=true`, and policy-stopped sessions now report
