@@ -292,6 +292,23 @@ fn waf_header_present_secret_values_are_projected() {
 }
 
 #[test]
+fn fault_injection_match_header_values_are_projected() {
+    let projected = project(
+        "fault_injection",
+        json!({
+            "abort": { "status_code": 503, "percentage": 100.0 },
+            "match": { "headers": { "x-chaos-test": "fault-target-secret-canary" } },
+            "expires_at": "2026-11-01T12:30:00Z"
+        }),
+    );
+    assert_eq!(projected["match"]["headers"]["x-chaos-test"], REDACTED);
+    // Header names, fault shape, and the experiment bound stay visible.
+    assert_eq!(projected["abort"]["status_code"], 503);
+    assert_eq!(projected["expires_at"], "2026-11-01T12:30:00Z");
+    assert_no_canaries(&projected, &["fault-target-secret-canary"]);
+}
+
+#[test]
 fn otel_header_values_are_secret_by_default_regardless_of_name() {
     let projected = project(
         "otel_tracing",
@@ -1369,6 +1386,37 @@ fn placeholder_sites_ignore_a_later_layer_rendering_an_earlier_layers_output() {
 fn placeholder_outside_a_masked_site_is_not_reported() {
     let config = json!({"service": "[REDACTED]", "batch_size": 50});
     assert!(placeholder_sites("http_logging", &config).is_empty());
+}
+
+#[test]
+fn response_mock_match_values_are_secret_and_mock_content_stays_visible() {
+    let projected = project(
+        "response_mock",
+        json!({
+            "rules": [
+                {
+                    "path": "/users",
+                    "match": {
+                        "headers": {"x-tenant-token": "rm-header-canary"},
+                        "query_params": {"page": "rm-query-canary"}
+                    },
+                    "status_code": 200,
+                    "headers": {"x-mock": "visible"},
+                    "body": "[]"
+                },
+                {"path": "/plain", "body": "plain-body"}
+            ]
+        }),
+    );
+    let rules = projected["rules"].as_array().expect("rules stay an array");
+    assert_eq!(rules[0]["match"]["headers"]["x-tenant-token"], REDACTED);
+    assert_eq!(rules[0]["match"]["query_params"]["page"], REDACTED);
+    assert_eq!(rules[0]["path"], "/users");
+    assert_eq!(rules[0]["status_code"], 200);
+    assert_eq!(rules[0]["headers"]["x-mock"], "visible");
+    assert_eq!(rules[0]["body"], "[]");
+    assert_eq!(rules[1]["body"], "plain-body");
+    assert_no_canaries(&projected, &["rm-header-canary", "rm-query-canary"]);
 }
 
 #[test]

@@ -8,7 +8,8 @@ use ferrum_edge::plugins::utils::claim_resolver::{
 use ferrum_edge::plugins::utils::json_escape::escape_json_string;
 use ferrum_edge::plugins::utils::jwks_store::JwksKeyStore;
 use ferrum_edge::plugins::utils::jwt_verifier::{
-    JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks,
+    CompiledJwtValidation, JwtVerifyParams, peek_unverified_issuer,
+    verify_jwt_with_compiled_validation, verify_jwt_with_jwks,
 };
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
@@ -944,6 +945,115 @@ async fn jwt_verifier_accepts_matching_kid_and_key() {
         .await
         .expect("matching kid must verify");
     assert_eq!(claims["sub"], "user");
+}
+
+/// `CompiledJwtValidation` is the per-provider precompiled form of the policy
+/// `verify_jwt_with_jwks` rebuilds on every call (jwks_auth-SOL-3). Both paths
+/// must reach the identical verdict and claims for every issuer, audience,
+/// shape, and `kid` case.
+#[tokio::test]
+async fn compiled_validation_matches_per_call_validation() {
+    let audiences = vec!["api".to_string(), "other-api".to_string()];
+    let params = JwtVerifyParams {
+        issuer: Some("https://issuer"),
+        audiences: &audiences,
+        require_exp: true,
+        leeway_secs: 0,
+        validate_nbf: true,
+    };
+    let compiled = CompiledJwtValidation::new(&params);
+    let store = two_key_store();
+    let now = chrono::Utc::now().timestamp();
+
+    let cases = [
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+            "key-1",
+            true,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": ["x", "other-api"]}),
+            "key-1",
+            true,
+        ),
+        (json!({"sub": "u", "iss": "https://issuer"}), "key-1", false),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "nope"}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": 42}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://other", "aud": "api"}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": ["https://issuer"], "aud": "api"}),
+            "key-1",
+            false,
+        ),
+        (json!({"sub": "u", "aud": "api"}), "key-1", false),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api", "nbf": now + 600}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+            "no-such-kid",
+            false,
+        ),
+    ];
+    for (claims, kid, accepted) in cases {
+        let token = super::jwks_auth_support::create_rs256_token_with_kid(
+            &claims,
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            kid,
+        );
+        let per_call = verify_jwt_with_jwks(&token, &store, &params).await;
+        let precompiled = verify_jwt_with_compiled_validation(&token, &store, &compiled);
+        assert_eq!(
+            per_call.is_some(),
+            accepted,
+            "per-call verdict for {claims}"
+        );
+        assert_eq!(
+            per_call, precompiled,
+            "compiled verdict must match for {claims}"
+        );
+    }
+
+    // A token signed by the other published key under `key-1` stays rejected.
+    let wrong_key = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+        "key-1",
+    );
+    assert!(verify_jwt_with_compiled_validation(&wrong_key, &store, &compiled).is_none());
+}
+
+/// The compiled policy carries the configured `exp`/`nbf` leeway.
+#[test]
+fn compiled_validation_applies_configured_leeway() {
+    let now = chrono::Utc::now().timestamp();
+    let store = two_key_store();
+    let recently_expired = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "u", "exp": now - 20}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "key-1",
+    );
+    let strict = CompiledJwtValidation::new(&jwt_verify_params());
+    let lenient = CompiledJwtValidation::new(&JwtVerifyParams {
+        leeway_secs: 60,
+        ..jwt_verify_params()
+    });
+    assert!(verify_jwt_with_compiled_validation(&recently_expired, &store, &strict).is_none());
+    assert!(verify_jwt_with_compiled_validation(&recently_expired, &store, &lenient).is_some());
 }
 
 fn ctx_with_header(name: &str, value: &str) -> RequestContext {
@@ -2590,4 +2700,108 @@ fn openai_stream_within_the_index_ceiling_stays_inspectable() {
         "choices": [{"index": 999, "delta": {"content": "late"}}]
     }));
     assert!(!reassembler.provider_stream_uninspectable());
+}
+
+#[test]
+fn extended_reassembler_folds_legacy_function_calls_and_cohere_v2_events() {
+    let frames = [
+        json!({"choices": [{"index": 0, "delta": {"function_call": {"name": "no", "arguments": "{\"a\":"}}}]}),
+        json!({"choices": [{"index": 0, "delta": {"function_call": {"name": "te", "arguments": "1}"}}}]}),
+        json!({"type": "message-start", "delta": {"message": {"role": "assistant", "content": [], "tool_plan": "", "tool_calls": []}}}),
+        json!({"type": "content-start", "index": 0, "delta": {"message": {"content": {"type": "text", "text": ""}}}}),
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": "Hel"}}}}),
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": "lo."}}}}),
+        json!({"type": "tool-plan-delta", "delta": {"message": {"tool_plan": "I will look it up."}}}),
+        json!({"type": "tool-call-start", "index": 0, "delta": {"message": {"tool_calls": {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": ""}}}}}),
+        json!({"type": "tool-call-delta", "index": 0, "delta": {"message": {"tool_calls": {"function": {"arguments": "{\"q\":1}"}}}}}),
+        json!({"type": "tool-call-end", "index": 0}),
+        json!({"type": "message-end", "delta": {"finish_reason": "COMPLETE"}}),
+    ];
+
+    // The default reassembler leaves both shapes to its callers
+    // (`ai_response_guard` keeps its own legacy function_call accumulators).
+    let mut default = SseReassembler::new();
+    for frame in &frames {
+        default.push_frame(frame);
+    }
+    assert!(default.into_texts().is_empty());
+
+    let mut extended = SseReassembler::with_extended_provider_shapes();
+    for frame in &frames {
+        extended.push_frame(frame);
+    }
+    assert!(!extended.provider_stream_uninspectable());
+    assert_eq!(extended.assistant_content(), "Hello.I will look it up.");
+    let texts = extended.into_texts();
+    let text_of = |kind: SseTextKind| -> Vec<(String, String)> {
+        texts
+            .iter()
+            .filter(|text| text.kind == kind)
+            .map(|text| (text.json_path.clone(), text.text.clone()))
+            .collect()
+    };
+    assert_eq!(
+        text_of(SseTextKind::ChatFunctionCallName),
+        vec![(
+            "$.choices[0].delta.function_call.name".to_string(),
+            "note".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::ChatFunctionCallArguments),
+        vec![(
+            "$.choices[0].delta.function_call.arguments".to_string(),
+            "{\"a\":1}".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereText),
+        vec![(
+            "$.message.content[0].text".to_string(),
+            "Hello.".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolPlan),
+        vec![(
+            "$.message.tool_plan".to_string(),
+            "I will look it up.".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolName),
+        vec![(
+            "$.message.tool_calls[0].function.name".to_string(),
+            "lookup".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolArguments),
+        vec![(
+            "$.message.tool_calls[0].function.arguments".to_string(),
+            "{\"q\":1}".to_string()
+        )]
+    );
+}
+
+#[test]
+fn extended_reassembler_fails_closed_on_unmodelled_cohere_v2_content() {
+    for frame in [
+        // An unmodelled hyphenated event inside an identified Cohere v2 stream.
+        json!({"type": "content-shiny", "index": 0}),
+        // A non-text content part.
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"type": "thinking", "thinking": "hmm"}}}}),
+        // A non-string text fragment.
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": 7}}}}),
+    ] {
+        let mut reassembler = SseReassembler::with_extended_provider_shapes();
+        reassembler.push_frame(
+            &json!({"type": "message-start", "delta": {"message": {"role": "assistant"}}}),
+        );
+        reassembler.push_frame(&frame);
+        assert!(
+            reassembler.provider_stream_uninspectable(),
+            "{frame} must mark the stream uninspectable"
+        );
+    }
 }

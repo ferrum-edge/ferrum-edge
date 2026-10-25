@@ -21,6 +21,11 @@ approval endpoint's answer.
   still runs well before `ai_federation`.
 - **Protocols:** HTTP family (HTTP/1.1, HTTP/2, HTTP/3). Raw WebSocket frame
   tools are out of scope for the MVP.
+- **Request body ceiling:** the plugin declares no plugin-local request-body
+  buffer ceiling; governed request buffering is bounded by the gateway's
+  retained request ceiling (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, or the finite
+  `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` when that is `0`), and a governed
+  body past the 4 MiB inspection window still fails closed in enforce mode.
 - **Failure policy:** `FailClosed`.
 - **Configuration admission:** unknown properties are rejected at every
   fixed-shape layer (`config`, `inspect`, each `tools.<name>` policy,
@@ -40,7 +45,7 @@ Each is toggled independently under `inspect`; at least one must be enabled.
 | --- | --- | --- |
 | `request_tool_definitions` | `false` | Tool definitions the client exposes to the model, in every provider shape: OpenAI `tools[].function.name` and legacy `functions[].name`, Anthropic `tools[].name`, Google `tools[].functionDeclarations[].name`, Bedrock `toolConfig.tools[].toolSpec.name`. A provider built-in that carries a `type` but no name of its own (`{"type": "code_interpreter"}`) is governed under its `type`. A disallowed definition is rejected/dry-run; an entry no shape can name is ungovernable. |
 | `response_tool_calls` | `true` | Buffered response tool calls in every provider shape: OpenAI `choices[].message.tool_calls[]` and legacy `choices[].message.function_call`, OpenAI Responses `output[]` items of `type: "function_call"`, Anthropic `content[]` blocks of `type: "tool_use"`, Google `candidates[].content.parts[].functionCall`, Cohere v2 `message.tool_calls[]`, Bedrock Converse `output.message.content[].toolUse`. |
-| `streaming_response_tool_calls` | `false` | SSE tool-call deltas, reassembled across frames, in **these four** provider shapes — a narrower set than the buffered row above: OpenAI `choices[].delta.tool_calls` and legacy `choices[].delta.function_call`, Anthropic `content_block_start` (`content_block.type: "tool_use"`) plus `content_block_delta` (`delta.type: "input_json_delta"`), Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall`. OpenAI Responses events and Bedrock's binary event stream are **not** accumulated (see [Limitations](#limitations-mvp)). Batch boundaries are OpenAI `finish_reason`, Google `finishReason`, Anthropic `message_delta` (`delta.stop_reason`) / `message_stop`, and Cohere `message-end`. |
+| `streaming_response_tool_calls` | `false` | SSE tool-call deltas, reassembled across frames, in **these five** provider shapes — a narrower set than the buffered row above: OpenAI Chat Completions `choices[].delta.tool_calls` and legacy `choices[].delta.function_call`, OpenAI Responses `response.output_item.added` (a `function_call` item) plus `response.function_call_arguments.delta` (see [Streaming behavior](#streaming-behavior) for the restatement checks), Anthropic `content_block_start` (`content_block.type: "tool_use"`) plus `content_block_delta` (`delta.type: "input_json_delta"`), Cohere v2 `tool-call-start` / `tool-call-delta`, Google `candidates[].content.parts[].functionCall`. Bedrock's binary event stream is **not** accumulated (see [Limitations](#limitations-mvp)). Batch boundaries are OpenAI `finish_reason`, Google `finishReason`, Anthropic `message_delta` (`delta.stop_reason`) / `message_stop`, Cohere `message-end`, and OpenAI Responses `response.completed` / `response.incomplete` / `response.failed`. |
 | `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`), including calls inside JSON-RPC **batch arrays**. Omitted `params.arguments` normalizes to `{}` before evaluation (MCP zero-argument calls); provider response `function.arguments` omissions are not normalized. |
 | `a2a_methods` | `false` | A2A JSON-RPC method names (governed against the `tools` map), including batch arrays. |
 
@@ -64,6 +69,23 @@ Each is toggled independently under `inspect`; at least one must be enabled.
   held body without governing it. This applies in both `enforce` and `dry_run`: the truncated
   call triggers no approval webhook or decision metadata, and none of its held frames are
   released. Only frames the governor already cleared reach the client before the earlier cut.
+- **OpenAI Responses restatements.** A Responses stream restates each finished
+  call in `response.function_call_arguments.done`, `response.output_item.done`,
+  and the `output[]` of the terminal `response.completed` event, and a client may
+  act on any of them. Every restatement must equal the name and arguments the
+  deltas built **exactly**; a different value, a second
+  `response.output_item.added` for the same `output_index`, an argument delta for
+  a call no event opened, or an event without a usable `output_index` makes the
+  batch ungovernable (fail closed in enforce). A call that appears only in a
+  restatement (for example only in `response.completed`) is governed as a
+  complete call. Approval correlation reads the model from the
+  `response.model` that Responses lifecycle events embed and identifies the
+  provider as OpenAI, unless request or routing metadata already supplied them.
+- **Uninspectable events.** An SSE event whose bytes are not valid UTF-8 (even
+  in an ignored comment line — a WHATWG client still decodes the event's intact
+  `data:` lines), or whose `data:` payload is well-formed JSON nested past the
+  inspection parser's limit, cannot be inspected. Enforce mode cuts the stream
+  before releasing it or anything held behind it; dry-run forwards it unchanged.
 - **Call identity.** Duplicate `tool_calls[].index` values in one frame, or
   conflicting / changing `tool_calls[].id` values for the same
   `(choice, index)` slot, are **ungovernable** and fail closed in enforce mode
@@ -96,7 +118,10 @@ Each is toggled independently under `inspect`; at least one must be enabled.
   streaming inspection without buffered-response inspection.
 - **Line terminators.** SSE parsing (live and buffered) accepts all three spec
   line terminators (`\r\n`, `\r`, `\n`). A `\r` at a chunk edge is held until
-  the next chunk disambiguates a straddled `\r\n`.
+  the next chunk disambiguates a straddled `\r\n`. Event framing and the
+  leading-bytes shape sniff resume where the previous chunk left off, so a long
+  event or prelude delivered in many small chunks costs work linear in its size
+  rather than a rescan from its first byte on every chunk.
 - **Body-shape sniffing.** The inspector classifies the stream from its leading
   bytes:
   - *SSE-shaped* — any syntactically valid SSE field or comment line (printable
@@ -183,7 +208,14 @@ marker**: an object member named `tool_calls`, `toolCalls`, `tool_call`,
 `function_calls`, or `functionCalls` whose value is non-`null` and non-empty,
 or a block tagged `"type": "tool_use"` / `"toolUse"` / `"function_call"` / `"tool-call"`.
 A payload that carries such a marker but from which **no call could be
-extracted** is ungovernable.
+extracted** is ungovernable. When calls **were** extracted, the scan still runs
+over every location the extractors did not read: a second call placed in an
+unread location (for example a top-level `tool_call` beside a readable
+`choices[].message.tool_calls[]`, which a normalizing client runtime may also
+honor) is ungovernable too; under the `allow` opt-out the unread location is
+forwarded but every readable call beside it is still governed. Locations an extractor did read — including the
+argument documents inside them — are skipped, so marker-like names inside a
+call's own arguments never count. The same rule applies per SSE frame.
 
 | `unknown_shape_action` | Default | Behavior |
 | --- | --- | --- |
@@ -205,7 +237,10 @@ fixed reason (when metadata emission is enabled). The case is therefore never
 Scoping the posture to a positive marker is deliberate: payloads with **no**
 tool surface at all — ordinary REST JSON on a shared proxy, embeddings /
 moderations / image responses, content-only completions — stay out of scope
-under both settings and are never rejected. Empty and `null` containers
+under both settings and are never rejected — at any size inside the 4 MiB
+inspection window: the marker scan's node budget covers every value a 4 MiB
+document can hold, so a large embeddings batch or numeric array is scanned to
+the end rather than refused because it is large. Empty and `null` containers
 (`"tool_calls": []`, `"tool_calls": null`) are the documented provider "no
 calls" shapes and are not markers.
 
@@ -230,7 +265,14 @@ forwarded ungoverned:
   cannot be policy-checked — a missing or non-string `function.name` (policy
   is keyed by name), or a `tool_calls` value that is present but not an array.
   A `null` `tool_calls`/`function_call` is OpenAI's normal content-only shape
-  and is fine. An SSE-labeled buffered body whose bytes are **not valid
+  and is fine. A JSON response that the bounded scanner validates as a complete,
+  well-formed document but that the inspection parser cannot materialize —
+  nesting past its 128-level recursion limit, or a number outside its range —
+  is also uninspectable: other parsers read such a document, so a tool call
+  inside it was never evaluated. This applies to buffered JSON, the
+  post-transform re-check, buffered and live SSE `data:` payloads, and a fully
+  held JSON-shaped stream. Malformed JSON keeps the forward posture listed under
+  [Limitations](#limitations-mvp). An SSE-labeled buffered body whose bytes are **not valid
   UTF-8** (opaque/binary without a `Content-Encoding` header — e.g. a
   transform stripped the header from compressed bytes) cannot be parsed for
   SSE frames at all and fails closed, matching the live inspector's opaque
@@ -306,7 +348,18 @@ Argument checks (`max_arg_bytes`, `required_args`, `json_schema`,
 `blocked_arg_patterns`) apply to the `allow`, `require_approval`, and
 `redact_args` actions. A blocked-pattern match denies under
 `allow`/`require_approval`, and is **redacted** under `redact_args` (buffered
-path). A `redact_args` policy must configure at least one
+path). Patterns run over the raw arguments text and — when that text contains a
+JSON escape — also over its JSON-decoded views: the canonical re-serialization
+and every decoded string (member names included). OpenAI and Cohere carry
+arguments as model-written JSON *source*, so without this an escaped spelling
+(`"api\u005fkey"`, `"http:\/\/"`) would hide a match from the regex while the
+executing runtime decodes it. Under `redact_args`, redaction rewrites the raw
+text, so the decision is taken on the decoded views of the **rewritten**
+arguments (this plugin's own placeholders removed): any pattern match that
+survives the rewrite (an escape-hidden occurrence it cannot remove in place)
+**denies** the call instead of forwarding the secret. An escaped arguments
+document that is well-formed JSON but nested past the inspection parser's limit
+has no decoded view, so a policy with `blocked_arg_patterns` denies it. A `redact_args` policy must configure at least one
 `blocked_arg_patterns` entry; an empty redaction policy is rejected rather than
 silently turning the tool into an allowlist entry. Regexes that match empty
 input are rejected at config load; a contextual zero-length match that can
@@ -325,6 +378,43 @@ successful buffered redaction rewrite invalidates origin representation
 validators / integrity headers (`ETag`, `Content-Digest`, `Repr-Digest`,
 `Digest`, `Content-MD5`, `Last-Modified`, and related checksum / signature
 fields) so clients never validate against pre-redaction bytes.
+
+### Tool name globs
+
+A `tools` key containing `*` is a glob: `*` matches any run of characters,
+including none, and crosses `.`, `/`, and `_` (a deny glob such as `*delete*`
+must not be escapable by the separator a tool name uses). Keys are anchored at
+both ends. Precedence for one call name:
+
+1. an **exact** key always wins;
+2. otherwise, among matching globs, the one with the **most literal** (non-`*`)
+   bytes wins; ties go to fewer wildcards, then to the key's byte order;
+3. otherwise `default_action` applies.
+
+So `github.*: allow` plus `github.delete*: deny` allows `github.create_pr` and
+denies `github.delete_repo`, and an exact `github.read_secret: deny` beats both.
+At most 256 glob keys are admitted, each at most 256 UTF-8 bytes. Glob keys are
+never A2A aliases. `ai_tool_governor.policy_ids` records the governing key (the
+glob itself for a glob match).
+
+### Caller identity scopes
+
+A tool policy can be scoped to callers with `allowed_consumers` /
+`denied_consumers` (Consumer `username`) and `allowed_groups` / `denied_groups`
+(Consumer `acl_groups`), evaluated against the gateway-mapped Consumer of the
+request:
+
+- a `denied_*` match denies, and wins over any `allowed_*` match;
+- with any `allowed_*` list configured, the caller must match an allowed
+  consumer or group;
+- with any scope configured, a request **without a mapped Consumer** is denied
+  (an unmapped external identity cannot be evaluated against these lists).
+
+The scope is decided after a per-tool `deny` or `dry_run` and before argument
+checks and approval, so a caller outside the scope never reaches the approval
+webhook. A request tool *definition* outside the caller's scope is refused like
+a denied tool. Example: `kubectl.apply: {action: require_approval,
+allowed_groups: [sre]}` sends SRE calls to approval and denies everyone else.
 
 A per-tool **`dry_run`** action is purely observational: it forwards the call
 and records `ai_tool_governor.decision=dry_run` for concrete calls and exposed
@@ -357,7 +447,7 @@ silently resolves to the default in this table.
 | `default_action` | string | `deny` | `allow` \| `deny` \| `require_approval`. Applies to any tool with no `tools` entry. `allow` additionally requires at least one `tools` entry — an allow-by-default instance with no policies would govern nothing and is rejected. |
 | `unknown_shape_action` | string | `deny` | `deny` \| `allow`. Posture for a payload carrying a tool-call marker no extractor could read. See [Unreadable tool-call shapes](#unreadable-tool-call-shapes-unknown_shape_action). |
 | `inspect` | object | `{}` | Inspection surfaces. At least one must be enabled after defaults are applied. |
-| `tools` | object | `{}` | Free-form map: exact tool name → policy object. An empty tool name is rejected. |
+| `tools` | object | `{}` | Free-form map: tool name or `*` glob → policy object (see [Tool name globs](#tool-name-globs)). An empty tool name is rejected; at most 256 glob keys of at most 256 UTF-8 bytes each. |
 | `approval` | object | absent | Approval webhook. Required when `mode: enforce` and a `require_approval` action is reachable from a concrete-call surface (`response_tool_calls`, `streaming_response_tool_calls`, `mcp_tool_calls`, or `a2a_methods`). Definition-only inspection blocks `require_approval` locally and needs no webhook. |
 | `response` | object | `{}` | Rejection / redaction output shape. |
 | `observability` | object | `{}` | Metadata and audit-logging controls. |
@@ -389,6 +479,10 @@ every other surface is `false` or omitted.
 | `required_args` | array of strings | `[]` | Each entry must be a non-empty string. Deny when any listed key is absent from the parsed arguments object. |
 | `blocked_arg_patterns` | array of objects | `[]` | At most **32** entries; each entry is closed to the two keys below. |
 | `json_schema` | object | unset | An open JSON Schema document the parsed arguments must satisfy, else deny. Compiled at admission — an invalid schema is rejected. Arbitrary keywords inside the document are intentionally allowed. |
+| `allowed_consumers` | array of strings | unset | Consumer usernames allowed to use the tool. 1–256 entries, each 1–512 UTF-8 bytes. See [Caller identity scopes](#caller-identity-scopes). |
+| `denied_consumers` | array of strings | unset | Consumer usernames denied the tool; wins over every `allowed_*` match. Same bounds. |
+| `allowed_groups` | array of strings | unset | Consumer `acl_groups` allowed to use the tool. Same bounds. |
+| `denied_groups` | array of strings | unset | Consumer `acl_groups` denied the tool; wins over every `allowed_*` match. Same bounds. |
 
 ### `tools.<name>.blocked_arg_patterns[]`
 
@@ -401,11 +495,13 @@ every other surface is `false` or omitted.
 
 | Key | Type | Default | Admitted values and notes |
 | --- | --- | --- | --- |
-| `endpoint_url` | string | **required** | Must parse as a URL whose scheme is `http` or `https`. The scheme is **case-insensitive** (`HTTPS://…` is admitted; the URL parser normalizes it), and the host is screened against the backend egress policy at admission. |
+| `endpoint_url` | string | **required** | Must parse as a URL whose scheme is `http` or `https`. The scheme is **case-insensitive** (`HTTPS://…` is admitted; the URL parser normalizes it), and the host is screened against the backend egress policy at admission. An `http://` URL is admitted only to a loopback IP literal host written as a dotted-quad `127.d.d.d` or `[::1]` (a co-located sidecar; URL userinfo is not part of the host) unless `allow_plaintext: true`: a cleartext channel lets a man-in-the-middle forge `allow` verdicts. |
 | `timeout_ms` | integer | `1500` | `1`–`30000`. Per-webhook-call timeout; `0` is rejected rather than meaning "no timeout". |
 | `cache_ttl_seconds` | integer ≥ 0 | `300` | `0`–`2592000` (30 days). **`0` disables caching.** The cache is bounded at 4096 entries; at capacity expired entries are purged and new decisions are simply not cached. |
 | `fail_on_error` | string | `reject` | `reject` \| `warn` \| `allow`. Behavior when the endpoint cannot be evaluated: `reject` fails closed, `warn` / `allow` fail open. |
 | `include_arguments` | boolean | `false` | Include the raw tool arguments in the approval request body. Off by default so secrets are not sent. |
+| `headers` | object | `{}` | Extra approval request headers, header name → value; at most 32. A value is a literal or a whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference resolved from the process environment at the **first approval call** (validation does not need the live secret; an unset or invalid secret is an approval endpoint error handled by `fail_on_error`). Names must be valid and unique case-insensitively and may not be `content-type`, `content-length`, `host`, `transfer-encoding`, `connection`, `keep-alive`, `proxy-connection`, `te`, `trailer`, `upgrade`, or `X-Ferrum-Hops`; values are 1–8192 UTF-8 bytes and valid header values. Values are never logged or echoed. |
+| `allow_plaintext` | boolean | `false` | Admit an `http://` `endpoint_url` whose host is not a loopback IP literal. Verdicts, any `headers` credential, and (with `include_arguments`) raw arguments then cross the network in clear. |
 
 ### `response`
 
@@ -502,19 +598,29 @@ config:
 ```
 
 `filesystem.write` calls are POSTed to the approval webhook with request
-correlation, consumer/proxy/model/provider, tool name, arguments hash, and risk.
+correlation, consumer/proxy/model/provider, tool name, arguments hash, and risk,
+plus `principal` — the authority-qualified caller: `{"kind":"consumer",
+"namespace","id"}` for a mapped Consumer, or `{"kind":"external","subject",
+"mechanism","authority"}` for an external identity, where `authority` is the
+opaque hex digest of the verifying authority (it reveals no issuer or URL). The
+display `consumer` field alone cannot distinguish the same subject issued by two
+accepted authorities; `principal` can.
 Request correlation prefers private canonical state from the built-in
 `correlation_id` plugin. On custom-only chains it falls back to transaction
 metadata `request_id`, then legacy `correlation_id`; canonical state always wins
 over either plugin-writable compatibility key.
 `approval.timeout_ms` defaults to 1500 and may not exceed 30000. A single
-governed batch waits at most 30s cumulative for approvals, governs at most 64
-concrete calls, stops further webhook fan-out after an enforce-mode block, and
-cancels an in-flight approval HTTP call when the governing future is dropped
-(client cancel). Identical calls reuse the cached decision for
-`cache_ttl_seconds`; the cache key covers consumer, proxy, model, **provider**,
-tool name, and arguments (every field the webhook receives that can change its
-decision). For streamed and buffered-SSE responses the model/provider come from
+governed batch resolves its approvals with at most **8 webhook calls in
+flight** (parallel tool calls cost about one round trip, not one per call),
+waits at most 30s in total for approvals, governs at most 64 concrete calls,
+starts no further webhook call after an enforce-mode block (calls already in
+flight complete and are recorded), and cancels in-flight approval HTTP calls
+when the governing future is dropped (client cancel). Identical calls reuse the
+cached decision for `cache_ttl_seconds` — within one batch they share a single
+resolution, like a cache hit; the cache key covers consumer, **principal**,
+proxy, model, **provider**, tool name, and arguments (every field the webhook
+receives that can change its decision), so equal subject strings verified by
+different authorities never share a decision. For streamed and buffered-SSE responses the model/provider come from
 request/routing metadata or, when absent, from the SSE frames themselves — a
 decision made for one model is never reused for another. The cache is
 bounded at 4096 entries — at capacity expired entries are purged and new
@@ -558,7 +664,8 @@ When `observability.emit_metadata` is on (default), the plugin writes
 (`allow` / `dry_run` / `deny` / `require_approval` / `approved` /
 `approval_denied`),
 `tool_names`, `risk` (the maximum within the winning decision rank; see
-below), `policy_ids`, `approval_id`, `arguments_hashes`
+below), `policy_ids` (the governing `tools` key — the glob itself for a glob
+match), `approval_id`, `arguments_hashes`
 (SHA-256, when `hash_arguments` is on), `redacted_tools`, and
 `uninspectable_reason` (fixed values only, never raw body bytes):
 
@@ -670,16 +777,18 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   or rejected, and a framed-gRPC **response** that reaches the buffered hooks
   (buffered by `response_body_mode: Buffer` or another plugin) is never
   inspected, size-checked, or rewritten by this plugin.
-- A JSON-labelled **response** body that fails to parse is forwarded (only
-  oversized responses fail closed) — rejecting every unparseable JSON response
-  on a shared proxy would break unrelated routes.
+- A JSON-labelled **response** body that is malformed JSON is forwarded (no
+  parser reads a tool call out of it) — rejecting every unparseable JSON
+  response on a shared proxy would break unrelated routes. Oversized responses,
+  and well-formed JSON beyond the inspection parser's nesting/numeric limits,
+  fail closed.
 - **Provider scope is explicit, not universal.** Buffered tool calls and
   definitions are read in the OpenAI (Chat Completions and Responses),
   Anthropic Messages, Google Gemini, Cohere v2, and Amazon Bedrock Converse
   shapes. **Streaming SSE accumulation is narrower than the buffered set** — it
-  covers exactly the four dialects in the `streaming_response_tool_calls` row
-  of the inspection table (OpenAI Chat Completions, Anthropic, Cohere v2,
-  Google); see the two streaming bullets below. A dialect
+  covers exactly the five dialects in the `streaming_response_tool_calls` row
+  of the inspection table (OpenAI Chat Completions, OpenAI Responses,
+  Anthropic, Cohere v2, Google); see the Bedrock bullet below. A dialect
   outside that set is not silently allowed: if the payload carries a tool-call
   marker the plugin cannot resolve into a call, `unknown_shape_action` (default
   `deny`) fails closed and the fixed `unrecognized_tool_call_shape` observation
@@ -694,18 +803,10 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   JSON-shaped, so on a stream-marked governed request they take the opaque
   path: held in full and cut at end-of-stream in enforce, released unchanged in
   dry-run.
-- **OpenAI Responses streaming is buffered-only.** A buffered Responses body is
-  governed (`output[]` items of `type: "function_call"`), but the Responses
-  **event** stream (`response.output_item.added`,
-  `response.function_call_arguments.delta`, …) has no accumulator — the four
-  dialects in the `streaming_response_tool_calls` row above are the complete
-  streaming set. A Responses SSE frame carrying a tool-call marker is therefore
-  an **unreadable shape, not an allow**: `unknown_shape_action` (default `deny`)
-  cuts the stream in enforce, and the fixed `unrecognized_tool_call_shape`
-  observation is recorded under both settings. `ai_stream_router` does not close
-  this gap either — it normalizes Anthropic and Google Gemini streams to OpenAI
-  Chat Completions chunks and treats an `openai` provider's stream as already
-  normalized.
+- **OpenAI Responses governance covers `function_call` items only.** Other
+  Responses tool item types (`custom_tool_call`, `computer_call`,
+  `local_shell_call`, hosted-tool calls) are outside the buffered and streaming
+  extractors alike.
 - The unknown-shape posture is scoped to a positive tool-call marker. It does
   not attempt to decide whether an arbitrary body "is an AI response", so a
   provider dialect with no recognizable marker is out of scope in both

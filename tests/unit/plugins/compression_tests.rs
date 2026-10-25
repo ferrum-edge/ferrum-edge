@@ -309,7 +309,9 @@ fn test_accepts_every_valid_config_field() {
         "gzip_level": 6,
         "max_decompressed_request_size": 1_048_576,
         "min_content_length": 512,
-        "remove_accept_encoding": false
+        "remove_accept_encoding": false,
+        "weaken_strong_etag": true,
+        "zstd_level": 3
     });
     let present: std::collections::BTreeSet<&str> = config
         .as_object()
@@ -5809,79 +5811,6 @@ async fn test_before_proxy_does_not_reserve_for_unnegotiable_encodings() {
 }
 
 #[tokio::test]
-async fn test_unsafe_global_response_limits_decline_compression_before_buffering() {
-    use ferrum_edge::_test_support::{
-        compression_response_admission_declined_for_test,
-        compression_response_admission_reserved_for_test,
-    };
-    use ferrum_edge::plugins::compression::HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE;
-
-    let plugin = make_plugin(json!({}));
-    for limit in [0, HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE + 1] {
-        let mut ctx = make_ctx(Some("gzip"));
-        ctx.max_response_body_size_bytes = limit;
-        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
-        assert!(
-            compression_response_admission_declined_for_test(&ctx),
-            "unsafe response limit {limit} must decline compression admission"
-        );
-        assert!(!compression_response_admission_reserved_for_test(&ctx));
-        assert!(
-            !plugin.should_buffer_response_body(&ctx),
-            "unsafe response limit {limit} must stream identity"
-        );
-
-        let mut response_headers = HashMap::from([
-            ("content-type".to_string(), "application/json".to_string()),
-            ("content-length".to_string(), "1000".to_string()),
-        ]);
-        assert!(matches!(
-            plugin
-                .after_proxy(&mut ctx, 200, &mut response_headers)
-                .await,
-            PluginResult::Continue
-        ));
-        assert!(
-            !response_headers.contains_key("content-encoding"),
-            "unsafe response limit {limit} must not commit compression"
-        );
-
-        let accept_encoding = "gzip, identity;q=0";
-        let mut identity_barred_ctx = make_ctx(Some(accept_encoding));
-        identity_barred_ctx.max_response_body_size_bytes = limit;
-        before_proxy_with_accept_encoding(&plugin, &mut identity_barred_ctx, Some(accept_encoding))
-            .await;
-        assert!(
-            !plugin.should_buffer_response_body(&identity_barred_ctx),
-            "unsafe response limit {limit} must not buffer when identity is prohibited"
-        );
-        let mut identity_barred_headers = HashMap::from([
-            ("content-type".to_string(), "application/json".to_string()),
-            ("content-length".to_string(), "1000".to_string()),
-        ]);
-        match plugin
-            .after_proxy(&mut identity_barred_ctx, 200, &mut identity_barred_headers)
-            .await
-        {
-            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 406),
-            other => panic!(
-                "expected 406 when identity is barred under unsafe response limit {limit}, got {other:?}"
-            ),
-        }
-        assert!(!identity_barred_headers.contains_key("content-encoding"));
-    }
-
-    let mut ceiling_ctx = make_ctx(Some("gzip"));
-    ceiling_ctx.max_response_body_size_bytes = HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE;
-    before_proxy_with_accept_encoding(&plugin, &mut ceiling_ctx, Some("gzip")).await;
-    assert!(
-        compression_response_admission_reserved_for_test(&ceiling_ctx),
-        "the exact compression safety ceiling must remain admissible"
-    );
-    assert!(plugin.should_buffer_response_body(&ceiling_ctx));
-}
-
-#[tokio::test]
 async fn test_head_does_not_reserve_or_buffer_response() {
     use ferrum_edge::_test_support::compression_response_admission_reserved_for_test;
     let plugin = make_plugin(json!({}));
@@ -6766,7 +6695,8 @@ fn content_type_rules_that_the_matcher_can_match_are_admitted() {
             "image/svg+xml",
             "application/vnd.api+json",
             "text/csv",
-            "APPLICATION/JSON"
+            "TEXT/PLAIN",
+            "font/*"
         ]
     }));
     assert!(plugin.is_ok(), "usable media-type rules must be admitted");
@@ -7423,4 +7353,951 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }
+}
+
+// ──────── Plugin review fixes: negotiation source, length gate, codings ────────
+
+/// A context whose pristine `Accept-Encoding` was captured by the production
+/// request-init stamp from raw wire headers, before any `before_proxy` hook —
+/// the same sequence the H1/H2 and H3 handlers run.
+fn make_ctx_with_client_accept_encoding(accept_encoding: &str) -> RequestContext {
+    let mut ctx = make_ctx(None);
+    let mut raw = http::HeaderMap::new();
+    raw.insert(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_str(accept_encoding).expect("accept-encoding must be valid"),
+    );
+    ctx.set_raw_headers(raw);
+    ferrum_edge::_test_support::stamp_original_request_metadata_for_test(&mut ctx);
+    ctx.materialize_headers();
+    ctx
+}
+
+/// Run a real `request_transformer` header rule, then compression's
+/// `before_proxy`, over the same backend-bound header map — production order
+/// (3000 before 4050).
+async fn run_request_transformer_then_compression(
+    plugin: &CompressionPlugin,
+    ctx: &mut RequestContext,
+    rule: serde_json::Value,
+) -> HashMap<String, String> {
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+    let transformer =
+        RequestTransformer::new(&json!({ "rules": [rule] })).expect("valid transformer");
+    let mut request_headers = ctx.headers.clone();
+    assert!(matches!(
+        transformer.before_proxy(ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        plugin.before_proxy(ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    request_headers
+}
+
+fn json_response_headers(content_length: usize) -> HashMap<String, String> {
+    HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), content_length.to_string()),
+    ])
+}
+
+/// compression-SOL-1 / M1: a backend-facing `Accept-Encoding` rewrite must not
+/// make the gateway emit a coding the client explicitly refused.
+#[tokio::test]
+async fn request_transformer_rewrite_cannot_select_a_coding_the_client_refused() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx_with_client_accept_encoding("gzip, br;q=0, identity;q=0");
+    let backend_headers = run_request_transformer_then_compression(
+        &plugin,
+        &mut ctx,
+        json!({"operation": "update", "target": "header", "key": "Accept-Encoding", "value": "br"}),
+    )
+    .await;
+    assert!(
+        !backend_headers.contains_key("accept-encoding"),
+        "remove_accept_encoding still strips the backend-facing header"
+    );
+
+    let mut response_headers = json_response_headers(1000);
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &response_headers);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "the client refused br; negotiation must use its own Accept-Encoding"
+    );
+}
+
+/// compression-SOL-1 / M1: removing the backend-facing header must not erase the
+/// client's negotiation — gzip stays selectable.
+#[tokio::test]
+async fn request_transformer_removal_cannot_erase_client_negotiation() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx_with_client_accept_encoding("gzip, identity;q=0");
+    run_request_transformer_then_compression(
+        &plugin,
+        &mut ctx,
+        json!({"operation": "remove", "target": "header", "key": "Accept-Encoding"}),
+    )
+    .await;
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "the client's gzip preference still selects a coding to buffer for"
+    );
+
+    let mut response_headers = json_response_headers(1000);
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &response_headers);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+}
+
+/// compression-SOL-1 / M1: abort recovery decides identity acceptability from
+/// the client's own field, so a rewrite that dropped `identity;q=0` cannot turn
+/// a failed encode into the identity body the client refused.
+#[tokio::test]
+async fn abort_recovery_honors_the_clients_identity_refusal_after_a_rewrite() {
+    use ferrum_edge::_test_support::reconcile_aborted_gateway_response_encoding_for_test;
+    use ferrum_edge::plugins::compression::{
+        with_test_codec_budget, with_test_response_buffer_budget,
+    };
+
+    with_test_response_buffer_budget(1, || async {
+        with_test_codec_budget(0, || async {
+            let plugin = make_plugin(json!({"min_content_length": 10}));
+            let mut ctx = make_ctx_with_client_accept_encoding("gzip, identity;q=0");
+            run_request_transformer_then_compression(
+                &plugin,
+                &mut ctx,
+                json!({"operation": "update", "target": "header", "key": "Accept-Encoding", "value": "gzip"}),
+            )
+            .await;
+
+            let mut resp = json_response_headers(1000);
+            stamp_original_response_metadata_for_test(&mut ctx, 200, &resp);
+            assert!(matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+                PluginResult::Continue
+            ));
+            assert_eq!(resp.get("content-encoding").map(String::as_str), Some("gzip"));
+
+            let mut body = bytes::Bytes::from(compressible_json_body());
+            assert!(
+                plugin
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &body,
+                        Some("application/json"),
+                        &resp,
+                    )
+                    .await
+                    .is_none(),
+                "codec saturation aborts the committed encode"
+            );
+            let mut status = 200;
+            assert!(
+                reconcile_aborted_gateway_response_encoding_for_test(
+                    &mut ctx,
+                    &mut status,
+                    &mut resp,
+                    &mut body,
+                ),
+                "the client's identity;q=0 must still produce the 406 terminal"
+            );
+            assert_eq!(status, 406);
+            assert!(!resp.contains_key("content-encoding"));
+        })
+        .await;
+    })
+    .await;
+}
+
+/// compression-claude-2 / M2: an unlimited or larger-than-ceiling response limit
+/// no longer disables compression wholesale. A response whose backend declares
+/// a fitting `Content-Length` is compressed; unknown or oversized lengths stream
+/// identity, and the identity-refused client still gets 406.
+#[tokio::test]
+async fn unsafe_response_limits_length_gate_compression_instead_of_disabling_it() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_declined_for_test,
+        compression_response_admission_reserved_for_test,
+    };
+    use ferrum_edge::plugins::compression::{
+        HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE, with_test_response_buffer_budget,
+    };
+
+    with_test_response_buffer_budget(8, || async {
+        let plugin = make_plugin(json!({}));
+        for limit in [0, HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE + 1] {
+            // Fitting declared length: buffered and compressed.
+            let mut ctx = make_ctx(Some("gzip"));
+            ctx.max_response_body_size_bytes = limit;
+            before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+            assert!(
+                !compression_response_admission_declined_for_test(&ctx),
+                "limit {limit} must no longer decline compression up front"
+            );
+            assert!(compression_response_admission_reserved_for_test(&ctx));
+            assert!(
+                plugin.should_buffer_response_body(&ctx),
+                "limit {limit}: the pre-header vote waits for the declared length"
+            );
+            let mut fitting = json_response_headers(1000);
+            assert!(refines_to_buffer(&plugin, &ctx, &fitting));
+            stamp_original_response_metadata_for_test(&mut ctx, 200, &fitting);
+            assert!(matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut fitting).await,
+                PluginResult::Continue
+            ));
+            assert_eq!(
+                fitting.get("content-encoding").map(String::as_str),
+                Some("gzip"),
+                "limit {limit}: a fitting declared length must be compressed"
+            );
+
+            // Unknown length (chunked): released, identity, slot returned.
+            let mut chunked_ctx = make_ctx(Some("gzip"));
+            chunked_ctx.max_response_body_size_bytes = limit;
+            before_proxy_with_accept_encoding(&plugin, &mut chunked_ctx, Some("gzip")).await;
+            let mut chunked =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            assert!(
+                !refines_to_buffer(&plugin, &chunked_ctx, &chunked),
+                "limit {limit}: an unknown length must stream"
+            );
+            assert!(
+                plugin.should_release_response_body_before_content_type_rewrite(
+                    &chunked_ctx,
+                    200,
+                    &chunked
+                )
+            );
+            stamp_original_response_metadata_for_test(&mut chunked_ctx, 200, &chunked);
+            assert!(matches!(
+                plugin
+                    .after_proxy(&mut chunked_ctx, 200, &mut chunked)
+                    .await,
+                PluginResult::Continue
+            ));
+            assert!(!chunked.contains_key("content-encoding"));
+            assert!(
+                !compression_response_admission_reserved_for_test(&chunked_ctx),
+                "limit {limit}: a length-gated decline returns the buffer slot"
+            );
+
+            // Oversized declared length: released and identity.
+            let mut big_ctx = make_ctx(Some("gzip"));
+            big_ctx.max_response_body_size_bytes = limit;
+            before_proxy_with_accept_encoding(&plugin, &mut big_ctx, Some("gzip")).await;
+            let ceiling = big_ctx
+                .retained_response_body_ceiling()
+                .min(HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE);
+            let mut oversized = json_response_headers(ceiling + 1);
+            assert!(!refines_to_buffer(&plugin, &big_ctx, &oversized));
+            stamp_original_response_metadata_for_test(&mut big_ctx, 200, &oversized);
+            assert!(matches!(
+                plugin.after_proxy(&mut big_ctx, 200, &mut oversized).await,
+                PluginResult::Continue
+            ));
+            assert!(!oversized.contains_key("content-encoding"));
+
+            // A Content-Length an earlier hook ADDED to a chunked backend
+            // response (which the refinement already released) must not commit.
+            let mut added_ctx = make_ctx(Some("gzip"));
+            added_ctx.max_response_body_size_bytes = limit;
+            before_proxy_with_accept_encoding(&plugin, &mut added_ctx, Some("gzip")).await;
+            let backend =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            stamp_original_response_metadata_for_test(&mut added_ctx, 200, &backend);
+            let mut hook_added = json_response_headers(1000);
+            assert!(matches!(
+                plugin
+                    .after_proxy(&mut added_ctx, 200, &mut hook_added)
+                    .await,
+                PluginResult::Continue
+            ));
+            assert!(
+                !hook_added.contains_key("content-encoding"),
+                "limit {limit}: only the backend's own declared length admits a commit"
+            );
+
+            // Identity refused + unknown length: the fixed 406 terminal.
+            let accept_encoding = "gzip, identity;q=0";
+            let mut barred_ctx = make_ctx(Some(accept_encoding));
+            barred_ctx.max_response_body_size_bytes = limit;
+            before_proxy_with_accept_encoding(&plugin, &mut barred_ctx, Some(accept_encoding))
+                .await;
+            let mut barred =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            stamp_original_response_metadata_for_test(&mut barred_ctx, 200, &barred);
+            match plugin.after_proxy(&mut barred_ctx, 200, &mut barred).await {
+                PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 406),
+                other => panic!("limit {limit}: expected 406, got {other:?}"),
+            }
+        }
+
+        // A bounded limit at the exact ceiling keeps the ordinary behavior: no
+        // declared length is required.
+        let mut ceiling_ctx = make_ctx(Some("gzip"));
+        ceiling_ctx.max_response_body_size_bytes = HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE;
+        before_proxy_with_accept_encoding(&plugin, &mut ceiling_ctx, Some("gzip")).await;
+        assert!(compression_response_admission_reserved_for_test(
+            &ceiling_ctx
+        ));
+        let chunked = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        assert!(refines_to_buffer(&plugin, &ceiling_ctx, &chunked));
+        assert!(!plugin.may_release_response_body_under_retries(&ceiling_ctx));
+    })
+    .await;
+}
+
+/// M2: retries must not pin every length-gated response onto the buffered path
+/// (where a large download would be refused instead of streaming identity).
+#[tokio::test]
+async fn length_gated_requests_release_unbounded_responses_under_retries() {
+    use ferrum_edge::plugins::compression::with_test_response_buffer_budget;
+
+    with_test_response_buffer_budget(2, || async {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some("gzip"));
+        ctx.max_response_body_size_bytes = 0;
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        assert!(plugin.may_release_response_body_under_retries(&ctx));
+
+        let chunked = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+        assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &chunked));
+        assert!(
+            !plugin.should_release_response_body_under_retries(
+                &ctx,
+                200,
+                &json_response_headers(1000)
+            ),
+            "a fitting declared length keeps the body for compression"
+        );
+    })
+    .await;
+}
+
+/// M2: a length-gated native gRPC exchange is never pinned onto the buffered
+/// path — the native gRPC dispatch cannot release a server stream later.
+#[tokio::test]
+async fn length_gated_native_grpc_requests_do_not_buffer() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_declined_for_test, mark_native_grpc_request_for_test,
+    };
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.max_response_body_size_bytes = 0;
+    mark_native_grpc_request_for_test(&mut ctx);
+    before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+    assert!(compression_response_admission_declined_for_test(&ctx));
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+/// compression-claude-3 / M3: a later hook relabeling the committed coding to
+/// one this instance cannot produce must abort the encode, so the shared loop
+/// restores identity instead of publishing plaintext under that label.
+#[tokio::test]
+async fn unsupported_final_content_encoding_aborts_to_identity() {
+    use ferrum_edge::_test_support::reconcile_aborted_gateway_response_encoding_for_test;
+    for (config, relabel) in [
+        (json!({"min_content_length": 10}), "deflate"),
+        // `br` is a real coding, but not one this instance enabled.
+        (
+            json!({"min_content_length": 10, "algorithms": ["gzip"]}),
+            "br",
+        ),
+    ] {
+        let plugin = make_plugin(config);
+        let mut ctx = make_ctx(None);
+        let mut resp = HashMap::new();
+        plan_response_algorithm(&plugin, &mut ctx, &mut resp, "gzip").await;
+        resp.insert("content-encoding".to_string(), relabel.to_string());
+
+        let mut body = bytes::Bytes::from(compressible_json_body());
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some("application/json"),
+                    &resp,
+                )
+                .await
+                .is_none()
+        );
+        let mut status = 200;
+        assert!(
+            !reconcile_aborted_gateway_response_encoding_for_test(
+                &mut ctx,
+                &mut status,
+                &mut resp,
+                &mut body,
+            ),
+            "{relabel}: identity is acceptable, so recovery restores it"
+        );
+        assert_eq!(status, 200);
+        assert!(
+            !resp.contains_key("content-encoding"),
+            "{relabel}: plaintext must not keep the unproducible label"
+        );
+        assert_eq!(resp.get("content-length"), Some(&body.len().to_string()));
+    }
+}
+
+/// M3: the same relabel with identity refused becomes the 406 terminal.
+#[tokio::test]
+async fn unsupported_final_content_encoding_with_identity_refused_returns_406() {
+    use ferrum_edge::_test_support::reconcile_aborted_gateway_response_encoding_for_test;
+    let plugin = make_plugin(json!({"min_content_length": 10}));
+    let accept_encoding = "gzip, identity;q=0";
+    let mut ctx = make_ctx(Some(accept_encoding));
+    before_proxy_with_accept_encoding(&plugin, &mut ctx, Some(accept_encoding)).await;
+    let mut resp = json_response_headers(1000);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    resp.insert("content-encoding".to_string(), "deflate".to_string());
+
+    let mut body = bytes::Bytes::from(compressible_json_body());
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &resp)
+            .await
+            .is_none()
+    );
+    let mut status = 200;
+    assert!(reconcile_aborted_gateway_response_encoding_for_test(
+        &mut ctx,
+        &mut status,
+        &mut resp,
+        &mut body,
+    ));
+    assert_eq!(status, 406);
+}
+
+/// compression-claude-4 / M4: `type/*` ranges are honored; wildcards the matcher
+/// could never satisfy are refused at admission.
+#[tokio::test]
+async fn content_type_wildcards_match_or_are_refused() {
+    let plugin = make_plugin(json!({"content_types": ["text/*"], "min_content_length": 10}));
+    for (content_type, expected) in [
+        ("text/html", true),
+        ("text/css; charset=utf-8", true),
+        ("TEXT/Plain", true),
+        ("application/json", false),
+        ("text", false),
+        ("text/", false),
+    ] {
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        let mut resp = HashMap::from([
+            ("content-type".to_string(), content_type.to_string()),
+            ("content-length".to_string(), "1000".to_string()),
+        ]);
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            resp.contains_key("content-encoding"),
+            expected,
+            "{content_type}: `text/*` match must be {expected}"
+        );
+    }
+
+    for rule in [
+        "*/*",
+        "*/json",
+        "application/vnd.*+json",
+        "te*t/html",
+        "text/*html",
+    ] {
+        let err = match CompressionPlugin::new(&json!({ "content_types": [rule] })) {
+            Ok(_) => panic!("{rule:?} must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.contains("content_types[0]"), "{rule}: {err}");
+        assert!(err.contains("type/subtype"), "{rule}: {err}");
+    }
+}
+
+/// M4: duplicate list entries and oversized rule lists are refused.
+#[test]
+fn duplicate_and_oversized_compression_lists_are_refused() {
+    for (config, field) in [
+        (json!({"algorithms": ["gzip", "gzip"]}), "algorithms[1]"),
+        (json!({"algorithms": ["br", "brotli"]}), "algorithms[1]"),
+        (
+            json!({"algorithms": ["zstd", "gzip", "zstd"]}),
+            "algorithms[2]",
+        ),
+        (
+            json!({"content_types": ["text/html", "TEXT/HTML"]}),
+            "content_types[1]",
+        ),
+    ] {
+        let err = match CompressionPlugin::new(&config) {
+            Ok(_) => panic!("{config} must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.contains(field), "{config}: {err}");
+        assert!(err.contains("repeats"), "{config}: {err}");
+    }
+
+    use ferrum_edge::plugins::compression::MAX_CONTENT_TYPE_RULES;
+    let rules = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|index| format!("application/x-rule-{index}"))
+            .collect()
+    };
+    assert!(
+        CompressionPlugin::new(&json!({ "content_types": rules(MAX_CONTENT_TYPE_RULES) })).is_ok()
+    );
+    let err = match CompressionPlugin::new(
+        &json!({ "content_types": rules(MAX_CONTENT_TYPE_RULES + 1) }),
+    ) {
+        Ok(_) => panic!("an over-cap content_types list must be refused"),
+        Err(err) => err,
+    };
+    assert!(err.contains("content_types"), "{err}");
+    assert!(err.contains("at most"), "{err}");
+}
+
+fn zstd_decode(encoded: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    // Decode under the RFC 9659 window cap a conforming client applies, so the
+    // round trip also proves the gateway never needs a larger window.
+    let mut decoder = zstd::stream::read::Decoder::new(encoded).expect("zstd decoder construction");
+    decoder.window_log_max(23).expect("window cap");
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .expect("gateway zstd output must decode under an 8 MB window");
+    out
+}
+
+/// compression-claude-6 / M6: `zstd` is opt-in, negotiated in configured
+/// server-preference order, and round-trips through the bounded encoder.
+#[tokio::test]
+async fn zstd_is_negotiated_in_preference_order_and_round_trips() {
+    let plugin = make_plugin(json!({
+        "algorithms": ["gzip", "br", "zstd"],
+        "min_content_length": 10
+    }));
+    for (accept_encoding, expected) in [
+        ("zstd", Some("zstd")),
+        ("gzip, br, zstd", Some("gzip")),
+        ("zstd, br", Some("br")),
+        ("zstd;q=1, gzip;q=0.5", Some("zstd")),
+        ("ZSTD", Some("zstd")),
+        ("zstd;q=0, gzip;q=0, br;q=0", None),
+    ] {
+        let mut ctx = make_ctx(Some(accept_encoding));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some(accept_encoding)).await;
+        let mut resp = json_response_headers(1000);
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            resp.get("content-encoding").map(String::as_str),
+            expected,
+            "Accept-Encoding {accept_encoding:?}"
+        );
+    }
+
+    // The default `algorithms` never offers zstd.
+    let default_plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(Some("zstd"));
+    before_proxy_with_accept_encoding(&default_plugin, &mut ctx, Some("zstd")).await;
+    let mut resp = json_response_headers(1000);
+    assert!(matches!(
+        default_plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+    assert!(!resp.contains_key("content-encoding"));
+
+    for level in [1u64, 19] {
+        let plugin = make_plugin(json!({
+            "algorithms": ["zstd"],
+            "zstd_level": level,
+            "min_content_length": 10
+        }));
+        let mut ctx = make_ctx(None);
+        let mut resp = HashMap::new();
+        plan_response_algorithm(&plugin, &mut ctx, &mut resp, "zstd").await;
+        let original = compressible_json_body();
+        let encoded = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &resp,
+            )
+            .await
+            .expect("committed zstd must be produced");
+        assert_eq!(zstd_decode(&encoded), original, "zstd_level {level}");
+    }
+}
+
+/// M6: `zstd_level` admission mirrors the RFC 9659 window cap.
+#[test]
+fn zstd_level_bounds_are_enforced() {
+    for level in [0u64, 20, 22] {
+        let err = match CompressionPlugin::new(&json!({"zstd_level": level})) {
+            Ok(_) => panic!("zstd_level {level} must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.contains("zstd_level"), "{err}");
+        assert!(err.contains("between 1 and 19"), "{err}");
+    }
+    assert!(CompressionPlugin::new(&json!({"algorithms": ["zstd"], "zstd_level": 19})).is_ok());
+}
+
+/// M6: an instance that lists `zstd` decodes `zstd` uploads through the charged
+/// strict decoder; an instance that does not still refuses them.
+#[tokio::test]
+async fn zstd_request_decompression_follows_the_instance_algorithms() {
+    let plaintext = b"zstd upload decoded once by the gateway".to_vec();
+    let compressed = zstd::stream::encode_all(&plaintext[..], 3).expect("zstd encode");
+
+    let enabled: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({
+        "decompress_request": true,
+        "algorithms": ["gzip", "br", "zstd"]
+    })))];
+    let mut ctx = make_request_ctx_with_body("zstd", &compressed);
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let mut body = compressed.clone();
+    let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &enabled,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body, plaintext);
+    assert!(!headers.contains_key("content-encoding"));
+    assert_eq!(
+        headers
+            .get("x-ferrum-original-content-encoding")
+            .map(String::as_str),
+        Some("zstd")
+    );
+
+    // Trailing bytes after the frame fail closed like gzip/br do.
+    let mut trailing = compressed.clone();
+    trailing.extend_from_slice(b"junk");
+    let mut ctx = make_request_ctx_with_body("zstd", &trailing);
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let mut body = trailing.clone();
+    match apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &enabled,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await
+    {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("trailing zstd data must be refused, got {other:?}"),
+    }
+    assert_eq!(body, trailing);
+
+    let default_plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(make_plugin(json!({"decompress_request": true})))];
+    let mut ctx = make_request_ctx_with_body("zstd", &compressed);
+    let mut headers = std::mem::take(&mut ctx.headers);
+    let mut body = compressed.clone();
+    match apply_buffered_request_body_normalization_before_before_proxy_for_test(
+        &default_plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+    )
+    .await
+    {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("zstd without the opt-in must stay unsupported, got {other:?}"),
+    }
+}
+
+/// compression-claude-8 / M8: by default a strong `ETag` still keeps the
+/// response uncoded; with `weaken_strong_etag` the coded variant keeps the weak
+/// form of the validator through the shared transform lifecycle.
+#[tokio::test]
+async fn weaken_strong_etag_compresses_and_keeps_a_weak_validator() {
+    let default_plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(Some("gzip"));
+    before_proxy_with_accept_encoding(&default_plugin, &mut ctx, Some("gzip")).await;
+    let mut resp = json_response_headers(1000);
+    resp.insert("etag".to_string(), "\"v1\"".to_string());
+    assert!(!refines_to_buffer(&default_plugin, &ctx, &resp));
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &resp);
+    assert!(matches!(
+        default_plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+    assert!(!resp.contains_key("content-encoding"));
+    assert_eq!(resp.get("etag").map(String::as_str), Some("\"v1\""));
+
+    let plugin = Arc::new(make_plugin(json!({
+        "min_content_length": 10,
+        "weaken_strong_etag": true
+    }))) as Arc<dyn Plugin>;
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    let original = compressible_json_body();
+    let mut status = 200u16;
+    let mut headers = json_response_headers(original.len());
+    headers.insert("etag".to_string(), "\"v1\"".to_string());
+    assert!(
+        plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &headers
+        ),
+        "a weakenable strong ETag must keep the body for the encode"
+    );
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, status, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(headers.get("etag").map(String::as_str), Some("W/\"v1\""));
+
+    let mut body = bytes::Bytes::from(original.clone());
+    let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    assert!(!replaced);
+    assert!(rewritten);
+    assert_eq!(
+        headers.get("etag").map(String::as_str),
+        Some("W/\"v1\""),
+        "the coded variant keeps the weak validator after stale-validator cleanup"
+    );
+    assert_eq!(gunzip_bytes(&body), original);
+}
+
+/// M8: a validator with no weak form still blocks, and an aborted encode puts
+/// the origin's strong validator back on the restored identity body.
+#[tokio::test]
+async fn weaken_strong_etag_refuses_malformed_validators_and_restores_on_abort() {
+    use ferrum_edge::_test_support::{
+        reconcile_aborted_gateway_response_encoding_for_test,
+        take_compression_response_buffer_permit_for_test,
+    };
+    let plugin = make_plugin(json!({"min_content_length": 10, "weaken_strong_etag": true}));
+    for malformed in ["v1", "\"a\", \"b\"", "\"has space\""] {
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        let mut resp = json_response_headers(1000);
+        resp.insert("etag".to_string(), malformed.to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !resp.contains_key("content-encoding"),
+            "{malformed:?} has no weak form, so it must still be preserved"
+        );
+        assert_eq!(resp.get("etag").map(String::as_str), Some(malformed));
+    }
+
+    let mut ctx = make_ctx(Some("gzip"));
+    before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+    let mut resp = json_response_headers(1000);
+    resp.insert("etag".to_string(), "\"v2\"".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(resp.get("etag").map(String::as_str), Some("W/\"v2\""));
+    let _ = take_compression_response_buffer_permit_for_test(&mut ctx);
+    let mut body = bytes::Bytes::from(compressible_json_body());
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &resp)
+            .await
+            .is_none()
+    );
+    let mut status = 200;
+    assert!(!reconcile_aborted_gateway_response_encoding_for_test(
+        &mut ctx,
+        &mut status,
+        &mut resp,
+        &mut body,
+    ));
+    assert!(!resp.contains_key("content-encoding"));
+    assert_eq!(
+        resp.get("etag").map(String::as_str),
+        Some("\"v2\""),
+        "the identity body is the origin's bytes, so it gets the origin validator back"
+    );
+}
+
+/// Drive an optional `response_transformer` body rule (4000) then
+/// `compression` with `weaken_strong_etag` through `after_proxy` and the shared
+/// buffered body lifecycle, production order, for a strong-`ETag` JSON
+/// response. `None` runs compression alone (the no-rewrite control).
+async fn run_weakening_lifecycle_after_body_rule(
+    body_rule: Option<serde_json::Value>,
+) -> (bool, HashMap<String, String>, bytes::Bytes, RequestContext) {
+    use ferrum_edge::plugins::response_transformer::ResponseTransformer;
+    let compression = Arc::new(make_plugin(json!({
+        "algorithms": ["gzip"],
+        "min_content_length": 0,
+        "weaken_strong_etag": true
+    }))) as Arc<dyn Plugin>;
+    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    if let Some(rule) = body_rule {
+        plugins.push(Arc::new(
+            ResponseTransformer::new(&json!({ "rules": [rule] })).expect("valid transformer"),
+        ));
+    }
+    plugins.push(compression);
+
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    for plugin in &plugins {
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    }
+    let original = br#"{"state":"private","note":"origin representation"}"#.to_vec();
+    let mut status = 200u16;
+    let mut headers = json_response_headers(original.len());
+    headers.insert("etag".to_string(), "\"v1\"".to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    for plugin in &plugins {
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, status, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(headers.get("etag").map(String::as_str), Some("W/\"v1\""));
+
+    let mut body = bytes::Bytes::from(original);
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    (rewritten, headers, body, ctx)
+}
+
+/// PR6848-SOL-1: a semantic body rewrite retires the origin validator, and the
+/// weakening must not resurrect it on the encoded, DIFFERENT document.
+#[tokio::test]
+async fn weaken_strong_etag_does_not_resurrect_a_validator_after_a_semantic_rewrite() {
+    let (rewritten, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(Some(
+        json!({"operation": "update", "target": "body", "key": "state", "value": "public"}),
+    ))
+    .await;
+    assert!(rewritten);
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&gunzip_bytes(&body)).expect("encoded body is the rewritten JSON");
+    assert_eq!(decoded["state"], "public");
+    assert!(
+        headers.keys().all(|key| !key.eq_ignore_ascii_case("etag")),
+        "the origin validator does not describe the rewritten document: {headers:?}"
+    );
+}
+
+/// PR6848-SOL-1 control: with no semantic rewrite, compression alone still
+/// keeps the weak validator through the full lifecycle.
+#[tokio::test]
+async fn weaken_strong_etag_keeps_the_weak_validator_when_no_semantic_rewrite_ran() {
+    let (rewritten, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(None).await;
+    assert!(rewritten, "compression still encoded the body");
+    assert_eq!(headers.get("etag").map(String::as_str), Some("W/\"v1\""));
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&gunzip_bytes(&body)).expect("encoded body is the origin JSON");
+    assert_eq!(decoded["state"], "private");
+}
+
+/// PR6848-SOL-1: an encode abort after a semantic rewrite must not put the
+/// origin's strong validator on the rewritten identity body either.
+#[tokio::test]
+async fn weaken_strong_etag_abort_after_a_semantic_rewrite_does_not_restore_the_origin_validator() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+    with_test_codec_budget(0, || async {
+        let (_, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(Some(
+            json!({"operation": "update", "target": "body", "key": "state", "value": "public"}),
+        ))
+        .await;
+        assert!(
+            !headers.contains_key("content-encoding"),
+            "codec saturation restores the identity representation"
+        );
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&body).expect("identity body is the rewritten JSON");
+        assert_eq!(decoded["state"], "public");
+        assert!(
+            headers.keys().all(|key| !key.eq_ignore_ascii_case("etag")),
+            "the rewritten identity body must not carry the origin validator: {headers:?}"
+        );
+    })
+    .await;
+}
+
+/// PR6848-SOL-1 control: an abort with no semantic rewrite still restores the
+/// origin validator, because the identity body is then the origin's bytes.
+#[tokio::test]
+async fn weaken_strong_etag_abort_without_a_rewrite_restores_the_origin_validator() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+    with_test_codec_budget(0, || async {
+        let (_, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(None).await;
+        assert!(!headers.contains_key("content-encoding"));
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&body).expect("identity body is the origin JSON");
+        assert_eq!(decoded["state"], "private");
+        assert_eq!(headers.get("etag").map(String::as_str), Some("\"v1\""));
+    })
+    .await;
 }

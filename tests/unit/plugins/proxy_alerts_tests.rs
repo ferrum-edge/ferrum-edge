@@ -2466,11 +2466,15 @@ fn grpc_status_count_keeps_http_status_distinct_across_shapes() {
             observation.breach
         );
         assert_eq!(
-            observation.sample_count,
-            if expect_match { 1 } else { 0 },
-            "{case}: matched count"
+            observation.sample_count, 1,
+            "{case}: every gRPC transaction counts toward the window total"
         );
         let rendered = observation.render(&parsed.rules[0]);
+        assert_eq!(
+            rendered.observed,
+            if expect_match { "1" } else { "0" },
+            "{case}: matched count"
+        );
         assert!(
             rendered.reason.contains("gRPC transactions"),
             "{case}: reason should name gRPC, got {}",
@@ -2605,8 +2609,13 @@ fn grpc_status_count_zero_ok_can_be_selected_explicitly() {
         .unwrap();
     assert!(obs3.breach);
     assert_eq!(
-        obs3.sample_count, 2,
+        obs3.render(&parsed.rules[0]).observed,
+        "2",
         "non-OK must not increase an OK-only matched count"
+    );
+    assert_eq!(
+        obs3.sample_count, 3,
+        "sample_count is the gRPC window total, matched or not"
     );
 }
 
@@ -2689,11 +2698,13 @@ fn grpc_status_count_trigger_and_resolve_via_recovery_gate() {
         LifecycleOutcome::Trigger
     );
     gate.settle_trigger_success(1, "grpc-p", 0, 1_000, 1_000);
-    // Still active while above threshold.
+    // Still active while above threshold: a reminder is reserved and, once
+    // its delivery settles, the incident is Active again.
     assert_eq!(
         gate.observe(1, "grpc-p", true, 60_000, 2_000, 0),
         LifecycleOutcome::StillActive
     );
+    gate.settle_trigger_success(1, "grpc-p", 0, 2_000, 2_000);
     // Drop below threshold → recovering, then resolve after quiet window.
     assert_eq!(
         gate.observe(1, "grpc-p", false, 60_000, 3_000, 0),
@@ -3054,4 +3065,475 @@ fn startup_diagnostics_preserve_second_rule_threshold_errors_for_every_kind() {
             &[],
         );
     }
+}
+
+// ------------------------------------------- Launch-review regression coverage
+
+fn ws_context_with_termination(
+    reason: Option<&str>,
+    direction: Option<Direction>,
+    error_class: Option<ErrorClass>,
+) -> WsDisconnectContext {
+    let mut ctx = WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "p1".to_string(),
+        proxy_lifecycle_generation: None,
+        proxy_name: Some("api".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://backend".to_string(),
+        http_method: "GET".to_string(),
+        request_path: "/".to_string(),
+        handshake_status_code: 101,
+        listen_port: 443,
+        duration_ms: 10.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 1,
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
+        timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
+        direction,
+        io_side: None,
+        error_class,
+        consumer_username: None,
+        auth_method: None,
+        connection_id: 0,
+        metadata: Default::default(),
+    };
+    if let Some(reason) = reason {
+        ctx.metadata.insert(
+            "websocket.termination_reason".to_string(),
+            reason.to_string(),
+        );
+    }
+    ctx
+}
+
+fn ws_cause_rules() -> ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig {
+    parse_config(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [
+            { "name": "policy_closes", "type": "stream_disconnect_cause",
+              "causes": ["gateway_policy"], "threshold_count": 1, "channels": ["c"] },
+            { "name": "graceful_closes", "type": "stream_disconnect_cause",
+              "causes": ["graceful_shutdown"], "threshold_count": 1, "channels": ["c"] },
+            { "name": "timeouts", "type": "stream_disconnect_cause",
+              "causes": ["idle_timeout"], "threshold_count": 1, "channels": ["c"] }
+        ]
+    }))
+    .unwrap()
+}
+
+/// (policy, graceful, idle_timeout) breach flags for one WebSocket disconnect.
+fn ws_cause_matches(ctx: &WsDisconnectContext) -> (bool, bool, bool) {
+    let parsed = ws_cause_rules();
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+    let breach = |idx: usize| {
+        parsed.rules[idx]
+            .observe(SampleInput::WebSocket(ctx), &store, 1_000)
+            .expect("websocket disconnects feed stream_disconnect_cause rules")
+            .breach
+    };
+    (breach(0), breach(1), breach(2))
+}
+
+#[test]
+fn websocket_policy_terminations_match_gateway_policy_not_graceful_shutdown() {
+    // Credential expiry, client-trust withdrawal, and the absolute maximum
+    // lifetime close the session with a policy Close frame and no relay error.
+    for reason in ["credential_expired", "trust_withdrawn", "max_lifetime"] {
+        let ctx = ws_context_with_termination(Some(reason), None, None);
+        assert_eq!(
+            ws_cause_matches(&ctx),
+            (true, false, false),
+            "{reason}: a policy close must count as gateway_policy, never graceful_shutdown"
+        );
+        // The bounded close-delivery grace can still record a timeout for the
+        // remaining half; the policy decision stays the disconnect cause.
+        let grace_timeout = ws_context_with_termination(
+            Some(reason),
+            Some(Direction::BackendToClient),
+            Some(ErrorClass::ReadWriteTimeout),
+        );
+        assert_eq!(
+            ws_cause_matches(&grace_timeout),
+            (true, false, false),
+            "{reason}: a close-grace timeout must not mask the policy cause"
+        );
+    }
+}
+
+#[test]
+fn websocket_peer_close_drain_and_timeouts_keep_their_causes() {
+    for reason in [Some("normal_peer_close"), Some("drain"), None] {
+        let ctx = ws_context_with_termination(reason, None, None);
+        assert_eq!(
+            ws_cause_matches(&ctx),
+            (false, true, false),
+            "{reason:?}: clean close / drain stays graceful_shutdown"
+        );
+    }
+    let idle = ws_context_with_termination(
+        Some("idle_timeout"),
+        None,
+        Some(ErrorClass::ReadWriteTimeout),
+    );
+    assert_eq!(
+        ws_cause_matches(&idle),
+        (false, false, true),
+        "a relay read/write timeout stays idle_timeout"
+    );
+}
+
+#[test]
+fn count_rule_sample_count_reports_window_total_not_matched_count() {
+    let parsed = parse_config(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [
+            { "name": "server_errors", "type": "status_code_count",
+              "status_codes": [500], "threshold_count": 2, "channels": ["c"] }
+        ]
+    }))
+    .unwrap();
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+    let mut last = None;
+    for (idx, status) in [200u16, 500, 200, 500, 200].into_iter().enumerate() {
+        let summary = TransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: Some("p1".to_string()),
+            response_status_code: status,
+            ..TransactionSummary::default()
+        };
+        last = parsed.rules[0].observe(SampleInput::Http(&summary), &store, 1_000 + idx as u64);
+    }
+    let observation = last.expect("status_code_count observes HTTP summaries");
+    assert!(observation.breach);
+    assert_eq!(
+        observation.sample_count, 5,
+        "${{sample_count}} / Samples must be the window total, as documented"
+    );
+    assert_eq!(observation.render(&parsed.rules[0]).observed, "2");
+}
+
+#[test]
+fn reminder_trigger_holds_recovery_until_it_settles() {
+    let gate = RecoveryGate::new();
+    assert_eq!(
+        gate.observe(1, "p", true, 5_000, 1_000, 0),
+        LifecycleOutcome::Trigger
+    );
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
+
+    // A reminder reserves an in-flight seat instead of leaving Active in place.
+    assert_eq!(
+        gate.observe(1, "p", true, 5_000, 2_000, 0),
+        LifecycleOutcome::StillActive
+    );
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingReminder {
+            fired_at_ms: 1_000,
+            reserved_at_ms: 2_000,
+        })
+    );
+
+    // While it is on the wire, recovery cannot start and no Resolve can be
+    // reserved — however long the rule has been healthy — and a continued
+    // breach does not reserve a duplicate reminder.
+    for now_ms in [3_000, 60_000] {
+        assert_eq!(
+            gate.evaluate(1, "p", false, 5_000, now_ms, 0),
+            LifecycleOutcome::Quiet
+        );
+        assert_eq!(
+            gate.observe(1, "p", false, 5_000, now_ms, 0),
+            LifecycleOutcome::Quiet,
+            "a Resolve admitted now could be overtaken by the in-flight reminder"
+        );
+    }
+    assert_eq!(
+        gate.observe(1, "p", true, 5_000, 60_001, 0),
+        LifecycleOutcome::Quiet
+    );
+
+    // A stale token cannot settle the seat; the matching one returns Active.
+    gate.settle_trigger_success(1, "p", 0, 1_999, 1_999);
+    assert!(matches!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingReminder { .. })
+    ));
+    gate.settle_trigger_success(1, "p", 0, 2_000, 2_000);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::Active { fired_at_ms: 2_000 })
+    );
+
+    // Only now does recovery run, ending in the single Resolve.
+    assert_eq!(
+        gate.observe(1, "p", false, 5_000, 61_000, 0),
+        LifecycleOutcome::EnteringRecovery
+    );
+    assert_eq!(
+        gate.observe(1, "p", false, 5_000, 66_000, 0),
+        LifecycleOutcome::Resolve
+    );
+}
+
+#[test]
+fn failed_or_unadmitted_reminder_returns_to_active_not_healthy() {
+    let gate = RecoveryGate::new();
+    gate.observe(1, "p", true, 5_000, 1_000, 0);
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
+
+    // Failed / abandoned reminder delivery: the incident was already delivered,
+    // so it stays Active (never Healthy) and recovery may proceed.
+    assert_eq!(
+        gate.observe(1, "p", true, 5_000, 2_000, 0),
+        LifecycleOutcome::StillActive
+    );
+    gate.settle_trigger_failure(1, "p", 0, 2_000);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::Active { fired_at_ms: 1_000 })
+    );
+
+    // A reminder the dispatch path reserved but never admitted (cooldown or
+    // permit lost a race) is rolled back the same way.
+    assert_eq!(
+        gate.observe(1, "p", true, 5_000, 3_000, 0),
+        LifecycleOutcome::StillActive
+    );
+    gate.rollback_unadmitted_reservation(1, "p", 0, LifecycleOutcome::StillActive, 2_999);
+    assert!(
+        matches!(
+            gate.current_state(1, "p", 0),
+            Some(RuleState::PendingReminder { .. })
+        ),
+        "a mismatched rollback token must not clear the live reminder seat"
+    );
+    gate.rollback_unadmitted_reservation(1, "p", 0, LifecycleOutcome::StillActive, 3_000);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::Active { fired_at_ms: 1_000 })
+    );
+    assert_eq!(
+        gate.observe(1, "p", false, 5_000, 4_000, 0),
+        LifecycleOutcome::EnteringRecovery
+    );
+}
+
+#[test]
+fn established_window_lookups_do_not_wait_on_the_generation_writer_lock() {
+    let store = std::sync::Arc::new(WindowStore::new(std::collections::HashMap::from([(
+        1,
+        RuleWindowSpec {
+            window_seconds: 60,
+            kind: WindowKind::Counter,
+        },
+    )])));
+    // Establish the generation row (the only path that needs the writer lock).
+    store.record_count(1, "ferrum|p1", 7, true, 1_000);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (result, reader) = store
+        .with_generation_writer_lock_for_test(1, "ferrum|p1", || {
+            let reader_store = std::sync::Arc::clone(&store);
+            let reader = std::thread::spawn(move || {
+                let fused = reader_store.record_count_and_snapshot(1, "ferrum|p1", 7, false, 1_001);
+                let snapshot = reader_store.snapshot_count(1, "ferrum|p1", 7, 1_002);
+                let _ = tx.send((fused, snapshot));
+            });
+            // Wait while still holding the writer lock: an established hit must
+            // be served from the published snapshot, not queue on the mutex.
+            (rx.recv_timeout(std::time::Duration::from_secs(5)), reader)
+        })
+        .expect("the window row was established above");
+    reader.join().expect("reader thread");
+    let (fused, snapshot) =
+        result.expect("established record/snapshot must not block on the generation writer lock");
+    assert_eq!(fused, (1, 2));
+    assert_eq!(snapshot, (1, 2));
+}
+
+#[test]
+fn fused_record_and_snapshot_matches_split_record_then_snapshot() {
+    let specs = || {
+        std::collections::HashMap::from([
+            (
+                1,
+                RuleWindowSpec {
+                    window_seconds: 10,
+                    kind: WindowKind::Counter,
+                },
+            ),
+            (
+                2,
+                RuleWindowSpec {
+                    window_seconds: 10,
+                    kind: WindowKind::Histogram,
+                },
+            ),
+        ])
+    };
+    let fused = WindowStore::new(specs());
+    let split = WindowStore::new(specs());
+    for (idx, (matched, latency)) in [(true, 3.0), (false, 700.0), (true, 40.0), (false, 9_000.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let now_ms = 1_000 + (idx as u64) * 3_000;
+        split.record_count(1, "ferrum|p1", 0, matched, now_ms);
+        assert_eq!(
+            fused.record_count_and_snapshot(1, "ferrum|p1", 0, matched, now_ms),
+            split.snapshot_count(1, "ferrum|p1", 0, now_ms)
+        );
+        split.record_latency(2, "ferrum|p1", 0, latency, now_ms);
+        assert_eq!(
+            fused.record_latency_and_percentile(2, "ferrum|p1", 0, latency, 95, now_ms),
+            split.snapshot_percentile(2, "ferrum|p1", 0, 95, now_ms)
+        );
+    }
+}
+
+#[test]
+fn incident_key_correlates_trigger_and_resolve_per_policy_rule_and_proxy() {
+    use ferrum_edge::notifications::EventAction;
+    use ferrum_edge::plugins::proxy_alerts::render::{
+        AlertSubject, build_webhook_vars, incident_key,
+    };
+
+    let parsed = parse_config(&minimal_config()).unwrap();
+    let rule = &parsed.rules[0];
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+    let summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: Some("p1".to_string()),
+        proxy_name: Some("api".to_string()),
+        response_status_code: 500,
+        ..TransactionSummary::default()
+    };
+    let observation = rule
+        .observe(SampleInput::Http(&summary), &store, 1_000)
+        .expect("error_rate observes HTTP summaries");
+    let subject = AlertSubject {
+        namespace: "ferrum",
+        proxy_id: Some("p1"),
+        proxy_name: Some("api"),
+    };
+    let vars = |subject: AlertSubject<'_>, policy: &str, action: EventAction| {
+        build_webhook_vars(rule, &observation, subject, policy, action, Utc::now())
+    };
+    let trigger = vars(subject, "alerts-a", EventAction::Trigger);
+    let resolve = vars(subject, "alerts-a", EventAction::Resolve);
+    let key = trigger["incident_key"].clone();
+    assert_eq!(
+        key, resolve["incident_key"],
+        "Resolve must close the Trigger's incident"
+    );
+    assert_eq!(key, incident_key("alerts-a", "ferrum", "p1", "proxy_5xx"));
+    assert_eq!(key.len(), 4 + 64);
+    assert!(key.starts_with("pa1-"));
+    assert!(
+        key[4..]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+
+    // A display-name change does not move the incident.
+    let renamed = AlertSubject {
+        proxy_name: Some("renamed"),
+        ..subject
+    };
+    assert_eq!(
+        key,
+        vars(renamed, "alerts-a", EventAction::Resolve)["incident_key"]
+    );
+
+    // Another proxy_alerts instance on the same proxy that reuses the rule
+    // name is a different incident: its Resolve cannot close this one.
+    assert_ne!(
+        key,
+        vars(subject, "alerts-b", EventAction::Resolve)["incident_key"],
+        "the plugin-config identity must scope the incident key"
+    );
+
+    // Different policies, proxies, tenants, and rules are different incidents,
+    // and the fields cannot collide by concatenation.
+    let base = incident_key("pc", "ferrum", "p1", "r");
+    assert_ne!(base, incident_key("pc2", "ferrum", "p1", "r"));
+    assert_ne!(base, incident_key("pc", "ferrum", "p2", "r"));
+    assert_ne!(base, incident_key("pc", "other", "p1", "r"));
+    assert_ne!(base, incident_key("pc", "ferrum", "p1", "s"));
+    assert_ne!(
+        incident_key("pc", "a|b", "c", "r"),
+        incident_key("pc", "a", "b|c", "r")
+    );
+    assert_ne!(
+        incident_key("pcferrum", "", "p1", "r"),
+        incident_key("pc", "ferrum", "p1", "r")
+    );
+}
+
+#[test]
+fn blank_plugin_config_id_is_rejected() {
+    let err =
+        ProxyAlerts::new_with_config_id(&minimal_config(), http_client(), Some("  ")).unwrap_err();
+    assert!(err.contains("plugin config id"), "got: {err}");
+    assert!(
+        ProxyAlerts::new_with_config_id(&minimal_config(), http_client(), Some("alerts-a")).is_ok()
+    );
+}
+
+#[test]
+fn documented_pagerduty_examples_correlate_on_incident_key() {
+    let docs = include_str!("../../../docs/proxy_alerts.md");
+    assert!(
+        docs.contains(r#"\"dedup_key\":\"${incident_key}\""#),
+        "the PagerDuty example must send dedup_key so Resolve closes the incident"
+    );
+    assert!(docs.contains("| `${incident_key}` |"));
+    let openapi = include_str!("../../../openapi.yaml");
+    assert!(openapi.contains(r#""dedup_key":"${incident_key}""#));
+}
+
+#[test]
+fn offline_instance_has_no_lifecycle_task() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    assert_eq!(plugin.lifecycle_task_finished_for_test(), None);
+}
+
+#[tokio::test]
+async fn lifecycle_task_does_not_keep_a_dropped_instance_alive() {
+    let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
+    assert_eq!(
+        plugin.lifecycle_task_finished_for_test(),
+        Some(false),
+        "a runtime instance owns a background lifecycle task"
+    );
+    let alive = plugin.core_alive_probe_for_test();
+    assert!(alive());
+    drop(plugin);
+    assert!(
+        !alive(),
+        "the lifecycle task must hold only a weak handle and stop with the instance"
+    );
 }

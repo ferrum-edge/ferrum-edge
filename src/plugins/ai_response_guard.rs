@@ -5,11 +5,16 @@
 //! guardrails including PII detection in responses, keyword/phrase blocklists,
 //! and response format validation.
 //!
-//! Built-in PII patterns: SSN, credit card, email, US phone, API keys, AWS keys,
-//! IPv4 addresses, and IBAN (shared with ai_prompt_shield).
+//! Built-in PII patterns: SSN, credit card (Luhn-confirmed), email, US phone,
+//! API keys, AWS keys, IPv4/IPv6 addresses, and IBAN (shared with
+//! ai_prompt_shield and ai_transcript_audit). An instance `allowlist` excuses
+//! exact values or whole-match patterns from PII findings.
 //!
 //! Actions: reject (return error to client), redact (replace matches with placeholders),
-//! or warn (add metadata/headers but pass through).
+//! or warn (record `ai_response_guard_*` metadata and pass through; no response
+//! header is added). Content rules govern successful (2xx) responses; the size
+//! bound applies to every buffered status, and a `redact` transform may still
+//! rewrite a buffered non-2xx body it can parse.
 //!
 //! Native gRPC responses are inspected only for methods an operator explicitly
 //! enrolled under the `grpc` config block. Enrolled methods are decoded against
@@ -45,7 +50,8 @@ use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{
     AnthropicEvent, MAX_OPENAI_STREAM_ACCUMULATORS, SseEventName, SseReassembler, SseTextKind,
     is_text_event_stream_media_type, is_tgi_stream_frame, original_response_is_event_stream,
-    parse_sse_data_frames_checked, split_sse_line_terminator, sse_lines_inclusive, strip_sse_boms,
+    parse_sse_data_frames_checked, split_sse_line_terminator, sse_lines, sse_lines_inclusive,
+    strip_sse_boms,
 };
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -90,8 +96,22 @@ const CONFIG_KEYS: &[&str] = &[
     "require_json",
     "required_fields",
     "max_completion_length",
+    "allowlist",
     "grpc",
 ];
+
+/// Closed key set for the `allowlist` config block.
+const ALLOWLIST_CONFIG_KEYS: &[&str] = &["values", "patterns"];
+
+/// Hard ceiling on `allowlist.values` entries.
+const MAX_ALLOWLIST_VALUES: usize = 1024;
+
+/// Upper bound on one `allowlist.values` entry, in UTF-8 bytes.
+const MAX_ALLOWLIST_VALUE_BYTES: usize = 1024;
+
+/// Hard ceiling on `allowlist.patterns` entries (each is compiled into the
+/// allowlist `RegexSet`).
+const MAX_ALLOWLIST_PATTERNS: usize = 256;
 
 /// Closed key set for the `grpc` config block.
 pub const AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS: &[&str] = &[
@@ -180,6 +200,129 @@ struct ContentPattern {
     /// already substituted with `name`. Built once at config-load time so
     /// `redact_text` does not re-render the template per pattern per call.
     placeholder: String,
+    /// Built-in post-match validator (the `credit_card` Luhn checksum). A
+    /// regex match it refuses is not a finding: it is neither detected nor
+    /// redacted, and it is not residual content.
+    validator: Option<fn(&str) -> bool>,
+    /// Whether the instance `allowlist` applies. True for built-in and custom
+    /// PII patterns; blocked phrases and blocked patterns are never excused.
+    allowlistable: bool,
+}
+
+impl ContentPattern {
+    /// Whether one regex match of this pattern is a finding. Every detector,
+    /// redactor, and residual re-scan asks this same question, so a match the
+    /// guard declines to report is also one it never rewrites and never
+    /// treats as residual.
+    fn counts(&self, matched: &str, allowlist: &PiiAllowlist) -> bool {
+        if self.validator.is_some_and(|valid| !valid(matched)) {
+            return false;
+        }
+        !(self.allowlistable && allowlist.allows(matched))
+    }
+
+    /// Whether a regex match must be confirmed by [`Self::counts`] before it
+    /// is reported. False on the common path, where any match is a finding.
+    fn needs_confirmation(&self, allowlist: &PiiAllowlist) -> bool {
+        self.validator.is_some() || (self.allowlistable && !allowlist.is_empty())
+    }
+}
+
+/// Operator `allowlist`: exact matched values and whole-match regexes that are
+/// never PII findings (for example a public support address, or a
+/// card-shaped order-number family).
+///
+/// Compared against the COMPLETE matched text of a PII pattern — an allowed
+/// value embedded in a longer match does not excuse that match. Applies only to
+/// `pii_patterns` and `custom_pii_patterns`.
+#[derive(Debug, Default)]
+struct PiiAllowlist {
+    values: HashSet<String>,
+    /// Each operator pattern anchored as `^(?:…)$`.
+    patterns: Option<RegexSet>,
+}
+
+impl PiiAllowlist {
+    fn is_empty(&self) -> bool {
+        self.values.is_empty() && self.patterns.is_none()
+    }
+
+    fn allows(&self, matched: &str) -> bool {
+        self.values.contains(matched)
+            || self
+                .patterns
+                .as_ref()
+                .is_some_and(|patterns| patterns.is_match(matched))
+    }
+}
+
+/// Parse the optional closed `allowlist` block.
+fn parse_allowlist(config: &Value) -> Result<PiiAllowlist, String> {
+    let Some(block) = config.get("allowlist") else {
+        return Ok(PiiAllowlist::default());
+    };
+    if !block.is_object() {
+        return Err("ai_response_guard: `allowlist` must be an object".to_string());
+    }
+    reject_unknown_keys(block, ALLOWLIST_CONFIG_KEYS, "allowlist")?;
+    let mut allowlist = PiiAllowlist::default();
+    if let Some(values) = block.get("values") {
+        let Some(values) = values.as_array() else {
+            return Err("ai_response_guard: `allowlist.values` must be an array".to_string());
+        };
+        if values.len() > MAX_ALLOWLIST_VALUES {
+            return Err(format!(
+                "ai_response_guard: `allowlist.values` must have at most {MAX_ALLOWLIST_VALUES} entries"
+            ));
+        }
+        for (idx, value) in values.iter().enumerate() {
+            let Some(value) = value.as_str() else {
+                return Err(format!(
+                    "ai_response_guard: `allowlist.values[{idx}]` must be a string"
+                ));
+            };
+            if value.is_empty() || value.len() > MAX_ALLOWLIST_VALUE_BYTES {
+                return Err(format!(
+                    "ai_response_guard: `allowlist.values[{idx}]` must be 1 to {MAX_ALLOWLIST_VALUE_BYTES} UTF-8 bytes"
+                ));
+            }
+            allowlist.values.insert(value.to_string());
+        }
+    }
+    if let Some(patterns) = block.get("patterns") {
+        let Some(patterns) = patterns.as_array() else {
+            return Err("ai_response_guard: `allowlist.patterns` must be an array".to_string());
+        };
+        if patterns.len() > MAX_ALLOWLIST_PATTERNS {
+            return Err(format!(
+                "ai_response_guard: `allowlist.patterns` must have at most {MAX_ALLOWLIST_PATTERNS} entries"
+            ));
+        }
+        let mut anchored = Vec::with_capacity(patterns.len());
+        for (idx, pattern) in patterns.iter().enumerate() {
+            let Some(pattern) = pattern.as_str().filter(|pattern| !pattern.is_empty()) else {
+                return Err(format!(
+                    "ai_response_guard: `allowlist.patterns[{idx}]` must be a non-empty string"
+                ));
+            };
+            // Compile the operator text on its own first, so it cannot close the
+            // anchoring group (`a)|(b`) and turn a whole-match rule into a
+            // substring rule.
+            let source = format!("^(?:{pattern})$");
+            if Regex::new(pattern).is_err() || Regex::new(&source).is_err() {
+                return Err(format!(
+                    "ai_response_guard: `allowlist.patterns[{idx}]` is invalid or too complex"
+                ));
+            }
+            anchored.push(source);
+        }
+        if !anchored.is_empty() {
+            allowlist.patterns = Some(RegexSet::new(anchored).map_err(|_| {
+                "ai_response_guard: `allowlist.patterns` set is invalid or too complex".to_string()
+            })?);
+        }
+    }
+    Ok(allowlist)
 }
 
 /// Aggregate output/work allowance for one structured redaction pass over one
@@ -307,8 +450,8 @@ impl LiveCapacityLedger {
 ///
 /// Growth is reserved explicitly (doubling, capped at `room`) rather than left
 /// to `push_str`, whose geometric growth could allocate past the bound before
-/// any length check sees it.
-fn push_within_capacity(output: &mut String, value: &str, room: usize) -> bool {
+/// any length check sees it. Shared with `ai_prompt_shield`.
+pub(crate) fn push_within_capacity(output: &mut String, value: &str, room: usize) -> bool {
     let Some(needed) = output.len().checked_add(value.len()) else {
         return false;
     };
@@ -325,27 +468,34 @@ fn push_within_capacity(output: &mut String, value: &str, room: usize) -> bool {
     true
 }
 
-/// Sequential literal replacement under a live-capacity bound.
+/// Sequential literal replacement under a live-capacity bound, where each pass
+/// carries a context `T` and only matches `admit(&context, matched_text)`
+/// accepts are replaced; the rest are copied through verbatim.
 ///
 /// Every pass reads the previous pass's output while writing the next one, so
 /// two buffers are live at once: the new buffer may only use `limit` minus the
 /// capacity of the still-resident intermediate (the borrowed input text is
 /// already charged by its owner). Replacement is literal (the
-/// `regex::NoExpand` contract). A zero-width match is refused: admission
-/// rejects patterns that match the empty string, but a contextual assertion
-/// (`\b`) can still produce an empty span beside non-empty input. `None` is a
-/// refusal; the returned string is compacted to its length so no amplified
-/// intermediate capacity is retained. Shared with `ai_prompt_shield`.
-pub(crate) fn replace_sequentially_bounded<'p>(
+/// `regex::NoExpand` contract). A zero-width match is refused whether or not
+/// it would be admitted: admission rejects patterns that match the empty
+/// string, but a contextual assertion (`\b`) can still produce an empty span
+/// beside non-empty input. `None` is a refusal; the returned string is
+/// compacted to its length so no amplified intermediate capacity is retained.
+/// `ai_prompt_shield` keeps the same allocation contract in its own variant,
+/// which also bounds match-walk work.
+fn replace_sequentially_bounded_admitting<'p, T>(
     text: &str,
-    passes: impl Iterator<Item = (&'p Regex, &'p str)>,
+    passes: impl Iterator<Item = (&'p Regex, &'p str, T)>,
     limit: usize,
+    admit: impl Fn(&T, &str) -> bool,
 ) -> Option<String> {
     let mut current: Option<String> = None;
-    for (regex, placeholder) in passes {
+    for (regex, placeholder, context) in passes {
         let replaced = {
             let input: &str = current.as_deref().unwrap_or(text);
-            let mut matches = regex.find_iter(input);
+            let mut matches = regex.find_iter(input).filter(|matched| {
+                matched.start() == matched.end() || admit(&context, matched.as_str())
+            });
             let Some(first_match) = matches.next() else {
                 continue;
             };
@@ -394,7 +544,7 @@ pub(crate) fn json_escaped_len(text: &str) -> usize {
 /// pattern's pre-rendered placeholder, under `budget`.
 ///
 /// Live allocations are bounded by what the shared allowance can still pay for
-/// (see [`replace_sequentially_bounded`]), and only net growth of the
+/// (see [`replace_sequentially_bounded_admitting`]), and only net growth of the
 /// JSON-escaped form is charged, so a non-expanding redaction spends nothing.
 /// On refusal the ORIGINAL text is returned and the budget is marked failed.
 /// Every caller re-verifies its candidate (or checks the budget) and fails
@@ -402,16 +552,18 @@ pub(crate) fn json_escaped_len(text: &str) -> usize {
 fn redact_scalar_bounded<'p>(
     text: &str,
     patterns: impl Iterator<Item = &'p ContentPattern>,
+    allowlist: &PiiAllowlist,
     budget: &RedactionBudget,
 ) -> String {
     if budget.is_exhausted() {
         return text.to_string();
     }
     let limit = text.len().saturating_add(budget.remaining.get());
-    let Some(result) = replace_sequentially_bounded(
+    let Some(result) = replace_sequentially_bounded_admitting(
         text,
-        patterns.map(|pattern| (&pattern.regex, pattern.placeholder.as_str())),
+        patterns.map(|pattern| (&pattern.regex, pattern.placeholder.as_str(), pattern)),
         limit,
+        |pattern, matched| pattern.counts(matched, allowlist),
     ) else {
         budget.fail();
         return text.to_string();
@@ -511,6 +663,12 @@ pub struct AiResponseGuard {
     required_fields: Vec<String>,
     /// Maximum allowed completion length in characters (0 = unlimited).
     max_completion_length: usize,
+    /// Operator exceptions for PII findings (see [`PiiAllowlist`]).
+    allowlist: PiiAllowlist,
+    /// True when some pattern's regex matches must be confirmed per match
+    /// (a built-in validator, or an allowlist that applies to it). False keeps
+    /// detection on the single `RegexSet` pass.
+    match_filtering: bool,
     /// Native-gRPC inspection contract. `None` when the operator did not
     /// configure a `grpc` block, which keeps every gRPC response outside this
     /// plugin's scope (no buffering vote, no inspection, no transform).
@@ -658,6 +816,8 @@ impl AiResponseGuard {
                             name: full_name,
                             regex,
                             placeholder,
+                            validator: crate::plugins::utils::ai_pii::builtin_pii_validator(name),
+                            allowlistable: true,
                         });
                     }
                     Err(_) => {
@@ -716,6 +876,8 @@ impl AiResponseGuard {
                             name: full_name,
                             regex,
                             placeholder,
+                            validator: None,
+                            allowlistable: true,
                         });
                     }
                     Err(_) => {
@@ -756,6 +918,8 @@ impl AiResponseGuard {
                             name,
                             regex,
                             placeholder,
+                            validator: None,
+                            allowlistable: false,
                         });
                     }
                     Err(_) => {
@@ -800,6 +964,8 @@ impl AiResponseGuard {
                             name: name.to_string(),
                             regex,
                             placeholder,
+                            validator: None,
+                            allowlistable: false,
                         });
                     }
                     Err(_) => {
@@ -824,6 +990,8 @@ impl AiResponseGuard {
         }
 
         let max_completion_length = optional_usize(config, "max_completion_length")?.unwrap_or(0);
+
+        let allowlist = parse_allowlist(config)?;
 
         let grpc = load_grpc_inspection(config, descriptor_mode)?;
         if grpc.is_some() {
@@ -872,6 +1040,10 @@ impl AiResponseGuard {
         // as an individual Regex), so RegexSet construction cannot fail
         // for syntax — but we still propagate any error defensively.
         let detection_pattern_count = pii_patterns.len() + blocked_phrases.len();
+        let match_filtering = pii_patterns
+            .iter()
+            .chain(blocked_phrases.iter())
+            .any(|pattern| pattern.needs_confirmation(&allowlist));
         let detection_set = RegexSet::new(
             pii_patterns
                 .iter()
@@ -897,6 +1069,8 @@ impl AiResponseGuard {
             require_json,
             required_fields,
             max_completion_length,
+            allowlist,
+            match_filtering,
             grpc,
         })
     }
@@ -904,14 +1078,69 @@ impl AiResponseGuard {
     /// Look up the pattern name at the given combined-index position
     /// (`pii_patterns ++ blocked_phrases`).
     fn pattern_name(&self, idx: usize) -> Option<&str> {
+        self.pattern_at(idx).map(|pattern| pattern.name.as_str())
+    }
+
+    /// The pattern at a combined-index position (`pii_patterns ++
+    /// blocked_phrases`), which is the `detection_set` index.
+    fn pattern_at(&self, idx: usize) -> Option<&ContentPattern> {
         let pii_len = self.pii_patterns.len();
         if idx < pii_len {
-            self.pii_patterns.get(idx).map(|p| p.name.as_str())
+            self.pii_patterns.get(idx)
         } else {
-            self.blocked_phrases
-                .get(idx - pii_len)
-                .map(|p| p.name.as_str())
+            self.blocked_phrases.get(idx - pii_len)
         }
+    }
+
+    /// Mark in `hit` every pattern that has at least one FINDING in `text`.
+    ///
+    /// The `RegexSet` pass is the whole decision unless a matched pattern needs
+    /// per-match confirmation (a built-in validator or an applicable
+    /// allowlist); only then is that one pattern's regex re-run to look for a
+    /// match that [`ContentPattern::counts`] accepts.
+    fn mark_hits(&self, text: &str, hit: &mut [bool]) {
+        for idx in self.detection_set.matches(text).into_iter() {
+            let Some(slot) = hit.get_mut(idx) else {
+                continue;
+            };
+            if *slot {
+                continue;
+            }
+            *slot = match self.pattern_at(idx) {
+                Some(pattern)
+                    if self.match_filtering && pattern.needs_confirmation(&self.allowlist) =>
+                {
+                    self.pattern_has_finding(pattern, text)
+                }
+                Some(_) => true,
+                None => false,
+            };
+        }
+    }
+
+    /// Whether `text` carries at least one finding of any pattern — the
+    /// residual question. Same confirmation rule as [`Self::mark_hits`].
+    fn has_finding(&self, text: &str) -> bool {
+        if !self.match_filtering {
+            return self.detection_set.is_match(text);
+        }
+        self.detection_set
+            .matches(text)
+            .into_iter()
+            .any(|idx| match self.pattern_at(idx) {
+                Some(pattern) if pattern.needs_confirmation(&self.allowlist) => {
+                    self.pattern_has_finding(pattern, text)
+                }
+                Some(_) => true,
+                None => false,
+            })
+    }
+
+    fn pattern_has_finding(&self, pattern: &ContentPattern, text: &str) -> bool {
+        pattern
+            .regex
+            .find_iter(text)
+            .any(|matched| pattern.counts(matched.as_str(), &self.allowlist))
     }
 
     /// Extract client-visible or executable completion text from supported AI
@@ -944,6 +1173,11 @@ impl AiResponseGuard {
                 {
                     collect_content_value(container.get("content"), &mut texts);
                     collect_string_value(container.get("refusal"), &mut texts);
+                    // Chat-dialect reasoning text (DeepSeek / vLLM
+                    // `reasoning_content`, OpenRouter `reasoning`) is delivered
+                    // to the client beside `content`.
+                    collect_string_value(container.get("reasoning_content"), &mut texts);
+                    collect_string_value(container.get("reasoning"), &mut texts);
                     collect_function_value(container.get("function_call"), &mut texts);
                     if let Some(tool_calls) = container.get("tool_calls").and_then(Value::as_array)
                     {
@@ -962,6 +1196,9 @@ impl AiResponseGuard {
                 collect_string_value(item.get("name"), &mut texts);
                 collect_argument_value(item.get("arguments"), &mut texts);
                 collect_content_value(item.get("content"), &mut texts);
+                // A `reasoning` item's `summary[]` parts are client-visible
+                // `summary_text` strings.
+                collect_content_value(item.get("summary"), &mut texts);
             }
         }
 
@@ -972,6 +1209,24 @@ impl AiResponseGuard {
         // already accepts.
         if let Some(message) = json.get("output").and_then(|output| output.get("message")) {
             collect_content_value(message.get("content"), &mut texts);
+            // Converse blocks that are not text: a `toolUse` block's invoked
+            // `name` and decoded `input` document (executable content), and a
+            // `reasoningContent` block's `reasoningText.text`.
+            if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+                for block in blocks {
+                    if let Some(tool_use) = block.get("toolUse") {
+                        collect_string_value(tool_use.get("name"), &mut texts);
+                        collect_decoded_argument_value(tool_use.get("input"), &mut texts);
+                    }
+                    collect_string_value(
+                        block
+                            .get("reasoningContent")
+                            .and_then(|reasoning| reasoning.get("reasoningText"))
+                            .and_then(|reasoning| reasoning.get("text")),
+                        &mut texts,
+                    );
+                }
+            }
         }
 
         // Anthropic: content[].text, joining adjacent text blocks.
@@ -999,6 +1254,9 @@ impl AiResponseGuard {
             for block in content {
                 collect_string_value(block.get("name"), &mut texts);
                 collect_decoded_argument_value(block.get("input"), &mut texts);
+                // Extended-thinking blocks carry the model's reasoning in
+                // `thinking`; it is delivered to the client like prose.
+                collect_string_value(block.get("thinking"), &mut texts);
             }
         }
 
@@ -1063,9 +1321,7 @@ impl AiResponseGuard {
         }
         let mut hit = vec![false; self.detection_pattern_count];
         for text in texts {
-            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
-                hit[idx] = true;
-            }
+            self.mark_hits(text.as_ref(), &mut hit);
         }
         let mut detected = Vec::new();
         for (idx, &h) in hit.iter().enumerate() {
@@ -1117,15 +1373,11 @@ impl AiResponseGuard {
         collect_decoded_json_strings(json, &mut texts);
         collect_decoded_argument_tokens(json, &mut texts);
         for text in &texts {
-            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
-                hit[idx] = true;
-            }
+            self.mark_hits(text.as_ref(), &mut hit);
         }
         // Pass 2: raw serialized body (cross-token / contextual / duplicate-key).
         if let Some(raw) = raw {
-            for idx in self.detection_set.matches(raw).into_iter() {
-                hit[idx] = true;
-            }
+            self.mark_hits(raw, &mut hit);
         }
         let mut detected = Vec::new();
         for (idx, &h) in hit.iter().enumerate() {
@@ -1169,9 +1421,7 @@ impl AiResponseGuard {
             collect_decoded_argument_tokens(frame, &mut texts);
         }
         for text in &texts {
-            for idx in self.detection_set.matches(text.as_ref()).into_iter() {
-                hit[idx] = true;
-            }
+            self.mark_hits(text.as_ref(), &mut hit);
         }
         // Scan the coherent client-visible/executable stream as well as each
         // decoded frame. In particular, Responses API argument deltas are a
@@ -1179,14 +1429,10 @@ impl AiResponseGuard {
         // expose JSON escapes such as `\u0040` to the detector.
         let (accumulated, _) = self.extract_sse_completion_texts_checked(frames, events);
         for text in &accumulated {
-            for idx in self.detection_set.matches(text).into_iter() {
-                hit[idx] = true;
-            }
+            self.mark_hits(text, &mut hit);
         }
         if let Some(raw) = raw {
-            for idx in self.detection_set.matches(raw).into_iter() {
-                hit[idx] = true;
-            }
+            self.mark_hits(raw, &mut hit);
         }
         let mut detected = Vec::new();
         for (idx, &h) in hit.iter().enumerate() {
@@ -1205,6 +1451,7 @@ impl AiResponseGuard {
         redact_scalar_bounded(
             text,
             self.pii_patterns.iter().chain(self.blocked_phrases.iter()),
+            &self.allowlist,
             budget,
         )
     }
@@ -1259,6 +1506,7 @@ impl AiResponseGuard {
                     &pattern.regex,
                     pattern.placeholder.as_str(),
                     input,
+                    |matched| pattern.counts(matched, &self.allowlist),
                 ) {
                     return None;
                 }
@@ -1332,7 +1580,7 @@ impl AiResponseGuard {
     fn text_residual_bounded(&self, text: &[u8], room: usize) -> Option<bool> {
         let cleaned = self.strip_known_placeholders_bounded(text, room)?;
         let cleaned = std::str::from_utf8(&cleaned).ok()?;
-        Some(self.detection_set.is_match(cleaned))
+        Some(self.has_finding(cleaned))
     }
 
     /// Verify a whole-body text replacement using only the scratch room left
@@ -1672,6 +1920,7 @@ impl AiResponseGuard {
             &mut decoded,
             &self.pii_patterns,
             &self.blocked_phrases,
+            &self.allowlist,
             false,
             budget,
         );
@@ -1739,6 +1988,7 @@ impl AiResponseGuard {
             json,
             &self.pii_patterns,
             &self.blocked_phrases,
+            &self.allowlist,
             true,
             budget,
         );
@@ -1756,6 +2006,11 @@ impl AiResponseGuard {
         }
         if let Some(refusal) = value.get_mut("refusal") {
             self.redact_string_value(refusal, budget);
+        }
+        for reasoning_key in ["reasoning_content", "reasoning"] {
+            if let Some(reasoning) = value.get_mut(reasoning_key) {
+                self.redact_string_value(reasoning, budget);
+            }
         }
         if let Some(function_call) = value.get_mut("function_call") {
             self.redact_function_value(function_call, budget);
@@ -1799,17 +2054,41 @@ impl AiResponseGuard {
                 if let Some(content) = item.get_mut("content") {
                     self.redact_content_value(content, budget);
                 }
+                if let Some(summary) = item.get_mut("summary") {
+                    self.redact_content_value(summary, budget);
+                }
             }
         }
 
-        // Amazon Bedrock Converse: output.message.content[].text. Mirrors the
-        // extraction above so detection and redaction stay symmetric.
+        // Amazon Bedrock Converse: output.message.content[].text, plus a
+        // `toolUse` block's name and decoded `input` and a `reasoningContent`
+        // block's `reasoningText.text`. Mirrors the extraction above so
+        // detection and redaction stay symmetric.
         if let Some(content) = json
             .get_mut("output")
             .and_then(|output| output.get_mut("message"))
             .and_then(|message| message.get_mut("content"))
         {
             self.redact_content_value(content, budget);
+            if let Some(blocks) = content.as_array_mut() {
+                for block in blocks {
+                    if let Some(tool_use) = block.get_mut("toolUse") {
+                        if let Some(name) = tool_use.get_mut("name") {
+                            self.redact_string_value(name, budget);
+                        }
+                        if let Some(input) = tool_use.get_mut("input") {
+                            self.redact_decoded_arguments_value(input, budget);
+                        }
+                    }
+                    if let Some(text) = block
+                        .get_mut("reasoningContent")
+                        .and_then(|reasoning| reasoning.get_mut("reasoningText"))
+                        .and_then(|reasoning| reasoning.get_mut("text"))
+                    {
+                        self.redact_string_value(text, budget);
+                    }
+                }
+            }
         }
 
         // Anthropic: content[].text, plus a tool-use block's `name` and its
@@ -1831,6 +2110,9 @@ impl AiResponseGuard {
                 }
                 if let Some(input) = block.get_mut("input") {
                     self.redact_decoded_arguments_value(input, budget);
+                }
+                if let Some(thinking) = block.get_mut("thinking") {
+                    self.redact_string_value(thinking, budget);
                 }
             }
         }
@@ -1903,8 +2185,8 @@ impl AiResponseGuard {
 
     /// Shared action handler for detected PII/blocked content.
     fn mark_rejected(ctx: &mut RequestContext, reason: impl Into<String>) {
-        ctx.metadata
-            .insert("ai_response_guard_rejected".to_string(), reason.into());
+        let reason: String = reason.into();
+        merge_metadata_list(ctx, "ai_response_guard_rejected", &reason);
     }
 
     fn respond_to_detection(
@@ -1938,8 +2220,7 @@ impl AiResponseGuard {
                     "ai_response_guard: content detected (types: {:?}), passing through (warn mode)",
                     detected
                 );
-                ctx.metadata
-                    .insert("ai_response_guard_detected".to_string(), detected.join(","));
+                merge_metadata_list(ctx, "ai_response_guard_detected", &detected.join(","));
                 PluginResult::Continue
             }
             GuardAction::Redact => {
@@ -1962,8 +2243,7 @@ impl AiResponseGuard {
                         headers: HashMap::new(),
                     };
                 }
-                ctx.metadata
-                    .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+                merge_metadata_list(ctx, "ai_response_guard_redacted", &detected.join(","));
                 // `Continue` here is a PROMISE that the producer phase will
                 // install a redacted replacement, not a decision to deliver
                 // these bytes. Record the promise in typed request state so a
@@ -1999,6 +2279,16 @@ impl AiResponseGuard {
         self.require_json || !self.required_fields.is_empty() || self.action != GuardAction::Warn
     }
 
+    /// Whether some configured rule decides on the VALUES of a parsed JSON
+    /// document (detection, required members, completion length). `require_json`
+    /// alone only asks whether the bytes parse, which duplicate members do not
+    /// change, so it does not make an ambiguous document uninspectable.
+    fn decides_on_collapsed_json(&self) -> bool {
+        self.detection_pattern_count > 0
+            || !self.required_fields.is_empty()
+            || self.max_completion_length > 0
+    }
+
     fn respond_to_uninspectable(
         &self,
         ctx: &mut RequestContext,
@@ -2017,8 +2307,7 @@ impl AiResponseGuard {
                 headers: HashMap::new(),
             }
         } else {
-            ctx.metadata
-                .insert("ai_response_guard_warning".to_string(), reason.to_string());
+            merge_metadata_list(ctx, "ai_response_guard_warning", reason);
             PluginResult::Continue
         }
     }
@@ -2069,6 +2358,7 @@ impl AiResponseGuard {
     /// JSON tokens so escapes cannot hide content from detection.
     ///
     /// Also reports whether the stream was FULLY reassembled. `false` means a
+    /// reassembled tool-argument document has duplicate object members, or a
     /// provider stream carried something the reassembler could not fold into
     /// its document — an Anthropic event, `delta.type`, or content-block index,
     /// or a malformed / unfoldable Gemini `candidates` frame — so the
@@ -2094,7 +2384,7 @@ impl AiResponseGuard {
             std::collections::BTreeMap::new();
         // Same per-family live-key ceiling the shared reassembler applies, so
         // provider-chosen indexes cannot grow these side accumulators either.
-        let mut provider_key_counts = [0usize; 6];
+        let mut provider_key_counts = [0usize; PROVIDER_TEXT_KINDS];
         let mut provider_overflow = false;
 
         for (frame_index, frame) in frames.iter().enumerate() {
@@ -2158,6 +2448,24 @@ impl AiResponseGuard {
                         )
                         .push_str(refusal);
                     }
+                    // Chat-dialect reasoning deltas (`reasoning_content`,
+                    // `reasoning`) are client-visible like `content`.
+                    for (kind, key) in [(0u8, "reasoning_content"), (1u8, "reasoning")] {
+                        if let Some(reasoning) = choice
+                            .get("delta")
+                            .and_then(|delta| delta.get(key))
+                            .and_then(Value::as_str)
+                        {
+                            bounded_provider_text(
+                                &mut provider_texts,
+                                &mut provider_key_counts,
+                                &mut provider_overflow,
+                                kind,
+                                index,
+                            )
+                            .push_str(reasoning);
+                        }
+                    }
                 }
             }
 
@@ -2183,10 +2491,35 @@ impl AiResponseGuard {
                 )
                 .push_str(delta);
             }
+
+            // Responses API reasoning deltas (`response.reasoning_summary_text.delta`,
+            // `response.reasoning_text.delta`) stream a reasoning item's
+            // client-visible text.
+            if frame
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_responses_reasoning_delta)
+                && let Some(delta) = frame.get("delta").and_then(Value::as_str)
+            {
+                let index = frame
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
+                bounded_provider_text(
+                    &mut provider_texts,
+                    &mut provider_key_counts,
+                    &mut provider_overflow,
+                    6,
+                    index,
+                )
+                .push_str(delta);
+            }
         }
 
         let mut texts: Vec<String> = Vec::new();
-        let fully_reassembled = !reassembler.provider_stream_uninspectable() && !provider_overflow;
+        let mut fully_reassembled =
+            !reassembler.provider_stream_uninspectable() && !provider_overflow;
         for sse_text in reassembler.into_texts() {
             if matches!(
                 sse_text.kind,
@@ -2195,6 +2528,12 @@ impl AiResponseGuard {
                     | SseTextKind::AnthropicToolInput
                     | SseTextKind::GeminiFunctionCallArgs
             ) {
+                // A reassembled argument document with duplicate members is
+                // read collapsed by the decoded pass but executed by the tool
+                // client as sent: not evidence of a clean stream.
+                if crate::util::json_dup_keys::str_ambiguity(&sse_text.text).is_some() {
+                    fully_reassembled = false;
+                }
                 append_decoded_argument_texts(&sse_text.text, &mut texts);
             }
             texts.push(sse_text.text);
@@ -2203,6 +2542,9 @@ impl AiResponseGuard {
             // Kind 3 accumulates legacy `function_call.arguments`, which is
             // nested JSON like the reassembler's tool-call arguments.
             if kind == 3 {
+                if crate::util::json_dup_keys::str_ambiguity(&text).is_some() {
+                    fully_reassembled = false;
+                }
                 append_decoded_argument_texts(&text, &mut texts);
             }
             texts.push(text);
@@ -2242,7 +2584,8 @@ impl AiResponseGuard {
                 (
                     event_type.ends_with("output_text.delta")
                         || event_type.ends_with("function_call_arguments.delta")
-                        || event_type.ends_with("refusal.delta"),
+                        || event_type.ends_with("refusal.delta")
+                        || is_responses_reasoning_delta(event_type),
                     event_type.ends_with("function_call_arguments.delta"),
                 )
             })
@@ -2369,6 +2712,7 @@ impl AiResponseGuard {
             value,
             &self.pii_patterns,
             &self.blocked_phrases,
+            &self.allowlist,
             false,
             budget,
         );
@@ -2465,8 +2809,16 @@ impl AiResponseGuard {
     ///
     /// Prefers the finalized `grpc_full_method` published by
     /// `grpc_method_router` (which reflects a method rewrite applied before
-    /// dispatch) and falls back to the canonical request path. Backends never
-    /// echo `:path` in a response, so the request is the only correct source.
+    /// dispatch), then the backend-effective path the proxy bound at the
+    /// backend-path boundary (`RequestContext::authorized_backend_path`, bound
+    /// for every request on a `grpc`-enrolled instance because it opts into
+    /// `requires_backend_path_resolution`), and only then the request path.
+    /// Without the bound path, a guard-only route with `strip_listen_path` or a
+    /// `backend_path` would decide enrollment on the client path, which the
+    /// backend never receives, and skip an enrolled method entirely. Backends
+    /// never echo `:path` in a response, so the request is the only correct
+    /// source. A pre-dispatch synthetic reply has no bound path and keeps the
+    /// client path.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
         match ctx.metadata.get("grpc_full_method") {
             Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
@@ -2476,7 +2828,7 @@ impl AiResponseGuard {
                 path.push_str(method);
                 Cow::Owned(path)
             }
-            None => Cow::Borrowed(ctx.path.as_str()),
+            None => Cow::Borrowed(ctx.authorized_backend_path().unwrap_or(ctx.path.as_str())),
         }
     }
 
@@ -2587,12 +2939,21 @@ impl AiResponseGuard {
                     };
                 }
                 GuardAction::Warn => {
-                    ctx.metadata
-                        .insert("ai_response_guard_warning".to_string(), reason);
+                    merge_metadata_list(ctx, "ai_response_guard_warning", &reason);
                 }
             }
         }
 
+        // This instance's exact residual-verified redaction output: size,
+        // framing, decode, and length rules ran above; detection would only
+        // re-find the placeholders the redactor wrote.
+        if self.has_verified_redaction(
+            ctx,
+            body,
+            Some(Self::grpc_redaction_label(response_headers)),
+        ) {
+            return PluginResult::Continue;
+        }
         let detected = self.detect_grpc_matches(&scan);
         if detected.is_empty() {
             return PluginResult::Continue;
@@ -2770,11 +3131,45 @@ impl AiResponseGuard {
         }
         // Re-verify against the exact bytes the client would receive, using the
         // same selected-field surface and aggregate matching as inspection.
+        // This instance's own placeholders are stripped first, exactly as the
+        // HTTP residual verifier does: a rule whose name matches its own regex
+        // (`name: draft, regex: draft`) renders `[REDACTED:draft]`, which is
+        // text the redactor wrote, not residual upstream content.
         let verify_scan =
             scan_grpc_body(&rewritten, method, grpc, encoding, self.max_scan_bytes).ok()?;
-        self.detect_grpc_matches(&verify_scan)
-            .is_empty()
-            .then_some(rewritten)
+        (!self.grpc_scan_has_residual(&verify_scan, ledger.room())).then_some(rewritten)
+    }
+
+    /// Placeholder-aware residual detection over a re-decoded gRPC candidate:
+    /// every governed string and the ordered aggregate, each with this
+    /// instance's rendered placeholders removed under `room` (a strip that
+    /// cannot fit is residual, fail closed). Map keys are never rewritten, so
+    /// they cannot hold a placeholder this instance wrote and are checked as
+    /// delivered.
+    fn grpc_scan_has_residual(&self, scan: &GrpcScan, room: usize) -> bool {
+        let aggregate = (!scan.aggregate.is_empty()).then_some(scan.aggregate.as_str());
+        scan.scanned
+            .iter()
+            .map(String::as_str)
+            .chain(aggregate)
+            .any(|text| {
+                !matches!(
+                    self.text_residual_bounded(text.as_bytes(), room),
+                    Some(false)
+                )
+            })
+            || scan.map_keys.iter().any(|key| self.has_finding(key))
+    }
+
+    /// Digest label binding a verified gRPC redaction to the message encoding
+    /// its frames were verified under. The native-gRPC contract is selected by
+    /// request flavor and `grpc-encoding`, never by the response media type.
+    fn grpc_redaction_label(response_headers: &HashMap<String, String>) -> &'static str {
+        match grpc_message_encoding(response_headers) {
+            GrpcMessageEncoding::Identity => "application/grpc;encoding=identity",
+            GrpcMessageEncoding::Gzip => "application/grpc;encoding=gzip",
+            GrpcMessageEncoding::Unsupported => "application/grpc;encoding=unsupported",
+        }
     }
 }
 
@@ -3919,6 +4314,32 @@ impl Plugin for AiResponseGuard {
         self.has_validation_rules
     }
 
+    /// A `grpc`-enrolled instance joins the backend-path boundary so the proxy
+    /// binds the backend-effective path for every request on its route. That
+    /// bound path is this instance's own enrollment witness when no
+    /// `grpc_full_method` was published, so enrollment never depends on a
+    /// companion `grpc_method_router` (see [`Self::grpc_method_path`]). The
+    /// buffering vote is cast after the bind on every dispatcher.
+    fn requires_backend_path_resolution(&self) -> bool {
+        self.grpc.is_some()
+    }
+
+    /// An `action`-independent structural rule (`require_json` /
+    /// `required_fields`) rejects an empty successful body, so a zero-byte
+    /// synthetic success (a mock or function reply) must reach the body phase
+    /// instead of skipping it. No-content semantics (HEAD, 1xx, 204, 205, 304)
+    /// keep their empty answer, and native gRPC is outside the JSON rules.
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+    ) -> bool {
+        (self.require_json || !self.required_fields.is_empty())
+            && !ctx.is_native_grpc_request()
+            && (200..300).contains(&response_status)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
+    }
+
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         if request_method_omits_response_body(&ctx.method) {
             return false;
@@ -4008,398 +4429,9 @@ impl Plugin for AiResponseGuard {
         response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // An absent body on a no-content response is HTTP's answer, not a
-        // representation to inspect; bytes that somehow arrive on one are still
-        // inspected.
-        if body.is_empty() && synthetic_response_omits_body(&ctx.method, response_status) {
-            return PluginResult::Continue;
-        }
-
-        // Native gRPC framing has its own descriptor-based contract; the
-        // JSON/SSE/text document model below never applies to it.
-        if ctx.is_native_grpc_request() {
-            return self.inspect_grpc_response(ctx, response_status, response_headers, body);
-        }
-
-        // The shared representation gate owns origin decoding and its retained
-        // budget. It runs before transforms, after this early inspection hook.
-        // Defer only a response this instance claims there; the final hook must
-        // inspect the installed plaintext even when no redaction was needed.
-        if !body.is_empty()
-            && self.enforces_response_body_policy(
-                ctx,
-                response_headers.get("content-type").map(String::as_str),
-                body,
-            )
-        {
-            return PluginResult::Continue;
-        }
-
-        // Enforce the aggregate scan/work bound before the successful-response
-        // content gate. Buffered non-2xx error bodies still reach the transform
-        // phase, so returning before this check would let a large raw body evade
-        // the configured fail-closed/warn disposition and reach a redaction
-        // regex pass outside the bound.
-        if body.len() > self.max_scan_bytes {
-            debug!(
-                body_size = body.len(),
-                max_scan_bytes = self.max_scan_bytes,
-                "ai_response_guard: rejecting or warning on oversized governed response"
-            );
-            return self.respond_to_uninspectable(
-                ctx,
-                "body_exceeds_max_scan_bytes",
-                "response body exceeds max_scan_bytes",
-            );
-        }
-
-        // Content governance remains scoped to successful responses. The size
-        // policy above is representation-independent and applies to every
-        // buffered status.
-        if !(200..300).contains(&response_status) {
-            return PluginResult::Continue;
-        }
-
-        let content_type = response_headers
-            .get("content-type")
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        let is_sse = is_text_event_stream_media_type(content_type);
-        let is_json = is_json_content_type(content_type);
-
-        if body.is_empty() {
-            if self.require_json || !self.required_fields.is_empty() {
-                return self.respond_to_uninspectable(
-                    ctx,
-                    "empty_response_body",
-                    "response body is empty",
-                );
-            }
-            return PluginResult::Continue;
-        }
-
-        // A gRPC-framed response reaching the JSON/SSE/text model belongs to a
-        // request that is not native gRPC (a native one returned above), so the
-        // descriptor contract cannot name a message type for it and
-        // `transform_response_body` declines these bytes. Scanning length-
-        // prefixed frames as a raw text document would let `scan_mode: all`
-        // report a redaction the transform can never apply; fail closed for
-        // enforcing actions instead, exactly as content mode already does.
-        //
-        // gRPC-Web is the same grammar and the same hazard, and it is what a
-        // browser client on a mixed route actually sends: its request flavor is
-        // `Plain`, so it never reaches `inspect_grpc_response` above, and
-        // `grpc_web`'s `after_proxy` has already relabeled the response to
-        // `application/grpc-web*` — a native-gRPC media-type test alone would
-        // let those frames through to the text redactor.
-        if response_is_grpc_framed(ctx, Some(content_type), body) {
-            return self.respond_to_uninspectable(
-                ctx,
-                "grpc_framed_response_requires_grpc_contract",
-                "gRPC-framed responses are only inspectable through the grpc enrollment contract",
-            );
-        }
-
-        // --- SSE path: parse frames, extract accumulated texts, detect ---
-        if is_sse {
-            if self.require_json || !self.required_fields.is_empty() {
-                return self.respond_to_uninspectable(
-                    ctx,
-                    "sse_cannot_satisfy_json_structure",
-                    "SSE is not a single JSON response",
-                );
-            }
-            let parsed = parse_sse_data_frames_checked(body);
-            if !parsed.fully_parsed {
-                return self.respond_to_uninspectable(
-                    ctx,
-                    "uninspectable_sse",
-                    "SSE contains malformed, non-JSON, or non-UTF-8 data",
-                );
-            }
-            let (frames, events) = (parsed.frames, parsed.events);
-            if frames.is_empty() && self.scan_mode != ScanMode::All {
-                return PluginResult::Continue;
-            }
-
-            let (accumulated, fully_reassembled) =
-                self.extract_sse_completion_texts_checked(&frames, &events);
-            if !fully_reassembled {
-                // A provider stream carried something reassembly could not
-                // cover — an Anthropic event, delta type, or content-block
-                // index, or a malformed / unfoldable Gemini `candidates` frame
-                // — so the accumulated text is not proof the whole response is
-                // clean.
-                return self.respond_to_uninspectable(
-                    ctx,
-                    "uninspectable_sse",
-                    "SSE contains an unsupported provider streaming event",
-                );
-            }
-
-            // Check max completion length on accumulated text
-            if self.max_completion_length > 0 {
-                let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
-                if let Some(reason) = self.check_completion_length(&refs) {
-                    match self.action {
-                        GuardAction::Reject | GuardAction::Redact => {
-                            Self::mark_rejected(ctx, reason.clone());
-                            return PluginResult::Reject {
-                                status_code: 502,
-                                body: format!(
-                                    r#"{{"error":"AI response guard: {}"}}"#,
-                                    escape_json_string(&reason)
-                                ),
-                                headers: HashMap::new(),
-                            };
-                        }
-                        GuardAction::Warn => {
-                            ctx.metadata
-                                .insert("ai_response_guard_warning".to_string(), reason);
-                        }
-                    }
-                }
-            }
-
-            if self.has_verified_redaction(ctx, body, Some(content_type)) {
-                return PluginResult::Continue;
-            }
-            let detected = if self.scan_mode == ScanMode::All {
-                self.detect_matches_in_decoded_sse_frames(
-                    &frames,
-                    &events,
-                    std::str::from_utf8(body).ok(),
-                )
-            } else {
-                let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
-                self.detect_matches(&refs)
-            };
-
-            if detected.is_empty() {
-                return PluginResult::Continue;
-            }
-
-            let retained_ceiling = ctx.retained_response_body_ceiling();
-            if self.action == GuardAction::Redact {
-                match self.redact_sse_leaves_residual(body, retained_ceiling) {
-                    None => {
-                        // Aggregate retained-memory exhaustion — not restricted
-                        // content. Mark the one-shot pending signal so the
-                        // enclosing on_response_body loop installs the shared
-                        // capacity terminal.
-                        ctx.mark_buffered_response_capacity_refusal_pending();
-                        return PluginResult::Continue;
-                    }
-                    Some(true) => {
-                        debug!(
-                            "ai_response_guard: redact leaves residual SSE content, rejecting response"
-                        );
-                        let types_json: Vec<String> = detected
-                            .iter()
-                            .map(|t| format!("\"{}\"", escape_json_string(t)))
-                            .collect();
-                        Self::mark_rejected(ctx, detected.join(","));
-                        return PluginResult::Reject {
-                            status_code: 502,
-                            body: format!(
-                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                                types_json.join(","),
-                            ),
-                            headers: HashMap::new(),
-                        };
-                    }
-                    Some(false) => {}
-                }
-            }
-
-            return self.respond_to_detection(ctx, response_status, &detected);
-        }
-
-        // Scan-all can safely inspect arbitrary UTF-8 representations as raw
-        // text. Structured content mode has no completion mapping for them, so
-        // enforcing actions fail closed instead of silently passing through.
-        if !is_json && !self.require_json && self.required_fields.is_empty() {
-            if self.scan_mode == ScanMode::All {
-                let Ok(text) = std::str::from_utf8(body) else {
-                    return self.respond_to_uninspectable(
-                        ctx,
-                        "non_utf8_response",
-                        "response body is not valid UTF-8",
-                    );
-                };
-                if let Some(reason) = self.check_completion_length(&[text]) {
-                    match self.action {
-                        GuardAction::Reject | GuardAction::Redact => {
-                            Self::mark_rejected(ctx, reason.clone());
-                            return PluginResult::Reject {
-                                status_code: 502,
-                                body: format!(
-                                    r#"{{"error":"AI response guard: {}"}}"#,
-                                    escape_json_string(&reason)
-                                ),
-                                headers: HashMap::new(),
-                            };
-                        }
-                        GuardAction::Warn => {
-                            ctx.metadata
-                                .insert("ai_response_guard_warning".to_string(), reason);
-                        }
-                    }
-                }
-                if self.has_verified_redaction(ctx, body, Some(content_type)) {
-                    return PluginResult::Continue;
-                }
-                let detected = self.detect_matches(&[text]);
-                return if detected.is_empty() {
-                    PluginResult::Continue
-                } else {
-                    self.respond_to_detection(ctx, response_status, &detected)
-                };
-            }
-            return self.respond_to_uninspectable(
-                ctx,
-                "unsupported_response_content_type",
-                "response content type is not inspectable in content mode",
-            );
-        }
-
-        // --- JSON path ---
-
-        // Parse JSON
-        let json: Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(_) => {
-                return self.respond_to_uninspectable(
-                    ctx,
-                    "invalid_json",
-                    "response body is not valid JSON",
-                );
-            }
-        };
-
-        // Check required fields
-        for field in &self.required_fields {
-            if json.get(field.as_str()).is_none() {
-                Self::mark_rejected(ctx, format!("missing_required_field:{field}"));
-                return PluginResult::Reject {
-                    status_code: 502,
-                    body: format!(
-                        r#"{{"error":"AI response missing required field: \"{}\""}}"#,
-                        escape_json_string(field)
-                    ),
-                    headers: HashMap::new(),
-                };
-            }
-        }
-
-        // Pattern detection in scan-all is handled separately below, but the
-        // completion-length rule is independent of scan mode and must still
-        // inspect supported completion/tool fields.
-        let texts = if self.scan_mode == ScanMode::Content || self.max_completion_length > 0 {
-            self.extract_completion_texts(&json)
-        } else {
-            Vec::new()
-        };
-
-        // Check max completion length
-        if !texts.is_empty()
-            && let Some(reason) = self.check_completion_length(&texts)
-        {
-            match self.action {
-                GuardAction::Reject | GuardAction::Redact => {
-                    Self::mark_rejected(ctx, reason.clone());
-                    return PluginResult::Reject {
-                        status_code: 502,
-                        body: format!(
-                            r#"{{"error":"AI response guard: {}"}}"#,
-                            escape_json_string(&reason)
-                        ),
-                        headers: HashMap::new(),
-                    };
-                }
-                GuardAction::Warn => {
-                    ctx.metadata
-                        .insert("ai_response_guard_warning".to_string(), reason);
-                }
-            }
-        }
-
-        // Detect PII and blocked content
-        if self.has_verified_redaction(ctx, body, Some(content_type)) {
-            return PluginResult::Continue;
-        }
-        let detected = if self.scan_mode == ScanMode::All {
-            self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
-        } else {
-            self.detect_matches(&texts)
-        };
-
-        if detected.is_empty() {
-            return PluginResult::Continue;
-        }
-
-        // Redact mode can detect PII the redactor cannot rewrite — in scan-all,
-        // object keys, numeric scalars, cross-token custom patterns, and
-        // duplicate-key values; in content mode, matches that exist only across
-        // adjacent content-array parts and decoded tool-argument keys/numbers.
-        // Forwarding such a body while reporting it `redacted` would leak PII,
-        // so fail closed (reject) when redaction would leave residual
-        // detections rather than emit false "redacted" telemetry. Bodies whose
-        // PII is fully rewritable fall through to the normal redact path below.
-        //
-        // Both residual scans build a COMPLETE redacted candidate (a cloned
-        // document tree, and in scan-all its serialized form) during INSPECTION,
-        // where no producer phase has reserved anything. That candidate is
-        // upstream-shaped and the same order of size as the response, so it is
-        // charged like any other retained allocation: a window sized to this
-        // response's retained ceiling is reserved before the candidate exists
-        // and released as soon as the scan is done, keeping the peak at the
-        // documented two ceilings. A budget that cannot admit the window is a
-        // capacity refusal — not residual restricted content — and must select
-        // the shared health-neutral terminal (GHSA-pwcm-6rh8-f2gh).
-        if self.action == GuardAction::Redact {
-            match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
-                ctx.retained_response_body_ceiling(),
-            ) {
-                None => {
-                    ctx.mark_buffered_response_capacity_refusal_pending();
-                    return PluginResult::Continue;
-                }
-                Some(window) => {
-                    let leaves_residual = if self.scan_mode == ScanMode::All {
-                        self.redact_leaves_residual(&json, body.len(), window.window_bytes())
-                    } else {
-                        self.content_redact_leaves_residual(
-                            &json,
-                            body.len(),
-                            window.window_bytes(),
-                        )
-                    };
-                    drop(window);
-                    if leaves_residual {
-                        debug!(
-                            "ai_response_guard: redact leaves residual content, rejecting response"
-                        );
-                        let types_json: Vec<String> = detected
-                            .iter()
-                            .map(|t| format!("\"{}\"", escape_json_string(t)))
-                            .collect();
-                        Self::mark_rejected(ctx, detected.join(","));
-                        return PluginResult::Reject {
-                            status_code: 502,
-                            body: format!(
-                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                                types_json.join(","),
-                            ),
-                            headers: HashMap::new(),
-                        };
-                    }
-                }
-            }
-        }
-
-        self.respond_to_detection(ctx, response_status, &detected)
+        let result = self.inspect_response_body(ctx, response_status, response_headers, body);
+        self.record_inspection_witness(ctx, response_status, response_headers, body, &result);
+        result
     }
 
     async fn transform_response_body_with_context(
@@ -4419,6 +4451,16 @@ impl Plugin for AiResponseGuard {
         let ceiling = ctx.retained_response_body_ceiling();
         if self.grpc_transform_applies(ctx, content_type) {
             let replacement = self.redacted_grpc_body(ctx, response_headers, body, ceiling);
+            if let Some(redacted) = replacement.as_deref() {
+                // Same private exact-output witness as the HTTP paths, so the
+                // final re-inspection does not re-detect this instance's own
+                // placeholders in the bytes it just verified.
+                self.record_verified_redaction(
+                    ctx,
+                    redacted,
+                    Some(Self::grpc_redaction_label(response_headers)),
+                );
+            }
             return self.discharge_pending_redaction(ctx, replacement);
         }
         // A gRPC or gRPC-Web response body is length-prefixed protobuf framing
@@ -4451,8 +4493,7 @@ impl Plugin for AiResponseGuard {
         if let Some(redacted) = replacement.as_deref() {
             self.record_verified_redaction(ctx, redacted, content_type);
             if !detected.is_empty() {
-                ctx.metadata
-                    .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+                merge_metadata_list(ctx, "ai_response_guard_redacted", &detected.join(","));
             }
         } else if !sse_refused
             && content_type.is_some_and(is_text_event_stream_media_type)
@@ -4629,13 +4670,18 @@ impl Plugin for AiResponseGuard {
             return self.undelivered_redaction_reject(ctx, detected);
         }
 
-        // Re-inspect the published representation. `on_response_body` needs a
-        // mutable header map; it is given a scratch copy because this phase is
-        // non-rewriting and the client-visible headers are already final.
-        let mut scratch_headers = response_headers.clone();
-        let result = self
-            .on_response_body(ctx, response_status, &mut scratch_headers, body)
-            .await;
+        // The exact representation phase 9 already inspected and found nothing
+        // to act on (same bytes, status, media type, and gRPC message
+        // encoding): a second parse and scan would reach the same verdict. Any
+        // later change — a `response_transformer` rename moving content into a
+        // governed field, a relabeled media type, a new status — misses the
+        // witness and gets the full fresh pass (`GHSA-62jg-v563-4q23`).
+        if self.has_inspection_witness(ctx, response_status, response_headers, body) {
+            return PluginResult::Continue;
+        }
+
+        // Re-inspect the published representation.
+        let result = self.inspect_response_body(ctx, response_status, response_headers, body);
         if !matches!(result, PluginResult::Continue) {
             return result;
         }
@@ -4688,6 +4734,445 @@ impl Plugin for AiResponseGuard {
 }
 
 impl AiResponseGuard {
+    /// Phase-9 inspection of one buffered response representation. Also the
+    /// final client-visible re-decision (`finalize_client_visible_response_body`)
+    /// when the representation changed after this phase inspected it.
+    fn inspect_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        // An absent body on a no-content response is HTTP's answer, not a
+        // representation to inspect; bytes that somehow arrive on one are still
+        // inspected.
+        if body.is_empty() && synthetic_response_omits_body(&ctx.method, response_status) {
+            return PluginResult::Continue;
+        }
+
+        // Native gRPC framing has its own descriptor-based contract; the
+        // JSON/SSE/text document model below never applies to it.
+        if ctx.is_native_grpc_request() {
+            return self.inspect_grpc_response(ctx, response_status, response_headers, body);
+        }
+
+        // The shared representation gate owns origin decoding and its retained
+        // budget. It runs before transforms, after this early inspection hook.
+        // Defer only a response this instance claims there; the final hook must
+        // inspect the installed plaintext even when no redaction was needed.
+        if !body.is_empty()
+            && self.enforces_response_body_policy(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+                body,
+            )
+        {
+            return PluginResult::Continue;
+        }
+
+        // Enforce the aggregate scan/work bound before the successful-response
+        // content gate. Buffered non-2xx error bodies still reach the transform
+        // phase, so returning before this check would let a large raw body evade
+        // the configured fail-closed/warn disposition and reach a redaction
+        // regex pass outside the bound.
+        if body.len() > self.max_scan_bytes {
+            debug!(
+                body_size = body.len(),
+                max_scan_bytes = self.max_scan_bytes,
+                "ai_response_guard: rejecting or warning on oversized governed response"
+            );
+            return self.respond_to_uninspectable(
+                ctx,
+                "body_exceeds_max_scan_bytes",
+                "response body exceeds max_scan_bytes",
+            );
+        }
+
+        // Content governance remains scoped to successful responses. The size
+        // policy above is representation-independent and applies to every
+        // buffered status.
+        if !(200..300).contains(&response_status) {
+            return PluginResult::Continue;
+        }
+
+        let content_type = response_headers
+            .get("content-type")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        let is_sse = is_text_event_stream_media_type(content_type);
+        let is_json = is_json_content_type(content_type);
+
+        if body.is_empty() {
+            if self.require_json || !self.required_fields.is_empty() {
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "empty_response_body",
+                    "response body is empty",
+                );
+            }
+            return PluginResult::Continue;
+        }
+
+        // A gRPC-framed response reaching the JSON/SSE/text model belongs to a
+        // request that is not native gRPC (a native one returned above), so the
+        // descriptor contract cannot name a message type for it and
+        // `transform_response_body` declines these bytes. Scanning length-
+        // prefixed frames as a raw text document would let `scan_mode: all`
+        // report a redaction the transform can never apply; fail closed for
+        // enforcing actions instead, exactly as content mode already does.
+        //
+        // gRPC-Web is the same grammar and the same hazard, and it is what a
+        // browser client on a mixed route actually sends: its request flavor is
+        // `Plain`, so it never reaches `inspect_grpc_response` above, and
+        // `grpc_web`'s `after_proxy` has already relabeled the response to
+        // `application/grpc-web*` — a native-gRPC media-type test alone would
+        // let those frames through to the text redactor.
+        if response_is_grpc_framed(ctx, Some(content_type), body) {
+            return self.respond_to_uninspectable(
+                ctx,
+                "grpc_framed_response_requires_grpc_contract",
+                "gRPC-framed responses are only inspectable through the grpc enrollment contract",
+            );
+        }
+
+        // --- SSE path: parse frames, extract accumulated texts, detect ---
+        if is_sse {
+            if self.require_json || !self.required_fields.is_empty() {
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "sse_cannot_satisfy_json_structure",
+                    "SSE is not a single JSON response",
+                );
+            }
+            let parsed = parse_sse_data_frames_checked(body);
+            if !parsed.fully_parsed {
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "uninspectable_sse",
+                    "SSE contains malformed, non-JSON, or non-UTF-8 data",
+                );
+            }
+            let (frames, events) = (parsed.frames, parsed.events);
+            if frames.is_empty() && self.scan_mode != ScanMode::All {
+                return PluginResult::Continue;
+            }
+            // Same duplicate-member ambiguity as the JSON path, per `data:`
+            // payload and per serialized tool-argument document in a frame;
+            // arguments reassembled ACROSS frames are screened by the
+            // reassembly below and report as not fully reassembled.
+            if self.decides_on_collapsed_json()
+                && (std::str::from_utf8(body).is_ok_and(sse_data_payloads_are_ambiguous)
+                    || frames.iter().any(argument_documents_are_ambiguous))
+            {
+                let result = self.respond_to_uninspectable(
+                    ctx,
+                    "ambiguous_json_document",
+                    "SSE data contains duplicate JSON object members",
+                );
+                if !matches!(result, PluginResult::Continue) {
+                    return result;
+                }
+            }
+
+            let (accumulated, fully_reassembled) =
+                self.extract_sse_completion_texts_checked(&frames, &events);
+            if !fully_reassembled {
+                // A provider stream carried something reassembly could not
+                // cover — an Anthropic event, delta type, or content-block
+                // index, or a malformed / unfoldable Gemini `candidates` frame
+                // — so the accumulated text is not proof the whole response is
+                // clean.
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "uninspectable_sse",
+                    "SSE contains an unsupported provider streaming event",
+                );
+            }
+
+            // Check max completion length on accumulated text
+            if self.max_completion_length > 0 {
+                let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
+                if let Some(reason) = self.check_completion_length(&refs) {
+                    match self.action {
+                        GuardAction::Reject | GuardAction::Redact => {
+                            Self::mark_rejected(ctx, reason.clone());
+                            return PluginResult::Reject {
+                                status_code: 502,
+                                body: format!(
+                                    r#"{{"error":"AI response guard: {}"}}"#,
+                                    escape_json_string(&reason)
+                                ),
+                                headers: HashMap::new(),
+                            };
+                        }
+                        GuardAction::Warn => {
+                            merge_metadata_list(ctx, "ai_response_guard_warning", &reason);
+                        }
+                    }
+                }
+            }
+
+            if self.has_verified_redaction(ctx, body, Some(content_type)) {
+                return PluginResult::Continue;
+            }
+            let detected = if self.scan_mode == ScanMode::All {
+                self.detect_matches_in_decoded_sse_frames(
+                    &frames,
+                    &events,
+                    std::str::from_utf8(body).ok(),
+                )
+            } else {
+                let refs: Vec<&str> = accumulated.iter().map(|s| s.as_str()).collect();
+                self.detect_matches(&refs)
+            };
+
+            if detected.is_empty() {
+                return PluginResult::Continue;
+            }
+
+            let retained_ceiling = ctx.retained_response_body_ceiling();
+            if self.action == GuardAction::Redact {
+                match self.redact_sse_leaves_residual(body, retained_ceiling) {
+                    None => {
+                        // Aggregate retained-memory exhaustion — not restricted
+                        // content. Mark the one-shot pending signal so the
+                        // enclosing on_response_body loop installs the shared
+                        // capacity terminal.
+                        ctx.mark_buffered_response_capacity_refusal_pending();
+                        return PluginResult::Continue;
+                    }
+                    Some(true) => {
+                        debug!(
+                            "ai_response_guard: redact leaves residual SSE content, rejecting response"
+                        );
+                        let types_json: Vec<String> = detected
+                            .iter()
+                            .map(|t| format!("\"{}\"", escape_json_string(t)))
+                            .collect();
+                        Self::mark_rejected(ctx, detected.join(","));
+                        return PluginResult::Reject {
+                            status_code: 502,
+                            body: format!(
+                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                                types_json.join(","),
+                            ),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    Some(false) => {}
+                }
+            }
+
+            return self.respond_to_detection(ctx, response_status, &detected);
+        }
+
+        // Scan-all can safely inspect arbitrary UTF-8 representations as raw
+        // text. Structured content mode has no completion mapping for them, so
+        // enforcing actions fail closed instead of silently passing through.
+        if !is_json && !self.require_json && self.required_fields.is_empty() {
+            if self.scan_mode == ScanMode::All {
+                let Ok(text) = std::str::from_utf8(body) else {
+                    return self.respond_to_uninspectable(
+                        ctx,
+                        "non_utf8_response",
+                        "response body is not valid UTF-8",
+                    );
+                };
+                if let Some(reason) = self.check_completion_length(&[text]) {
+                    match self.action {
+                        GuardAction::Reject | GuardAction::Redact => {
+                            Self::mark_rejected(ctx, reason.clone());
+                            return PluginResult::Reject {
+                                status_code: 502,
+                                body: format!(
+                                    r#"{{"error":"AI response guard: {}"}}"#,
+                                    escape_json_string(&reason)
+                                ),
+                                headers: HashMap::new(),
+                            };
+                        }
+                        GuardAction::Warn => {
+                            merge_metadata_list(ctx, "ai_response_guard_warning", &reason);
+                        }
+                    }
+                }
+                if self.has_verified_redaction(ctx, body, Some(content_type)) {
+                    return PluginResult::Continue;
+                }
+                let detected = self.detect_matches(&[text]);
+                return if detected.is_empty() {
+                    PluginResult::Continue
+                } else {
+                    self.respond_to_detection(ctx, response_status, &detected)
+                };
+            }
+            return self.respond_to_uninspectable(
+                ctx,
+                "unsupported_response_content_type",
+                "response content type is not inspectable in content mode",
+            );
+        }
+
+        // --- JSON path ---
+
+        // Parse JSON
+        let json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => {
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "invalid_json",
+                    "response body is not valid JSON",
+                );
+            }
+        };
+
+        // Every content rule below decides on serde's collapsed tree, which
+        // keeps only the LAST of duplicate object members, while the original
+        // bytes — first member included — are what the client receives and its
+        // parser may keep the first. An overwritten member carrying `\u0040`-
+        // escaped PII is invisible to both the decoded passes (dropped) and the
+        // raw pass (still escaped), so an ambiguous document is not inspectable
+        // evidence. The same holds for a serialized tool `arguments` document.
+        if self.decides_on_collapsed_json()
+            && (ctx.json_scan_memo.ambiguity(body).is_some()
+                || argument_documents_are_ambiguous(&json))
+        {
+            let result = self.respond_to_uninspectable(
+                ctx,
+                "ambiguous_json_document",
+                "response JSON contains duplicate object members",
+            );
+            if !matches!(result, PluginResult::Continue) {
+                return result;
+            }
+        }
+
+        // Check required fields
+        for field in &self.required_fields {
+            if json.get(field.as_str()).is_none() {
+                Self::mark_rejected(ctx, format!("missing_required_field:{field}"));
+                return PluginResult::Reject {
+                    status_code: 502,
+                    body: format!(
+                        r#"{{"error":"AI response missing required field: \"{}\""}}"#,
+                        escape_json_string(field)
+                    ),
+                    headers: HashMap::new(),
+                };
+            }
+        }
+
+        // Pattern detection in scan-all is handled separately below, but the
+        // completion-length rule is independent of scan mode and must still
+        // inspect supported completion/tool fields.
+        let texts = if self.scan_mode == ScanMode::Content || self.max_completion_length > 0 {
+            self.extract_completion_texts(&json)
+        } else {
+            Vec::new()
+        };
+
+        // Check max completion length
+        if !texts.is_empty()
+            && let Some(reason) = self.check_completion_length(&texts)
+        {
+            match self.action {
+                GuardAction::Reject | GuardAction::Redact => {
+                    Self::mark_rejected(ctx, reason.clone());
+                    return PluginResult::Reject {
+                        status_code: 502,
+                        body: format!(
+                            r#"{{"error":"AI response guard: {}"}}"#,
+                            escape_json_string(&reason)
+                        ),
+                        headers: HashMap::new(),
+                    };
+                }
+                GuardAction::Warn => {
+                    merge_metadata_list(ctx, "ai_response_guard_warning", &reason);
+                }
+            }
+        }
+
+        // Detect PII and blocked content
+        if self.has_verified_redaction(ctx, body, Some(content_type)) {
+            return PluginResult::Continue;
+        }
+        let detected = if self.scan_mode == ScanMode::All {
+            self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok())
+        } else {
+            self.detect_matches(&texts)
+        };
+
+        if detected.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        // Redact mode can detect PII the redactor cannot rewrite — in scan-all,
+        // object keys, numeric scalars, cross-token custom patterns, and
+        // duplicate-key values; in content mode, matches that exist only across
+        // adjacent content-array parts and decoded tool-argument keys/numbers.
+        // Forwarding such a body while reporting it `redacted` would leak PII,
+        // so fail closed (reject) when redaction would leave residual
+        // detections rather than emit false "redacted" telemetry. Bodies whose
+        // PII is fully rewritable fall through to the normal redact path below.
+        //
+        // Both residual scans build a COMPLETE redacted candidate (a cloned
+        // document tree, and in scan-all its serialized form) during INSPECTION,
+        // where no producer phase has reserved anything. That candidate is
+        // upstream-shaped and the same order of size as the response, so it is
+        // charged like any other retained allocation: a window sized to this
+        // response's retained ceiling is reserved before the candidate exists
+        // and released as soon as the scan is done, keeping the peak at the
+        // documented two ceilings. A budget that cannot admit the window is a
+        // capacity refusal — not residual restricted content — and must select
+        // the shared health-neutral terminal (GHSA-pwcm-6rh8-f2gh).
+        if self.action == GuardAction::Redact {
+            match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
+                ctx.retained_response_body_ceiling(),
+            ) {
+                None => {
+                    ctx.mark_buffered_response_capacity_refusal_pending();
+                    return PluginResult::Continue;
+                }
+                Some(window) => {
+                    let leaves_residual = if self.scan_mode == ScanMode::All {
+                        self.redact_leaves_residual(&json, body.len(), window.window_bytes())
+                    } else {
+                        self.content_redact_leaves_residual(
+                            &json,
+                            body.len(),
+                            window.window_bytes(),
+                        )
+                    };
+                    drop(window);
+                    if leaves_residual {
+                        debug!(
+                            "ai_response_guard: redact leaves residual content, rejecting response"
+                        );
+                        let types_json: Vec<String> = detected
+                            .iter()
+                            .map(|t| format!("\"{}\"", escape_json_string(t)))
+                            .collect();
+                        Self::mark_rejected(ctx, detected.join(","));
+                        return PluginResult::Reject {
+                            status_code: 502,
+                            body: format!(
+                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                                types_json.join(","),
+                            ),
+                            headers: HashMap::new(),
+                        };
+                    }
+                }
+            }
+        }
+
+        self.respond_to_detection(ctx, response_status, &detected)
+    }
+
     /// Bind residual verification to this instance's exact output and media
     /// type. Keep the digest private to the request; public redaction metadata
     /// cannot authorize placeholder or structural-value exemptions.
@@ -4698,6 +5183,89 @@ impl AiResponseGuard {
         digest.update(content_type.as_bytes());
         digest.update(body);
         digest.finalize()
+    }
+
+    /// Private digest of one inspected representation: status, media type,
+    /// gRPC message encoding, and exact bytes.
+    fn inspection_digest(
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(response_status.to_be_bytes());
+        for name in ["content-type", "grpc-encoding"] {
+            match response_headers.get(name) {
+                Some(value) => {
+                    digest.update([1u8]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value.as_bytes());
+                }
+                None => digest.update([0u8]),
+            }
+        }
+        digest.update(body);
+        digest.finalize()
+    }
+
+    /// Record (or retire) this instance's witness that phase 9 inspected these
+    /// exact bytes and left nothing for a later phase to do.
+    ///
+    /// Only a `Continue` that is a complete decision counts: not a deferral to
+    /// the shared representation gate (the plaintext has not been inspected
+    /// yet), and not a `redact` promise still waiting for its transform. The
+    /// witness is per instance and private to the request, like the
+    /// verified-redaction digest, so neither metadata nor another instance can
+    /// mint it.
+    fn record_inspection_witness(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+        result: &PluginResult,
+    ) {
+        let deferred = !body.is_empty()
+            && self.enforces_response_body_policy(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+                body,
+            );
+        let redaction_pending = ctx.plugin_state().is_some_and(|state| {
+            state
+                .ai_response_guard_pending_redactions
+                .contains_key(&self.instance_id)
+        });
+        if !matches!(result, PluginResult::Continue) || deferred || redaction_pending {
+            if let Some(state) = ctx.plugin_state_opt_mut() {
+                state
+                    .ai_response_guard_inspected_clean
+                    .remove(&self.instance_id);
+            }
+            return;
+        }
+        let digest = Self::inspection_digest(response_status, response_headers, body);
+        ctx.plugin_state_mut()
+            .ai_response_guard_inspected_clean
+            .insert(self.instance_id, digest);
+    }
+
+    fn has_inspection_witness(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> bool {
+        ctx.plugin_state()
+            .and_then(|state| {
+                state
+                    .ai_response_guard_inspected_clean
+                    .get(&self.instance_id)
+            })
+            .is_some_and(|digest| {
+                *digest == Self::inspection_digest(response_status, response_headers, body)
+            })
     }
 
     fn record_verified_redaction(
@@ -4845,6 +5413,14 @@ impl AiResponseGuard {
             Err(_) => return None,
         };
 
+        // Representation-safe on its own, like the residual checks below: a
+        // duplicate-member document cannot be rewritten into the bytes a
+        // first-member parser reads. `on_response_body` refuses it first.
+        if crate::util::json_dup_keys::slice_ambiguity(body).is_some()
+            || argument_documents_are_ambiguous(&json)
+        {
+            return None;
+        }
         let budget = RedactionBudget::for_response(body.len(), ceiling);
         if self.scan_mode == ScanMode::All {
             *detected = self.detect_matches_in_decoded_json(&json, std::str::from_utf8(body).ok());
@@ -4885,6 +5461,45 @@ impl AiResponseGuard {
     }
 }
 
+/// Merge the comma-separated `values` into the comma-separated list at `key`,
+/// keeping first-seen order and dropping repeats.
+///
+/// Several `ai_response_guard` instances can govern one response (for example
+/// one redacting emails and one warning on SSNs), and the final client-visible
+/// phase re-runs inspection; a plain insert let the later write erase the
+/// earlier instance's findings from transaction logs and
+/// `ai_transcript_audit` records. A union keeps every finding under the same
+/// public keys.
+fn merge_metadata_list(ctx: &mut RequestContext, key: &str, values: &str) {
+    if !ctx.metadata.contains_key(key) {
+        ctx.metadata.insert(key.to_string(), values.to_string());
+        return;
+    }
+    let Some(existing) = ctx.metadata.get_mut(key) else {
+        return;
+    };
+    for value in values.split(',').filter(|value| !value.is_empty()) {
+        if existing.split(',').any(|present| present == value) {
+            continue;
+        }
+        if !existing.is_empty() {
+            existing.push(',');
+        }
+        existing.push_str(value);
+    }
+}
+
+/// Number of side-accumulator kinds in `extract_sse_completion_texts_checked`:
+/// 0 chat `reasoning_content`, 1 chat `reasoning`, 2/3 legacy `function_call`
+/// name/arguments, 4 chat refusal, 5 Responses refusal, 6 Responses reasoning.
+const PROVIDER_TEXT_KINDS: usize = 7;
+
+/// Responses API event types that stream a reasoning item's text.
+fn is_responses_reasoning_delta(event_type: &str) -> bool {
+    event_type.ends_with("reasoning_summary_text.delta")
+        || event_type.ends_with("reasoning_text.delta")
+}
+
 /// Find or create one legacy `function_call` / refusal side accumulator,
 /// folding a key beyond [`MAX_OPENAI_STREAM_ACCUMULATORS`] live keys of its
 /// kind into one overflow accumulator. The text is kept for inspection; the
@@ -4892,7 +5507,7 @@ impl AiResponseGuard {
 /// closed, exactly as the shared reassembler's own fold does.
 fn bounded_provider_text<'a>(
     texts: &'a mut std::collections::BTreeMap<(u8, usize), String>,
-    counts: &mut [usize; 6],
+    counts: &mut [usize; PROVIDER_TEXT_KINDS],
     overflow: &mut bool,
     kind: u8,
     index: usize,
@@ -4923,6 +5538,7 @@ fn write_pattern_replaced(
     regex: &Regex,
     placeholder: &str,
     text: &str,
+    admit: impl Fn(&str) -> bool,
 ) -> bool {
     let bytes = text.as_bytes();
     let mut last = 0;
@@ -4932,6 +5548,11 @@ fn write_pattern_replaced(
         // assertion that still yields an empty span is refused here.
         if matched.start() == matched.end() {
             return false;
+        }
+        // A match that is not a finding (failed validator, allowlisted value)
+        // stays in the output verbatim.
+        if !admit(matched.as_str()) {
+            continue;
         }
         if !sink.push(&bytes[last..matched.start()]) || !sink.push(placeholder.as_bytes()) {
             return false;
@@ -5674,6 +6295,105 @@ fn for_each_argument_value(json: &mut Value, visitor: &mut impl FnMut(&mut Value
     }
 }
 
+/// Read-only twin of [`for_each_argument_value`]: visit every serialized
+/// tool/function `arguments` string in the same positions.
+fn for_each_argument_string<'a>(json: &'a Value, visitor: &mut impl FnMut(&'a str)) {
+    let mut visit = |value: Option<&'a Value>| {
+        if let Some(arguments) = value.and_then(Value::as_str) {
+            visitor(arguments);
+        }
+    };
+    if let Some(choices) = json.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            for container in [choice.get("message"), choice.get("delta")]
+                .into_iter()
+                .flatten()
+            {
+                visit(
+                    container
+                        .get("function_call")
+                        .and_then(|function| function.get("arguments")),
+                );
+                if let Some(tool_calls) = container.get("tool_calls").and_then(Value::as_array) {
+                    for tool_call in tool_calls {
+                        visit(
+                            tool_call
+                                .get("function")
+                                .and_then(|function| function.get("arguments")),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some(output) = json.get("output").and_then(Value::as_array) {
+        for item in output {
+            visit(item.get("arguments"));
+        }
+    }
+    if json
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| event_type.ends_with("function_call_arguments.delta"))
+    {
+        visit(json.get("delta"));
+    }
+}
+
+/// Whether any serialized tool `arguments` document in `json` has duplicate
+/// object members (or exhausts the bounded duplicate-member screen). The
+/// decoded-argument passes read serde's collapsed tree, so an overwritten
+/// member is invisible to them while the tool client still receives it.
+fn argument_documents_are_ambiguous(json: &Value) -> bool {
+    let mut ambiguous = false;
+    for_each_argument_string(json, &mut |arguments| {
+        ambiguous = ambiguous || crate::util::json_dup_keys::str_ambiguity(arguments).is_some();
+    });
+    ambiguous
+}
+
+/// Whether one SSE event's joined `data:` payload is a JSON document with
+/// duplicate object members. Mirrors `parse_sse_data_frames_checked`: lines
+/// joined with `\n`, trimmed, empty and `[DONE]` payloads skipped.
+fn sse_event_data_is_ambiguous(data: &[&str]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let joined = data.join("\n");
+    let trimmed = joined.trim();
+    !trimmed.is_empty()
+        && trimmed != "[DONE]"
+        && crate::util::json_dup_keys::str_ambiguity(trimmed).is_some()
+}
+
+/// Whether any `data:` payload of a buffered SSE body is a duplicate-member
+/// JSON document. Events and fields are split exactly as
+/// `parse_sse_data_frames_checked` splits them (leading BOMs ignored, CRLF /
+/// LF / CR line ends, `:` comments, one optional space after the colon).
+fn sse_data_payloads_are_ambiguous(body: &str) -> bool {
+    let mut data: Vec<&str> = Vec::new();
+    for line in sse_lines(strip_sse_boms(body)) {
+        if line.is_empty() {
+            if sse_event_data_is_ambiguous(&data) {
+                return true;
+            }
+            data.clear();
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        if field == "data" {
+            data.push(value);
+        }
+    }
+    sse_event_data_is_ambiguous(&data)
+}
+
 fn collect_function_value<'a>(value: Option<&'a Value>, texts: &mut Vec<Cow<'a, str>>) {
     let Some(value) = value else {
         return;
@@ -5825,20 +6545,32 @@ fn redact_json_strings(
     value: &mut Value,
     pii_patterns: &[ContentPattern],
     blocked_phrases: &[ContentPattern],
+    allowlist: &PiiAllowlist,
     top_level: bool,
     budget: &RedactionBudget,
 ) {
     match value {
         Value::String(s) => {
-            let result =
-                redact_scalar_bounded(s, pii_patterns.iter().chain(blocked_phrases.iter()), budget);
+            let result = redact_scalar_bounded(
+                s,
+                pii_patterns.iter().chain(blocked_phrases.iter()),
+                allowlist,
+                budget,
+            );
             if result != *s {
                 *s = result;
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_json_strings(item, pii_patterns, blocked_phrases, false, budget);
+                redact_json_strings(
+                    item,
+                    pii_patterns,
+                    blocked_phrases,
+                    allowlist,
+                    false,
+                    budget,
+                );
             }
         }
         Value::Object(map) => {
@@ -5850,7 +6582,7 @@ fn redact_json_strings(
                 if top_level && STRUCTURAL_KEYS.contains(&k.as_str()) && val.is_string() {
                     continue;
                 }
-                redact_json_strings(val, pii_patterns, blocked_phrases, false, budget);
+                redact_json_strings(val, pii_patterns, blocked_phrases, allowlist, false, budget);
             }
         }
         _ => {}

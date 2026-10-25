@@ -3371,7 +3371,7 @@ Returns `503 Service Unavailable` when proxy state is not yet available, `404 No
 
 ### `POST /mesh/egress-scope/test`
 
-Dry-runs a candidate destination against the current scope. Accepts a JSON object with `host` (required) and `port` (optional). Returns whether the destination is admitted by the resolved scope. Never mutates slice state.
+Dry-runs a candidate destination against the current scope. Accepts a JSON object with `host` (required) and `port` (optional). Returns whether the destination is admitted by the resolved scope. Never mutates slice state. `host` may embed a port (`reviews.alpha.svc.cluster.local:8080`, `[2001:db8::1]:443`) using the data-plane grammar (decimal 1–65535, leading zeros allowed); an explicit `port` overrides it. Any other suffix (`:0`, `:+8080`, `:http`) stays part of the host and the candidate is reported as a `deny`, matching how the `mesh_outbound_registry` plugin judges that `Host`.
 
 Because this is a non-mutating diagnostic, it remains available in read-only
 mesh and DP admin states with the standard admin JWT authentication.

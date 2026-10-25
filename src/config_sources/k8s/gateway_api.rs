@@ -6043,6 +6043,10 @@ pub(crate) fn parse_gateway_api_duration_ms(value: &str) -> Option<u64> {
 /// destination when it is constructed, so admitting it here would emit a
 /// plugin config that fails the whole plugin-cache build instead of refusing
 /// this one route. `remove` stays allowed: the client value is already gone.
+/// The router's `x-path-param-*` route-capture namespace
+/// ([`crate::proxy::headers::is_path_param_assertion_header`], same folding)
+/// is refused for the same reason: `mesh_route_dispatch` refuses it at
+/// construction too.
 ///
 /// Response-side `set` / `add` / `remove` also refuse the gRPC terminal status
 /// fields ([`GRPC_TERMINAL_STATUS_FIELDS`]). In a Trailers-Only response —
@@ -6105,6 +6109,14 @@ fn ensure_header_modifier_filter(
                     object,
                     format!(
                         "{where_}.name {UNSUPPORTED_SHAPE_MARKER}: the `x-consumer-*` request-header namespace is gateway-owned consumer assertion metadata and cannot be set by a route filter"
+                    ),
+                ));
+            }
+            if !response_side && crate::proxy::headers::is_path_param_assertion_header(name) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "{where_}.name {UNSUPPORTED_SHAPE_MARKER}: the `x-path-param-*` request-header namespace carries the router's path captures and cannot be set by a route filter"
                     ),
                 ));
             }

@@ -1837,6 +1837,26 @@ pub struct BackendTlsConfig {
     /// mesh slice apply, like `Upstream::resolved_subset_tls`.
     #[serde(skip)]
     pub tls_refused: bool,
+    /// Runtime-only provider-isolation marker. `true` when this resolved
+    /// configuration must NOT inherit the gateway-global backend client
+    /// identity (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` /
+    /// `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`) when its own client cert/key are
+    /// unset.
+    ///
+    /// Set only by [`Self::isolated_public_verify`], which `ai_stream_router`
+    /// commits for a third-party HTTPS provider that does not opt into
+    /// `inherit_backend_tls`: an unset per-route client identity must mean "no
+    /// client certificate", never "present the gateway's internal backend
+    /// identity to the provider". Every backend TLS builder and every pool /
+    /// TLS-config-cache key resolves the effective client identity through
+    /// [`Self::effective_client_cert_path`] /
+    /// [`Self::effective_client_key_path`], and the pool key carries an explicit
+    /// `|noglobalid` segment, so an isolated client is never shared with one
+    /// built from the global pair.
+    ///
+    /// Never accepted from or emitted to config.
+    #[serde(skip)]
+    pub suppress_global_client_identity: bool,
 }
 
 impl BackendTlsConfig {
@@ -1851,7 +1871,52 @@ impl BackendTlsConfig {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         }
+    }
+
+    /// Verification against the built-in public trust roots ONLY, isolated
+    /// from every gateway-global backend TLS fallback.
+    ///
+    /// [`Self::default_verify`] leaves the CA and client identity unset, and
+    /// the backend TLS builder fills unset fields from gateway-wide settings: a
+    /// private `FERRUM_TLS_CA_BUNDLE_PATH` replaces the public roots,
+    /// `FERRUM_TLS_NO_VERIFY` disables verification, and the global backend
+    /// client certificate is offered to the peer. For a third-party provider
+    /// none of that is acceptable, so this selects `system://` trust (which
+    /// already bypasses the global bundle and `FERRUM_TLS_NO_VERIFY`) and sets
+    /// [`Self::suppress_global_client_identity`] so no gateway client
+    /// certificate is ever presented.
+    pub fn isolated_public_verify() -> Self {
+        Self {
+            server_ca_cert_path: Some(crate::tls::source::SYSTEM_TRUST_ROOTS_SOURCE.to_string()),
+            suppress_global_client_identity: true,
+            ..Self::default_verify()
+        }
+    }
+
+    /// The client certificate source a backend TLS client actually presents:
+    /// this config's own, else the gateway-global one unless
+    /// [`Self::suppress_global_client_identity`] is set.
+    pub fn effective_client_cert_path<'a>(
+        &'a self,
+        global_client_cert_path: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.suppress_global_client_identity {
+            return self.client_cert_path.as_deref();
+        }
+        self.client_cert_path.as_deref().or(global_client_cert_path)
+    }
+
+    /// The client key source paired with [`Self::effective_client_cert_path`].
+    pub fn effective_client_key_path<'a>(
+        &'a self,
+        global_client_key_path: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.suppress_global_client_identity {
+            return self.client_key_path.as_deref();
+        }
+        self.client_key_path.as_deref().or(global_client_key_path)
     }
 
     /// A destination whose backend TLS was refused on this node: no material,
@@ -1875,6 +1940,7 @@ impl BackendTlsConfig {
             san_allow_list: upstream.backend_tls_san_allow_list.clone(),
             san_allow_list_key_digest: digest,
             tls_refused: upstream.backend_tls_refused,
+            suppress_global_client_identity: false,
         }
     }
 
@@ -1889,6 +1955,7 @@ impl BackendTlsConfig {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         }
     }
 
@@ -5455,6 +5522,17 @@ impl GatewayConfig {
             if plugin.plugin_name == "prometheus_metrics" && plugin.scope != PluginScope::Global {
                 errors.push(format!(
                     "PluginConfig {:?} (prometheus_metrics) must have scope `global`",
+                    plugin.id
+                ));
+            }
+            // `openapi_validator`'s operation table describes ONE proxy's API.
+            // A global or proxy-group instance would apply it to every proxy it
+            // reaches and, with `fail_on_unknown_operation`, refuse every
+            // unrelated route. The Admin API already requires proxy scope; the
+            // same rule holds for file-mode and every other full-config load.
+            if plugin.plugin_name == "openapi_validator" && plugin.scope != PluginScope::Proxy {
+                errors.push(format!(
+                    "PluginConfig {:?} (openapi_validator) must have scope `proxy`",
                     plugin.id
                 ));
             }
@@ -10492,6 +10570,12 @@ impl PluginConfig {
         if self.plugin_name == "prometheus_metrics" && self.scope != PluginScope::Global {
             errors.push(
                 "prometheus_metrics must have scope `global` (it owns one process-wide registry)"
+                    .to_string(),
+            );
+        }
+        if self.plugin_name == "openapi_validator" && self.scope != PluginScope::Proxy {
+            errors.push(
+                "openapi_validator must have scope `proxy` (its operation table describes one proxy's API)"
                     .to_string(),
             );
         }

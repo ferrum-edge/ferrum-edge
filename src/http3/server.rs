@@ -3499,6 +3499,12 @@ async fn handle_h3_request(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // The `h3` request stream exposes no end-of-stream signal before the first
+    // body read (a client's FIN is only observable by polling for DATA), so an
+    // HTTP/3 request may always carry DATA after its head. Body policies must
+    // not treat an omitted `Content-Length` / `Content-Type` as proof of an
+    // empty body here.
+    ctx.inbound_request_body_may_follow = Some(true);
     // The task-scoped diagnostic-reference slot (issue #5767), so the terminal
     // transaction log can record the detail this request's reference names.
     ctx.set_diagnostic_slot(crate::diagnostic_ref::current_h3_slot());
@@ -5923,6 +5929,17 @@ async fn handle_h3_request(
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
+    } else if ctx.route_override_path.is_some() {
+        // Same as the H1/H2 ladder: a path-only route rewrite can select a
+        // method a per-method body policy did not vote for before_proxy.
+        crate::proxy::final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_plugin_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress,
+        )
     } else {
         (
             initial_plugin_needs_request_buffering,
@@ -5956,6 +5973,9 @@ async fn handle_h3_request(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // Stale request digests over the final outbound headers — the same
+    // retirement the H1/H2 ladder makes at the same point. Keep both in sync.
+    crate::proxy::retire_stale_request_integrity_headers(&ctx, &mut owned_proxy_headers);
     // Proxy hop limit (issue #6109): the same `X-Ferrum-Hops` re-assertion the
     // H1/H2 ladder makes in `src/proxy/mod.rs::handle_proxy_request_inner`, at
     // the same point; the deferred passes and the finalized-egress overlay
@@ -6326,6 +6346,32 @@ async fn handle_h3_request(
         ctx.bind_authorized_backend_path(backend_path);
     }
 
+    // Same as the H1/H2 ladder: a per-method gRPC body policy selects on the
+    // backend-effective method bound just above, which listen-path stripping
+    // and a base path can make differ from the method the earlier vote saw.
+    // The effective headers now live in `proxy_headers`, so swap them in for
+    // the request-time predicates.
+    let (plugin_needs_request_buffering, final_body_before_backend_dispatch) =
+        if backend_path_is_policy_bound && matches!(http_flavor, HttpFlavor::Grpc) {
+            std::mem::swap(&mut ctx.headers, &mut proxy_headers);
+            let (buffering, terminal_dispatch, _needs_context) =
+                crate::proxy::final_request_body_requirements(
+                    &plugins,
+                    &ctx,
+                    request_may_need_plugin_buffering,
+                    has_terminal_body_dispatch,
+                    has_contextual_final_body_hook,
+                    has_finalized_request_egress,
+                );
+            std::mem::swap(&mut ctx.headers, &mut proxy_headers);
+            (buffering, terminal_dispatch)
+        } else {
+            (
+                plugin_needs_request_buffering,
+                final_body_before_backend_dispatch,
+            )
+        };
+
     if has_deferred_routing_header_hooks {
         // Deferral changes authorization order, not the client-path view that
         // before_proxy hooks received before a mesh backend rewrite.
@@ -6345,6 +6391,7 @@ async fn handle_h3_request(
             // Re-establish gateway assertions and egress baggage
             // policy before a deferred function's headers reach a backend.
             crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
+            crate::proxy::retire_stale_request_integrity_headers_in_map(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -6382,6 +6429,7 @@ async fn handle_h3_request(
         }
         if matches!(deferred_result, PluginResult::Continue) {
             crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
+            crate::proxy::retire_stale_request_integrity_headers_in_map(&ctx, &mut proxy_headers);
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -8242,6 +8290,7 @@ async fn handle_h3_request(
                 authorization_termination: ctx
                     .authorization_termination()
                     .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+                route_policy_cut: outcome.route_deadline_cut,
             };
             run_response_stream_termination_hooks(
                 &plugins,
@@ -9732,6 +9781,7 @@ async fn handle_h3_request(
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+            route_policy_cut: route_deadline_cut,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
@@ -10366,6 +10416,7 @@ async fn handle_h3_request(
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+            route_policy_cut: h3_stream_result.route_deadline_cut,
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
