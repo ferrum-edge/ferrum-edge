@@ -14124,8 +14124,10 @@ pub(crate) fn screen_redis_endpoint_egress(
 /// LDAP and `ws_logging` hostnames are freshly resolved and screened
 /// immediately before every connection/reconnection, and only screened
 /// addresses are dialed. `kafka_logging` cannot reach that bar with the pinned
-/// librdkafka client and is therefore refused outright under any policy that
-/// can deny an address (see `kafka_logging::screen_kafka_broker_list_egress`).
+/// librdkafka client and is therefore refused under any policy that can deny
+/// an address unless the node operator attests every bootstrap broker in
+/// `FERRUM_KAFKA_ALLOWED_BROKERS` (see
+/// `kafka_logging::screen_kafka_broker_list_egress`).
 /// JWKS hostname resolution keeps the shared client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
@@ -14172,10 +14174,11 @@ pub(crate) fn screen_direct_client_endpoint_egress(
         }
         // broker_list is parsed with the pinned librdkafka grammar
         // (`[proto://]host[:port]`, comma separated) so protocol-prefixed
-        // literals are screened too, and kafka_logging is refused outright when
-        // the policy can deny addresses librdkafka would dial without Ferrum
-        // ever seeing them (bootstrap hostname resolution, metadata-advertised
-        // brokers). See `kafka_logging::screen_kafka_broker_list_egress`.
+        // literals are screened too, and kafka_logging is refused when the
+        // policy can deny addresses librdkafka would dial without Ferrum ever
+        // seeing them (bootstrap hostname resolution, metadata-advertised
+        // brokers), unless FERRUM_KAFKA_ALLOWED_BROKERS attests every bootstrap
+        // broker. See `kafka_logging::screen_kafka_broker_list_egress`.
         "kafka_logging" => {
             kafka_logging::screen_kafka_broker_list_egress(config, backend_allow_ips)?;
         }

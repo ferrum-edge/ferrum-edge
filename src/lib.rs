@@ -4272,6 +4272,42 @@ pub mod _test_support {
         )
     }
 
+    /// Deterministic probe: an immediate librdkafka `QueueFull` waits for
+    /// queue space within `budget` instead of dropping the record at once, and
+    /// a saturated producer stops waiting until an enqueue succeeds.
+    pub async fn kafka_logging_probe_queue_full_backoff_for_test(
+        free_queue_after: Option<std::time::Duration>,
+        budget: std::time::Duration,
+    ) -> Result<crate::plugins::kafka_logging::KafkaQueueFullProbeOutcome, String> {
+        crate::plugins::kafka_logging::probe_queue_full_backoff_for_test(free_queue_after, budget)
+            .await
+    }
+
+    /// Deterministic probe: the production flush-worker configuration hands
+    /// librdkafka many records per worker turn. Returns
+    /// `(flushes, records_flushed)`.
+    pub async fn kafka_logging_probe_worker_batching_for_test(
+        records: usize,
+    ) -> Result<(usize, usize), String> {
+        crate::plugins::kafka_logging::probe_worker_batching_for_test(records).await
+    }
+
+    /// The partition key `kafka_logging` derives for an HTTP summary.
+    pub fn kafka_logging_http_record_key_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::TransactionSummary,
+    ) -> Result<Option<String>, String> {
+        crate::plugins::kafka_logging::http_record_key_for_test(config, summary)
+    }
+
+    /// The partition key `kafka_logging` derives for a stream summary.
+    pub fn kafka_logging_stream_record_key_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::StreamTransactionSummary,
+    ) -> Result<Option<String>, String> {
+        crate::plugins::kafka_logging::stream_record_key_for_test(config, summary)
+    }
+
     // ── plugins/loki_logging ────────────────────────────────────────────────
     /// Construct Loki logging against a test-owned retained-byte ceiling.
     ///

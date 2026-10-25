@@ -21374,7 +21374,7 @@ components:
     KafkaLoggingConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload. Requires a fully-open backend egress policy: librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned client exposes no connect/resolve callback, so those addresses cannot be screened. Admission returns 400 whenever FERRUM_BACKEND_* policy can deny any address (including the default posture). broker_list is parsed with librdkafka's [proto://]host[:port] grammar, so protocol-prefixed denied literals and protocol prefixes that disagree with security_protocol are rejected."
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload. librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned client exposes no connect/resolve callback, so those addresses cannot be screened. Admission therefore returns 400 whenever FERRUM_BACKEND_* policy can deny any address (including the default posture), unless the node operator attests the Kafka cluster with FERRUM_KAFKA_ALLOWED_BROKERS and every broker_list entry is listed there (host:port, or an IP covered by a listed CIDR); a listed literal broker IP may pass FERRUM_BACKEND_DENY_CIDRS and the FERRUM_BACKEND_ALLOW_IPS mode but never the dangerous-range baseline. That depends on the node's environment, so this schema does not model it. broker_list is parsed with librdkafka's [proto://]host[:port] grammar, so protocol-prefixed denied literals and protocol prefixes that disagree with security_protocol are rejected."
       required:
         - broker_list
         - topic
@@ -21416,6 +21416,49 @@ components:
             required: [sasl_password]
           then:
             required: [sasl_username]
+        # A SASL transport needs an explicit mechanism (librdkafka would
+        # otherwise default to GSSAPI), PLAIN/SCRAM need the credentials, and
+        # OAUTHBEARER/GSSAPI never read them.
+        - if:
+            required: [security_protocol]
+            properties:
+              security_protocol:
+                enum: [sasl_plaintext, sasl_ssl]
+          then:
+            required: [sasl_mechanism]
+        - if:
+            required: [sasl_mechanism]
+            properties:
+              sasl_mechanism:
+                enum: [PLAIN, SCRAM-SHA-256, SCRAM-SHA-512]
+          then:
+            required: [sasl_username, sasl_password]
+        - if:
+            required: [sasl_mechanism]
+            properties:
+              sasl_mechanism:
+                enum: [OAUTHBEARER, GSSAPI]
+          then:
+            not:
+              anyOf:
+                - required: [sasl_username]
+                - required: [sasl_password]
+        # enable.idempotence=true requires acks all; librdkafka refuses an
+        # explicit acks 0/1 only at producer creation. The constructor reads
+        # the boolean case-insensitively (true/t/1), which this enum
+        # approximates.
+        - if:
+            required: [acks, producer_config]
+            properties:
+              acks:
+                enum: ["0", "1"]
+          then:
+            properties:
+              producer_config:
+                properties:
+                  enable.idempotence:
+                    not:
+                      enum: ["true", "True", "TRUE", "t", "T", "1"]
         # resolve_schema refuses both together.
         - not:
             required: [schema, schema_ref]
@@ -21471,14 +21514,18 @@ components:
             broker decision.
         key_field:
           type: string
-          enum: [client_ip, proxy_id, none]
+          enum: [client_ip, proxy_id, consumer_username, none]
           default: client_ip
           description: >-
             Partition key field: client_ip (groups by client), proxy_id (groups
-            by route), none (omits the record key and delegates partition
-            selection to the configured librdkafka partitioner — by default
-            consistent_random with sticky batching, NOT a Ferrum per-record
-            rotation). Matched exactly: lowercase, no surrounding whitespace.
+            by route), consumer_username (groups by the summary's effective
+            identity — the mapped Consumer's username, or the external
+            authenticated identity when no Consumer is mapped; unauthenticated
+            records carry no key), none (omits the record key and delegates
+            partition selection to the configured librdkafka partitioner — by
+            default consistent_random with sticky batching, NOT a Ferrum
+            per-record rotation). Matched exactly: lowercase, no surrounding
+            whitespace.
         buffer_capacity:
           type: integer
           default: 10000
@@ -21493,7 +21540,10 @@ components:
           description: >-
             Maximum retained bytes for one pre-serialized Kafka payload plus its
             optional partition key. Oversized entries are dropped before enqueue.
-            Hard maximum 1048576.
+            An explicit producer_config message.max.bytes must be at least
+            max_entry_bytes + 128 bytes of record framing (a cross-field bound
+            the constructor enforces); without one, message.max.bytes defaults
+            to the larger of 1048576 and that floor. Hard maximum 1048576.
         buffer_max_bytes:
           type: integer
           default: 16777216
@@ -21543,9 +21593,14 @@ components:
             sasl_plaintext/sasl_ssl; username and password must be paired.
         sasl_mechanism:
           type: string
-          minLength: 1
-          pattern: '\S'
-          description: SASL mechanism (e.g., PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
+          enum: [PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER, GSSAPI]
+          description: >-
+            SASL mechanism, matched exactly (librdkafka compares it
+            case-sensitively). Required with sasl_plaintext/sasl_ssl. PLAIN and
+            SCRAM-* require sasl_username and sasl_password; OAUTHBEARER and
+            GSSAPI refuse them. GSSAPI is refused at admission except on
+            Windows builds, because this gateway's librdkafka is built without
+            Cyrus SASL.
         sasl_username:
           type: string
           minLength: 1
@@ -21613,6 +21668,45 @@ components:
                     - sasl.mechanisms
                     - sasl.username
                     - sasl.password
+              # Every spelling of a property a top-level field owns (acks,
+              # message_timeout_ms, compression), including librdkafka aliases
+              # and the topic. prefix. Re-cased spellings are refused at
+              # admission only, as above.
+              - not:
+                  enum:
+                    - acks
+                    - request.required.acks
+                    - topic.acks
+                    - topic.request.required.acks
+                    - message.timeout.ms
+                    - delivery.timeout.ms
+                    - topic.message.timeout.ms
+                    - topic.delivery.timeout.ms
+                    - compression.codec
+                    - compression.type
+                    - topic.compression.codec
+                    - topic.compression.type
+              # Ferrum-bounded budgets accept only their exact name; a topic.
+              # spelling would skip the cap and race Ferrum's value.
+              - not:
+                  enum:
+                    - topic.queue.buffering.max.messages
+                    - topic.queue.buffering.max.kbytes
+                    - topic.message.max.bytes
+          # Two spellings of one librdkafka property would be applied in hash
+          # order. The constructor also catches re-cased and topic.-prefixed
+          # duplicates.
+          not:
+            anyOf:
+              - required: [linger.ms, queue.buffering.max.ms]
+              - required: [retries, message.send.max.retries]
+              - required: [max.in.flight, max.in.flight.requests.per.connection]
+              - required:
+                  - sasl.oauthbearer.client.credentials.client.id
+                  - sasl.oauthbearer.client.id
+              - required:
+                  - sasl.oauthbearer.client.credentials.client.secret
+                  - sasl.oauthbearer.client.secret
           properties:
             # Ferrum re-derives these three budgets and caps them at its own
             # hard maxima, so the admitted string is a bounded decimal integer.
@@ -21629,7 +21723,7 @@ components:
               pattern: '^([1-9][0-9]{0,4}|1[0-9]{5}|2[0-5][0-9]{4}|26[01][0-9]{3}|2620[0-9]{2}|2621[0-3][0-9]|26214[0-4])$'
             message.max.bytes:
               type: string
-              description: "librdkafka maximum message size in bytes, 1-4194304."
+              description: "librdkafka maximum message size in bytes, 1-4194304, and at least max_entry_bytes + 128 (enforced by the constructor)."
               pattern: '^([1-9][0-9]{0,5}|[1-3][0-9]{6}|40[0-9]{5}|41[0-8][0-9]{4}|419[0-3][0-9]{3}|4194[0-2][0-9]{2}|419430[0-4])$'
           additionalProperties:
             type: string
@@ -21639,7 +21733,14 @@ components:
             Escape hatch: additional librdkafka producer properties as string
             key-value pairs. Cannot override bootstrap.servers or authoritative
             TLS/SASL controls, including official aliases, PEM/keystore identity
-            alternatives, or hostname-verification disablement. TLS-namespace
+            alternatives, or hostname-verification disablement. Every spelling
+            of acks, message.timeout.ms, and compression (aliases such as
+            request.required.acks, delivery.timeout.ms, compression.type, and
+            topic.-prefixed forms) is refused — use the top-level field — and
+            two keys naming the same librdkafka property (for example linger.ms
+            and queue.buffering.max.ms) are refused, because librdkafka would
+            apply them in hash order. enable.idempotence=true requires acks
+            all. TLS-namespace
             properties require ssl/sasl_ssl; SASL/HTTPS-auth properties require
             sasl_plaintext/sasl_ssl. Queue/message budgets cannot exceed Ferrum
             hard maxima. ssl.crl.location cannot conflict with gateway

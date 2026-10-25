@@ -8097,10 +8097,16 @@ fn kafka_logging_schema_matches_runtime_admission() {
         })),
         base(json!({
             "security_protocol": "sasl_ssl",
+            "sasl_mechanism": "PLAIN",
             "sasl_username": " padded ",
             "sasl_password": " padded ",
             "producer_config": {"sasl.kerberos.service.name": "kafka"}
         })),
+        base(json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "OAUTHBEARER"})),
+        base(json!({"key_field": "consumer_username"})),
+        base(json!({"producer_config": {"queue.buffering.max.ms": "5"}})),
+        base(json!({"acks": "all", "producer_config": {"enable.idempotence": "true"}})),
+        base(json!({"acks": "1", "producer_config": {"enable.idempotence": "false"}})),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &valid, true);
     }
@@ -8132,6 +8138,35 @@ fn kafka_logging_schema_matches_runtime_admission() {
         base(json!({"producer_config": {"message.max.bytes": "4194305"}})),
         base(json!({"producer_config": {"ssl.cipher.suites": "DEFAULT"}})),
         base(json!({"producer_config": {"sasl.kerberos.service.name": "kafka"}})),
+        // SASL mechanism/credential coherence (kafka_logging-CLAUDE-3).
+        base(json!({
+            "security_protocol": "sasl_ssl",
+            "sasl_username": "alice",
+            "sasl_password": "secret"
+        })),
+        base(json!({"security_protocol": "sasl_plaintext", "sasl_mechanism": "PLAIN"})),
+        base(json!({
+            "security_protocol": "sasl_plaintext",
+            "sasl_mechanism": "OAUTHBEARER",
+            "sasl_username": "alice",
+            "sasl_password": "secret"
+        })),
+        base(json!({
+            "security_protocol": "sasl_plaintext",
+            "sasl_mechanism": "plain",
+            "sasl_username": "alice",
+            "sasl_password": "secret"
+        })),
+        // Managed properties and duplicate spellings (kafka_logging-CLAUDE-1).
+        base(json!({"producer_config": {"acks": "0"}})),
+        base(json!({"producer_config": {"request.required.acks": "0"}})),
+        base(json!({"producer_config": {"delivery.timeout.ms": "1000"}})),
+        base(json!({"producer_config": {"compression.type": "gzip"}})),
+        base(json!({"producer_config": {"topic.acks": "0"}})),
+        base(json!({"producer_config": {"topic.message.max.bytes": "1024"}})),
+        base(json!({"producer_config": {"linger.ms": "5", "queue.buffering.max.ms": "50"}})),
+        // Idempotence requires acks all (kafka_logging-CLAUDE-2).
+        base(json!({"acks": "1", "producer_config": {"enable.idempotence": "true"}})),
     ] {
         assert_component_validity(&spec, "KafkaLoggingConfig", &invalid, false);
     }
