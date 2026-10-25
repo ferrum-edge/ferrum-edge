@@ -503,3 +503,95 @@ async fn undeclared_env_sources_are_redacted_by_default() {
         Some("[REDACTED]")
     );
 }
+
+/// workload_metrics-MUSE-3: personal-access-token (`PAT`) segments and a
+/// terminal bare `AUTH` segment name credentials, so neither can be copied
+/// into telemetry or declared safe. `GITLAB_PAT` / `x-service-auth` were not
+/// used while writing the rule, proving it generalizes.
+#[test]
+fn custom_tags_reject_pat_and_terminal_auth_credential_spellings() {
+    for env_var in [
+        "GITHUB_PAT",
+        "AZURE_DEVOPS_PAT",
+        "GITLAB_PAT",
+        "githubPat",
+        "PAT",
+        "BASIC_AUTH",
+        "DOCKER_AUTH",
+        "NPM_AUTH",
+        "basicAuth",
+    ] {
+        let error = workload_metrics_new_with_env_lookup_for_test(
+            &json!({
+                "custom_env_tags": {"dimension": env_var}
+            }),
+            |_| Ok("live-secret-value".to_string()),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected credential rejection for {env_var}"));
+        assert!(
+            error.contains("cannot copy a credential-bearing environment variable"),
+            "expected credential rejection for {env_var}, got {error}"
+        );
+        assert!(!error.contains(env_var), "name must not be echoed: {error}");
+
+        let error = workload_metrics_new_with_env_lookup_for_test(
+            &json!({ "safe_tag_sources": [env_var] }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{env_var} must not be declarable as safe"));
+        assert!(error.contains("safe_tag_sources[0]"), "{error}");
+    }
+
+    for header in [
+        "x-pat",
+        "x-github-pat",
+        "x-basic-auth",
+        "x-service-auth",
+        "x-basicAuth",
+    ] {
+        let error = workload_metrics_new_with_env_lookup_for_test(
+            &json!({
+                "custom_header_tags": {"dimension": header}
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected sensitive-header rejection for {header}"));
+        assert!(
+            error.contains("cannot copy sensitive header"),
+            "expected sensitive-header rejection for {header}, got {error}"
+        );
+
+        let error = workload_metrics_new_with_env_lookup_for_test(
+            &json!({ "safe_tag_sources": [header] }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{header} must not be declarable as safe"));
+        assert!(error.contains("safe_tag_sources[0]"), "{error}");
+    }
+}
+
+/// The `PAT` / terminal-`AUTH` rule matches whole segments only: `PATH`,
+/// `PATTERN`, `PATCH`, and a non-terminal `AUTH` remain ordinary dimensions.
+#[test]
+fn custom_tags_admit_pat_and_auth_lookalike_dimensions() {
+    for env_var in [
+        "PATH_PREFIX",
+        "PATTERN_NAME",
+        "PATCH_LEVEL",
+        "AUTH_TYPE",
+        "AUTH_MODE",
+        "AUTHENTICATION_MODE",
+    ] {
+        workload_metrics_new_with_env_lookup_for_test(
+            &json!({
+                "custom_env_tags": {"dimension": env_var}
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .unwrap_or_else(|error| panic!("benign name {env_var} must be admitted, got {error}"));
+    }
+}
