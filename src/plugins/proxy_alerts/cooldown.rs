@@ -5,7 +5,10 @@
 //!   `AtomicU64` per ownership key.
 //! - [`RecoveryGate`] tracks per-`(rule_id, proxy_id, ownership_generation)`
 //!   lifecycle so a rule that breaches and then recovers can dispatch a
-//!   single resolve event.
+//!   single resolve event. `proxy_alerts` owns one gate per notification
+//!   channel, so every channel carries its own incident lifecycle: a Trigger
+//!   or Resolve that one channel missed (backpressure, failure) is retried for
+//!   that channel without being masked by a sibling channel's success.
 //!
 //! Both surfaces are infallible by design — they only return whether to
 //! proceed; the caller's `tokio::spawn` does the actual dispatch.
@@ -227,6 +230,18 @@ pub enum RuleState {
     Active {
         fired_at_ms: u64,
     },
+    /// The incident is Active and a reminder Trigger (`StillActive`) was
+    /// admitted for dispatch but has not settled yet.
+    ///
+    /// Recovery is held until that reminder settles — success, failure, or
+    /// abandonment alike — and the state returns to `Active`. Without this
+    /// seat a slow reminder could still be on the wire when recovery admitted
+    /// and delivered the Resolve, and the late reminder would then reopen the
+    /// already-resolved incident at the receiver with no Resolve owed locally.
+    PendingReminder {
+        fired_at_ms: u64,
+        reserved_at_ms: u64,
+    },
     Recovering {
         left_threshold_at_ms: u64,
     },
@@ -278,9 +293,10 @@ pub enum LifecycleOutcome {
     /// Healthy → PendingTrigger. Caller should dispatch a `Trigger` notification
     /// (subject to cooldown).
     Trigger,
-    /// Active → Active. Caller MAY dispatch a re-trigger if its cooldown
-    /// allows; this is informational so the cooldown gate stays the source
-    /// of truth.
+    /// Active → PendingReminder. Caller MAY dispatch a reminder Trigger if
+    /// its cooldown allows (the cooldown gate stays the source of truth); an
+    /// unadmitted reminder must be rolled back to `Active` with
+    /// [`RecoveryGate::rollback_unadmitted_reservation`].
     StillActive,
     /// Active → Recovering. No notification.
     EnteringRecovery,
@@ -338,19 +354,46 @@ impl RecoveryGate {
         now_ms: u64,
         ownership_generation: u64,
     ) -> LifecycleOutcome {
+        self.observe_committed(
+            rule_id,
+            proxy_id,
+            breach,
+            recovery_ms,
+            now_ms,
+            ownership_generation,
+        )
+        .0
+    }
+
+    /// [`Self::observe`] that also returns the state committed by the
+    /// transition, so the dispatch path does not need a second lookup to read
+    /// the reservation it just made.
+    pub fn observe_committed(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        breach: bool,
+        recovery_ms: u64,
+        now_ms: u64,
+        ownership_generation: u64,
+    ) -> (LifecycleOutcome, RuleState) {
         let per_generation = self.per_proxy_generations(rule_id, proxy_id);
         per_generation.with_mut(
             ownership_generation,
             || RuleState::Healthy,
-            |state| Self::transition(state, breach, recovery_ms, now_ms),
+            |state| {
+                let outcome = Self::transition(state, breach, recovery_ms, now_ms);
+                (outcome, *state)
+            },
         )
     }
 
     /// Evaluate the next lifecycle outcome without committing a transition.
     ///
-    /// Used by the dispatch path so Trigger/Resolve transitions can be
-    /// committed only after at least one notification channel accepts the
-    /// event. Non-notifying outcomes still use [`Self::observe`] directly.
+    /// Used by the dispatch path so a channel's Trigger/Resolve transition is
+    /// committed only after that channel's dispatch is admitted (permit and
+    /// cooldown reserved). Non-notifying outcomes still use [`Self::observe`]
+    /// directly.
     ///
     /// # Concurrency: deliberate TOCTOU + commit-or-drop
     ///
@@ -366,6 +409,10 @@ impl RecoveryGate {
     /// preferable to a phantom alert. Holding evaluate+commit across the
     /// dispatch reservation would extend generation-map contention into
     /// channel/permit work and is intentionally avoided.
+    ///
+    /// The dispatch path itself calls [`Self::evaluate_state`] with the state
+    /// it already read; this lookup form serves tests and debugging.
+    #[allow(dead_code)] // Used by external test crate.
     pub fn evaluate(
         &self,
         rule_id: u32,
@@ -375,16 +422,26 @@ impl RecoveryGate {
         now_ms: u64,
         ownership_generation: u64,
     ) -> LifecycleOutcome {
-        let state = self
-            .state
-            .get(&rule_id)
-            .and_then(|per_rule| {
-                per_rule
-                    .get(proxy_id)
-                    .and_then(|generations| generations.get_copied(&ownership_generation))
-            })
-            .unwrap_or(RuleState::Healthy);
-        let mut state = state;
+        Self::evaluate_state(
+            self.current_state(rule_id, proxy_id, ownership_generation),
+            breach,
+            recovery_ms,
+            now_ms,
+        )
+    }
+
+    /// [`Self::evaluate`] against an already-read state (`None` = no row yet,
+    /// i.e. Healthy). The dispatch path reads the state once per sample and
+    /// reuses it for both its quiet-hour check and this evaluation; the later
+    /// commit (`observe`) revalidates under the row lock, so the deliberate
+    /// evaluate/commit TOCTOU contract above is unchanged.
+    pub fn evaluate_state(
+        state: Option<RuleState>,
+        breach: bool,
+        recovery_ms: u64,
+        now_ms: u64,
+    ) -> LifecycleOutcome {
+        let mut state = state.unwrap_or(RuleState::Healthy);
         Self::transition(&mut state, breach, recovery_ms, now_ms)
     }
 
@@ -436,7 +493,20 @@ impl RecoveryGate {
             // stays pending so a late success still lands on Active, and a late
             // failure rolls back to Healthy via [`Self::settle_trigger`].
             (RuleState::PendingTrigger { .. }, _) => LifecycleOutcome::Quiet,
-            (RuleState::Active { .. }, true) => LifecycleOutcome::StillActive,
+            (RuleState::Active { fired_at_ms }, true) => {
+                // Reserve the reminder's in-flight seat; the caller dispatches
+                // it subject to cooldown or rolls the seat back.
+                *state = RuleState::PendingReminder {
+                    fired_at_ms,
+                    reserved_at_ms: now_ms,
+                };
+                LifecycleOutcome::StillActive
+            }
+            // A reminder Trigger is in flight. Neither direction changes the
+            // incident until it settles: no duplicate reminder on breach, and
+            // no recovery (and therefore no Resolve) that the late reminder
+            // could overtake on the wire.
+            (RuleState::PendingReminder { .. }, _) => LifecycleOutcome::Quiet,
             (RuleState::Active { .. }, false) if recovery_ms == 0 => {
                 *state = RuleState::Healthy;
                 LifecycleOutcome::Quiet
@@ -528,10 +598,11 @@ impl RecoveryGate {
         }
     }
 
-    /// Commit a successful Trigger delivery: PendingTrigger → Active.
+    /// Commit a successful Trigger delivery: PendingTrigger → Active, or a
+    /// settled reminder: PendingReminder → Active.
     ///
-    /// No-op when the state is no longer PendingTrigger (e.g. retired
-    /// generation or a concurrent Reactivate path).
+    /// No-op when the state no longer holds this reservation token (e.g.
+    /// retired generation or a concurrent Reactivate path).
     pub fn settle_trigger_success(
         &self,
         rule_id: u32,
@@ -545,13 +616,19 @@ impl RecoveryGate {
             ownership_generation,
             || RuleState::Healthy,
             |state| {
-                if matches!(
-                    state,
+                match *state {
                     RuleState::PendingTrigger {
                         reserved_at_ms: current,
-                    } if *current == reserved_at_ms
-                ) {
-                    *state = RuleState::Active { fired_at_ms };
+                    } if current == reserved_at_ms => {
+                        *state = RuleState::Active { fired_at_ms };
+                    }
+                    RuleState::PendingReminder {
+                        reserved_at_ms: current,
+                        ..
+                    } if current == reserved_at_ms => {
+                        *state = RuleState::Active { fired_at_ms };
+                    }
+                    _ => {}
                 }
                 LifecycleOutcome::Quiet
             },
@@ -559,6 +636,10 @@ impl RecoveryGate {
     }
 
     /// Roll back a failed/abandoned Trigger: PendingTrigger → Healthy.
+    ///
+    /// A failed or abandoned reminder returns PendingReminder → Active: the
+    /// incident was already delivered, only the reminder is in doubt, and
+    /// recovery may proceed now that nothing is left in flight.
     pub fn settle_trigger_failure(
         &self,
         rule_id: u32,
@@ -571,13 +652,19 @@ impl RecoveryGate {
             ownership_generation,
             || RuleState::Healthy,
             |state| {
-                if matches!(
-                    state,
+                match *state {
                     RuleState::PendingTrigger {
                         reserved_at_ms: current,
-                    } if *current == reserved_at_ms
-                ) {
-                    *state = RuleState::Healthy;
+                    } if current == reserved_at_ms => {
+                        *state = RuleState::Healthy;
+                    }
+                    RuleState::PendingReminder {
+                        fired_at_ms,
+                        reserved_at_ms: current,
+                    } if current == reserved_at_ms => {
+                        *state = RuleState::Active { fired_at_ms };
+                    }
+                    _ => {}
                 }
                 LifecycleOutcome::Quiet
             },
@@ -594,10 +681,10 @@ impl RecoveryGate {
     /// instead. Leaving that seat without a dispatch permit orphans it forever.
     ///
     /// `reserved_at_ms` must be the `now_ms` passed to the `observe` that
-    /// produced `committed`. Only event-reserving outcomes are rolled back, and
-    /// only via the token-matched failure settlers so a newer reservation
-    /// cannot be damaged. [`LifecycleOutcome::StillActive`] and other
-    /// non-reserving outcomes are no-ops.
+    /// produced `committed`. Only event-reserving outcomes are rolled back
+    /// (`Trigger` → Healthy, `StillActive` reminder → Active, `Resolve` →
+    /// Recovering), and only via the token-matched failure settlers so a newer
+    /// reservation cannot be damaged. Non-reserving outcomes are no-ops.
     pub fn rollback_unadmitted_reservation(
         &self,
         rule_id: u32,
@@ -607,7 +694,7 @@ impl RecoveryGate {
         reserved_at_ms: u64,
     ) {
         match committed {
-            LifecycleOutcome::Trigger => {
+            LifecycleOutcome::Trigger | LifecycleOutcome::StillActive => {
                 self.settle_trigger_failure(
                     rule_id,
                     proxy_id,
@@ -634,8 +721,7 @@ impl RecoveryGate {
                     reserved_at_ms,
                 );
             }
-            LifecycleOutcome::StillActive
-            | LifecycleOutcome::EnteringRecovery
+            LifecycleOutcome::EnteringRecovery
             | LifecycleOutcome::Reactivate
             | LifecycleOutcome::Quiet => {}
         }
@@ -771,6 +857,37 @@ impl RecoveryGate {
             });
             !per_rule.is_empty()
         });
+    }
+
+    /// Rows for `rule_id` whose lifecycle can advance with time alone:
+    /// `Active` (may enter recovery), `Recovering` (may resolve), and
+    /// `CompensatingTrigger` (may fall back to Healthy). Pending / in-flight
+    /// states are owned by their delivery settle and are excluded.
+    ///
+    /// Cold path (background re-evaluation). Collects owned rows so no map
+    /// guard is held while the caller dispatches.
+    pub fn time_driven_rows(&self, rule_id: u32) -> Vec<(String, u64, RuleState)> {
+        let Some(per_rule) = self
+            .state
+            .get(&rule_id)
+            .map(|per_rule| Arc::clone(per_rule.value()))
+        else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for entry in per_rule.iter() {
+            for (generation, state) in entry.value().entries() {
+                if matches!(
+                    state,
+                    RuleState::Active { .. }
+                        | RuleState::Recovering { .. }
+                        | RuleState::CompensatingTrigger { .. }
+                ) {
+                    rows.push((entry.key().clone(), generation, state));
+                }
+            }
+        }
+        rows
     }
 
     /// Drop terminal `Healthy` rows left after a Resolve (or recovery-less

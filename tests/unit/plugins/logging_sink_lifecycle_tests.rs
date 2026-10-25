@@ -1507,7 +1507,8 @@ async fn kafka_drop_without_runtime_closes_uncommitted_generation() {
     );
 }
 
-/// Multi-thread Drop finalizes an un-finalized live generation in place.
+/// Multi-thread Drop hands an un-finalized live generation to a tracked
+/// background finalize (kafka_logging-SOL-1) that unregisters it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kafka_drop_on_multi_thread_runtime_finalizes_generation() {
     let plugin = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
@@ -1525,12 +1526,18 @@ async fn kafka_drop_on_multi_thread_runtime_finalizes_generation() {
 
     drop(plugin);
 
-    assert!(
-        !ferrum_edge::plugins::kafka_logging::snapshots()
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ferrum_edge::plugins::kafka_logging::snapshots()
             .iter()
-            .any(|snap| snap.generation_id == generation_id),
-        "multi-thread Drop must finalize and unregister generation {generation_id}"
-    );
+            .any(|snap| snap.generation_id == generation_id)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("multi-thread Drop must finalize and unregister generation {generation_id}")
+    });
 }
 
 /// Producer construction failures during start restore pending activation so

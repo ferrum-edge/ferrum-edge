@@ -748,7 +748,7 @@ async fn test_istio_policy_without_origin_strips_response_mock_access_control_he
         .before_proxy(&mut ctx, &mut request_headers)
         .await
     {
-        PluginResult::Reject {
+        PluginResult::RejectBinary {
             status_code,
             body,
             headers,
@@ -795,7 +795,7 @@ async fn test_response_mock_headers_survive_rejection_without_cors_participation
         .before_proxy(&mut ctx, &mut request_headers)
         .await
     {
-        PluginResult::Reject {
+        PluginResult::RejectBinary {
             status_code,
             body,
             headers,

@@ -79,6 +79,7 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+const UNKNOWN_MODEL_REJECT_BODY: &str = r#"{"error":"AI request model unavailable","details":"model_limits requires an uncompressed, parseable request body so the requested model's token budget can be enforced"}"#;
 
 /// Base names of every per-request reservation-lifecycle metadata entry this
 /// plugin owns. Each is turned into an INSTANCE-SCOPED `ctx.metadata` key by
@@ -147,10 +148,25 @@ mod meta {
     /// `on_unmetered_response` policy AND for response-body/stream inspection:
     /// a non-AI response is never buffered, inspected, charged, or rejected.
     pub const AI_REQUEST: &str = "ai_ratelimit_request";
-    /// Marks compressed JSON requests that look like possible AI calls but
-    /// could not be estimated before proxying because decompression happens
-    /// later.
+    /// Marks an AI candidate whose body could not be inspected, so no safe
+    /// pre-request estimate exists: a still-compressed JSON request, a body
+    /// that does not parse (nesting past the JSON parser's depth limit, a
+    /// malformed document a lenient upstream still accepts), or a non-UTF-8
+    /// JSON-labelled body. The default `charge_estimate` policy rejects a
+    /// usage-less 2xx for such a request instead of treating the missing
+    /// estimate as a free charge.
     pub const COMPRESSED_AI_REQUEST: &str = "ai_ratelimit_compressed_ai_request";
+    /// The request's top-level `model` when it matched a `model_limits`
+    /// entry: the request is charged against that model's own budget window
+    /// (and ceiling) rather than the default one. Every reconciliation reads
+    /// it back, so admission and correction always address the same window.
+    pub const BUDGET_MODEL: &str = "ai_ratelimit_budget_model";
+    /// Digest of a `POST` body this instance classified as non-AI in
+    /// `before_proxy`. The final request-body hook re-classifies only when the
+    /// backend-visible body differs, so a body transform that turns a non-AI
+    /// request into a provider call is admitted and metered instead of riding
+    /// through unclassified.
+    pub const CLASSIFIED_BODY_DIGEST: &str = "ai_ratelimit_classified_body_digest";
     /// Marks the rare fallback where a co-located `compression` plugin decoded
     /// a POST JSON body without a mutable pre-`before_proxy` buffer. The normal
     /// buffered path refreshes `ctx.metadata["request_body"]` to plaintext and
@@ -239,6 +255,8 @@ struct InstanceKeys {
     compressed_ai_request: String,
     deferred_compressed_classification: String,
     encoded_stream: String,
+    budget_model: String,
+    classified_body_digest: String,
     /// `(base name, instance-scoped metadata key, response header name)` for
     /// `expose_headers`. The header NAMES are fixed by the public contract, but
     /// the metadata each instance stages them from is instance-owned, so a
@@ -263,6 +281,8 @@ impl InstanceKeys {
             compressed_ai_request: scoped(meta::COMPRESSED_AI_REQUEST),
             deferred_compressed_classification: scoped(meta::DEFERRED_COMPRESSED_CLASSIFICATION),
             encoded_stream: scoped(meta::ENCODED_STREAM),
+            budget_model: scoped(meta::BUDGET_MODEL),
+            classified_body_digest: scoped(meta::CLASSIFIED_BODY_DIGEST),
             exposed_headers: EXPOSED_RATELIMIT_HEADERS
                 .iter()
                 .map(|(base, header_name)| (*base, scoped(base), *header_name))
@@ -338,7 +358,19 @@ const AI_RATE_LIMITER_POLICY_CONFIG_KEYS: &[&str] = &[
     "expose_headers",
     "provider",
     "on_unmetered_response",
+    "consumer_limits",
+    "model_limits",
+    "media_token_estimate",
 ];
+
+/// Largest number of entries one `consumer_limits` / `model_limits` map may
+/// hold. Each entry is an exact-match lookup, never a per-request scan.
+const MAX_BUDGET_OVERRIDES: usize = 1_024;
+/// Longest consumer identity or model name a budget override may name, in
+/// characters (the unit OpenAPI `maxLength` counts).
+const MAX_BUDGET_OVERRIDE_KEY_CHARS: usize = 512;
+/// Largest per-media-item token estimate `media_token_estimate` accepts.
+const MAX_MEDIA_TOKEN_ESTIMATE: u64 = 1_000_000;
 
 /// Closed top-level key set for `ai_rate_limiter` plugin config.
 ///
@@ -356,6 +388,9 @@ pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
     "expose_headers",
     "provider",
     "on_unmetered_response",
+    "consumer_limits",
+    "model_limits",
+    "media_token_estimate",
     // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
@@ -380,6 +415,18 @@ pub struct AiRateLimiter {
     /// Configured provider, resolved once. `None` means `auto` (detect per
     /// response document).
     configured_provider: Option<AiProvider>,
+    /// Per-consumer ceilings (`consumer_limits`), keyed by the authenticated
+    /// identity `limit_by: consumer` keys on. A listed consumer keeps its own
+    /// window under its usual key; only the ceiling differs.
+    consumer_limits: HashMap<String, u64>,
+    /// Per-model budgets (`model_limits`), keyed by the request's exact
+    /// top-level `model`. A listed model is charged against its own window
+    /// per identity, with its own ceiling, and never the default window.
+    model_limits: HashMap<String, u64>,
+    /// Tokens reserved for each recognized image/audio/file content part
+    /// (`media_token_estimate`). `0` keeps binary payload leaves out of the
+    /// estimate entirely.
+    media_token_estimate: u64,
     /// Process-unique identity for this constructed instance. Scopes every
     /// reservation-lifecycle metadata key so two `ai_rate_limiter` instances —
     /// even with byte-identical budget config but intentionally separate budgets
@@ -524,6 +571,20 @@ impl AiRateLimiter {
             None => OnUnmeteredResponse::ChargeEstimate,
         };
 
+        let consumer_limits = parse_budget_overrides(config, "consumer_limits")?;
+        if !consumer_limits.is_empty() && limit_by != "consumer" {
+            return Err(
+                "ai_rate_limiter: `consumer_limits` requires `limit_by: consumer`".to_string(),
+            );
+        }
+        let model_limits = parse_budget_overrides(config, "model_limits")?;
+        let media_token_estimate = optional_u64(config, "media_token_estimate")?.unwrap_or(0);
+        if media_token_estimate > MAX_MEDIA_TOKEN_ESTIMATE {
+            return Err(format!(
+                "ai_rate_limiter: `media_token_estimate` must be <= {MAX_MEDIA_TOKEN_ESTIMATE}"
+            ));
+        }
+
         // Scope the ENTIRE per-request reservation lifecycle to THIS limiter
         // instance via a process-unique id, not to a budget-config fingerprint.
         // Two instances routinely enforce on SEPARATE token windows: a different
@@ -561,6 +622,15 @@ impl AiRateLimiter {
         semantics.text("limit_by", &limit_by);
         semantics.text("provider", &provider);
         semantics.text("on_unmetered_response", on_unmetered_response.as_str());
+        // Budget overrides decide which ceiling (and, for a model, which
+        // window) a request is charged against, so they are enforcement
+        // semantics; an omitted map and an explicit empty map encode alike.
+        semantics.text(
+            "consumer_limits",
+            &budget_overrides_fingerprint(&consumer_limits),
+        );
+        semantics.text("model_limits", &budget_overrides_fingerprint(&model_limits));
+        semantics.u64("media_token_estimate", media_token_estimate);
 
         Ok(Self {
             token_limit,
@@ -571,6 +641,9 @@ impl AiRateLimiter {
             provider,
             on_unmetered_response,
             configured_provider,
+            consumer_limits,
+            model_limits,
+            media_token_estimate,
             instance_id,
             keys: InstanceKeys::new(instance_id),
             stream_usage_handoff_key: allocate_response_stream_handoff_id(),
@@ -720,6 +793,127 @@ impl AiRateLimiter {
         key
     }
 
+    /// The `model_limits` entry this request is charged against, if any.
+    ///
+    /// Read back from instance-scoped metadata written at admission, so every
+    /// reconciliation addresses the same window admission did. A body
+    /// transform that changes the request's `model` re-attributes the
+    /// reservation in the final request-body hook (see
+    /// `reattribute_final_model`), which rewrites this marker.
+    fn budget_model<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        if self.model_limits.is_empty() {
+            return None;
+        }
+        ctx.metadata
+            .get(&self.keys.budget_model)
+            .map(String::as_str)
+            .filter(|model| self.model_limits.contains_key(*model))
+    }
+
+    /// The window this request is admitted and reconciled against.
+    ///
+    /// The default budget uses the identity key unchanged. A model-scoped
+    /// budget prefixes it with a length-delimited model segment
+    /// (`m<len>:<model>|<identity key>`): default keys begin `consumer:` or
+    /// `ip:`, so the two key spaces are disjoint, and the length prefix keeps
+    /// an identity that itself contains `|` from aliasing another model's
+    /// window.
+    fn budget_key(&self, ctx: &RequestContext) -> String {
+        let base = self.rate_key(ctx);
+        let Some(model) = self.budget_model(ctx) else {
+            return base;
+        };
+        let len = model.len().to_string();
+        let mut key = String::with_capacity(base.len() + model.len() + len.len() + 3);
+        key.push('m');
+        key.push_str(&len);
+        key.push(':');
+        key.push_str(model);
+        key.push('|');
+        key.push_str(&base);
+        key
+    }
+
+    /// The ceiling this request's window is enforced against: its
+    /// `model_limits` budget, else its consumer's `consumer_limits` override,
+    /// else the configured `token_limit`.
+    fn effective_limit(&self, ctx: &RequestContext) -> u64 {
+        if let Some(model) = self.budget_model(ctx)
+            && let Some(limit) = self.model_limits.get(model)
+        {
+            return *limit;
+        }
+        self.default_limit(ctx)
+    }
+
+    /// The ceiling of this request's default (non-model) window: its
+    /// consumer's `consumer_limits` override, else `token_limit`.
+    fn default_limit(&self, ctx: &RequestContext) -> u64 {
+        if self.limit_by == "consumer"
+            && !self.consumer_limits.is_empty()
+            && let Some(identity) = ctx.effective_identity()
+            && let Some(limit) = self.consumer_limits.get(identity)
+        {
+            return *limit;
+        }
+        self.token_limit
+    }
+
+    /// Refusal for an AI candidate whose `model` cannot be read while
+    /// `model_limits` is configured (`PR6847-SOL-2`).
+    ///
+    /// Each listed model owns an independent window, so a request that may be
+    /// a call to ANY model cannot be enforced against any single window: the
+    /// default window is usually far larger, and even the strictest listed
+    /// window may be empty while the model actually called is exhausted.
+    /// Rather than admit such a request against the wrong budget, refuse it.
+    /// A still content-coded body is answered `415` with
+    /// `Accept-Encoding: identity`; an unparseable one `400`. A co-located
+    /// `compression` plugin with `decompress_request: true` makes compressed
+    /// calls inspectable, and so attributable to their real model.
+    fn reject_unknown_model(&self, still_encoded: bool) -> PluginResult {
+        let mut headers = HashMap::new();
+        let status_code = if still_encoded {
+            headers.insert("accept-encoding".to_string(), "identity".to_string());
+            415
+        } else {
+            400
+        };
+        PluginResult::Reject {
+            status_code,
+            body: UNKNOWN_MODEL_REJECT_BODY.to_string(),
+            headers,
+        }
+    }
+
+    fn check_budget_op(&self, limit: u64) -> AiRateLimitOp {
+        if limit == self.token_limit {
+            AiRateLimitOp::CheckBudget
+        } else {
+            AiRateLimitOp::CheckBudgetWithLimit { limit }
+        }
+    }
+
+    fn reserve_op(&self, tokens: u64, limit: u64) -> AiRateLimitOp {
+        if limit == self.token_limit {
+            AiRateLimitOp::Reserve { tokens }
+        } else {
+            AiRateLimitOp::ReserveWithLimit { tokens, limit }
+        }
+    }
+
+    /// `Retry-After` for a budget refusal, in whole seconds.
+    ///
+    /// The configured window: by then every token the local sliding window
+    /// counted at refusal time has aged out, and in centralized mode the
+    /// weighted two-window estimate has decayed by a full window. It is an
+    /// upper bound for the earliest retry that can succeed, never a promise —
+    /// a smaller request may fit sooner — so a client that honours it cannot
+    /// hammer an exhausted budget.
+    fn retry_after_seconds(&self) -> u64 {
+        self.window_seconds.max(1)
+    }
+
     fn evict_stale_entries(&self) {
         self.evict_stale_entries_at(Instant::now());
     }
@@ -785,11 +979,21 @@ impl AiRateLimiter {
         // contract, last writer in configured plugin order wins), but each
         // instance's four values stay internally consistent instead of
         // interleaving one instance's limit with another's remaining.
+        //
+        // A budget override publishes ITS ceiling. Reconciliation outcomes
+        // report `remaining` against the configured default, so it is
+        // recomputed from the reported usage whenever an override applies.
+        let limit = self.effective_limit(ctx);
+        let remaining = if limit == self.token_limit {
+            outcome.remaining.unwrap_or(0)
+        } else {
+            limit.saturating_sub(outcome.usage.unwrap_or(0))
+        };
         for (base, meta_key, _) in &self.keys.exposed_headers {
             let value = match *base {
-                "ai_ratelimit_limit" => self.token_limit.to_string(),
+                "ai_ratelimit_limit" => limit.to_string(),
                 "ai_ratelimit_window" => self.window_seconds.to_string(),
-                "ai_ratelimit_remaining" => outcome.remaining.unwrap_or(0).to_string(),
+                "ai_ratelimit_remaining" => remaining.to_string(),
                 "ai_ratelimit_usage" => outcome.usage.unwrap_or(0).to_string(),
                 // Unreachable for the compiled-in table; a new entry that
                 // forgets a value here writes nothing rather than a wrong one.
@@ -819,13 +1023,18 @@ impl AiRateLimiter {
         }
     }
 
-    fn reject(&self, usage: u64) -> PluginResult {
+    /// Budget refusal (`429`). Always carries `Retry-After` — it is flow
+    /// control, not telemetry, so it does not depend on `expose_headers` —
+    /// and the four `x-ai-ratelimit-*` values when they are exposed. `limit`
+    /// is the ceiling the refused window is enforced against.
+    fn reject(&self, usage: u64, limit: u64) -> PluginResult {
         let mut headers = HashMap::new();
+        headers.insert(
+            "retry-after".to_string(),
+            self.retry_after_seconds().to_string(),
+        );
         if self.expose_headers {
-            headers.insert(
-                "x-ai-ratelimit-limit".to_string(),
-                self.token_limit.to_string(),
-            );
+            headers.insert("x-ai-ratelimit-limit".to_string(), limit.to_string());
             headers.insert("x-ai-ratelimit-remaining".to_string(), "0".to_string());
             headers.insert(
                 "x-ai-ratelimit-window".to_string(),
@@ -838,7 +1047,7 @@ impl AiRateLimiter {
             status_code: 429,
             body: format!(
                 r#"{{"error":"AI token rate limit exceeded","details":"Token usage {} exceeds limit {} in window of {} seconds"}}"#,
-                usage, self.token_limit, self.window_seconds
+                usage, limit, self.window_seconds
             ),
             headers,
         }
@@ -873,22 +1082,121 @@ impl AiRateLimiter {
         // warning per attacker-selected new key would turn fail-closed
         // admission into log amplification.
         super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+        // Idle identity state is reclaimed once it has been inactive for a
+        // window, so the window is also the bound for this refusal.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "retry-after".to_string(),
+            self.retry_after_seconds().to_string(),
+        );
         PluginResult::Reject {
             status_code: 429,
             body: CAPACITY_REJECT_BODY.to_string(),
-            headers: HashMap::new(),
+            headers,
         }
     }
 
-    async fn reserve_usage(&self, key: String, tokens: u64) -> Option<RateLimitOutcome> {
-        self.limiter
+    /// Admit one AI call against its budget window: reserve `reserved_tokens`
+    /// when there is an estimate, otherwise check that the window is not
+    /// already exhausted. `key` and `limit` come from [`Self::budget_key`] and
+    /// [`Self::effective_limit`]; they are resolved by the caller so no
+    /// request context is held across the backend round trip.
+    ///
+    /// `Err` carries the refusal to return: the state-capacity `429`, the
+    /// centralized-enforcement `503`, or the budget `429`.
+    async fn admit(
+        &self,
+        key: String,
+        limit: u64,
+        reserved_tokens: u64,
+    ) -> Result<RateLimitOutcome, PluginResult> {
+        // Advance sampled idle reclamation before admission so an exactly-full
+        // map of expired keys cannot remain pinned closed when only new
+        // identities arrive. Cleanup never removes live budgets.
+        self.evict_stale_entries();
+        let op = if reserved_tokens > 0 {
+            self.reserve_op(reserved_tokens, limit)
+        } else {
+            self.check_budget_op(limit)
+        };
+        let Some(outcome) = self
+            .limiter
             .check_with_redis_key_and_local_capacity(
                 key.clone(),
                 || key.clone(),
-                &AiRateLimitOp::Reserve { tokens },
+                &op,
                 MAX_STATE_ENTRIES,
             )
             .await
+        else {
+            return Err(self.reject_capacity());
+        };
+
+        if !outcome.allowed {
+            if outcome.enforcement_unavailable {
+                // The shared failover backend emits one bounded operational
+                // warning per outage. Do not turn an unavailable dependency
+                // into one warning and one "exceeded" metric per request.
+                return Err(self.reject_enforcement_unavailable());
+            }
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+            let usage = outcome.usage.unwrap_or(0);
+            // The rate-limit key embeds the identity dimension (consumer,
+            // authenticated identity, SPIFFE ID, or client IP) and is never
+            // logged; the bounded counters below stay.
+            warn_sampled!(
+                current_tokens = usage,
+                limit = limit,
+                plugin = "ai_rate_limiter",
+                "AI token rate limit exceeded"
+            );
+            return Err(self.reject(usage, limit));
+        }
+        Ok(outcome)
+    }
+
+    /// Record an admitted reservation on this instance's metadata so every
+    /// later reconciliation releases or corrects exactly what was reserved.
+    fn record_admission(
+        &self,
+        ctx: &mut RequestContext,
+        outcome: &RateLimitOutcome,
+        reserved_tokens: u64,
+    ) {
+        if reserved_tokens > 0 {
+            ctx.metadata.insert(
+                self.keys.reserved_tokens.clone(),
+                reserved_tokens.to_string(),
+            );
+            // Shared PRESENCE marker consumed only by the proxy's
+            // `run_after_proxy_hooks` gate for recording the genuine backend
+            // status. Its value is this instance's estimate but is never read
+            // back for a decision — every accounting read uses the
+            // instance-scoped key above (GHSA-wh4p-pmxm-3784).
+            ctx.metadata.insert(
+                RESERVED_TOKENS_METADATA_KEY.to_string(),
+                reserved_tokens.to_string(),
+            );
+            // Carry the local-window reservation id so reconciliation releases
+            // the exact entry this request created (correct under concurrent,
+            // out-of-order completions). `None` in Redis mode — harmless, the
+            // Redis reconciliation path ignores it.
+            if let Some(reservation_id) = outcome.reservation_id {
+                ctx.metadata
+                    .insert(self.keys.reservation_id.clone(), reservation_id.to_string());
+            }
+            // Carry the Redis window this reservation credited so reconciliation
+            // debits the SAME window even across a rollover (centralized mode).
+            // `None` in local mode — the in-memory window pins the correction via
+            // the matched entry's timestamp instead.
+            if let Some(reserved_window_index) = outcome.reserved_window_index {
+                ctx.metadata.insert(
+                    self.keys.reserved_window_index.clone(),
+                    reserved_window_index.to_string(),
+                );
+            }
+        }
+        self.store_metadata(ctx, outcome);
     }
 
     async fn adjust_usage(
@@ -1049,48 +1357,368 @@ impl AiRateLimiter {
         delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 
-    /// Estimate the tokens to pre-reserve for this request and report whether it
-    /// looked like an AI call at all. The returned `bool` is `true` only when the
-    /// buffered `request_body` parsed as JSON **and** carries a recognized LLM
-    /// request field (see [`json_looks_like_ai_request`]); a parseable but non-LLM
-    /// JSON `POST` returns `false` so a shared proxy doesn't subject ordinary API
-    /// traffic to the `on_unmetered_response` policy. The estimate itself may still
-    /// be 0 for a genuine AI request (e.g. `completion_tokens` mode with no `max_*`
-    /// cap), which is why callers must track the AI-request signal separately from
-    /// `reserved_tokens > 0`. Parses the body exactly once.
-    fn estimate_request_tokens(&self, ctx: &RequestContext) -> (bool, u64) {
-        self.classify_request_tokens(ctx).unwrap_or((false, 0))
+    /// Classify the staged request text (`ctx.metadata["request_body"]`) as
+    /// parsed JSON, or `None` when there is no text view or it does not parse.
+    ///
+    /// Used for the pre-`before_proxy` decompression path, where an
+    /// unavailable or malformed view defers to the final request-body hook
+    /// instead of deciding now.
+    fn classify_staged_json(&self, ctx: &RequestContext) -> Option<RequestClass> {
+        let text = ctx.metadata.get("request_body")?;
+        let json = parse_request_json(text)?;
+        Some(self.classify_json(ctx, &json))
     }
 
-    /// Parse the staged request text once, distinguishing an unavailable or
-    /// malformed view (`None`) from valid non-AI JSON (`Some((false, 0))`). The
-    /// distinction lets pre-`before_proxy` decompression reserve immediately
-    /// from refreshed plaintext while retaining the rare final-body fallback.
-    fn classify_request_tokens(&self, ctx: &RequestContext) -> Option<(bool, u64)> {
-        let body = ctx.metadata.get("request_body")?;
-        let Ok(json) = serde_json::from_str::<Value>(body) else {
-            return None;
-        };
-        // Gate the AI-request marker on LLM shape, not mere JSON parseability: the
-        // plugin forces full response buffering, so `reconcile_usage` runs for
-        // EVERY buffered 2xx. Without this gate a `reject`-mode limiter would 502
-        // (and `charge_estimate` would bill) an ordinary non-LLM JSON `POST` that
-        // happens to share the proxy. See `request_was_ai_call`.
-        if !json_looks_like_ai_request(&json) {
-            return Some((false, 0));
+    /// Classify an uncompressed request from its staged text view.
+    ///
+    /// A body that parses is classified by its LLM shape alone, whatever its
+    /// `Content-Type` label: a lenient OpenAI-compatible upstream parses a JSON
+    /// body labelled `text/plain`, unlabelled, or labelled
+    /// `application/grpc-web+json` exactly as it parses `application/json`, so
+    /// the label cannot be what exempts a call (`ai_rate_limiter-MUSE-3`). A
+    /// genuine gRPC-Web frame begins with its flag byte and never parses as
+    /// JSON, so framed traffic stays out of scope.
+    ///
+    /// A `POST` whose body does NOT parse is an uninspectable AI candidate —
+    /// handled like a still-compressed body — when it is labelled JSON or
+    /// starts like a JSON object, under ANY label, gRPC-Web included: nesting
+    /// past the parser's depth limit or a document only a lenient upstream
+    /// accepts must not make a provider call free (`ai_rate_limiter-MUSE-2`,
+    /// `PR6847-SOL-1`). An empty body, prose, binary uploads, and genuine
+    /// frames stay non-AI.
+    ///
+    /// Only `POST` is in scope at all: a body-bearing `GET` (another plugin may
+    /// stage one) never consults the budget (`PR6847-SOL-5`).
+    fn classify_staged_body(
+        &self,
+        ctx: &RequestContext,
+        is_post: bool,
+        json_label: bool,
+    ) -> RequestClass {
+        if !is_post {
+            return RequestClass::NonAi;
         }
+        let Some(text) = ctx.metadata.get("request_body") else {
+            // No text view: an empty body, or bytes that are not UTF-8 (for
+            // example UTF-16 JSON, which lenient parsers accept). Only a JSON
+            // label on a non-empty body still suggests an AI call.
+            let non_empty = ctx
+                .metadata
+                .get("request_body_size_bytes")
+                .and_then(|size| size.parse::<u64>().ok())
+                .is_some_and(|size| size > 0);
+            return if json_label && non_empty {
+                RequestClass::Uninspectable
+            } else {
+                RequestClass::NonAi
+            };
+        };
+        self.classify_body_bytes(ctx, text.as_bytes(), json_label)
+    }
 
-        Some((true, self.estimate_request_tokens_from_json(&json)))
+    /// Classify one candidate `POST` body from its bytes: a parsed document
+    /// by its LLM shape, an unparseable one by [`unparseable_body_class`].
+    /// Shared by `before_proxy` and the final request-body hook so the two
+    /// boundaries cannot disagree about a body (`PR6847-SOL-4`).
+    fn classify_body_bytes(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        json_label: bool,
+    ) -> RequestClass {
+        match std::str::from_utf8(body).ok().and_then(parse_request_json) {
+            Some(json) => self.classify_json(ctx, &json),
+            None => unparseable_body_class(json_body_start(body), json_label),
+        }
+    }
+
+    /// Classify one parsed request document.
+    ///
+    /// Gate the AI-request marker on LLM shape, not mere JSON parseability:
+    /// without it a `reject`-mode limiter would 502 (and `charge_estimate`
+    /// would bill) an ordinary non-LLM JSON `POST` that happens to share the
+    /// proxy. See `request_was_ai_call`.
+    fn classify_json(&self, ctx: &RequestContext, json: &Value) -> RequestClass {
+        if !json_looks_like_ai_request(json, self.cohere_native_request(ctx)) {
+            return RequestClass::NonAi;
+        }
+        RequestClass::Ai {
+            estimate: self.estimate_request_tokens_from_json(json),
+            budget_model: self.matched_budget_model(json),
+        }
+    }
+
+    /// Whether a bare Cohere v1 `message` marks an AI call on its own.
+    ///
+    /// Cohere v1 chat makes `model` optional, so `{"message": "..."}` is valid
+    /// provider traffic there; on a generic route the same body is ordinary
+    /// API JSON. An explicit `provider: cohere`, or a request path ending in
+    /// Cohere's `/v1/chat`, scopes it (`ai_rate_limiter-SOL-3`).
+    fn cohere_native_request(&self, ctx: &RequestContext) -> bool {
+        self.configured_provider == Some(AiProvider::Cohere) || is_cohere_v1_chat_path(&ctx.path)
+    }
+
+    /// The request's `model` when a `model_limits` entry names it exactly.
+    fn matched_budget_model(&self, json: &Value) -> Option<String> {
+        if self.model_limits.is_empty() {
+            return None;
+        }
+        json.get("model")
+            .and_then(Value::as_str)
+            .filter(|model| self.model_limits.contains_key(*model))
+            .map(str::to_string)
     }
 
     fn estimate_request_tokens_from_json(&self, json: &Value) -> u64 {
-        let prompt_tokens = estimate_prompt_tokens(json);
+        let mut prompt_tokens = estimate_prompt_tokens(json);
+        if self.media_token_estimate > 0 {
+            prompt_tokens = prompt_tokens
+                .saturating_add(count_media_parts(json).saturating_mul(self.media_token_estimate));
+        }
         let completion_tokens = requested_completion_tokens(json);
         match self.count_mode.as_str() {
             "prompt_tokens" => prompt_tokens,
             "completion_tokens" => completion_tokens,
             _ => prompt_tokens.saturating_add(completion_tokens),
         }
+    }
+
+    /// Record the digest of the `POST` body `before_proxy` classified, so the
+    /// final request-body hook can tell whether a transform changed it.
+    fn record_classified_body_digest(&self, ctx: &mut RequestContext) {
+        let Some(digest) = ctx
+            .metadata
+            .get("request_body")
+            .map(|body| request_body_digest(body.as_bytes()))
+        else {
+            return;
+        };
+        ctx.metadata
+            .insert(self.keys.classified_body_digest.clone(), digest.to_string());
+    }
+
+    /// Final-body half of the Case A fallback (see `before_proxy`): the
+    /// decompressed plaintext is finally visible, so classify it. It could not
+    /// take a safe pre-reservation, so an AI call is tagged uninspectable and
+    /// the default `charge_estimate` rejects a usage-less 2xx instead of
+    /// treating the absent estimate as a free charge.
+    ///
+    /// With `model_limits`, `before_proxy` could only check the default window
+    /// because the model was unknown. Now that the model is readable, a listed
+    /// model's request is attributed to its own budget window and checked
+    /// against it; nothing was reserved, so moving the window releases
+    /// nothing. A plaintext that still cannot be read is refused, since no
+    /// model budget can be established for it (`PR6847-SOL-2`).
+    async fn classify_deferred_final_body(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        // Defensive re-check against the final headers: a deferred body should
+        // be JSON and decompressed by now. If `content-encoding` is somehow
+        // still present (no `transform_request_body` decoded it) or the
+        // content-type was relabeled to non-JSON, the body cannot be inspected
+        // — fail closed so a usage-less compressed AI 2xx still cannot bypass
+        // the unmetered policy. A relabel to a framed gRPC / gRPC-Web media type
+        // counts as uninspectable too: the `+json` suffix satisfies
+        // `is_json_content_type` but the payload is a length-prefixed wire
+        // frame. Genuine gRPC-Web traffic never reaches here — `before_proxy`
+        // never defers a framed content-type in the first place.
+        let content_type = headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
+        let inspectable = !has_non_identity_content_encoding(headers)
+            && is_json_content_type(content_type)
+            && !is_framed_grpc_content_type(content_type);
+        // Mark an AI call ONLY when the decompressed body parses as one, so a
+        // non-AI JSON body on a shared proxy is never subjected to the
+        // `on_unmetered_response` policy. A JSON body that does not parse at
+        // all is an uninspectable candidate (`ai_rate_limiter-MUSE-2`).
+        let class = if inspectable {
+            self.classify_body_bytes(ctx, body, true)
+        } else {
+            RequestClass::Uninspectable
+        };
+        let matched_model = match class {
+            RequestClass::Ai { budget_model, .. } => Some(budget_model),
+            RequestClass::Uninspectable if !self.model_limits.is_empty() => {
+                return self.reject_unknown_model(has_non_identity_content_encoding(headers));
+            }
+            RequestClass::Uninspectable => None,
+            RequestClass::Deferred | RequestClass::NonAi => return PluginResult::Continue,
+        };
+        if let Some(matched_model) = matched_model
+            && !self.model_limits.is_empty()
+            && matched_model.as_deref() != self.budget_model(ctx)
+        {
+            match matched_model {
+                Some(model) => {
+                    ctx.metadata.insert(self.keys.budget_model.clone(), model);
+                }
+                None => {
+                    ctx.metadata.remove(&self.keys.budget_model);
+                }
+            }
+            let key = self.budget_key(ctx);
+            let limit = self.effective_limit(ctx);
+            if let Err(rejection) = self.admit(key, limit, 0).await {
+                return rejection;
+            }
+        }
+        ctx.metadata
+            .insert(self.keys.ai_request.clone(), "true".to_string());
+        ctx.metadata
+            .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
+        PluginResult::Continue
+    }
+
+    /// Re-classify a backend-visible body that differs from the one
+    /// `before_proxy` classified.
+    ///
+    /// Body transforms run after `before_proxy`, so a `request_transformer`
+    /// rename or add can turn an ordinary JSON `POST` into a valid provider
+    /// request (`ai_rate_limiter-SOL-2`). Without this pass that call carried
+    /// no AI marker, its response was never an accounting candidate, and even
+    /// explicit provider usage was discarded — a persistent bypass, not a
+    /// temporary underestimate. A newly identified AI call is admitted here
+    /// against its FINAL cost (reserve, or refuse with the usual `429`/`503`),
+    /// so it enters the normal reconciliation lifecycle. The final body is
+    /// classified exactly as `before_proxy` classifies one: a changed body
+    /// that cannot be parsed but looks like JSON enters the fail-closed
+    /// uninspectable lifecycle (`PR6847-SOL-4`). An unchanged body (the digest
+    /// recorded in `before_proxy` matches) costs one hash and no parse.
+    ///
+    /// For a request already admitted as an AI call, only its model budget can
+    /// change: see [`Self::reattribute_final_model`].
+    async fn reclassify_final_body(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if ctx.method != "POST" || has_non_identity_content_encoding(headers) || body.is_empty() {
+            return PluginResult::Continue;
+        }
+        let already_admitted = self.response_accounting_candidate(ctx);
+        if already_admitted && self.model_limits.is_empty() {
+            return PluginResult::Continue;
+        }
+        let classified_digest = ctx
+            .metadata
+            .get(&self.keys.classified_body_digest)
+            .and_then(|digest| digest.parse::<u64>().ok());
+        if classified_digest == Some(request_body_digest(body)) {
+            return PluginResult::Continue;
+        }
+        if already_admitted {
+            return self.reattribute_final_model(ctx, body).await;
+        }
+
+        let content_type = headers.get("content-type").map(String::as_str);
+        let json_label = !content_type.is_some_and(is_framed_grpc_content_type)
+            && content_type.is_some_and(is_json_content_type);
+        let (estimate, budget_model, uninspectable) =
+            match self.classify_body_bytes(ctx, body, json_label) {
+                RequestClass::Ai {
+                    estimate,
+                    budget_model,
+                } => (estimate, budget_model, false),
+                RequestClass::Uninspectable if !self.model_limits.is_empty() => {
+                    return self.reject_unknown_model(false);
+                }
+                RequestClass::Uninspectable => (0, None, true),
+                RequestClass::Deferred | RequestClass::NonAi => return PluginResult::Continue,
+            };
+        if let Some(model) = budget_model {
+            ctx.metadata.insert(self.keys.budget_model.clone(), model);
+        }
+        let key = self.budget_key(ctx);
+        let limit = self.effective_limit(ctx);
+        let outcome = match self.admit(key, limit, estimate).await {
+            Ok(outcome) => outcome,
+            Err(rejection) => return rejection,
+        };
+        ctx.metadata
+            .insert(self.keys.ai_request.clone(), "true".to_string());
+        if uninspectable {
+            ctx.metadata
+                .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
+        }
+        self.record_admission(ctx, &outcome, estimate);
+        PluginResult::Continue
+    }
+
+    /// Re-attribute an admitted AI call whose model a body transform changed
+    /// (`PR6847-SOL-3`).
+    ///
+    /// The admission reserved against the model budget the INBOUND body named.
+    /// If the backend-visible body now names a different budget (a listed
+    /// model, a different listed model, or no listed model), that reservation
+    /// is released on its old window and the call is admitted again against
+    /// the final model's window and ceiling with the final body's estimate —
+    /// refused with the usual `429`/`503` if that window cannot cover it — so
+    /// every later reconciliation charges the window of the model the
+    /// provider actually served. A body that no longer looks like an AI call
+    /// keeps its admitted attribution. A changed body that no longer PARSES
+    /// may now name any model, so it is refused like any other request whose
+    /// model budget cannot be established (`PR6847-SOL-3`); the gateway
+    /// rejection releases the admitted reservation.
+    async fn reattribute_final_model(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
+        let Some(json) = std::str::from_utf8(body).ok().and_then(parse_request_json) else {
+            if json_body_start(body).is_some() {
+                return self.reject_unknown_model(false);
+            }
+            return PluginResult::Continue;
+        };
+        if !json_looks_like_ai_request(&json, self.cohere_native_request(ctx)) {
+            return PluginResult::Continue;
+        }
+        let final_model = self.matched_budget_model(&json);
+        if final_model.as_deref() == self.budget_model(ctx) {
+            return PluginResult::Continue;
+        }
+        let estimate = self.estimate_request_tokens_from_json(&json);
+        // Release the parsed document before the backend round trips.
+        drop(json);
+
+        let reserved_tokens = self.reserved_tokens(ctx);
+        if reserved_tokens > 0 {
+            // Best effort: if the old window's store cannot be reached, its
+            // reservation simply expires with the window — the conservative
+            // direction.
+            let _ = self
+                .adjust_usage(
+                    self.budget_key(ctx),
+                    self.reservation_id(ctx),
+                    self.reserved_window_index(ctx),
+                    self.reservation_backend(ctx),
+                    0,
+                    reserved_tokens,
+                )
+                .await;
+        }
+        ctx.metadata.remove(&self.keys.reserved_tokens);
+        ctx.metadata.remove(&self.keys.reservation_id);
+        ctx.metadata.remove(&self.keys.reserved_window_index);
+        match final_model {
+            Some(model) => {
+                ctx.metadata.insert(self.keys.budget_model.clone(), model);
+            }
+            None => {
+                ctx.metadata.remove(&self.keys.budget_model);
+            }
+        }
+
+        let key = self.budget_key(ctx);
+        let limit = self.effective_limit(ctx);
+        let outcome = match self.admit(key, limit, estimate).await {
+            Ok(outcome) => outcome,
+            Err(rejection) => return rejection,
+        };
+        self.record_admission(ctx, &outcome, estimate);
+        PluginResult::Continue
     }
 
     async fn reconcile_usage(
@@ -1128,7 +1756,7 @@ impl AiRateLimiter {
                 .insert(self.keys.actual_tokens.clone(), actual_tokens.to_string());
             if let Some(outcome) = self
                 .adjust_usage(
-                    self.rate_key(ctx),
+                    self.budget_key(ctx),
                     reservation_id,
                     reserved_window_index,
                     reservation_backend,
@@ -1143,7 +1771,7 @@ impl AiRateLimiter {
                     // the original reservation provenance, so a Redis estimate
                     // is never subtracted from an unrelated local reservation.
                     let local = self.limiter.check_local_at_with_capacity(
-                        self.rate_key(ctx),
+                        self.budget_key(ctx),
                         &AiRateLimitOp::AdjustUsage {
                             reservation_id,
                             reserved_window_index,
@@ -1210,7 +1838,7 @@ impl AiRateLimiter {
         if !(200..300).contains(&response_status) {
             if let Some(outcome) = self
                 .adjust_usage(
-                    self.rate_key(ctx),
+                    self.budget_key(ctx),
                     reservation_id,
                     reserved_window_index,
                     reservation_backend,
@@ -1252,7 +1880,7 @@ impl AiRateLimiter {
                         provider = %self.provider,
                         count_mode = %self.count_mode,
                         detail = %unmetered_detail,
-                        "ai_rate_limiter: rejecting compressed AI response without token usage because no safe pre-request estimate exists"
+                        "ai_rate_limiter: rejecting uninspectable AI response without token usage because no safe pre-request estimate exists"
                     );
                     return self.reject_unmetered();
                 }
@@ -1272,7 +1900,7 @@ impl AiRateLimiter {
                 );
                 if let Some(outcome) = self
                     .adjust_usage(
-                        self.rate_key(ctx),
+                        self.budget_key(ctx),
                         reservation_id,
                         reserved_window_index,
                         reservation_backend,
@@ -1407,15 +2035,32 @@ impl AiRateLimiter {
     fn extract_token_count(&self, ctx: &RequestContext, body: &[u8]) -> Option<u64> {
         let json: Value = serde_json::from_slice(body).ok()?;
         let provider = match self.configured_provider {
-            Some(provider) => provider,
-            None => detect_response_provider(&json)?,
+            Some(provider) => Some(provider),
+            None => detect_response_provider(&json),
         };
-        let usage = extract_response_usage(&json, provider);
-        self.reconciliation_tokens(
-            ctx,
-            usage.total_for_mode(&self.count_mode),
-            usage.is_complete_for_mode(&self.count_mode),
-        )
+        if let Some(provider) = provider {
+            let usage = extract_response_usage(&json, provider);
+            let tokens = self.reconciliation_tokens(
+                ctx,
+                usage.total_for_mode(&self.count_mode),
+                usage.is_complete_for_mode(&self.count_mode),
+            );
+            if tokens.is_some() {
+                return tokens;
+            }
+        }
+        if matches!(self.configured_provider, None | Some(AiProvider::Cohere))
+            && let Some(input_tokens) = cohere_embed_billed_input_tokens(&json)
+        {
+            // An embedding generates no output, so its billed input is the
+            // complete count in every mode.
+            let tokens = match self.count_mode.as_str() {
+                "completion_tokens" => 0,
+                _ => input_tokens,
+            };
+            return self.reconciliation_tokens(ctx, Some(tokens), true);
+        }
+        None
     }
 
     /// Buffered-SSE usage extraction.
@@ -1608,6 +2253,7 @@ const AI_REQUEST_STRONG_MARKERS: &[&str] = &[
     "prompt",               // legacy completions
     "input",                // OpenAI Responses / embeddings
     "previous_response_id", // OpenAI Responses continuation (no `input` needed)
+    "texts",                // Cohere Embed (also the Bedrock-hosted Cohere embed body)
 ];
 
 /// Generic words that ALSO appear in ordinary non-LLM JSON (e.g. `{"message":
@@ -1621,11 +2267,22 @@ const AI_REQUEST_STRONG_MARKERS: &[&str] = &[
 /// is LLM-idiomatic, and Codex flagged only the much more generic `message`.)
 const AI_REQUEST_WEAK_MARKERS: &[&str] = &["message", "instructions"];
 
+/// Vertex AI legacy `predict` instance fields that carry model input — text
+/// (`prompt`), chat (`messages`), and embedding (`content`) instances. Generic
+/// ML-serving `instances` (tensors) carry none of them, so they stay non-AI.
+const VERTEX_PREDICT_INSTANCE_FIELDS: &[&str] = &["prompt", "messages", "content"];
+
 /// Whether a parsed request body looks like an LLM/AI call. A strong marker alone
 /// qualifies; a generic weak marker qualifies only alongside a top-level `model`.
-/// A JSON object matching neither is treated as non-AI traffic and left out of the
-/// token-budget / unmetered-response path.
-fn json_looks_like_ai_request(json: &Value) -> bool {
+/// A bare Cohere v1 `message` string also qualifies when `cohere_native` scopes
+/// the request to Cohere (see `AiRateLimiter::cohere_native_request`).
+/// Embedding and predict surfaces of supported providers are recognized by
+/// their own shapes (`ai_rate_limiter-MUSE-5`): Gemini `embedContent`'s
+/// `content.parts`, Gemini `batchEmbedContents`' `requests[].content.parts`,
+/// and Vertex `predict`'s `instances[]` model-input fields.
+/// A JSON object matching none of these is treated as non-AI traffic and left
+/// out of the token-budget / unmetered-response path.
+fn json_looks_like_ai_request(json: &Value, cohere_native: bool) -> bool {
     let Some(obj) = json.as_object() else {
         return false;
     };
@@ -1635,10 +2292,169 @@ fn json_looks_like_ai_request(json: &Value) -> bool {
     {
         return true;
     }
-    obj.contains_key("model")
+    if cohere_native && obj.get("message").is_some_and(Value::is_string) {
+        return true;
+    }
+    if obj.contains_key("model")
         && AI_REQUEST_WEAK_MARKERS
             .iter()
             .any(|field| obj.contains_key(*field))
+    {
+        return true;
+    }
+    if is_gemini_content(obj.get("content")) {
+        return true;
+    }
+    if obj
+        .get("requests")
+        .and_then(Value::as_array)
+        .is_some_and(|requests| {
+            requests
+                .iter()
+                .any(|request| is_gemini_content(request.get("content")))
+        })
+    {
+        return true;
+    }
+    obj.get("instances")
+        .and_then(Value::as_array)
+        .is_some_and(|instances| {
+            instances.iter().any(|instance| {
+                instance.as_object().is_some_and(|instance| {
+                    VERTEX_PREDICT_INSTANCE_FIELDS
+                        .iter()
+                        .any(|field| instance.contains_key(*field))
+                })
+            })
+        })
+}
+
+/// A Gemini `Content` object: `{"parts": [...]}`.
+fn is_gemini_content(value: Option<&Value>) -> bool {
+    value
+        .and_then(|content| content.get("parts"))
+        .is_some_and(Value::is_array)
+}
+
+/// Whether `path` is Cohere's v1 chat endpoint (`.../v1/chat`).
+fn is_cohere_v1_chat_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path.trim_end_matches('/').ends_with("/v1/chat")
+}
+
+/// Parse one request document, ignoring a leading UTF-8 byte-order mark that
+/// lenient upstream parsers skip but `serde_json` rejects.
+fn parse_request_json(text: &str) -> Option<Value> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    serde_json::from_str::<Value>(text).ok()
+}
+
+/// First significant byte of a request body (after a UTF-8 BOM and ASCII
+/// whitespace), or `None` for a blank body.
+fn json_body_start(body: &[u8]) -> Option<u8> {
+    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    body.iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+}
+
+/// Scope of a `POST` body that does not parse, from its first significant
+/// byte: blank is non-AI; a body that begins like a JSON object — whatever its
+/// label — or any non-blank JSON-labelled body is an uninspectable AI
+/// candidate; anything else (prose, binary, a gRPC-Web frame's flag byte) is
+/// non-AI.
+fn unparseable_body_class(first: Option<u8>, json_label: bool) -> RequestClass {
+    match first {
+        None => RequestClass::NonAi,
+        Some(b'{') => RequestClass::Uninspectable,
+        Some(_) if json_label => RequestClass::Uninspectable,
+        Some(_) => RequestClass::NonAi,
+    }
+}
+
+/// Cheap in-process digest of a request body, used only to tell whether the
+/// backend-visible body differs from the one classified in `before_proxy`.
+fn request_body_digest(body: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write(body);
+    hasher.finish()
+}
+
+/// Cohere Embed's billing statement: `meta.billed_units.input_tokens` on a
+/// response that bills no output. A chat response reports `tokens` (read by
+/// the shared extractor) and bills output too, so it never matches here.
+fn cohere_embed_billed_input_tokens(json: &Value) -> Option<u64> {
+    let billed = json.get("meta")?.get("billed_units")?;
+    if billed.get("output_tokens").is_some() {
+        return None;
+    }
+    billed.get("input_tokens")?.as_u64()
+}
+
+/// Parse a `consumer_limits` / `model_limits` map of exact names to positive
+/// token ceilings. Error messages never echo the supplied names or values.
+fn parse_budget_overrides(
+    config: &Value,
+    field: &'static str,
+) -> Result<HashMap<String, u64>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(HashMap::new());
+    };
+    let entries = value.as_object().ok_or_else(|| {
+        format!("ai_rate_limiter: `{field}` must be an object mapping names to token limits")
+    })?;
+    if entries.len() > MAX_BUDGET_OVERRIDES {
+        return Err(format!(
+            "ai_rate_limiter: `{field}` must contain at most {MAX_BUDGET_OVERRIDES} entries"
+        ));
+    }
+    let mut parsed = HashMap::with_capacity(entries.len());
+    for (name, limit) in entries {
+        let length = name.chars().count();
+        if length == 0 || length > MAX_BUDGET_OVERRIDE_KEY_CHARS {
+            return Err(format!(
+                "ai_rate_limiter: `{field}` names must be 1 to {MAX_BUDGET_OVERRIDE_KEY_CHARS} characters long"
+            ));
+        }
+        let limit = limit.as_u64().filter(|limit| *limit > 0).ok_or_else(|| {
+            format!("ai_rate_limiter: every `{field}` value must be a positive unsigned integer")
+        })?;
+        parsed.insert(name.clone(), limit);
+    }
+    Ok(parsed)
+}
+
+/// Canonical, order-independent encoding of one budget-override map for the
+/// local-state compatibility fingerprint. Entries are sorted and
+/// length-delimited, so no two maps share an encoding.
+fn budget_overrides_fingerprint(overrides: &HashMap<String, u64>) -> String {
+    use std::fmt::Write as _;
+    let mut entries: Vec<(&String, &u64)> = overrides.iter().collect();
+    entries.sort();
+    let mut encoded = String::new();
+    for (name, limit) in entries {
+        let _ = write!(encoded, "{}:{name}={limit};", name.len());
+    }
+    encoded
+}
+
+/// How one instance classified a request for its token budget.
+enum RequestClass {
+    /// A parsed LLM request: its pre-dispatch estimate and, when a
+    /// `model_limits` entry names its model, the model whose budget it charges.
+    Ai {
+        estimate: u64,
+        budget_model: Option<String>,
+    },
+    /// A request that may be an AI call but cannot be inspected (still
+    /// compressed, unparseable, or non-UTF-8 JSON). Budget-checked with no
+    /// estimate and subject to the fail-closed unmetered handling.
+    Uninspectable,
+    /// A decoded body whose plaintext only the final request-body hook sees.
+    Deferred,
+    /// Outside this limiter's scope; never consults the budget.
+    NonAi,
 }
 
 /// True when a `content-encoding` header marks the request body as encoded with
@@ -1676,8 +2492,76 @@ fn is_framed_grpc_content_type(content_type: &str) -> bool {
 }
 
 fn estimate_prompt_tokens(json: &Value) -> u64 {
-    let chars = prompt_character_count(json);
-    if chars == 0 { 0 } else { chars.div_ceil(4) }
+    prompt_character_count(json).div_ceil(4)
+}
+
+/// Estimate units (quarter tokens) for one billed string.
+///
+/// `chars / 4` is only conservative for ASCII prose. Current BPE tokenizers
+/// spend roughly one token per CJK, kana, Hangul, Indic, or emoji scalar and
+/// one per two Cyrillic/Greek/Arabic/Hebrew scalars, so a `chars / 4` estimate
+/// under-reserved those prompts three- to eight-fold
+/// (`ai_rate_limiter-MUSE-6`). Weighting each scalar by its UTF-8 width — one
+/// unit for ASCII, two for a two-byte scalar, a full token (four units) for a
+/// three- or four-byte scalar — keeps ASCII exactly as before and errs high,
+/// never low, for everything else.
+fn text_estimate_units(text: &str) -> u64 {
+    if text.is_ascii() {
+        return text.len() as u64;
+    }
+    text.chars().fold(0_u64, |units, scalar| {
+        units.saturating_add(match scalar.len_utf8() {
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        })
+    })
+}
+
+/// Recognized image / audio / file content parts in the request, the same
+/// parts whose binary payload leaves the prompt walk excludes.
+///
+/// Each is reserved at `media_token_estimate` tokens: excluding a base64
+/// payload stops a vision request from being falsely denied for its encoded
+/// size, but the provider still bills the medium itself (hundreds to
+/// thousands of input tokens per image).
+fn count_media_parts(json: &Value) -> u64 {
+    let Some(root) = json.as_object() else {
+        return 0;
+    };
+    let mut count = 0_u64;
+    for (field, family) in [
+        ("messages", ContentFamily::Messages),
+        ("input", ContentFamily::ResponsesInput),
+        ("contents", ContentFamily::GeminiContents),
+    ] {
+        let Some(messages) = root.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for message in messages.iter().filter_map(Value::as_object) {
+            for container in ["content", "parts"] {
+                let Some(parts) = message.get(container).and_then(Value::as_array) else {
+                    continue;
+                };
+                for part in parts.iter().filter_map(Value::as_object) {
+                    if is_media_content_part(family, part) {
+                        count = count.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+fn is_media_content_part(family: ContentFamily, part: &serde_json::Map<String, Value>) -> bool {
+    let part_type = part.get("type").and_then(Value::as_str);
+    part.iter().any(|(key, value)| {
+        content_part_binary_kind(family, part_type, key, value).is_some()
+            || value
+                .as_str()
+                .is_some_and(|text| content_part_string_leaf_excluded(family, part_type, key, text))
+    })
 }
 
 /// Pre-dispatch prompt character estimate for token reservation.
@@ -1714,7 +2598,10 @@ fn estimate_prompt_tokens(json: &Value) -> u64 {
 /// - Unknown, malformed, or collision-shaped objects outside those contexts
 ///   count fail-closed.
 ///
-/// This is a conservative chars/4 estimate, not provider tokenizer parity.
+/// The result is in estimate units ([`text_estimate_units`]): one per ASCII
+/// character, so ASCII prompts keep the `chars / 4` estimate, and more for
+/// wider scripts. It is a reservation heuristic, not provider tokenizer
+/// parity.
 ///
 /// The hot path is allocation-light: recursion carries a `Copy` context enum
 /// (no per-request path vectors, maps, or locks) and follows the `Value` tree
@@ -1839,7 +2726,7 @@ fn is_binary_payload_string(value: &str) -> bool {
 }
 
 fn member_name_character_count(key: &str) -> u64 {
-    key.chars().count() as u64
+    text_estimate_units(key)
 }
 
 fn count_member_and_value(acc: u64, key: &str, value: &Value, child_ctx: PromptWalkCtx) -> u64 {
@@ -2096,7 +2983,7 @@ fn prompt_json_character_count(value: &Value, ctx: PromptWalkCtx) -> u64 {
         // Ordinary strings always count — including well-formed `data:` URLs in
         // instructions, schemas, or unknown fields. Binary payload exclusion
         // happens only at recognized multimodal leaves (member handling below).
-        Value::String(value) => value.chars().count() as u64,
+        Value::String(value) => text_estimate_units(value),
         Value::Array(values) => {
             let elem_ctx = child_context_for_array_element(ctx);
             values.iter().fold(0_u64, |acc, value| {
@@ -2255,14 +3142,17 @@ impl Plugin for AiRateLimiter {
         if has_non_identity_content_encoding(&ctx.headers) {
             return false;
         }
-        // Framed gRPC-Web bodies reach the HTTP view (native gRPC does not —
-        // see `supported_protocols`). Their `+json` media types match
-        // `is_json_content_type` but the payload is a length-prefixed wire
-        // frame, which `before_proxy` refuses to classify, so buffering one
-        // would spend memory for an estimate this plugin will never compute.
+        // Every other `POST` is buffered, whatever its `Content-Type`: the label
+        // is client-supplied, and a lenient upstream parses a JSON body sent as
+        // `text/plain`, with no label, or as `application/grpc-web+json` just
+        // like `application/json` (`ai_rate_limiter-MUSE-3`). `before_proxy`
+        // then classifies by the body itself; a genuine gRPC-Web frame never
+        // parses as JSON and stays out of scope. Native gRPC never reaches the
+        // HTTP view (see `supported_protocols`), and its streams are not
+        // buffered here regardless.
         ctx.method == "POST"
-            && ctx.headers.get("content-type").is_some_and(|content_type| {
-                is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+            && !ctx.headers.get("content-type").is_some_and(|content_type| {
+                crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
             })
     }
 
@@ -2270,7 +3160,8 @@ impl Plugin for AiRateLimiter {
         // The normal pre-`before_proxy` decompression path refreshes plaintext
         // early. Retain final-body context for the rare fallback where a decoder
         // could only stage plaintext for the later transform; its instance-owned
-        // deferred marker is consumed there.
+        // deferred marker is consumed there. The same hook re-classifies a body
+        // a transform changed after `before_proxy` judged it non-AI.
         true
     }
 
@@ -2399,12 +3290,12 @@ impl Plugin for AiRateLimiter {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let key = self.rate_key(ctx);
-        // Classify the request against the `on_unmetered_response` policy. The
-        // hard input is a *compressed* body, which is not JSON-parseable here.
-        // There are three cases, distinguished by how the optional co-located
-        // `compression` plugin (priority 4050, runs before this plugin at 4200)
-        // handled the body:
+        // Classify the request first: only an AI call (or a candidate this
+        // plugin cannot inspect) is in scope, and only in-scope requests ever
+        // consult the token budget. The hard input is a *compressed* body,
+        // which is not JSON-parseable here. Cases, distinguished by how the
+        // optional co-located `compression` plugin (priority 4050, runs before
+        // this plugin at 4200) handled the body:
         //
         //   Case A — `compression` with `decompress_request: true` already
         //     decoded the normal buffered body in the shared pre-`before_proxy`
@@ -2422,30 +3313,24 @@ impl Plugin for AiRateLimiter {
         //     inspectable, so fail closed — mark a POST JSON body as an AI
         //     candidate so the unmetered policy still applies, leaving
         //     GET/empty/non-JSON traffic exempt.
-        //   Case C — uncompressed: estimate normally over the buffered body.
+        //   Case C — uncompressed: classify the staged body itself, whatever
+        //     its label (see `classify_staged_body`): a parseable LLM-shaped
+        //     body is an AI call, an unparseable JSON-looking `POST` is an
+        //     uninspectable candidate, and everything else is out of scope.
         //
         // Read headers from the `headers` parameter, not `ctx.headers`: when no
         // plugin advertises `modifies_request_headers()` the handler `mem::take`s
         // headers out of `ctx.headers` for this phase. See limitation #4 below
         // and docs/plugins.md. Mirrors `ai_request_guard` (#1919), which defers
         // compressed-body inspection the same way. We do NOT decompress here.
-        // Framed gRPC / gRPC-Web bodies carry length-prefixed wire frames, not a
-        // bare JSON document, even when their media type ends in `+json`; exclude
-        // them so a normal gRPC 2xx without LLM usage is never marked an AI
-        // candidate and turned into a 502.
-        let is_post_json = ctx.method == "POST"
-            && headers.get("content-type").is_some_and(|content_type| {
-                is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
-            });
-        // A framed request is never an AI candidate on any branch below, even if
-        // a co-located plugin left a JSON-parseable `request_body` in metadata:
-        // the wire body is a length-prefixed frame sequence, so estimating over
-        // it would attribute another representation's tokens to this request.
-        // Native gRPC never reaches here (HTTP-only protocol view); this covers
-        // gRPC-Web, which rides the HTTP view.
-        let is_framed_grpc = headers
-            .get("content-type")
-            .is_some_and(|content_type| is_framed_grpc_content_type(content_type));
+        // Framed gRPC / gRPC-Web labels never make a request a JSON candidate:
+        // a genuine frame is a length-prefixed wire sequence, so it is in scope
+        // only if its staged body is in fact a bare LLM JSON document.
+        let content_type = headers.get("content-type").map(String::as_str);
+        let is_post = ctx.method == "POST";
+        let framed_label = content_type.is_some_and(is_framed_grpc_content_type);
+        let json_label = !framed_label && content_type.is_some_and(is_json_content_type);
+        let is_post_json = is_post && json_label;
         let still_compressed = has_non_identity_content_encoding(headers);
         // Detect the decompressed-by-`compression` (Case A) path from the
         // compression-owned metadata, NOT a client-settable header. See
@@ -2454,28 +3339,37 @@ impl Plugin for AiRateLimiter {
             && ctx
                 .metadata
                 .contains_key(COMPRESSION_REQUEST_ENCODING_METADATA_KEY);
-        let normalized_request_tokens = (decompressed_by_compression && is_post_json)
-            .then(|| self.classify_request_tokens(ctx))
-            .flatten();
-        let defer_compressed_classification =
-            decompressed_by_compression && is_post_json && normalized_request_tokens.is_none();
-        let (is_ai_request, reserved_tokens) = if is_framed_grpc {
-            // Framed gRPC-Web: out of scope for this JSON policy entirely.
-            (false, 0)
-        } else if still_compressed {
+        let class = if still_compressed {
             // Case B: uninspectable compressed body — fail closed for POST JSON.
-            (is_post_json, 0)
-        } else if defer_compressed_classification {
-            // Case A fallback: defer to `on_final_request_body` (plaintext there).
-            (false, 0)
-        } else if let Some(classification) = normalized_request_tokens {
-            // Case A normal buffered decode: the shared normalizer refreshed
-            // the text view, so classify and reserve from that plaintext now.
-            classification
+            if is_post_json {
+                RequestClass::Uninspectable
+            } else {
+                RequestClass::NonAi
+            }
+        } else if decompressed_by_compression && is_post_json {
+            // Case A: classify the refreshed plaintext, or defer the rare
+            // fallback without a parseable text view to the final-body hook.
+            self.classify_staged_json(ctx)
+                .unwrap_or(RequestClass::Deferred)
         } else {
-            // Case C: uncompressed — estimate over the buffered inbound body.
-            self.estimate_request_tokens(ctx)
+            // Case C: uncompressed — classify the buffered inbound body.
+            self.classify_staged_body(ctx, is_post, json_label)
         };
+
+        // Out-of-scope traffic — a `GET`, a framed gRPC-Web call, a parsed
+        // non-LLM JSON `POST`, prose — never consults the token budget: it can
+        // never be charged, so refusing it with 429 once AI traffic exhausted
+        // the budget (or 503 during a centralized outage), or spending a Redis
+        // round trip and an identity slot on it, enforced nothing
+        // (`ai_rate_limiter-MUSE-4`). Record what was classified so the final
+        // request-body hook can tell whether a transform changed it.
+        if matches!(class, RequestClass::NonAi) {
+            if is_post && !still_compressed {
+                self.record_classified_body_digest(ctx);
+            }
+            return PluginResult::Continue;
+        }
+
         // Pre-reservation vs. fall-back-to-check behavior, and two
         // intentional limitations operators must understand:
         //
@@ -2516,16 +3410,15 @@ impl Plugin for AiRateLimiter {
         //    (`ctx.metadata["request_body"]`, the buffered inbound body). Body
         //    rules in `request_transformer` run later in the pipeline
         //    (`transform_request_body`, at dispatch time — after this
-        //    `before_proxy` phase), and the transformed body is a dispatch-local
-        //    value that is never written back into `ctx.metadata`. So a proxy
-        //    that adds/raises `max_tokens` or appends prompt content in a body
-        //    transform reserves against the smaller inbound body; concurrent
-        //    transformed requests can briefly oversubscribe the budget until
-        //    post-response reconciliation charges actual usage. Reserving
-        //    against the final body is not feasible here without running the
-        //    transform pipeline twice; reconciliation is the corrective. This is
-        //    documented under `count_mode` / `request_transformer` interaction
-        //    in docs/plugins.md.
+        //    `before_proxy` phase). A proxy that adds/raises `max_tokens` or
+        //    appends prompt content to an AI request therefore reserves against
+        //    the smaller inbound body; reconciliation charges actual usage. A
+        //    transform that turns a request this phase judged NON-AI into a
+        //    provider call is different — nothing would ever be charged — so
+        //    `on_final_request_body_with_context` re-classifies the
+        //    backend-visible body whenever it differs from the one classified
+        //    here and admits a newly identified AI call against its final cost
+        //    (`ai_rate_limiter-SOL-2`).
         //
         // 4. A body normalized by a co-located `compression` plugin is classified
         //    and pre-reserved from the refreshed plaintext view (Case A). A body
@@ -2535,102 +3428,67 @@ impl Plugin for AiRateLimiter {
         //    (Case B). The rare decoded fallback without a refreshed text view
         //    defers classification to `on_final_request_body`; a usage-less 2xx
         //    can therefore never turn the missing estimate into a free call.
-        // Advance sampled idle reclamation before admission so an exactly-full
-        // map of expired keys cannot remain pinned closed when only new
-        // identities arrive. Cleanup never removes live budgets.
-        self.evict_stale_entries();
-        let Some(outcome) = (if reserved_tokens > 0 {
-            self.reserve_usage(key.clone(), reserved_tokens).await
-        } else {
-            self.limiter
-                .check_with_redis_key_and_local_capacity(
-                    key.clone(),
-                    || key.clone(),
-                    &AiRateLimitOp::CheckBudget,
-                    MAX_STATE_ENTRIES,
-                )
-                .await
-        }) else {
-            return self.reject_capacity();
-        };
-
-        if !outcome.allowed {
-            if outcome.enforcement_unavailable {
-                // The shared failover backend emits one bounded operational
-                // warning per outage. Do not turn an unavailable dependency
-                // into one warning and one "exceeded" metric per request.
-                return self.reject_enforcement_unavailable();
-            }
-            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            let usage = outcome.usage.unwrap_or(0);
-            // The rate-limit key embeds the identity dimension (consumer,
-            // authenticated identity, SPIFFE ID, or client IP) and is never
-            // logged; the bounded counters below stay.
-            warn_sampled!(
-                current_tokens = usage,
-                limit = self.token_limit,
-                plugin = "ai_rate_limiter",
-                "AI token rate limit exceeded"
-            );
-            return self.reject(usage);
+        // With model budgets, a candidate whose model cannot be read cannot be
+        // enforced against any single model window, so it is refused
+        // (`PR6847-SOL-2`). The deferred decode fallback is budget-checked on
+        // its default window here and attributed to its real model by the
+        // final request-body hook, before anything is reserved.
+        if !self.model_limits.is_empty() && matches!(class, RequestClass::Uninspectable) {
+            return self.reject_unknown_model(still_compressed);
         }
+        let budget_model = match &class {
+            RequestClass::Ai { budget_model, .. } => budget_model.clone(),
+            RequestClass::Uninspectable | RequestClass::Deferred | RequestClass::NonAi => None,
+        };
+        if let Some(model) = budget_model {
+            ctx.metadata.insert(self.keys.budget_model.clone(), model);
+        }
+        let reserved_tokens = match &class {
+            RequestClass::Ai { estimate, .. } => *estimate,
+            _ => 0,
+        };
+        let key = self.budget_key(ctx);
+        let limit = self.effective_limit(ctx);
+        let outcome = match self.admit(key, limit, reserved_tokens).await {
+            Ok(outcome) => outcome,
+            Err(rejection) => return rejection,
+        };
 
         // Record this request's `on_unmetered_response` classification:
         //   - Case A normal buffered decode: classify and reserve from the
         //     refreshed plaintext above. Only its rare no-text-view fallback
         //     defers to `on_final_request_body`.
-        //   - Case B (uninspectable compressed POST JSON): `is_ai_request` is the
-        //     fail-closed candidate; also tag it compressed so the default
+        //   - Uninspectable (compressed POST JSON, or a body that does not
+        //     parse): the fail-closed candidate; also tag it so the default
         //     `charge_estimate` path rejects a usage-less 2xx (no safe estimate).
-        //   - Case C / estimated AI: mark from the parsed body.
-        if defer_compressed_classification {
-            ctx.metadata.insert(
-                self.keys.deferred_compressed_classification.clone(),
-                "true".to_string(),
-            );
-        } else if is_ai_request {
-            ctx.metadata
-                .insert(self.keys.ai_request.clone(), "true".to_string());
-            if still_compressed {
+        //   - Estimated AI: mark from the parsed body.
+        match class {
+            RequestClass::Deferred => {
+                ctx.metadata.insert(
+                    self.keys.deferred_compressed_classification.clone(),
+                    "true".to_string(),
+                );
+            }
+            RequestClass::Uninspectable => {
+                ctx.metadata
+                    .insert(self.keys.ai_request.clone(), "true".to_string());
                 ctx.metadata
                     .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
             }
+            RequestClass::Ai { .. } => {
+                ctx.metadata
+                    .insert(self.keys.ai_request.clone(), "true".to_string());
+                // With model budgets, the final request-body hook must be able
+                // to tell whether a transform changed the body (and so,
+                // possibly, the model) after this admission (`PR6847-SOL-3`).
+                if !self.model_limits.is_empty() {
+                    self.record_classified_body_digest(ctx);
+                }
+            }
+            RequestClass::NonAi => {}
         }
 
-        if reserved_tokens > 0 {
-            ctx.metadata.insert(
-                self.keys.reserved_tokens.clone(),
-                reserved_tokens.to_string(),
-            );
-            // Shared PRESENCE marker consumed only by the proxy's
-            // `run_after_proxy_hooks` gate for recording the genuine backend
-            // status. Its value is this instance's estimate but is never read
-            // back for a decision — every accounting read uses the
-            // instance-scoped key above (GHSA-wh4p-pmxm-3784).
-            ctx.metadata.insert(
-                RESERVED_TOKENS_METADATA_KEY.to_string(),
-                reserved_tokens.to_string(),
-            );
-            // Carry the local-window reservation id so reconciliation releases
-            // the exact entry this request created (correct under concurrent,
-            // out-of-order completions). `None` in Redis mode — harmless, the
-            // Redis reconciliation path ignores it.
-            if let Some(reservation_id) = outcome.reservation_id {
-                ctx.metadata
-                    .insert(self.keys.reservation_id.clone(), reservation_id.to_string());
-            }
-            // Carry the Redis window this reservation credited so reconciliation
-            // debits the SAME window even across a rollover (centralized mode).
-            // `None` in local mode — the in-memory window pins the correction via
-            // the matched entry's timestamp instead.
-            if let Some(reserved_window_index) = outcome.reserved_window_index {
-                ctx.metadata.insert(
-                    self.keys.reserved_window_index.clone(),
-                    reserved_window_index.to_string(),
-                );
-            }
-        }
-        self.store_metadata(ctx, &outcome);
+        self.record_admission(ctx, &outcome, reserved_tokens);
         PluginResult::Continue
     }
 
@@ -2640,64 +3498,18 @@ impl Plugin for AiRateLimiter {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only act on the rare Case A fallback where a co-located `compression`
-        // plugin decoded a POST JSON body but the pre-`before_proxy` phase had no
-        // parseable text view to refresh. The normal buffered decode is already
-        // classified and pre-reserved from plaintext in `before_proxy`. Keys are
-        // instance-scoped, so each co-located limiter consumes only its own
-        // deferred marker.
+        // The rare Case A fallback: a co-located `compression` plugin decoded a
+        // POST JSON body but the pre-`before_proxy` phase had no parseable text
+        // view to refresh. Keys are instance-scoped, so each co-located limiter
+        // consumes only its own deferred marker.
         if ctx
             .metadata
             .remove(&self.keys.deferred_compressed_classification)
-            .is_none()
+            .is_some()
         {
-            return PluginResult::Continue;
+            return self.classify_deferred_final_body(ctx, headers, body).await;
         }
-
-        // Defensive re-check against the final headers: a deferred body should be
-        // JSON and decompressed by now. If `content-encoding` is somehow still
-        // present (no `transform_request_body` decoded it) or the content-type was
-        // relabeled to non-JSON, the body cannot be inspected — fail closed so a
-        // usage-less compressed AI 2xx still cannot bypass the unmetered policy.
-        // A relabel to a framed gRPC / gRPC-Web media type counts as
-        // uninspectable too: the `+json` suffix satisfies `is_json_content_type`
-        // but the payload is a length-prefixed wire frame, so parsing it as a
-        // bare JSON document would silently exempt a deferred AI candidate.
-        // Genuine gRPC-Web traffic never reaches here — `before_proxy` refuses
-        // to defer a framed content-type in the first place.
-        let content_type = headers
-            .get("content-type")
-            .map(String::as_str)
-            .unwrap_or("");
-        if has_non_identity_content_encoding(headers)
-            || !is_json_content_type(content_type)
-            || is_framed_grpc_content_type(content_type)
-        {
-            ctx.metadata
-                .insert(self.keys.ai_request.clone(), "true".to_string());
-            ctx.metadata
-                .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
-            return PluginResult::Continue;
-        }
-
-        // The decompressed body is available now. Mark the request as an AI call
-        // ONLY when it actually parses as one, so a non-AI JSON body on a shared
-        // proxy is never subjected to the `on_unmetered_response` policy. This
-        // fallback could not take a safe pre-reservation, so tag it compressed;
-        // default `charge_estimate` rejects a usage-less 2xx instead of treating
-        // an absent estimate as a free charge.
-        if serde_json::from_slice::<Value>(body)
-            .ok()
-            .as_ref()
-            .is_some_and(json_looks_like_ai_request)
-        {
-            ctx.metadata
-                .insert(self.keys.ai_request.clone(), "true".to_string());
-            ctx.metadata
-                .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
-        }
-
-        PluginResult::Continue
+        self.reclassify_final_body(ctx, headers, body).await
     }
 
     async fn after_proxy(

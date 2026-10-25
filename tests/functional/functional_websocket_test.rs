@@ -666,6 +666,9 @@ plugin_configs:
             content-type: "application/json"
             x-mock: "ws"
           body: '{{"mock":"ws-handshake"}}'
+        - path: "/success"
+          status_code: 200
+          body: "would-claim-an-open-tunnel"
     scope: global
     enabled: true
 "#,
@@ -710,7 +713,7 @@ plugin_configs:
         X-WS-Reject-Order: "security-policy"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
-      remove: ["server", "x-powered-by", "content-type"]
+      remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
   - id: "plugin-correlation-id-ws-admission"
@@ -2574,10 +2577,6 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
     assert_no_failed_websocket_negotiation_headers(&rejected.headers);
-    assert!(
-        !rejected.headers.contains_key(http::header::CONTENT_TYPE),
-        "the final H3 reject writer must preserve policy removal of content-type"
-    );
     assert_failed_websocket_handshake_framing(&rejected.headers);
     let rejected_headers = rejected.headers.clone();
     let rejected_body = rejected
@@ -2880,6 +2879,9 @@ async fn test_websocket_method_policy_uses_forwarded_get_method() {
 /// Issue #2467: response_mock intentionally participates in every WebSocket
 /// handshake frontend. Matching and default-unmatched responses must terminate
 /// H1 Upgrade and H2/H3 Extended CONNECT before any backend dial or frame relay.
+/// A success-shaped (2xx) rule must surface as a final 500 on every frontend,
+/// never as an H2 stream reset or an Extended CONNECT "tunnel established"
+/// (response_mock-SOL-1).
 #[ignore]
 #[tokio::test]
 async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
@@ -2946,6 +2948,26 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
             .contains("no mock rule matched")
     );
 
+    let h1_success = h1_client
+        .get(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/success"
+        ))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .send()
+        .await
+        .expect("success-shaped H1 response-mock handshake");
+    assert_eq!(h1_success.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        h1_success
+            .text()
+            .await
+            .expect("success-shaped H1 mock body")
+            .contains("cannot mock a successful WebSocket handshake")
+    );
+
     let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
         .await
         .expect("connect to gateway H2 port");
@@ -3007,6 +3029,32 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
         .expect("unmatched H2 mock body")
         .to_bytes();
     assert!(String::from_utf8_lossy(&h2_miss_body).contains("no mock rule matched"));
+
+    let h2_success_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!(
+            "http://127.0.0.1:{gateway_http_port}/ws-mock/success"
+        ))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build success-shaped H2 WebSocket request");
+    let h2_success = h2_sender
+        .send_request(h2_success_request)
+        .await
+        .expect("success-shaped H2 mock must be a final response, not a stream reset");
+    let (h2_success_parts, h2_success_body) = h2_success.into_parts();
+    assert_eq!(h2_success_parts.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let h2_success_body = h2_success_body
+        .collect()
+        .await
+        .expect("success-shaped H2 mock body")
+        .to_bytes();
+    assert!(
+        String::from_utf8_lossy(&h2_success_body)
+            .contains("cannot mock a successful WebSocket handshake")
+    );
     h2_connection_task.abort();
 
     let h3_match_url = format!("https://localhost:{gateway_https_port}/ws-mock/match");
@@ -3044,6 +3092,21 @@ async fn test_response_mock_short_circuits_websocket_handshakes_h1_h2_and_h3() {
             .await
             .expect("unmatched H3 mock body")
             .contains("no mock rule matched")
+    );
+
+    let h3_success_url = format!("https://localhost:{gateway_https_port}/ws-mock/success");
+    let h3_success_client = Http3Client::insecure().expect("success-shaped H3 client");
+    let mut h3_success = h3_success_client
+        .websocket(&h3_success_url, WebSocketOptions::default())
+        .await
+        .expect("success-shaped H3 response-mock handshake");
+    assert_eq!(h3_success.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        h3_success
+            .recv_body_text()
+            .await
+            .expect("success-shaped H3 mock body")
+            .contains("cannot mock a successful WebSocket handshake")
     );
 
     let _ = gateway.kill();

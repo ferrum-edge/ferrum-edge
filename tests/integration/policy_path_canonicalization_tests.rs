@@ -273,7 +273,10 @@ async fn request_termination_prefix_fires_for_every_spelling_of_the_prefix() {
         let mut ctx = boundary_ctx("GET", raw);
         let result = plugin.on_request_received(&mut ctx).await;
         assert!(
-            matches!(result, PluginResult::Reject { .. }),
+            matches!(
+                result,
+                PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+            ),
             "termination must fire for spelling {raw:?}, got {result:?}"
         );
     }

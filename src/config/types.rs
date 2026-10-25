@@ -5902,6 +5902,17 @@ impl GatewayConfig {
                     plugin.id
                 ));
             }
+            // `openapi_validator`'s operation table describes ONE proxy's API.
+            // A global or proxy-group instance would apply it to every proxy it
+            // reaches and, with `fail_on_unknown_operation`, refuse every
+            // unrelated route. The Admin API already requires proxy scope; the
+            // same rule holds for file-mode and every other full-config load.
+            if plugin.plugin_name == "openapi_validator" && plugin.scope != PluginScope::Proxy {
+                errors.push(format!(
+                    "PluginConfig {:?} (openapi_validator) must have scope `proxy`",
+                    plugin.id
+                ));
+            }
             // Compile the declarative execution trigger here so a malformed
             // regex/CIDR/field shape is a config-load error, not a per-request
             // surprise. Plugin-cache publication compiles it again (and adds the
@@ -10938,6 +10949,12 @@ impl PluginConfig {
         if self.plugin_name == "prometheus_metrics" && self.scope != PluginScope::Global {
             errors.push(
                 "prometheus_metrics must have scope `global` (it owns one process-wide registry)"
+                    .to_string(),
+            );
+        }
+        if self.plugin_name == "openapi_validator" && self.scope != PluginScope::Proxy {
+            errors.push(
+                "openapi_validator must have scope `proxy` (its operation table describes one proxy's API)"
                     .to_string(),
             );
         }

@@ -178,6 +178,11 @@ pub struct CrossProtocolOutcome {
     /// `log_rejected_request`; the H3 frontend must not emit a duplicate generic
     /// transaction summary for the same request.
     pub rejection_logged: bool,
+    /// The matched route rule's deadline (the earlier of its total and the
+    /// committed attempt's budget) cut the streamed response body. Logged as
+    /// `read_write_timeout`, settled health-neutrally; carried so response
+    /// stream termination hooks can settle plugin-side breakers the same way.
+    pub route_deadline_cut: bool,
 }
 
 /// Wake an H3 request pump if its owning bridge future is dropped before the
@@ -433,6 +438,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     }
 }
 
@@ -815,6 +821,7 @@ fn cross_protocol_header_write_disconnect_outcome(
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     }
 }
 
@@ -6773,6 +6780,7 @@ where
                         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         rejection_logged: false,
+                        route_deadline_cut: false,
                     });
                 }
                 let (deadline_bytes, deadline_written) =
@@ -6792,6 +6800,7 @@ where
                     backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                     backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                     rejection_logged: false,
+                    route_deadline_cut: false,
                 });
             }
         };
@@ -6819,6 +6828,7 @@ where
             backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             rejection_logged: false,
+            route_deadline_cut: false,
         });
     }
 
@@ -7141,6 +7151,7 @@ where
                     backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                     backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
                     rejection_logged: false,
+                    route_deadline_cut: false,
                 });
             }
         };
@@ -7210,6 +7221,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut,
     })
 }
 
@@ -8425,6 +8437,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -8891,7 +8904,7 @@ where
             hyper_method.clone(),
             initial_hmap,
             initial_body,
-            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+            crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers),
             grpc_dispatch_proxy,
             &current_url,
             &initial_grpc_transport,
@@ -9176,7 +9189,9 @@ where
                     hmap.clone(),
                     body_bytes.clone(),
                     // A retry replays the complete request, trailers included.
-                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
+                    crate::plugins::grpc_web::staged_request_trailers(
+                        &ctx.grpc_web_request_trailers,
+                    ),
                     grpc_retry_dispatch_proxy,
                     &current_url,
                     &grpc_retry_transport,
@@ -10168,6 +10183,7 @@ where
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 rejection_logged: false,
+                route_deadline_cut: false,
             })
         }
         Ok(GrpcResponseKind::Streaming(streaming)) => {
@@ -12730,6 +12746,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -13249,6 +13266,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -13283,6 +13301,7 @@ fn terminal_deadline_write_aborted_outcome(
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     }
 }
 
@@ -13927,6 +13946,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -14246,6 +14266,7 @@ where
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 rejection_logged: false,
+                route_deadline_cut: false,
             })
         } else {
             write_grpc_error_send_with_policy(
@@ -14440,6 +14461,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
+        route_deadline_cut: false,
     })
 }
 
@@ -16066,7 +16088,7 @@ mod tests {
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20hyper_method.clone(),\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_hmap,\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20initial_body,\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers),\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
             ),
             "initial gRPC dispatch must move the prepared headers/body and use the \
