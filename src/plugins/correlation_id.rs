@@ -1,7 +1,9 @@
 //! Correlation ID / Request ID Plugin
 //!
 //! Generates a unique request ID for every request and propagates it
-//! through the proxy chain. If the client sends one, it is preserved.
+//! through the proxy chain. With the default `inbound_policy: "preserve"` a
+//! well-formed client-supplied ID is kept; `"generate"` always mints a fresh,
+//! gateway-owned ID and overwrites any inbound value.
 
 use async_trait::async_trait;
 use http::header::HeaderName;
@@ -59,13 +61,27 @@ const RESERVED_HEADER_NAMES: &[&str] = &[
     "x-forwarded-proto",
     "x-goog-api-key",
     "x-grpc-web-mode",
+    // Untrusted-peer `X-Real-IP` is dropped by every backend request builder
+    // regardless of `FERRUM_REAL_IP_HEADER`, so a correlation ID written there
+    // would be echoed and logged but never reach the backend.
+    "x-real-ip",
     "x-xsrf-token",
 ];
+
+/// How an instance treats a well-formed inbound value on its header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundPolicy {
+    /// Keep a valid client-supplied ID (default).
+    Preserve,
+    /// Always mint a fresh gateway-owned UUID and overwrite the inbound value.
+    Generate,
+}
 
 pub struct CorrelationId {
     header_name: String,
     instance_metadata_key: String,
     echo_downstream: bool,
+    inbound_policy: InboundPolicy,
     /// `[header_name]` when `echo_downstream` is on, empty otherwise.
     /// Precomputed so `Plugin::response_trailer_policy` can hand out a bounded
     /// slice without allocating per request.
@@ -87,7 +103,7 @@ impl CorrelationId {
         let mut unknown_keys: Vec<&str> = object
             .keys()
             .map(String::as_str)
-            .filter(|key| !matches!(*key, "header_name" | "echo_downstream"))
+            .filter(|key| !matches!(*key, "header_name" | "echo_downstream" | "inbound_policy"))
             .collect();
         if !unknown_keys.is_empty() {
             unknown_keys.sort_unstable();
@@ -128,6 +144,18 @@ impl CorrelationId {
             }
         };
 
+        let inbound_policy = match config.get("inbound_policy") {
+            None | Some(Value::Null) => InboundPolicy::Preserve,
+            Some(Value::String(s)) if s == "preserve" => InboundPolicy::Preserve,
+            Some(Value::String(s)) if s == "generate" => InboundPolicy::Generate,
+            Some(other) => {
+                return Err(format!(
+                    "correlation_id: `inbound_policy` must be `preserve` or `generate`, got: {:?}",
+                    other.to_string()
+                ));
+            }
+        };
+
         let instance_metadata_key = format!("{INSTANCE_METADATA_PREFIX}{header_name}");
         let echoed_header_names = if echo_downstream {
             vec![header_name.clone()]
@@ -138,6 +166,7 @@ impl CorrelationId {
             header_name,
             instance_metadata_key,
             echo_downstream,
+            inbound_policy,
             echoed_header_names,
         })
     }
@@ -147,13 +176,35 @@ impl CorrelationId {
     }
 }
 
-/// `name` is expected to be lowercase. The whole gateway-owned `x-consumer-*`
-/// namespace and the gateway's `X-Ferrum-Hops` loop-guard count are reserved
-/// alongside the closed protocol-managed set.
+/// `name` is expected to be lowercase. Every backend-visible gateway assertion
+/// (the `x-consumer-*` namespace, `x-authenticated-identity`, and the private
+/// GeoIP `x-geo-country`, each with `_` equivalent to `-`) and the gateway's
+/// `X-Ferrum-Hops` loop-guard count are reserved alongside the closed
+/// protocol-managed set. Outbound refresh strips and regenerates the assertion
+/// names, so a correlation ID written there would never reach the backend.
 pub(crate) fn is_reserved_header_name(name: &str) -> bool {
     RESERVED_HEADER_NAMES.contains(&name)
+        // The `x-consumer-*` namespace is decided by the shared predicate every
+        // consumer-assertion boundary uses; the wider gateway-assertion set adds
+        // the remaining names outbound refresh strips (`x-geo-country`).
         || crate::proxy::headers::is_consumer_assertion_header(name)
+        || crate::proxy::headers::is_gateway_assertion_header(name)
         || crate::proxy::hop_limit::is_proxy_hops_header(name)
+}
+
+/// Overwrite `name` in `headers` with `value`, reusing the existing key and
+/// value buffer when the field is already present (the common case for the
+/// outbound map, which is built from the request headers this plugin already
+/// wrote). Only a missing field allocates a new key/value pair.
+fn set_header_value(headers: &mut HashMap<String, String>, name: &str, value: &str) {
+    if let Some(existing) = headers.get_mut(name) {
+        if existing.as_str() != value {
+            existing.clear();
+            existing.push_str(value);
+        }
+    } else {
+        headers.insert(name.to_owned(), value.to_owned());
+    }
 }
 
 fn parse_configured_header_name(raw: &str) -> Result<String, String> {
@@ -177,6 +228,12 @@ fn parse_configured_header_name(raw: &str) -> Result<String, String> {
     if crate::proxy::headers::is_consumer_assertion_header(&lower) {
         return Err(format!(
             "correlation_id: `header_name` is in the gateway-owned `x-consumer-*` consumer assertion namespace and cannot be used for correlation IDs: {:?}",
+            render_header_name_for_error(trimmed)
+        ));
+    }
+    if crate::proxy::headers::is_gateway_assertion_header(&lower) {
+        return Err(format!(
+            "correlation_id: `header_name` is a gateway-owned backend assertion header that the proxy strips and regenerates before dispatch and cannot be used for correlation IDs: {:?}",
             render_header_name_for_error(trimmed)
         ));
     }
@@ -260,37 +317,43 @@ impl Plugin for CorrelationId {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let (request_id, generated) = if let Some(existing) = ctx.headers.get(&self.header_name) {
-            // Preserve the client-supplied id only when it is both within the
-            // length cap AND made up of safe correlation-id characters. The
-            // inbound value is untrusted and is reflected downstream, forwarded
-            // upstream, and projected into `ctx.metadata["request_id"]` for
-            // logging sinks. `http::HeaderValue` already blocks CR/LF/NUL, but
-            // it legally permits HTAB, DEL (0x7F), and obs-text (0x80-0xFF),
-            // which could pollute a plain-text log sink or a downstream consumer
-            // expecting a token. Reject those by regenerating a fresh UUID —
-            // mirroring the over-length branch and the RFC 7230 strictness
-            // already applied to `header_name`. (Finding #69.)
-            if existing.len() <= 256 && is_valid_correlation_id(existing) {
-                (existing.clone(), false)
-            } else {
+        // Preserve the client-supplied id only when the instance policy allows
+        // it and the value is both within the length cap AND made up of safe
+        // correlation-id characters. The inbound value is untrusted and is
+        // reflected downstream, forwarded upstream, and projected into
+        // `ctx.metadata["request_id"]` for logging sinks. `http::HeaderValue`
+        // already blocks CR/LF/NUL, but it legally permits HTAB, DEL (0x7F),
+        // and obs-text (0x80-0xFF), which could pollute a plain-text log sink
+        // or a downstream consumer expecting a token. Reject those by
+        // regenerating a fresh UUID — mirroring the over-length branch and the
+        // RFC 7230 strictness already applied to `header_name`. (Finding #69.)
+        // `inbound_policy: "generate"` takes the same replacement path for every
+        // inbound value so the gateway always owns the ID.
+        let preserved = match self.inbound_policy {
+            InboundPolicy::Preserve => ctx
+                .headers
+                .get(&self.header_name)
+                .filter(|existing| existing.len() <= 256 && is_valid_correlation_id(existing))
+                .cloned(),
+            InboundPolicy::Generate => None,
+        };
+        let (request_id, generated) = match preserved {
+            Some(existing) => (existing, false),
+            None => {
                 let id = Uuid::new_v4().to_string();
-                ctx.headers.insert(self.header_name.clone(), id.clone());
+                set_header_value(&mut ctx.headers, &self.header_name, &id);
                 (id, true)
             }
-        } else {
-            let id = Uuid::new_v4().to_string();
-            ctx.headers.insert(self.header_name.clone(), id.clone());
-            (id, true)
         };
 
         // Keep each authoritative instance value in private lifecycle state
         // across phase-separated execution. Public metadata is a compatibility
         // projection only. The first instance in configured lifecycle order
         // also owns the canonical consumer-facing request ID. Gateway-minted
-        // (omitted or rejected inbound) values are recorded as generated so
-        // `response_caching` can omit that header/value from the shared-cache
-        // key without trusting a client-spoofable metadata marker.
+        // (omitted, rejected, or policy-overwritten inbound) values are
+        // recorded as generated so `response_caching` can omit that
+        // header/value from the shared-cache key without trusting a
+        // client-spoofable metadata marker.
         ctx.publish_correlation_id(
             &self.instance_metadata_key,
             &self.header_name,
@@ -308,7 +371,7 @@ impl Plugin for CorrelationId {
     ) -> PluginResult {
         // Ensure the correlation ID header is in the outgoing request
         if let Some(request_id) = self.request_id(ctx) {
-            headers.insert(self.header_name.clone(), request_id.to_string());
+            set_header_value(headers, &self.header_name, request_id);
         }
         PluginResult::Continue
     }
@@ -322,7 +385,7 @@ impl Plugin for CorrelationId {
         if self.echo_downstream
             && let Some(request_id) = self.request_id(ctx)
         {
-            response_headers.insert(self.header_name.clone(), request_id.to_string());
+            set_header_value(response_headers, &self.header_name, request_id);
         }
         PluginResult::Continue
     }
@@ -336,7 +399,7 @@ impl Plugin for CorrelationId {
         if self.echo_downstream
             && let Some(request_id) = self.request_id(ctx)
         {
-            response_headers.insert(self.header_name.clone(), request_id.to_string());
+            set_header_value(response_headers, &self.header_name, request_id);
         }
     }
 

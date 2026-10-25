@@ -1644,8 +1644,6 @@ impl CorrelationIdState {
         generated: bool,
     ) -> bool {
         let publish_canonical = self.canonical.is_none();
-        self.instances
-            .insert(instance_key.to_string(), request_id.clone());
         self.generated_headers
             .retain(|(existing, _)| !existing.eq_ignore_ascii_case(header_name));
         if generated {
@@ -1653,8 +1651,11 @@ impl CorrelationIdState {
                 .push((header_name.to_string(), request_id.clone()));
         }
         if publish_canonical {
-            self.canonical = Some(request_id);
+            self.canonical = Some(request_id.clone());
         }
+        // The instance slot takes ownership of the caller's value, so only the
+        // canonical and generated-provenance copies allocate.
+        self.instances.insert(instance_key.to_string(), request_id);
         publish_canonical
     }
 
@@ -4730,12 +4731,14 @@ impl RequestContext {
             request_id.clone(),
             generated,
         );
-        self.metadata
-            .insert(instance_key.to_string(), request_id.clone());
         if publish_canonical {
             self.metadata
-                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+                .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
         }
+        // The instance projection takes ownership of the caller's value; the
+        // instance key never equals `REQUEST_ID_METADATA_KEY`, so the insert
+        // order is not observable.
+        self.metadata.insert(instance_key.to_string(), request_id);
     }
 
     /// Whether `name` currently carries a gateway-minted correlation value.
@@ -10358,10 +10361,10 @@ impl StreamConnectionContext {
             generated,
         );
         let metadata = self.metadata.get_or_insert_with(MetadataMap::default);
-        metadata.insert(instance_key.to_string(), request_id.clone());
         if publish_canonical {
-            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
+            metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.clone());
         }
+        metadata.insert(instance_key.to_string(), request_id);
     }
 
     /// Previously memoized execution-trigger decision for `token`, if any.
