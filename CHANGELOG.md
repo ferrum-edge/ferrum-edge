@@ -361,43 +361,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`mcp_gateway` production-launch hardening.** A discovered tool
-  `inputSchema` now passes the same bounded depth / node / local-`$ref` walk
-  audit as `outputSchema` before `jsonschema` compiles it on the request
-  worker (whether or not `validation.validate_tool_arguments` is on), so a
-  hostile upstream's long flat `$defs` reference chain can no longer exhaust
-  the worker stack; only that tool is omitted. A second aggregate instance on
-  a disjoint endpoint no longer consumes or clears another instance's
-  trusted public→upstream tool rewrite. A `discovery.on_schema_change:
-  hide_until_configured` quarantine is now an instance-wide gate keyed by
-  server and public tool name, so a fresh session (for any principal) can
-  no longer see a changed tool as new; only a configuration change clears
-  it. Aggregate-routed calls no longer forward the client's `Authorization`,
-  `Proxy-Authorization`, `Cookie`, or route credential headers to the
-  tool-selected upstream unless the new per-server
-  `servers.*.forward_client_credentials: true` opts in. **Breaking:**
-  prompts, resources, and resource templates are now policy-gated: new
+- **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
+  client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
   `policy.default_prompt_action` / `policy.default_resource_action`, both
   falling back to `policy.default_action` (default `deny`), apply to the list
   methods and to `prompts/get` / `resources/read` (refused with JSON-RPC
   `-32001`); set the family defaults to `allow` to keep the previous open
-  behavior.
-- **`mcp_gateway` upstream authentication.** New per-server
+  behavior. A read is refused when ANY binding of its upstream URI (an exact
+  resource or a matching template) is denied, unless the requested public URI
+  has its own entry. Aggregate-routed calls no longer carry the client's
+  `Authorization`, `Proxy-Authorization`, `Cookie`, route credential headers,
+  or any query string to the tool-selected upstream: the gateway commits an
+  empty backend query and re-asserts the header boundary over the final
+  backend headers, unless the new per-server
+  `servers.*.forward_client_credentials: true` opts in. An aggregate `DELETE`
+  without a session header now answers HTTP 400 (JSON-RPC `-32600`) instead
+  of `200`. See `docs/upgrade_guide.md`.
+- **`mcp_gateway` production-launch hardening** (issue #6819). A discovered
+  tool `inputSchema` now passes the same bounded depth / node / local-`$ref`
+  walk audit as `outputSchema` — which now also descends into schema-valued
+  `dependencies`, `additionalItems`, and `$recursiveRef` — before `jsonschema`
+  compiles it on the request worker (whether or not
+  `validation.validate_tool_arguments` is on), so a hostile upstream's long
+  flat reference chain can no longer exhaust the worker stack; only that tool
+  is omitted. A second aggregate instance on a disjoint endpoint no longer
+  consumes or clears another instance's trusted public→upstream tool rewrite.
+  A `discovery.on_schema_change: hide_until_configured` quarantine is now an
+  instance-wide gate keyed by server and public tool name, enforced live on
+  `tools/list`, `tools/call`, and final admission in every session (including
+  already-cached and last-good catalogs); only a configuration change clears
+  it, and only published (non-colliding) tools occupy its bounded table.
+- **`mcp_gateway` upstream authentication** (issue #6819). New per-server
   `servers.*.headers` (at most 32; a value may be a whole
   `${FERRUM_PLUGIN_SECRET_<NAME>}` reference) are sent on every
   gateway-originated request — `initialize`, `notifications/initialized`,
   every `*/list` page, session `DELETE` — and installed on routed calls to
-  that server, replacing any client copy. Names join the credential-header
-  registry; gateway-owned, hop-by-hop, forwarding, `x-consumer-*`, and session
-  header names are refused.
-- **`mcp_gateway` session lifecycle.** An enabled aggregate instance now runs a
-  background reaper (every half `sessions.session_ttl_seconds`, 1–60 s) that
-  reclaims expired sessions at rest and `DELETE`s their upstream sessions
-  best-effort; it is aborted with the instance. Per-server catalog discovery
-  fans out concurrently (up to 8 servers at a time). An aggregate `DELETE`
-  without a session header now answers HTTP 400 (JSON-RPC `-32600`) instead
-  of a `200` success.
+  that server, replacing any client copy, including over the final backend
+  headers. Names join the credential-header registry; gateway-owned,
+  hop-by-hop, forwarding, `x-consumer-*`, and session header names are
+  refused.
+- **`mcp_gateway` session lifecycle** (issue #6819). An enabled aggregate
+  instance now runs a background reaper (every half
+  `sessions.session_ttl_seconds`, 1–60 s) that reclaims expired sessions at
+  rest; their upstream `DELETE`s run on a separate bounded worker (8 in
+  flight, 10 s each, best-effort queue), so a slow upstream never delays the
+  next sweep. An upstream `initialize` whose result arrives after its session
+  was removed now deletes that upstream session instead of orphaning it. Both
+  per-server catalog and resource-template discovery fan out concurrently (up
+  to 8 servers at a time).
 
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to

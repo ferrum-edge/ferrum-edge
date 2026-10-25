@@ -454,6 +454,11 @@ struct McpPolicy {
     /// Public `mcp://` resource URI, or public resource-template URI, to its
     /// action (`allow` / `deny`).
     resources: HashMap<String, PolicyAction>,
+    /// Whether `resources` denies some public resource-template URI (a key
+    /// carrying a `{...}` expression). Only then can a template deny cover a
+    /// resource otherwise allowed, so only then do resource reads and lists
+    /// consult the template catalog.
+    template_deny: bool,
     /// Every ACL group name referenced by a `policy.tools.*.allowed_groups` or
     /// `denied_groups` list, interned at config load to its bit position in an
     /// [`McpGroupSet`]. Empty when no tool entry carries a group condition, in
@@ -726,8 +731,22 @@ impl McpUpstreamHeaders {
 
     /// Replace every spelling of each configured header on a routed call's
     /// backend header map with the configured value.
+    ///
+    /// Idempotent and allocation-free when the map already carries exactly
+    /// the configured value under the canonical name, because the final
+    /// backend-header policy re-applies it on every pass.
     fn apply_to_map(&self, headers: &mut HashMap<String, String>) {
         for (name, value) in self.0.iter() {
+            let intact = {
+                let mut spellings = headers.keys().filter(|key| key.eq_ignore_ascii_case(name));
+                matches!(
+                    (spellings.next(), spellings.next()),
+                    (Some(key), None) if key == name
+                ) && headers.get(name) == Some(value)
+            };
+            if intact {
+                continue;
+            }
             remove_header(headers, name);
             headers.insert(name.clone(), value.clone());
         }
@@ -1002,6 +1021,11 @@ struct ToolCatalogEntry {
     // until an operator reconfigures/reloads — including explicitly-configured
     // tools, which the per-refresh schema check would otherwise re-enable.
     hidden_by_schema_change: bool,
+    /// The instance-wide quarantine flag of this tool's schema baseline, read
+    /// live on every list, call, and final admission. `None` until the entry
+    /// survives collision handling and is baselined, or when
+    /// `on_schema_change` is `allow`.
+    schema_quarantine: Option<Arc<AtomicBool>>,
     input_validator: Arc<jsonschema::Validator>,
     /// Compiled `outputSchema` when the tool declared one that passed admission.
     output_validator: Option<Arc<jsonschema::Validator>>,
@@ -1011,6 +1035,26 @@ struct ToolCatalogEntry {
     schema_hash: String,
     #[allow(dead_code)] // Stored for description-only drift detection extensions.
     description_hash: String,
+}
+
+impl ToolCatalogEntry {
+    /// Whether this tool is quarantined by a schema change: sticky in this
+    /// session's catalog, or set on the instance-wide baseline by any session.
+    fn schema_quarantined(&self) -> bool {
+        self.hidden_by_schema_change
+            || self
+                .schema_quarantine
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    /// Hide and disable this entry exactly like a schema-changed tool.
+    fn mark_schema_quarantined(&mut self) {
+        self.hidden_by_schema_change = true;
+        self.hidden_by_discovery = true;
+        self.hidden_from_discovery = true;
+        self.enabled = false;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1151,6 +1195,9 @@ impl McpCatalog {
 /// Most servers whose catalog lists one refresh fetches concurrently.
 const MAX_CONCURRENT_SERVER_DISCOVERY: usize = 8;
 
+/// One server's fetched resource-template list for a template refresh pass.
+type ServerTemplateListing<'a> = (&'a McpServerConfig, Result<Vec<Value>, String>);
+
 /// One server's fetched catalog families for a refresh pass; `None` for a
 /// family that was not attempted.
 struct ServerFamilyListings {
@@ -1245,6 +1292,24 @@ pub(crate) struct McpAdmissionRecord {
     /// present the final request is a REST call, not a JSON-RPC envelope, and
     /// it is re-checked against this claim instead.
     bridge: Option<Arc<McpBridgeClaim>>,
+    /// Whether the selected MCP upstream must NOT receive the client's
+    /// credentials (`servers.*.forward_client_credentials` off). When set the
+    /// canonical backend query funnel commits an empty query for this
+    /// request, so neither a client query credential nor a later query
+    /// transform reaches the tool-selected upstream.
+    isolate_client_credentials: bool,
+}
+
+impl McpAdmissionRecord {
+    /// The backend-visible query this admission commits, `None` to leave the
+    /// ordinary query funnel in charge (transparent forwarding, an OpenAPI
+    /// bridge call, or a server opted in to client credential forwarding).
+    ///
+    /// The configured `upstream_url` carries no query (admission refuses
+    /// one), so the committed empty query appends nothing to it.
+    pub(crate) fn committed_query(&self) -> Option<&str> {
+        self.isolate_client_credentials.then_some("")
+    }
 }
 
 impl std::fmt::Debug for McpAdmissionRecord {
@@ -1318,6 +1383,10 @@ struct McpAdmittedTarget {
     /// context at that point. `None` for an ungated tool, a prompt, or a
     /// resource.
     grant: Option<McpToolGrant>,
+    /// The admitted tool's instance-wide schema quarantine flag, re-read in
+    /// the final request-body hook so a quarantine set by another session
+    /// after `before_proxy` still stops the call before egress.
+    schema_quarantine: Option<Arc<AtomicBool>>,
 }
 
 impl McpAdmittedTarget {
@@ -1332,6 +1401,7 @@ impl McpAdmittedTarget {
                 .and_then(|params| params.get("arguments"))
                 .cloned(),
             grant: None,
+            schema_quarantine: None,
         }
     }
 
@@ -1342,11 +1412,17 @@ impl McpAdmittedTarget {
             binds_arguments: false,
             arguments: None,
             grant: None,
+            schema_quarantine: None,
         }
     }
 
     fn with_grant(mut self, grant: Option<McpToolGrant>) -> Self {
         self.grant = grant;
+        self
+    }
+
+    fn with_schema_quarantine(mut self, flag: Option<Arc<AtomicBool>>) -> Self {
+        self.schema_quarantine = flag;
         self
     }
 }
@@ -1475,12 +1551,16 @@ struct DownstreamMcpSession {
 /// clears only when the configuration changes (a new instance).
 #[derive(Debug, Clone)]
 struct ToolSchemaBaseline {
-    /// The first schema hash this instance admitted for the tool, updated to
+    /// The first schema hash this instance published for the tool, updated to
     /// the latest observed hash after a change.
     schema_hash: String,
     /// Sticky: set when the schema changed under
-    /// `discovery.on_schema_change: hide_until_configured`.
-    quarantined: bool,
+    /// `discovery.on_schema_change: hide_until_configured`. Shared with every
+    /// session's catalog entry for the tool (and every call admitted from
+    /// one), so a quarantine detected in one session stops the tool in every
+    /// already-cached session too, including last-good entries carried
+    /// through a degraded refresh.
+    quarantined: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -2098,13 +2178,7 @@ impl McpGateway {
             // propagates end-user tokens to a same-trust upstream opts in per
             // server. Configured `servers.*.headers` are installed below either
             // way.
-            let route_ctx: &RequestContext = ctx;
-            headers.retain(|name, _| {
-                !(MCP_CLIENT_CREDENTIAL_HEADERS
-                    .iter()
-                    .any(|credential| name.eq_ignore_ascii_case(credential))
-                    || route_ctx.request_header_requires_redaction(name))
-            });
+            strip_client_credential_headers(ctx, headers);
         }
         server.headers.apply_to_map(headers);
         if self.mode == McpGatewayMode::AggregateRouter {
@@ -2175,6 +2249,10 @@ impl McpGateway {
             upstream_session_drift: AtomicBool::new(false),
             target,
             bridge: None,
+            isolate_client_credentials: self
+                .servers
+                .get(server_id)
+                .is_none_or(|server| !server.forward_client_credentials),
         }));
     }
 
@@ -2387,6 +2465,7 @@ impl McpGateway {
                 McpAdmittedTarget::without_arguments("name", upstream_name).with_grant(grant),
             ),
             bridge: Some(claim),
+            isolate_client_credentials: false,
         }));
     }
 
@@ -3128,13 +3207,45 @@ impl McpGateway {
         )
         .await?;
 
-        if let Some(mut session) = self.session_store.get_mut(downstream_session_id) {
-            session.last_seen = Instant::now();
-            if let Some(upstream) = session.upstream_sessions.get_mut(server_id) {
-                upstream.initialized = true;
-                upstream.upstream_session_id = upstream_session_id.clone();
-                upstream.protocol_version = Some(negotiated_protocol_version);
+        // Commit under the session's shard lock. Expiry (request path or the
+        // background reaper), `DELETE`, and cap eviction remove the session
+        // under the same lock, so exactly one side owns the new upstream
+        // session: either the commit lands first and the removal tears it down,
+        // or the removal won and this initialize — whose result arrived after
+        // its downstream owner was gone — deletes it here instead of orphaning
+        // it upstream.
+        let committed = match self.session_store.get_mut(downstream_session_id) {
+            Some(mut session) => {
+                session.last_seen = Instant::now();
+                match session.upstream_sessions.get_mut(server_id) {
+                    Some(upstream) => {
+                        upstream.initialized = true;
+                        upstream.upstream_session_id = upstream_session_id.clone();
+                        upstream.protocol_version = Some(negotiated_protocol_version.clone());
+                        true
+                    }
+                    None => false,
+                }
             }
+            None => false,
+        };
+        if !committed {
+            if let Some(orphaned) = upstream_session_id {
+                delete_upstream_session(
+                    &self.http_client,
+                    server,
+                    &self.sessions.upstream_session_header,
+                    UpstreamSessionTeardown {
+                        server_id: server.server_id.clone(),
+                        upstream_session_id: orphaned,
+                        protocol_version: negotiated_protocol_version,
+                    },
+                    crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+                    &ctx.plugin_http_call_ns,
+                )
+                .await;
+            }
+            return Err("downstream MCP session ended during upstream initialization".to_string());
         }
         Ok(upstream_session_id)
     }
@@ -4412,6 +4523,12 @@ impl McpGateway {
             );
         }
 
+        // Baseline only the tools this refresh actually publishes, after
+        // collision handling and tombstone reconciliation.
+        for entry in tools.values_mut() {
+            self.admit_tool_schema_baseline(entry);
+        }
+
         let mut catalog = catalog_lock.write().await;
         let changed = catalog.tools.keys().collect::<HashSet<_>>() != tools.keys().collect()
             || catalog.prompts.keys().collect::<HashSet<_>>() != prompts.keys().collect()
@@ -4464,21 +4581,31 @@ impl McpGateway {
         let discovered_at = Utc::now();
 
         if self.discovery.aggregate_resources {
-            for server in self
+            // Same bounded per-server fan-out as `refresh_catalog`; results are
+            // merged afterwards, and public template URIs are server-prefixed,
+            // so merge order cannot change the catalog.
+            let template_servers: Vec<&McpServerConfig> = self
                 .servers
                 .values()
                 .filter(|server| server.enabled && server.expose_resources)
-            {
-                match self
-                    .request_upstream_list_pages(
+                .collect();
+            let mut listings: Vec<ServerTemplateListing<'_>> =
+                Vec::with_capacity(template_servers.len());
+            for chunk in template_servers.chunks(MAX_CONCURRENT_SERVER_DISCOVERY) {
+                let results = futures_util::future::join_all(chunk.iter().map(|server| {
+                    self.request_upstream_list_pages(
                         ctx,
                         downstream_session_id,
                         server,
                         "resources/templates/list",
                         "resourceTemplates",
                     )
-                    .await
-                {
+                }))
+                .await;
+                listings.extend(chunk.iter().copied().zip(results));
+            }
+            for (server, listed) in listings {
+                match listed {
                     Ok(items) => {
                         stats.record_success();
                         last_good.insert((server.server_id.clone(), "resource_templates"));
@@ -4691,8 +4818,11 @@ impl McpGateway {
         // sessions: a fresh session has no old catalog, so without it the same
         // (or any other) principal could re-`initialize` and see a changed
         // tool as new.
-        let quarantined_for_instance =
-            self.tool_schema_quarantined(&server.server_id, &public_name, &schema_hash);
+        let schema_quarantine =
+            self.existing_tool_schema_quarantine(&server.server_id, &public_name, &schema_hash);
+        let quarantined_for_instance = schema_quarantine
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
         let hidden_by_schema_change = previously_hidden_by_schema_change
             || quarantined_for_instance
             || (schema_changed
@@ -4719,6 +4849,7 @@ impl McpGateway {
             hidden_by_discovery,
             hidden_from_discovery,
             hidden_by_schema_change,
+            schema_quarantine,
             input_validator,
             output_validator,
             discovered_at,
@@ -4727,49 +4858,77 @@ impl McpGateway {
         }
     }
 
-    /// Record `schema_hash` against this instance's baseline for the tool and
-    /// report whether the tool is quarantined by a schema change.
+    /// The established instance-wide quarantine flag for a tool, recording a
+    /// schema change against it, or `None` when no baseline exists yet.
     ///
-    /// The first hash any session admits becomes the baseline. A different
-    /// hash later, from any session, quarantines the tool for the lifetime of
-    /// this instance under `discovery.on_schema_change: hide_until_configured`;
-    /// only a configuration change (a new plugin instance) clears it. With
-    /// `allow` the baseline just follows the latest schema. When the bounded
-    /// baseline table is full, a tool it does not already track cannot be
-    /// baselined and fails closed under `hide_until_configured`.
-    fn tool_schema_quarantined(
+    /// Never allocates a baseline: a candidate entry may still be discarded by
+    /// collision handling, and a name that is never published must not
+    /// consume the bounded baseline table (see
+    /// [`Self::admit_tool_schema_baseline`]). A different hash than the
+    /// published baseline, from any session, sets the sticky quarantine under
+    /// `discovery.on_schema_change: hide_until_configured`; only a
+    /// configuration change (a new plugin instance) clears it.
+    fn existing_tool_schema_quarantine(
         &self,
         server_id: &str,
         public_name: &str,
         schema_hash: &str,
-    ) -> bool {
-        let hide = self.discovery.on_schema_change == DiscoveryBehavior::HideUntilConfigured;
+    ) -> Option<Arc<AtomicBool>> {
+        if self.discovery.on_schema_change != DiscoveryBehavior::HideUntilConfigured {
+            return None;
+        }
         let key = (server_id.to_string(), public_name.to_string());
+        let mut baseline = self.tool_schema_baselines.get_mut(&key)?;
+        if baseline.schema_hash != schema_hash {
+            baseline.quarantined.store(true, Ordering::Release);
+            baseline.schema_hash = schema_hash.to_string();
+        }
+        Some(Arc::clone(&baseline.quarantined))
+    }
+
+    /// Baseline a tool entry that survived collision handling into a refreshed
+    /// catalog, attaching the shared quarantine flag.
+    ///
+    /// Only published entries reach this point, so discarded collision
+    /// candidates never occupy the bounded table. When the table is full, a
+    /// tool it does not already track cannot be baselined and fails closed:
+    /// it is hidden like a schema-changed tool. A concurrent session that
+    /// baselined the same tool first with a different schema quarantines it.
+    fn admit_tool_schema_baseline(&self, entry: &mut ToolCatalogEntry) {
+        if entry.schema_quarantine.is_some()
+            || self.discovery.on_schema_change != DiscoveryBehavior::HideUntilConfigured
+        {
+            return;
+        }
+        let key = (entry.server_id.clone(), entry.public_name.clone());
         if !self.tool_schema_baselines.contains_key(&key)
             && self.tool_schema_baselines.len() >= self.max_tool_schema_baselines
         {
-            if hide {
-                warn_sampled!(
-                    server_id = %server_id,
-                    "MCP tool schema baseline table is full; hiding a tool it cannot baseline"
-                );
-            }
-            return hide;
+            warn_sampled!(
+                server_id = %entry.server_id,
+                "MCP tool schema baseline table is full; hiding a tool it cannot baseline"
+            );
+            entry.mark_schema_quarantined();
+            return;
         }
-        let mut baseline =
-            self.tool_schema_baselines
-                .entry(key)
-                .or_insert_with(|| ToolSchemaBaseline {
-                    schema_hash: schema_hash.to_string(),
-                    quarantined: false,
-                });
-        if baseline.schema_hash != schema_hash {
-            if hide {
-                baseline.quarantined = true;
+        let flag = {
+            let mut baseline =
+                self.tool_schema_baselines
+                    .entry(key)
+                    .or_insert_with(|| ToolSchemaBaseline {
+                        schema_hash: entry.schema_hash.clone(),
+                        quarantined: Arc::new(AtomicBool::new(false)),
+                    });
+            if baseline.schema_hash != entry.schema_hash {
+                baseline.quarantined.store(true, Ordering::Release);
+                baseline.schema_hash = entry.schema_hash.clone();
             }
-            baseline.schema_hash = schema_hash.to_string();
+            Arc::clone(&baseline.quarantined)
+        };
+        if flag.load(Ordering::Acquire) {
+            entry.mark_schema_quarantined();
         }
-        baseline.quarantined
+        entry.schema_quarantine = Some(flag);
     }
 
     fn prompt_entry_from_value(
@@ -4994,6 +5153,7 @@ impl McpGateway {
             .values()
             .filter(|entry| {
                 !entry.hidden_from_discovery
+                    && !entry.schema_quarantined()
                     && (entry.enabled
                         || !(self.discovery.hide_denied_items || self.policy.hide_denied_tools))
                     && grant_view.as_ref().is_none_or(|view| {
@@ -5074,6 +5234,19 @@ impl McpGateway {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
             return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
+        // A configured template deny can cover an exact resource: load the
+        // template catalog (best effort) so the listing matches what a read of
+        // each listed resource decides. The read itself fails closed.
+        if self.policy.template_deny
+            && self
+                .ensure_resource_templates(ctx, downstream_session_id)
+                .await
+                .is_err()
+        {
+            warn_sampled!(
+                "MCP resource template catalog unavailable while filtering resources/list"
+            );
+        }
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
         };
@@ -5096,10 +5269,7 @@ impl McpGateway {
         let resources: Vec<Value> = catalog
             .resources
             .values()
-            .filter(|entry| {
-                entry.enabled
-                    && self.policy.action_for_resource(&entry.public_uri) == PolicyAction::Allow
-            })
+            .filter(|entry| entry.enabled && self.resource_listing_allowed(&catalog, entry))
             .map(resource_entry_to_public_value)
             .collect();
         json_response(
@@ -5244,7 +5414,7 @@ impl McpGateway {
             );
         }
         let policy_action = self.policy.action_for_tool(&public_name);
-        if policy_action != PolicyAction::Allow || !entry.enabled {
+        if policy_action != PolicyAction::Allow || !entry.enabled || entry.schema_quarantined() {
             if self.observability.emit_metadata {
                 ctx.metadata.insert(
                     "mcp.policy_decision".to_string(),
@@ -5437,7 +5607,8 @@ impl McpGateway {
             &server.server_id,
             Some(
                 McpAdmittedTarget::with_arguments("name", &entry.upstream_name, envelope)
-                    .with_grant(grant),
+                    .with_grant(grant)
+                    .with_schema_quarantine(entry.schema_quarantine.clone()),
             ),
         );
         PluginResult::Continue
@@ -5714,7 +5885,21 @@ impl McpGateway {
             }
         };
         // Resource policy is decided once the read resolved to an upstream
-        // binding, before any upstream initialize or dispatch.
+        // binding, before any upstream initialize or dispatch. A configured
+        // template deny can cover an exact resource, so the template catalog
+        // must be current before the decision; when it cannot be loaded the
+        // read fails closed rather than skipping that deny.
+        if self.policy.template_deny
+            && let Err(error) = self
+                .ensure_resource_templates(ctx, downstream_session_id)
+                .await
+        {
+            return catalog_error_response(
+                envelope.id.clone(),
+                "MCP resource template catalog unavailable",
+                error,
+            );
+        }
         let resource_action = {
             let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
                 return session_not_found_response();
@@ -5796,8 +5981,9 @@ impl McpGateway {
     /// Otherwise every catalog binding of the same upstream URI decides, and
     /// deny wins: each exact resource of that server with that upstream URI
     /// (so an alternate percent-encoding of a denied resource's public URI
-    /// cannot reach it through a template), then each matching enabled
-    /// resource template. A read with no binding falls back to
+    /// cannot reach it through a template) AND each matching enabled resource
+    /// template (so a denied template cannot be bypassed through an exact
+    /// resource it covers). A read with no binding falls back to
     /// `policy.default_resource_action`.
     fn resource_read_action(
         &self,
@@ -5809,6 +5995,8 @@ impl McpGateway {
         if let Some(action) = self.policy.resources.get(public_uri) {
             return *action;
         }
+        // Every binding decides and any deny wins: an exact resource allowed
+        // only by default never masks a matching template deny, and vice versa.
         let mut bound = false;
         for entry in catalog
             .resources
@@ -5820,9 +6008,6 @@ impl McpGateway {
             if action != PolicyAction::Allow {
                 return action;
             }
-        }
-        if bound {
-            return PolicyAction::Allow;
         }
         for entry in catalog.resource_templates.values().filter(|entry| {
             entry.enabled
@@ -5840,6 +6025,26 @@ impl McpGateway {
         } else {
             self.policy.default_resource_action
         }
+    }
+
+    /// Whether `resources/list` publishes an exact resource: the same decision
+    /// a `resources/read` of its own public URI gets. The template pass runs
+    /// only when the policy configures a template deny, so the ordinary list
+    /// stays one map lookup per resource.
+    fn resource_listing_allowed(&self, catalog: &McpCatalog, entry: &ResourceCatalogEntry) -> bool {
+        if let Some(action) = self.policy.resources.get(&entry.public_uri) {
+            return *action == PolicyAction::Allow;
+        }
+        if self.policy.default_resource_action != PolicyAction::Allow {
+            return false;
+        }
+        !self.policy.template_deny
+            || self.resource_read_action(
+                catalog,
+                &entry.public_uri,
+                &entry.server_id,
+                &entry.upstream_uri,
+            ) == PolicyAction::Allow
     }
 
     /// Metadata for a prompt / resource request refused by policy.
@@ -7039,6 +7244,15 @@ impl McpGateway {
         grant.decide(&view).err()
     }
 
+    /// Whether the admitted tool's instance-wide schema quarantine is set.
+    fn final_schema_quarantined(ctx: &RequestContext) -> bool {
+        ctx.mcp_admission
+            .as_deref()
+            .and_then(|record| record.target.as_ref())
+            .and_then(|target| target.schema_quarantine.as_ref())
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
     fn reject_final_grant(&self, ctx: &mut RequestContext, denial: McpGrantDenial) -> PluginResult {
         if self.observability.emit_metadata {
             ctx.metadata.insert(
@@ -7351,7 +7565,8 @@ impl McpGateway {
         allowed_methods: Option<&[String]>,
     ) -> McpAdminToolSnapshot {
         let action = self.policy.action_for_tool(&entry.public_name);
-        let effective = if entry.hidden_by_schema_change {
+        let schema_quarantined = entry.schema_quarantined();
+        let effective = if schema_quarantined {
             "hidden_schema_changed"
         } else if entry.hidden_by_discovery {
             "hidden_until_configured"
@@ -7375,9 +7590,10 @@ impl McpGateway {
             explicitly_configured: self.policy.tools.contains_key(&entry.public_name),
             effective,
             listed: route_allowed
+                && !schema_quarantined
                 && !entry.hidden_from_discovery
                 && (entry.enabled || !hide_denied_tools),
-            callable: route_allowed && entry.enabled,
+            callable: route_allowed && !schema_quarantined && entry.enabled,
             allowed_groups: grant
                 .and_then(|grant| grant.allowed)
                 .map(|allowed| admin_group_names(&allowed, group_names)),
@@ -7620,9 +7836,27 @@ impl Plugin for McpGateway {
         }
         let name = self.sessions.upstream_session_header.as_str();
         let recorded = record.upstream_session.as_deref();
-        if !self.upstream_session_intact(recorded, headers) {
+        let session_intact = self.upstream_session_intact(recorded, headers);
+        if !session_intact {
             record.upstream_session_drift.store(true, Ordering::Relaxed);
-        } else if recorded.is_none() || header_value(headers, name).is_some() {
+        }
+        // The selected MCP upstream's credential boundary is re-asserted over
+        // the FINAL header map too: a later generic header rule or a
+        // finalized-egress overlay must neither carry a client / normal-backend
+        // credential to the tool-selected upstream nor replace that server's
+        // configured credential. Unrelated headers are left alone. An OpenAPI
+        // bridge call targets this proxy's own backend and keeps its
+        // allowlist.
+        if record.bridge.is_none()
+            && let Some(server) = self.servers.get(&record.server_id)
+            && server.upstream().is_some()
+        {
+            if !server.forward_client_credentials {
+                strip_client_credential_headers(ctx, headers);
+            }
+            server.headers.apply_to_map(headers);
+        }
+        if session_intact && (recorded.is_none() || header_value(headers, name).is_some()) {
             // Already exactly the recorded state.
             return;
         }
@@ -7685,10 +7919,23 @@ impl Plugin for McpGateway {
         // the context at this point: a later plugin that swapped or cleared
         // the identified consumer after `before_proxy` cannot carry an
         // ungranted call to the upstream.
-        match self.final_grant_denial(ctx) {
-            None => PluginResult::Continue,
-            Some(denial) => self.reject_final_grant(ctx, denial),
+        if let Some(denial) = self.final_grant_denial(ctx) {
+            return self.reject_final_grant(ctx, denial);
         }
+        // A schema-change quarantine set by any session after admission still
+        // stops the call before egress.
+        if Self::final_schema_quarantined(ctx) {
+            if self.observability.emit_metadata {
+                ctx.metadata.insert(
+                    "mcp.policy_decision".to_string(),
+                    "hidden_schema_changed".to_string(),
+                );
+                ctx.metadata
+                    .insert("mcp.route_decision".to_string(), "deny".to_string());
+            }
+            return Self::correlate_gateway_terminal(ctx, tool_call_denied(None), &[]);
+        }
+        PluginResult::Continue
     }
 
     async fn before_proxy(
@@ -8449,13 +8696,89 @@ enum ResponseRewriteOutcome {
     Ambiguous,
 }
 
+/// One initialized upstream MCP session to tear down, detached from its
+/// downstream session so the session's catalog and other state can be released
+/// before any network I/O.
+struct UpstreamSessionTeardown {
+    server_id: String,
+    upstream_session_id: String,
+    protocol_version: String,
+}
+
+/// The initialized upstream sessions of an already-removed downstream session.
+fn upstream_session_teardowns(session: DownstreamMcpSession) -> Vec<UpstreamSessionTeardown> {
+    let fallback_protocol_version = session.protocol_version;
+    session
+        .upstream_sessions
+        .into_iter()
+        .filter_map(|(server_id, upstream)| {
+            if !upstream.initialized {
+                return None;
+            }
+            let upstream_session_id = upstream.upstream_session_id?;
+            Some(UpstreamSessionTeardown {
+                server_id,
+                upstream_session_id,
+                protocol_version: upstream
+                    .protocol_version
+                    .unwrap_or_else(|| fallback_protocol_version.clone()),
+            })
+        })
+        .collect()
+}
+
+/// Issue the upstream `DELETE` for one upstream MCP session, carrying the
+/// server's configured `servers.*.headers`. Failures are logged, not fatal.
+async fn delete_upstream_session(
+    http_client: &PluginHttpClient,
+    server: &McpServerConfig,
+    upstream_session_header: &str,
+    teardown: UpstreamSessionTeardown,
+    hops: Option<u8>,
+    accumulator: &AtomicU64,
+) {
+    let Some((upstream_url, _)) = server.upstream() else {
+        return;
+    };
+    let Ok(client) = http_client.get() else {
+        return;
+    };
+    let request = client
+        .delete(upstream_url)
+        .header(upstream_session_header, teardown.upstream_session_id)
+        .header("mcp-protocol-version", teardown.protocol_version);
+    let request = server.headers.apply_to_request(request);
+    let request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, hops);
+    match http_client
+        .execute_redacted_tracked(
+            request,
+            "mcp_gateway.session_delete",
+            &redacted_endpoint_url_str(upstream_url),
+            accumulator,
+        )
+        .await
+    {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            warn!(
+                server_id = %server.server_id,
+                status = %response.status(),
+                "MCP upstream session delete returned non-success status"
+            );
+        }
+        Err(error) => {
+            warn!(
+                server_id = %server.server_id,
+                error = %error,
+                "MCP upstream session delete failed"
+            );
+        }
+    }
+}
+
 /// Issue the upstream `DELETE` for each initialized upstream session of an
-/// already-removed downstream session, carrying the server's configured
-/// `servers.*.headers`. Failures are logged, not fatal.
-///
-/// Shared by request-scoped teardown (session `DELETE`, expiry on touch, cap
-/// eviction), which passes the request's hop count, and by the background
-/// session reaper, which is not request-scoped and passes `None`.
+/// already-removed downstream session. Request-scoped teardown (session
+/// `DELETE`, expiry on touch, cap eviction) passes the request's hop count.
 async fn delete_upstream_session_set(
     http_client: &PluginHttpClient,
     servers: &HashMap<String, McpServerConfig>,
@@ -8464,59 +8787,19 @@ async fn delete_upstream_session_set(
     hops: Option<u8>,
     accumulator: &AtomicU64,
 ) {
-    let Ok(client) = http_client.get() else {
-        return;
-    };
-    for (server_id, upstream) in session.upstream_sessions {
-        let Some(upstream_session_id) = upstream.upstream_session_id.clone() else {
+    for teardown in upstream_session_teardowns(session) {
+        let Some(server) = servers.get(&teardown.server_id) else {
             continue;
         };
-        if !upstream.initialized {
-            continue;
-        }
-        let Some(server) = servers.get(&server_id) else {
-            continue;
-        };
-        let Some((upstream_url, _)) = server.upstream() else {
-            continue;
-        };
-        let request = client
-            .delete(upstream_url)
-            .header(upstream_session_header, upstream_session_id)
-            .header(
-                "mcp-protocol-version",
-                upstream
-                    .protocol_version
-                    .as_deref()
-                    .unwrap_or(session.protocol_version.as_str()),
-            );
-        let request = server.headers.apply_to_request(request);
-        let request = crate::proxy::hop_limit::stamp_plugin_call_proxy_hops(request, hops);
-        match http_client
-            .execute_redacted_tracked(
-                request,
-                "mcp_gateway.session_delete",
-                &redacted_endpoint_url_str(upstream_url),
-                accumulator,
-            )
-            .await
-        {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) => {
-                warn!(
-                    server_id = %server.server_id,
-                    status = %response.status(),
-                    "MCP upstream session delete returned non-success status"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    server_id = %server.server_id,
-                    error = %error,
-                    "MCP upstream session delete failed"
-                );
-            }
-        }
+        delete_upstream_session(
+            http_client,
+            server,
+            upstream_session_header,
+            teardown,
+            hops,
+            accumulator,
+        )
+        .await;
     }
 }
 
@@ -8524,14 +8807,27 @@ async fn delete_upstream_session_set(
 /// sweep runs every half `sessions.session_ttl_seconds`, within these bounds.
 const MIN_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// Upstream `DELETE`s the reaper's cleanup worker queues before it drops new
+/// ones (best-effort teardown never grows without bound).
+const MAX_PENDING_REAPER_TEARDOWNS: usize = 4096;
+/// Upstream `DELETE`s the cleanup worker runs at once.
+const MAX_CONCURRENT_REAPER_TEARDOWNS: usize = 8;
+/// Bound on one reaper upstream `DELETE`, so a slow upstream holds one of
+/// the worker's slots at most this long.
+const REAPER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Owns one instance's background session reaper task and aborts it on drop,
-/// so a reloaded, updated, or deleted instance never leaves a sweep running.
-struct McpSessionReaperGuard(tokio::task::JoinHandle<()>);
+/// Owns one instance's background session reaper tasks — the expiry sweep and
+/// its upstream-cleanup worker — and aborts both on drop, so a reloaded,
+/// updated, or deleted instance never leaves maintenance running.
+struct McpSessionReaperGuard {
+    sweep: tokio::task::JoinHandle<()>,
+    cleanup: tokio::task::JoinHandle<()>,
+}
 
 impl Drop for McpSessionReaperGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        self.sweep.abort();
+        self.cleanup.abort();
     }
 }
 
@@ -8541,13 +8837,22 @@ impl Drop for McpSessionReaperGuard {
 /// only when that session id is presented again or a later `initialize`
 /// scans the store, so `sessions.session_ttl_seconds` would not bound how long
 /// its catalog, SSE broker slot, and upstream MCP sessions are retained. The
-/// task holds only WEAK references to the instance's session state, so it
+/// sweep holds only WEAK references to the instance's session state, so it
 /// never extends the generation's lifetime (in particular the SSE broker's
 /// `Drop`-driven retirement), and exits once that state is gone. Removal goes
 /// through the same store / catalog-index / broker funnel as every other
-/// teardown, re-checking expiry atomically per entry; upstream `DELETE`s are
-/// best-effort and issued after the in-memory removal. `None` when no Tokio
-/// runtime is current (for example offline validation).
+/// teardown, re-checking expiry atomically per entry.
+///
+/// The sweep never waits on the network. Each removed session is reduced to
+/// lightweight teardown records at once (its catalog is released) and handed
+/// to a separate cleanup worker through a bounded queue; the worker keeps at
+/// most [`MAX_CONCURRENT_REAPER_TEARDOWNS`] upstream `DELETE`s in flight, each
+/// bounded by [`REAPER_TEARDOWN_TIMEOUT`], starting the next as soon as one
+/// finishes, and a full queue drops new records (teardown is best-effort). A
+/// slow upstream therefore delays only its own cleanup, never the next expiry
+/// sweep. These calls are not request-scoped
+/// and carry no hop count. `None` when no Tokio runtime is current (for
+/// example offline validation).
 fn spawn_session_reaper(
     session_store: &Arc<DashMap<String, DownstreamMcpSession>>,
     session_catalogs_by_hash: &Arc<DashMap<String, Arc<RwLock<McpCatalog>>>>,
@@ -8562,9 +8867,9 @@ fn spawn_session_reaper(
     let catalogs = Arc::downgrade(session_catalogs_by_hash);
     let broker = Arc::downgrade(sse_broker);
     let interval = (session_ttl / 2).clamp(MIN_SESSION_REAP_INTERVAL, MAX_SESSION_REAP_INTERVAL);
-    let task = runtime.spawn(async move {
-        // Not request-scoped: there is no request to attribute call time to.
-        let accumulator = AtomicU64::new(0);
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<UpstreamSessionTeardown>(MAX_PENDING_REAPER_TEARDOWNS);
+    let sweep = runtime.spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
             let reaped = {
@@ -8576,19 +8881,58 @@ fn spawn_session_reaper(
                 reap_expired_sessions(&store, &catalogs, &broker, session_ttl)
             };
             for session in reaped {
-                delete_upstream_session_set(
-                    &http_client,
-                    &servers,
-                    &upstream_session_header,
-                    session,
-                    None,
-                    &accumulator,
-                )
-                .await;
+                for teardown in upstream_session_teardowns(session) {
+                    if sender.try_send(teardown).is_err() {
+                        warn_sampled!(
+                            "MCP session reaper cleanup queue is full; dropping a best-effort upstream session delete"
+                        );
+                    }
+                }
             }
         }
     });
-    Some(McpSessionReaperGuard(task))
+    let cleanup = runtime.spawn(async move {
+        let servers = Arc::new(servers);
+        let upstream_session_header: Arc<str> = Arc::from(upstream_session_header);
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REAPER_TEARDOWNS));
+        // Owned by this task: aborting the worker drops the set, which aborts
+        // every in-flight delete with it.
+        let mut in_flight = tokio::task::JoinSet::new();
+        while let Some(teardown) = receiver.recv().await {
+            while in_flight.try_join_next().is_some() {}
+            let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                break;
+            };
+            let servers = Arc::clone(&servers);
+            let http_client = http_client.clone();
+            let upstream_session_header = Arc::clone(&upstream_session_header);
+            in_flight.spawn(async move {
+                let _permit = permit;
+                let Some(server) = servers.get(&teardown.server_id) else {
+                    return;
+                };
+                // Not request-scoped: there is no request to attribute call
+                // time to.
+                let accumulator = AtomicU64::new(0);
+                let delete = delete_upstream_session(
+                    &http_client,
+                    server,
+                    &upstream_session_header,
+                    teardown,
+                    None,
+                    &accumulator,
+                );
+                if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, delete)
+                    .await
+                    .is_err()
+                {
+                    warn_sampled!("MCP session reaper upstream session delete timed out");
+                }
+            });
+        }
+        while in_flight.join_next().await.is_some() {}
+    });
+    Some(McpSessionReaperGuard { sweep, cleanup })
 }
 
 /// Remove every downstream session idle for at least `session_ttl`, with its
@@ -9301,7 +9645,9 @@ fn audit_output_schema_node(
         return Ok(());
     };
     active.insert(identity);
-    for key in ["$ref", "$dynamicRef"] {
+    // Every reference keyword any supported draft compiles: `$ref`, the
+    // 2020-12 `$dynamicRef`, and the 2019-09 `$recursiveRef`.
+    for key in ["$ref", "$dynamicRef", "$recursiveRef"] {
         if let Some(value) = map.get(key) {
             let Some(reference) = value.as_str() else {
                 return Err(format!("{label} has a non-string '{key}'"));
@@ -9380,7 +9726,24 @@ fn audit_output_schema_node(
                     label,
                 )?,
             },
+            // Draft 4-7 `dependencies`: a schema-valued entry is compiled like
+            // `dependentSchemas`; an array-valued entry is a property list.
+            "dependencies" => {
+                if let Some(object) = value.as_object() {
+                    for child in object.values().filter(|child| !child.is_array()) {
+                        audit_output_schema_node(
+                            child,
+                            document,
+                            depth + 1,
+                            max_depth_seen,
+                            active,
+                            label,
+                        )?;
+                    }
+                }
+            }
             "additionalProperties"
+            | "additionalItems"
             | "unevaluatedProperties"
             | "unevaluatedItems"
             | "contains"
@@ -10637,6 +11000,9 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
         parse_item_default_action(policy, "default_resource_action")?.unwrap_or(default_action);
     let prompts = parse_item_policy_map(policy, "prompts")?;
     let resources = parse_item_policy_map(policy, "resources")?;
+    let template_deny = resources
+        .iter()
+        .any(|(key, action)| *action != PolicyAction::Allow && key.contains('{'));
     Ok(McpPolicy {
         default_action,
         hide_denied_tools,
@@ -10645,6 +11011,7 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
         default_resource_action,
         prompts,
         resources,
+        template_deny,
         grant_groups,
     })
 }

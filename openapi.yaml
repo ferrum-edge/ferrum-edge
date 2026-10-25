@@ -37883,7 +37883,8 @@ components:
                   every gateway-originated request to this MCP server —
                   initialize, notifications/initialized, every */list page, and
                   the session DELETE — and installed on every routed call to it,
-                  replacing any client-supplied spelling. Use it for a service
+                  replacing any client-supplied spelling (re-asserted over the
+                  final backend headers after later header rules). Use it for a service
                   credential such as Authorization or an API-key header. A value
                   that is exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is resolved
                   from the process environment at plugin load (any other `${...}`
@@ -37900,7 +37901,7 @@ components:
               forward_client_credentials:
                 type: [boolean, "null"]
                 default: false
-                description: aggregate_router only (rejected in transparent_proxy, which forwards the client request unchanged; not accepted on an openapi server). By default an aggregate-routed tools/call, prompts/get, resources/read, or passthrough request to this server does NOT carry the client's Authorization, Proxy-Authorization, or Cookie header, nor any header in the route's credential-header registry, because the client chose this upstream by naming an item (MCP token passthrough). Set true only for an upstream in the same trust domain that must receive end-user tokens. Configured headers apply either way.
+                description: aggregate_router only (rejected in transparent_proxy, which forwards the client request unchanged; not accepted on an openapi server). By default an aggregate-routed tools/call, prompts/get, resources/read, or passthrough request to this server does NOT carry the client's Authorization, Proxy-Authorization, or Cookie header, any header in the route's credential-header registry, or any query string (the backend query is committed empty, and the header boundary is re-asserted over the final backend headers after later header rules), because the client chose this upstream by naming an item (MCP token passthrough). Set true only for an upstream in the same trust domain that must receive end-user tokens; it restores the client credential headers and the ordinary query. Configured headers apply either way.
               openapi:
                 $ref: "#/components/schemas/McpGatewayOpenApiBridge"
         policy:
@@ -37933,7 +37934,7 @@ components:
                     enum: [allow, deny]
             resources:
               type: [object, "null"]
-              description: Public resource URI (mcp://{server_id}/...) or public resource-template URI (as resources/templates/list publishes it) to policy. A resource or template whose action is not allow is omitted from resources/list or resources/templates/list. resources/read is decided once the URI resolves to an upstream binding, before any upstream initialize or dispatch, and answers JSON-RPC -32001 when refused; an entry for the exact requested public URI wins, otherwise every catalog binding of the same upstream URI decides and deny wins (each exact resource with that upstream URI, then each matching template), so a denied resource cannot be read through an allowed template under another public spelling. The key set is operator-defined; each entry is a closed object.
+              description: Public resource URI (mcp://{server_id}/...) or public resource-template URI (as resources/templates/list publishes it) to policy. A resource or template whose action is not allow is omitted from resources/list or resources/templates/list. resources/read is decided once the URI resolves to an upstream binding, before any upstream initialize or dispatch, and answers JSON-RPC -32001 when refused; an entry for the exact requested public URI wins, otherwise every catalog binding of the same upstream URI decides and any deny wins (each exact resource with that upstream URI and each matching template), so a denied resource cannot be read through an allowed template under another public spelling and a denied template covers the exact resources it matches (they are not listed either). When some template URI is denied, a read first refreshes the template catalog and fails closed with -32006 if it cannot. The key set is operator-defined; each entry is a closed object.
               additionalProperties:
                 type: object
                 additionalProperties: false
