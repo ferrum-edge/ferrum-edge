@@ -736,12 +736,12 @@ const NONCE_CONFIG_KEYS: &[&str] = &[
     "max_total_cache_bytes",
 ];
 
-/// UTF-16→UTF-8 size is bounded by construction for well-formed input: each
-/// BMP code point uses 2 wire bytes and at most 3 UTF-8 bytes (≤ 3/2×), and
-/// supplementary planes use a surrogate pair (4 wire bytes → 4 UTF-8 bytes).
-/// UTF-8→UTF-8 is 1:1. A post-decode `len * 3/2` cap is therefore unreachable
-/// and is omitted; odd-length / invalid-surrogate sequences fail closed during
-/// incremental decoding instead.
+// UTF-16→UTF-8 size is bounded by construction for well-formed input: each
+// BMP code point uses 2 wire bytes and at most 3 UTF-8 bytes (≤ 3/2×), and
+// supplementary planes use a surrogate pair (4 wire bytes → 4 UTF-8 bytes).
+// UTF-8→UTF-8 is 1:1. A post-decode `len * 3/2` cap is therefore unreachable
+// and is omitted; odd-length / invalid-surrogate sequences fail closed during
+// incremental decoding instead.
 
 // ── Config types ────────────────────────────────────────────────────────────
 
