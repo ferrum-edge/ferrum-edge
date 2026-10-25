@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `ldap_auth` validates DNs, attribute names, and ports at load**
+  (issue n/a, PR #6846). `search_base_dn`, `group_base_dn`, and DN-shaped
+  `bind_dn_template` / `service_account_dn` values must be RFC 4514
+  distinguished names (an unescaped `=` inside a value is refused as a likely
+  missing comma; AD userPrincipalName and down-level bind names stay
+  accepted), `canonical_identity_attribute` / `group_attribute` /
+  `group_member_attribute` must be RFC 4512 attribute descriptions (`1.1` is
+  refused), and an `ldap_url` port of `0` is refused. Such values used to pass
+  `validate` and fail every request.
+- **`ldap_auth` membership modes, failover, and credential bounds** (PR
+  #6846). `group_member_attribute` sets a custom DN-valued membership
+  attribute and `group_membership_mode: ad_in_chain` proves nested Active
+  Directory membership with `LDAP_MATCHING_RULE_IN_CHAIN`
+  (`1.2.840.113556.1.4.1941`) in both the group search and the custom-filter
+  recheck. The connection budget is split across screened DNS candidates so a
+  stalled or TLS-failing address no longer starves the next, and
+  `failover_ldap_urls` adds replicas tried in order on connection, transport,
+  `busy` (51), or `unavailable` (52) failures (never on credential
+  rejections). Opt-in `negative_cache_ttl_seconds`,
+  `max_failed_attempts_per_user` / `failed_attempt_backoff_seconds`, and
+  `service_connection_max_age_seconds` bound repeated bad credentials,
+  per-username failure runs, and service-account connection churn. Cache keys
+  fold login spellings like the directory, and group names compare like
+  `caseIgnoreMatch`.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -361,6 +385,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `ldap_auth` treats `group_attribute` as authoritative** (issue
+  n/a, PR #6846). A group entry whose returned `group_attribute` value did not
+  match `required_groups` still passed through its CN RDN, so with
+  `group_attribute: sAMAccountName` a caller able to create groups in a
+  delegated OU could satisfy `gateway-admins` with a look-alike
+  `CN=gateway-admins,OU=Delegated,…`. Now only the returned attribute's values
+  decide; the entry's own first RDN stands in only when `group_attribute` is
+  `cn` and the directory omits it, and then only a `cn`-typed component. Any
+  other omitted `group_attribute` fails closed (`403`). Cached group re-checks
+  follow the same rule.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

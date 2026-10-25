@@ -28,6 +28,27 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ldap_auth`: authoritative group attribute and stricter admission (PR #6846)
+
+`group_attribute` now decides required-group membership on its own. A group
+entry whose returned `group_attribute` value does not match no longer passes
+through its CN, and a configured non-`cn` attribute that the directory omits
+fails closed. Before upgrading, check that your directory returns
+`group_attribute` for every required group and that its value equals the
+`required_groups` entry (for Active Directory, prefer the domain-unique
+`sAMAccountName`). A deployment that relied on the CN fallback with
+`group_attribute: sAMAccountName` must either list the `sAMAccountName` values
+in `required_groups` or switch to `group_attribute: cn`. Users who reach a
+required AD group only through nested groups also need
+`group_membership_mode: ad_in_chain`.
+
+`search_base_dn`, `group_base_dn`, and DN-shaped `bind_dn_template` /
+`service_account_dn` must be RFC 4514 DNs, and attribute fields must be
+RFC 4512 attribute descriptions. Escape any `=`, `<`, `>`, or `"` inside a DN
+value (`\=` or `\3D`), remove stray spaces from attribute names, and replace an
+`ldap_url` port of `0`. Run `ferrum-edge validate` to find affected
+configurations.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
