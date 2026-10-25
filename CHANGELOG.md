@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`response_caching` gains `ignore_request_headers` and a lookup counter.**
+  `ignore_request_headers` is an operator attestation that named request
+  headers (for example a per-request `X-Request-Id` stamped by a CDN) never
+  select the response: each is removed from the request before the key is
+  derived, so the origin never receives it and the key still binds every
+  header the origin sees. Credential/session, `Host`, hop-by-hop,
+  `Cache-Control`/`Pragma`, precondition/range, `Content-*`, `Expect`,
+  `Accept`/`Accept-Encoding`, and forwarding headers are refused, as is a name
+  also in `vary_by_headers`; a non-empty list makes the instance a request
+  header mutator, so it cannot share a proxy with `request_deduplication`.
+  Lookup outcomes are exported as the bounded
+  `ferrum_response_cache_lookups_total{status}` counter (`hit`, `miss`,
+  `bypass`, `revalidated`, `predicted_bypass`). The `respect_cache_control:
+  false` docs now state that it also ignores the origin's `no-store` /
+  `private` / `no-cache` storage prohibitions and qualified field protections,
+  and that authorized responses then can never be stored.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +155,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`response_caching` enforces client `max-age` / `min-fresh` and hardens
+  replay sanitation.** A request `Cache-Control: max-age` is compared with the
+  entry's current age and `min-fresh` with its remaining freshness, so an entry
+  the client would not accept is refetched instead of served (`max-age=0`
+  always refetches). `Set-Cookie` and `Content-Range` store refusals match
+  case-insensitively. Retained entries now go through the shared
+  `cache_headers` replay sanitizer used by `ai_semantic_cache` and
+  `request_deduplication`, so per-request trace/correlation IDs,
+  `Retry-After`, `Set-Cookie2`, and `WWW-Authenticate` are no longer replayed
+  from the cache. HIT / REVALIDATED / PREDICTED-BYPASS / request `no-store`
+  lookups no longer stage the storage-side header delta and JSON snapshot only
+  to discard them.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
@@ -360,6 +388,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. EastWestGateway keeps the unscoped fail-closed fallback.
 
 ### Security
+
+- **`response_caching` binds the frontend scheme and route construction, and
+  publishes `Vary` on no-cache refreshes.** The key now binds the effective
+  frontend scheme from private connection provenance (the proxy regenerates
+  `X-Forwarded-Proto` from it), so an HTTPS representation is not replayed to
+  a plaintext request for the same authority or vice versa. It also binds the
+  matched proxy's `backend_path`, `strip_listen_path`, and
+  `preserve_host_header`, so a proxy-only reload that changes the assembled
+  origin path or outbound `Host` cannot keep replaying the old route through a
+  retained global cache instance. An honored request `Cache-Control: no-cache`
+  refresh (`BYPASS`) now carries the same downstream `Vary` contract as a
+  `MISS`, so a downstream shared cache cannot store it without the configured
+  and mandatory credential dimensions.
 
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to

@@ -94,7 +94,13 @@ paths:
   framing — and a gateway-minted `correlation_id` header whose live value still
   matches private request provenance (issue #3929). Client-supplied correlation
   values remain origin-visible dimensions; do not globally ignore `x-request-id`
-  or trust a client-spoofable metadata/header marker. A conditional
+  or trust a client-spoofable metadata/header marker. The only operator
+  relaxation is `ignore_request_headers`, which REMOVES each named header from
+  the backend request before keying (so the key still binds everything the
+  origin receives); never turn it into a key-only exclusion. The key also binds
+  the frontend scheme (`request_is_secure`, which regenerates
+  `X-Forwarded-Proto`) and the matched proxy's `backend_path` /
+  `strip_listen_path` / `preserve_host_header`. A conditional
   revalidation, a pure client no-cache/no-store refresh, and `Content-Length: 0`
   are addressed to an entry rather than selecting a different one — keying the
   raw view would put each of them in a partition the entry cannot be reached
