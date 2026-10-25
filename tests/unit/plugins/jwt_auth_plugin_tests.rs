@@ -1552,7 +1552,7 @@ async fn hide_credentials_defaults_to_forwarding_the_token() {
     ctx.query_params
         .insert("jwt".to_string(), "raw.jwt.value".to_string());
     plugin.mark_query_credentials_for_redaction(&mut ctx);
-    assert!(ctx.metadata.get("auth.strip_query_param.jwt").is_none());
+    assert!(!ctx.metadata.contains_key("auth.strip_query_param.jwt"));
     let mut headers = HashMap::new();
     headers.insert(
         "authorization".to_string(),
