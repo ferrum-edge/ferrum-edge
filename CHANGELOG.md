@@ -22,8 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute, `group_membership_mode: ad_in_chain` proves nested Active
   Directory membership with `LDAP_MATCHING_RULE_IN_CHAIN`
   (`1.2.840.113556.1.4.1941`) in both the group search and the custom-filter
-  recheck, and `group_membership_mode: member_of` proves it from the user
-  entry's `memberOf` DNs matched against required groups found by name. The connection budget is split across screened DNS candidates so a
+  recheck, and `group_membership_mode: member_of` has the directory confirm
+  that the user entry's `memberOf` lists a required group found by name. The connection budget is split across screened DNS candidates so a
   stalled or TLS-failing address no longer starves the next, and
   `failover_ldap_urls` adds replicas tried in order on connection, transport,
   `busy` (51), or `unavailable` (52) failures (never on credential

@@ -25054,7 +25054,7 @@ components:
           type: string
           enum: [direct, ad_in_chain, member_of]
           default: direct
-          description: "member_of reads group DNs from the authenticated user's own entry (group_member_attribute, default memberOf) and accepts a required group only when an entry under group_base_dn named by its group_attribute value has a DN equal to one of them; it cannot be combined with group_filter. direct proves membership from the group entry's own membership attribute. ad_in_chain (Active Directory only) uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) on group_member_attribute (default member), so a user who is a member through nested groups matches; the directory evaluates the chain under the group search's size and time limits, and custom-filter matches are rechecked with the same in-chain predicate."
+          description: "member_of finds the required groups under group_base_dn by their group_attribute value and accepts one only when a base-scope equality search on the authenticated user's entry confirms that its group_member_attribute (default memberOf) lists that exact group DN, so DN matching follows the directory schema; it cannot be combined with group_filter. direct proves membership from the group entry's own membership attribute. ad_in_chain (Active Directory only) uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) on group_member_attribute (default member), so a user who is a member through nested groups matches; the directory evaluates the chain under the group search's size and time limits, and custom-filter matches are rechecked with the same in-chain predicate."
         starttls:
           type: boolean
           default: false

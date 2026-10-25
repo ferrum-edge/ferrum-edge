@@ -208,8 +208,8 @@ enum GroupMembershipMode {
     /// Reverse membership: the authenticated user's own entry lists group DNs
     /// in `group_member_attribute` (default `memberOf`, maintained by the
     /// directory). A required group counts only when an entry found under
-    /// `group_base_dn` by its authoritative `group_attribute` value has a DN
-    /// equal to one of those values.
+    /// `group_base_dn` by its authoritative `group_attribute` value is listed
+    /// there, as proven by the directory's own DN matching.
     MemberOf,
 }
 
@@ -453,35 +453,42 @@ impl CredentialGuardState {
 
     /// Count one credential failure for `key` as a single per-key operation:
     /// concurrent first failures combine instead of overwriting each other.
+    ///
+    /// The slot is reserved while the key's shard is held through
+    /// `DashMap::entry`, so a concurrent first failure for the same username
+    /// either finds the winner's state (and adds to it) or reserves the slot
+    /// itself; losing the last free slot to that winner cannot drop a count.
     fn record_account_failure(&self, key: CacheKey, now: Instant) {
         let threshold = self.semantics.max_failed_attempts_per_user;
         let backoff = Duration::from_secs(self.semantics.failed_attempt_backoff_secs);
-        if let Some(mut state) = self.account_failures.map.get_mut(&key) {
-            state.record_failure(now, threshold, backoff);
-            return;
-        }
-        if !self.account_failures.try_reserve()
-            && (!self.prune_one_account(now, backoff) || !self.account_failures.try_reserve())
-        {
-            // Full of live state: the request was already refused or counted
-            // elsewhere; never evict a live block to make room.
-            return;
-        }
-        match self.account_failures.map.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                // A concurrent first failure won the slot: add to it.
-                occupied.get_mut().record_failure(now, threshold, backoff);
-                self.account_failures.release();
+        let mut pruned = false;
+        loop {
+            match self.account_failures.map.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                    occupied.get_mut().record_failure(now, threshold, backoff);
+                    return;
+                }
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    if self.account_failures.try_reserve() {
+                        let mut state = AccountFailures {
+                            consecutive: 0,
+                            last_failure: now,
+                            blocked_until: None,
+                        };
+                        state.record_failure(now, threshold, backoff);
+                        vacant.insert(state);
+                        return;
+                    }
+                }
             }
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                let mut state = AccountFailures {
-                    consecutive: 0,
-                    last_failure: now,
-                    blocked_until: None,
-                };
-                state.record_failure(now, threshold, backoff);
-                vacant.insert(state);
+            // Full: reclaim one slot that no longer constrains anyone (with
+            // the shard released), then try once more. A tracker full of
+            // live state never evicts it; that username's next request is
+            // refused at admission instead.
+            if pruned || !self.prune_one_account(now, backoff) {
+                return;
             }
+            pruned = true;
         }
     }
 }
@@ -2343,11 +2350,16 @@ impl LdapAuth {
         }))
     }
 
-    /// `member_of` mode: read the user's own reverse-membership attribute,
-    /// then accept a required group only when an entry under `group_base_dn`
-    /// named by its authoritative `group_attribute` value has a DN equal to one
-    /// of those values. A look-alike group elsewhere, a value that is not a
-    /// parsable DN, or a group the user's entry does not list never matches.
+    /// `member_of` mode: find the required groups under `group_base_dn` by
+    /// their authoritative `group_attribute` value, then let the directory
+    /// prove, with a base-scope equality search on the authenticated entry,
+    /// that its reverse-membership attribute lists that exact group DN.
+    ///
+    /// The DN comparison is the directory's own `distinguishedNameMatch`, so
+    /// each naming attribute keeps its schema equality rule (a
+    /// `caseExactMatch` naming attribute stays case-sensitive). The plugin
+    /// never compares DNs itself. A look-alike group elsewhere or a group the
+    /// entry does not list never matches.
     async fn search_member_of_groups(
         &self,
         ldap: &mut Ldap,
@@ -2358,62 +2370,6 @@ impl LdapAuth {
             .group_member_attribute
             .as_deref()
             .unwrap_or(LDAP_AUTH_DEFAULT_MEMBER_OF_ATTRIBUTE);
-        let user_result = ldap
-            .with_search_options(
-                SearchOptions::new()
-                    .sizelimit(LDAP_AUTH_USER_SEARCH_SIZE_LIMIT)
-                    .timelimit(self.search_time_limit_seconds),
-            )
-            .with_timeout(self.connect_timeout)
-            .search(user_dn, Scope::Base, "(objectClass=*)", vec![attribute])
-            .await
-            .map_err(|e| transport_error("group membership read", e))?;
-        if user_result.1.rc != 0 {
-            return Err(directory_result_error(
-                &user_result.1,
-                "group membership read",
-            ));
-        }
-        let mut user_entries = user_result.0;
-        let user_entry = match user_entries.len() {
-            0 => return Ok(false),
-            1 => user_entries.pop().ok_or_else(|| {
-                AuthError::Backend(
-                    "ldap_auth: group membership entry disappeared after uniqueness check"
-                        .to_string(),
-                )
-            })?,
-            _ => {
-                return Err(AuthError::Backend(
-                    "ldap_auth: base-scope group membership read returned multiple entries"
-                        .to_string(),
-                ));
-            }
-        };
-        let user_entry = SearchEntry::construct(user_entry);
-        let Some(values) = ldap_attribute_values(&user_entry.attrs, attribute, "group membership")?
-        else {
-            if !used_service_account {
-                warn!(
-                    "ldap_auth: the authenticated entry returned no '{}' values over an anonymous bind; configure a service account if the directory restricts that attribute",
-                    attribute
-                );
-            }
-            return Ok(false);
-        };
-        if values.len() > LDAP_AUTH_MAX_MEMBER_OF_VALUES {
-            return Err(AuthError::Backend(format!(
-                "ldap_auth: the authenticated entry lists more than {LDAP_AUTH_MAX_MEMBER_OF_VALUES} '{attribute}' values"
-            )));
-        }
-        let member_of: Vec<NormalizedDn> = values
-            .iter()
-            .filter_map(|value| normalize_distinguished_name(value.as_str()))
-            .collect();
-        if member_of.is_empty() {
-            return Ok(false);
-        }
-
         let Some(filter) = self.member_of_group_filter.as_deref() else {
             return Ok(false);
         };
@@ -2437,22 +2393,78 @@ impl LdapAuth {
         if result_code != 0 && result_code != 4 {
             return Err(directory_result_error(&search_result.1, "group search"));
         }
+
+        let mut proofs = 0usize;
+        let mut unproven_candidates = false;
         for result_entry in search_result.0 {
             let entry = SearchEntry::construct(result_entry);
-            if self.entry_matches_required_group(&entry)?
-                && normalize_distinguished_name(&entry.dn)
-                    .is_some_and(|group_dn| member_of.contains(&group_dn))
+            if !self.entry_matches_required_group(&entry)? {
+                continue;
+            }
+            if proofs == LDAP_AUTH_MAX_MEMBER_OF_PROOFS {
+                unproven_candidates = true;
+                break;
+            }
+            proofs += 1;
+            if self
+                .user_entry_lists_group(ldap, user_dn, attribute, &entry.dn)
+                .await?
             {
                 return Ok(true);
             }
         }
-        if result_code == 4 {
+        if proofs == 0 && !used_service_account {
+            warn!(
+                "ldap_auth: no required group was found under '{}' over an anonymous bind; configure a service account if the directory restricts group reads",
+                group_base
+            );
+        }
+        if result_code == 4 || unproven_candidates {
             return Err(AuthError::Backend(
-                "ldap_auth: group search exceeded the configured size limit before proving required membership"
+                "ldap_auth: group search exceeded the configured limits before proving required membership"
                     .to_string(),
             ));
         }
         Ok(false)
+    }
+
+    /// Base-scope `(<attribute>=<group DN>)` search on the authenticated entry:
+    /// the directory, not the plugin, decides whether the entry lists that DN.
+    async fn user_entry_lists_group(
+        &self,
+        ldap: &mut Ldap,
+        user_dn: &str,
+        attribute: &str,
+        group_dn: &str,
+    ) -> Result<bool, AuthError> {
+        if group_dn.len() > LDAP_AUTH_MAX_FILTER_VALUE_BYTES {
+            return Ok(false);
+        }
+        let proof_filter = format!("({attribute}={})", escape_filter_value(group_dn));
+        let search_result = ldap
+            .with_search_options(
+                SearchOptions::new()
+                    .sizelimit(1)
+                    .timelimit(self.search_time_limit_seconds),
+            )
+            .with_timeout(self.connect_timeout)
+            .search(user_dn, Scope::Base, &proof_filter, vec!["1.1"])
+            .await
+            .map_err(|e| transport_error("group membership verification", e))?;
+        if search_result.1.rc != 0 {
+            return Err(directory_result_error(
+                &search_result.1,
+                "group membership verification",
+            ));
+        }
+        match search_result.0.len() {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(AuthError::Backend(
+                "ldap_auth: base-scope group membership verification returned multiple entries"
+                    .to_string(),
+            )),
+        }
     }
 
     async fn returned_group_proves_membership(
@@ -3112,58 +3124,9 @@ fn required_group_name_filter(group_attribute: &str, required_groups: &[String])
     filter
 }
 
-/// Most reverse-membership values (`memberOf`) read from one user entry.
-const LDAP_AUTH_MAX_MEMBER_OF_VALUES: usize = 4_096;
-
-/// A DN compared component by component: attribute types lowercased, values
-/// decoded and prepared like `caseIgnoreMatch`, and multi-valued RDN
-/// components sorted.
-type NormalizedDn = Vec<Vec<(String, String)>>;
-
-/// Normalize `dn` for equality, or `None` (never a partial guess) when it is
-/// not representable as text, so callers fail closed.
-fn normalize_distinguished_name(dn: &str) -> Option<NormalizedDn> {
-    let mut rdns = Vec::new();
-    let mut avas = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    for ch in dn.chars() {
-        if escaped {
-            current.push('\\');
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '+' => push_normalized_ava(&mut current, &mut avas)?,
-            ',' | ';' => {
-                push_normalized_ava(&mut current, &mut avas)?;
-                let mut rdn = std::mem::take(&mut avas);
-                rdn.sort();
-                rdns.push(rdn);
-            }
-            _ => current.push(ch),
-        }
-    }
-    if escaped {
-        return None;
-    }
-    push_normalized_ava(&mut current, &mut avas)?;
-    avas.sort();
-    rdns.push(avas);
-    Some(rdns)
-}
-
-/// Decode the raw `type=value` pair accumulated in `current` into `avas`.
-fn push_normalized_ava(current: &mut String, avas: &mut Vec<(String, String)>) -> Option<()> {
-    let pair = parse_rdn_pair(&std::mem::take(current))?;
-    avas.push((
-        pair.attribute_type.to_ascii_lowercase(),
-        prepare_case_ignore(&pair.value),
-    ));
-    Some(())
-}
+/// Most required-group entries whose membership `member_of` mode proves
+/// per flow; more same-named candidates fail closed.
+const LDAP_AUTH_MAX_MEMBER_OF_PROOFS: usize = 16;
 
 /// Keyed digest over a domain tag, a length-framed username, and optionally
 /// the password.
@@ -3198,9 +3161,9 @@ fn credential_digest(
 /// Prepare a value the way LDAP `caseIgnoreMatch` compares it (RFC 4518
 /// insignificant-space handling, then case folding): surrounding whitespace
 /// is dropped, interior whitespace runs collapse to one space, and the result
-/// is lowercased. Group names and login keys are compared in this form so
-/// `"Domain  Admins "` matches `"domain admins"` exactly as the directory
-/// itself would match them.
+/// is lowercased. Group names and the per-username failure-count key are
+/// compared in this form, so `"Domain  Admins "` matches `"domain admins"`
+/// exactly as the directory itself would match them.
 fn prepare_case_ignore(value: &str) -> String {
     let mut prepared = String::with_capacity(value.len());
     for word in value.split_whitespace() {

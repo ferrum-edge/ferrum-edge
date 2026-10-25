@@ -4709,14 +4709,16 @@ async fn authenticate_with_endpoints(primary_port: u16, failover_ports: &[u16]) 
     result
 }
 
-/// A closed TCP port on this host: connecting to it is refused.
-async fn refused_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind throwaway listener");
-    let port = listener.local_addr().expect("throwaway addr").port();
-    drop(listener);
-    port
+/// A TCP port on this host that refuses connections: bound but never put in
+/// the listening state, so no other test can take it while the returned
+/// socket is held.
+fn refused_port() -> (tokio::net::TcpSocket, u16) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("create reserved socket");
+    socket
+        .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .expect("reserve a refusing port");
+    let port = socket.local_addr().expect("reserved addr").port();
+    (socket, port)
 }
 
 #[tokio::test]
@@ -4737,7 +4739,7 @@ async fn test_failover_endpoint_answers_when_the_primary_is_busy() {
 
 #[tokio::test]
 async fn test_failover_endpoint_answers_when_the_primary_refuses_connections() {
-    let primary = refused_port().await;
+    let (_reserved, primary) = refused_port();
     let (replica, replica_task) = spawn_bind_response_ldap_server(0).await;
     assert_continue(authenticate_with_endpoints(primary, &[replica]).await);
     replica_task.await.expect("replica LDAP server");
@@ -4787,7 +4789,7 @@ async fn test_non_transient_directory_error_never_fails_over() {
 #[tokio::test]
 async fn test_every_endpoint_unavailable_fails_closed() {
     let (primary, _primary_task) = spawn_bind_response_ldap_server(52).await;
-    let replica = refused_port().await;
+    let (_reserved, replica) = refused_port();
     assert_backend_rejection_hides_credentials(
         authenticate_with_endpoints(primary, &[replica]).await,
         &["user-secret"],
@@ -5600,11 +5602,18 @@ async fn test_compatible_rebuild_keeps_the_failed_attempt_backoff() {
 const MEMBER_OF_REAL_GROUP_DN: &str = "cn=gateway-admins,ou=groups,dc=example,dc=com";
 const MEMBER_OF_LOOK_ALIKE_DN: &str = "cn=gateway-admins,ou=delegated,ou=groups,dc=example,dc=com";
 
-/// Directory for `member_of` mode: binds succeed for the counting passwords,
-/// a search requesting `memberOf` returns Alice's entry with the current
-/// `member_of` values, a search under `ou=groups` returns the real group
-/// (`sAMAccountName=gateway-admins`) and a delegated look-alike with the same
-/// CN (`sAMAccountName=tenant-team`), and any other search returns Alice.
+const CASE_EXACT_PRIVILEGED_GROUP_DN: &str = "appGroupId=Admins,ou=groups,dc=example,dc=com";
+const CASE_EXACT_UNPRIVILEGED_GROUP_DN: &str = "appGroupId=admins,ou=groups,dc=example,dc=com";
+
+/// Directory for `member_of` mode. Binds succeed. A `memberOf` equality
+/// search on Alice's entry returns it when one of the current `member_of`
+/// values equals the asserted DN under the schema's DN matching: case
+/// -insensitively for `cn`/`ou`/`dc` DNs, exactly for DNs named by the
+/// `caseExactMatch` attribute `appGroupId`. A search under `ou=groups`
+/// returns the real group (`sAMAccountName=gateway-admins`), a delegated
+/// look-alike with the same CN (`sAMAccountName=tenant-team`), and two
+/// `appGroupId` groups differing only by case, of which only `Admins` carries
+/// `ferrumRole=gateway-admins`. Any other search returns Alice.
 async fn spawn_member_of_directory(
     member_of: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> (u16, Arc<AtomicUsize>) {
@@ -5632,17 +5641,24 @@ async fn spawn_member_of_directory(
                             let mut response = Vec::new();
                             if ldap_message_contains(&request, "memberOf") {
                                 let values = member_of.lock().expect("memberOf values").clone();
-                                let values: Vec<&str> = values.iter().map(String::as_str).collect();
-                                let attributes: Vec<(&str, &[&str])> = if values.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    vec![("memberOf", values.as_slice())]
-                                };
-                                response.extend(search_result_entry(
-                                    message_id,
-                                    "uid=alice,ou=users,dc=example,dc=com",
-                                    &attributes,
-                                ));
+                                let lowered_request = request.to_ascii_lowercase();
+                                let listed = values.iter().any(|value| {
+                                    if value.contains("appGroupId") {
+                                        ldap_message_contains(&request, value)
+                                    } else {
+                                        ldap_message_contains(
+                                            &lowered_request,
+                                            &value.to_ascii_lowercase(),
+                                        )
+                                    }
+                                });
+                                if listed {
+                                    response.extend(search_result_entry(
+                                        message_id,
+                                        "uid=alice,ou=users,dc=example,dc=com",
+                                        &[],
+                                    ));
+                                }
                             } else if ldap_message_contains(&request, "ou=groups") {
                                 response.extend(search_result_entry(
                                     message_id,
@@ -5659,6 +5675,16 @@ async fn spawn_member_of_directory(
                                         ("cn", &["gateway-admins"]),
                                         ("sAMAccountName", &["tenant-team"]),
                                     ],
+                                ));
+                                response.extend(search_result_entry(
+                                    message_id,
+                                    CASE_EXACT_PRIVILEGED_GROUP_DN,
+                                    &[("ferrumRole", &["gateway-admins"])],
+                                ));
+                                response.extend(search_result_entry(
+                                    message_id,
+                                    CASE_EXACT_UNPRIVILEGED_GROUP_DN,
+                                    &[("ferrumRole", &["viewer"])],
                                 ));
                             } else {
                                 response.extend(search_result_entry(
@@ -5741,6 +5767,25 @@ async fn test_member_of_mode_denies_a_look_alike_group() {
         &[MEMBER_OF_LOOK_ALIKE_DN],
         json!({"group_attribute": "sAMAccountName"}),
         Some(403),
+    )
+    .await;
+}
+
+/// DN equality is the directory's: with a `caseExactMatch` naming attribute,
+/// membership in `appGroupId=admins` is not membership in the privileged
+/// `appGroupId=Admins` (PR6846-SOL-9).
+#[tokio::test]
+async fn test_member_of_mode_keeps_case_exact_naming_attributes_distinct() {
+    assert_member_of_result(
+        &[CASE_EXACT_UNPRIVILEGED_GROUP_DN],
+        json!({"group_attribute": "ferrumRole"}),
+        Some(403),
+    )
+    .await;
+    assert_member_of_result(
+        &[CASE_EXACT_PRIVILEGED_GROUP_DN],
+        json!({"group_attribute": "ferrumRole"}),
+        None,
     )
     .await;
 }
