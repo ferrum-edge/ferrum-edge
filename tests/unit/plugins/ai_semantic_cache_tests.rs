@@ -9412,3 +9412,92 @@ async fn deterministic_stream_requests_skip_the_embedding_round_trip() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(ai_semantic_cache_scope_key(&ctx, id).is_some());
 }
+
+/// Look up a fresh prompt (MISS) and run the store hook over a provider-backed
+/// synthetic answer, as the synthetic finalizer does before any committed hook.
+async fn stage_provider_backed_synthetic(
+    plugin: &AiSemanticCache,
+    prompt: &str,
+    body: &[u8],
+) -> RequestContext {
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": prompt}]
+    })
+    .to_string();
+    let (mut ctx, result) = run_lookup(plugin, &request, None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    for key in [
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY,
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY,
+        PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY,
+    ] {
+        ctx.metadata.insert(key.to_string(), "true".to_string());
+    }
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &json_request_headers(), body)
+        .await;
+    ctx.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    ctx
+}
+
+/// PR6822-SOL-7: a staged provider-backed synthetic entry is charged against
+/// `max_total_size_bytes` BEFORE its body is copied, so staged entries waiting
+/// for their committed hook cannot exceed the hard budget; a refusal or a
+/// dropped request releases the reservation, and publication transfers it
+/// without reserving twice.
+#[tokio::test]
+async fn staged_synthetic_stores_are_charged_against_the_byte_budget() {
+    const BUDGET: usize = 6_000;
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "max_entry_size_bytes": 4_096,
+        "max_total_size_bytes": BUDGET
+    }));
+    let body = serde_json::to_vec(&json!({"answer": "x".repeat(3_000)})).unwrap();
+
+    // Two staged entries would need more than the budget: the second is
+    // refused before any copy, and nothing is published yet.
+    let mut first = stage_provider_backed_synthetic(&plugin, "one", &body).await;
+    let staged = ai_semantic_cache_cache_budget_used_for_test(&plugin);
+    assert!(
+        staged > body.len() && staged <= BUDGET,
+        "a staged entry must hold its reservation: {staged}"
+    );
+    let second = stage_provider_backed_synthetic(&plugin, "two", &body).await;
+    assert_eq!(
+        ai_semantic_cache_cache_budget_used_for_test(&plugin),
+        staged,
+        "a second staged entry over budget must be refused, not retained"
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+    drop(second);
+
+    // A final-header refusal releases the staged reservation.
+    let mut no_store = json_request_headers();
+    no_store.insert("cache-control".to_string(), "no-store".to_string());
+    plugin
+        .on_response_committed(&mut first, 200, &no_store, &body)
+        .await;
+    assert_eq!(ai_semantic_cache_cache_budget_used_for_test(&plugin), 0);
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+
+    // A request dropped before its committed hook releases it too.
+    let cancelled = stage_provider_backed_synthetic(&plugin, "three", &body).await;
+    assert!(ai_semantic_cache_cache_budget_used_for_test(&plugin) > 0);
+    drop(cancelled);
+    assert_eq!(ai_semantic_cache_cache_budget_used_for_test(&plugin), 0);
+
+    // Publication moves the reservation into the entry without a second one.
+    let mut published = stage_provider_backed_synthetic(&plugin, "four", &body).await;
+    let reserved = ai_semantic_cache_cache_budget_used_for_test(&plugin);
+    plugin
+        .on_response_committed(&mut published, 200, &json_request_headers(), &body)
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_eq!(
+        ai_semantic_cache_cache_budget_used_for_test(&plugin),
+        reserved,
+        "publication must transfer, not duplicate, the reservation"
+    );
+}

@@ -469,6 +469,13 @@ pub(crate) struct PendingSemanticCacheStore {
     body: Bytes,
     semantic_scope_key: Option<String>,
     embedding: Option<EmbeddingPoint>,
+    /// Bytes charged against [`AiSemanticCache::cache_budget`] for this entry.
+    approx_size: usize,
+    /// Reservation taken BEFORE the body was copied, so a staged synthetic
+    /// entry counts against `max_total_size_bytes` while it waits for its
+    /// committed hook. Transferred into the published [`CacheEntry`]; a
+    /// refusal, cancellation, or request drop releases it with this value.
+    budget_lease: Arc<ByteLease>,
 }
 
 impl std::fmt::Debug for PendingSemanticCacheStore {
@@ -2610,6 +2617,9 @@ impl AiSemanticCache {
     /// Retain an admitted response locally and, when configured, in Redis,
     /// under the byte budget.
     async fn publish_retained_response(&self, pending: PendingSemanticCacheStore) {
+        // The byte-budget reservation was taken before the body was copied
+        // (see `on_final_response_body`) and is moved into the entry here, so
+        // publication never reserves twice.
         let PendingSemanticCacheStore {
             cache_key,
             status_code,
@@ -2617,26 +2627,9 @@ impl AiSemanticCache {
             body,
             semantic_scope_key,
             embedding,
+            approx_size,
+            budget_lease,
         } = pending;
-        let approx_size = cache_entry_approx_size(
-            body.len(),
-            &safe_headers,
-            semantic_scope_key.as_ref(),
-            embedding.as_ref(),
-        );
-
-        // Hard total-size enforcement via lock-free byte leases. Concurrent
-        // distinct-key admits race on `ByteBudget::try_acquire`; losers skip
-        // retention so published + in-flight HNSW generations and entries
-        // cannot permanently exceed `max_total_size_bytes`.
-        let Some(budget_lease) = self.cache_budget.try_acquire(approx_size) else {
-            debug!(
-                entry_size = approx_size,
-                max_total = self.max_total_size_bytes,
-                "ai_semantic_cache: total cache size would exceed limit, skipping"
-            );
-            return;
-        };
 
         // Optional test rendezvous: park here after admission so concurrent
         // stores can observe lease ownership before insert. Production keeps
@@ -5976,6 +5969,27 @@ impl Plugin for AiSemanticCache {
         // markers intact if a later retry path re-enters the hook.
         ctx.metadata.remove(&self.meta_cache_key);
         let (semantic_scope_key, embedding) = self.take_staged_semantic(ctx);
+        let approx_size = cache_entry_approx_size(
+            body.len(),
+            &safe_headers,
+            semantic_scope_key.as_ref(),
+            embedding.as_ref(),
+        );
+
+        // Hard total-size enforcement via lock-free byte leases, reserved
+        // BEFORE the body is copied or staged. Concurrent distinct-key admits
+        // race on `ByteBudget::try_acquire`; losers skip retention, so
+        // published entries, staged synthetic entries awaiting their committed
+        // hook, and published + in-flight HNSW generations cannot exceed
+        // `max_total_size_bytes`.
+        let Some(budget_lease) = self.cache_budget.try_acquire(approx_size) else {
+            debug!(
+                entry_size = approx_size,
+                max_total = self.max_total_size_bytes,
+                "ai_semantic_cache: total cache size would exceed limit, skipping"
+            );
+            return PluginResult::Continue;
+        };
         let pending = PendingSemanticCacheStore {
             cache_key,
             status_code: response_status,
@@ -5983,6 +5997,8 @@ impl Plugin for AiSemanticCache {
             body: Bytes::copy_from_slice(body),
             semantic_scope_key,
             embedding,
+            approx_size,
+            budget_lease,
         };
         if synthetic_response {
             ctx.plugin_state_mut()
