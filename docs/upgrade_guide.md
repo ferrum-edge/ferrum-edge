@@ -43,8 +43,11 @@ a validation warning. Before upgrading:
   characters;
 - rotate any secret that was copied across Consumers.
 
-Rotation entries inside one Consumer and reuse across namespaces are still
-allowed. `jwt_auth` also gains `algorithm` (`HS256` default) and
+A running gateway remembers a secret it has seen shared until it restarts,
+so replace it on **every** Consumer that held it rather than only on one.
+Database-mode and control-plane polling now take a full reload for any changed
+Consumer that carries `jwt`. Rotation entries inside one Consumer and reuse
+across namespaces are still allowed. `jwt_auth` also gains `algorithm` (`HS256` default) and
 `hide_credentials` (default `false`); existing configurations keep their
 behavior. See [plugins.md](plugins.md#jwt_auth).
 

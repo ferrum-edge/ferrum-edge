@@ -326,6 +326,95 @@ pub(crate) fn hmac_secret_strength(secret: &str) -> usize {
 pub(crate) fn jwt_secret_meets_minimum_strength(secret: &str) -> bool {
     hmac_secret_strength(secret) >= MIN_JWT_SECRET_LENGTH
 }
+
+/// Every `secret` string a stored Consumer `jwt` credential value carries,
+/// whatever its shape: each array element's `secret` (malformed or weak
+/// entries included) or a legacy single object's `secret`. Ownership checks
+/// use this rather than the verifier-eligible entries, because a holder knows
+/// a secret whether or not its own entry is usable.
+pub(crate) fn jwt_credential_secret_values(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .filter_map(|entry| entry.get("secret").and_then(serde_json::Value::as_str))
+            .collect(),
+        serde_json::Value::Object(object) => object
+            .get("secret")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a stored Consumer `jwt` credential value is a non-empty array of
+/// objects whose every `secret` is a string meeting the strength floor.
+fn jwt_credential_value_is_admissible(value: &serde_json::Value) -> bool {
+    match value.as_array() {
+        Some(entries) if !entries.is_empty() => entries.iter().all(|entry| {
+            entry
+                .as_object()
+                .and_then(|obj| obj.get("secret"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(jwt_secret_meets_minimum_strength)
+        }),
+        _ => false,
+    }
+}
+
+/// Why [`GatewayConfig::quarantine_invalid_jwt_credentials_with_history`]
+/// strips a Consumer's `jwt` credential.
+enum JwtQuarantineReason {
+    /// Another Consumer in the namespace holds one of its secrets.
+    Shared(String),
+    /// One of its secrets was shared in an earlier generation.
+    PreviouslyShared,
+    /// Malformed, or a secret below the strength floor.
+    Weak,
+}
+
+/// Process-local record of Consumer `jwt` secrets that were configured on
+/// more than one Consumer of a namespace.
+///
+/// A secret that was ever shared is known to another Consumer, so it must not
+/// be reactivated by a later incremental swap that no longer shows the other
+/// holder (the live snapshot it patches is already quarantined). Entries are
+/// SHA-256 digests bound to the namespace; the secret itself is never kept.
+/// The record only grows; a process restart (an authoritative fresh load)
+/// starts empty.
+#[derive(Debug, Clone, Default)]
+pub struct JwtSharedSecretHistory {
+    digests: HashSet<[u8; 32]>,
+}
+
+impl JwtSharedSecretHistory {
+    fn digest(namespace: &str, secret: &str) -> [u8; 32] {
+        let mut hasher = crate::fips::approved::Sha256::new();
+        hasher.update(b"ferrum-edge/jwt-shared-secret/v1\0");
+        hasher.update((namespace.len() as u64).to_be_bytes());
+        hasher.update(namespace.as_bytes());
+        hasher.update(secret.as_bytes());
+        hasher.finalize()
+    }
+
+    pub(crate) fn record(&mut self, namespace: &str, secret: &str) {
+        self.digests.insert(Self::digest(namespace, secret));
+    }
+
+    pub(crate) fn contains(&self, namespace: &str, secret: &str) -> bool {
+        !self.digests.is_empty() && self.digests.contains(&Self::digest(namespace, secret))
+    }
+
+    /// Number of recorded shared secrets.
+    pub fn len(&self) -> usize {
+        self.digests.len()
+    }
+
+    /// Whether no shared secret has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.digests.is_empty()
+    }
+}
 /// Minimum byte length for the server-side Basic-auth HMAC secret.
 pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
 /// Default maximum number of credential entries per type (for zero-downtime rotation).
@@ -5048,10 +5137,10 @@ impl GatewayConfig {
         for consumer in &self.consumers {
             let namespace = consumer.namespace.as_str();
             let id = consumer.id.as_str();
-            for entry in consumer.credential_entries("jwt") {
-                let Some(secret) = entry.get("secret").and_then(|s| s.as_str()) else {
-                    continue;
-                };
+            let Some(value) = consumer.credentials.get("jwt") else {
+                continue;
+            };
+            for secret in jwt_credential_secret_values(value) {
                 match owners.entry((namespace, secret)) {
                     std::collections::hash_map::Entry::Vacant(slot) => {
                         slot.insert(id);
@@ -5124,19 +5213,42 @@ impl GatewayConfig {
     }
 
     /// Fail-closed handling of Consumer `jwt` credential policy at full-load
+    /// time, for a snapshot judged on its own (no earlier generation).
+    ///
+    /// See [`Self::quarantine_invalid_jwt_credentials_with_history`]; this is
+    /// that function with an empty history.
+    pub fn quarantine_invalid_jwt_credentials(&mut self) -> Vec<String> {
+        self.quarantine_invalid_jwt_credentials_with_history(&mut JwtSharedSecretHistory::default())
+    }
+
+    /// Fail-closed handling of Consumer `jwt` credential policy at full-load
     /// and runtime-swap time.
     ///
-    /// Strips the `jwt` credential from every consumer whose stored value is
-    /// not a non-empty array of objects each carrying a string `secret` with
-    /// at least [`MIN_JWT_SECRET_LENGTH`] non-whitespace characters, and then
-    /// from EVERY consumer whose secret is shared with another consumer in the
-    /// same namespace. Unlike [`Self::quarantine_invalid_hmac_credentials`]
-    /// there is no first-loaded winner: whoever holds a shared JWT secret can
-    /// sign a token naming any Consumer that accepts it, so no holder of the
-    /// shared value is a trustworthy owner. The same secret may be reused in a
-    /// different namespace. Extra legacy fields beside `secret` (for example
-    /// a historical `algorithm: HS256` selector) are left to admission-time
-    /// validation; the verifier only ever reads `secret`.
+    /// Ownership is decided first, from the untouched snapshot: every secret
+    /// string a consumer stores counts, including one in an entry that is
+    /// itself malformed or weak, because removing a credential from
+    /// verification does not remove its holder's knowledge of the secret.
+    /// Then the `jwt` credential is stripped from every consumer that:
+    ///
+    /// - holds a secret that another consumer in the same namespace also
+    ///   holds. There is no first-loaded winner (unlike
+    ///   [`Self::quarantine_invalid_hmac_credentials`]): whoever holds a
+    ///   shared JWT secret can sign a token naming any Consumer that accepts
+    ///   it, so no holder is a trustworthy owner;
+    /// - holds a secret that `history` records as shared in an earlier
+    ///   generation. An incremental swap patches the already-quarantined live
+    ///   snapshot, which no longer shows the other holder, so the history is
+    ///   what keeps a still-shared (or once-shared, hence known to another
+    ///   Consumer) key from being reactivated by a later point delta;
+    /// - stores anything other than a non-empty array of objects each
+    ///   carrying a string `secret` with at least [`MIN_JWT_SECRET_LENGTH`]
+    ///   non-whitespace characters.
+    ///
+    /// Secrets shared in this snapshot are added to `history` (as namespace-
+    /// bound SHA-256 digests, never the secret). The same secret may be
+    /// reused in a different namespace. Extra legacy fields beside `secret`
+    /// (for example a historical `algorithm: HS256` selector) are left to
+    /// admission-time validation; the verifier only ever reads `secret`.
     ///
     /// Admin write-time validation rejects NEW violations; this guard covers
     /// pre-existing and out-of-band rows and snapshots from sources that
@@ -5144,62 +5256,91 @@ impl GatewayConfig {
     /// `jwt_auth` plugin returns 401 for a consumer with no `jwt` entries.
     /// Returns one human-readable message per quarantined credential (never
     /// containing the secret); callers log these at `error!` severity.
-    pub fn quarantine_invalid_jwt_credentials(&mut self) -> Vec<String> {
-        let mut messages = Vec::new();
+    pub fn quarantine_invalid_jwt_credentials_with_history(
+        &mut self,
+        history: &mut JwtSharedSecretHistory,
+    ) -> Vec<String> {
+        let decisions: Vec<Option<JwtQuarantineReason>> = {
+            let mut holders: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+            for consumer in &self.consumers {
+                let Some(value) = consumer.credentials.get("jwt") else {
+                    continue;
+                };
+                for secret in jwt_credential_secret_values(value) {
+                    let ids = holders
+                        .entry((consumer.namespace.as_str(), secret))
+                        .or_default();
+                    if !ids.contains(&consumer.id.as_str()) {
+                        ids.push(consumer.id.as_str());
+                    }
+                }
+            }
+            for ((namespace, secret), ids) in &holders {
+                if ids.len() > 1 {
+                    history.record(namespace, secret);
+                }
+            }
 
-        for consumer in &mut self.consumers {
-            let Some(value) = consumer.credentials.get("jwt") else {
+            self.consumers
+                .iter()
+                .map(|consumer| {
+                    let value = consumer.credentials.get("jwt")?;
+                    let namespace = consumer.namespace.as_str();
+                    let secrets = jwt_credential_secret_values(value);
+                    let other_holder = secrets.iter().find_map(|secret| {
+                        holders
+                            .get(&(namespace, *secret))
+                            .and_then(|ids| ids.iter().find(|id| **id != consumer.id.as_str()))
+                            .map(|id| (*id).to_string())
+                    });
+                    if let Some(other_id) = other_holder {
+                        return Some(JwtQuarantineReason::Shared(other_id));
+                    }
+                    if secrets
+                        .iter()
+                        .any(|secret| history.contains(namespace, secret))
+                    {
+                        return Some(JwtQuarantineReason::PreviouslyShared);
+                    }
+                    if !jwt_credential_value_is_admissible(value) {
+                        return Some(JwtQuarantineReason::Weak);
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        let mut messages = Vec::new();
+        for (consumer, decision) in self.consumers.iter_mut().zip(decisions) {
+            let Some(reason) = decision else {
                 continue;
             };
-            let admissible = match value.as_array() {
-                Some(entries) if !entries.is_empty() => entries.iter().all(|entry| {
-                    entry
-                        .as_object()
-                        .and_then(|obj| obj.get("secret"))
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(jwt_secret_meets_minimum_strength)
-                }),
-                _ => false,
-            };
-            if !admissible {
-                consumer.credentials.remove("jwt");
-                messages.push(format!(
+            consumer.credentials.remove("jwt");
+            messages.push(match reason {
+                JwtQuarantineReason::Shared(other_id) => format!(
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets is also \
+                     configured on consumer {:?} in namespace {:?} — whoever holds a shared \
+                     secret can sign tokens as either Consumer, so the credential is excluded \
+                     on every Consumer that shares it. Give each of them a new, distinct \
+                     secret to restore it.",
+                    consumer.id, other_id, consumer.namespace
+                ),
+                JwtQuarantineReason::PreviouslyShared => format!(
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets was \
+                     shared with another Consumer in namespace {:?} in an earlier \
+                     configuration generation of this process, so another Consumer can still \
+                     sign tokens as this one. Give the Consumer a new, distinct secret to \
+                     restore it.",
+                    consumer.id, consumer.namespace
+                ),
+                JwtQuarantineReason::Weak => format!(
                     "Quarantined jwt credential of consumer {:?}: a stored entry is \
                      malformed or its secret has fewer than {} non-whitespace characters \
                      — the credential is excluded from this config load so the weak \
                      secret cannot authenticate. Repair the stored credential to restore it.",
                     consumer.id, MIN_JWT_SECRET_LENGTH
-                ));
-            }
-        }
-
-        let mut affected: HashMap<(String, String), String> = HashMap::new();
-        for (id, other, namespace) in self.jwt_credential_collisions() {
-            affected
-                .entry((namespace.to_string(), id.to_string()))
-                .or_insert_with(|| other.to_string());
-            affected
-                .entry((namespace.to_string(), other.to_string()))
-                .or_insert_with(|| id.to_string());
-        }
-        if affected.is_empty() {
-            return messages;
-        }
-
-        for consumer in &mut self.consumers {
-            let key = (consumer.namespace.clone(), consumer.id.clone());
-            if let Some(other_id) = affected.get(&key)
-                && consumer.credentials.remove("jwt").is_some()
-            {
-                messages.push(format!(
-                    "Quarantined jwt credential of consumer {:?}: one of its secrets is also \
-                     configured on consumer {:?} in namespace {:?} — whoever holds a shared \
-                     secret can sign tokens as either Consumer, so the credential is excluded \
-                     from this config load on every Consumer that shares it. Rotate the shared \
-                     secret to restore it.",
-                    consumer.id, other_id, consumer.namespace
-                ));
-            }
+                ),
+            });
         }
 
         messages

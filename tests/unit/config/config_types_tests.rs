@@ -2032,6 +2032,101 @@ fn test_quarantine_jwt_strips_weak_or_malformed_credentials() {
     }
 }
 
+/// PR #6865 review (SOL-1): ownership is judged before any credential is
+/// stripped, so a holder whose own credential is malformed or weak still
+/// counts as a holder of the strong secret it shares.
+#[test]
+fn test_quarantine_jwt_counts_holders_whose_own_credential_is_malformed() {
+    let shared = "shared-jwt-secret-at-least-32-characters";
+    let eve_shapes = [
+        serde_json::json!([{"secret": shared}, {"secret": "short"}]),
+        serde_json::json!([{"secret": shared}, {"no_secret": true}]),
+        serde_json::json!([{"secret": shared}, {"secret": 12345}]),
+        serde_json::json!([{"secret": shared}, "not-an-object"]),
+        serde_json::json!([{"secret": shared, "extra": true}, {"secret": " ".repeat(40)}]),
+        // Legacy single-object shape: never verifiable, but Eve knows it.
+        serde_json::json!({"secret": shared}),
+    ];
+    for eve_shape in eve_shapes {
+        let mut eve = make_consumer("eve", "eve");
+        eve.credentials.insert("jwt".into(), eve_shape.clone());
+        let mut config = empty_config();
+        config.consumers = vec![
+            jwt_consumer("alice", "alice", &[shared]),
+            eve,
+            jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+        ];
+
+        let messages = config.quarantine_invalid_jwt_credentials();
+        assert_eq!(messages.len(), 2, "eve shape {eve_shape}: {messages:?}");
+        assert!(messages.iter().all(|message| !message.contains(shared)));
+        assert!(
+            !config.consumers[0].has_credential("jwt"),
+            "alice must lose the secret eve also holds (eve shape {eve_shape})"
+        );
+        assert!(!config.consumers[1].credentials.contains_key("jwt"));
+        assert!(config.consumers[2].has_credential("jwt"));
+    }
+}
+
+/// PR #6865 review (SOL-2): an incremental swap patches an already
+/// quarantined snapshot that no longer shows the other holder, so the
+/// shared-secret history must keep a once-shared key quarantined.
+#[test]
+fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
+    use ferrum_edge::config::types::JwtSharedSecretHistory;
+
+    let shared = "shared-jwt-secret-at-least-32-characters";
+    let mut history = JwtSharedSecretHistory::default();
+
+    // Generation 1: Alice and Eve share the secret; both lose it.
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[shared]),
+        jwt_consumer("eve", "eve", &[shared]),
+    ];
+    assert_eq!(
+        config
+            .quarantine_invalid_jwt_credentials_with_history(&mut history)
+            .len(),
+        2
+    );
+    assert_eq!(history.len(), 1);
+
+    // Generation 2: a point delta re-delivers Alice with the same secret on
+    // top of the stripped snapshot (Eve's stripped credential is gone).
+    config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
+    assert!(config.validate_unique_jwt_credentials().is_ok());
+    let messages = config.quarantine_invalid_jwt_credentials_with_history(&mut history);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("\"alice\""));
+    assert!(!messages[0].contains(shared));
+    assert!(!config.consumers[0].has_credential("jwt"));
+
+    // Without history (a fresh authoritative load) the same snapshot passes.
+    config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
+    let mut fresh = config.clone();
+    assert!(fresh.quarantine_invalid_jwt_credentials().is_empty());
+
+    // A new distinct secret restores Alice, and the history is namespace
+    // bound: another namespace may still use the once-shared value.
+    config.consumers[0] = jwt_consumer(
+        "alice",
+        "alice",
+        &["alice-new-jwt-secret-at-least-32-characters"],
+    );
+    let mut tenant = jwt_consumer("carol", "carol", &[shared]);
+    tenant.namespace = "tenant-b".to_string();
+    config.consumers.push(tenant);
+    assert!(
+        config
+            .quarantine_invalid_jwt_credentials_with_history(&mut history)
+            .is_empty()
+    );
+    assert!(config.consumers[0].has_credential("jwt"));
+    assert!(config.consumers[2].has_credential("jwt"));
+}
+
 #[test]
 fn test_quarantine_jwt_keeps_strong_secrets_and_legacy_selector_fields() {
     // The verifier only reads `secret`, so a historical `algorithm: HS256`

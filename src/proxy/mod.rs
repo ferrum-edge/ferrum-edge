@@ -7642,6 +7642,13 @@ pub struct ProxyState {
     /// release) → SVID material (install, then release) → request epoch
     /// (commit). No helper called inside this boundary reacquires publication.
     pub gateway_trust_publication_lock: Arc<std::sync::Mutex<()>>,
+    /// Consumer `jwt` secrets this process has seen configured on more than
+    /// one Consumer of a namespace (namespace-bound digests only). Every
+    /// full and incremental swap quarantines against it, so a later point
+    /// delta cannot reactivate a key another Consumer is known to hold after
+    /// the live snapshot already stripped that other holder. Locked only on
+    /// the config-swap cold path, never on the request path.
+    jwt_shared_secret_history: Arc<std::sync::Mutex<crate::config::types::JwtSharedSecretHistory>>,
     /// Whether this process cannot know its namespace's AUTHORITATIVE gateway
     /// trust state (issue #3727).
     ///
@@ -11271,6 +11278,9 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
+            jwt_shared_secret_history: Arc::new(std::sync::Mutex::new(
+                crate::config::types::JwtSharedSecretHistory::default(),
+            )),
             gateway_trust_authority_unresolved: Arc::new(AtomicBool::new(false)),
             mesh_trust_registry,
             mesh_inbound_tls,
@@ -14028,8 +14038,9 @@ impl ProxyState {
             error!("Config reload: {}", message);
         }
         // Same boundary for Consumer `jwt` secrets: weak, malformed, or
-        // cross-Consumer shared JWT secrets never reach the ConsumerIndex.
-        for message in new_config.quarantine_invalid_jwt_credentials() {
+        // cross-Consumer shared JWT secrets (including ones shared in an
+        // earlier generation) never reach the ConsumerIndex.
+        for message in self.quarantine_jwt_credentials(&mut new_config) {
             error!("Config reload: {}", message);
         }
         inject_gateway_workload_metrics_if_svid(
@@ -14876,8 +14887,11 @@ impl ProxyState {
         }
         // Consumer `jwt` secrets get the same fail-closed treatment on the
         // patched snapshot, so a delta that introduces a shared secret strips
-        // it from every Consumer holding it, not only the delta's rows.
-        for message in new_config.quarantine_invalid_jwt_credentials() {
+        // it from every Consumer holding it, not only the delta's rows. The
+        // patched snapshot no longer shows holders an earlier generation
+        // already stripped, so the process-local shared-secret history is
+        // what keeps a later delta from reactivating such a key.
+        for message in self.quarantine_jwt_credentials(&mut new_config) {
             error!("Incremental config: {}", message);
         }
         inject_gateway_workload_metrics_if_svid(
@@ -15249,6 +15263,17 @@ impl ProxyState {
         self.config.load_full()
     }
 
+    /// Quarantine weak, malformed, and shared Consumer `jwt` credentials in
+    /// a candidate about to be swapped, against (and extending) this
+    /// process's shared-secret history. Cold path only.
+    fn quarantine_jwt_credentials(&self, config: &mut GatewayConfig) -> Vec<String> {
+        let mut history = self
+            .jwt_shared_secret_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        config.quarantine_invalid_jwt_credentials_with_history(&mut history)
+    }
+
     /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
     /// does before it swaps, so the result is content-comparable against
     /// [`Self::current_config`].
@@ -15276,7 +15301,13 @@ impl ProxyState {
         candidate.normalize_fields();
         candidate.resolve_upstream_tls();
         let _ = candidate.quarantine_invalid_hmac_credentials();
-        let _ = candidate.quarantine_invalid_jwt_credentials();
+        // Read-only use of the history: comparison must not record anything.
+        let mut history = self
+            .jwt_shared_secret_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let _ = candidate.quarantine_invalid_jwt_credentials_with_history(&mut history);
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
             &self.gateway_svid_bundle,

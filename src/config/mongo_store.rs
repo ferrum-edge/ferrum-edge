@@ -10063,6 +10063,19 @@ mod inner {
             config.normalize_fields();
             config.resolve_upstream_tls();
 
+            // Fail-closed Consumer `jwt` secret policy, parity with the SQL
+            // loader: strip weak, malformed, or cross-Consumer shared JWT
+            // secrets (on every Consumer sharing one) before this snapshot
+            // can publish or broadcast. Runs before identity quarantine so a
+            // consumer that quarantine removes still counts as a key holder.
+            let jwt_quarantined = config.quarantine_invalid_jwt_credentials();
+            for message in &jwt_quarantined {
+                error!(
+                    "MongoDB config: {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
+            }
+
             // Fail-closed consumer identity collisions (issue #2121): Mongo
             // `load_full_config` does not run the SQL-side
             // `ValidationPipeline`, so quarantine colliding consumers here
@@ -10084,17 +10097,6 @@ mod inner {
             // stored rows.
             let hmac_quarantined = config.quarantine_invalid_hmac_credentials();
             for message in &hmac_quarantined {
-                error!(
-                    "MongoDB config: {}",
-                    crate::startup::sanitize_startup_cause(message, &[])
-                );
-            }
-            // Fail-closed Consumer `jwt` secret policy, parity with the SQL
-            // loader: strip weak, malformed, or cross-Consumer shared JWT
-            // secrets (on every Consumer sharing one) before this snapshot
-            // can publish or broadcast.
-            let jwt_quarantined = config.quarantine_invalid_jwt_credentials();
-            for message in &jwt_quarantined {
                 error!(
                     "MongoDB config: {}",
                     crate::startup::sanitize_startup_cause(message, &[])

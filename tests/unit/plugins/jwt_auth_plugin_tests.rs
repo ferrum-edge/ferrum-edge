@@ -1701,3 +1701,34 @@ async fn unknown_identity_and_wrong_signature_answer_identically() {
         );
     }
 }
+
+/// PR #6865 review (SOL-3): the equalizing verification uses a per-instance
+/// CSPRNG key, never a constant a client could sign with to steer unknown
+/// identities onto the successful-signature (claims-decoding) path.
+#[test]
+fn equalizing_verification_key_is_random_per_instance() {
+    assert!(
+        !JWT_AUTH_SOURCE.contains("const TIMING_EQUALIZATION_KEY"),
+        "the equalization key must not be a published constant"
+    );
+    let constructor = JWT_AUTH_SOURCE
+        .split("pub fn new(config: &Value)")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("JwtAuth::new body");
+    assert!(
+        constructor.contains("SystemRandom::new()")
+            && constructor.contains(".fill(timing_equalization_secret.as_mut())"),
+        "the equalization key must be drawn from the CSPRNG at construction"
+    );
+    let equalize = JWT_AUTH_SOURCE
+        .split("fn equalize_verification_work(&self, token: &str) {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("equalize_verification_work body");
+    assert!(
+        equalize.contains("DecodingKey::from_secret(&self.timing_equalization_secret[..])")
+            && equalize.contains("decode::<Value>(token, &key, &self.validation)"),
+        "the equalizing run must mirror one real-path attempt"
+    );
+}

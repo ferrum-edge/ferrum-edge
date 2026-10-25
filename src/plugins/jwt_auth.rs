@@ -32,8 +32,11 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decod
 use serde_json::Value;
 use tracing::debug;
 
+use zeroize::Zeroizing;
+
 use crate::config::types::jwt_secret_meets_minimum_strength;
 use crate::consumer_index::ConsumerIndex;
+use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 
 use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::utils::header_extract::{ConfiguredHeaderLookup, lookup_configured_header};
@@ -42,13 +45,6 @@ use super::utils::token_extract::{
     STRIP_QUERY_PARAM_METADATA_PREFIX, bearer_credential_from_authorization_value,
 };
 use super::{RequestContext, strip_auth_scheme};
-
-/// Fixed, non-credential key for the equalizing verification run when the
-/// token names no Consumer that has an eligible JWT secret. It only has to
-/// cost one HMAC verification; it can never authenticate because a successful
-/// decode against it is discarded.
-const TIMING_EQUALIZATION_KEY: &[u8] =
-    b"ferrum-edge jwt_auth timing-equalization key (never a credential)";
 
 /// Unsafe validation that skips signature verification, used only to extract
 /// claims before looking up the consumer's secret for proper verification.
@@ -69,9 +65,12 @@ pub struct JwtAuth {
     hide_credentials: bool,
     /// Precomputed `auth.strip_query_param.<name>` key for query lookups.
     strip_query_metadata_key: Option<String>,
-    /// Key for the equalizing verification run (see
-    /// [`TIMING_EQUALIZATION_KEY`]). Built once at construction.
-    timing_equalization_key: DecodingKey,
+    /// Per-instance random secret for the equalizing verification run when
+    /// the token names no Consumer that has an eligible JWT secret. Drawn from
+    /// the CSPRNG at construction and never exposed, so no client can sign a
+    /// token that passes it: the run always stops at the signature check,
+    /// exactly like a wrong-signature attempt on the real path.
+    timing_equalization_secret: Zeroizing<[u8; 32]>,
 }
 
 enum TokenLookup {
@@ -115,6 +114,10 @@ impl JwtAuth {
             parse_optional_bool(config_obj.get("hide_credentials"), "hide_credentials")?
                 .unwrap_or(false);
         let algorithm = parse_algorithm(config_obj.get("algorithm"))?;
+        let mut timing_equalization_secret = Zeroizing::new([0u8; 32]);
+        SystemRandom::new()
+            .fill(timing_equalization_secret.as_mut())
+            .map_err(|_| "jwt_auth: failed to generate the timing-equalization key".to_string())?;
 
         // The algorithm is pinned here and never read from the token header:
         // `jsonwebtoken` refuses a token whose header names any other
@@ -178,17 +181,19 @@ impl JwtAuth {
             audiences_configured: !audiences.is_empty(),
             hide_credentials,
             strip_query_metadata_key,
-            timing_equalization_key: DecodingKey::from_secret(TIMING_EQUALIZATION_KEY),
+            timing_equalization_secret,
         })
     }
 
     /// Spend one signature verification when the token names no Consumer
-    /// with an eligible JWT secret, so an unknown identity costs about what a
-    /// known identity with a wrong signature does and response timing does
-    /// not reveal which usernames, ids, or custom ids exist. The result is
-    /// discarded: this key can never authenticate a request.
+    /// with an eligible JWT secret, doing what one wrong-signature attempt on
+    /// the real path does (build the key, run `decode`, fail at the signature
+    /// because the secret is unknowable), so an unknown identity costs about
+    /// what a known identity with a single wrong key does. The result is
+    /// discarded either way.
     fn equalize_verification_work(&self, token: &str) {
-        let _ = decode::<Value>(token, &self.timing_equalization_key, &self.validation);
+        let key = DecodingKey::from_secret(&self.timing_equalization_secret[..]);
+        let _ = decode::<Value>(token, &key, &self.validation);
     }
 
     /// Whether `before_proxy` should remove the value it found under the

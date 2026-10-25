@@ -2723,6 +2723,24 @@ impl DatabaseStore {
             .run()?;
         Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
 
+        // Fail-closed Consumer `jwt` secret policy: strip weak, malformed, or
+        // cross-Consumer shared JWT secrets (on every Consumer sharing one)
+        // instead of publishing them behind the warning-only field validation
+        // below. Admin write-time validation rejects new violations; this
+        // guard covers stored rows. It runs BEFORE identity quarantine: a
+        // consumer that identity quarantine removes still knows its secrets,
+        // so it must count as a holder when shared-key ownership is judged.
+        let jwt_quarantined = config.quarantine_invalid_jwt_credentials();
+        if !jwt_quarantined.is_empty() {
+            for message in &jwt_quarantined {
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
+            }
+            error!(
+                "Quarantined {} jwt credential(s) during full config load",
+                jwt_quarantined.len()
+            );
+        }
+
         // Fail-closed consumer identity handling (issue #2121): quarantine
         // (remove) consumers whose id/username/custom_id collides with an
         // earlier-loaded consumer instead of warn-and-overwrite, which
@@ -2756,21 +2774,6 @@ impl DatabaseStore {
             );
         }
 
-        // Fail-closed Consumer `jwt` secret policy: strip weak, malformed, or
-        // cross-Consumer shared JWT secrets (on every Consumer sharing one)
-        // instead of publishing them behind the warning-only field validation
-        // below. Admin write-time validation rejects new violations; this
-        // guard covers stored rows.
-        let jwt_quarantined = config.quarantine_invalid_jwt_credentials();
-        if !jwt_quarantined.is_empty() {
-            for message in &jwt_quarantined {
-                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
-            }
-            error!(
-                "Quarantined {} jwt credential(s) during full config load",
-                jwt_quarantined.len()
-            );
-        }
         let consumer_quarantine_active =
             !quarantined.is_empty() || !hmac_quarantined.is_empty() || !jwt_quarantined.is_empty();
 
