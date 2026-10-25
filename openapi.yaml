@@ -22176,7 +22176,9 @@ components:
         are rejected. Body capture is opt-in and default off. It never forces an
         ineligible message to buffer: a body is sampled only when the message
         declares an identity Content-Encoding, a Content-Length that fits inside
-        the configured cap, and a capturable textual Content-Type
+        the configured cap (or, with the explicit capture_body_prefix opt-in, a
+        text/plain or form Content-Length up to 1048576 bytes), and a
+        capturable textual Content-Type
         (application/json, +json, text/json,
         application/x-www-form-urlencoded, text/plain). gRPC
         (application/grpc*), SSE (text/event-stream), WebSocket upgrades
@@ -22206,6 +22208,22 @@ components:
         omitted. When the transaction_debug DEBUG target is disabled no body is
         buffered for capture. Captured bytes go only to the transaction_debug
         tracing target and are never written into transaction-log metadata.
+        Values are also screened by shape regardless of field or header name:
+        compact JWS/JWE tokens (recognized from the base64url-decoded JSON
+        protected header, so whitespace inside the header does not evade it),
+        well-known provider API keys, AWS access key ids, and PEM private-key
+        blocks are redacted in captured bodies and in header dumps. Exactly one
+        capture record is emitted per enabled direction even when a transform
+        flips the decision between the header phase and the final body hook.
+        Capture can be targeted with capture_request_header (plus an optional
+        exact capture_request_header_value), capture_sample_rate, and
+        capture_expires_at; a request outside the target never buffers and is
+        reported as omitted with reason not_selected or capture_expired.
+        capture_body_prefix opts text/plain and form bodies whose declared
+        Content-Length exceeds the cap (up to 1048576 bytes) into buffering
+        and renders a redacted prefix of complete lines or pairs marked
+        truncated; JSON, chunked/unknown-length, and larger bodies are
+        unchanged.
       allOf:
         - if:
             required: [max_request_body_bytes]
@@ -22253,9 +22271,112 @@ components:
                 properties:
                   log_response_body:
                     const: true
+        - if:
+            required: [capture_body_prefix]
+            properties:
+              capture_body_prefix:
+                const: true
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_sample_rate]
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_request_header]
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_expires_at]
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_request_header_value]
+          then:
+            required: [capture_request_header]
         - not:
             required: [schema, schema_ref]
       properties:
+        capture_body_prefix:
+          type: boolean
+          default: false
+          description: >-
+            Admit text/plain and application/x-www-form-urlencoded bodies whose
+            declared Content-Length exceeds the capture cap (up to 1048576
+            bytes) and render a redacted prefix of the complete lines / pairs
+            that fit inside the cap, marked truncated. JSON bodies, which need
+            the whole document for field redaction, and chunked/unknown-length
+            bodies are unchanged. True requires log_request_body or
+            log_response_body true. Null is rejected.
+        capture_sample_rate:
+          type: number
+          default: 1
+          exclusiveMinimum: 0
+          maximum: 1
+          description: >-
+            Fraction of requests whose bodies are captured, chosen
+            deterministically per request so both directions agree. Requests
+            that are not sampled never buffer and report reason not_selected.
+            Requires log_request_body or log_response_body true.
+        capture_request_header:
+          type: string
+          minLength: 1
+          pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Capture only requests that carry this request header (an HTTP
+            header token, compared case-insensitively). Other requests never
+            buffer and report reason not_selected. Requires log_request_body
+            or log_response_body true.
+        capture_request_header_value:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[!-~](?:[ -~]*[!-~])?$'
+          description: >-
+            Exact value capture_request_header must carry (compared after
+            trimming the received value). 1-256 visible ASCII characters
+            without surrounding spaces. When set, the selector header is
+            redacted from header dumps. Requires capture_request_header.
+        capture_expires_at:
+          type: string
+          format: date-time
+          description: >-
+            RFC 3339 instant after which capture stops: requests received at or
+            after it never buffer and report reason capture_expired. A past
+            instant is accepted. Requires log_request_body or
+            log_response_body true.
         redacted_headers:
           type: array
           items:

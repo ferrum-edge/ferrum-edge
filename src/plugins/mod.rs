@@ -3905,6 +3905,13 @@ pub(crate) struct PluginRequestState {
     /// isolation. Bounded by the number of attached WAF instances (operator
     /// configuration), never by request content.
     pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
+    /// Per-`transaction_debugger`-instance record that a body-capture record
+    /// was already emitted for each direction, so the header-phase and
+    /// final-body hooks emit exactly one record between them. Content-free
+    /// flags keyed by the process-unique instance id; bounded by the attached
+    /// debugger instances.
+    pub(crate) transaction_debugger_capture_records:
+        HashMap<u64, transaction_debugger::CaptureRecordState>,
 }
 
 /// Return an identity only when it contains a meaningful non-whitespace value.
