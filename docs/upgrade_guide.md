@@ -57,8 +57,9 @@ Behaviour changes that need no config edit but may matter downstream:
   WebSocket.
 - When an instance has body rules, `Content-Digest`, `Repr-Digest`,
   `Digest`, and `Content-MD5` are removed from any request whose FINAL
-  outbound `Content-Type` is JSON (or absent) and that may carry a body —
-  even when the rules end up not changing it. A backend that requires request digests cannot sit behind body
+  outbound `Content-Type` is JSON (or absent) and whose body is not proven
+  empty by `Content-Length: 0` (including a lengthless HTTP/2 or HTTP/3
+  `GET`) — even when the rules end up not changing it. A backend that requires request digests cannot sit behind body
   rules.
 - Transaction logs gain `request_transformer.rule_skipped` and
   `request_transformer.body_skipped` metadata when a rule or body pass did not

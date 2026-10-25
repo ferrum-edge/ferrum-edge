@@ -18109,18 +18109,17 @@ pub fn refresh_backend_gateway_assertion_headers(
 /// before the body transform runs, so a digest cannot be recomputed for the
 /// rewritten bytes.
 ///
-/// Free on the ordinary path: the request transformer only requests this when
-/// the request actually carried such a field, and the outbound map is copied
-/// (clone-on-write) only when one must be removed. `ctx.headers` keeps the
-/// original inbound view.
+/// Enrolled by every enabled body-rule `request_transformer`, independent of
+/// whether its own `before_proxy` saw a digest — a later header rule, rename,
+/// or the route-header finalizer can introduce one. Allocation-free when the
+/// final map carries no such field: the check is one scan of the header
+/// names, and the outbound map is copied (clone-on-write) only when a field
+/// must be removed. `ctx.headers` keeps the original inbound view.
 pub(crate) fn retire_stale_request_integrity_headers(
     ctx: &RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
-    if !ctx
-        .plugin_state()
-        .is_some_and(|state| state.request_body_integrity_retirement)
-    {
+    if !ctx.request_body_integrity_retirement {
         return;
     }
     let effective = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
@@ -18137,11 +18136,7 @@ pub(crate) fn retire_stale_request_integrity_headers_in_map(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
-    if ctx
-        .plugin_state()
-        .is_some_and(|state| state.request_body_integrity_retirement)
-        && request_integrity_retirement_applies(ctx, headers)
-    {
+    if ctx.request_body_integrity_retirement && request_integrity_retirement_applies(ctx, headers) {
         crate::plugins::request_transformer::strip_body_bound_integrity_headers(headers);
     }
 }

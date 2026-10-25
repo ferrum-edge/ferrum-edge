@@ -77,12 +77,12 @@
 //! Body rules can replace the request bytes after the backend header map has
 //! already been fixed on some dispatch ladders, so a client
 //! `Content-Digest` / `Repr-Digest` / `Digest` / `Content-MD5` computed over
-//! the original bytes cannot be repaired afterwards. When a request carries
-//! such a field, `before_proxy` asks proxy core to retire it; core decides
-//! over the FINAL outbound headers (after every `before_proxy` hook and the
-//! route-header finalizer) whether the body rules may rewrite the request (a
-//! body may be present and the effective `Content-Type` is absent or JSON),
-//! and removes the fields clone-on-write (`proxy::
+//! the original bytes cannot be repaired afterwards. `before_proxy` enrols the
+//! request (a plain bool); core then inspects the FINAL outbound headers
+//! (after every `before_proxy` hook and the route-header finalizer) and, when
+//! such a field is present and the body rules may rewrite the request (the
+//! body is not proven empty by `Content-Length: 0` and the effective
+//! `Content-Type` is absent or JSON), removes the fields clone-on-write (`proxy::
 //! retire_stale_request_integrity_headers`). Client JSON number lexemes are
 //! preserved exactly across a rewrite (see
 //! `body_transform::apply_request_body_rules`).
@@ -1074,14 +1074,20 @@ pub(crate) fn is_body_bound_request_integrity_header(name: &str) -> bool {
 }
 
 /// Whether request-transformer body rules may replace the bytes of a request
-/// with these FINAL outbound headers: a body may be present and the effective
-/// `Content-Type` is absent or a JSON document type (framed gRPC `+json` can
-/// never parse as one document).
+/// with these FINAL outbound headers: the body is not proven empty and the
+/// effective `Content-Type` is absent or a JSON document type (framed gRPC
+/// `+json` can never parse as one document).
+///
+/// The method is deliberately NOT consulted: an HTTP/2 or HTTP/3 `GET` may
+/// carry DATA without `Content-Length`, and the body pass buffers and rewrites
+/// it all the same. Only an explicit `Content-Length: 0` proves emptiness here.
 pub(crate) fn request_body_rules_may_rewrite(
-    method: &str,
+    _method: &str,
     headers: &HashMap<String, String>,
 ) -> bool {
-    crate::proxy::request_may_have_body(method, headers)
+    !headers
+        .get("content-length")
+        .is_some_and(|length| length.trim() == "0")
         && headers
             .get("content-type")
             .map(String::as_str)
@@ -1259,17 +1265,12 @@ impl Plugin for RequestTransformer {
             );
         }
         // Body rules may rewrite the bytes a client digest describes. Whether
-        // they can is decided by proxy core over the FINAL outbound headers
-        // (a later header rule or the route-header finalizer may still change
-        // `Content-Type`), so only request the retirement here — and only when
-        // the request carries such a field, keeping the ordinary path free of
-        // any header copy or per-request state.
-        if !self.body_rules.is_empty()
-            && headers
-                .keys()
-                .any(|name| is_body_bound_request_integrity_header(name))
-        {
-            ctx.plugin_state_mut().request_body_integrity_retirement = true;
+        // they can — and whether a digest is even present — is decided by
+        // proxy core over the FINAL outbound headers: a later header rule, a
+        // rename into `Content-Digest`, or the route-header finalizer can still
+        // change either. Enrolment is a plain bool, so it never allocates.
+        if !self.body_rules.is_empty() {
+            ctx.request_body_integrity_retirement = true;
         }
         if let Some(reason) = rule_skipped {
             ctx.metadata

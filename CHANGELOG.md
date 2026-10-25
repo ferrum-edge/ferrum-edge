@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mesh_route_dispatch` `request_transform` add/update destinations under
   `x-path-param-*` are refused too.
   Unapplied rules and body passes record `request_transformer.rule_skipped` /
-  `request_transformer.body_skipped` metadata.
+  `request_transformer.body_skipped` metadata (reviewed safe, so default logs
+  show the reason).
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

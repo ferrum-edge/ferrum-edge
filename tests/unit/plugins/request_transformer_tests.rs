@@ -2899,9 +2899,11 @@ async fn integrity_headers_survive_when_body_rules_cannot_rewrite() {
     }))
     .unwrap();
 
-    // A bodiless GET is never rewritten.
+    // A body proven empty by `Content-Length: 0` is never rewritten.
     let mut ctx = make_ctx();
-    let outbound = run_chain_then_retire(&[&body_plugin], &mut ctx, integrity_headers(None)).await;
+    let mut inbound = integrity_headers(None);
+    inbound.insert("content-length".to_string(), "0".to_string());
+    let outbound = run_chain_then_retire(&[&body_plugin], &mut ctx, inbound).await;
     assert!(outbound.is_none());
 
     // Framed gRPC JSON can never parse as one document.
@@ -3346,4 +3348,88 @@ async fn templates_cannot_copy_a_credential_an_earlier_rename_relabelled() {
             .is_some_and(|query| query.contains("k="))
     );
     assert!(!headers.contains_key("x-copied"));
+}
+
+#[tokio::test]
+async fn digest_retirement_covers_a_lengthless_get_body() {
+    // PR #6858 review SOL-7: an HTTP/2 or HTTP/3 GET may carry DATA without
+    // `Content-Length`, and the body pass rewrites it all the same, so the
+    // method alone never proves the body empty.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let outbound = run_chain_then_retire(
+        &[&plugin],
+        &mut ctx,
+        integrity_headers(Some("application/json")),
+    )
+    .await
+    .expect("the stale digest is retired");
+    assert!(!outbound.contains_key("content-digest"));
+    assert!(!outbound.contains_key("content-md5"));
+}
+
+#[tokio::test]
+async fn digest_retirement_covers_a_digest_introduced_by_a_later_rename() {
+    // PR #6858 review SOL-8: the body instance saw no integrity field, but a
+    // later header-only instance renames one into `Content-Digest`. Core
+    // inspects the FINAL headers, so it is still retired.
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let rename = RequestTransformer::new(&json!({
+        "rules": [{"operation": "rename", "target": "header", "key": "x-wire-digest", "new_key": "content-digest"}]
+    }))
+    .unwrap();
+    let mut inbound: HashMap<String, String> = HashMap::new();
+    inbound.insert("content-type".to_string(), "application/json".to_string());
+    inbound.insert("x-wire-digest".to_string(), "sha-256=:stale:".to_string());
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(&[&body, &rename], &mut ctx, inbound)
+        .await
+        .expect("the rename produced an outbound copy");
+    assert!(!outbound.contains_key("x-wire-digest"));
+    assert!(
+        !outbound.contains_key("content-digest"),
+        "a digest introduced after the body instance ran must still be retired"
+    );
+}
+
+#[test]
+fn skip_reasons_survive_default_log_serialization() {
+    // PR #6858 review SOL-9: the fixed reason literals are reviewed safe
+    // metadata, so default transaction logs show which reason applied.
+    use ferrum_edge::plugins::TransactionSummary;
+    use ferrum_edge::plugins::request_transformer::{
+        BODY_SKIPPED_METADATA_KEY, RULE_SKIPPED_METADATA_KEY,
+    };
+    use ferrum_edge::plugins::utils::metadata_redaction::metadata_value_is_redacted;
+
+    assert!(!metadata_value_is_redacted(BODY_SKIPPED_METADATA_KEY));
+    assert!(!metadata_value_is_redacted(RULE_SKIPPED_METADATA_KEY));
+    let summary = TransactionSummary {
+        metadata: [
+            (
+                BODY_SKIPPED_METADATA_KEY.to_string(),
+                "parse_error".to_string(),
+            ),
+            (
+                RULE_SKIPPED_METADATA_KEY.to_string(),
+                "template_unresolved".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..TransactionSummary::default()
+    };
+    let rendered = serde_json::to_value(&summary)
+        .expect("summary serializes")
+        .to_string();
+    assert!(rendered.contains("parse_error"), "{rendered}");
+    assert!(rendered.contains("template_unresolved"), "{rendered}");
+    // Only the two exact keys are reviewed, not the namespace.
+    assert!(metadata_value_is_redacted("request_transformer.other"));
 }

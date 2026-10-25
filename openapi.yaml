@@ -26544,8 +26544,9 @@ components:
                   auto-emitted empty-rules instance act as that eligible
                   consumer. Validated at config load — CRLF in values,
                   unknown operations, and `add`/`update` destinations in the
-                  gateway-owned `x-consumer-*` consumer assertion namespace are
-                  rejected.
+                  gateway-owned `x-consumer-*` consumer assertion namespace or
+                  the router's `x-path-param-*` route-capture namespace
+                  (case-insensitive, `_` or `-`) are rejected.
                 items:
                   type: object
                   additionalProperties: false

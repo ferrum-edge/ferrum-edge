@@ -2565,6 +2565,14 @@ pub struct RequestContext {
     /// Keep this source fact separate from the effective budget so an earlier
     /// default policy cannot satisfy a later `reject_no_deadline` policy.
     pub(crate) grpc_deadline_had_valid_client_timeout: bool,
+    /// Set by every enabled `request_transformer` with body rules that ran
+    /// `before_proxy` for this request. Proxy core then inspects the FINAL
+    /// outbound headers for content-integrity fields (`Content-Digest`,
+    /// `Repr-Digest`, `Digest`, `Content-MD5`) and retires them when the body
+    /// rules may rewrite the request
+    /// (`crate::proxy::retire_stale_request_integrity_headers`). A plain bool
+    /// so the enrollment itself never allocates.
+    pub(crate) request_body_integrity_retirement: bool,
     /// Monotonic receipt instant captured with the request context. Effective
     /// budgets are added to this exact anchor, independent of wall-clock jumps.
     pub(crate) grpc_deadline_received_at: tokio::time::Instant,
@@ -3717,12 +3725,6 @@ pub(crate) struct PluginRequestState {
     /// instances) cannot launder a credential name. Empty unless a rename ran.
     pub(crate) request_header_rename_lineage: Vec<(String, String)>,
     pub(crate) request_query_rename_lineage: Vec<(String, String)>,
-    /// Set by an enabled `request_transformer` with body rules when this
-    /// request carries a content-integrity field (`Content-Digest`,
-    /// `Repr-Digest`, `Digest`, `Content-MD5`). Proxy core then retires those
-    /// fields over the FINAL outbound headers when the body rules may rewrite
-    /// the request (`crate::proxy::retire_stale_request_integrity_headers`).
-    pub(crate) request_body_integrity_retirement: bool,
     /// Deltas from the original request-header view to the complete
     /// backend-visible view, staged by `response_caching` instances during
     /// lookup and consumed when the origin supplies its final `Vary`
@@ -4362,6 +4364,7 @@ impl RequestContext {
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
+            request_body_integrity_retirement: false,
             grpc_deadline_received_at: tokio::time::Instant::now(),
             grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
@@ -5891,6 +5894,7 @@ impl RequestContext {
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
+            request_body_integrity_retirement: self.request_body_integrity_retirement,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
