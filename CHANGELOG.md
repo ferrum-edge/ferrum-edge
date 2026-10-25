@@ -158,6 +158,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `retry_ms` now also reaches a streamed genuine backend event stream:
     `retry: <ms>` is written once ahead of the first backend bytes, as its
     own line so it dispatches no event. A later backend `retry:` overrides it.
+    Content-coded (gzip/br), `no-transform`, and `206`/`226` streams are
+    forwarded unchanged.
   - Docs now say that only the `Last-Event-ID` request header is forwarded
     (a query-parameter cursor is not converted), and which idle timeouts
     affect long-lived event streams.

@@ -30121,7 +30121,7 @@ components:
           format: uint64
           minimum: 1
           maximum: 18446744073709551615
-          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping, and written once ahead of the first bytes of a streamed genuine backend text/event-stream 2xx response (as its own line, so it dispatches no event; a later backend retry: field overrides it). Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
+          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping, and written once ahead of the first bytes of a streamed genuine backend text/event-stream 2xx response (as its own line, so it dispatches no event; a later backend retry: field overrides it). Never written into a stream under a non-identity Content-Encoding, a Cache-Control: no-transform stream, or a 206/226 response. Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
         force_sse_content_type:
           type: boolean
           default: false

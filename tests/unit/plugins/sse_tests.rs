@@ -2278,3 +2278,87 @@ async fn test_retry_inspector_declines_non_genuine_streams() {
             .is_none()
     );
 }
+
+// ── Fix round 2: retry injection never touches coded or protected streams ─────
+
+/// PR6831-SOL-3: a genuine event stream the backend sent under gzip/br is a
+/// compressed bitstream. Plaintext `retry:` written ahead of it would break the
+/// client's decoder, so no inspector attaches (directly or through the shared
+/// resolver every transport uses) and the bytes are forwarded unchanged.
+#[tokio::test]
+async fn test_retry_inspector_never_attaches_to_content_coded_streams() {
+    let plugin = Arc::new(make_plugin(json!({
+        "retry_ms": 2500,
+        "strip_accept_encoding": false
+    })));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    for coding in ["gzip", "br", "gzip, br"] {
+        let (mut ctx, mut headers) =
+            stamped_origin_with("text/event-stream", "content-encoding", coding);
+        assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+        assert_eq!(
+            headers.get("content-encoding").map(String::as_str),
+            Some(coding),
+            "the coding is preserved: {coding}"
+        );
+        let content_type = content_type_of(&headers);
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, 200, content_type)
+                .is_none(),
+            "no direct inspector for {coding}"
+        );
+        assert!(
+            ferrum_edge::plugins::create_response_stream_inspector(
+                &plugins,
+                &mut ctx,
+                200,
+                content_type,
+            )
+            .is_none(),
+            "the shared resolver must not attach one either: {coding}"
+        );
+    }
+}
+
+/// An explicit `identity` coding is not a transformation, so the field is
+/// still written.
+#[tokio::test]
+async fn test_retry_inspector_still_attaches_to_identity_coded_streams() {
+    let plugin = make_plugin(json!({"retry_ms": 2500}));
+    let (mut ctx, mut headers) =
+        stamped_origin_with("text/event-stream", "content-encoding", "identity");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, content_type_of(&headers))
+        .expect("identity bytes are the text an EventSource parses");
+    let first = forwarded(inspector.on_chunk(b"data: a\n\n").await);
+    assert_eq!(first, b"retry: 2500\ndata: a\n\n");
+}
+
+/// The other representation boundaries the wrapper honors apply to the
+/// stream field too: `no-transform` forbids adding content, and a `206`/`226`
+/// body is not the start of an event stream.
+#[tokio::test]
+async fn test_retry_inspector_respects_no_transform_and_partial_content() {
+    let plugin = make_plugin(json!({"retry_ms": 2500}));
+    let (mut ctx, mut headers) =
+        stamped_origin_with("text/event-stream", "cache-control", "no-transform");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, content_type_of(&headers))
+            .is_none(),
+        "no-transform forbids the added field"
+    );
+
+    for status in [206, 226] {
+        let (ctx, _) = stamped_origin("text/event-stream");
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, status, Some("text/event-stream"))
+                .is_none(),
+            "status {status}"
+        );
+    }
+}

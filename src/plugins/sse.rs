@@ -53,8 +53,9 @@
 //!    line after it, so it dispatches no event and leaves the client's last
 //!    event ID untouched; a `retry:` the backend sends later still wins. A
 //!    leading UTF-8 BOM is dropped so the field stays at the start of the
-//!    decoded stream. No keep-alive comments are generated: inspectors run only
-//!    when the backend sends bytes.
+//!    decoded stream. Content-coded (gzip/br/...), `no-transform`, and
+//!    `206`/`226` streams are left untouched. No keep-alive comments are
+//!    generated: inspectors run only when the backend sends bytes.
 //!
 //! ## Representations wrapping declines
 //!
@@ -414,13 +415,23 @@ impl SsePlugin {
             || Self::wrap_refused_for_representation(ctx, response_headers)
     }
 
-    /// Whether the response now being streamed is the backend's own event
-    /// stream: the pristine stamp records an origin `text/event-stream`, no
-    /// `sse` instance relabelled it, and gateway policy has not replaced it.
-    /// An unstamped response is gateway-authored and is left alone.
+    /// Whether the response now being streamed is the backend's own,
+    /// uncoded event stream that this plugin may add a field to: the pristine
+    /// stamp records an origin `text/event-stream`, no `sse` instance
+    /// relabelled it, and gateway policy has not replaced it. An unstamped
+    /// response is gateway-authored and is left alone.
+    ///
+    /// The bytes must also be the text an EventSource parses. A non-identity
+    /// origin `Content-Encoding` (the pristine marker the wrapper already
+    /// honors) means they are a compressed bitstream, and plaintext written
+    /// ahead of it would make the client's decoder fail. An origin
+    /// `Cache-Control: no-transform` forbids adding content at all (RFC 9110
+    /// §7.7).
     fn streamed_response_is_origin_event_stream(ctx: &RequestContext) -> bool {
         let metadata = &ctx.metadata;
         metadata.contains_key(crate::proxy::ORIGINAL_RESPONSE_METADATA_STAMPED_KEY)
+            && !metadata.contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+            && !metadata.contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
             && metadata
                 .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
                 .map(String::as_str)
@@ -862,7 +873,10 @@ impl super::Plugin for SsePlugin {
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
         let retry_field = self.retry_stream_prefix.as_ref()?;
+        // `206`/`226` bodies are a fragment or delta of a representation, not
+        // the start of an event stream the field could precede.
         if !(200..300).contains(&response_status)
+            || !super::response_body_rewrite_allowed(response_status)
             || !content_type.is_some_and(Self::is_sse_content_type)
             || !Self::streamed_response_is_origin_event_stream(ctx)
         {
