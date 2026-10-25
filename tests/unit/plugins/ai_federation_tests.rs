@@ -5546,6 +5546,99 @@ async fn completed_federation_call_publishes_non_replayable_dedup_tombstone() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+/// PR #6822: federation sanitizes the provider's response headers before
+/// normalization, so `ai_semantic_cache` cannot see an origin `Cache-Control`
+/// or `Set-Cookie`. Federation therefore records retention eligibility from the
+/// ORIGINAL headers, and the composed cache + federation chain retains an
+/// answer (one provider call for two identical requests) only when the origin
+/// allowed it.
+#[tokio::test]
+async fn semantic_cache_retains_federation_answers_only_when_the_origin_allows_it() {
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
+    use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
+
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Capital of France?"}]
+    });
+    let request_bytes = serde_json::to_vec(&request).unwrap();
+    for (origin_header, expect_cached) in [
+        (None, true),
+        (Some(("cache-control", "no-store")), false),
+        (Some(("cache-control", "max-age=60, private")), false),
+        (Some(("set-cookie", "sid=origin-session")), false),
+    ] {
+        let server = MockServer::start().await;
+        let mut template = ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-origin",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Paris."},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        }));
+        if let Some((name, value)) = origin_header {
+            template = template.insert_header(name, value);
+        }
+        Mock::given(method("POST"))
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        let federation = Arc::new(
+            ai_federation::AiFederation::new(
+                &json!({
+                    "providers": [{
+                        "name": "openai",
+                        "provider_type": "openai",
+                        "api_key": "sk-test",
+                        "model_patterns": ["gpt-*"],
+                        "base_url": server.uri(),
+                        "allow_plaintext": true
+                    }]
+                }),
+                create_test_http_client(),
+            )
+            .unwrap(),
+        );
+        let cache = Arc::new(
+            AiSemanticCache::new(&json!({"ttl_seconds": 300}), create_test_http_client()).unwrap(),
+        );
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::clone(&cache) as Arc<dyn Plugin>,
+            Arc::clone(&federation) as Arc<dyn Plugin>,
+        ];
+        let headers = json_headers();
+        for _ in 0..2 {
+            let mut ctx = post_json_ctx(&request);
+            let mut result = cache
+                .on_final_request_body_with_context(&mut ctx, &headers, &request_bytes)
+                .await;
+            if matches!(result, PluginResult::Continue) {
+                result = run_federation_final_body(&federation, &mut ctx, &headers).await;
+            }
+            match finalize_plugin_rejection_for_test(&plugins, &mut ctx, result).await {
+                PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+                other => panic!("expected a 200 answer, got {other:?}"),
+            }
+        }
+        let provider_calls = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            provider_calls,
+            if expect_cached { 1 } else { 2 },
+            "origin header {origin_header:?}: cached={expect_cached}"
+        );
+        assert_eq!(
+            cache.tracked_keys_count(),
+            Some(usize::from(expect_cached)),
+            "origin header {origin_header:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn prewire_concurrency_rejection_releases_dedup_inflight_marker() {
     let server = MockServer::start().await;
