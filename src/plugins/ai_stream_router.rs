@@ -2558,8 +2558,11 @@ const GEMINI_STRICT_SCHEMA_KEYWORDS: &[&str] = &[
 /// String `format` values Gemini documents as enforced.
 const GEMINI_STRICT_SCHEMA_FORMATS: &[&str] = &["date-time", "date", "time"];
 
-/// Annotation keywords that may sit beside `$ref` (they change no constraint).
-const GEMINI_REF_SIBLING_ANNOTATIONS: &[&str] = &["$ref", "title", "description"];
+/// Non-`$` keywords that may sit beside `$ref`: annotations that change no
+/// constraint. `$`-prefixed siblings (`$defs`) are reference/definition
+/// metadata Gemini permits beside `$ref`; every keyword still has to pass
+/// [`GEMINI_STRICT_SCHEMA_KEYWORDS`], and `$defs` entries are screened too.
+const GEMINI_REF_SIBLING_ANNOTATIONS: &[&str] = &["title", "description"];
 
 /// Nesting bound for the strict-schema screen; deeper schemas are refused
 /// rather than walked, so hostile nesting cannot grow the stack.
@@ -2579,9 +2582,9 @@ fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), &'sta
         _ => return Err("strict response_format json_schema contains a non-object subschema"),
     };
     if object.contains_key("$ref")
-        && object
-            .keys()
-            .any(|keyword| !GEMINI_REF_SIBLING_ANNOTATIONS.contains(&keyword.as_str()))
+        && object.keys().any(|keyword| {
+            !keyword.starts_with('$') && !GEMINI_REF_SIBLING_ANNOTATIONS.contains(&keyword.as_str())
+        })
     {
         return Err(
             "strict response_format json_schema combines `$ref` with sibling constraints, which Gemini does not apply",

@@ -11853,6 +11853,46 @@ async fn gemini_strict_json_schema_must_be_representable() {
         assert!(!error.contains("schemas.example.invalid"), "{error}");
     }
 
+    // A root `$ref` beside its `$defs` is a supported self-contained schema
+    // (PR6824-SOL-7): `$defs` is definition metadata, not a sibling constraint.
+    let referenced = json!({
+        "$defs": {
+            "Result": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false
+            }
+        },
+        "$ref": "#/$defs/Result"
+    });
+    let parsed = translate_gemini_body(&plugin, &strict_request(referenced.clone(), true))
+        .await
+        .expect("a root $ref with its $defs must translate");
+    assert_eq!(parsed["generationConfig"]["responseJsonSchema"], referenced);
+    // The definitions beside that `$ref` are still screened, and a real
+    // sibling constraint is still refused.
+    for refused in [
+        json!({
+            "$defs": {"Result": {"type": "string", "minLength": 3}},
+            "$ref": "#/$defs/Result"
+        }),
+        json!({
+            "$defs": {"Result": {"type": "array"}},
+            "$ref": "#/$defs/Result",
+            "maxItems": 2
+        }),
+    ] {
+        let error = translate_gemini_body(&plugin, &strict_request(refused.clone(), true))
+            .await
+            .expect_err("a nested unenforced or sibling constraint must be refused");
+        assert_eq!(
+            reject_param(&error).as_deref(),
+            Some("response_format"),
+            "{refused}: {error}"
+        );
+    }
+
     // A non-strict schema is best-effort by OpenAI's own contract.
     let loose = json!({"type": "object", "properties": {"id": {"type": "string", "minLength": 8}}});
     let parsed = translate_gemini_body(&plugin, &strict_request(loose.clone(), false))
