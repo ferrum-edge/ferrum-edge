@@ -14545,3 +14545,135 @@ async fn grpc_late_enrollment_is_staged_at_the_backend_path_boundary() {
         Some("true")
     );
 }
+
+/// Drive a deferred `before_proxy` short circuit after the backend path was
+/// bound: no final request-body hook, then the reject-path refresh and the
+/// transaction-log fallback.
+async fn deferred_short_circuit_after_bind(
+    plugin: &AiTranscriptAudit,
+    ctx: &mut RequestContext,
+    backend_path: &str,
+) {
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(ctx, backend_path);
+    let mut response_headers = HashMap::new();
+    plugin.after_proxy(ctx, 503, &mut response_headers).await;
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 503;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_boundary_staging_ignores_a_provisional_router_method() {
+    // PR6815-SOL-5: `grpc_method_router` publishes the CLIENT method in
+    // `on_request_received` and refreshes it only in its own backend-path
+    // callback, which may run after this one (priorities are configurable).
+    // The boundary decision must come from the authoritative `backend_path`.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("provisional-router-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.metadata
+        .insert("grpc_full_method".to_string(), "audit/SayHello".to_string());
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    let mut headers = grpc_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the provisional router value must not veto the enrolled backend path"
+    );
+    // The router's own (later) boundary callback refreshes the method.
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    deferred_short_circuit_after_bind(&plugin, &mut ctx, "/test.Greeter/SayHello").await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("provisional-router-subject"),
+        "{request_body}"
+    );
+
+    // And a provisional value cannot enroll an unenrolled backend path.
+    let mut other = grpc_ctx("/audit/SayHello");
+    other.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    other.request_body_bytes = Some(Bytes::from(req));
+    let resolved = plugin
+        .on_backend_path_resolved(&mut other, "/test.Greeter/Other")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        other
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_boundary_staging_uses_the_live_before_proxy_framing_witness() {
+    // PR6815-SOL-6: a `before_proxy` transform set `grpc-encoding: gzip` on
+    // the live header map while `ctx.headers` still holds the inbound map
+    // (no `grpc-encoding`). A call enrolled only at the backend-path boundary
+    // and then short-circuited must decode with the live witness.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = live_grpc_audit_plugin(&endpoint);
+
+    let request = gzip_grpc_frame(&hello_request_bytes("live-witness-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.headers.remove("grpc-encoding");
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+    let mut proxy_headers = grpc_headers();
+    proxy_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the client path is not enrolled"
+    );
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    deferred_short_circuit_after_bind(&plugin, &mut ctx, "/test.Greeter/SayHello").await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the live framing witness must decode the gzip request: {}",
+        records[0]
+    );
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("live-witness-subject"),
+        "the inflated excerpt must carry the decoded field: {request_body}"
+    );
+}

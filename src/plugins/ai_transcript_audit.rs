@@ -5003,10 +5003,19 @@ impl Plugin for AiTranscriptAudit {
     /// enrolled client path is left alone; the final hook (or the reject-path
     /// refresh) re-decides it against the bound path.
     ///
-    /// No authoritative finalized header map exists at this boundary, so the
-    /// request context's `grpc-encoding` is recorded as the framing witness a
-    /// short-circuit capture uses; ordinary dispatch still captures from the
-    /// final hook's own backend-visible header map.
+    /// Enrollment is decided from `backend_path` itself, the authoritative
+    /// value at this boundary. `grpc_full_method` is NOT consulted here: it may
+    /// still hold `grpc_method_router`'s provisional client-path value, because
+    /// priorities are configurable and the router's own boundary callback can
+    /// run after this one.
+    ///
+    /// No header map is available at this boundary, so the framing witness is
+    /// the `grpc-encoding` this instance recorded from the live `before_proxy`
+    /// header map (never `RequestContext::headers`, which may be the original
+    /// inbound map). Without one the witness is `Unsupported`, so a
+    /// short-circuit capture withholds the excerpt rather than misreading the
+    /// frames. Ordinary dispatch still captures from the final hook's own
+    /// backend-visible header map.
     async fn on_backend_path_resolved(
         &self,
         ctx: &mut RequestContext,
@@ -5021,23 +5030,13 @@ impl Plugin for AiTranscriptAudit {
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
             return PluginResult::Continue;
         }
-        // Same precedence as `grpc_method_path`: a published
-        // `grpc_full_method` (refreshed from this same path by an earlier
-        // `grpc_method_router` in the boundary list) wins; otherwise the path
-        // being bound is the method.
-        let enrolled = if ctx
-            .metadata
-            .get("grpc_full_method")
-            .is_some_and(|method| !method.is_empty())
-        {
-            grpc.enrolls(&Self::grpc_method_path(ctx))
-        } else {
-            grpc.enrolls(backend_path)
-        };
-        if !enrolled {
+        if !grpc.enrolls(backend_path) {
             return PluginResult::Continue;
         }
-        let encoding = grpc_message_encoding(&ctx.headers);
+        let encoding = ctx
+            .plugin_state()
+            .and_then(|state| state.ai_transcript_audit_grpc_request_encoding)
+            .unwrap_or(GrpcMessageEncoding::Unsupported);
         let stage_result = if let Some(body) = ctx.metadata.remove("request_body") {
             let staged =
                 self.stage_grpc_candidate(ctx, body.as_bytes(), encoding, BodyPhase::Provisional);
@@ -5210,6 +5209,15 @@ impl Plugin for AiTranscriptAudit {
         // method view does not select must not fall through to the JSON
         // candidate path below — `application/grpc+json` would otherwise
         // satisfy its content-type test.
+        if self.grpc_enrollment_owns_request(ctx) {
+            // Record the framing witness from this LIVE header map even when
+            // the provisional method is not enrolled: the backend-effective
+            // method can still enroll the call at the backend-path boundary,
+            // where no header map is available, and a deferred short circuit
+            // after that boundary never reaches the final request-body hook.
+            ctx.plugin_state_mut()
+                .ai_transcript_audit_grpc_request_encoding = Some(grpc_message_encoding(headers));
+        }
         if self.request_capture_route(ctx) == RequestCaptureRoute::GrpcNotEnrolled {
             return PluginResult::Continue;
         }
@@ -9096,8 +9104,8 @@ struct GrpcFrame<'a> {
 }
 
 /// Message encoding negotiated for this body, from `grpc-encoding`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrpcMessageEncoding {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrpcMessageEncoding {
     Identity,
     Gzip,
     /// An encoding this plugin cannot decode. Only reachable when a frame

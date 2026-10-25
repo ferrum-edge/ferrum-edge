@@ -3898,6 +3898,17 @@ pub(crate) struct PluginRequestState {
     /// isolation. Bounded by the number of attached WAF instances (operator
     /// configuration), never by request content.
     pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
+    /// `grpc-encoding` framing witness `ai_transcript_audit` records from the
+    /// LIVE `before_proxy` header map for a native-gRPC request on a
+    /// `grpc`-enrolled instance, before the backend-effective method is known.
+    /// A call enrolled only at the backend-path boundary has no other
+    /// authoritative framing source when a deferred `before_proxy` hook
+    /// short-circuits it (no final request-body hook runs), and
+    /// `RequestContext::headers` may be the original inbound map rather than the
+    /// backend-visible one. Kept out of public metadata so no other plugin can
+    /// rewrite it and it never reaches a transaction log.
+    pub(crate) ai_transcript_audit_grpc_request_encoding:
+        Option<ai_transcript_audit::GrpcMessageEncoding>,
 }
 
 /// Return an identity only when it contains a meaningful non-whitespace value.
