@@ -36622,9 +36622,9 @@ components:
       additionalProperties: false
       description: >-
         Plugin: ai_request_guard — Validates and constrains AI/LLM API
-        requests. All four numeric limits (`max_tokens_limit`,
-        `default_max_tokens`, `max_messages`, `max_prompt_characters`) are
-        unsigned 64-bit integers: negative, fractional, and above-`uint64`
+        requests. All five numeric limits (`max_tokens_limit`,
+        `default_max_tokens`, `max_choices`, `max_messages`,
+        `max_prompt_characters`) are unsigned 64-bit integers: negative, fractional, and above-`uint64`
         values are rejected at plugin construction, and `0` is a valid,
         maximally strict setting rather than "unset" (omit the field to leave
         the policy unconfigured). Two relationships between sibling values are
@@ -36637,6 +36637,7 @@ components:
       anyOf:
         - required: [max_tokens_limit]
         - required: [default_max_tokens]
+        - required: [max_choices]
         - required: [allowed_models]
           properties:
             allowed_models:
@@ -36672,11 +36673,17 @@ components:
           maximum: 18446744073709551615
           description: >-
             Maximum allowed output-token request value across OpenAI and
-            provider-native token fields. Unsigned 64-bit integer; `0` is
-            accepted and refuses any request that asks for a positive number of
-            tokens. When `default_max_tokens` is also set it must not exceed
-            this value — a construction-time relationship JSON Schema cannot
-            express (see the component description).
+            provider-native token fields (including both Gemini ProtoJSON
+            spellings, `generationConfig.maxOutputTokens` and
+            `generation_config.max_output_tokens`). Request caps spelled as
+            integral floats, exponents, or quoted integers are evaluated (and
+            clamped) by value; a present cap that is not a non-negative integer
+            (negative, fractional, boolean, unparseable string, ...) is rejected
+            with HTTP 400 in both reject and clamp modes. Unsigned 64-bit
+            integer; `0` is accepted and refuses any request that asks for a
+            positive number of tokens. When `default_max_tokens` is also set it
+            must not exceed this value — a construction-time relationship JSON
+            Schema cannot express (see the component description).
         enforce_max_tokens:
           type: string
           enum: [reject, clamp]
@@ -36687,12 +36694,27 @@ components:
           format: uint64
           minimum: 0
           maximum: 18446744073709551615
-          description: Unsigned 64-bit integer (`0` accepted), and must be <= max_tokens_limit when that limit is also configured — a construction-time relationship JSON Schema cannot express (see the component description). Inject a default output-token limit if no supported token field is present; top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap (including TGI parameters.max_new_tokens)
+          description: Unsigned 64-bit integer (`0` accepted), and must be <= max_tokens_limit when that limit is also configured — a construction-time relationship JSON Schema cannot express (see the component description). Inject a default output-token limit if no supported token field is present (a JSON null cap counts as absent and is replaced); top-level-shaped bodies keep a family-correct top-level fallback (max_output_tokens for Responses, else max_tokens) so a spoofed provider marker or stray cross-provider alias cannot uncap them, while unambiguously provider-native bodies receive only their native cap (including TGI parameters.max_new_tokens). With supported_schema bedrock_converse every body receives inferenceConfig.maxTokens (created when absent) and no top-level cap
+        max_choices:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 18446744073709551615
+          description: >-
+            Maximum completions one request may ask for, across OpenAI `n` and
+            `best_of`, Cohere `num_generations`, Gemini
+            `generationConfig.candidateCount` (both ProtoJSON spellings), and
+            TGI `parameters.best_of`. `max_tokens_limit` bounds tokens per
+            completion, so the worst case per request is `max_choices` ×
+            `max_tokens_limit`. A larger or non-integer value is rejected with
+            HTTP 400. A request that omits the count (or sends `0`) is
+            counted as the provider default of one completion, so `0` refuses
+            every request. Unsigned 64-bit integer.
         supported_schema:
           type: string
-          enum: [chat_completions, responses, provider_native, auto]
+          enum: [chat_completions, responses, provider_native, bedrock_converse, auto]
           default: auto
-          description: Request schema family accepted when strict_schema is true
+          description: Request schema family accepted when strict_schema is true. bedrock_converse also binds default_max_tokens injection to Amazon Bedrock Converse (inferenceConfig.maxTokens, created when the optional inferenceConfig is absent)
         strict_schema:
           type: boolean
           default: false
@@ -36702,21 +36724,21 @@ components:
           items:
             type: string
           default: []
-          description: Whitelist of allowed model names (empty = allow all)
+          description: Whitelist of allowed model names (empty = allow all). Matched against the body model and against any model the request path selects (Gemini/Vertex models/{model}:{method}, Bedrock model/{modelId}/converse|invoke, Azure openai/deployments/{deployment}); every model found must be allowed
         blocked_models:
           type: array
           items:
             type: string
           default: []
-          description: Blacklist of model names (takes precedence over allowed)
+          description: Blacklist of model names (takes precedence over allowed). Matched against the body model and any request-path model (see allowed_models)
         require_model_for_model_policy:
           type: boolean
           default: true
-          description: Require a non-empty string model field when allowed_models or blocked_models is configured. Setting false only relaxes a genuinely-absent model; a present-but-invalid model (non-string or empty/whitespace) is still rejected with HTTP 400
+          description: Require a non-empty string model field when allowed_models or blocked_models is configured, unless the request path selects a model (see allowed_models). Setting false only relaxes a genuinely-absent model; a present-but-invalid model (non-string or empty/whitespace) is still rejected with HTTP 400
         require_user_field:
           type: boolean
           default: false
-          description: Require user field in request body
+          description: Require a non-empty string user field in the request body (null and blank values are rejected)
         max_messages:
           type: integer
           format: uint64
@@ -36732,7 +36754,7 @@ components:
           format: uint64
           minimum: 0
           maximum: 18446744073709551615
-          description: Maximum total prompt characters (Unicode scalar values; `0` is accepted and refuses any request carrying counted text) across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse messages[].content[].toolResult content and guardContent text, tools, tool arguments (including Bedrock Converse messages[].content[].toolUse.input), document/RAG fields (including Anthropic text document source.data and every eligible member value of a Cohere documents[] map, minus its id and _excludes-named members), Google Vertex legacy predict instances[].prompt, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
+          description: Maximum total prompt characters (Unicode scalar values; `0` is accepted and refuses any request carrying counted text) across prompt/input/system fields, message text, text multimodal parts, Bedrock Converse messages[].content[].toolResult content and guardContent text, tools (including Bedrock Converse toolConfig.tools[]), tool arguments (including Bedrock Converse messages[].content[].toolUse.input) and Gemini contents[].parts[].functionResponse.response tool results, document/RAG fields (including Anthropic text document source.data and every eligible member value of a Cohere documents[] map, minus its id and _excludes-named members), Google Vertex legacy predict instances[].prompt, and Azure "On Your Data" data_sources[]/dataSources[].parameters.role_information/roleInformation
         temperature_range:
           type: array
           items:
@@ -36740,7 +36762,7 @@ components:
             format: double
           minItems: 2
           maxItems: 2
-          description: "Allowed [min, max] range for top-level temperature plus Gemini generationConfig.temperature and Bedrock inferenceConfig.temperature; conflicting aliases are rejected. Both bounds must be finite and temperature_range[0] must be <= temperature_range[1] — a construction-time relationship JSON Schema cannot express (see the component description)"
+          description: "Allowed [min, max] range for top-level temperature plus Gemini generationConfig.temperature / generation_config.temperature and Bedrock inferenceConfig.temperature; conflicting aliases are rejected. Both bounds must be finite and temperature_range[0] must be <= temperature_range[1] — a construction-time relationship JSON Schema cannot express (see the component description)"
         block_system_prompts:
           type: boolean
           default: false
@@ -36756,11 +36778,11 @@ components:
           items:
             type: string
           default: []
-          description: Required fields in request body
+          description: Required top-level fields in the request body; each must be present, not null, and not a blank string
         fail_on_uninspectable_body:
           type: boolean
           default: true
-          description: Reject JSON POST requests whose body cannot be inspected because the buffered body is missing, empty, non-UTF-8, malformed JSON, or still compressed after request transforms (no compression/decompress_request decoded it). Set false only for compatibility when the backend must handle such uninspectable bodies itself.
+          description: Reject in-scope POST requests whose body cannot be inspected because the buffered body is missing, empty, non-UTF-8, malformed JSON, ambiguous JSON (duplicate object member names, including escaped spellings, or a document over the duplicate-scan budgets), or still compressed after request transforms (no compression/decompress_request decoded it). Set false only for compatibility when the backend must handle such uninspectable bodies itself.
 
     AiRateLimiterConfig:
       type: object
