@@ -28,6 +28,31 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ai_federation`: unrepresentable generation controls are refused, provider timeouts capped (PR #6816)
+
+The translating providers (`anthropic`, `google_gemini`, `google_vertex`,
+`aws_bedrock`) used to drop OpenAI fields they could not express and still
+answer `200`. They now map what they can (Gemini/Vertex: `response_format`
+JSON modes, `n > 1`, `seed`, non-zero penalties; Anthropic:
+`parallel_tool_calls: false`) and refuse the rest before any provider call.
+With `fallback_enabled` the next matching provider is tried; when none can
+represent the control the client receives `400` with
+`code: provider_translation_failed` naming the field. Clients that sent, for
+example, `response_format` to Anthropic, `seed` to Bedrock, `logprobs: true`,
+`tools[].function.strict: true`, `reasoning_effort`, `reasoning`, `verbosity`,
+or a schema-less `json_schema` must drop the field for those providers, route
+the model to a provider that supports it (OpenAI-compatible providers and
+Cohere still receive the body unchanged), or add such a provider as a
+fallback. A `strict: true` JSON schema routed to Gemini/Vertex must stay
+inside the enforced keyword subset listed in `docs/plugins.md`; set
+`strict: false` to forward any schema as guidance. Neutral values (`n: 1`,
+zero penalties, `logprobs: false`, `parallel_tool_calls: true`) are unaffected.
+
+Per-provider `connect_timeout_seconds` and `read_timeout_seconds` now accept
+`1`–`86400`. A configuration with a larger value fails validation and
+admission; lower it (use `streaming.read_timeout_seconds: 0` for an unbounded
+streaming budget).
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

@@ -2384,7 +2384,7 @@ impl AiFederation {
                 .filter(|provider| provider_matches_model(provider, model))
                 .collect();
         }
-        self.ordered_provider_indices(model)
+        self.ordered_provider_indices(model, |_| true)
             .into_iter()
             .filter_map(|index| self.providers.get(index))
             .collect()
@@ -2398,7 +2398,16 @@ impl AiFederation {
     /// group is chosen by weighted random selection; every later attempt keeps
     /// the deterministic order. Shared by the buffered and streaming paths so
     /// both select the same way.
-    fn ordered_provider_indices(&self, model: &str) -> Vec<usize> {
+    ///
+    /// `eligible` excludes providers the calling path could not serve this
+    /// request with (the streaming claim passes its stream-eligibility rule),
+    /// so their share is renormalized among the providers that can serve it
+    /// instead of transferring wholesale to the next one in order.
+    fn ordered_provider_indices(
+        &self,
+        model: &str,
+        eligible: impl Fn(&ResolvedProvider) -> bool,
+    ) -> Vec<usize> {
         let mut order: Vec<usize> = self
             .providers
             .iter()
@@ -2407,7 +2416,12 @@ impl AiFederation {
             .map(|(index, _)| index)
             .collect();
         if self.weighted_selection {
-            apply_weighted_first_choice(&self.providers, &mut order, weighted_selection_roll());
+            apply_weighted_first_choice(
+                &self.providers,
+                &mut order,
+                eligible,
+                weighted_selection_roll,
+            );
         }
         order
     }
@@ -2431,9 +2445,17 @@ impl AiFederation {
 /// reordered (an unweighted group keeps configuration order); providers without
 /// a `weight` count as `1`. A provider whose circuit cannot currently admit
 /// competes with weight `0`, because the attempt loop would only skip it and
-/// hand its share to the next provider in configuration order. `roll` is the
-/// random draw, injected so selection is deterministic under test.
-fn apply_weighted_first_choice(providers: &[ResolvedProvider], order: &mut [usize], roll: u64) {
+/// hand its share to the next provider in configuration order; so does one the
+/// caller marks ineligible. `roll` produces the random draw and is invoked only
+/// when at least two providers of the group have a positive share, so a
+/// request whose selection cannot change draws nothing; it is injected so
+/// selection is deterministic under test.
+fn apply_weighted_first_choice(
+    providers: &[ResolvedProvider],
+    order: &mut [usize],
+    eligible: impl Fn(&ResolvedProvider) -> bool,
+    roll: impl FnOnce() -> u64,
+) {
     let Some(lead_priority) = order
         .first()
         .and_then(|index| providers.get(*index))
@@ -2466,20 +2488,26 @@ fn apply_weighted_first_choice(providers: &[ResolvedProvider], order: &mut [usiz
             providers
                 .get(*index)
                 .filter(|provider| {
-                    provider
-                        .circuit
-                        .as_ref()
-                        .is_none_or(|circuit| circuit.may_admit())
+                    eligible(provider)
+                        && provider
+                            .circuit
+                            .as_ref()
+                            .is_none_or(|circuit| circuit.may_admit())
                 })
                 .map_or(0, |provider| u64::from(provider.weight.unwrap_or(1)))
         })
         .collect();
-    // At most MAX_PROVIDERS * MAX_PROVIDER_WEIGHT, far below u64::MAX.
-    let total: u64 = weights.iter().sum();
-    if total == 0 {
+    if weights.iter().filter(|weight| **weight > 0).count() < 2 {
+        // Zero or one provider can take the first attempt: the order cannot
+        // change (a lone positive share is moved to the front without a draw).
+        if let Some(position) = weights.iter().position(|weight| *weight > 0) {
+            order[..=position].rotate_right(1);
+        }
         return;
     }
-    let mut target = roll % total;
+    // At most MAX_PROVIDERS * MAX_PROVIDER_WEIGHT, far below u64::MAX.
+    let total: u64 = weights.iter().sum();
+    let mut target = roll() % total;
     let mut chosen = 0;
     for (position, weight) in weights.iter().enumerate() {
         if target < *weight {
@@ -2721,26 +2749,35 @@ struct ParsedToolCall {
 const MAX_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
 
 /// Read the `extra_content.google.thought_signature` extension of an OpenAI
-/// tool call. Absent at any level is `None`; a present but malformed value is
+/// tool call. Absent or `null` at any level is `None`; a present but malformed value is
 /// an error so a continuation is never silently sent unsigned. The value is
 /// never echoed in a diagnostic.
 fn parse_tool_call_thought_signature(
     call_object: &serde_json::Map<String, Value>,
     scope: &str,
 ) -> Result<Option<String>, String> {
-    let Some(extra) = call_object.get("extra_content") else {
+    // `null` at any level is an unset optional field, not a malformed one:
+    // serializers that emit explicit nulls must not turn an unsigned call
+    // into a rejected transcript.
+    let Some(extra) = call_object
+        .get("extra_content")
+        .filter(|value| !value.is_null())
+    else {
         return Ok(None);
     };
     let extra = extra
         .as_object()
         .ok_or_else(|| format!("ai_federation: {scope} extra_content must be an object"))?;
-    let Some(google) = extra.get("google") else {
+    let Some(google) = extra.get("google").filter(|value| !value.is_null()) else {
         return Ok(None);
     };
     let google = google
         .as_object()
         .ok_or_else(|| format!("ai_federation: {scope} extra_content.google must be an object"))?;
-    let Some(signature) = google.get("thought_signature") else {
+    let Some(signature) = google
+        .get("thought_signature")
+        .filter(|value| !value.is_null())
+    else {
         return Ok(None);
     };
     match signature.as_str() {
@@ -3126,9 +3163,10 @@ enum ResponseFormatMode {
     Text,
     /// `{"type":"json_object"}`.
     JsonObject,
-    /// `{"type":"json_schema", "json_schema": {...}}`, with its schema when one
-    /// was supplied.
-    JsonSchema(Option<Value>),
+    /// `{"type":"json_schema", "json_schema": {"schema": {...}, "strict": ..}}`.
+    /// The schema is required: a schema-less `json_schema` is malformed under
+    /// the OpenAI contract and is refused rather than downgraded to JSON mode.
+    JsonSchema { schema: Value, strict: bool },
 }
 
 /// OpenAI generation controls beyond the base set (messages, token limit,
@@ -3189,22 +3227,23 @@ fn parse_response_format(body: &Value) -> Result<ResponseFormatMode, String> {
                         .to_string(),
                 );
             }
-            if spec
-                .get("strict")
-                .is_some_and(|strict| !strict.is_boolean())
-            {
-                return Err(
-                    "ai_federation: 'response_format.json_schema.strict' must be a boolean"
-                        .to_string(),
-                );
-            }
-            match spec.get("schema") {
-                None | Some(Value::Null) => Ok(ResponseFormatMode::JsonSchema(None)),
-                Some(schema @ Value::Object(_)) => {
-                    Ok(ResponseFormatMode::JsonSchema(Some(schema.clone())))
+            let strict = match spec.get("strict") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(strict)) => *strict,
+                Some(_) => {
+                    return Err(
+                        "ai_federation: 'response_format.json_schema.strict' must be a boolean"
+                            .to_string(),
+                    );
                 }
-                Some(_) => Err(
-                    "ai_federation: 'response_format.json_schema.schema' must be an object"
+            };
+            match spec.get("schema") {
+                Some(schema @ Value::Object(_)) => Ok(ResponseFormatMode::JsonSchema {
+                    schema: schema.clone(),
+                    strict,
+                }),
+                _ => Err(
+                    "ai_federation: 'response_format.json_schema.schema' must be a JSON Schema object"
                         .to_string(),
                 ),
             }
@@ -3228,6 +3267,108 @@ fn non_zero_penalty(body: &Value, field: &str) -> Result<Option<Value>, String> 
     } else {
         Ok(Some(value.clone()))
     }
+}
+
+/// JSON Schema keywords Gemini/Vertex `responseJsonSchema` documents as
+/// enforced (Gemini API structured-output guide, "JSON Schema support"; Vertex
+/// AI "Supported schema fields"). Deliberately conservative: a keyword that is
+/// not listed here is treated as unenforced for a strict schema.
+const GEMINI_STRICT_SCHEMA_KEYWORDS: &[&str] = &[
+    "type",
+    "title",
+    "description",
+    "enum",
+    "format",
+    "anyOf",
+    "$ref",
+    "$defs",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "prefixItems",
+    "minItems",
+    "maxItems",
+    "minimum",
+    "maximum",
+];
+
+/// String `format` values Gemini documents as enforced.
+const GEMINI_STRICT_SCHEMA_FORMATS: &[&str] = &["date-time", "date", "time"];
+
+/// Nesting bound for the strict-schema screen. Deeper schemas are refused
+/// rather than walked, so hostile nesting cannot grow the stack.
+const MAX_STRICT_SCHEMA_DEPTH: usize = 32;
+
+/// Check one strict JSON Schema node (and every nested subschema) against the
+/// Gemini-enforced subset. The error names the first offending keyword,
+/// bounded, without echoing any schema value.
+fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), String> {
+    if depth > MAX_STRICT_SCHEMA_DEPTH {
+        return Err(format!(
+            "strict json_schema nests deeper than {MAX_STRICT_SCHEMA_DEPTH} levels"
+        ));
+    }
+    let object = match schema {
+        // Boolean subschemas (`true` / `false`) carry no keywords.
+        Value::Bool(_) => return Ok(()),
+        Value::Object(object) => object,
+        _ => return Err("strict json_schema contains a non-object subschema".to_string()),
+    };
+    for (keyword, value) in object {
+        if !GEMINI_STRICT_SCHEMA_KEYWORDS.contains(&keyword.as_str()) {
+            return Err(format!(
+                "strict json_schema uses `{}`, which Gemini does not enforce",
+                bounded_error_value(keyword)
+            ));
+        }
+        match keyword.as_str() {
+            "format" => {
+                if !value
+                    .as_str()
+                    .is_some_and(|format| GEMINI_STRICT_SCHEMA_FORMATS.contains(&format))
+                {
+                    return Err(
+                        "strict json_schema uses a `format` Gemini does not enforce (supported: date-time, date, time)"
+                            .to_string(),
+                    );
+                }
+            }
+            "$ref" => {
+                // Only document-local references resolve inside the schema the
+                // provider receives.
+                if !value
+                    .as_str()
+                    .is_some_and(|reference| reference.starts_with('#'))
+                {
+                    return Err(
+                        "strict json_schema `$ref` must be a local `#...` reference".to_string()
+                    );
+                }
+            }
+            "properties" | "$defs" => {
+                let members = value
+                    .as_object()
+                    .ok_or_else(|| format!("strict json_schema `{keyword}` must be an object"))?;
+                for member in members.values() {
+                    screen_gemini_strict_schema(member, depth + 1)?;
+                }
+            }
+            "anyOf" | "prefixItems" => {
+                let members = value
+                    .as_array()
+                    .ok_or_else(|| format!("strict json_schema `{keyword}` must be an array"))?;
+                for member in members {
+                    screen_gemini_strict_schema(member, depth + 1)?;
+                }
+            }
+            "items" | "additionalProperties" => {
+                screen_gemini_strict_schema(value, depth + 1)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Parse and gate the extended generation controls for one translating
@@ -3295,11 +3436,21 @@ fn translated_generation_controls(
             "no native token-bias control",
         ));
     }
+    // Generation-affecting fields with no faithful native mapping on these
+    // adapters. Reasoning depth (`reasoning_effort` / `reasoning`) maps to
+    // model-family-specific thinking budgets or levels, and `verbosity` has
+    // no native control, so translating either would substitute a setting the
+    // client never chose. The legacy `functions` / `function_call` pair
+    // declares tools the adapters only accept as `tools` / `tool_choice`.
     for field in [
         "reasoning_effort",
+        "reasoning",
+        "verbosity",
         "audio",
         "prediction",
         "web_search_options",
+        "functions",
+        "function_call",
     ] {
         if present_non_null(body, field).is_some() {
             return Err(unrepresentable_control(
@@ -3355,7 +3506,7 @@ fn translated_generation_controls(
                     "no native JSON output mode",
                 ));
             }
-            ResponseFormatMode::JsonSchema(_) => {
+            ResponseFormatMode::JsonSchema { .. } => {
                 return Err(unrepresentable_control(
                     adapter,
                     "response_format",
@@ -3391,6 +3542,21 @@ fn translated_generation_controls(
                 "no native frequency penalty",
             ));
         }
+    }
+    // A STRICT schema is a promise that every constraint is enforced. Gemini
+    // and Vertex enforce only a documented JSON Schema subset and silently
+    // ignore the rest (`minLength`/`maxLength`, property counts,
+    // `uniqueItems`, `contains`, ...), so a strict schema outside that subset
+    // is refused here rather than weakened. A non-strict schema is guidance
+    // and is forwarded unchanged.
+    if adapter == NativeAdapter::Gemini
+        && let ResponseFormatMode::JsonSchema {
+            schema,
+            strict: true,
+        } = &response_format
+        && let Err(detail) = screen_gemini_strict_schema(schema, 0)
+    {
+        return Err(unrepresentable_control(adapter, "response_format", &detail));
     }
     // Anthropic alone can disable parallel tool use (`tool_choice`).
     if disable_parallel_tool_use && adapter != NativeAdapter::Anthropic {
@@ -4580,13 +4746,13 @@ fn translate_to_gemini(
     // Gemini API and Vertex AI accept it alongside `responseMimeType`).
     match controls.response_format {
         ResponseFormatMode::Text => {}
-        ResponseFormatMode::JsonObject | ResponseFormatMode::JsonSchema(None) => {
+        ResponseFormatMode::JsonObject => {
             gen_config.insert(
                 "responseMimeType".to_string(),
                 Value::String("application/json".to_string()),
             );
         }
-        ResponseFormatMode::JsonSchema(Some(schema)) => {
+        ResponseFormatMode::JsonSchema { schema, .. } => {
             gen_config.insert(
                 "responseMimeType".to_string(),
                 Value::String("application/json".to_string()),
@@ -5551,6 +5717,7 @@ fn gemini_part_thought_signature<'a>(
     let Some(signature) = part
         .get("thoughtSignature")
         .or_else(|| part.get("thought_signature"))
+        .filter(|value| !value.is_null())
     else {
         return Ok(None);
     };
@@ -6346,16 +6513,45 @@ enum StreamOutcome {
 
 /// Whether a terminated stream body ended on a PROVIDER transport fault.
 ///
-/// A client disconnect (including a client RPC deadline, which the body wrapper
-/// reports as a disconnect) and gateway-local classes
-/// (`client_side_no_backend_signal`: policy refusals, request-size limits,
-/// gateway buffer capacity, connection-limit and trust refusals) are not
-/// evidence about the provider and stay circuit-neutral.
-fn body_outcome_is_provider_fault(outcome: &crate::proxy::deferred_log::BodyOutcome) -> bool {
+/// Mirrors proxy core's own body-phase breaker rule
+/// (`error_class_is_post_wire_backend_failure`: read timeout, reset, close,
+/// protocol error, oversized body), so the federation circuit and the core
+/// breaker cannot drift apart on the same exchange. On top of that, a cut the
+/// gateway's own policy made is not evidence about the provider and stays
+/// neutral: a client disconnect (including a client RPC deadline, which the
+/// body wrapper reports as a disconnect), an authorization-lifetime
+/// termination, and a route-rule total request deadline
+/// ([`route_policy_deadline_elapsed`]). The route cut is logged as a
+/// `read_write_timeout` exactly like a provider read timeout, so its
+/// provenance comes from the request's typed deadline, never the class.
+fn body_outcome_is_provider_fault(
+    ctx: &RequestContext,
+    outcome: &crate::proxy::deferred_log::BodyOutcome,
+) -> bool {
     !outcome.client_disconnected
-        && outcome.body_error_class.is_some_and(|class| {
-            !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class))
-        })
+        && outcome.authorization_termination.is_none()
+        && crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(
+            outcome.body_error_class,
+        )
+        && !route_policy_deadline_elapsed(ctx)
+}
+
+/// Whether the matched route rule's TOTAL request deadline produced, or could
+/// have produced, this request's timeout.
+///
+/// True when proxy core recorded a route-deadline phase (a gateway-authored
+/// route `504`) or when the armed total deadline has already elapsed at the
+/// terminal. The route budget ends a healthy long generation or a slow-reading
+/// client exactly as it ends a slow provider, so core settles it
+/// health-neutrally; a provider timeout that coincides with an elapsed route
+/// deadline is indistinguishable from it and is treated neutrally too. The
+/// provider's own `read_timeout_seconds` / `connect_timeout_seconds` are
+/// backend budgets, not route deadlines, and still score as faults.
+fn route_policy_deadline_elapsed(ctx: &RequestContext) -> bool {
+    ctx.route_request_timeout_recorded()
+        || ctx
+            .route_request_deadline_at()
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
 }
 
 impl StreamOutcome {
@@ -7418,7 +7614,9 @@ impl AiFederation {
         // instances), so selection must yield indices rather than borrows.
         // Same predicate and same attempt order (priority, then the optional
         // weighted first choice) as [`AiFederation::find_providers_for_model`].
-        let matching_providers: Vec<usize> = self.ordered_provider_indices(model);
+        let matching_providers: Vec<usize> = self.ordered_provider_indices(model, |provider| {
+            stream_target_for(provider, &Self::resolve_model(provider, model)).is_ok()
+        });
         if matching_providers.is_empty() {
             if self.fail_on_no_matching_provider {
                 let echoed_model = truncate_model_for_error(model);
@@ -8388,7 +8586,12 @@ impl Plugin for AiFederation {
         // metadata. Gateway-local refusals and client disconnects
         // (`client_side_no_backend_signal`) stay neutral.
         if let Some(class) = ctx.last_backend_dispatch_error_class() {
-            if !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class)) {
+            // A route-rule total deadline that expired before the response
+            // head is gateway policy, not provider evidence, exactly like the
+            // body-phase cut (see `route_policy_deadline_elapsed`).
+            if !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class))
+                && !route_policy_deadline_elapsed(ctx)
+            {
                 self.stage_owned_stream(ctx, StreamOutcome::Failed);
             }
             // A gateway-local refusal (policy, connection limit, trust, buffer
@@ -8511,7 +8714,7 @@ impl Plugin for AiFederation {
         let Some(lifecycle) = self.owned_stream_lifecycle(ctx) else {
             return;
         };
-        if body_outcome_is_provider_fault(outcome) {
+        if body_outcome_is_provider_fault(ctx, outcome) {
             // The provider's body died on a transport fault (read timeout,
             // reset, protocol error) that the inspector never saw: its driver
             // exits on the error without calling `on_end`, so the truncation
@@ -9546,12 +9749,50 @@ pub mod test_helpers {
             .filter(|(_, provider)| provider_matches_model(provider, model))
             .map(|(index, _)| index)
             .collect();
-        apply_weighted_first_choice(&plugin.providers, &mut order, roll);
+        apply_weighted_first_choice(&plugin.providers, &mut order, |_| true, || roll);
         order
             .into_iter()
             .filter_map(|index| plugin.providers.get(index))
             .map(|provider| provider.name.clone())
             .collect()
+    }
+
+    /// Whether ordering the providers matching `model` would draw a random
+    /// value, and the resulting names when the draw returns `roll`. With
+    /// `streaming` the streaming claim's eligibility rule applies.
+    pub fn weighted_roll_drawn_for_test(
+        plugin: &AiFederation,
+        model: &str,
+        streaming: bool,
+        roll: u64,
+    ) -> (bool, Vec<String>) {
+        let mut order: Vec<usize> = plugin
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider_matches_model(provider, model))
+            .map(|(index, _)| index)
+            .collect();
+        let drawn = std::cell::Cell::new(false);
+        apply_weighted_first_choice(
+            &plugin.providers,
+            &mut order,
+            |provider| {
+                !streaming
+                    || stream_target_for(provider, &AiFederation::resolve_model(provider, model))
+                        .is_ok()
+            },
+            || {
+                drawn.set(true);
+                roll
+            },
+        );
+        let names = order
+            .into_iter()
+            .filter_map(|index| plugin.providers.get(index))
+            .map(|provider| provider.name.clone())
+            .collect();
+        (drawn.get(), names)
     }
 
     /// Provider names matching `model` in the order the dispatch paths use

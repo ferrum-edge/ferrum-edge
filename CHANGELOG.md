@@ -26,8 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration) next to the existing aggregate series.
 
 ### Changed
-- **`ai_federation` refuses generation controls a translating provider cannot
-  represent, and maps them for Gemini/Vertex.** `anthropic`, `google_gemini`,
+- **BREAKING — `ai_federation` refuses generation controls a translating
+  provider cannot represent, and maps them for Gemini/Vertex** (issue/PR #6816).
+  `anthropic`, `google_gemini`,
   `google_vertex`, and `aws_bedrock` rebuild the provider request from a fixed
   field set and used to drop `response_format`, `n`, `seed`, penalties,
   `logprobs`, `tools[].function.strict`, and similar fields silently, so a
@@ -35,14 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vertex now map `response_format` `json_object` / `json_schema`
   (`responseMimeType: application/json` plus `responseJsonSchema`), `n > 1`
   (`candidateCount`), `seed`, and non-zero penalties; Anthropic maps
-  `parallel_tool_calls: false`. Every other non-neutral control is refused
+  `parallel_tool_calls: false`. A `json_schema` must carry a `schema` object,
+  and a `strict: true` schema sent to Gemini/Vertex may use only the keyword
+  subset Google enforces. Every other non-neutral control (including
+  `reasoning_effort`, `reasoning`, `verbosity`, and legacy `functions`) is refused
   during translation, before provider I/O, so fallback can reach a provider
   that represents it and otherwise the request fails `400`
   (`provider_translation_failed`). See the support matrix in
   `docs/plugins.md`.
-- **`ai_federation` provider `connect_timeout_seconds` / `read_timeout_seconds`
-  are capped at 86400.** An unbounded per-call budget let one hanging provider
-  hold a non-queuing `max_concurrent_requests` permit indefinitely.
+- **BREAKING — `ai_federation` provider `connect_timeout_seconds` /
+  `read_timeout_seconds` are capped at 86400** (issue/PR #6816). An unbounded
+  per-call budget let one hanging provider hold a non-queuing
+  `max_concurrent_requests` permit indefinitely; a larger value now fails
+  configuration admission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -186,8 +192,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a success under the default fallback statuses, so a timed-out half-open
   probe could close the circuit) or whose body died on a read timeout or reset
   after headers (previously a neutral release) is now scored a circuit failure
-  from trusted dispatch/body provenance. Client disconnects and gateway-local
-  refusals stay neutral, and scoring stays exactly-once.
+  from trusted dispatch/body provenance, using proxy core's post-wire
+  backend-failure classes. Client disconnects, authorization-lifetime
+  terminations, gateway-local refusals, and route-rule total request deadlines
+  stay neutral, and scoring stays exactly-once.
 - **`ai_federation` documents the buffered provider-error envelope.** A buffered
   provider non-2xx body is replaced by a fixed `upstream_error` envelope with the
   provider's status and safe headers; this is now stated in `docs/plugins.md`

@@ -10521,6 +10521,10 @@ fn malformed_generation_controls_fail_translation() {
         json!({"response_format": "json_object"}),
         json!({"response_format": {"type": "json_schema"}}),
         json!({"response_format": {"type": "json_schema", "json_schema": {"schema": []}}}),
+        // A schema-less json_schema is malformed, never downgraded to JSON mode.
+        json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}}),
+        json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": null}}}),
+        json!({"response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "object"}, "strict": "yes"}}}),
         json!({"parallel_tool_calls": "no"}),
         json!({"logprobs": "yes"}),
     ] {
@@ -10899,4 +10903,348 @@ async fn provider_circuit_metrics_carry_the_configured_provider_name() {
         provider_gauge_line(&output, name).is_none(),
         "dropping an open circuit must release its gauge series"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PR #6816 review round 1
+// ---------------------------------------------------------------------------
+
+/// Arm a 1 ms route-rule total request deadline on `ctx` and let it elapse.
+async fn expire_route_total_deadline(ctx: &mut RequestContext) {
+    ctx.route_override_request_timeout_ms = Some(1);
+    ctx.arm_route_request_deadline(false);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert!(
+        ctx.route_request_deadline_at()
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    );
+}
+
+/// PR6816-SOL-1: a route-rule total deadline that cuts a healthy provider's
+/// stream is logged as `read_write_timeout` but is gateway policy, so it must
+/// release the claim neutrally instead of opening the provider circuit.
+#[tokio::test]
+async fn streaming_route_total_deadline_cut_is_circuit_neutral() {
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = event_stream_response_headers();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    expire_route_total_deadline(&mut ctx).await;
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            200,
+            &BodyOutcome::error(ErrorClass::ReadWriteTimeout, 64, false),
+        )
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("released")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true),
+        "a route policy cut must not open a healthy provider's circuit"
+    );
+
+    // The same expiry before the response head is neutral too.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    expire_route_total_deadline(&mut ctx).await;
+    record_backend_dispatch_outcome_for_test(&mut ctx, Some(ErrorClass::ReadWriteTimeout), true);
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 504, &mut response_headers)
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        None
+    );
+    drop(ctx);
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true)
+    );
+}
+
+/// PR6816-MUSE-3: only proxy core's post-wire backend-failure classes count.
+/// A graceful remote close or an unclassified request error does not.
+#[tokio::test]
+async fn streaming_body_fault_classes_match_core_post_wire_set() {
+    for (class, expected) in [
+        (ErrorClass::GracefulRemoteClose, "released"),
+        (ErrorClass::RequestError, "released"),
+        (ErrorClass::ConnectionClosed, "failed"),
+        (ErrorClass::ResponseBodyTooLarge, "failed"),
+    ] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::error(class, 8, false))
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some(expected),
+            "{class:?}"
+        );
+    }
+}
+
+/// PR6816-SOL-2: a strict schema is forwarded to Gemini only when every
+/// keyword is in the enforced subset; otherwise it is refused before I/O.
+#[test]
+fn gemini_strict_json_schema_must_stay_inside_the_enforced_subset() {
+    fn with_schema(schema: Value, strict: bool) -> Value {
+        with_fields(
+            sample_openai_request(),
+            json!({"response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "s", "strict": strict, "schema": schema}
+            }}),
+        )
+    }
+    let supported = json!({
+        "type": "object",
+        "title": "Decision",
+        "properties": {
+            "approved": {"type": "boolean", "description": "outcome"},
+            "when": {"type": "string", "format": "date-time"},
+            "score": {"type": "number", "minimum": 0, "maximum": 1},
+            "tags": {"type": "array", "items": {"type": "string", "enum": ["a", "b"]}, "minItems": 1, "maxItems": 3},
+            "pair": {"type": "array", "prefixItems": [{"type": "string"}, {"type": "integer"}]},
+            "either": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "child": {"$ref": "#/$defs/child"}
+        },
+        "$defs": {"child": {"type": "object", "properties": {"x": {"type": "string"}}}},
+        "required": ["approved"],
+        "additionalProperties": false
+    });
+    for provider in ["google_gemini", "google_vertex"] {
+        let parsed = translated_body(provider, &with_schema(supported.clone(), true))
+            .unwrap_or_else(|error| {
+                panic!("{provider} refused a supported strict schema: {error}")
+            });
+        assert_eq!(parsed["generationConfig"]["responseJsonSchema"], supported);
+    }
+
+    for (keyword, schema) in [
+        (
+            "maxLength",
+            json!({"type": "object", "properties": {"id": {"type": "string", "maxLength": 8}}}),
+        ),
+        (
+            "minProperties",
+            json!({"type": "object", "minProperties": 1}),
+        ),
+        (
+            "uniqueItems",
+            json!({"type": "array", "items": {"type": "string"}, "uniqueItems": true}),
+        ),
+        ("pattern", json!({"type": "string", "pattern": "^a"})),
+        ("oneOf", json!({"oneOf": [{"type": "string"}]})),
+        ("format", json!({"type": "string", "format": "email"})),
+        ("$ref", json!({"$ref": "https://example.com/schema.json"})),
+        (
+            "contains",
+            json!({"$defs": {"x": {"type": "array", "contains": {"type": "string"}}}}),
+        ),
+    ] {
+        let error = translated_body("google_gemini", &with_schema(schema.clone(), true))
+            .expect_err("an unenforced strict keyword must be refused");
+        assert!(error.contains("response_format"), "{keyword}: {error}");
+        assert!(error.contains(keyword), "{keyword}: {error}");
+        // The same schema without `strict` is guidance and is forwarded.
+        let parsed = translated_body("google_gemini", &with_schema(schema.clone(), false)).unwrap();
+        assert_eq!(parsed["generationConfig"]["responseJsonSchema"], schema);
+    }
+
+    // Hostile nesting is bounded rather than walked without limit.
+    let mut deep = json!({"type": "string"});
+    for _ in 0..40 {
+        deep = json!({"type": "array", "items": deep});
+    }
+    assert!(translated_body("google_gemini", &with_schema(deep, true)).is_err());
+}
+
+/// PR6816-MUSE-1: explicit nulls in the extension are an unset field.
+#[test]
+fn null_thought_signature_extension_is_treated_as_absent() {
+    for extra in [
+        json!(null),
+        json!({"google": null}),
+        json!({"google": {"thought_signature": null}}),
+    ] {
+        let request = json!({
+            "model": "gemini-3-pro-preview",
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                        "extra_content": extra
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+            ]
+        });
+        for provider in ["google_gemini", "openai", "anthropic"] {
+            let result =
+                test_helpers::translate_request_test(provider, &request, "model-1", &json!({}));
+            assert!(result.is_ok(), "{provider} rejected {extra}: {result:?}");
+        }
+        let (_, _, bytes) =
+            test_helpers::translate_request_test("google_gemini", &request, "gemini-3", &json!({}))
+                .unwrap();
+        let outbound: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            outbound["contents"][1]["parts"][0]
+                .get("thoughtSignature")
+                .is_none()
+        );
+    }
+
+    let native = json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "lookup", "args": {}},
+                    "thoughtSignature": null
+                }]
+            },
+            "finishReason": "STOP"
+        }]
+    });
+    let (normalized, _, _, _) = test_helpers::normalize_response_test(
+        "google_gemini",
+        200,
+        &serde_json::to_vec(&native).unwrap(),
+        "gemini-3-pro-preview",
+    )
+    .unwrap();
+    assert!(
+        normalized["choices"][0]["message"]["tool_calls"][0]
+            .get("extra_content")
+            .is_none()
+    );
+}
+
+/// PR6816-MUSE-7: reasoning depth, verbosity, and the legacy function-calling
+/// pair have no faithful translation and are refused.
+#[test]
+fn reasoning_verbosity_and_legacy_functions_are_refused_by_translating_adapters() {
+    for (field, fields) in [
+        ("reasoning", json!({"reasoning": {"effort": "high"}})),
+        ("verbosity", json!({"verbosity": "low"})),
+        ("reasoning_effort", json!({"reasoning_effort": "minimal"})),
+        (
+            "functions",
+            json!({"functions": [{"name": "lookup", "parameters": {"type": "object"}}]}),
+        ),
+        ("function_call", json!({"function_call": "auto"})),
+    ] {
+        for provider in ["anthropic", "google_gemini", "google_vertex", "aws_bedrock"] {
+            let error = translated_body(
+                provider,
+                &with_fields(sample_openai_request(), fields.clone()),
+            )
+            .expect_err("must be refused");
+            assert!(error.contains(field), "{provider}/{field}: {error}");
+        }
+    }
+    // `null` is an unset field.
+    for provider in ["anthropic", "google_gemini", "aws_bedrock"] {
+        assert!(
+            translated_body(
+                provider,
+                &with_fields(
+                    sample_openai_request(),
+                    json!({"reasoning": null, "verbosity": null})
+                ),
+            )
+            .is_ok()
+        );
+    }
+}
+
+/// PR6816-MUSE-5: no random value is drawn unless two providers can take the
+/// first attempt, and streaming-ineligible providers get no share.
+#[test]
+fn weighted_selection_draws_only_when_the_choice_can_change() {
+    let one_admitting = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({
+                "priority": 1,
+                "weight": 5,
+                "circuit_breaker": {"failure_threshold": 1, "cooldown_seconds": 600}
+            })),
+            named_openai("b", json!({"priority": 1, "weight": 5}))
+        ]
+    }));
+    assert!(test_helpers::open_circuit_for_test(&one_admitting, 0));
+    let (drawn, order) =
+        test_helpers::weighted_roll_drawn_for_test(&one_admitting, "gpt-4o", false, 0);
+    assert!(!drawn, "a lone admitting provider needs no draw");
+    assert_eq!(order, ["b", "a"]);
+
+    let single_leader = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({"priority": 1})),
+            named_openai("b", json!({"priority": 2, "weight": 5}))
+        ]
+    }));
+    let (drawn, order) =
+        test_helpers::weighted_roll_drawn_for_test(&single_leader, "gpt-4o", false, 0);
+    assert!(!drawn);
+    assert_eq!(order, ["a", "b"]);
+
+    let two = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("a", json!({"priority": 1, "weight": 1})),
+            named_openai("b", json!({"priority": 1, "weight": 1}))
+        ]
+    }));
+    let (drawn, order) = test_helpers::weighted_roll_drawn_for_test(&two, "gpt-4o", false, 1);
+    assert!(drawn);
+    assert_eq!(order, ["b", "a"]);
+}
+
+#[test]
+fn streaming_weighted_selection_gives_no_share_to_ineligible_providers() {
+    let plugin = streaming_plugin_with(json!({
+        "streaming": {"enabled": true},
+        "providers": [
+            {
+                "name": "claude",
+                "provider_type": "anthropic",
+                "api_key": "sk-ant",
+                "priority": 1,
+                "weight": 1000
+            },
+            named_openai("a", json!({"priority": 1, "weight": 1, "model_patterns": []})),
+            named_openai("b", json!({"priority": 1, "weight": 1, "model_patterns": []}))
+        ]
+    }));
+    // Anthropic cannot stream here, so the share is split over a and b only.
+    let (drawn, order) = test_helpers::weighted_roll_drawn_for_test(&plugin, "any-model", true, 0);
+    assert!(drawn);
+    assert_eq!(order, ["a", "claude", "b"]);
+    let (_, order) = test_helpers::weighted_roll_drawn_for_test(&plugin, "any-model", true, 1);
+    assert_eq!(order, ["b", "claude", "a"]);
+    // The buffered path can use Anthropic, so it keeps its share there.
+    let (_, order) = test_helpers::weighted_roll_drawn_for_test(&plugin, "any-model", false, 0);
+    assert_eq!(order[0], "claude");
 }
