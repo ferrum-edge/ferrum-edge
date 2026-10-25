@@ -182,6 +182,20 @@ fn soap_ws_security_password_reference(name: &str) -> Value {
     })
 }
 
+fn mcp_gateway_server_header_reference(name: &str) -> Value {
+    json!({
+        "mode": "aggregate_router",
+        "endpoint": {"path": "/mcp"},
+        "servers": {
+            "demo": {
+                "upstream_url": "http://127.0.0.1:9/mcp",
+                "namespace": "demo",
+                "headers": {"authorization": format!("${{{name}}}")}
+            }
+        }
+    })
+}
+
 fn workload_metrics_lightstep_token_env(name: &str) -> Value {
     json!({
         "span_reporting_disabled": true,
@@ -247,6 +261,7 @@ const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 7] = [
     ("ai_semantic_firewall", ai_semantic_firewall_api_key_env),
     ("ai_stream_router", ai_stream_router_api_key_reference),
     ("soap_ws_security", soap_ws_security_password_reference),
+    ("mcp_gateway", mcp_gateway_server_header_reference),
     ("workload_metrics", workload_metrics_lightstep_token_env),
     ("proxy_alerts", proxy_alerts_webhook_url_env),
     ("proxy_alerts", proxy_alerts_smtp_credential_env),
