@@ -1208,25 +1208,38 @@ impl GovernorEngine {
         } else {
             DecodedArgumentViews::new(raw_args, parsed)
         };
+        // An escaped arguments document that is well-formed JSON but too deep
+        // for the inspection parser has no decoded view at all, so its escapes
+        // could hide a match from every check below: uninspectable.
+        if !policy.blocked_arg_patterns.is_empty()
+            && parsed.is_none()
+            && raw_args.contains('\\')
+            && is_well_formed_json(raw_args.as_bytes())
+        {
+            return (
+                PolicyOutcome::Deny(format!(
+                    "tool '{name}' arguments exceed the inspection parser's limits and cannot be screened for blocked patterns"
+                )),
+                matched,
+                policy.risk,
+            );
+        }
         let redacting = policy.action == ToolAction::RedactArgs;
         let mut matched_patterns = Vec::new();
-        let mut decoded_only = false;
         for bp in &policy.blocked_arg_patterns {
-            if redacting {
-                // Redaction rewrites the raw text, so it can only remove the
-                // occurrences visible there. More occurrences in a decoded
-                // view means at least one is escape-hidden and would survive.
-                let raw_hits = bp.regex.find_iter(raw_args).count();
-                if raw_hits > 0 {
-                    matched_patterns.push(bp.name.clone());
-                }
-                if decoded.max_hits(&bp.regex) > raw_hits {
-                    decoded_only = true;
-                }
-            } else if bp.regex.is_match(raw_args) || decoded.any_match(&bp.regex) {
+            // Redaction can only act on raw matches; its decoded coverage is
+            // decided separately below.
+            if bp.regex.is_match(raw_args) || (!redacting && decoded.any_match(&bp.regex)) {
                 matched_patterns.push(bp.name.clone());
             }
         }
+        // Redaction rewrites the raw text, so it removes only the occurrences
+        // visible there. Decide on the decoded views of the ACTUAL rewritten
+        // arguments (this plugin's own placeholders removed): any surviving
+        // match is an escape-hidden occurrence the rewrite cannot remove.
+        let decoded_only = redacting
+            && !decoded.is_empty()
+            && self.redaction_leaves_decoded_match(raw_args, &policy.blocked_arg_patterns);
         if decoded_only {
             return (
                 PolicyOutcome::Deny(format!(
@@ -1256,6 +1269,43 @@ impl GovernorEngine {
             ToolAction::Deny => PolicyOutcome::Deny(format!("tool '{name}' is denied by policy")),
         };
         (outcome, matched, policy.risk)
+    }
+
+    /// Whether a blocked pattern still matches a JSON-decoded view of the
+    /// arguments AFTER `redact_args` rewrote the raw text. This plugin's own
+    /// rendered placeholders are removed from each view first, so a pattern
+    /// that matches its own placeholder is not re-flagged. A rewrite that
+    /// cannot be computed or no longer parses is left to the redaction paths,
+    /// which already fail closed on amplification.
+    fn redaction_leaves_decoded_match(
+        &self,
+        raw_args: &str,
+        patterns: &[BlockedArgPattern],
+    ) -> bool {
+        let placeholder = &self.response.redaction_placeholder;
+        let Ok((redacted, _)) = redact_arguments(raw_args, patterns, placeholder) else {
+            return false;
+        };
+        let Ok(rewritten) = serde_json::from_str::<Value>(&redacted) else {
+            return false;
+        };
+        let rendered: Vec<String> = patterns
+            .iter()
+            .filter_map(|pattern| render_redaction_placeholder(placeholder, &pattern.name).ok())
+            .filter(|rendered| !rendered.is_empty())
+            .collect();
+        let strip = |view: &str| -> String {
+            let mut view = view.to_string();
+            for rendered in &rendered {
+                view = view.replace(rendered.as_str(), "");
+            }
+            view
+        };
+        let mut views = vec![strip(rewritten.to_string().as_str())];
+        views.extend(json_string_leaves(&rewritten).into_iter().map(strip));
+        patterns
+            .iter()
+            .any(|pattern| views.iter().any(|view| pattern.regex.is_match(view)))
     }
 
     /// Govern a tool *definition* (name only, no arguments).
@@ -5689,14 +5739,14 @@ impl ToolCallStreamInspector {
 
     fn record_frame_context(&mut self, frame: &Value) {
         if self.corr.model.is_none()
-            && let Some(model) = frame.get("model").and_then(Value::as_str)
+            && let Some(model) = stream_frame_model(frame)
         {
             self.corr.model = Some(model.to_string());
         }
         if self.corr.provider.is_none()
-            && let Some(provider) = detect_sse_provider(frame)
+            && let Some(provider) = stream_frame_provider(frame)
         {
-            self.corr.provider = Some(provider.as_str().to_string());
+            self.corr.provider = Some(provider);
         }
     }
 
@@ -6012,7 +6062,8 @@ impl ToolCallStreamInspector {
                 );
                 return self.terminate(Vec::new());
             }
-            return ResponseStreamAction::Forward(Bytes::from(body));
+            // The opt-out (or dry-run) forwards the unread location only; any
+            // readable call beside it is still governed below.
         }
         let calls = extract.calls;
         if calls.is_empty() {
@@ -6620,6 +6671,45 @@ fn collect_finished_choices(
     }
 }
 
+/// The model a streaming frame reports: top-level `model` (Chat Completions,
+/// Gemini, Cohere), else the `response.model` an OpenAI Responses lifecycle
+/// event embeds. Shared by the live inspector and buffered-SSE extraction so
+/// approval correlation is identical on both paths.
+fn stream_frame_model(frame: &Value) -> Option<&str> {
+    frame.get("model").and_then(Value::as_str).or_else(|| {
+        responses_event_response(frame)
+            .and_then(|response| response.get("model"))
+            .and_then(Value::as_str)
+    })
+}
+
+/// The provider a streaming frame identifies. OpenAI Responses events carry no
+/// top-level provider discriminator, so a `response.*` event is OpenAI.
+fn stream_frame_provider(frame: &Value) -> Option<String> {
+    if frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("response."))
+    {
+        return Some(
+            super::utils::ai_providers::AiProvider::OpenAi
+                .as_str()
+                .to_string(),
+        );
+    }
+    detect_sse_provider(frame).map(|provider| provider.as_str().to_string())
+}
+
+/// The `response` object an OpenAI Responses lifecycle event embeds.
+fn responses_event_response(frame: &Value) -> Option<&Value> {
+    frame
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| kind.starts_with("response."))
+        .and_then(|_| frame.get("response"))
+        .filter(|response| response.is_object())
+}
+
 /// The `output_index` an OpenAI Responses streaming event addresses. `None`
 /// when absent or unusable — malformed rather than guessed.
 fn block_output_index(frame: &Value) -> Option<usize> {
@@ -6888,14 +6978,14 @@ impl BufferedSseBatches {
         match classify_event(event) {
             SseEvent::Frame(frame) => {
                 if self.extract.model.is_none()
-                    && let Some(m) = frame.get("model").and_then(Value::as_str)
+                    && let Some(m) = stream_frame_model(&frame)
                 {
                     self.extract.model = Some(m.to_string());
                 }
                 if self.extract.provider.is_none()
-                    && let Some(p) = detect_sse_provider(&frame)
+                    && let Some(p) = stream_frame_provider(&frame)
                 {
-                    self.extract.provider = Some(p.as_str().to_string());
+                    self.extract.provider = Some(p);
                 }
                 if frame_has_tool_calls(&frame) {
                     self.saw_tool_calls = true;
@@ -8109,18 +8199,8 @@ impl<'v> DecodedArgumentViews<'v> {
             || self.leaves.iter().any(|leaf| regex.is_match(leaf))
     }
 
-    /// The larger of the canonical-view and leaf-view match counts.
-    fn max_hits(&self, regex: &Regex) -> usize {
-        let canonical = self
-            .canonical
-            .as_deref()
-            .map_or(0, |canonical| regex.find_iter(canonical).count());
-        let leaves = self
-            .leaves
-            .iter()
-            .map(|leaf| regex.find_iter(leaf).count())
-            .sum::<usize>();
-        canonical.max(leaves)
+    fn is_empty(&self) -> bool {
+        self.canonical.is_none() && self.leaves.is_empty()
     }
 }
 
@@ -8782,7 +8862,7 @@ fn parse_approval(
     };
     if parsed.scheme() == "http"
         && !allow_plaintext
-        && !is_loopback_ip_literal_endpoint(endpoint_url, parsed.host())
+        && !is_loopback_ip_literal_endpoint(&without_url_userinfo(endpoint_url), parsed.host())
     {
         return Err(
             "ai_tool_governor: `approval.endpoint_url` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `approval.allow_plaintext: true`"
@@ -8803,6 +8883,21 @@ fn parse_approval(
         headers,
         resolved_headers: tokio::sync::OnceCell::new(),
     }))
+}
+
+/// `endpoint` with any URL userinfo (`user:pass@`) removed from its authority,
+/// so the loopback-literal check reads the host itself. The WHATWG parser ends
+/// userinfo at the LAST `@` of the authority, and so does this.
+fn without_url_userinfo(endpoint: &str) -> Cow<'_, str> {
+    let Some(scheme_end) = endpoint.find("://").map(|index| index + 3) else {
+        return Cow::Borrowed(endpoint);
+    };
+    let rest = &endpoint[scheme_end..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return Cow::Borrowed(endpoint);
+    };
+    Cow::Owned(format!("{}{}", &endpoint[..scheme_end], &rest[at + 1..]))
 }
 
 /// Parse `approval.headers`: header name → literal value, or a whole-value

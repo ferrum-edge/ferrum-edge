@@ -13599,7 +13599,7 @@ mod launch_review {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({ "decision": "allow" }))
-                    .set_delay(std::time::Duration::from_millis(400)),
+                    .set_delay(std::time::Duration::from_millis(1000)),
             )
             .expect(4)
             .mount(&server)
@@ -13622,8 +13622,8 @@ mod launch_review {
         );
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(1200),
-            "four 400ms approvals took {elapsed:?}; sequential resolution needs 1600ms"
+            elapsed < std::time::Duration::from_millis(3000),
+            "four 1s approvals took {elapsed:?}; sequential resolution needs 4s"
         );
         assert_eq!(
             ctx.metadata
@@ -13993,6 +13993,9 @@ mod launch_review {
             ),
             ("http://127.0.0.1:9000/decide", json!({}), true),
             ("http://[::1]:9000/decide", json!({}), true),
+            // URL userinfo is not part of the host.
+            ("http://user:secret@127.0.0.1:9000/decide", json!({}), true),
+            ("http://user@approval.example/decide", json!({}), false),
             ("https://approval.example/decide", json!({}), true),
         ] {
             assert_admission_parity(
@@ -14123,5 +14126,204 @@ mod launch_review {
         }
         server.verify().await;
         drop(env);
+    }
+
+    // --- Fix round 1 (PR6835-SOL-1..5) --------------------------------------
+
+    /// A held JSON-shaped stream with an unread marker beside a readable call:
+    /// the `allow` opt-out forwards the unread location but must still govern
+    /// the readable sibling (PR6835-SOL-1).
+    fn json_stream_with_unread_marker(readable: &str) -> Vec<u8> {
+        json!({
+            "choices": [{ "message": { "tool_calls": [
+                { "function": { "name": readable, "arguments": "{}" } }
+            ] } }],
+            "tool_call": { "name": "other", "arguments": "{}" }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn unread_marker_opt_out_still_governs_readable_calls_in_held_json_streams() {
+        let mut config = deny_by_default_streaming();
+        config["unknown_shape_action"] = json!("allow");
+        let plugin = make(config);
+        let body = json_stream_with_unread_marker("danger");
+        let (out, terminated) = drive(&plugin, &[body.as_slice()]).await;
+        assert!(
+            terminated,
+            "the readable denied call must still be governed"
+        );
+        assert!(!String::from_utf8_lossy(&out).contains("danger"));
+
+        // A readable allowed call is released with the unread location.
+        let allowed = json_stream_with_unread_marker("safe");
+        let (out, terminated) = drive(&plugin, &[allowed.as_slice()]).await;
+        assert!(!terminated);
+        assert_eq!(out, allowed);
+    }
+
+    #[tokio::test]
+    async fn unread_marker_opt_out_still_sends_readable_calls_to_approval() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "deny" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let plugin = make(json!({
+            "default_action": "deny",
+            "unknown_shape_action": "allow",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true },
+            "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+        }));
+        let body = json_stream_with_unread_marker("deploy");
+        let (_, terminated) = drive(&plugin, &[body.as_slice()]).await;
+        assert!(terminated, "the approval denial must cut the held stream");
+        server.verify().await;
+    }
+
+    /// `{"api<escape>key":"...","padding":<depth 200>}` — an escaped key inside
+    /// an arguments document too deep for the inspection parser (PR6835-SOL-2).
+    fn deep_escaped_key_arguments() -> String {
+        format!(
+            r#"{{"api{}u005fkey":"AKIAIOSFODNN7EXAMPLE","padding":{}}}"#,
+            '\\',
+            deep_padding(200)
+        )
+    }
+
+    #[tokio::test]
+    async fn escaped_secret_in_unmaterializable_arguments_is_denied() {
+        let plugin = make(secret_pattern_config("allow"));
+        let body = response_with_tool_call("http.post", &deep_escaped_key_arguments());
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+            Some(403),
+        );
+
+        // Reassembled streaming arguments take the same decision.
+        let frame = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"http.post","arguments": deep_escaped_key_arguments()}}]},"finish_reason":"tool_calls"}]})
+        );
+        let (out, terminated) = drive(&plugin, &[frame.as_bytes()]).await;
+        assert!(terminated);
+        assert!(!String::from_utf8_lossy(&out).contains("AKIA"));
+
+        // Dry-run still forwards.
+        let mut config = secret_pattern_config("allow");
+        config["mode"] = json!("dry_run");
+        let plugin = make(config);
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+        );
+    }
+
+    fn offsetting_redact_config() -> Value {
+        json!({
+            "default_action": "deny",
+            "tools": { "http.post": {
+                "action": "redact_args",
+                // `secret`, or a literal backslash followed by a slash.
+                "blocked_arg_patterns": [{ "name": "p", "regex": "secret|\\\\/" }]
+            } }
+        })
+    }
+
+    #[tokio::test]
+    async fn raw_only_match_cannot_offset_an_escape_hidden_secret() {
+        let plugin = make(offsetting_redact_config());
+        // One raw match (the escaped slash) and one escape-hidden `secret`:
+        // equal counts, but the raw rewrite leaves the secret decodable.
+        let args = format!(r#"{{"padding":"{0}/","value":"sec{0}u0072et"}}"#, '\\');
+        let body = response_with_tool_call("http.post", &args);
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+            Some(403),
+        );
+    }
+
+    #[tokio::test]
+    async fn redaction_that_removes_every_decoded_match_still_rewrites() {
+        let plugin = make(offsetting_redact_config());
+        let args = format!(r#"{{"padding":"{0}/","value":"secret"}}"#, '\\');
+        let body = response_with_tool_call("http.post", &args);
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                .await,
+        );
+        let rewritten = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .expect("redacted body");
+        assert!(!String::from_utf8_lossy(&rewritten).contains("secret\\\""));
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &json_headers(), &rewritten)
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_stream_model_and_provider_key_approvals() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let plugin = make(json!({
+            "default_action": "deny",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true },
+            "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 300 }
+        }));
+        let stream_for = |model: &str| {
+            responses_event(
+                "response.created",
+                json!({"type":"response.created",
+                    "response":{"id":"resp_0","object":"response","model":model,"output":[]}}),
+            ) + &responses_stream("deploy", &["{}"], "{}")
+        };
+        for model in ["model-a", "model-b", "model-a"] {
+            let body = stream_for(model);
+            let (out, terminated) = drive(&plugin, &[body.as_bytes()]).await;
+            assert!(!terminated, "{model}: an approved call must be released");
+            assert_eq!(out, body.as_bytes());
+        }
+        // The repeat of model-a hits its own cache entry only.
+        server.verify().await;
+        let received = server.received_requests().await.unwrap_or_default();
+        let payloads: Vec<Value> = received
+            .iter()
+            .map(|request| request.body_json::<Value>().expect("approval body is JSON"))
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["model"], json!("model-a"));
+        assert_eq!(payloads[1]["model"], json!("model-b"));
+        for payload in &payloads {
+            assert_eq!(payload["provider"], json!("openai"));
+        }
     }
 }

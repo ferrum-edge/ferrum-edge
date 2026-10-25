@@ -78,7 +78,9 @@ Each is toggled independently under `inspect`; at least one must be enabled.
   a call no event opened, or an event without a usable `output_index` makes the
   batch ungovernable (fail closed in enforce). A call that appears only in a
   restatement (for example only in `response.completed`) is governed as a
-  complete call.
+  complete call. Approval correlation reads the model from the
+  `response.model` that Responses lifecycle events embed and identifies the
+  provider as OpenAI, unless request or routing metadata already supplied them.
 - **Uninspectable events.** An SSE event whose bytes are not valid UTF-8 (even
   in an ignored comment line — a WHATWG client still decodes the event's intact
   `data:` lines), or whose `data:` payload is well-formed JSON nested past the
@@ -210,7 +212,8 @@ extracted** is ungovernable. When calls **were** extracted, the scan still runs
 over every location the extractors did not read: a second call placed in an
 unread location (for example a top-level `tool_call` beside a readable
 `choices[].message.tool_calls[]`, which a normalizing client runtime may also
-honor) is ungovernable too. Locations an extractor did read — including the
+honor) is ungovernable too; under the `allow` opt-out the unread location is
+forwarded but every readable call beside it is still governed. Locations an extractor did read — including the
 argument documents inside them — are skipped, so marker-like names inside a
 call's own arguments never count. The same rule applies per SSE frame.
 
@@ -351,8 +354,12 @@ and every decoded string (member names included). OpenAI and Cohere carry
 arguments as model-written JSON *source*, so without this an escaped spelling
 (`"api\u005fkey"`, `"http:\/\/"`) would hide a match from the regex while the
 executing runtime decodes it. Under `redact_args`, redaction rewrites the raw
-text, so a match visible only in a decoded view (it cannot be removed in place)
-**denies** the call instead of forwarding the secret. A `redact_args` policy must configure at least one
+text, so the decision is taken on the decoded views of the **rewritten**
+arguments (this plugin's own placeholders removed): any pattern match that
+survives the rewrite (an escape-hidden occurrence it cannot remove in place)
+**denies** the call instead of forwarding the secret. An escaped arguments
+document that is well-formed JSON but nested past the inspection parser's limit
+has no decoded view, so a policy with `blocked_arg_patterns` denies it. A `redact_args` policy must configure at least one
 `blocked_arg_patterns` entry; an empty redaction policy is rejected rather than
 silently turning the tool into an allowlist entry. Regexes that match empty
 input are rejected at config load; a contextual zero-length match that can
@@ -488,7 +495,7 @@ every other surface is `false` or omitted.
 
 | Key | Type | Default | Admitted values and notes |
 | --- | --- | --- | --- |
-| `endpoint_url` | string | **required** | Must parse as a URL whose scheme is `http` or `https`. The scheme is **case-insensitive** (`HTTPS://…` is admitted; the URL parser normalizes it), and the host is screened against the backend egress policy at admission. An `http://` URL is admitted only to a loopback IP literal written as a dotted-quad `127.d.d.d` or `[::1]` (a co-located sidecar) unless `allow_plaintext: true`: a cleartext channel lets a man-in-the-middle forge `allow` verdicts. |
+| `endpoint_url` | string | **required** | Must parse as a URL whose scheme is `http` or `https`. The scheme is **case-insensitive** (`HTTPS://…` is admitted; the URL parser normalizes it), and the host is screened against the backend egress policy at admission. An `http://` URL is admitted only to a loopback IP literal host written as a dotted-quad `127.d.d.d` or `[::1]` (a co-located sidecar; URL userinfo is not part of the host) unless `allow_plaintext: true`: a cleartext channel lets a man-in-the-middle forge `allow` verdicts. |
 | `timeout_ms` | integer | `1500` | `1`–`30000`. Per-webhook-call timeout; `0` is rejected rather than meaning "no timeout". |
 | `cache_ttl_seconds` | integer ≥ 0 | `300` | `0`–`2592000` (30 days). **`0` disables caching.** The cache is bounded at 4096 entries; at capacity expired entries are purged and new decisions are simply not cached. |
 | `fail_on_error` | string | `reject` | `reject` \| `warn` \| `allow`. Behavior when the endpoint cannot be evaluated: `reject` fails closed, `warn` / `allow` fail open. |

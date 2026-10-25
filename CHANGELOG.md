@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `ai_tool_governor` refuses non-loopback cleartext approval
+  endpoints** (issue #6835). `approval.endpoint_url` with `http://` is now
+  admitted only when its host is a loopback IP literal (`127.d.d.d` or
+  `[::1]`); any other cleartext endpoint fails config admission unless
+  `approval.allow_plaintext: true` is set, because a man-in-the-middle on the
+  approval channel could forge `allow` verdicts. Switch the endpoint to
+  `https://` or opt in explicitly.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

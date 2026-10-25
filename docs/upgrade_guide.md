@@ -28,6 +28,16 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ai_tool_governor`: cleartext approval endpoints need an explicit opt-in (#6835)
+
+An `ai_tool_governor` `approval.endpoint_url` that uses `http://` is now
+admitted only when its host is a loopback IP literal (`127.d.d.d` or `[::1]`, a
+co-located sidecar; URL userinfo is ignored for this check). A configuration
+whose cleartext approval endpoint points anywhere else is rejected at admission
+(admin API `400`, file-mode startup failure). Before upgrading, move the
+approval service to `https://`, or set `approval.allow_plaintext: true` to keep
+the cleartext channel knowingly. No other approval field changes meaning.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
