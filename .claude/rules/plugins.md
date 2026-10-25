@@ -318,7 +318,9 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
      the governed body direction carries an enforcing body policy
      (`request_body_policy_enforces` / `response_body_policy_enforces`, which
      also count `on_body_too_large: block` while globally enforcing); `allow` is
-     the silent variant of the default; `block` rejects unconditionally and is
+     the silent variant of the default; `block` rejects unconditionally (except
+     a `global_exemptions.header_present`-exempt request, for which every rule
+     and refusing disposition is suppressed) and is
      the only setting that also covers the cheap metadata/header scans. Do not
      make a fail-closed timeout the default: it rejects traffic the WAF scanned
      and cleared.
@@ -623,7 +625,7 @@ on a native-gRPC request.
 - `mcp_gateway` aggregate admission is re-decided in `on_final_request_body` against a private instance-owned `RequestContext::mcp_admission` record (message kind, method or response id, destination, mediated upstream session header, upstream item identity, admitted arguments); every routed aggregate path must record it after `set_route_to_server`, and only the gateway's own public→upstream rewrite may differ. The upstream session header is additionally owned by `mcp_gateway`'s `enforce_final_backend_header_policy` (strip every spelling, re-insert the recorded value); tampering it sees before the final body hook is latched on the record's private `AtomicBool` so that hook still refuses.
 - `mcp_gateway` per-consumer tool grants (`policy.tools.*.allowed_groups` / `denied_groups`, `allow` entries only) intern group names at load into a fixed 512-bit `McpGroupSet`; each `tools/list` / `tools/call` resolves `ctx.identified_consumer.acl_groups` (the live snapshot's Consumer, never a session-start copy) once into a `McpGrantView`. No Consumer fails closed. The grant rides on `McpAdmittedTarget::grant` and is re-decided in `on_final_request_body` after `final_admission_violation`. With any grant configured, unknown tools answer `-32001` like ungranted ones (no name probing); tool-name-only policies keep `-32003`. A group-conditioned key must be some configured server's `namespace` + `discovery.namespace_separator` + name, whatever its `enabled` / `expose_tools` (inert grants only warn) (`validate_grant_keys`). Grants cover `tools/list` / `tools/call` only. Synthetic `initialize` advertises `listChanged: false` until a `notifications/*/list_changed` emitter exists.
 - `mcp_gateway` OpenAPI bridge servers (`servers.*.openapi`, issue #5906) publish generated tools through the SAME catalog/policy/grant/validation path as upstream tools: `ToolDefinitionParts` (Arc-shared schemas and validators) are built once at load (`build_bridge_tool_parts`) and every session's `refresh_catalog` turns them into entries with `tool_entry_from_parts`, never recompiling; only `route_tool_call` branches (`route_bridge_tool_call`). A bridged call never sets a destination override: only a non-absolute `route_override_path`, the outbound query, an allowlisted header map, and the private `RequestContext::backend_method_override` (static token, never HEAD/OPTIONS/TRACE/CONNECT; read once after `before_proxy` on H1/H2 and native H3; transaction logs use `proxy::logged_http_method`, the client's method). Route-level `allowed_methods`, triggers, WAF, and path-keyed authz see the MCP `POST`, so `route_bridge_tool_call` re-applies `allowed_methods` to the bridged method and `x-ferrum-mcp` publishes only GET operations without explicit selection. The claim (`RequestContext::mcp_bridge`, shared with `McpAdmissionRecord::bridge`) carries the admitted envelope digest; the request-body transform rebuilds and re-validates a changed envelope into the claim's `OnceLock` outcome (body-only change) or latches a refusal, and `on_final_request_body` re-decides against it. The response is converted in `normalize_response_body` (2xx always `isError: false`; failure class from `ctx.backend_dispatch_state()`, never a response header) and HTTP 200 is selected through `RequestContext::normalized_response_status`, which `normalize_response_body_for_inspection` honors only for the replacement that same normalizer installed. Header names go through `mcp_openapi_bridge::bridge_header_name_is_reserved` plus the deployment names (session headers, `FERRUM_REAL_IP_HEADER`, `ctx.is_correlation_header`) at load, in the `x-ferrum-mcp` generator, and per call.
-- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `response_mock` has no provenance-authorized framed unary `Reject` contract; only `serverless_function` terminate does.
+- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams, so `101` is refused at construction and a `2xx` rule matching a WebSocket handshake fails closed with `500` on every frontend. `delay_ms` must go through `fault_delay::run_fault_delay_in` (shared ceiling, budget, shutdown/peer cancellation), never a bare timer. Native gRPC is excluded because `response_mock` has no provenance-authorized framed unary `Reject` contract; only `serverless_function` terminate does.
 
 ## Mesh Authz Plugin
 
@@ -1016,9 +1018,12 @@ on a native-gRPC request.
 - The standard AWS credential fallbacks (`AWS_ACCESS_KEY_ID` /
   `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) in `serverless_function`
   (`aws_lambda`) and `ai_federation` (`aws_bedrock`) are the only remaining
-  ambient credential fallbacks; neither plugin uses the AWS SDK default chain
-  (IMDS, ECS, web identity, SSO, profiles), so keep it that way or extend the
-  scope. Whenever the key id or secret resolves from the environment, the
+  ambient credential fallbacks. `serverless_function` additionally offers an
+  explicit opt-in `aws_credentials: default_chain` (AWS SDK chain: IMDS, ECS,
+  web identity, SSO, profiles; `secrets-aws` builds only), cached and refreshed
+  off the request path by `utils::aws_refreshing_credentials`; it is held to the
+  same endpoint scope below. `ai_federation` does not use the SDK chain.
+  Whenever the key id or secret resolves from the environment, the
   region must pass the partition grammar
   (`ambient_cloud_credentials::aws_region_partition`, mirroring the SDK
   `aws` / `aws-cn` / `aws-us-gov` regexes with lowercase letters) and the

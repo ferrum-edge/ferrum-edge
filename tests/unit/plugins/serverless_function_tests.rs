@@ -7426,3 +7426,1174 @@ async fn test_invocation_carries_the_proxy_hop_count() {
         assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Lambda Invoke API failures are invocation failures, never function output
+// ---------------------------------------------------------------------------
+
+/// Sentinels a Lambda service error body carries that must never reach a
+/// client: an account id, a function ARN, and a caller principal.
+const LAMBDA_SERVICE_ERROR_SENTINELS: [&str; 3] = [
+    "918273645012",
+    "arn:aws:lambda:us-east-1:918273645012:function:audit",
+    "arn:aws:iam::918273645012:user/ci-deployer",
+];
+
+async fn lambda_service_error_server(status: u16) -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(status)
+                .insert_header(
+                    "x-amzn-ErrorType",
+                    "TooManyRequestsException:http://internal.amazon.com/coral/",
+                )
+                .set_body_string(format!(
+                    r#"{{"Type":"User","message":"User: {} is not authorized to perform: lambda:InvokeFunction on resource: {}"}}"#,
+                    LAMBDA_SERVICE_ERROR_SENTINELS[2], LAMBDA_SERVICE_ERROR_SENTINELS[1]
+                )),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+fn lambda_mock_config(server: &wiremock::MockServer, extra: Value) -> Value {
+    let mut config = json!({
+        "provider": "aws_lambda",
+        "aws_region": "us-east-1",
+        "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+        "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "aws_function_name": "audit",
+        "aws_endpoint_url": server.uri(),
+        "timeout_ms": 5000
+    });
+    for (key, value) in extra.as_object().expect("extra config is an object") {
+        config[key] = value.clone();
+    }
+    config
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_lambda_invoke_api_errors_use_the_configured_error_path_in_terminate_mode() {
+    for status in [403_u16, 404, 413, 429, 500, 503] {
+        let server = lambda_service_error_server(status).await;
+
+        let reject = ServerlessFunction::new(
+            &lambda_mock_config(
+                &server,
+                json!({"mode": "terminate", "on_error": "reject", "error_status_code": 502}),
+            ),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+        match reject.finalized_egress(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502, "status={status}");
+                assert!(body.contains("lambda_service_error"), "{body}");
+                for sentinel in LAMBDA_SERVICE_ERROR_SENTINELS {
+                    assert!(!body.contains(sentinel), "status={status}: {body}");
+                }
+            }
+            other => panic!("status={status}: expected the configured reject, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.metadata
+                .get("serverless_function.standalone.error_class")
+                .map(String::as_str),
+            Some("lambda_service_error"),
+            "status={status}"
+        );
+
+        let fall_through = ServerlessFunction::new(
+            &lambda_mock_config(
+                &server,
+                json!({"mode": "terminate", "on_error": "continue"}),
+            ),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+        assert!(
+            matches!(
+                fall_through
+                    .finalized_egress(&mut ctx, &mut HashMap::new())
+                    .await,
+                PluginResult::Continue
+            ),
+            "status={status}: on_error=continue must reach the backend"
+        );
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_lambda_invoke_api_errors_are_service_errors_in_pre_proxy_mode() {
+    let server = lambda_service_error_server(429).await;
+    let plugin = ServerlessFunction::new(
+        &lambda_mock_config(
+            &server,
+            json!({"mode": "pre_proxy", "error_status_code": 503}),
+        ),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(body.contains("lambda_service_error"), "{body}");
+        }
+        other => panic!("expected the configured reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_lambda_invoke_api_errors_follow_on_error_for_native_grpc_terminate() {
+    let server = lambda_service_error_server(429).await;
+    for (on_error, expect_continue) in [("continue", true), ("reject", false)] {
+        let plugin = ServerlessFunction::new(
+            &lambda_mock_config(&server, json!({"mode": "terminate", "on_error": on_error})),
+            default_client(),
+        )
+        .unwrap();
+        let mut ctx = create_test_context();
+        ferrum_edge::_test_support::set_request_http_flavor_for_test(
+            &mut ctx,
+            ferrum_edge::config::types::HttpFlavor::Grpc,
+        );
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/grpc".to_string());
+        let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
+        if expect_continue {
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "a provider failure is not malformed function output: {result:?}"
+            );
+        } else {
+            match result {
+                PluginResult::Reject { body, .. } => {
+                    assert!(body.contains("lambda_service_error"), "{body}");
+                    for sentinel in LAMBDA_SERVICE_ERROR_SENTINELS {
+                        assert!(!body.contains(sentinel), "{body}");
+                    }
+                }
+                other => panic!("expected reject, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_azure_terminate_still_returns_function_authored_error_statuses() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Only the Lambda Invoke API status is provider-authored. An HTTP-trigger
+    // function's own 429 remains its response.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(body.as_ref(), b"slow down");
+        }
+        other => panic!("expected the function's own response, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AWS header-bearing credentials must be HTTP field values
+// ---------------------------------------------------------------------------
+
+#[test]
+#[parallel(serverless_env)]
+fn test_unrepresentable_aws_header_credentials_fail_admission() {
+    for field in ["aws_access_key_id", "aws_session_token"] {
+        for value in ["audit\ncredential", "audit\rcredential", "audit\u{0}cred"] {
+            let mut config = json!({
+                "provider": "aws_lambda",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+                "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                "aws_function_name": "audit-fn"
+            });
+            config[field] = json!(value);
+            let expected = format!("`{field}` is not a valid HTTP header value");
+
+            let err = expect_err(ServerlessFunction::new(&config, default_client()));
+            assert!(err.contains(&expected), "field={field}: {err}");
+            assert!(
+                !err.contains("audit"),
+                "must not reflect the credential: {err}"
+            );
+
+            let shape_only =
+                ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+                    .expect_err("CP/admin admission must refuse it too");
+            assert!(
+                shape_only.contains(&expected),
+                "field={field}: {shape_only}"
+            );
+            assert!(!shape_only.contains("audit"), "{shape_only}");
+
+            // Provider-independent: an inactive AWS field is screened too.
+            let mut azure = json!({
+                "provider": "azure_functions",
+                "function_url": "http://127.0.0.1:45678/pre"
+            });
+            azure[field] = json!(value);
+            let err = expect_err(ServerlessFunction::new(&azure, default_client()));
+            assert!(err.contains(&expected), "field={field}: {err}");
+        }
+    }
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_ordinary_aws_session_token_is_accepted() {
+    ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "ASIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aws_session_token": "FwoGZXIvYXdzEBYaDH/test+session=token",
+            "aws_function_name": "audit-fn"
+        }),
+        default_client(),
+    )
+    .expect("an ordinary session token is accepted");
+}
+
+/// The environment-resolved AWS key id and session token reach the same
+/// validator as configured ones. Asserted over the source for the reason given
+/// on `test_environment_resolved_credentials_are_validated_too`: publishing a
+/// malformed process credential would fail unrelated tests in this binary.
+#[test]
+#[parallel(serverless_env)]
+fn test_environment_resolved_aws_header_credentials_are_validated_too() {
+    let source = include_str!("../../../src/plugins/serverless_function.rs");
+    let aws = source
+        .split("Provider::AwsLambda => {")
+        .nth(1)
+        .expect("aws provider arm must remain present")
+        .split("Provider::AzureFunctions => {")
+        .next()
+        .expect("aws provider arm must remain bounded");
+
+    let key_fallback = aws
+        .find("env_non_empty(\"AWS_ACCESS_KEY_ID\")")
+        .expect("access key id keeps its environment fallback");
+    let key_validated = aws
+        .find("credential_header_value(\"aws_access_key_id\", &access_key_id)")
+        .expect("the effective access key id is validated as a header value");
+    assert!(key_fallback < key_validated);
+
+    let token_fallback = aws
+        .find("env_non_empty(\"AWS_SESSION_TOKEN\")")
+        .expect("session token keeps its environment fallback");
+    let token_validated = aws
+        .find("credential_header_value(\"aws_session_token\", token)")
+        .expect("the effective session token is validated as a header value");
+    assert!(token_fallback < token_validated);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded `timeout_ms` / `max_response_body_bytes`
+// ---------------------------------------------------------------------------
+
+#[test]
+#[parallel(serverless_env)]
+fn test_timeout_and_response_ceiling_are_bounded_at_admission() {
+    let base = json!({
+        "provider": "azure_functions",
+        "function_url": "http://127.0.0.1:45678/pre"
+    });
+    let with = |field: &str, value: Value| {
+        let mut config = base.clone();
+        config[field] = value;
+        config
+    };
+
+    ServerlessFunction::new(&with("timeout_ms", json!(900_000)), default_client())
+        .expect("15 minutes is accepted");
+    ServerlessFunction::new(
+        &with("max_response_body_bytes", json!(64 * 1024 * 1024)),
+        default_client(),
+    )
+    .expect("64 MiB is accepted");
+
+    for value in [json!(900_001), json!(u64::MAX)] {
+        let err = expect_err(ServerlessFunction::new(
+            &with("timeout_ms", value.clone()),
+            default_client(),
+        ));
+        assert!(err.contains("`timeout_ms` must be at most 900000"), "{err}");
+        assert!(!err.contains(&value.to_string()), "{err}");
+    }
+    for value in [json!(64 * 1024 * 1024 + 1), json!(u64::MAX)] {
+        let err = expect_err(ServerlessFunction::new(
+            &with("max_response_body_bytes", value),
+            default_client(),
+        ));
+        assert!(
+            err.contains("`max_response_body_bytes` must be at most 67108864"),
+            "{err}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The payload is serialized directly, byte-for-byte the published contract
+// ---------------------------------------------------------------------------
+
+async fn capturing_server() -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn captured_payload_bytes(server: &wiremock::MockServer) -> Vec<u8> {
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1);
+    requests[0].body.clone()
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_payload_bytes_match_the_published_field_order() {
+    let server = capturing_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true,
+            // A repeated name (in any case) is forwarded once, in first
+            // position.
+            "forward_headers": ["x-b", "X-A", "x-b", "x-missing"]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/api/v1/users".to_string();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("user@example.com".to_string());
+    ctx.request_body_bytes = Some(Bytes::from_static(b"{\"name\":\"Al\\\"ice\",\"name\":1}"));
+    let mut headers = HashMap::new();
+    headers.insert("x-a".to_string(), "one".to_string());
+    headers.insert("x-b".to_string(), "two".to_string());
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    assert!(matches!(
+        plugin.finalized_egress(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let payload = captured_payload_bytes(&server).await;
+    assert_eq!(
+        String::from_utf8(payload).expect("utf-8 payload"),
+        concat!(
+            r#"{"method":"POST","path":"/api/v1/users","client_ip":"127.0.0.1","#,
+            r#""authenticated_identity":"user@example.com","#,
+            r#""headers":{"x-b":"two","x-a":"one"},"#,
+            r#""body":"{\"name\":\"Al\\\"ice\",\"name\":1}","#,
+            r#""body_encoding":"utf8","body_content_type":"application/json"}"#
+        )
+    );
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_large_binary_body_round_trips_through_the_streaming_base64_writer() {
+    let server = capturing_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    // 3 MiB + 1 byte: not UTF-8, and not a multiple of the 3-byte base64
+    // group, so the chunked encoder's padding path is exercised too.
+    let original: Vec<u8> = (0..(3 * 1024 * 1024 + 1))
+        .map(|index: usize| ((index % 251) as u8) | 0x80)
+        .collect();
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.request_body_bytes = Some(Bytes::from(original.clone()));
+
+    assert!(matches!(
+        plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    let payload: Value =
+        serde_json::from_slice(&captured_payload_bytes(&server).await).expect("json payload");
+    assert_eq!(payload["body_encoding"], "base64");
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        payload["body"].as_str().expect("base64 body"),
+    )
+    .expect("standard base64");
+    assert_eq!(decoded, original);
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_large_utf8_body_round_trips_exactly() {
+    let server = capturing_server().await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_body": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let original = "\"quoted\" \\ back\tslash \u{2028} ünïcödé \u{1}\n".repeat(64 * 1024);
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.request_body_bytes = Some(Bytes::from(original.clone()));
+
+    assert!(matches!(
+        plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    let payload: Value =
+        serde_json::from_slice(&captured_payload_bytes(&server).await).expect("json payload");
+    assert_eq!(payload["body_encoding"], "utf8");
+    assert_eq!(payload["body"].as_str(), Some(original.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// `payload_format: aws_api_gateway_v2`
+// ---------------------------------------------------------------------------
+
+async fn lambda_result_server(result: wiremock::ResponseTemplate) -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(result)
+        .mount(&server)
+        .await;
+    server
+}
+
+fn api_gateway_v2_plugin(server: &wiremock::MockServer, extra: Value) -> ServerlessFunction {
+    let mut config = lambda_mock_config(
+        server,
+        json!({"mode": "terminate", "payload_format": "aws_api_gateway_v2"}),
+    );
+    for (key, value) in extra.as_object().expect("extra config is an object") {
+        config[key] = value.clone();
+    }
+    ServerlessFunction::new(&config, default_client()).expect("api gateway v2 config")
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_api_gateway_v2_format_requires_lambda_terminate() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "http://127.0.0.1:45678/pre",
+            "mode": "terminate",
+            "payload_format": "aws_api_gateway_v2"
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("requires `provider: aws_lambda`"), "{err}");
+
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
+            "aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "aws_function_name": "audit-fn",
+            "payload_format": "aws_api_gateway_v2"
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("requires `mode: terminate`"), "{err}");
+
+    for (value, fragment) in [
+        (json!("aws_api_gateway_v1"), "unknown `payload_format`"),
+        (json!(2), "`payload_format` must be a string"),
+    ] {
+        let err = expect_err(ServerlessFunction::new(
+            &json!({
+                "provider": "azure_functions",
+                "function_url": "http://127.0.0.1:45678/pre",
+                "payload_format": value
+            }),
+            default_client(),
+        ));
+        assert!(err.contains(fragment), "{err}");
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_request_event_shape() {
+    let server = lambda_result_server(
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({"statusCode": 204})),
+    )
+    .await;
+    let plugin = api_gateway_v2_plugin(
+        &server,
+        json!({
+            "forward_body": true,
+            "forward_headers": ["cookie", "user-agent", "x-request-id"]
+        }),
+    );
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/orders/42".to_string();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("user@example.com".to_string());
+    ctx.request_body_bytes = Some(Bytes::from_static(b"{\"qty\":2}"));
+    let mut headers = HashMap::new();
+    headers.insert("cookie".to_string(), "session=abc; theme=dark".to_string());
+    headers.insert("user-agent".to_string(), "curl/8.5".to_string());
+    headers.insert("x-request-id".to_string(), "req-1".to_string());
+    headers.insert("x-not-forwarded".to_string(), "hidden".to_string());
+
+    let _ = plugin.finalized_egress(&mut ctx, &mut headers).await;
+    let event: Value =
+        serde_json::from_slice(&captured_payload_bytes(&server).await).expect("json event");
+
+    assert_eq!(event["version"], "2.0");
+    assert_eq!(event["routeKey"], "$default");
+    assert_eq!(event["rawPath"], "/orders/42");
+    assert_eq!(event["rawQueryString"], "");
+    assert_eq!(event["cookies"], json!(["session=abc", "theme=dark"]));
+    assert_eq!(
+        event["headers"],
+        json!({"user-agent": "curl/8.5", "x-request-id": "req-1"})
+    );
+    assert!(event.get("queryStringParameters").is_none());
+    assert_eq!(event["body"], "{\"qty\":2}");
+    assert_eq!(event["isBase64Encoded"], false);
+    let http = &event["requestContext"]["http"];
+    assert_eq!(http["method"], "POST");
+    assert_eq!(http["path"], "/orders/42");
+    assert_eq!(http["sourceIp"], "127.0.0.1");
+    assert_eq!(http["userAgent"], "curl/8.5");
+    assert_eq!(event["requestContext"]["stage"], "$default");
+    assert!(event["requestContext"]["timeEpoch"].is_i64());
+    assert_eq!(
+        event["requestContext"]["authorizer"]["lambda"]["authenticated_identity"],
+        "user@example.com"
+    );
+    assert!(
+        !String::from_utf8_lossy(&captured_payload_bytes(&server).await).contains("hidden"),
+        "only forward_headers reach the event"
+    );
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_binary_body_is_base64_encoded() {
+    let server = lambda_result_server(
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({"statusCode": 200})),
+    )
+    .await;
+    let plugin = api_gateway_v2_plugin(&server, json!({"forward_body": true}));
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.request_body_bytes = Some(Bytes::from_static(&[0xff, 0x00, 0x41]));
+
+    let _ = plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await;
+    let event: Value =
+        serde_json::from_slice(&captured_payload_bytes(&server).await).expect("json event");
+    assert_eq!(event["body"], "/wBB");
+    assert_eq!(event["isBase64Encoded"], true);
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_structured_response_is_mapped_and_sanitized() {
+    let server = lambda_result_server(
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("x-invoke-only", "lambda-service-header")
+            .set_body_json(json!({
+                "statusCode": 201,
+                "headers": {
+                    "Content-Type": "text/plain",
+                    "x-app": "1",
+                    "connection": "x-app",
+                    "x-amz-leak": "provider"
+                },
+                "multiValueHeaders": {"x-multi": ["a", "b"]},
+                "cookies": ["a=1; Path=/", "b=2"],
+                "body": "created",
+                "ignoredMember": true
+            })),
+    )
+    .await;
+    let plugin = api_gateway_v2_plugin(&server, json!({}));
+    let mut ctx = create_test_context();
+
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 201);
+            assert_eq!(body.as_ref(), b"created");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("text/plain")
+            );
+            assert_eq!(headers.get("x-multi").map(String::as_str), Some("a, b"));
+            assert_eq!(
+                headers.get("set-cookie").map(String::as_str),
+                Some("a=1; Path=/\nb=2")
+            );
+            // `Connection`-listed, hop-by-hop, and provider-control fields are
+            // stripped, and the Invoke API's own headers are never returned.
+            assert!(!headers.contains_key("x-app"), "{headers:?}");
+            assert!(!headers.contains_key("connection"), "{headers:?}");
+            assert!(!headers.contains_key("x-amz-leak"), "{headers:?}");
+            assert!(!headers.contains_key("x-invoke-only"), "{headers:?}");
+        }
+        other => panic!("expected the mapped response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_base64_and_inferred_responses() {
+    let server = lambda_result_server(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+        "statusCode": 200,
+        "isBase64Encoded": true,
+        "body": "AAEC"
+    })))
+    .await;
+    let plugin = api_gateway_v2_plugin(&server, json!({}));
+    match plugin
+        .finalized_egress(&mut create_test_context(), &mut HashMap::new())
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(body.as_ref(), &[0_u8, 1, 2]),
+        other => panic!("expected the decoded body, got {other:?}"),
+    }
+
+    // No `statusCode`: API Gateway returns the JSON value as the body.
+    let server = lambda_result_server(
+        wiremock::ResponseTemplate::new(200).set_body_string(r#"{"message":"hi"}"#),
+    )
+    .await;
+    let plugin = api_gateway_v2_plugin(&server, json!({}));
+    match plugin
+        .finalized_egress(&mut create_test_context(), &mut HashMap::new())
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(body.as_ref(), br#"{"message":"hi"}"#);
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        other => panic!("expected the inferred response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_malformed_results_fail_closed() {
+    for result in [
+        r#"{"statusCode":"201","body":"x"}"#,
+        r#"{"statusCode":101}"#,
+        r#"{"statusCode":200,"statusCode":500,"body":"secret-detail"}"#,
+        r#"{"statusCode":200,"headers":{"x-a":1}}"#,
+        r#"{"statusCode":200,"headers":{"bad header":"v"}}"#,
+        r#"{"statusCode":200,"cookies":"a=1"}"#,
+        r#"{"statusCode":200,"isBase64Encoded":true,"body":"not base64!"}"#,
+        r#"{"statusCode":200,"body":{"nested":"secret-detail"}}"#,
+        "not json secret-detail",
+    ] {
+        let server =
+            lambda_result_server(wiremock::ResponseTemplate::new(200).set_body_string(result))
+                .await;
+        let plugin = api_gateway_v2_plugin(&server, json!({"error_status_code": 502}));
+        let mut ctx = create_test_context();
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502, "{result}");
+                assert!(
+                    body.contains("invalid_api_gateway_response"),
+                    "{result}: {body}"
+                );
+                assert!(!body.contains("secret-detail"), "{body}");
+            }
+            other => panic!("{result}: expected a fail-closed reject, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_refuses_native_grpc_before_invocation() {
+    let server = lambda_result_server(
+        wiremock::ResponseTemplate::new(200).set_body_json(json!({"statusCode": 200})),
+    )
+    .await;
+    let plugin = api_gateway_v2_plugin(&server, json!({"on_error": "continue"}));
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("unsupported_grpc_payload_format"), "{body}");
+        }
+        other => panic!("expected a pre-invocation refusal, got {other:?}"),
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the function must not be invoked"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `aws_credentials: default_chain` (workload identity)
+// ---------------------------------------------------------------------------
+
+fn default_chain_lambda_config(extra: Value) -> Value {
+    let mut config = json!({
+        "provider": "aws_lambda",
+        "aws_region": "us-east-1",
+        "aws_function_name": "audit-fn",
+        "aws_credentials": "default_chain"
+    });
+    for (key, value) in extra.as_object().expect("extra config is an object") {
+        config[key] = value.clone();
+    }
+    config
+}
+
+type FetchCounter = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+/// A stand-in for the AWS SDK chain that answers `answer` and counts calls.
+fn fixture_fetcher(
+    answer: Result<(&'static str, &'static str), &'static str>,
+) -> (
+    ferrum_edge::plugins::utils::aws_refreshing_credentials::AwsCredentialFetcher,
+    FetchCounter,
+) {
+    use ferrum_edge::plugins::utils::aws_refreshing_credentials::{
+        AwsCredentialFetchFuture, AwsCredentialSnapshot,
+    };
+    let calls: FetchCounter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = std::sync::Arc::clone(&calls);
+    let fetcher: ferrum_edge::plugins::utils::aws_refreshing_credentials::AwsCredentialFetcher =
+        std::sync::Arc::new(move || -> AwsCredentialFetchFuture {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                match answer {
+                    Ok((key_id, token)) => Ok(AwsCredentialSnapshot::new(
+                        key_id,
+                        "workload-fixture-secret",
+                        Some(token.to_string()),
+                        Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)),
+                    )),
+                    Err(reason) => Err(reason.to_string()),
+                }
+            })
+        });
+    (fetcher, calls)
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_default_chain_refuses_literal_credentials() {
+    for field in [
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    ] {
+        let mut extra = json!({});
+        extra[field] = json!("literal-value");
+        let config = default_chain_lambda_config(extra);
+        let expected =
+            format!("`{field}` cannot be combined with `aws_credentials: default_chain`");
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(err.contains(&expected), "{err}");
+        let shape_only =
+            ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+                .expect_err("CP/admin admission refuses it too");
+        assert!(shape_only.contains(&expected), "{shape_only}");
+    }
+
+    let err = expect_err(ServerlessFunction::new(
+        &default_chain_lambda_config(json!({"aws_credentials": "instance_profile"})),
+        default_client(),
+    ));
+    assert!(err.contains("unknown `aws_credentials`"), "{err}");
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_default_chain_is_held_to_the_ambient_endpoint_scope() {
+    // Shape-only admission accepts an official endpoint on any build: whether
+    // the serving node carries the chain is node-local.
+    ferrum_edge::plugins::validate_plugin_config(
+        "serverless_function",
+        &default_chain_lambda_config(json!({})),
+    )
+    .expect("default_chain with an official endpoint is admissible");
+    ferrum_edge::plugins::validate_plugin_config(
+        "serverless_function",
+        &default_chain_lambda_config(json!({
+            "aws_endpoint_url": "https://lambda-fips.us-east-1.amazonaws.com"
+        })),
+    )
+    .expect("an official FIPS endpoint is in scope");
+
+    for extra in [
+        json!({"aws_endpoint_url": "https://lambda.attacker.example"}),
+        json!({"aws_region": "s3-us-west-2"}),
+    ] {
+        let config = default_chain_lambda_config(extra);
+        let shape_only =
+            ferrum_edge::plugins::validate_plugin_config("serverless_function", &config)
+                .expect_err("an out-of-scope endpoint or region is refused");
+        assert!(
+            shape_only.contains("aws_credentials: default_chain"),
+            "{shape_only}"
+        );
+        assert!(!shape_only.contains("attacker"), "{shape_only}");
+
+        let (fetcher, calls) = fixture_fetcher(Ok(("ASIAWORKLOADFIXTURE", "workload-token")));
+        let err = match ferrum_edge::plugins::serverless_function::test_helpers::new_with_default_chain_fetcher_test(
+            &config,
+            default_client(),
+            fetcher,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("the serving node must refuse an out-of-scope endpoint"),
+        };
+        assert!(err.contains("aws_credentials: default_chain"), "{err}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(not(feature = "secrets-aws"))]
+#[test]
+#[parallel(serverless_env)]
+fn test_default_chain_needs_the_secrets_aws_feature_on_a_serving_node() {
+    let err = expect_err(ServerlessFunction::new(
+        &default_chain_lambda_config(json!({})),
+        default_client(),
+    ));
+    assert!(err.contains("`secrets-aws`"), "{err}");
+}
+
+#[cfg(feature = "secrets-aws")]
+#[test]
+#[parallel(serverless_env)]
+fn test_default_chain_constructs_without_contacting_the_chain() {
+    ServerlessFunction::new(&default_chain_lambda_config(json!({})), default_client())
+        .expect("construction is lazy: the chain is first consulted by an invocation");
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_default_chain_signs_with_cached_workload_credentials() {
+    let server = capturing_server().await;
+    let (fetcher, calls) = fixture_fetcher(Ok(("ASIAWORKLOADFIXTURE", "workload-session-token")));
+    let plugin =
+        ferrum_edge::plugins::serverless_function::test_helpers::new_with_default_chain_fetcher_test(
+            &default_chain_lambda_config(json!({
+                "aws_endpoint_url": server.uri(),
+                "allow_custom_endpoint_with_ambient_credentials": true,
+                "on_error": "reject"
+            })),
+            default_client(),
+            fetcher,
+        )
+        .expect("an opted-in private endpoint");
+
+    for _ in 0..2 {
+        let mut ctx = create_test_context();
+        assert!(matches!(
+            plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await,
+            PluginResult::Continue
+        ));
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a fresh credential is reused, not refetched per request"
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let authorization = request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .expect("signed request");
+        assert!(
+            authorization.starts_with("AWS4-HMAC-SHA256 Credential=ASIAWORKLOADFIXTURE/"),
+            "{authorization}"
+        );
+        assert!(
+            authorization.contains("x-amz-security-token"),
+            "{authorization}"
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("x-amz-security-token")
+                .and_then(|value| value.to_str().ok()),
+            Some("workload-session-token")
+        );
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_default_chain_without_credentials_fails_before_invocation() {
+    let server = capturing_server().await;
+    for (on_error, expect_continue) in [("reject", false), ("continue", true)] {
+        let (fetcher, _calls) = fixture_fetcher(Err("no provider in chain"));
+        let plugin =
+            ferrum_edge::plugins::serverless_function::test_helpers::new_with_default_chain_fetcher_test(
+                &default_chain_lambda_config(json!({
+                    "aws_endpoint_url": server.uri(),
+                    "allow_custom_endpoint_with_ambient_credentials": true,
+                    "on_error": on_error,
+                    "error_status_code": 503
+                })),
+                default_client(),
+                fetcher,
+            )
+            .expect("an opted-in private endpoint");
+        let mut ctx = create_test_context();
+        let result = plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await;
+        if expect_continue {
+            assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        } else {
+            match result {
+                PluginResult::Reject {
+                    status_code, body, ..
+                } => {
+                    assert_eq!(status_code, 503);
+                    assert!(body.contains("aws_credentials_unavailable"), "{body}");
+                }
+                other => panic!("expected reject, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            ctx.metadata
+                .get("serverless_function.standalone.error_class")
+                .map(String::as_str),
+            Some("aws_credentials_unavailable")
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "nothing is sent without a usable credential"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR #6843 fix round 1: API Gateway response header bounds, merge, and
+// string inference
+// ---------------------------------------------------------------------------
+
+async fn api_gateway_v2_terminate(result: Value) -> PluginResult {
+    let server =
+        lambda_result_server(wiremock::ResponseTemplate::new(200).set_body_json(result)).await;
+    let plugin = api_gateway_v2_plugin(&server, json!({"error_status_code": 502}));
+    plugin
+        .finalized_egress(&mut create_test_context(), &mut HashMap::new())
+        .await
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_header_count_and_bytes_are_bounded_without_panicking() {
+    // 40,000 distinct names would exceed `http::HeaderMap` capacity, whose
+    // panicking `append` aborts a `panic = "abort"` gateway. 129 exceeds the
+    // field-line bound; two 20 KiB values exceed the aggregate byte budget.
+    let many: serde_json::Map<String, Value> = (0..40_000)
+        .map(|index| (format!("x-{index}"), json!("v")))
+        .collect();
+    let just_over: serde_json::Map<String, Value> = (0..129)
+        .map(|index| (format!("x-{index}"), json!("v")))
+        .collect();
+    let big = "a".repeat(20 * 1024);
+    for result in [
+        json!({"statusCode": 200, "headers": many}),
+        json!({"statusCode": 200, "headers": just_over}),
+        json!({"statusCode": 200, "multiValueHeaders": {"x-big": [big.clone(), big.clone() + "b"]}}),
+    ] {
+        match api_gateway_v2_terminate(result).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(body.contains("invalid_api_gateway_response"), "{body}");
+            }
+            other => panic!("expected a bounded refusal, got {other:?}"),
+        }
+    }
+
+    let at_limit: serde_json::Map<String, Value> = (0..128)
+        .map(|index| (format!("x-{index}"), json!("v")))
+        .collect();
+    match api_gateway_v2_terminate(json!({"statusCode": 200, "headers": at_limit})).await {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert_eq!(headers.get("x-127").map(String::as_str), Some("v"));
+        }
+        other => panic!("128 field lines are accepted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_merges_identical_single_and_multi_value_headers() {
+    match api_gateway_v2_terminate(json!({
+        "statusCode": 302,
+        "headers": {
+            "Location": "https://public.example/login",
+            "Content-Type": "application/json"
+        },
+        "multiValueHeaders": {
+            "location": ["https://public.example/login"],
+            "CONTENT-TYPE": ["application/json"],
+            "x-list": ["a", "b"]
+        },
+        "body": ""
+    }))
+    .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 302);
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://public.example/login"),
+                "an identical pair in both containers is one Location"
+            );
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert_eq!(headers.get("x-list").map(String::as_str), Some("a, b"));
+        }
+        other => panic!("expected the redirect, got {other:?}"),
+    }
+
+    // Genuinely conflicting singleton values still fail closed.
+    match api_gateway_v2_terminate(json!({
+        "statusCode": 302,
+        "headers": {"Location": "https://public.example/a"},
+        "multiValueHeaders": {"Location": ["https://public.example/b"]}
+    }))
+    .await
+    {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(!headers.contains_key("location"), "{headers:?}");
+        }
+        other => panic!("expected the response without Location, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_string_result_is_the_decoded_body() {
+    for (result, expected) in [
+        (json!("Hello from Lambda!"), "Hello from Lambda!"),
+        (json!("line one\nsaid \"hi\""), "line one\nsaid \"hi\""),
+        (json!(""), ""),
+    ] {
+        match api_gateway_v2_terminate(result).await {
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, 200);
+                assert_eq!(body.as_ref(), expected.as_bytes());
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("application/json")
+                );
+            }
+            other => panic!("expected the decoded string body, got {other:?}"),
+        }
+    }
+
+    // Non-string, non-structured values keep their JSON text.
+    match api_gateway_v2_terminate(json!([1, 2])).await {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(body.as_ref(), b"[1,2]"),
+        other => panic!("expected the JSON body, got {other:?}"),
+    }
+}

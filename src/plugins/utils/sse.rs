@@ -633,6 +633,67 @@ pub enum SseTextKind {
     /// the `token.text` fragments of one stream into the same field the
     /// buffered document carries (`$[*].generated_text`).
     TgiGeneratedText,
+    /// Legacy Chat Completions streamed `delta.function_call.name`
+    /// (`$.choices[*].delta.function_call.name`). Only produced by a
+    /// reassembler built with
+    /// [`with_extended_provider_shapes`](SseReassembler::with_extended_provider_shapes).
+    ChatFunctionCallName,
+    /// Legacy Chat Completions streamed `delta.function_call.arguments`
+    /// (`$.choices[*].delta.function_call.arguments`). Extended shapes only.
+    ChatFunctionCallArguments,
+    /// Cohere v2 `/v2/chat` assistant text, reassembled from the
+    /// `content-start` / `content-delta` events of one content index into the
+    /// buffered document's `$.message.content[*].text`. Extended shapes only.
+    CohereText,
+    /// Cohere v2 `tool-plan-delta` prose (`$.message.tool_plan`). Extended
+    /// shapes only.
+    CohereToolPlan,
+    /// Cohere v2 streamed tool-call name
+    /// (`$.message.tool_calls[*].function.name`). Extended shapes only.
+    CohereToolName,
+    /// Cohere v2 streamed tool-call arguments
+    /// (`$.message.tool_calls[*].function.arguments`). Extended shapes only.
+    CohereToolArguments,
+    /// One Cohere v2 citation source (`citation-start`
+    /// `delta.message.citations.sources[]`): a tool output or document the
+    /// client receives beside the completion, serialized compactly and kept
+    /// separate from it (`$.message.citations[*].sources`). Extended shapes
+    /// only.
+    CohereCitationSource,
+}
+
+/// Cohere v2 `/v2/chat` streaming event types this reassembler models. Every
+/// Cohere v2 SSE frame carries its event name in the JSON `type` field (and
+/// usually on the `event:` line too); the hyphenated spelling cannot collide
+/// with the underscore-separated Anthropic names or the dotted Responses-API
+/// names.
+const COHERE_V2_STREAM_EVENTS: &[&str] = &[
+    "message-start",
+    "content-start",
+    "content-delta",
+    "content-end",
+    "tool-plan-delta",
+    "tool-call-start",
+    "tool-call-delta",
+    "tool-call-end",
+    "citation-start",
+    "citation-end",
+    "message-end",
+    "debug",
+];
+
+/// Whether one parsed SSE `data:` frame is a Cohere v2 `/v2/chat` streaming
+/// event that a reassembler built with
+/// [`SseReassembler::with_extended_provider_shapes`] folds.
+///
+/// Callers that decide whether an otherwise segment-less window is a governed
+/// provider stream this build cannot map use this to exclude the frames that
+/// ARE mapped.
+pub fn is_cohere_v2_stream_frame(frame: &Value) -> bool {
+    frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| COHERE_V2_STREAM_EVENTS.contains(&event_type))
 }
 
 /// Ceiling on the number of distinct Anthropic content blocks one stream may
@@ -849,11 +910,62 @@ pub struct SseReassembler {
     /// could not be reassembled into the paths this type exposes. Sticky for
     /// the rest of the stream.
     provider_uninspectable: bool,
+    /// Opt-in for the shapes
+    /// [`with_extended_provider_shapes`](Self::with_extended_provider_shapes)
+    /// adds. Off by default so a caller
+    /// that keeps its own side accumulators for them (`ai_response_guard`
+    /// tracks legacy `function_call` itself) does not read them twice.
+    extended_provider_shapes: bool,
+    /// `choice_index -> legacy Chat Completions function_call name + arguments`.
+    function_calls: Vec<(usize, ToolCallAccumulator)>,
+    /// Lookup table for `function_calls`, avoiding linear scans over untrusted indexes.
+    function_call_positions: HashMap<usize, usize>,
+    /// Cohere v2 assistant text keyed by the event `index`.
+    cohere_text: Vec<(usize, String)>,
+    /// Lookup table for `cohere_text`, avoiding linear scans over untrusted indexes.
+    cohere_text_positions: HashMap<usize, usize>,
+    /// Cohere v2 `tool-plan-delta` prose. One plan per message, so no index.
+    cohere_tool_plan: String,
+    /// Cohere v2 tool calls keyed by the event `index`.
+    cohere_tool_calls: Vec<(usize, ToolCallAccumulator)>,
+    /// Lookup table for `cohere_tool_calls`, avoiding linear scans over untrusted indexes.
+    cohere_tool_call_positions: HashMap<usize, usize>,
+    /// Set once a Cohere v2 event has been folded, so a later frame carrying
+    /// an unmodelled hyphenated event type is recognized as out-of-protocol.
+    cohere_stream: bool,
+    /// Cohere v2 citation sources keyed by `(citation index, source position)`.
+    cohere_citation_sources: Vec<((usize, usize), String)>,
+    /// Lookup table for `cohere_citation_sources`.
+    cohere_citation_source_positions: HashMap<(usize, usize), usize>,
 }
 
 impl SseReassembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A reassembler that additionally folds two shapes the default one
+    /// leaves to its callers:
+    ///
+    /// * legacy Chat Completions `choices[].delta.function_call.{name,
+    ///   arguments}` fragments, per choice index; and
+    /// * Cohere v2 `/v2/chat` streaming events (`content-start` /
+    ///   `content-delta` text per content index, `tool-plan-delta` prose,
+    ///   `tool-call-start` / `tool-call-delta` name and arguments per tool
+    ///   index, and each `citation-start` source as its own fragment; a
+    ///   `debug` event with a payload marks the stream uninspectable). An unmodelled hyphenated event, a modelled event carrying a
+    ///   non-string text/name/arguments, or a non-text content part inside an
+    ///   identified Cohere v2 stream marks it uninspectable.
+    ///
+    /// Both families are bounded like the OpenAI-style families: at most
+    /// [`MAX_OPENAI_STREAM_ACCUMULATORS`] live keys each, with the excess
+    /// folded into one overflow accumulator and the stream marked
+    /// uninspectable.
+    pub fn with_extended_provider_shapes() -> Self {
+        Self {
+            extended_provider_shapes: true,
+            ..Self::default()
+        }
     }
 
     /// The assistant prose reassembled so far — legacy Completions `text`,
@@ -881,6 +993,10 @@ impl SseReassembler {
         }
         combined.push_str(&self.tgi_text);
         combined.push_str(&self.anthropic_error_text);
+        for (_index, text) in &self.cohere_text {
+            combined.push_str(text);
+        }
+        combined.push_str(&self.cohere_tool_plan);
         combined
     }
 
@@ -902,6 +1018,7 @@ impl SseReassembler {
             .iter()
             .map(|(_, candidate)| candidate.text.len())
             .sum();
+        let cohere: usize = self.cohere_text.iter().map(|(_, t)| t.len()).sum();
         completion_text
             .saturating_add(content)
             .saturating_add(responses)
@@ -909,6 +1026,8 @@ impl SseReassembler {
             .saturating_add(gemini)
             .saturating_add(self.tgi_text.len())
             .saturating_add(self.anthropic_error_text.len())
+            .saturating_add(cohere)
+            .saturating_add(self.cohere_tool_plan.len())
     }
 
     /// Total bytes retained across every reassembled text accumulator (assistant
@@ -971,6 +1090,26 @@ impl SseReassembler {
                     .saturating_add(candidate.args_json.len())
             })
             .sum::<usize>();
+        let function_calls = self
+            .function_calls
+            .iter()
+            .map(|(_, call)| call.name.len().saturating_add(call.arguments.len()))
+            .sum::<usize>();
+        let cohere_text = self
+            .cohere_text
+            .iter()
+            .map(|(_, text)| text.len())
+            .sum::<usize>();
+        let cohere_tool_calls = self
+            .cohere_tool_calls
+            .iter()
+            .map(|(_, call)| call.name.len().saturating_add(call.arguments.len()))
+            .sum::<usize>();
+        let cohere_citation_sources = self
+            .cohere_citation_sources
+            .iter()
+            .map(|(_, source)| source.len())
+            .sum::<usize>();
         completion_text
             .saturating_add(content)
             .saturating_add(tool_calls)
@@ -980,6 +1119,11 @@ impl SseReassembler {
             .saturating_add(gemini)
             .saturating_add(self.tgi_text.len())
             .saturating_add(self.anthropic_error_text.len())
+            .saturating_add(function_calls)
+            .saturating_add(cohere_text)
+            .saturating_add(self.cohere_tool_plan.len())
+            .saturating_add(cohere_tool_calls)
+            .saturating_add(cohere_citation_sources)
     }
 
     /// Number of live keyed accumulators across every family.
@@ -992,6 +1136,10 @@ impl SseReassembler {
             .saturating_add(self.responses_args.len())
             .saturating_add(self.anthropic_blocks.len())
             .saturating_add(self.gemini_candidates.len())
+            .saturating_add(self.function_calls.len())
+            .saturating_add(self.cohere_text.len())
+            .saturating_add(self.cohere_tool_calls.len())
+            .saturating_add(self.cohere_citation_sources.len())
     }
 
     /// `true` when a stream identified as a provider protocol this reassembler
@@ -1144,6 +1292,49 @@ impl SseReassembler {
             "$.error.message".to_string(),
             &self.anthropic_error_text,
         );
+        for (choice, accum) in &self.function_calls {
+            push(
+                SseTextKind::ChatFunctionCallName,
+                format!("$.choices[{choice}].delta.function_call.name"),
+                &accum.name,
+            );
+            push(
+                SseTextKind::ChatFunctionCallArguments,
+                format!("$.choices[{choice}].delta.function_call.arguments"),
+                &accum.arguments,
+            );
+        }
+        for (index, text) in &self.cohere_text {
+            push(
+                SseTextKind::CohereText,
+                format!("$.message.content[{index}].text"),
+                text,
+            );
+        }
+        push(
+            SseTextKind::CohereToolPlan,
+            "$.message.tool_plan".to_string(),
+            &self.cohere_tool_plan,
+        );
+        for (index, accum) in &self.cohere_tool_calls {
+            push(
+                SseTextKind::CohereToolName,
+                format!("$.message.tool_calls[{index}].function.name"),
+                &accum.name,
+            );
+            push(
+                SseTextKind::CohereToolArguments,
+                format!("$.message.tool_calls[{index}].function.arguments"),
+                &accum.arguments,
+            );
+        }
+        for ((citation, source), text) in &self.cohere_citation_sources {
+            push(
+                SseTextKind::CohereCitationSource,
+                format!("$.message.citations[{citation}].sources[{source}]"),
+                text,
+            );
+        }
         out
     }
 
@@ -1187,7 +1378,15 @@ impl SseReassembler {
             || self
                 .gemini_candidates
                 .iter()
-                .any(|(_index, candidate)| !candidate.name.is_empty());
+                .any(|(_index, candidate)| !candidate.name.is_empty())
+            || self
+                .function_calls
+                .iter()
+                .any(|(_choice, accum)| !accum.name.is_empty())
+            || self
+                .cohere_tool_calls
+                .iter()
+                .any(|(_index, accum)| !accum.name.is_empty());
         let has_arguments = self
             .tool_calls
             .iter()
@@ -1203,7 +1402,19 @@ impl SseReassembler {
             || self
                 .gemini_candidates
                 .iter()
-                .any(|(_index, candidate)| !candidate.args_json.is_empty());
+                .any(|(_index, candidate)| !candidate.args_json.is_empty())
+            || self
+                .function_calls
+                .iter()
+                .any(|(_choice, accum)| !accum.arguments.is_empty())
+            || self
+                .cohere_tool_calls
+                .iter()
+                .any(|(_index, accum)| !accum.arguments.is_empty())
+            || self
+                .cohere_citation_sources
+                .iter()
+                .any(|(_key, source)| !source.is_empty());
         let argument_budget = if has_names && has_arguments {
             keep_total.div_ceil(2)
         } else if has_arguments {
@@ -1229,6 +1440,15 @@ impl SseReassembler {
         for (_index, candidate) in self.gemini_candidates.iter_mut().rev() {
             retain_tail_within_budget(&mut candidate.args_json, &mut argument_remaining);
         }
+        for (_choice, accum) in self.function_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.arguments, &mut argument_remaining);
+        }
+        for (_index, accum) in self.cohere_tool_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.arguments, &mut argument_remaining);
+        }
+        for (_key, source) in self.cohere_citation_sources.iter_mut().rev() {
+            retain_tail_within_budget(source, &mut argument_remaining);
+        }
         let mut name_remaining = name_budget;
         for (_key, accum) in self.tool_calls.iter_mut().rev() {
             retain_tail_within_budget(&mut accum.name, &mut name_remaining);
@@ -1239,12 +1459,36 @@ impl SseReassembler {
         for (_index, candidate) in self.gemini_candidates.iter_mut().rev() {
             retain_tail_within_budget(&mut candidate.name, &mut name_remaining);
         }
+        for (_choice, accum) in self.function_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.name, &mut name_remaining);
+        }
+        for (_index, accum) in self.cohere_tool_calls.iter_mut().rev() {
+            retain_tail_within_budget(&mut accum.name, &mut name_remaining);
+        }
 
         self.tool_calls
             .retain(|(_key, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
         self.tool_call_positions.clear();
         for (position, (key, _accum)) in self.tool_calls.iter().enumerate() {
             self.tool_call_positions.insert(*key, position);
+        }
+        self.function_calls
+            .retain(|(_choice, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
+        self.function_call_positions.clear();
+        for (position, (choice, _accum)) in self.function_calls.iter().enumerate() {
+            self.function_call_positions.insert(*choice, position);
+        }
+        self.cohere_tool_calls
+            .retain(|(_index, accum)| !accum.name.is_empty() || !accum.arguments.is_empty());
+        self.cohere_tool_call_positions.clear();
+        for (position, (index, _accum)) in self.cohere_tool_calls.iter().enumerate() {
+            self.cohere_tool_call_positions.insert(*index, position);
+        }
+        self.cohere_citation_sources
+            .retain(|(_key, source)| !source.is_empty());
+        self.cohere_citation_source_positions.clear();
+        for (position, (key, _source)) in self.cohere_citation_sources.iter().enumerate() {
+            self.cohere_citation_source_positions.insert(*key, position);
         }
         self.responses_args
             .retain(|(_output, text)| !text.is_empty());
@@ -1327,7 +1571,16 @@ impl SseReassembler {
         }
         drain_one(&mut self.tgi_text, &mut remaining);
         drain_one(&mut self.anthropic_error_text, &mut remaining);
+        for (_index, text) in &mut self.cohere_text {
+            drain_one(text, &mut remaining);
+        }
+        drain_one(&mut self.cohere_tool_plan, &mut remaining);
 
+        self.cohere_text.retain(|(_index, text)| !text.is_empty());
+        self.cohere_text_positions.clear();
+        for (position, (index, _text)) in self.cohere_text.iter().enumerate() {
+            self.cohere_text_positions.insert(*index, position);
+        }
         self.completion_text
             .retain(|(_choice, text)| !text.is_empty());
         self.completion_text_positions.clear();
@@ -1363,6 +1616,273 @@ impl SseReassembler {
         self.push_anthropic_events(event, frame);
         self.push_gemini_frame(frame);
         self.push_tgi_frame(frame);
+        if self.extended_provider_shapes {
+            self.push_legacy_function_call_deltas(frame);
+            self.push_cohere_v2_event(frame);
+        }
+    }
+
+    /// Accumulate legacy Chat Completions `choices[].delta.function_call`
+    /// fragments (the pre-`tool_calls` shape), keyed by choice index. Name and
+    /// arguments stay in separate accumulators so neither can hide a
+    /// cross-frame match in the other.
+    fn push_legacy_function_call_deltas(&mut self, frame: &Value) {
+        let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+            return;
+        };
+        for (positional, choice) in choices.iter().enumerate() {
+            let Some(function_call) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("function_call"))
+            else {
+                continue;
+            };
+            let choice_index = index_field(choice, "index").unwrap_or(positional);
+            let Some(object) = function_call.as_object() else {
+                // `function_call` present but not an object: outside the
+                // protocol and possibly carrying text nothing here reads.
+                self.provider_uninspectable = true;
+                continue;
+            };
+            for (field, value) in object {
+                let Some(text) = value.as_str() else {
+                    if !value.is_null() {
+                        self.provider_uninspectable = true;
+                    }
+                    continue;
+                };
+                match field.as_str() {
+                    "name" => self.function_call_mut(choice_index).name.push_str(text),
+                    "arguments" => self
+                        .function_call_mut(choice_index)
+                        .arguments
+                        .push_str(text),
+                    // An unmodelled member may carry client-visible text.
+                    _ => self.provider_uninspectable = true,
+                }
+            }
+        }
+    }
+
+    /// Accumulate one Cohere v2 `/v2/chat` streaming event.
+    ///
+    /// Coverage: `content-start` / `content-delta` (`delta.message.content.text`
+    /// per event `index`), `tool-plan-delta` (`delta.message.tool_plan`),
+    /// `tool-call-start` / `tool-call-delta`
+    /// (`delta.message.tool_calls.function.{name, arguments}` per `index`), a
+    /// `message-start` envelope (an empty one carries nothing; a populated
+    /// `tool_plan` is folded, populated `content` / `tool_calls` arrays are
+    /// out of the modelled protocol), `citation-start` sources (each a
+    /// separate fragment; the cited `text` span is already in the content),
+    /// a `debug` event (any payload fails the stream closed), and the
+    /// no-content `content-end`, `tool-call-end`, `citation-end`, and
+    /// `message-end` events.
+    ///
+    /// Once a Cohere v2 event has been seen, a later unmodelled hyphenated
+    /// event, a non-text content part, or a non-string text/name/arguments
+    /// marks the stream uninspectable rather than being skipped.
+    fn push_cohere_v2_event(&mut self, frame: &Value) {
+        let Some(event_type) = frame.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        if !COHERE_V2_STREAM_EVENTS.contains(&event_type) {
+            // A hyphenated event name the protocol may have added later, on a
+            // stream that already identified itself as Cohere v2.
+            if self.cohere_stream && event_type.contains('-') {
+                self.provider_uninspectable = true;
+            }
+            return;
+        }
+        self.cohere_stream = true;
+        let message = frame.get("delta").and_then(|delta| delta.get("message"));
+        match event_type {
+            "content-start" | "content-delta" => {
+                let Some(content) = message.and_then(|message| message.get("content")) else {
+                    return;
+                };
+                let Some(object) = content.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let index = index_field(frame, "index").unwrap_or(0);
+                if object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|part_type| part_type != "text")
+                {
+                    // A `thinking` part or a part type added later: absorb any
+                    // plain text so it is still scanned, but the stream carries
+                    // content outside the modelled document.
+                    self.provider_uninspectable = true;
+                }
+                for (field, value) in object {
+                    match field.as_str() {
+                        "type" => {}
+                        "text" => match value.as_str() {
+                            Some(text) => self.cohere_text_mut(index).push_str(text),
+                            None => self.provider_uninspectable = true,
+                        },
+                        _ => {
+                            if let Some(text) = value.as_str() {
+                                self.cohere_text_mut(index).push_str(text);
+                            }
+                            self.provider_uninspectable = true;
+                        }
+                    }
+                }
+            }
+            "tool-plan-delta" => match message.and_then(|message| message.get("tool_plan")) {
+                None => {}
+                Some(Value::String(plan)) => self.cohere_tool_plan.push_str(plan),
+                Some(_) => self.provider_uninspectable = true,
+            },
+            "tool-call-start" | "tool-call-delta" => {
+                let Some(call) = message.and_then(|message| message.get("tool_calls")) else {
+                    return;
+                };
+                let Some(call) = call.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let Some(function) = call.get("function") else {
+                    return;
+                };
+                let Some(function) = function.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let index = index_field(frame, "index").unwrap_or(0);
+                for (field, value) in function {
+                    let Some(text) = value.as_str() else {
+                        if !value.is_null() {
+                            self.provider_uninspectable = true;
+                        }
+                        continue;
+                    };
+                    match field.as_str() {
+                        "name" => self.cohere_tool_call_mut(index).name.push_str(text),
+                        "arguments" => self.cohere_tool_call_mut(index).arguments.push_str(text),
+                        _ => self.provider_uninspectable = true,
+                    }
+                }
+            }
+            "message-start" => {
+                let Some(message) = message else {
+                    return;
+                };
+                match message.get("tool_plan") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(plan)) => self.cohere_tool_plan.push_str(plan),
+                    Some(_) => self.provider_uninspectable = true,
+                }
+                for field in ["content", "tool_calls"] {
+                    match message.get(field) {
+                        None | Some(Value::Null) => {}
+                        Some(Value::Array(items)) if items.is_empty() => {}
+                        // A populated envelope is outside the modelled stream:
+                        // its parts arrive as their own events.
+                        Some(_) => self.provider_uninspectable = true,
+                    }
+                }
+            }
+            // A citation's `text` is a span of content already reassembled
+            // from `content-delta`, but its `sources[]` carry whole tool
+            // outputs / documents the client receives too: each source is
+            // kept as its own fragment, never folded into the completion.
+            "citation-start" => {
+                let Some(citations) = message.and_then(|message| message.get("citations")) else {
+                    return;
+                };
+                let Some(citation) = citations.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let citation_index = index_field(frame, "index").unwrap_or(0);
+                match citation.get("sources") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Array(sources)) => {
+                        for (position, source) in sources.iter().enumerate() {
+                            let payload = source
+                                .get("tool_output")
+                                .or_else(|| source.get("document"))
+                                .unwrap_or(source);
+                            let rendered = match payload {
+                                Value::String(text) => text.clone(),
+                                Value::Null => continue,
+                                other => match serde_json::to_string(other) {
+                                    Ok(rendered) => rendered,
+                                    Err(_) => {
+                                        self.provider_uninspectable = true;
+                                        continue;
+                                    }
+                                },
+                            };
+                            self.cohere_citation_source_mut(citation_index, position)
+                                .push_str(&rendered);
+                        }
+                    }
+                    Some(_) => self.provider_uninspectable = true,
+                }
+            }
+            // A `debug` event echoes provider-side state such as the rendered
+            // `prompt` (system prompt included). No response path models it,
+            // so a debug event carrying anything beyond its discriminator is
+            // outside the inspected document and fails the stream closed.
+            "debug" => {
+                let carries_payload = frame.as_object().is_some_and(|object| {
+                    object
+                        .iter()
+                        .any(|(field, value)| field != "type" && !value.is_null())
+                });
+                if carries_payload {
+                    self.provider_uninspectable = true;
+                }
+            }
+            // `content-end`, `tool-call-end`, `citation-end`, `message-end`:
+            // no model text that is not already reassembled from the delta
+            // events.
+            _ => {}
+        }
+    }
+
+    fn cohere_citation_source_mut(&mut self, citation: usize, source: usize) -> &mut String {
+        bounded_slot(
+            &mut self.cohere_citation_sources,
+            &mut self.cohere_citation_source_positions,
+            (citation, source),
+            (usize::MAX, usize::MAX),
+            &mut self.provider_uninspectable,
+        )
+    }
+
+    fn function_call_mut(&mut self, choice: usize) -> &mut ToolCallAccumulator {
+        bounded_slot(
+            &mut self.function_calls,
+            &mut self.function_call_positions,
+            choice,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
+    }
+
+    fn cohere_text_mut(&mut self, index: usize) -> &mut String {
+        bounded_slot(
+            &mut self.cohere_text,
+            &mut self.cohere_text_positions,
+            index,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
+    }
+
+    fn cohere_tool_call_mut(&mut self, index: usize) -> &mut ToolCallAccumulator {
+        bounded_slot(
+            &mut self.cohere_tool_calls,
+            &mut self.cohere_tool_call_positions,
+            index,
+            usize::MAX,
+            &mut self.provider_uninspectable,
+        )
     }
 
     /// Consume the accumulator and return the reassembled fragments, dropping any
@@ -1505,6 +2025,66 @@ impl SseReassembler {
                 json_path: "$.error.message".to_string(),
                 text: self.anthropic_error_text,
             });
+        }
+        for (choice, accum) in self.function_calls {
+            if !accum.name.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ChatFunctionCallName,
+                    json_path: format!("$.choices[{choice}].delta.function_call.name"),
+                    text: accum.name,
+                });
+            }
+            if !accum.arguments.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::ChatFunctionCallArguments,
+                    json_path: format!("$.choices[{choice}].delta.function_call.arguments"),
+                    text: accum.arguments,
+                });
+            }
+        }
+        // Cohere v2 reassembles into the buffered `/v2/chat` document shape:
+        // `message.content[].text`, `message.tool_plan`, and
+        // `message.tool_calls[].function.{name, arguments}`.
+        for (index, text) in self.cohere_text {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereText,
+                    json_path: format!("$.message.content[{index}].text"),
+                    text,
+                });
+            }
+        }
+        if !self.cohere_tool_plan.is_empty() {
+            out.push(SseText {
+                kind: SseTextKind::CohereToolPlan,
+                json_path: "$.message.tool_plan".to_string(),
+                text: self.cohere_tool_plan,
+            });
+        }
+        for (index, accum) in self.cohere_tool_calls {
+            if !accum.name.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereToolName,
+                    json_path: format!("$.message.tool_calls[{index}].function.name"),
+                    text: accum.name,
+                });
+            }
+            if !accum.arguments.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereToolArguments,
+                    json_path: format!("$.message.tool_calls[{index}].function.arguments"),
+                    text: accum.arguments,
+                });
+            }
+        }
+        for ((citation, source), text) in self.cohere_citation_sources {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereCitationSource,
+                    json_path: format!("$.message.citations[{citation}].sources[{source}]"),
+                    text,
+                });
+            }
         }
         out
     }

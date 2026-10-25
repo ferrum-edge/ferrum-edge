@@ -126,10 +126,12 @@ address; an on-path attacker between gateway and backend.
   CRL is authoritative for still verifies. A configured CRL list is the issuers
   you chose to police, not a completeness claim —
   [What the verifier enforces](frontend_tls.md#what-the-verifier-enforces).
-- **`kafka_logging` requires a fully open egress policy.** Enabling it means
-  librdkafka dials cluster-advertised brokers the gateway never screens; the
-  plugin therefore fails closed unless the whole backend egress policy is
-  disarmed — [`kafka_logging` requires a fully-open egress policy](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
+- **`kafka_logging` dials brokers the gateway never screens.** librdkafka
+  resolves broker hostnames and dials cluster-advertised brokers itself; the
+  plugin therefore fails closed unless the backend egress policy is disarmed or
+  the node operator attests the cluster with `FERRUM_KAFKA_ALLOWED_BROKERS`.
+  The attestation is a statement, not a screen: an advertised broker outside it
+  is still dialed — [`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies).
 - `FERRUM_TLS_CA_BUNDLE_PATH` is **exclusive**: setting it replaces the built-in
   webpki roots rather than adding to them. That is the intended behaviour, but a
   bundle missing a public root silently breaks every public-CA backend.
@@ -339,7 +341,7 @@ release, not an open defect awaiting a fix in this document's scope.
 | Frontend/admin TLS live reload is opt-in; inline PEM is static until config reload | 1 | [Configuration Reference](configuration.md#tls-material-sources) |
 | The gateway cannot revoke an admin JWT it did not mint | 3 | [Authentication](admin_api.md#authentication) |
 | Audit handoff defaults to `fail_open` | 3 | [Admin API](configuration.md#admin-api) |
-| `kafka_logging` requires disarming the backend egress policy | 2, 6 | [`kafka_logging` requires a fully-open egress policy](configuration.md#kafka_logging-requires-a-fully-open-egress-policy) |
+| `kafka_logging` requires disarming the backend egress policy or attesting the Kafka cluster | 2, 6 | [`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies) |
 | A shared plane secret authenticates the plane, not a node | 4 | [Trust binding](cp_namespace_tenancy.md#trust-binding-ghsa-3f2j-wwqw-grmg) |
 | Bounded authorization under an unrevalidatable trust generation | 4 | [Retention of an unrevalidatable verifier is bounded (issue #3813)](cp_namespace_tenancy.md#retention-of-an-unrevalidatable-verifier-is-bounded-issue-3813) |
 | Mesh capability varies by topology; node waypoint is experimental | 5 | [Maturity and Support Status](mesh.md#maturity-and-support-status) |
