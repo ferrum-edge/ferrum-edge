@@ -26,10 +26,11 @@
 //!
 //! ## Request scope in the ordinary modes
 //!
-//! `content` and `all` select every `POST` that is not framed gRPC; the
-//! `Content-Type` decides only HOW the body is treated, never WHETHER it is
-//! looked at, because a client can omit or relabel that header while an
-//! upstream decodes the body as JSON anyway:
+//! `content` and `all` select every `POST`, `PUT`, and `PATCH` that is not
+//! framed gRPC (`mcp_arguments` keeps `POST`); the `Content-Type` decides only
+//! HOW the body is treated, never WHETHER it is looked at, because a client can
+//! omit or relabel that header while an upstream decodes the body as JSON
+//! anyway:
 //!
 //! * a JSON media type (`application/json`, `+json`) is **declared JSON**: a
 //!   body the shield cannot read as UTF-8 JSON — non-UTF-8 bytes, a strict
@@ -37,8 +38,10 @@
 //!   `reject` / `redact` and recorded by `warn` (a lenient upstream decoder may
 //!   read content the shield never inspected);
 //! * no `Content-Type`, or any other media type, is **sniffed**: the body is
-//!   inspected exactly like declared JSON when it parses as JSON, and anything
-//!   else (a binary upload, plain text) is left alone.
+//!   held to exactly the declared-JSON rules whenever it may be a JSON document
+//!   (see `may_be_json_document`), and anything else (a binary upload, plain
+//!   text) is left alone. Enforcing actions claim an encoded sniffed body so
+//!   the representation gate decodes it before that decision.
 //!
 //! ## The final backend-visible body is authoritative
 //!
@@ -685,15 +688,99 @@ fn is_json_whitespace_only(body: &[u8]) -> bool {
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
-/// True when `body`, after leading JSON whitespace, opens a JSON object or
-/// array. Used only to decide whether an oversized SNIFFED body is one the
-/// shield would inspect at all: a binary or plain-text upload is not refused
-/// by the scan ceiling, while an oversized JSON-shaped body still is.
-fn looks_like_json_document(body: &[u8]) -> bool {
-    body.iter()
-        .copied()
-        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
-        .is_some_and(|byte| matches!(byte, b'{' | b'['))
+/// Whether `body` may be a JSON document some upstream decoder would read,
+/// even when the shield's strict UTF-8 parser refuses it. A sniffed request
+/// (no or a non-JSON `Content-Type`) is inspected exactly like declared JSON
+/// when this holds, and left alone otherwise, so relabelling the header cannot
+/// switch off a fail-closed disposition the body itself still triggers.
+///
+/// Every strict JSON text satisfies it. Beyond that it is deliberately
+/// conservative toward what lenient decoders accept: a byte-order mark,
+/// UTF-16 / UTF-32 (NUL bytes ahead of a JSON-shaped first character), a
+/// leading comment (`/`, `#`), leading Unicode whitespace, an object or array
+/// opener, a root string (a body that opens and closes with `"`), a root
+/// number, and the `true` / `false` / `null` / `NaN` / `Infinity` literals.
+/// Ordinary text and binary uploads do not satisfy it. Linear in the body and
+/// allocation-free.
+fn may_be_json_document(body: &[u8]) -> bool {
+    const BYTE_ORDER_MARKS: [&[u8]; 4] = [
+        b"\xEF\xBB\xBF",
+        b"\xFE\xFF",
+        b"\xFF\xFE",
+        b"\x00\x00\xFE\xFF",
+    ];
+    if BYTE_ORDER_MARKS.iter().any(|bom| body.starts_with(bom)) {
+        return true;
+    }
+    if body.contains(&0) {
+        let lead = body
+            .iter()
+            .copied()
+            .find(|byte| !matches!(byte, 0 | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C));
+        if matches!(lead, Some(b'{' | b'[' | b'"' | b'/' | b'#')) {
+            return true;
+        }
+    }
+    let rest = trim_trailing_lenient_whitespace(skip_leading_lenient_whitespace(body));
+    match rest.first().copied() {
+        None => false,
+        Some(b'{' | b'[' | b'/' | b'#') => true,
+        Some(b'"') => rest.len() > 1 && rest.ends_with(b"\""),
+        Some(_) => is_json_like_scalar(rest),
+    }
+}
+
+/// A root JSON scalar other than a string, under strict or lenient spelling.
+fn is_json_like_scalar(text: &[u8]) -> bool {
+    if matches!(
+        text,
+        b"true" | b"false" | b"null" | b"NaN" | b"Infinity" | b"-Infinity" | b"+Infinity"
+    ) {
+        return true;
+    }
+    text.iter().any(u8::is_ascii_digit)
+        && text
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E'))
+}
+
+/// `body` without its leading ASCII whitespace (including JSON5's `\v` and
+/// `\f`) and leading Unicode whitespace / byte-order-mark characters, which a
+/// lenient decoder may skip.
+fn skip_leading_lenient_whitespace(mut body: &[u8]) -> &[u8] {
+    loop {
+        match body.first().copied() {
+            Some(b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) => body = &body[1..],
+            Some(0x80..=0xFF) => match leading_char(body) {
+                Some(ch) if ch.is_whitespace() || ch == '\u{FEFF}' => {
+                    body = body.get(ch.len_utf8()..).unwrap_or_default();
+                }
+                _ => return body,
+            },
+            _ => return body,
+        }
+    }
+}
+
+/// `body` without its trailing ASCII whitespace.
+fn trim_trailing_lenient_whitespace(mut body: &[u8]) -> &[u8] {
+    while let Some((last, rest)) = body.split_last() {
+        if !matches!(last, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            break;
+        }
+        body = rest;
+    }
+    body
+}
+
+/// The first UTF-8 character of `bytes`, when it opens with a valid one.
+fn leading_char(bytes: &[u8]) -> Option<char> {
+    let prefix = bytes.get(..4).unwrap_or(bytes);
+    let valid = match std::str::from_utf8(prefix) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(prefix.get(..error.valid_up_to())?).ok()?,
+    };
+    valid.chars().next()
 }
 
 impl AiPromptShield {
@@ -1430,6 +1517,18 @@ impl AiPromptShield {
             Some(value) if is_json_content_type(value) => BodyScope::Declared,
             _ => BodyScope::Sniffed,
         }
+    }
+
+    /// Whether a request method carries a body this instance inspects. The
+    /// ordinary modes cover every body-carrying write method an inference or
+    /// prompt endpoint uses (`POST`, `PUT`, `PATCH`); `mcp_arguments` keeps the
+    /// MCP transport's `POST`. One predicate for buffering, both inspection
+    /// hooks, the representation claim, and both transform variants, so another
+    /// body plugin forcing a buffer can never widen the shield's rewrites.
+    fn method_in_scope(&self, method: &str) -> bool {
+        method.eq_ignore_ascii_case("POST")
+            || (self.scan_mode != ScanMode::McpArguments
+                && (method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("PATCH")))
     }
 
     /// Refuse an in-scope body this instance cannot read for inspection, with
@@ -2228,12 +2327,12 @@ impl Plugin for AiPromptShield {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        // Every `POST` this instance may inspect is buffered — in the ordinary
-        // modes that is every `POST` that is not framed gRPC, whatever its
-        // `Content-Type` says, so omitting or relabelling the header cannot
-        // keep a JSON body away from the shield.
+        // Every request this instance may inspect is buffered — in the
+        // ordinary modes that is every `POST` / `PUT` / `PATCH` that is not
+        // framed gRPC, whatever its `Content-Type` says, so omitting or
+        // relabelling the header cannot keep a JSON body away from the shield.
         self.requires_request_body
-            && ctx.method.eq_ignore_ascii_case("POST")
+            && self.method_in_scope(&ctx.method)
             && self.body_scope(ctx.headers.get("content-type").map(String::as_str))
                 != BodyScope::Out
     }
@@ -2243,8 +2342,8 @@ impl Plugin for AiPromptShield {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only process POST requests
-        if !ctx.method.eq_ignore_ascii_case("POST") {
+        // Only process body-carrying methods in scope (see `method_in_scope`).
+        if !self.method_in_scope(&ctx.method) {
             return PluginResult::Continue;
         }
 
@@ -2272,7 +2371,9 @@ impl Plugin for AiPromptShield {
         // Decompression may occur later in request-body transforms. Mark a
         // declared-JSON request for deferred inspection instead of parsing
         // compressed bytes and silently allowing it. A sniffed body that is
-        // still encoded here is opaque to the sniff, so it is left alone.
+        // still encoded here is decided by the final hook, over the plaintext
+        // the representation gate stages for an enforcing instance (see
+        // `enforces_final_request_body_policy`).
         if has_non_identity_content_encoding(headers) {
             if scope == BodyScope::Declared {
                 ctx.metadata
@@ -2286,7 +2387,8 @@ impl Plugin for AiPromptShield {
         // missing view beside a recorded size is a non-UTF-8 body, not an
         // absent one. A declared-JSON body in an ordinary mode is then
         // uninspectable; `mcp_arguments` leaves that verdict to the final hook
-        // (see the "MCP tool arguments" module note).
+        // (see the "MCP tool arguments" module note), and so does a sniffed
+        // body, whose bytes only the final hook sees.
         let body = match ctx.metadata.get("request_body") {
             Some(b) if !b.is_empty() => b.as_str(),
             Some(_) => return PluginResult::Continue,
@@ -2301,13 +2403,22 @@ impl Plugin for AiPromptShield {
             }
         };
 
-        // Size limit check. A sniffed body that cannot even open a JSON
-        // document (a large binary or text upload) is not one the shield would
-        // inspect at any size, so the ceiling does not refuse it.
-        if body.len() > self.max_scan_bytes {
-            if scope == BodyScope::Sniffed && !looks_like_json_document(body.as_bytes()) {
+        // A sniffed body is held to exactly the declared-JSON rules once it may
+        // be a JSON document at all — including its `charset`, its size, and
+        // a strict-parse failure — and left alone otherwise (a text or binary
+        // upload), so relabelling the header changes nothing about a JSON
+        // prompt (see `may_be_json_document`).
+        if scope == BodyScope::Sniffed {
+            if !may_be_json_document(body.as_bytes()) {
                 return PluginResult::Continue;
             }
+            if self.has_unsupported_charset(BodyScope::Declared, headers) {
+                return self.handle_unsupported_charset(ctx);
+            }
+        }
+
+        // Size limit check.
+        if body.len() > self.max_scan_bytes {
             let body_size = body.len();
             return self.handle_oversize_body(ctx, body_size);
         }
@@ -2340,10 +2451,9 @@ impl Plugin for AiPromptShield {
                     (detected, is_streaming, Some(json))
                 }
                 Err(_) => {
-                    // A sniffed body that is not JSON is not a prompt this
-                    // shield reads; a declared-JSON body consisting only of
-                    // whitespace carries nothing for any decoder to read.
-                    if scope == BodyScope::Sniffed || is_json_whitespace_only(body.as_bytes()) {
+                    // A body consisting only of whitespace carries nothing for
+                    // any decoder to read.
+                    if is_json_whitespace_only(body.as_bytes()) {
                         return PluginResult::Continue;
                     }
                     // Declared JSON the strict parser refuses: all-mode
@@ -2601,10 +2711,12 @@ impl Plugin for AiPromptShield {
     ///
     /// The claim is decided from configuration and request state only, never by
     /// decoding `body`. `warn` never claims: it cannot refuse anything, so a
-    /// body it merely fails to observe must not become a `400`. Only a
-    /// declared-JSON `POST` is claimed: a sniffed body is inspected only when it
-    /// turns out to be JSON, so an ordinary compressed upload (or one on an
-    /// unrelated media type) is never refused for want of a decoder.
+    /// body it merely fails to observe must not become a `400`. Every in-scope
+    /// request is claimed, sniffed ones included: whether an encoded sniffed
+    /// body is a JSON prompt can only be decided over its plaintext, so the
+    /// `Content-Type` must not decide whether a decoder runs. An enforcing
+    /// shield therefore refuses a compressed upload on its route that the gate
+    /// cannot decode, whatever its media type.
     fn enforces_final_request_body_policy(
         &self,
         ctx: &RequestContext,
@@ -2614,10 +2726,10 @@ impl Plugin for AiPromptShield {
         if !self.requires_request_body || self.action == ShieldAction::Warn {
             return false;
         }
-        if !ctx.method.eq_ignore_ascii_case("POST") {
+        if !self.method_in_scope(&ctx.method) {
             return false;
         }
-        self.body_scope(headers.get("content-type").map(String::as_str)) == BodyScope::Declared
+        self.body_scope(headers.get("content-type").map(String::as_str)) != BodyScope::Out
     }
 
     /// The authoritative policy decision over the exact backend-visible request
@@ -2627,7 +2739,7 @@ impl Plugin for AiPromptShield {
     /// `before_proxy`: a later header rewrite (`text/plain` relabelled to
     /// `application/json`, say) can bring a request into scope that the early
     /// hook skipped, and the core buffers it for exactly that reason. Every
-    /// in-scope `POST` therefore gets substantive inspection here:
+    /// in-scope request therefore gets substantive inspection here:
     ///
     /// * **Revalidation.** Later body transforms can put policy-relevant
     ///   content back into a body `before_proxy` decided. Re-running detection
@@ -2642,7 +2754,9 @@ impl Plugin for AiPromptShield {
     ///
     /// A declared-JSON body that is not readable UTF-8 JSON is uninspectable in
     /// both classes and fails closed for enforcing actions, exactly as it does
-    /// in `before_proxy`; a sniffed body that is not JSON is left alone.
+    /// in `before_proxy`. A sniffed body gets exactly the same treatment when
+    /// it may be a JSON document ([`may_be_json_document`]) and is left alone
+    /// otherwise.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -2657,7 +2771,7 @@ impl Plugin for AiPromptShield {
             .remove(&self.deferred_compressed_marker)
             .is_some();
 
-        if !ctx.method.eq_ignore_ascii_case("POST") {
+        if !self.method_in_scope(&ctx.method) {
             return PluginResult::Continue;
         }
 
@@ -2682,10 +2796,12 @@ impl Plugin for AiPromptShield {
             Some(plaintext) => plaintext,
             None => {
                 if has_non_identity_content_encoding(headers) {
-                    // An encoded sniffed body is opaque to the sniff and was
-                    // never claimed; leave it alone like any other non-JSON
-                    // upload.
-                    if scope == BodyScope::Sniffed && !deferred {
+                    // `warn` never claims, so an encoded sniffed body has no
+                    // plaintext view and nothing says it is JSON at all; it is
+                    // left alone rather than recorded on every compressed
+                    // upload. Enforcing actions claimed it and fail closed.
+                    if scope == BodyScope::Sniffed && !deferred && self.action == ShieldAction::Warn
+                    {
                         return PluginResult::Continue;
                     }
                     // Nothing reduced this body to plaintext — no `compression`
@@ -2697,19 +2813,26 @@ impl Plugin for AiPromptShield {
             }
         };
 
-        if body.len() > self.max_scan_bytes {
-            if scope == BodyScope::Sniffed && !deferred && !looks_like_json_document(body) {
+        // A sniffed body is held to exactly the declared-JSON rules below once
+        // it may be a JSON document at all — its `charset`, its size, UTF-8,
+        // and a strict-parse failure — and left alone otherwise (a text or
+        // binary upload), mirroring `before_proxy`.
+        if scope == BodyScope::Sniffed && !deferred {
+            if !may_be_json_document(body) {
                 return PluginResult::Continue;
             }
+            if self.has_unsupported_charset(BodyScope::Declared, headers) {
+                return self.handle_unsupported_charset(ctx);
+            }
+        }
+
+        if body.len() > self.max_scan_bytes {
             return self.handle_oversize_body(ctx, body.len());
         }
 
         let Ok(body_text) = std::str::from_utf8(body) else {
             if deferred {
                 return self.handle_uninspectable_deferred_body(ctx, "non_utf8_body");
-            }
-            if scope == BodyScope::Sniffed {
-                return PluginResult::Continue;
             }
             // A non-UTF-8 declared-JSON body (UTF-16 / UTF-32, a UTF-16 BOM,
             // Latin-1) may be decoded by a lenient upstream into content this
@@ -2731,10 +2854,9 @@ impl Plugin for AiPromptShield {
                 // `mcp_arguments` applies exactly the `before_proxy` test — an
                 // empty bridged body or one not recognizable as a document that
                 // could carry a `tools/call` continues; one that may is refused.
-                // The ordinary modes apply the `before_proxy` disposition too: a
-                // sniffed non-JSON body or an all-whitespace body continues,
-                // all-mode reject/warn report raw PII by name, and anything else
-                // is uninspectable.
+                // The ordinary modes apply the `before_proxy` disposition too: an
+                // all-whitespace body continues, all-mode reject/warn report raw
+                // PII by name, and anything else is uninspectable.
                 return match self.scan_mode {
                     ScanMode::McpArguments => {
                         if mcp_body_may_carry_tool_call(body) {
@@ -2744,7 +2866,7 @@ impl Plugin for AiPromptShield {
                         }
                     }
                     ScanMode::All | ScanMode::Content => {
-                        if scope == BodyScope::Sniffed || is_json_whitespace_only(body) {
+                        if is_json_whitespace_only(body) {
                             return PluginResult::Continue;
                         }
                         let detected = self.detect_pii_raw_fallback(body_text);
@@ -2787,7 +2909,7 @@ impl Plugin for AiPromptShield {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !ctx.method.eq_ignore_ascii_case("POST") {
+        if !self.method_in_scope(&ctx.method) {
             return None;
         }
         // A later compression plugin may already have stripped the encoding
@@ -2813,7 +2935,7 @@ impl Plugin for AiPromptShield {
         // paths use the context-aware variant.
         if !request_headers
             .get(":method")
-            .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+            .is_some_and(|method| self.method_in_scope(method))
         {
             return None;
         }

@@ -370,11 +370,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (reasons `non_utf8_body`, `malformed_json`, `unsupported_charset`). Before, it was forwarded uninspected to an upstream whose decoder
     may read it. An `all`-mode `redact` instance no longer forwards a malformed
     body unchanged.
-  - Every `POST` that is not framed gRPC is buffered. A body with no or a
-    non-JSON `Content-Type` is inspected (and redacted) when it parses as JSON,
-    so relabelling the header no longer skips the shield. Non-JSON uploads
-    are left alone, but they are now buffered and held to the global
-    request-body limit.
+  - Every `POST`, `PUT`, and `PATCH` that is not framed gRPC is buffered
+    (`mcp_arguments` stays `POST`-only). A body with no or a non-JSON
+    `Content-Type` that may be a JSON document (strict JSON, a BOM, UTF-16 /
+    UTF-32, a JSON root scalar) is held to exactly the declared-JSON rules,
+    including the charset, size-ceiling, and unparseable-body refusals, and
+    an encoded one is decoded by the representation gate for enforcing
+    actions, so relabelling the header no longer skips the shield. Text and
+    binary uploads are left alone, but they are now buffered and held to the
+    global request-body limit.
   - gRPC-Web framing is recognized by the proxy's own classifier rather than
     an `application/grpc-web` prefix, so `application/grpc-webhook+json` is
     inspected.
