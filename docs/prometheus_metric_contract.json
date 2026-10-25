@@ -3410,6 +3410,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace",
@@ -3437,6 +3438,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace",
@@ -3464,6 +3466,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace"
@@ -3490,6 +3493,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace"
@@ -3516,6 +3520,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace",
@@ -3543,6 +3548,7 @@
       "destination_service",
       "request_protocol",
       "response_code",
+      "grpc_response_status",
       "response_flags",
       "connection_security_policy",
       "gateway_namespace"
@@ -3698,6 +3704,20 @@
       "request_protocol",
       "response_flags",
       "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_tracing_spans_dropped_total",
+    "type": "counter",
+    "help": "Finished mesh telemetry spans a workload_metrics exporter dropped, refused at enqueue or discarded at delivery, by provider and reason.",
+    "labels": [
+      "provider",
+      "reason",
       "gateway_namespace"
     ],
     "subsystem": "mesh",

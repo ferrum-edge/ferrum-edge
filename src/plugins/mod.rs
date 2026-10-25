@@ -7086,13 +7086,21 @@ impl RequestContext {
     /// normal-backend secret to the third-party provider URL. `None` is the
     /// ordinary unclaimed hot path: one `Option` test, no allocation.
     ///
+    /// An aggregate `mcp_gateway` admission whose selected upstream must not
+    /// receive client credentials commits `Some("")` the same way, so neither
+    /// a client query credential nor a later query transform reaches the
+    /// tool-selected MCP upstream (`McpAdmissionRecord::committed_query`).
+    ///
     /// Never log this value. It is a query string, so a transform could have
     /// relocated a credential into it.
     #[inline]
     pub(crate) fn committed_provider_query(&self) -> Option<&str> {
-        self.ai_stream_router_claim
+        if let Some(claim) = self.ai_stream_router_claim.as_deref() {
+            return Some(claim.committed_query());
+        }
+        self.mcp_admission
             .as_deref()
-            .map(ai_stream_router::AiStreamRouterClaim::committed_query)
+            .and_then(mcp_gateway::McpAdmissionRecord::committed_query)
     }
 
     /// Whether an `ai_stream_router` instance successfully claimed this request

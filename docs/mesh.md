@@ -2692,7 +2692,15 @@ inventory entries.
 
 `mesh_authz` and `workload_metrics` consume the **same** three-way verdict from
 one shared function — a second telemetry-only predicate is exactly how forged
-baggage would reach dashboards while authz correctly rejected it. Only the
+baggage would reach dashboards while authz correctly rejected it. They also
+read the **same** baggage input (`hbone_baggage_identity`): every pristine
+wire `baggage` field-line plus the folded request-map value. At
+`before_proxy`, after request transforms, `workload_metrics` rebuilds that
+folded value from the pristine wire block whenever it is held (materialization's
+own UTF-8 rule, so an obs-text field-line the ASCII-only raw accessor skips
+still counts exactly as it did for authorization) instead of reading the
+transformed map: a `baggage` header a transformer added after authorization is
+never honored and one it stripped before forwarding is not lost. Only the
 redacted reason code is emitted; the rejected identity is attacker-controlled
 and never reaches metadata, logs, or metric labels.
 
@@ -2705,6 +2713,14 @@ likewise be effective. Mesh injection therefore stamps an internal
 those enabled configs *after* the ensure/force step:
 
 - Disabled operator rows do not constrain or select the telemetry gate.
+- An enabled **proxy- or proxy-group-scoped** `mesh_authz` replaces the
+  global instance on its routes, so its gate is the one authorization runs
+  there. The global telemetry instance cannot vary per proxy, so every enabled
+  scoped gate joins the conjunction for all routes (deduplicated; when no
+  global gate exists, the instance's own default or mesh-managed gate is
+  kept beside them). If the deduplicated set would exceed the 16-gate bound,
+  injection writes a single `trusted_hbone_assertors: []` gate instead: no
+  baggage is honored, and workload telemetry stays constructed.
 - Telemetry honors baggage only if **every** compiled gate would honor that
   peer/asserted pair and trust-domain relation. Construction compiles each
   gate with the same `TrustedAssertorIndex` / `hbone_assertion_verdict` logic
@@ -4096,8 +4112,16 @@ Labels include:
 | `destination_app` | Destination `app` label |
 | `request_protocol` | Protocol (http, grpc, tcp) |
 | `response_code` | HTTP status code |
+| `grpc_response_status` | Finalized gRPC status for gRPC requests (native and translated gRPC-Web): `0`–`16`, with an out-of-range, malformed, or missing terminal status reported as UNKNOWN `2`; empty for non-gRPC requests. HTTP/gRPC families only. |
 | `response_flags` | Error flags |
 | `connection_security_policy` | `mutual_tls` or `none` |
+
+TCP families (`ferrum_mesh_tcp_*`) never carry `response_code` or
+`grpc_response_status`, including under an `ALL_METRICS` tag override. A
+`response_code` tag override whose value is the canonical decimal spelling of
+a status (`set` to `"200"`, or `string(response.code)`) is the same series as
+that status recorded without an override; a different spelling such as
+`"0200"` is a distinct series.
 
 #### How workload labels reach metrics (issue #6793)
 
@@ -4246,6 +4270,8 @@ count, honors memoized triggers, and counts nonzero final gRPC status as an
 error (including native and translated gRPC-Web outcomes).
 
 - `sampling_percentage`: 0.0--100.0. New root traces use a probabilistic PRNG decision; valid upstream W3C `traceparent` and B3 sampling decisions are inherited unchanged.
+- **Propagation format.** The active gateway span is always injected toward the backend as W3C `traceparent` (plus `tracestate` when present). It is additionally injected as B3 whenever a Zipkin provider is configured (also while span reporting is disabled) or the backend request still carries any B3 header: multi-header `x-b3-traceid` / `x-b3-spanid` / `x-b3-parentspanid` (when the span has a parent) / `x-b3-sampled`, and the single-header `b3: {trace}-{span}-{sampled}[-{parent}]` form when the request used it. Every incoming B3 header (any casing, including `x-b3-flags`) is replaced, so a B3-only backend continues from the gateway span rather than the caller's. Metrics-only instances (no sampling, providers, or disabled-reporting flag) never touch trace headers.
+- **Dropped spans.** A finished span an exporter refuses at enqueue, or discards at delivery, is counted on `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` (`provider` ∈ `opentelemetry`, `zipkin`, `datadog`, `lightstep`, `other`; `reason` ∈ `queue_full`, `byte_budget`, `process_ceiling`, `shutting_down`, `unavailable` at enqueue, and `export_failed` — once per lost span — when an enqueued batch is discarded after a non-retryable collector response, exhausted retries, or with no HTTP client, and for the spans an OTLP HTTP-200 partial-success response reports in `rejectedSpans`, capped at the batch size), beside the rate-limited warning. Standalone `otel_tracing` exporters never count here. Labels are fixed; no endpoint or error text is exported. An instance that cannot export (span reporting disabled, or no provider) builds no span at all.
 - `custom_tags`: literal key-value tags injected into every span. Tags merge by key across matching Telemetry scopes; a more-specific scope overrides only keys it names. A source change for a named tag is exclusive: literal, header, or environment replaces the less-specific source and its fallback rather than leaving both active.
 - `custom_header_tags`: tags resolved from request headers at runtime. Header tags merge by key with the same more-specific-overrides behavior as literal tags. Credential-bearing source headers (`Authorization`, cookies, API/auth/CSRF tokens, and operator-configured sensitive metadata names) are rejected. Custom tag names cannot collide with `mesh.*`, `mesh_authz.*`, trace identity/sampling controls, or other reserved telemetry keys. A workload-metrics instance accepts at most 32 custom tags, 128-byte names, and 1024-byte values; an oversized runtime header value is omitted. A source header not declared in `safe_tag_sources` is copied as `[REDACTED]`.
 - `custom_env_tags`: Istio `customTags.<tag>.environment` references carried as `tag_name -> env_var_name`. The Kubernetes translator never reads the controller-host environment. The mesh data plane resolves these at `workload_metrics` construction and reload (not on the request hot path). A present UTF-8 value overrides any matching `custom_tags` default; a missing variable keeps the translated `defaultValue` when one was set and otherwise omits the tag (Istio/Envoy semantics). Missing/empty environment names, non-portable env-var names, and credential-bearing names (including secret/password/token/key/credential names, the metadata redactor's credential classes such as session identifiers, passphrases/passcodes, PINs and one-time codes, JWTs, signatures and bearer assertions, database connection locations, client credential identifiers, and operator-configured sensitive metadata names) fail translation with `FerrumAccepted=False`/`Invalid`. Oversized or non-UTF-8 resolved values fail plugin construction/reload closed. Selected values are deliberately injected into transaction metadata and exported telemetry, so only trusted Telemetry authors should choose data-plane environment dimensions; diagnostics never include resolved values or rejected credential-bearing variable names.
