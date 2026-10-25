@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `body_validator` response scope, media-type defaults, and
+  per-method protobuf entries** (issue/PR #6845). Response validation now
+  applies only to `response_status_codes` (new; default `["2XX"]`), so a
+  backend `404` / `422` / `500` error document keeps its own status and body
+  instead of being replaced by a `502`; `206` / `226` fragments are never
+  validated. The default `content_types` / `response_content_types` add the
+  structured-suffix patterns `application/*+json` and `application/*+xml`
+  (`application/problem+json`, `application/vnd.*+json`, `application/soap+xml`
+  are now validated; gRPC-family types never match). An explicit empty
+  `content_types` / `response_content_types` is refused (it used to mean "every
+  media type"). A `protobuf_method_messages` entry is direction-authoritative:
+  a direction it omits is no longer validated against `protobuf_request_type` /
+  `protobuf_response_type`. Protobuf validation now also covers gRPC-Web
+  (binary and text) in both directions, including translated responses; only
+  enrolled gRPC methods are buffered; decoding is bounded before reflection
+  (50000 messages, 1048576 values, 32 levels, for every pool) and charged to
+  the aggregate decode budget (`503` / `RESOURCE_EXHAUSTED` on refusal); a
+  proto2 closed-enum number outside the declared set no longer satisfies
+  `required`; per-method request rules apply on HTTP/3 and generic dispatch;
+  and an empty synthetic success (for example an empty `response_mock` body)
+  is validated. New `enforcement_mode: log_only` and
+  `reject_unsupported_media_types` (`415`), and violations are published as
+  `body_validator.{request,response}_{outcome,status,detail}` metadata.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
