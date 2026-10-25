@@ -28949,8 +28949,13 @@ pub(crate) fn replace_buffered_response_with_authorization_terminal(
         // No gRPC terminal metadata exists for an ordinary HTTP response, so
         // the fixed redacted `401` is the terminal. Nothing here echoes an
         // expiry instant, claim, subject, or provider.
-        let (status, headers, body) =
+        let (status, mut headers, body) =
             authorization_expired_pre_commitment_response(ctx, termination, false);
+        decorate_plain_authorization_terminal_headers(
+            ctx,
+            initial_response_header_policy_plugins,
+            &mut headers,
+        );
         *response_headers = headers;
         *response_body = match body {
             ResponseBody::Buffered(bytes) => bytes,
@@ -43614,6 +43619,7 @@ async fn handle_proxy_request_inner(
         &mut response_status,
         &mut response_headers,
         &mut response_body,
+        initial_response_header_policy_plugins.as_ref(),
     );
     if precommit_authorization_terminal.is_some() {
         backend_resp.connection_error = false;
@@ -44482,6 +44488,7 @@ async fn handle_proxy_request_inner(
         &mut response_status,
         &mut response_headers,
         &mut response_body,
+        initial_response_header_policy_plugins.as_ref(),
     );
     if final_precommit_authorization_terminal.is_some() {
         // The terminal is fully buffered, so the summary and the latency
@@ -57407,6 +57414,42 @@ pub(crate) fn authorization_expired_pre_commitment_response(
     )
 }
 
+/// Apply the route's precomputed initial-response header policy (for example
+/// `security_headers`) to the fixed plain-HTTP authorization terminal, then
+/// restore the fields that terminal owns.
+///
+/// Only the context-free static policy runs: no asynchronous or request-state
+/// hook is replayed after expiry, and no backend header survives, because the
+/// map starts from the freshly built terminal. Framing stays with the final
+/// wire boundary and the JSON `Content-Type` is re-asserted after policy, so
+/// the fixed body cannot be relabeled. As on every gateway `401`, policy may
+/// replace the mandatory challenge (RFC 9110 §15.5.2) with one well-formed
+/// challenge list but cannot leave the response without one: anything else
+/// restores the reauthentication challenge.
+fn decorate_plain_authorization_terminal_headers(
+    ctx: &RequestContext,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    headers: &mut HashMap<String, String>,
+) {
+    if initial_response_header_policy_plugins.is_empty() {
+        return;
+    }
+    finalize_plain_gateway_error_response_headers(initial_response_header_policy_plugins, headers);
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("content-type"));
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let policy_challenge_is_well_formed = {
+        let present = crate::plugins::utils::auth_flow::response_authentication_challenges(headers);
+        matches!(
+            present.as_slice(),
+            [value] if *value == value.trim()
+                && crate::plugins::utils::auth_flow::is_valid_authentication_challenge(value)
+        )
+    };
+    if !policy_challenge_is_well_formed {
+        insert_reauthentication_challenge(headers, ctx);
+    }
+}
+
 /// Decide the shared pre-commitment terminal without constructing a body.
 #[inline]
 pub(crate) fn request_authorization_termination(
@@ -57460,17 +57503,29 @@ pub(crate) fn apply_precommit_authorization_terminal(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     response_body: &mut ResponseBody,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     let termination = request_authorization_termination(ctx, max_lifetime_seconds)?;
     // The authorization terminal replaces whatever response was selected
     // (issue #6774).
     ctx.note_gateway_response_replacement();
-    let (terminal_status, terminal_headers, terminal_body) =
+    let (terminal_status, mut terminal_headers, terminal_body) =
         authorization_expired_pre_commitment_response(
             ctx,
             termination,
             request_uses_grpc_content_type,
         );
+    // The replacement discards every header the response phases decorated,
+    // including the route's static security policy, and nothing awaits after
+    // this gate to re-decorate it. Reapply that context-free policy to the
+    // fixed plain-HTTP `401` synchronously.
+    if terminal_status == StatusCode::UNAUTHORIZED.as_u16() {
+        decorate_plain_authorization_terminal_headers(
+            ctx,
+            initial_response_header_policy_plugins,
+            &mut terminal_headers,
+        );
+    }
     *response_status = terminal_status;
     *response_headers = terminal_headers;
     *response_body = terminal_body;

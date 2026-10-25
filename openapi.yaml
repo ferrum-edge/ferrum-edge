@@ -29892,7 +29892,7 @@ components:
     SecurityHeadersConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, `config` must be an object, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed). An effective policy that sets and removes nothing is rejected."
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, `config` must be an object, and `set` and `remove` reject gateway-owned destinations: protocol-managed hop-by-hop / framing fields and representation metadata (`content-type`, `content-encoding`, `content-range`). `set` holds at most 64 entries, `remove` at most 64 names, and every configured value at most 8192 bytes. With `override_existing: false`, a backend copy of a built-in security header that browsers ignore (empty or unrecognized) is replaced rather than preserved. An effective policy that sets and removes nothing is rejected."
       not:
         allOf:
           - required: [content_type_options]
@@ -29948,6 +29948,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              maxLength: 8192
               pattern: '^(?:[\t ]*[Nn][Oo][Ss][Nn][Ii][Ff][Ff][\t ]*)?$'
             - type: "null"
           default: nosniff
@@ -29956,6 +29957,7 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              maxLength: 8192
               pattern: '^(?:[\t ]*(?:[Dd][Ee][Nn][Yy]|[Ss][Aa][Mm][Ee][Oo][Rr][Ii][Gg][Ii][Nn])[\t ]*)?$'
             - type: "null"
           default: SAMEORIGIN
@@ -29964,16 +29966,18 @@ components:
           oneOf:
             - type: boolean
             - type: string
+              maxLength: 8192
               pattern: '^(?:[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*(?:,[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*)*)?$'
             - type: "null"
           default: strict-origin-when-cross-origin
           description: "Referrer-Policy. Default strict-origin-when-cross-origin; a string must be a comma-separated list of Referrer-Policy tokens (no-referrer, no-referrer-when-downgrade, origin, origin-when-cross-origin, same-origin, strict-origin, strict-origin-when-cross-origin, unsafe-url; ASCII case-insensitive); false/null/\"\" disables."
         hsts:
-          description: "Strict-Transport-Security (opt-in). true = max-age=31536000; includeSubDomains; a string is used verbatim; false/null/\"\" disables; an object {max_age, include_subdomains, preload} builds the value. Object members accept JSON null as the documented default: max_age 31536000 (unsigned 64-bit integer), include_subdomains true, preload false."
+          description: "Strict-Transport-Security (opt-in). true = max-age=31536000; includeSubDomains; a string is used verbatim and must be a value browsers honor (RFC 6797): exactly one `max-age=<delta-seconds>` directive (optionally quoted), at most one valueless `includeSubDomains`, and `;`-separated token directives with an optional token or quoted value (quoted values may not contain `\"`, `\\`, or `;`); directive names are ASCII case-insensitive; false/null/\"\" disables; an object {max_age, include_subdomains, preload} builds the value. Object members accept JSON null as the documented default: max_age 31536000 (unsigned 64-bit integer), include_subdomains true, preload false."
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[\u0009\u0020-\u007E]*$'
+              maxLength: 8192
+              pattern: '^$|^(?=(?:[^;]*;)*[\t ]*[Mm][Aa][Xx]-[Aa][Gg][Ee][\t ]*=[\t ]*(?:[0-9]+|"[0-9]+")[\t ]*(?:;|$))(?!(?:[^;]*;)*[\t ]*[Mm][Aa][Xx]-[Aa][Gg][Ee][\t ]*(?:=[^;]*)?;(?:[^;]*;)*[\t ]*[Mm][Aa][Xx]-[Aa][Gg][Ee][\t ]*(?:=|;|$))(?!(?:[^;]*;)*[\t ]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ss][Uu][Bb][Dd][Oo][Mm][Aa][Ii][Nn][Ss][\t ]*=)(?!(?:[^;]*;)*[\t ]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ss][Uu][Bb][Dd][Oo][Mm][Aa][Ii][Nn][Ss][\t ]*;(?:[^;]*;)*[\t ]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ss][Uu][Bb][Dd][Oo][Mm][Aa][Ii][Nn][Ss][\t ]*(?:;|$))[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+(?:[\t ]*=[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"[\t \x21\x23-\x3A\x3C-\x5B\x5D-\x7E]*"))?[\t ]*)?(?:;[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+(?:[\t ]*=[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"[\t \x21\x23-\x3A\x3C-\x5B\x5D-\x7E]*"))?[\t ]*)?)*$'
             - type: "null"
             - type: object
               additionalProperties: false
@@ -29992,48 +29996,62 @@ components:
                   default: false
         content_security_policy:
           type: [string, "null"]
+          maxLength: 8192
           pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Content-Security-Policy value (opt-in; application-specific)."
         permissions_policy:
           type: [string, "null"]
+          maxLength: 8192
           pattern: '^[\u0009\u0020-\u007E]*$'
           description: "Permissions-Policy value (opt-in)."
         set:
           type: [object, "null"]
+          maxProperties: 64
           propertyNames:
             type: string
             minLength: 1
             maxLength: 65535
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             not:
-              pattern: "^(?:[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$"
+              pattern: "^(?:[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Rr][Aa][Nn][Gg][Ee])$"
           patternProperties:
             '^[Xx]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]-[Oo][Pp][Tt][Ii][Oo][Nn][Ss]$':
               type: string
+              maxLength: 8192
               pattern: '^[\t ]*[Nn][Oo][Ss][Nn][Ii][Ff][Ff][\t ]*$'
             '^[Xx]-[Ff][Rr][Aa][Mm][Ee]-[Oo][Pp][Tt][Ii][Oo][Nn][Ss]$':
               type: string
+              maxLength: 8192
               pattern: '^[\t ]*(?:[Dd][Ee][Nn][Yy]|[Ss][Aa][Mm][Ee][Oo][Rr][Ii][Gg][Ii][Nn])[\t ]*$'
             '^[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Pp][Oo][Ll][Ii][Cc][Yy]$':
               type: string
+              maxLength: 8192
               pattern: '^[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*(?:,[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*)*$'
+            '^[Ss][Tt][Rr][Ii][Cc][Tt]-[Tt][Rr][Aa][Nn][Ss][Pp][Oo][Rr][Tt]-[Ss][Ee][Cc][Uu][Rr][Ii][Tt][Yy]$':
+              type: string
+              maxLength: 8192
+              pattern: '^(?=(?:[^;]*;)*[\t ]*[Mm][Aa][Xx]-[Aa][Gg][Ee][\t ]*=[\t ]*(?:[0-9]+|"[0-9]+")[\t ]*(?:;|$))(?!(?:[^;]*;)*[\t ]*[Mm][Aa][Xx]-[Aa][Gg][Ee][\t ]*(?:=[^;]*)?;(?:[^;]*;)*[\t ]*[Mm][Aa][Xx]-[Aa][Gg][Ee][\t ]*(?:=|;|$))(?!(?:[^;]*;)*[\t ]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ss][Uu][Bb][Dd][Oo][Mm][Aa][Ii][Nn][Ss][\t ]*=)(?!(?:[^;]*;)*[\t ]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ss][Uu][Bb][Dd][Oo][Mm][Aa][Ii][Nn][Ss][\t ]*;(?:[^;]*;)*[\t ]*[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ss][Uu][Bb][Dd][Oo][Mm][Aa][Ii][Nn][Ss][\t ]*(?:;|$))[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+(?:[\t ]*=[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"[\t \x21\x23-\x3A\x3C-\x5B\x5D-\x7E]*"))?[\t ]*)?(?:;[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+(?:[\t ]*=[\t ]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"[\t \x21\x23-\x3A\x3C-\x5B\x5D-\x7E]*"))?[\t ]*)?)*$'
           additionalProperties:
             type: string
+            maxLength: 8192
             pattern: '^[\u0009\u0020-\u007E]*$'
-          description: "Arbitrary response headers to set (name -> value). An entry for X-Content-Type-Options, X-Frame-Options or Referrer-Policy (case-insensitive name) must carry a value the matching built-in option accepts (`nosniff`; `DENY` or `SAMEORIGIN`; a comma-separated list of Referrer-Policy tokens), since browsers ignore any other value; an empty value is rejected. Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
+          description: "Arbitrary response headers to set (name -> value), at most 64 entries. An entry for X-Content-Type-Options, X-Frame-Options, Referrer-Policy or Strict-Transport-Security (case-insensitive name) must carry a value the matching built-in option accepts (`nosniff`; `DENY` or `SAMEORIGIN`; a comma-separated list of Referrer-Policy tokens; an HSTS value with exactly one `max-age`), since browsers ignore any other value; an empty value is rejected. Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive) and representation metadata (`content-type`, `content-encoding`, `content-range`), which are rejected at construction — the gateway owns framing at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses; content-type-selective body inspection, compression, and range handling decide from the backend representation before this plugin runs. Values must satisfy the HTTP HeaderValue builder rules (only HTAB and printable ASCII) and are at most 8192 bytes."
         remove:
           type: [array, "null"]
+          maxItems: 64
           items:
             type: string
             minLength: 1
             maxLength: 65535
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            not:
+              pattern: "^(?:[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Rr][Aa][Nn][Gg][Ee])$"
           default: [server, x-powered-by]
-          description: "Valid HTTP field names (maximum 65,535 ASCII bytes) to strip case-insensitively. Names are canonicalized to lowercase. Defaults to Server and X-Powered-By; set [] to strip nothing."
+          description: "Valid HTTP field names (maximum 65,535 ASCII bytes, at most 64 names) to strip case-insensitively. Names are canonicalized to lowercase. Protocol-managed hop-by-hop / framing destinations and representation metadata (`content-type`, `content-encoding`, `content-range`) are rejected, the same closed set `set` refuses. Defaults to Server and X-Powered-By; set [] to strip nothing."
         override_existing:
           type: [boolean, "null"]
           default: true
-          description: "When false, only add a header the backend did not already set. Null selects true."
+          description: "When false, only add a header the backend did not already set. A backend copy of a built-in security header (X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Strict-Transport-Security, Content-Security-Policy, Permissions-Policy) that browsers ignore — empty, or not a value the matching option accepts — counts as missing and every case variant is replaced; arbitrary `set` headers keep pure presence semantics. Null selects true."
 
     CompressionConfig:
       type: [object, "null"]

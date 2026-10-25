@@ -610,8 +610,7 @@ fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
          \x20   config:\n\
          \x20     override_existing: false\n\
          \x20     set:\n\
-         \x20       X-H3-Gateway-Policy: enforced\n\
-         \x20       Content-Type: text/plain\n",
+         \x20       X-H3-Gateway-Policy: enforced\n",
     )
 }
 

@@ -710,7 +710,7 @@ plugin_configs:
         X-WS-Reject-Order: "security-policy"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
-      remove: ["server", "x-powered-by", "content-type"]
+      remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
   - id: "plugin-correlation-id-ws-admission"
@@ -2574,10 +2574,6 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
     assert_no_failed_websocket_negotiation_headers(&rejected.headers);
-    assert!(
-        !rejected.headers.contains_key(http::header::CONTENT_TYPE),
-        "the final H3 reject writer must preserve policy removal of content-type"
-    );
     assert_failed_websocket_handshake_framing(&rejected.headers);
     let rejected_headers = rejected.headers.clone();
     let rejected_body = rejected

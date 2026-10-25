@@ -12007,8 +12007,31 @@ pub mod _test_support {
         protected_status: u16,
         protected_body: &[u8],
     ) -> PrecommitAuthorizationGateForTest {
+        precommit_authorization_gate_with_policy_for_test(
+            ctx,
+            max_lifetime_seconds,
+            request_uses_grpc_content_type,
+            protected_status,
+            HashMap::new(),
+            protected_body,
+            &[],
+        )
+    }
+
+    /// The same production gate, starting from an already-decorated protected
+    /// response and given the route's precomputed initial-response header
+    /// policy slice, as the H1/H2 funnel passes it.
+    pub fn precommit_authorization_gate_with_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+        request_uses_grpc_content_type: bool,
+        protected_status: u16,
+        protected_headers: HashMap<String, String>,
+        protected_body: &[u8],
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> PrecommitAuthorizationGateForTest {
         let mut status = protected_status;
-        let mut headers = HashMap::new();
+        let mut headers = protected_headers;
         let mut body = crate::retry::ResponseBody::buffered(protected_body.to_vec());
         let termination = crate::proxy::apply_precommit_authorization_terminal(
             ctx,
@@ -12017,6 +12040,7 @@ pub mod _test_support {
             &mut status,
             &mut headers,
             &mut body,
+            initial_response_header_policy_plugins,
         );
         let body = match body {
             crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
@@ -12029,6 +12053,29 @@ pub mod _test_support {
             body,
             log_metadata: crate::proxy::clone_log_metadata(ctx),
         }
+    }
+
+    /// The buffered-response authorization terminal builder on a plain HTTP
+    /// request (no gRPC-Web content type), given an already-decorated
+    /// protected header map and the route's initial-response header policy.
+    /// Returns `(status, headers, body_bytes)`.
+    pub fn buffered_authorization_terminal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        protected_headers: HashMap<String, String>,
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        let mut headers = protected_headers;
+        let mut body = bytes::Bytes::from_static(b"protected");
+        let status = crate::proxy::replace_buffered_response_with_authorization_terminal(
+            ctx,
+            termination,
+            None,
+            &mut headers,
+            &mut body,
+            initial_response_header_policy_plugins,
+        );
+        (status, headers, body.to_vec())
     }
 
     /// The authorization-lifetime plan and bounded protocol family every H1/H2
