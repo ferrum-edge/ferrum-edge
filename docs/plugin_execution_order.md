@@ -990,7 +990,10 @@ reject or perform I/O after the backend has accepted the session. Ferrum then
 strips connection/framing/WebSocket transport fields, adds the authoritative
 H1 Upgrade fields or Extended CONNECT response, preserves the verified backend
 subprotocol, and appends any gateway-owned sticky cookie. `correlation_id`
-uses this boundary to echo generated and preserved IDs consistently.
+uses this boundary to echo generated and preserved IDs consistently, and
+`oidc_relying_party` uses it to deliver the session cookie it rotated or slid
+while authenticating the handshake, so a refresh performed for a WebSocket
+never leaves the browser holding the spent refresh token.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -1670,7 +1673,7 @@ Given all built-in plugins enabled, the execution order is:
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate, before_proxy |
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |
-| 17 | `oidc_relying_party` | 1075 | on_request_received, authenticate, before_proxy, after_proxy |
+| 17 | `oidc_relying_party` | 1075 | on_request_received, authenticate, before_proxy, after_proxy, apply_websocket_handshake_response_headers |
 | 18 | `jwt_auth` | 1100 | authenticate |
 | 19 | `key_auth` | 1200 | authenticate, before_proxy |
 | 20 | `ldap_auth` | 1250 | authenticate, before_proxy |

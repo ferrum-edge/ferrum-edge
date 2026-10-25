@@ -24508,7 +24508,8 @@ components:
         header kid that selects exactly one current trusted JWKS key; missing,
         empty, and unknown kid values are rejected with no all-keys fallback.
         Optional string fields accept null as "unset", matching constructor
-        admission.
+        admission. Sessions too large for one browser cookie are split across
+        bounded `<cookie_name>.N` chunk cookies.
       required: [providers, session]
       properties:
         providers:
@@ -24520,15 +24521,29 @@ components:
             additionalProperties: false
             required: [issuer, client_id, redirect_uri, scopes, client_auth]
             oneOf:
+              # A present `null` counts as "unset" (constructor admission), so
+              # the alternatives constrain non-null presence rather than key
+              # presence.
               - required: [discovery_url]
-                not:
-                  anyOf:
-                    - required: [authorization_endpoint]
-                    - required: [token_endpoint]
-                    - required: [jwks_uri]
+                properties:
+                  discovery_url:
+                    type: string
+                  authorization_endpoint:
+                    type: "null"
+                  token_endpoint:
+                    type: "null"
+                  jwks_uri:
+                    type: "null"
               - required: [authorization_endpoint, token_endpoint, jwks_uri]
-                not:
-                  required: [discovery_url]
+                properties:
+                  authorization_endpoint:
+                    type: string
+                  token_endpoint:
+                    type: string
+                  jwks_uri:
+                    type: string
+                  discovery_url:
+                    type: "null"
             properties:
               issuer:
                 type: string
@@ -24537,11 +24552,13 @@ components:
                   Expected ID token issuer, compared as an exact case-sensitive
                   string. Per RFC 7519 section 4.1.1 a present iss must be a
                   single string; an array, object, number, boolean, or null iss
-                  is rejected.
+                  is rejected. A discovery document is used only when its own
+                  `issuer` member is exactly this value (OpenID Connect
+                  Discovery section 4.3).
               discovery_url:
                 type: [string, "null"]
                 minLength: 1
-                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri.
+                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri. The document must carry an `issuer` exactly equal to `issuer`. Its endpoints must use HTTPS and may live on other origins (Google and Microsoft Entra ID publish cross-origin endpoints); plain HTTP is accepted only for a loopback development discovery_url and only on its own origin.
               authorization_endpoint:
                 type: [string, "null"]
                 minLength: 1
@@ -24616,14 +24633,16 @@ components:
                 description: Absolute callback URI registered with the provider, with no fragment (RFC 6749 §3.1.2). Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
               callback_path:
                 type: [string, "null"]
-                pattern: '^/[^\s?#;,]*$'
+                minLength: 1
+                pattern: '^(/[^\s?#;,%\\/]+)*/?$'
                 default: /oauth/callback
-                description: Callback path handled by Ferrum; must equal the path in redirect_uri. Also the correlation cookie's Path attribute, so it carries cookie-path syntax rules.
+                description: Callback path handled by Ferrum; must equal the path in redirect_uri. Also the correlation cookie's Path attribute, so it carries cookie-path syntax rules. Must already be a canonical request path (no percent-escapes, empty segments, dot segments, or backslashes), because it is compared with the frontend's canonical request path; dot segments are refused by the constructor.
               logout_path:
                 type: [string, "null"]
-                pattern: '^/[^\s?#;,]*$'
+                minLength: 1
+                pattern: '^(/[^\s?#;,%\\/]+)*/?$'
                 default: /oauth/logout
-                description: Must not resolve to the same path as callback_path; the callback branch is evaluated first.
+                description: Must not resolve to the same path as callback_path; the callback branch is evaluated first. Must be a canonical request path, like callback_path. Logout is state-changing, so GET/HEAD requests must carry `Sec-Fetch-Site` same-origin or none, a POST is refused only when the browser reports cross-site or same-site, and other methods answer 405; a refused request clears nothing and contacts no provider.
               scopes:
                 type: array
                 minItems: 1
@@ -24706,6 +24725,58 @@ components:
                   session.ttl_secs or the access-token lifetime. The session is
                   still additionally capped by session.ttl_secs and
                   session.idle_ttl_secs.
+              authorization_params:
+                type: [object, "null"]
+                maxProperties: 16
+                propertyNames:
+                  minLength: 1
+                  maxLength: 512
+                  pattern: '^[!-~]+$'
+                  not:
+                    enum:
+                      - response_type
+                      - client_id
+                      - redirect_uri
+                      - scope
+                      - state
+                      - nonce
+                      - code_challenge
+                      - code_challenge_method
+                      - max_age
+                      - response_mode
+                      - request
+                      - request_uri
+                additionalProperties:
+                  type: string
+                  maxLength: 512
+                description: >-
+                  Static extra authorization-request parameters, such as
+                  `prompt`, `acr_values`, `login_hint`, or `ui_locales`, appended
+                  after the parameters the plugin owns. Names the plugin sets
+                  (response_type, client_id, redirect_uri, scope, state, nonce,
+                  code_challenge, code_challenge_method, max_age, response_mode,
+                  request, request_uri) are rejected case-insensitively; values
+                  must not contain control characters.
+              max_age_secs:
+                type: [integer, "null"]
+                format: uint64
+                minimum: 0
+                maximum: 31536000
+                description: >-
+                  OpenID Connect `max_age`. When set it is sent on the
+                  authorization request, the callback requires an ID token
+                  `auth_time` no older than this (plus id_token_clock_skew_secs),
+                  and a session whose login is older re-challenges instead of
+                  refreshing.
+              forward_access_token:
+                type: boolean
+                default: false
+                description: >-
+                  Relay the session's current (refreshed) access token to the
+                  backend as `Authorization: Bearer <token>`. When enabled the
+                  backend Authorization header is gateway-owned on this route:
+                  every client-supplied copy is removed first, so a request whose
+                  accepted principal is not this session forwards none.
         session:
           type: object
           additionalProperties: false
@@ -24725,7 +24796,7 @@ components:
               type: string
               minLength: 32
               format: password
-              description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes and must not be a known published or placeholder value (including the documented `${OIDC_SESSION_SECRET_32_BYTES_MIN}` placeholder, the key Ferrum Foundry's OIDC template published, Ferrum's own sequential example/test secrets, and obvious placeholders such as changeme, change-me, replace-me, placeholder, example, or your-secret). Screening covers both the supplied value and the effective key material (standard Base64 decoded only when it yields at least 32 bytes, otherwise raw bytes before HKDF), including Base64 spellings of denied values and unresolved `${...}` templates anywhere in either textual value. A rejected value returns 400 naming this field without revealing the secret.
+              description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes and must not be a known published or placeholder value (including the documented `${OIDC_SESSION_SECRET_32_BYTES_MIN}` placeholder, the key Ferrum Foundry's OIDC template published, Ferrum's own sequential example/test secrets, and obvious placeholders such as changeme, change-me, replace-me, placeholder, or your-secret). Screening covers both the supplied value and the effective key material (standard Base64 decoded only when it yields at least 32 bytes, otherwise raw bytes before HKDF), including Base64 spellings of denied values and unresolved `${...}` templates anywhere in either textual value. A rejected value returns 400 naming this field without revealing the secret.
             encryption_secret_previous:
               type: [string, "null"]
               minLength: 32
@@ -24758,7 +24829,7 @@ components:
               default: 8000
               minimum: 1024
               maximum: 8000
-              description: Maximum encoded size for sealed session cookies and sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes.
+              description: "Maximum encoded size of the sealed session value and of sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes. A session whose complete Set-Cookie line would exceed 4000 bytes is split across `<cookie_name>.0`…`<cookie_name>.N` chunk cookies (at most 9) that each fit a browser cookie; a session above this cap is refused at the callback with a named error instead of being emitted. Every session cookie carries Max-Age equal to the remaining absolute session lifetime. Not part of the session context, and it bounds only what is issued: existing sessions and in-flight logins up to the 8000-byte admission maximum stay readable after it is lowered."
             secure:
               type: boolean
               default: true
@@ -24810,13 +24881,13 @@ components:
               format: uint64
               default: 10000
               minimum: 1
-              description: Per-instance maximum number of pending browser authorization flows this plugin instance will start (DoS admission). Cross-replica callbacks use the sealed correlation cookie and do not require a shared state cache.
+              description: Per-instance size of the pending-login replay cache (DoS admission). When it is full, further logins are still started as sealed-only flows (no local replay entry), each charged to its source under state_cache_max_entries_per_source, up to one more state_cache_max_entries; beyond that new login starts answer 503. Cross-replica callbacks use the sealed correlation cookie and do not require a shared state cache.
             state_cache_max_entries_per_source:
               type: integer
               format: uint64
               default: 32
               minimum: 1
-              description: Per-instance maximum pending browser authorization flows started per resolved client IP; must not exceed state_cache_max_entries.
+              description: Per-instance maximum pending browser authorization flows started per resolved client IP, enforced whether or not the replay cache is full; must not exceed state_cache_max_entries.
             post_login_redirect_param:
               type: [string, "null"]
               minLength: 1
@@ -24826,6 +24897,7 @@ components:
               items:
                 type: string
                 minLength: 1
+              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo; anything else lands on post_login_default_path.
             refresh_skew_secs:
               type: integer
               format: uint64

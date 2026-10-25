@@ -3293,16 +3293,19 @@ pub mod _test_support {
 
     /// Resolve a live discovery document with optional operator-supplied
     /// `userinfo_endpoint` / `end_session_endpoint` overrides, returning the
-    /// effective optional endpoints as `(userinfo, end_session)`.
+    /// effective optional endpoints as `(userinfo, end_session)`. The
+    /// document's `issuer` must equal `expected_issuer`.
     pub async fn oidc_resolve_discovery_for_test(
         http_client: &crate::plugins::PluginHttpClient,
         discovery_url: &str,
+        expected_issuer: &str,
         explicit_userinfo_endpoint: Option<String>,
         explicit_end_session_endpoint: Option<String>,
     ) -> Result<(Option<String>, Option<String>), String> {
         let resolved = oidc_discovery_seams::resolve_discovery_for_test(
             http_client,
             discovery_url,
+            expected_issuer,
             explicit_userinfo_endpoint,
             explicit_end_session_endpoint,
         )

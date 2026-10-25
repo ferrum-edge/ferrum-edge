@@ -2868,7 +2868,7 @@ config:
 
 Runs a browser-oriented OpenID Connect relying party flow with authorization code + PKCE, encrypted gateway sessions with a sliding idle window and proactive refresh-token rotation, ID token validation through provider JWKS, optional UserInfo merge, scope/role checks, claim header fan-out, and RP-initiated logout. Concurrent refresh-due requests carrying the same refresh token share one token-endpoint call per instance, and a refresh token the provider reports as `invalid_grant` is never re-sealed into a `Set-Cookie`; see [OIDC Relying Party](oidc_relying_party.md#concurrent-refreshes-and-spent-refresh-tokens) for the multi-replica caveat.
 
-Active in `on_request_received` (callback and logout paths), `authenticate` (session validation, refresh, and browser challenge), `before_proxy` (claim headers and session-cookie hiding), and `after_proxy` (rolling `Set-Cookie` emission). Logout expires the browser cookie and, with an authentic session cookie, sends `id_token_hint` to the provider and attempts discovered refresh-token revocation. No cookie or an invalid cookie returns the local logged-out page. Stateless cookie copies remain usable within the claims and absolute/idle lifetime limits even after logout; see [Logout](oidc_relying_party.md#logout) for residual validity and best-effort revocation behavior.
+Active in `on_request_received` (callback and logout paths), `authenticate` (session validation, refresh, and browser challenge), `before_proxy` (claim headers, optional access-token relay, and session-cookie hiding), and `after_proxy` (rolling `Set-Cookie` emission; successful WebSocket handshakes receive the same cookie through the handshake response decorator). Sessions too large for one browser cookie are split across bounded `<cookie_name>.N` chunk cookies, and every session cookie carries `Max-Age` equal to its remaining absolute lifetime. A refresh grant the provider accepted but whose result cannot be validated drops the spent refresh token instead of retrying it. Logout requires browser proof of a same-origin request (`Sec-Fetch-Site`) for `GET`/`HEAD` and refuses cross-site `POST`s. Logout expires the browser cookie and, with an authentic session cookie, sends `id_token_hint` to the provider and attempts discovered refresh-token revocation. No cookie or an invalid cookie returns the local logged-out page. Stateless cookie copies remain usable within the claims and absolute/idle lifetime limits even after logout; see [Logout](oidc_relying_party.md#logout) for residual validity and best-effort revocation behavior.
 
 **Priority:** 1075
 
@@ -2876,7 +2876,7 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 |---|---|---|
 | `providers` | Array | Exactly one OIDC provider configuration |
 | `providers[].issuer` | String | Expected ID token issuer, compared as an exact case-sensitive string. A present `iss` must be a single string (RFC 7519 §4.1.1); an array, object, number, boolean, or null `iss` is rejected |
-| `providers[].discovery_url` | String | OIDC discovery URL |
+| `providers[].discovery_url` | String | OIDC discovery URL. The document's `issuer` must equal `providers[].issuer` exactly; its endpoints must use HTTPS and may be on other origins (plain HTTP only on a loopback discovery URL's own origin) |
 | `providers[].authorization_endpoint` | String | Explicit authorization endpoint when discovery is not used |
 | `providers[].token_endpoint` | String | Explicit token endpoint when discovery is not used |
 | `providers[].jwks_uri` | String | Explicit JWKS URI when discovery is not used |
@@ -2890,8 +2890,8 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].client_auth.private_key_jwt_alg` | String | `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384`, or `EdDSA` |
 | `providers[].client_auth.private_key_jwt_kid` | String (optional) | `kid` header placed on the signed client assertion |
 | `providers[].redirect_uri` | String | Absolute callback URI registered with the provider, with no fragment; its host must match the browser request host before Ferrum issues a challenge (ports are ignored) |
-| `providers[].callback_path` | String | Callback path Ferrum handles (default: `/oauth/callback`); must equal the path in `redirect_uri` |
-| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`); must not resolve to the same path as `callback_path` |
+| `providers[].callback_path` | String | Callback path Ferrum handles (default: `/oauth/callback`); must equal the path in `redirect_uri` and be a canonical request path (no percent-escapes, empty or dot segments, or backslashes) |
+| `providers[].logout_path` | String | Local logout path (default: `/oauth/logout`); must not resolve to the same path as `callback_path` and must be canonical. `GET`/`HEAD` require `Sec-Fetch-Site: same-origin` or `none`; a `POST` is refused only when the browser reports `cross-site` or `same-site`; other methods answer `405` |
 | `providers[].scopes` | String[] | OIDC scopes; must include `openid` |
 | `providers[].audiences` | String[] | Accepted ID token audiences |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in session claims |
@@ -2902,13 +2902,16 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `providers[].consumer_identity_claim` | String | Claim used as the external authenticated identity (default: `sub`) |
 | `providers[].consumer_header_claim` | String | Claim emitted in `X-Authenticated-Identity` (default: `sub`) |
 | `providers[].id_token_clock_skew_secs` | u64 | ID token expiry leeway (default: `60`; `0`–`3600`) |
+| `providers[].max_age_secs` | u64 (optional) | OIDC `max_age` (`0`–`31536000`): sent on the authorization request; the callback requires an ID token `auth_time` within it, and a session whose login is older re-challenges |
+| `providers[].authorization_params` | Object (optional) | Static extra authorization-request parameters such as `prompt` or `acr_values` (at most 16); plugin-owned names are rejected |
+| `providers[].forward_access_token` | Boolean | Default `false`; relay the session's current access token upstream as `Authorization: Bearer`, removing any client-supplied `Authorization` |
 | `session.encryption_secret` | String | At least 32 bytes; encrypts and authenticates session cookies and sealed pending-flow correlation cookies. Published or placeholder values are rejected at admission |
 | `session.encryption_secret_previous` | String (optional) | Previous secret accepted for session and pending-flow cookie rotation; the same published/placeholder rejection applies |
 | `session.store` | String | Session backend; only `cookie` is implemented |
 | `session.cookie_name` | String (optional) | Explicit name opts out of automatic naming and must be an RFC 6265 `cookie-name` token; an explicit `__Host-`/`__Secure-` name must satisfy that prefix's attribute rules. Default is context-derived and prefixed `__Host-` (secure, no domain, root path), `__Secure-` (secure, otherwise), or unprefixed when `session.secure` is false |
 | `session.ttl_secs` | u64 | Absolute session lifetime (default: `3600`; `1`–`31536000`) |
 | `session.idle_ttl_secs` | u64 | Idle timeout (default: `1800`; `1`–`31536000`) |
-| `session.max_cookie_bytes` | u64 | Maximum sealed session and pending-flow cookie size (default: `8000`; `1024`–`8000`) |
+| `session.max_cookie_bytes` | u64 | Maximum sealed session value and pending-flow cookie size (default: `8000`; `1024`–`8000`). A session whose `Set-Cookie` line would exceed 4000 bytes is split across at most 9 `<cookie_name>.N` chunk cookies; a session above the cap is refused at the callback with a named error |
 | `session.domain` | String (optional) | Bare DNS name (optional leading dot); durable session Domain only. Correlation cookies never inherit it, and secure correlation cookies use browser-enforced `__Host-` scope (`Path=/`) |
 | `session.secure` | Boolean | Default `true`; when false, generated cookie names carry no `__Host-`/`__Secure-` prefix because a prefixed cookie without `Secure` is rejected by browsers |
 | `session.hide_session_cookie` | Boolean | Default `true`; strip this plugin's session and correlation cookies from the `Cookie` header forwarded upstream, leaving unrelated cookies intact |
@@ -2922,10 +2925,10 @@ Active in `on_request_received` (callback and logout paths), `authenticate` (ses
 | `behavior.challenge_api_status` | u64 | Non-browser challenge status: `401` (default) or `403` |
 | `behavior.html_accept_substrings` | String[] | `Accept` substrings that mark a browser request (default: `["text/html"]`) |
 | `behavior.post_login_redirect_param` | String (optional) | Query parameter carrying the post-login target; requires `behavior.trusted_redirect_hosts` |
-| `behavior.state_cache_max_entries` | u64 | Per-instance maximum pending login starts (default: `10000`); does not block cross-replica callbacks |
-| `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`) |
+| `behavior.state_cache_max_entries` | u64 | Per-instance pending-login replay cache size (default: `10000`); when full, logins continue as sealed-only flows up to one more cache-worth, then answer `503`; does not block cross-replica callbacks |
+| `behavior.state_cache_max_entries_per_source` | u64 | Per-instance per-client-IP pending login start cap (default: `32`), enforced even when the replay cache is full |
 | `behavior.post_login_default_path` | String | Redirect target when no trusted original URL exists |
-| `behavior.trusted_redirect_hosts` | String[] | Hosts allowed for post-login redirect parameters |
+| `behavior.trusted_redirect_hosts` | String[] | Origins allowed for post-login redirects, as `host` (default port only) or `host:port` (`host:443` equals `host` under `https`), case-insensitive; other shapes are rejected. The target must also use `redirect_uri`'s scheme and carry no userinfo |
 
 `session.encryption_secret` and `session.encryption_secret_previous` are checked
 at admission (Admin API create/update, batch, restore, and file/database config
@@ -2934,7 +2937,7 @@ load) against a small deny-list of known-public secrets: Ferrum's documented
 Ferrum Foundry's OIDC relying-party template published, the sequential secrets
 Ferrum's own examples and tests used, and obvious placeholders such as
 `changeme`, `change-me`/`change_me`, `replace-me`/`replace_me`, `placeholder`,
-`example`, and `your-secret`. The supplied value and its effective key material
+and `your-secret`/`your_secret`. The supplied value and its effective key material
 are both screened: standard Base64 is decoded only when it yields at least 32
 bytes, otherwise the raw value is used before HKDF. Base64 spellings of denied
 values are rejected, as are unresolved `${...}` templates anywhere in either
