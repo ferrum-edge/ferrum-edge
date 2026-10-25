@@ -879,7 +879,7 @@ fn is_base64_alphabet(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
 }
 
-fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() || !data.len().is_multiple_of(4) {
         return None;
     }

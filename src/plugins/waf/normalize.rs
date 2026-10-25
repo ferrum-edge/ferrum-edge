@@ -380,6 +380,67 @@ pub(super) fn decode_wide_charset_body_views(
     views
 }
 
+/// Whether a body's UTF-16 / UTF-32 reading is one a backend certainly
+/// takes, rather than one only the BOM-less signature (or a loosely written
+/// header) suggests: the body starts with a UTF-16 / UTF-32 byte-order mark,
+/// or the whole `Content-Type` value is the canonical
+/// `type/subtype; charset=<utf-16|utf-16le|utf-16be|utf-32|utf-32le|utf-32be>`
+/// (see [`content_type_is_canonical_wide_declaration`]).
+///
+/// The test is an allow-list on purpose. Media-type parsers disagree about
+/// empty parameters, quoted values, repeated headers and parameter order —
+/// ASP.NET Core stops reading parameters at an empty one and then defaults to
+/// UTF-8 — so any header that is not exactly canonical declares nothing, and
+/// the raw bytes are judged as the UTF-8 document a backend may read instead.
+/// Which readings are DECODED is unchanged ([`charset_value`]); this only
+/// decides whether a decoded wide reading may vouch for the raw bytes.
+pub(super) fn wide_charset_is_declared(body: &[u8], content_type: Option<&str>) -> bool {
+    utf32_bom(body).is_some()
+        || utf16_bom(body).is_some()
+        || content_type.is_some_and(content_type_is_canonical_wide_declaration)
+}
+
+/// `OWS type "/" subtype OWS ";" OWS "charset" OWS "=" OWS ( label / DQUOTE
+/// label DQUOTE ) OWS`, nothing more: one `Content-Type` value with exactly
+/// one parameter, a wide charset label (ASCII case-insensitive), no escapes.
+/// A comma-folded repeated header, a second or empty parameter, or anything
+/// after the label fails.
+fn content_type_is_canonical_wide_declaration(value: &str) -> bool {
+    const LABELS: [&str; 6] = [
+        "utf-16", "utf-16le", "utf-16be", "utf-32", "utf-32le", "utf-32be",
+    ];
+    fn trim(text: &str) -> &str {
+        text.trim_matches(|c: char| c == ' ' || c == '\t')
+    }
+    let Some((essence, parameter)) = value.split_once(';') else {
+        return false;
+    };
+    let Some((kind, subtype)) = trim(essence).split_once('/') else {
+        return false;
+    };
+    let is_token = |text: &str| !text.is_empty() && text.bytes().all(is_token_byte);
+    if !is_token(kind) || !is_token(subtype) {
+        return false;
+    }
+    let Some((name, label)) = parameter.split_once('=') else {
+        return false;
+    };
+    if !trim(name).eq_ignore_ascii_case("charset") {
+        return false;
+    }
+    let label = trim(label);
+    let label = label
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .unwrap_or(label);
+    LABELS.iter().any(|known| label.eq_ignore_ascii_case(known))
+}
+
+/// RFC 9110 `tchar`.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
 /// The wide width a BOM-less body's first four octets sign, if any: the
 /// NUL placement of two ASCII UTF-16 units or one ASCII UTF-32 unit. The
 /// NUL placement also implies an endianness (a leading NUL is big-endian).
@@ -581,9 +642,12 @@ fn resolve_utf32_body(body: &[u8], content_type: Option<&str>) -> WideEndian<Utf
     }
 }
 
-/// First `charset` parameter of a Content-Type. Duplicate `charset=`
-/// parameters are treated as unspecified (return `None`) so a conflicting
-/// pair cannot pick an endianness.
+/// First `charset` parameter of a Content-Type, read the lenient way many
+/// backends read it: split at every `;`, quotes trimmed. Duplicate
+/// `charset=` parameters are treated as unspecified (return `None`) so a
+/// conflicting pair cannot pick an endianness. This decides which wide
+/// readings are decoded (coverage), not whether one is authoritative; see
+/// [`wide_charset_is_declared`].
 fn charset_value(content_type: Option<&str>) -> Option<&str> {
     let content_type = content_type?;
     let mut declared = None;
@@ -618,7 +682,12 @@ fn declared_utf16_endian(
     content_type: Option<&str>,
     bom_endian: Option<Utf16Endian>,
 ) -> Option<Utf16Endian> {
-    let value = charset_value(content_type)?;
+    utf16_label_endian(charset_value(content_type)?, bom_endian)
+}
+
+/// The UTF-16 endianness a charset label names; `bom_endian` for the bare,
+/// endian-unspecified `utf-16`; `None` for a label outside the family.
+fn utf16_label_endian(value: &str, bom_endian: Option<Utf16Endian>) -> Option<Utf16Endian> {
     // WHATWG encoding index: every UTF-16LE label, so `charset=unicode` or
     // `charset=ucs-2` cannot slip past the transcoder that `utf-16le` hits.
     if value.eq_ignore_ascii_case("utf-16le")
@@ -664,7 +733,11 @@ fn declared_utf32_endian(
     content_type: Option<&str>,
     bom_endian: Option<Utf32Endian>,
 ) -> Option<Utf32Endian> {
-    let value = charset_value(content_type)?;
+    utf32_label_endian(charset_value(content_type)?, bom_endian)
+}
+
+/// UTF-32 counterpart of [`utf16_label_endian`].
+fn utf32_label_endian(value: &str, bom_endian: Option<Utf32Endian>) -> Option<Utf32Endian> {
     if value.eq_ignore_ascii_case("utf-32le") || value.eq_ignore_ascii_case("utf32le") {
         Some(Utf32Endian::Little)
     } else if value.eq_ignore_ascii_case("utf-32be") || value.eq_ignore_ascii_case("utf32be") {
