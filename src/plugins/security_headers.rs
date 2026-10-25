@@ -41,9 +41,11 @@ pub const MAX_HEADER_VALUE_BYTES: usize = 8192;
 const REPRESENTATION_MANAGED_DESTINATIONS: [&str; 3] =
     ["content-type", "content-encoding", "content-range"];
 
-/// Built-in security headers whose value browsers either honor or ignore as a
-/// whole. With `override_existing: false` a backend copy that a browser would
-/// ignore does not satisfy the policy.
+/// Built-in security headers whose backend value a browser either acts on or
+/// ignores entirely. With `override_existing: false` only a backend copy that
+/// a browser would ignore entirely fails to satisfy the policy; any value a
+/// browser acts on — even a different or weaker-looking one than the
+/// configured default — is kept.
 #[derive(Debug, Clone, Copy)]
 enum ManagedHeader {
     ContentTypeOptions,
@@ -68,20 +70,102 @@ impl ManagedHeader {
         }
     }
 
-    /// Whether a browser would act on `value` for this header.
+    /// Whether a browser acts on a backend `value` for this header.
+    ///
+    /// These follow the browser processing algorithms, NOT the strict
+    /// configuration-admission checks: admission refuses anything a browser
+    /// might not honor, while this keeps anything a browser might honor, so an
+    /// effective backend protection is never replaced by a weaker default.
     fn browser_honors(self, value: &str) -> bool {
         match self {
-            Self::ContentTypeOptions => {
-                builtin_token_expectation("content_type_options", value).is_none()
-            }
-            Self::FrameOptions => builtin_token_expectation("frame_options", value).is_none(),
-            Self::ReferrerPolicy => builtin_token_expectation("referrer_policy", value).is_none(),
-            Self::StrictTransportSecurity => hsts_value_is_valid(value),
-            Self::ContentSecurityPolicy | Self::PermissionsPolicy => {
-                !value.trim_matches([' ', '\t']).is_empty()
-            }
+            Self::ContentTypeOptions => backend_nosniff_is_effective(value),
+            Self::FrameOptions => backend_frame_options_is_effective(value),
+            Self::ReferrerPolicy => backend_referrer_policy_is_effective(value),
+            Self::StrictTransportSecurity => backend_hsts_is_effective(value),
+            Self::ContentSecurityPolicy | Self::PermissionsPolicy => !trim_ows(value).is_empty(),
         }
     }
+}
+
+fn trim_ows(text: &str) -> &str {
+    text.trim_matches([' ', '\t'])
+}
+
+/// Fetch "determine nosniff": the first comma-separated value is an ASCII
+/// case-insensitive `nosniff`.
+fn backend_nosniff_is_effective(value: &str) -> bool {
+    value
+        .split(',')
+        .next()
+        .is_some_and(|first| trim_ows(first).eq_ignore_ascii_case("nosniff"))
+}
+
+/// HTML X-Frame-Options processing: the comma-separated values form an ASCII
+/// case-insensitive set. A set of several distinct values blocks framing when
+/// it contains `deny`, `sameorigin`, or `allowall` (a conflict is treated as
+/// a denial); otherwise it is ignored. A single value is enforced only when it
+/// is `deny` or `sameorigin`. Repeated `DENY, DENY` and conflicting
+/// `DENY, SAMEORIGIN` therefore both still protect.
+fn backend_frame_options_is_effective(value: &str) -> bool {
+    fn is_framing_directive(token: &str) -> bool {
+        token.eq_ignore_ascii_case("deny") || token.eq_ignore_ascii_case("sameorigin")
+    }
+    let mut first: Option<&str> = None;
+    let mut distinct = false;
+    let mut recognized = false;
+    for token in value.split(',').map(trim_ows) {
+        recognized |= is_framing_directive(token) || token.eq_ignore_ascii_case("allowall");
+        match first {
+            None => first = Some(token),
+            Some(seen) => distinct |= !seen.eq_ignore_ascii_case(token),
+        }
+    }
+    if distinct {
+        recognized
+    } else {
+        first.is_some_and(is_framing_directive)
+    }
+}
+
+/// Referrer Policy "parse a referrer policy from a header": the last
+/// recognized non-empty token wins and unknown or empty tokens are skipped, so
+/// the field is effective when any token is a known policy.
+fn backend_referrer_policy_is_effective(value: &str) -> bool {
+    value.split(',').map(trim_ows).any(|token| {
+        REFERRER_POLICY_TOKENS
+            .iter()
+            .any(|known| token.eq_ignore_ascii_case(known))
+    })
+}
+
+/// A user agent ignores a Strict-Transport-Security field without exactly one
+/// `max-age` carrying `delta-seconds` (RFC 6797 §6.1). Other directive syntax
+/// is deliberately not judged here: when in doubt the backend value is kept.
+fn backend_hsts_is_effective(value: &str) -> bool {
+    let mut max_age: Option<bool> = None;
+    for directive in value.split(';') {
+        let (name, argument) = match directive.split_once('=') {
+            Some((name, argument)) => (trim_ows(name), Some(trim_ows(argument))),
+            None => (trim_ows(directive), None),
+        };
+        if !name.eq_ignore_ascii_case("max-age") {
+            continue;
+        }
+        if max_age.is_some() {
+            return false;
+        }
+        max_age = Some(argument.is_some_and(is_delta_seconds));
+    }
+    max_age == Some(true)
+}
+
+/// `1*DIGIT`, optionally as a quoted string.
+fn is_delta_seconds(argument: &str) -> bool {
+    let seconds = argument
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(argument);
+    !seconds.is_empty() && seconds.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[derive(Debug)]
@@ -108,10 +192,11 @@ impl SetEntry {
 /// What a response already carries for one `set` name.
 enum ExistingValue {
     Absent,
-    /// Every copy is a value the policy accepts.
+    /// At least one copy is a value a browser acts on (any copy, for an
+    /// arbitrary header).
     Satisfies,
-    /// A copy is one a browser would ignore (empty, or not a recognized value
-    /// for a built-in header).
+    /// Every copy is one a browser ignores entirely (empty, or syntactically
+    /// ineffective for that built-in header).
     Ignored,
 }
 
@@ -334,21 +419,26 @@ impl Plugin for SecurityHeaders {
 }
 
 /// Classify every case-insensitive copy of `entry.name` already in the map.
+///
+/// Conservative across several spellings: one copy a browser acts on keeps
+/// them all, so a combined field view that might still protect is never
+/// replaced.
 fn existing_value(headers: &HashMap<String, String>, entry: &SetEntry) -> ExistingValue {
     let mut present = false;
     for (key, value) in headers {
         if !key.eq_ignore_ascii_case(&entry.name) {
             continue;
         }
-        if let Some(managed) = entry.managed
-            && !managed.browser_honors(value)
-        {
-            return ExistingValue::Ignored;
-        }
         present = true;
+        if entry
+            .managed
+            .is_none_or(|managed| managed.browser_honors(value))
+        {
+            return ExistingValue::Satisfies;
+        }
     }
     if present {
-        ExistingValue::Satisfies
+        ExistingValue::Ignored
     } else {
         ExistingValue::Absent
     }
@@ -538,11 +628,7 @@ fn hsts_value_is_valid(value: &str) -> bool {
             let Some(argument) = argument else {
                 return false;
             };
-            let seconds = argument
-                .strip_prefix('"')
-                .and_then(|rest| rest.strip_suffix('"'))
-                .unwrap_or(argument);
-            if max_age_seen || seconds.is_empty() || !seconds.bytes().all(|b| b.is_ascii_digit()) {
+            if max_age_seen || !is_delta_seconds(argument) {
                 return false;
             }
             max_age_seen = true;

@@ -146,9 +146,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   route's static `security_headers` policy, with the JSON `Content-Type`
   re-asserted and the reauthentication challenge restored when policy removes
   it; no protected-response header survives. With `override_existing: false`,
-  a backend copy of a built-in security header that browsers ignore (empty,
-  `ALLOW-FROM …`, `DENY, SAMEORIGIN`, an HSTS value without `max-age`, an empty
-  CSP / Permissions-Policy) is replaced instead of satisfying the policy.
+  a backend copy of a built-in security header that browsers ignore entirely
+  (empty, a lone `ALLOW-FROM …` or `ALLOWALL`, a Referrer-Policy with no known
+  token, an HSTS value without exactly one valid `max-age`, an empty CSP /
+  Permissions-Policy) is replaced instead of satisfying the policy. Any value a
+  browser acts on — including comma-folded `DENY, DENY` or `DENY, SAMEORIGIN`
+  and `no-referrer, future-policy` — is kept, even when it differs from the
+  configured default.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

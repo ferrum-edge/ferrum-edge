@@ -849,15 +849,14 @@ fn single_copy<'a>(headers: &'a HashMap<String, String>, name: &str) -> Vec<&'a 
 }
 
 /// security_headers-CLAUDE-3: with `override_existing: false`, a backend copy
-/// of a built-in security header that a browser ignores (empty, unrecognized,
-/// or comma-folded duplicates) used to satisfy the policy, so no protection
-/// was delivered. Such a copy now counts as absent and every case variant is
-/// replaced by the configured value.
+/// of a built-in security header that a browser ignores ENTIRELY (empty, or
+/// syntactically ineffective for that header) used to satisfy the policy, so no
+/// protection was delivered. Such a copy now counts as absent and every case
+/// variant is replaced by the configured value.
 #[tokio::test]
 async fn override_disabled_replaces_backend_values_browsers_ignore() {
     let plugin = SecurityHeaders::new(&json!({
         "override_existing": false,
-        "frame_options": "DENY",
         "hsts": "max-age=600",
         "content_security_policy": "default-src 'self'",
         "permissions_policy": "geolocation=()",
@@ -869,17 +868,18 @@ async fn override_disabled_replaces_backend_values_browsers_ignore() {
         (
             "X-Frame-Options",
             "ALLOW-FROM https://partner.example",
-            "DENY",
+            "SAMEORIGIN",
         ),
-        ("X-Frame-Options", "DENY, SAMEORIGIN", "DENY"),
-        ("X-Frame-Options", "", "DENY"),
+        ("X-Frame-Options", "ALLOWALL", "SAMEORIGIN"),
+        ("X-Frame-Options", "", "SAMEORIGIN"),
         ("X-Content-Type-Options", "", "nosniff"),
-        ("X-Content-Type-Options", "nosniff, nosniff", "nosniff"),
+        ("X-Content-Type-Options", "sniff, nosniff", "nosniff"),
         (
             "Referrer-Policy",
             "no-referer",
             "strict-origin-when-cross-origin",
         ),
+        ("Referrer-Policy", " , ", "strict-origin-when-cross-origin"),
         (
             "Strict-Transport-Security",
             "includeSubDomains",
@@ -887,7 +887,7 @@ async fn override_disabled_replaces_backend_values_browsers_ignore() {
         ),
         (
             "Strict-Transport-Security",
-            "max-age=1, max-age=2",
+            "max-age=1; max-age=2",
             "max-age=600",
         ),
         ("Content-Security-Policy", " ", "default-src 'self'"),
@@ -905,14 +905,39 @@ async fn override_disabled_replaces_backend_values_browsers_ignore() {
             "{name}: {ignored:?} must be replaced by exactly one configured copy"
         );
     }
+}
 
-    // Recognized backend values, and any value of an arbitrary header, keep
-    // presence semantics and are preserved.
+/// PR6864-SOL-1: any backend value a browser acts on must survive
+/// `override_existing: false`, even when the strict admission checks would
+/// refuse it as configuration and even when it differs from the configured
+/// default. Comma-folded `DENY, DENY` / `DENY, SAMEORIGIN` still block framing
+/// (HTML X-Frame-Options processing), and `no-referrer,` /
+/// `no-referrer, future-policy` still suppress the Referer (the last
+/// recognized token wins); replacing them with the default `SAMEORIGIN` /
+/// `strict-origin-when-cross-origin` would weaken the backend's protection.
+#[tokio::test]
+async fn override_disabled_keeps_every_backend_value_browsers_honor() {
+    let plugin = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "hsts": "max-age=600",
+        "content_security_policy": "default-src 'self'",
+        "set": { "X-Custom": "gateway" }
+    }))
+    .expect("policy with default SAMEORIGIN frame options");
+
     for (name, kept) in [
+        ("X-Frame-Options", "DENY, DENY"),
+        ("X-Frame-Options", "DENY, SAMEORIGIN"),
+        ("X-Frame-Options", "deny"),
+        ("X-Frame-Options", "DENY,"),
         ("X-Frame-Options", "SAMEORIGIN"),
         ("X-Content-Type-Options", " NOSNIFF "),
+        ("X-Content-Type-Options", "nosniff, nosniff"),
+        ("Referrer-Policy", "no-referrer,"),
+        ("Referrer-Policy", "no-referrer, future-policy"),
         ("Referrer-Policy", "no-referrer, same-origin"),
         ("Strict-Transport-Security", "max-age=60; includeSubDomains"),
+        ("Strict-Transport-Security", "max-age=60; preload; preload"),
         ("Content-Security-Policy", "default-src 'none'"),
         ("X-Custom", ""),
     ] {
@@ -922,9 +947,20 @@ async fn override_disabled_replaces_backend_values_browsers_ignore() {
         assert_eq!(
             single_copy(&headers, name),
             vec![kept],
-            "{name}: recognized backend value {kept:?} must be preserved"
+            "{name}: effective backend value {kept:?} must be preserved"
         );
     }
+
+    // One effective spelling keeps the combined field view untouched.
+    let mut request = ctx();
+    let mut headers = HashMap::from([
+        ("X-Frame-Options".to_string(), "DENY".to_string()),
+        ("x-frame-options".to_string(), String::new()),
+    ]);
+    plugin.after_proxy(&mut request, 200, &mut headers).await;
+    let mut copies = single_copy(&headers, "x-frame-options");
+    copies.sort_unstable();
+    assert_eq!(copies, vec!["", "DENY"]);
 }
 
 /// security_headers-CLAUDE-4: entry counts and value lengths are bounded at

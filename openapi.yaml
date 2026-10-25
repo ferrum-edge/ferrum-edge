@@ -29892,7 +29892,7 @@ components:
     SecurityHeadersConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, `config` must be an object, and `set` and `remove` reject gateway-owned destinations: protocol-managed hop-by-hop / framing fields and representation metadata (`content-type`, `content-encoding`, `content-range`). `set` holds at most 64 entries, `remove` at most 64 names, and every configured value at most 8192 bytes. With `override_existing: false`, a backend copy of a built-in security header that browsers ignore (empty or unrecognized) is replaced rather than preserved. An effective policy that sets and removes nothing is rejected."
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, `config` must be an object, and `set` and `remove` reject gateway-owned destinations: protocol-managed hop-by-hop / framing fields and representation metadata (`content-type`, `content-encoding`, `content-range`). `set` holds at most 64 entries, `remove` at most 64 names, and every configured value at most 8192 bytes. With `override_existing: false`, a backend copy of a built-in security header that browsers ignore entirely (empty or ineffective) is replaced rather than preserved; values browsers act on are kept. An effective policy that sets and removes nothing is rejected."
       not:
         allOf:
           - required: [content_type_options]
@@ -30051,7 +30051,7 @@ components:
         override_existing:
           type: [boolean, "null"]
           default: true
-          description: "When false, only add a header the backend did not already set. A backend copy of a built-in security header (X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Strict-Transport-Security, Content-Security-Policy, Permissions-Policy) that browsers ignore — empty, or not a value the matching option accepts — counts as missing and every case variant is replaced; arbitrary `set` headers keep pure presence semantics. Null selects true."
+          description: "When false, only add a header the backend did not already set. A backend copy of a built-in security header (X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Strict-Transport-Security, Content-Security-Policy, Permissions-Policy) that browsers ignore entirely — empty, or ineffective under browser processing (a lone ALLOW-FROM/ALLOWALL, no known Referrer-Policy token, first X-Content-Type-Options value not nosniff, HSTS without exactly one valid max-age) — counts as missing and every case variant is replaced; any value a browser acts on (for example DENY, SAMEORIGIN or no-referrer, future-policy) is kept even when it differs from the configured default; arbitrary `set` headers keep pure presence semantics. Null selects true."
 
     CompressionConfig:
       type: [object, "null"]
