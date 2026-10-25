@@ -287,10 +287,11 @@ c32a8e92836e0bd55a0939bcf3a1eff5f407ec26c15cfc22bcd7ab315095c18a  vendor/hyper-1
 0530dbb42bdddfba675c51d98e57fcbd614447ad317036900a0c17c5da51ecb9  vendor/hyper-1.10.0-ferrum-patched/src/common/watch.rs
 bc07d9d804ca06140d01cf7c45f4d61b14df0d657de3fc20e4d4034a6ab0ce9e  vendor/hyper-1.10.0-ferrum-patched/src/error.rs
 db6fed7c4aec000af820989f0508a2534d864f3cce32cb19a12aca59b0705a22  vendor/hyper-1.10.0-ferrum-patched/src/ext/h1_reason_phrase.rs
+b0688064254f17dddc58780a74137b9edf6b92326e58fd6c42af76b15d358aba  vendor/hyper-1.10.0-ferrum-patched/src/ext/h2_body_deadline.rs
 e8b1f5e927d276a792ef441ae24cf3d0fc4eb64cb9d0e83788cb7365d4da0cd7  vendor/hyper-1.10.0-ferrum-patched/src/ext/h2_body_write_timeout.rs
 a064a160e1e8535588343b96423c7bfad327401849915b91d0bf80f2f5bb64a1  vendor/hyper-1.10.0-ferrum-patched/src/ext/h2_stream_termination.rs
 83a9b2a9cd7086f2be65d508d4cf0f45a2977fb90f94926d6a3cfbc98bdba073  vendor/hyper-1.10.0-ferrum-patched/src/ext/informational.rs
-14f6d5e587887e1343950b5edf3b8abbb3ef922d58860a7684e2d6b70bd7a6dd  vendor/hyper-1.10.0-ferrum-patched/src/ext/mod.rs
+de178179f4c9eba89f13b30c268094d4a4c86f20918ac4e254dcccc2e18da2df  vendor/hyper-1.10.0-ferrum-patched/src/ext/mod.rs
 614955cfca938025a7b471d9bc91004edfd1ff028b66553ce757b5b0ec040dce  vendor/hyper-1.10.0-ferrum-patched/src/ffi/body.rs
 f3e7b519d9725b99ddc18a25ab527014c804d5e112fe130ef3dd539eac6e5a09  vendor/hyper-1.10.0-ferrum-patched/src/ffi/client.rs
 dd269cd749cfe2679ba499e9dc0832469cbf4f8101157fd88d00c0fb526868d8  vendor/hyper-1.10.0-ferrum-patched/src/ffi/error.rs
@@ -309,7 +310,7 @@ c482e01ab0513e31c610b181de7a36f34b7da7f8469dfa4759c1f37fcb7ee7fe  vendor/hyper-1
 4e21b38d254e04ae42e4f01448ecf11fcd7304387780a47da3bca3ff2592e403  vendor/hyper-1.10.0-ferrum-patched/src/proto/h1/io.rs
 bdb49167f68428e34b9b60a46c535fa44d9a3a6a849b1f232a466f8379efd792  vendor/hyper-1.10.0-ferrum-patched/src/proto/h1/mod.rs
 1a382c3f9e395fdbdac557072e1f6c5e4fcebcb53dc604410e117f34adb16ffc  vendor/hyper-1.10.0-ferrum-patched/src/proto/h1/role.rs
-323d957facddb0f881515dbb162c22ddfce47eeb3042b85439f55629c8e6bd2b  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/client.rs
+2c2165675c7c6b3d90f715c890a622982e0b2dc0cf5bb1b6bd3cd465550cd82f  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/client.rs
 5495ca4ef2a6c6d177937700c3c9528588401e1cf8c9130aed460e3b95077745  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/mod.rs
 b091b7c2123a4003805992ea369d748ccbf65895e5f5b45ed2806da6cf1df171  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/ping.rs
 a0871194c7fe778821aa7c7c6e21d781eb2a7e06a5003f6774bca75897ae8d99  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/server.rs

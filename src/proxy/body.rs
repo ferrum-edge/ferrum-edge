@@ -5781,9 +5781,11 @@ where
 ///
 /// Dropping the backend RESPONSE alone does not reset an HTTP/2 stream whose
 /// UPLOAD half is still open (hyper's request pipe keeps a stream reference);
-/// the native-gRPC streaming upload therefore carries the same absolute
-/// deadline itself (`GrpcBody::Streaming::rpc_deadline`), and its error makes
-/// hyper reset the whole backend stream.
+/// the upload therefore carries the same absolute deadline into hyper's own
+/// request-body pipe (`grpc_proxy::attach_grpc_upload_deadline`, hyper patch
+/// 007), which resets the whole backend stream even while parked on backend
+/// flow control; the native-gRPC streaming body also ends in an error at it
+/// (`GrpcBody::Streaming::rpc_deadline`).
 #[derive(Clone, Debug)]
 pub(crate) struct ClientGrpcResponseDeadline {
     at: tokio::time::Instant,

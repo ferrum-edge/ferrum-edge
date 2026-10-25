@@ -61561,6 +61561,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     if let Some(write_timeout) = pipe_write_timeout.as_ref() {
         parts.extensions.insert(write_timeout.clone());
     }
+    // Same client RPC upload deadline as the native gRPC streaming dispatch:
+    // hyper's body pipe resets a still-open upload at the deadline even while
+    // parked on backend flow control (hyper patch 007).
+    grpc_proxy::attach_grpc_upload_deadline(&mut parts.extensions, client_grpc_deadline_at);
     parts.uri = tunneled_uri;
     parts.version = hyper::Version::HTTP_2;
     parts.method = match parse_hyper_method(method) {
@@ -61889,6 +61893,24 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                             resolved_ip,
                         )
                     },
+                    None,
+                    None,
+                );
+            }
+            // hyper's body pipe resets the stream at the client RPC deadline
+            // (hyper patch 007), the instant the header wait expires: a failure
+            // at or after it is that deadline, not a backend fault.
+            if is_grpc_flavored
+                && grpc_send_deadline_is_client
+                && client_grpc_deadline_at
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return (
+                    client_grpc_deadline_exceeded_response_for_request(
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -62739,6 +62761,9 @@ async fn proxy_to_backend_http2(
     if let Some(write_timeout) = passthrough_write_timeout.as_ref() {
         parts.extensions.insert(write_timeout.clone());
     }
+    // A gRPC upload relayed over direct H2 carries the same client RPC upload
+    // deadline as the native gRPC dispatch (hyper patch 007).
+    grpc_proxy::attach_grpc_upload_deadline(&mut parts.extensions, grpc_deadline_at);
     let backend_req = Request::from_parts(parts, body);
 
     // Post-EOS transport-drain bound (issue #4411): publish the backend socket

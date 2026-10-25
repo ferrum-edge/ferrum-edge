@@ -306,6 +306,22 @@ pub enum GrpcBody {
 const GRPC_UPLOAD_RPC_DEADLINE_MESSAGE: &str =
     "gRPC request upload ended: client RPC deadline exceeded";
 
+/// Attach the client RPC deadline to an HTTP/2 backend request as hyper's
+/// `Http2BodyDeadline` (hyper patch 007). The request body pipe then resets the
+/// stream at the deadline from its own task, whatever it is parked on — the
+/// client upload, or backend flow control with a chunk it cannot yet send —
+/// so a still-open upload cannot keep either half of the backend exchange
+/// alive past the RPC budget. A body that has already been sent in full arms
+/// nothing.
+pub(crate) fn attach_grpc_upload_deadline(
+    extensions: &mut http::Extensions,
+    deadline: Option<tokio::time::Instant>,
+) {
+    if let Some(deadline) = deadline {
+        extensions.insert(hyper::ext::Http2BodyDeadline::new(deadline.into_std()));
+    }
+}
+
 /// Arm [`GrpcBody::Streaming`]'s client RPC deadline. One timer per
 /// deadline-bearing streaming upload; it is dropped with the body as soon as
 /// the upload completes.
@@ -5972,6 +5988,10 @@ async fn proxy_grpc_streaming_dispatch(
     if let Some(write_timeout) = body_write_timeout.as_ref() {
         backend_req.extensions_mut().insert(write_timeout.clone());
     }
+    // The client RPC deadline also bounds the upload from hyper's own body
+    // pipe (hyper patch 007), which outlives this future and, while it holds a
+    // chunk the backend granted no window for, polls nothing the gateway owns.
+    attach_grpc_upload_deadline(backend_req.extensions_mut(), grpc_deadline_at);
 
     // Authorization ownership was armed before pool acquisition, but a slow
     // connect is not backend-body write inactivity. Start the write watermark

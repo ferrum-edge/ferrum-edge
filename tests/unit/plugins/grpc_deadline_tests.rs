@@ -6896,3 +6896,71 @@ fn a_composed_preflight_rejection_keeps_the_established_budget() {
         "the rejection log must still carry the budget the earlier instance established"
     );
 }
+
+/// Drive the RPC pump's intermediate reader the way an outer authorization
+/// pump does in production: it acknowledges the expiry on its own poll, while
+/// the client-facing guard stays alive because the client never drained.
+async fn rpc_close_after_an_intermediate_expiry_acknowledgement(drop_guard: bool) -> bool {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_streaming_for_test,
+        rpc_deadline_cancellable_body_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::new(),
+        dropped: Arc::clone(&dropped),
+    }));
+    let (mut reader, guard) = rpc_deadline_cancellable_body_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Arc::new(AtomicBool::new(false)),
+        closer.clone(),
+    );
+
+    // The pump expires at 1 s, releases the backend, and starts its grace.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+
+    // The intermediate reader polls now and settles the expiry itself.
+    let terminal = reader
+        .frame()
+        .await
+        .expect("the claimed expiry produces a terminal");
+    assert!(terminal.is_err(), "an unwrapped reader ends in an error");
+    drop(reader);
+    if drop_guard {
+        // hyper finished with the client-facing body: the client drained.
+        drop(guard);
+        tokio::time::sleep(authorization_transport_close_grace() + Duration::from_secs(1)).await;
+        return closer.close_requested();
+    }
+
+    tokio::time::sleep(authorization_transport_close_grace() + Duration::from_secs(1)).await;
+    let requested = closer.close_requested();
+    drop(guard);
+    requested
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_intermediate_expiry_acknowledgement_cannot_suppress_the_rpc_close() {
+    assert!(
+        rpc_close_after_an_intermediate_expiry_acknowledgement(false).await,
+        "an intermediate reader settling the expiry (an outer authorization pump in \
+         production) is not the client draining it: while the client-facing body is still \
+         held, the RPC grace must close the stalled connection"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_the_client_facing_body_still_cancels_the_rpc_close() {
+    assert!(
+        !rpc_close_after_an_intermediate_expiry_acknowledgement(true).await,
+        "hyper dropping the client-facing body proves settlement and must cancel the close"
+    );
+}

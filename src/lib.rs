@@ -10859,6 +10859,36 @@ pub mod _test_support {
         )
     }
 
+    /// The client RPC deadline's pump guard, held by the client-facing body
+    /// in production. Opaque: a test only keeps it alive or drops it.
+    pub struct RpcDeadlinePumpGuardForTest(
+        #[allow(dead_code)] crate::proxy::response_watchdog::ResponsePumpGuard,
+    );
+
+    /// Move one body into the client RPC deadline's response pump, as
+    /// `ProxyBody::with_client_grpc_deadline` does on an H1/H2 frontend, and
+    /// return the pump's intermediate reader separately from its guard, so a
+    /// test can drive that reader's own expiry acknowledgement while the
+    /// client-facing guard stays alive.
+    pub fn rpc_deadline_cancellable_body_for_test(
+        inner: crate::proxy::ProxyBody,
+        deadline_at: tokio::time::Instant,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> (
+        crate::proxy::response_watchdog::AuthorizationCancellableBody,
+        RpcDeadlinePumpGuardForTest,
+    ) {
+        let (body, guard) =
+            crate::proxy::response_watchdog::AuthorizationCancellableBody::for_client_rpc_deadline(
+                inner,
+                deadline_at,
+                fired,
+                Some(closer),
+            );
+        (body, RpcDeadlinePumpGuardForTest(guard))
+    }
+
     /// Which owner settled one authenticated streaming response (issue #3815).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum AuthorizationTerminalOwnershipForTest {

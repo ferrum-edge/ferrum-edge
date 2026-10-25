@@ -471,6 +471,7 @@ async fn run_response_pump<B>(
     fired: Arc<AtomicBool>,
     released: Arc<AtomicBool>,
     settled: Arc<AtomicBool>,
+    settlement_by_reader: bool,
     terminal: AuthorizationTerminalOwner,
     closer: Option<AuthorizationConnectionCloser>,
 ) where
@@ -601,7 +602,15 @@ async fn run_response_pump<B>(
             // protocol-correct terminal on its own. A body that does so is
             // dropped, which aborts this task before the sleep completes.
             tokio::time::sleep(TRANSPORT_CLOSE_GRACE).await;
-            if !settled.load(Ordering::Acquire) {
+            // The client RPC deadline's pump is owned by the CLIENT-FACING
+            // body ([`ResponsePumpGuard`]), so reaching this line already
+            // proves the client has not drained the terminal: hyper would have
+            // dropped that body and aborted this task. Its intermediate
+            // reader's `settled` acknowledgement is not that proof — an outer
+            // authorization pump can consume the terminal on the client's
+            // behalf — so only the authorization regime, whose reader IS the
+            // client-facing adapter, consults it.
+            if !settlement_by_reader || !settled.load(Ordering::Acquire) {
                 closer.request_close();
             }
         }
@@ -709,6 +718,9 @@ impl AuthorizationCancellableBody {
             Arc::clone(&fired),
             Arc::clone(&released),
             Arc::clone(&settled),
+            // Only the authorization regime's reader is the client-facing
+            // adapter; the RPC pump's settlement is its guard's lifetime.
+            accounting.is_some(),
             terminal.clone(),
             closer,
         ));
