@@ -224,13 +224,23 @@ fn test_content_type_exact_media_type_matching() {
         (" application/json ", true),
         ("application/xml; charset=utf-8", true),
         ("text/xml; charset=utf-8", true),
+        // RFC 6838 structured-suffix types are in the default list.
+        ("application/json-patch+json", true),
+        ("application/problem+json", true),
+        ("application/vnd.acme.v2+json; charset=utf-8", true),
+        ("application/soap+xml", true),
+        ("application/atom+xml", true),
+        // ...but a bare suffix and gRPC-family framings are not documents.
+        ("application/+json", false),
+        ("application/grpc+json", false),
+        ("application/grpc-web+json", false),
+        ("application/grpc-web-text+json", false),
+        ("text/foo+json", false),
         // Neighboring / distinct types must NOT match.
         ("application/json-seq", false),
         ("application/jsonp", false),
-        ("application/json-patch+json", false), // not in default list
         ("application/json2", false),
         ("text/xmlish", false),
-        ("application/soap+xml", false), // not in default list
         // Parameter values that merely contain a configured string.
         (
             "application/octet-stream; profile=\"application/json\"",
@@ -4019,7 +4029,10 @@ fn every_documented_config_key_is_accepted_together() {
             }
         },
         "protobuf_reject_unknown_fields": true,
-        "grpc_max_decompressed_size_bytes": 1024
+        "grpc_max_decompressed_size_bytes": 1024,
+        "enforcement_mode": "block",
+        "reject_unsupported_media_types": true,
+        "response_status_codes": ["2XX", 422]
     });
 
     let object = config.as_object().expect("object config");
@@ -6665,4 +6678,1139 @@ fn inherited_grpc_decompression_default_is_clamped_to_the_ceiling() {
             10 * 1024 * 1024
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Production-launch review fixes
+// ═══════════════════════════════════════════════════════════════════════
+
+fn grpc_frame_with_flag(flag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(flag);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn grpc_web_trailer_frame(block: &str) -> Vec<u8> {
+    grpc_frame_with_flag(0x80, block.as_bytes())
+}
+
+fn hello_ctx(path: &str) -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        path.to_string(),
+    )
+}
+
+fn content_type_headers(content_type: &str) -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), content_type.to_string())])
+}
+
+fn rejected_status(result: &PluginResult) -> Option<u16> {
+    match result {
+        PluginResult::Reject { status_code, .. } => Some(*status_code),
+        _ => None,
+    }
+}
+
+// ─── SOL-1: per-method request rules apply without a synthetic `:path` ──
+
+/// HTTP/3, the H3 bridge, and generic dispatch never inject `:path` into the
+/// final-hook headers. A method-only request rule must still select its
+/// descriptor from the request context there instead of silently skipping.
+#[tokio::test]
+async fn per_method_protobuf_request_rule_applies_without_a_synthetic_path_header() {
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {"request": "test.HelloRequest"}
+        },
+        "protobuf_reject_unknown_fields": true
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/grpc");
+    let mut unknown = encode_hello_request("Eve", 25);
+    unknown.extend_from_slice(&[0x98, 0x06, 0x01]); // field 99 = 1
+    let unknown = grpc_frame(&unknown);
+    let valid = grpc_frame(&encode_hello_request("Eve", 25));
+
+    let mut ctx = hello_ctx("/test.Greeter/SayHello");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &unknown)
+            .await,
+        Some(400),
+    );
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &[0xFF, 0x00])
+            .await,
+        Some(400),
+    );
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &valid)
+            .await,
+    );
+
+    // `grpc_full_method` (from `grpc_method_router`) names the method too.
+    let mut routed = hello_ctx("/rewritten");
+    routed.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut routed, &headers, &unknown)
+            .await,
+        Some(400),
+    );
+
+    // An unenrolled method is still not validated.
+    let mut other = hello_ctx("/test.Greeter/Other");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut other, &headers, &unknown)
+            .await,
+    );
+}
+
+/// The missing-descriptor fail-closed check uses the same resolved method.
+#[tokio::test]
+async fn missing_descriptor_fails_closed_for_a_context_selected_method() {
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {"request": "test.HelloRequest"}
+        }
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/grpc");
+    let mut ctx = hello_ctx("/test.Greeter/SayHello");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &[0, 0, 0, 0, 0])
+            .await,
+        Some(400),
+    );
+}
+
+// ─── SOL-2: empty synthetic successes are validated ─────────────────────
+
+#[test]
+fn empty_synthetic_successes_opt_into_response_validation() {
+    let plugin = response_schema_plugin(json!({"type": "object", "required": ["id"]}));
+    let ctx = make_response_ctx();
+    assert!(plugin.should_process_empty_synthetic_response_body(&ctx, 200));
+    assert!(plugin.should_process_empty_synthetic_response_body(&ctx, 201));
+    // Protocol no-body statuses, out-of-scope statuses, and fragments are not.
+    for status in [204u16, 205, 304, 404, 500, 206] {
+        assert!(
+            !plugin.should_process_empty_synthetic_response_body(&ctx, status),
+            "status {status} must not open the empty synthetic pipeline"
+        );
+    }
+    let head = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "HEAD".to_string(),
+        "/api/data".to_string(),
+    );
+    assert!(!plugin.should_process_empty_synthetic_response_body(&head, 200));
+
+    let request_only = BodyValidator::new(&json!({"required_fields": ["id"]})).unwrap();
+    assert!(!request_only.should_process_empty_synthetic_response_body(&ctx, 200));
+}
+
+/// End to end through the shared synthetic finalizer: an empty `200 JSON`
+/// short-circuit (for example an empty `response_mock` body) is refused with a
+/// `502` instead of being delivered unvalidated.
+#[tokio::test]
+async fn an_empty_synthetic_json_success_is_refused_by_the_synthetic_finalizer() {
+    use ferrum_edge::_test_support::{
+        finalize_synthetic_response_for_test, synthetic_response_body_hooks_apply_for_test,
+    };
+    let plugins: Vec<std::sync::Arc<dyn Plugin>> = vec![std::sync::Arc::new(
+        BodyValidator::new(&json!({"response_required_fields": ["id"]})).unwrap(),
+    )];
+    let mut ctx = make_response_ctx();
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    assert!(synthetic_response_body_hooks_apply_for_test(
+        200, false, b"", &plugins, &ctx
+    ));
+
+    let mut status = 200u16;
+    let mut headers = response_json_headers();
+    let mut body = bytes::Bytes::new();
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+    assert_eq!(status, 502, "an empty JSON success must fail validation");
+}
+
+// ─── SOL-3 / M6: bounded, charged protobuf decoding ─────────────────────
+
+const PB_TYPE_ENUM: u64 = 14;
+
+fn pb_enum(name: &str, values: &[(&str, u64)]) -> Vec<u8> {
+    let mut out = pb_str_field(1, name);
+    for (value_name, number) in values {
+        let mut value = pb_str_field(1, value_name);
+        value.extend(pb_varint_field(2, *number));
+        out.extend(pb_len_field(2, &value));
+    }
+    out
+}
+
+fn pb_enum_field(name: &str, number: u32, label: u64, ty: &str) -> Vec<u8> {
+    let mut out = pb_field(name, number, label, PB_TYPE_ENUM);
+    out.extend(pb_str_field(6, ty));
+    out
+}
+
+fn pb_file(name: &str, package: &str, syntax: Option<&str>, entries: &[(u32, Vec<u8>)]) -> Vec<u8> {
+    let mut file = pb_str_field(1, name);
+    file.extend(pb_str_field(2, package));
+    for (field, entry) in entries {
+        file.extend(pb_len_field(*field, entry));
+    }
+    if let Some(syntax) = syntax {
+        file.extend(pb_str_field(12, syntax));
+    }
+    pb_len_field(1, &file)
+}
+
+const PB_FILE_MESSAGE: u32 = 4;
+const PB_FILE_ENUM: u32 = 5;
+
+/// A proto3-ONLY descriptor set, so no proto2 initialization walk runs and the
+/// resource bounds must hold on their own:
+///
+/// ```proto
+/// syntax = "proto3"; package t3;
+/// message Child {}
+/// message Parent { repeated Child children = 1; repeated int32 values = 2; }
+/// message Node { Node next = 1; }
+/// enum Level { LOW = 0; }
+/// message Leveled { Level level = 1; }
+/// ```
+fn proto3_review_set() -> Vec<u8> {
+    let child = pb_message("Child", &[]);
+    let parent = pb_message(
+        "Parent",
+        &[
+            pb_message_field("children", 1, PB_LABEL_REPEATED, ".t3.Child"),
+            pb_field("values", 2, PB_LABEL_REPEATED, PB_TYPE_INT32),
+        ],
+    );
+    let node = pb_message(
+        "Node",
+        &[pb_message_field("next", 1, PB_LABEL_OPTIONAL, ".t3.Node")],
+    );
+    let level = pb_enum("Level", &[("LOW", 0)]);
+    let leveled = pb_message(
+        "Leveled",
+        &[pb_enum_field("level", 1, PB_LABEL_OPTIONAL, ".t3.Level")],
+    );
+    pb_file(
+        "t3.proto",
+        "t3",
+        Some("proto3"),
+        &[
+            (PB_FILE_MESSAGE, child),
+            (PB_FILE_MESSAGE, parent),
+            (PB_FILE_MESSAGE, node),
+            (PB_FILE_ENUM, level),
+            (PB_FILE_MESSAGE, leveled),
+        ],
+    )
+}
+
+/// A proto2 descriptor set with a closed enum:
+///
+/// ```proto
+/// syntax = "proto2"; package e2;
+/// enum Mode { SAFE = 0; }
+/// message Request { required Mode mode = 1; }
+/// message Tags { repeated Mode modes = 1; }
+/// ```
+fn proto2_enum_set() -> Vec<u8> {
+    let mode = pb_enum("Mode", &[("SAFE", 0)]);
+    let request = pb_message(
+        "Request",
+        &[pb_enum_field("mode", 1, PB_LABEL_REQUIRED, ".e2.Mode")],
+    );
+    let tags = pb_message(
+        "Tags",
+        &[pb_enum_field("modes", 1, PB_LABEL_REPEATED, ".e2.Mode")],
+    );
+    pb_file(
+        "e2.proto",
+        "e2",
+        None,
+        &[
+            (PB_FILE_ENUM, mode),
+            (PB_FILE_MESSAGE, request),
+            (PB_FILE_MESSAGE, tags),
+        ],
+    )
+}
+
+fn review_descriptor_dir(set: Vec<u8>) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("review.bin"), set).expect("write set");
+    dir
+}
+
+fn review_plugin(dir: &tempfile::TempDir, extra: serde_json::Value) -> BodyValidator {
+    let mut config = json!({
+        "protobuf_descriptor_path": dir.path().join("review.bin").to_string_lossy(),
+    });
+    let object = config.as_object_mut().expect("object");
+    for (key, value) in extra.as_object().expect("extra object") {
+        object.insert(key.clone(), value.clone());
+    }
+    BodyValidator::new(&config).expect("review plugin config")
+}
+
+fn repeated_empty_children(count: usize) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(count * 2);
+    for _ in 0..count {
+        payload.extend_from_slice(&[0x0a, 0x00]);
+    }
+    payload
+}
+
+/// A proto3-only pool with default unknown-field handling used to skip the
+/// message budget entirely, reflecting every repeated child before any limit
+/// ran. The wire preflight now refuses it before reflection.
+#[tokio::test]
+async fn protobuf_message_budget_is_enforced_before_reflection_for_proto3_pools() {
+    let dir = review_descriptor_dir(proto3_review_set());
+    let plugin = review_plugin(&dir, json!({"protobuf_request_type": "t3.Parent"}));
+    let headers = grpc_request_headers();
+
+    let within = grpc_frame(&repeated_empty_children(49_000));
+    assert_continue(plugin.on_final_request_body(&headers, &within).await);
+
+    let over = grpc_frame(&repeated_empty_children(50_001));
+    let body = reject_body(plugin.on_final_request_body(&headers, &over).await);
+    assert!(body.contains("inspection budget"), "{body}");
+
+    // The same bound holds for a gzip-compressed frame of the same payload.
+    let compressed = grpc_frame_with_flag(1, &gzip_member(&repeated_empty_children(50_001)));
+    let body = reject_body(plugin.on_final_request_body(&headers, &compressed).await);
+    assert!(body.contains("inspection budget"), "{body}");
+}
+
+#[tokio::test]
+async fn protobuf_value_and_depth_budgets_are_enforced_before_reflection() {
+    let dir = review_descriptor_dir(proto3_review_set());
+    let parent = review_plugin(&dir, json!({"protobuf_request_type": "t3.Parent"}));
+    let headers = grpc_request_headers();
+
+    // One packed field of 1,048,577 zero varints: a ~1 MiB payload that would
+    // reflect into over a million list values.
+    let packed = vec![0u8; (1 << 20) + 1];
+    let frame = grpc_frame(&pb_len_field(2, &packed));
+    let body = reject_body(parent.on_final_request_body(&headers, &frame).await);
+    assert!(body.contains("inspection budget"), "{body}");
+
+    // 40 levels of `Node { next }` exceed the 32-level bound.
+    let node = review_plugin(&dir, json!({"protobuf_request_type": "t3.Node"}));
+    let mut nested = Vec::new();
+    for _ in 0..40 {
+        nested = pb_len_field(1, &nested);
+    }
+    let body = reject_body(
+        node.on_final_request_body(&headers, &grpc_frame(&nested))
+            .await,
+    );
+    assert!(body.contains("nests deeper"), "{body}");
+
+    // A shallow chain still passes.
+    let mut shallow = Vec::new();
+    for _ in 0..8 {
+        shallow = pb_len_field(1, &shallow);
+    }
+    assert_continue(
+        node.on_final_request_body(&headers, &grpc_frame(&shallow))
+            .await,
+    );
+}
+
+/// The decompressed payload and the decoder heap are charged to the aggregate
+/// budget before allocation: a budget that cannot admit them refuses with the
+/// capacity outcome (not a validation verdict), and every charge is released
+/// when validation returns.
+#[test]
+fn protobuf_decode_working_set_is_charged_to_the_aggregate_budget() {
+    use ferrum_edge::_test_support::{
+        ResponseBufferBudgetProbe,
+        body_validator_protobuf_request_outcome_in_budget_for_test as outcome,
+    };
+    let plugin = protobuf_plugin();
+    let payload = encode_hello_request("Ada", 36);
+    let plain = grpc_frame(&payload);
+    let compressed = grpc_frame_with_flag(1, &gzip_member(&payload));
+    let path = "/test.Greeter/SayHello";
+
+    // One 64 KiB block cannot admit the gzip decoder's own heap.
+    let small = ResponseBufferBudgetProbe::new(64 * 1024, 64 * 1024);
+    let small_available = small.available_bytes();
+    assert_eq!(outcome(&plugin, &small, path, &compressed), "capacity");
+    assert_eq!(
+        small.available_bytes(),
+        small_available,
+        "refusal leaks no charge"
+    );
+    // ...but an uncompressed frame's small reflected working set fits.
+    assert_eq!(outcome(&plugin, &small, path, &plain), "pass");
+    assert_eq!(
+        small.available_bytes(),
+        small_available,
+        "a pass releases its charge"
+    );
+
+    // With the block held elsewhere even the uncompressed decode is refused.
+    let held = small.try_reserve(64 * 1024).expect("hold the only block");
+    assert_eq!(outcome(&plugin, &small, path, &plain), "capacity");
+    drop(held);
+    assert_eq!(outcome(&plugin, &small, path, &plain), "pass");
+
+    let large = ResponseBufferBudgetProbe::new(64 * 1024 * 1024, 64 * 1024 * 1024);
+    let large_available = large.available_bytes();
+    assert_eq!(outcome(&plugin, &large, path, &compressed), "pass");
+    assert_eq!(large.available_bytes(), large_available);
+    assert_eq!(
+        outcome(&plugin, &large, path, &grpc_frame(&[0xFF, 0xFE])),
+        "invalid"
+    );
+}
+
+// ─── SOL-4: closed proto2 enums ─────────────────────────────────────────
+
+#[tokio::test]
+async fn an_undeclared_closed_enum_number_cannot_satisfy_a_required_field() {
+    let dir = review_descriptor_dir(proto2_enum_set());
+    let plugin = review_plugin(
+        &dir,
+        json!({
+            "protobuf_request_type": "e2.Request",
+            "protobuf_response_type": "e2.Request"
+        }),
+    );
+    let headers = grpc_request_headers();
+    let undeclared = grpc_frame(&pb_varint_field(1, 1));
+    let declared = grpc_frame(&pb_varint_field(1, 0));
+
+    assert_reject(
+        plugin.on_final_request_body(&headers, &undeclared).await,
+        Some(400),
+    );
+    assert_continue(plugin.on_final_request_body(&headers, &declared).await);
+
+    let mut ctx = grpc_ctx();
+    assert_reject(
+        plugin
+            .finalize_client_visible_response_body(
+                &mut ctx,
+                200,
+                &grpc_response_headers(),
+                &undeclared,
+            )
+            .await,
+        Some(502),
+    );
+    // A declared value followed by an undeclared duplicate leaves the last
+    // occurrence undeclared, so the field is still unset.
+    let mut duplicate = pb_varint_field(1, 0);
+    duplicate.extend(pb_varint_field(1, 7));
+    assert_reject(
+        plugin
+            .on_final_request_body(&headers, &grpc_frame(&duplicate))
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn undeclared_closed_enum_values_are_unknown_fields_but_open_enums_are_not() {
+    let dir = review_descriptor_dir(proto2_enum_set());
+    let open_dir = review_descriptor_dir(proto3_review_set());
+    let headers = grpc_request_headers();
+    let mut tags = pb_varint_field(1, 0);
+    tags.extend(pb_varint_field(1, 9));
+    let tags = grpc_frame(&tags);
+
+    let strict = review_plugin(
+        &dir,
+        json!({"protobuf_request_type": "e2.Tags", "protobuf_reject_unknown_fields": true}),
+    );
+    assert_reject(
+        strict.on_final_request_body(&headers, &tags).await,
+        Some(400),
+    );
+    let permissive = review_plugin(&dir, json!({"protobuf_request_type": "e2.Tags"}));
+    assert_continue(permissive.on_final_request_body(&headers, &tags).await);
+
+    // proto3 enums are open: an unknown number is a value, not an unknown field.
+    let open = review_plugin(
+        &open_dir,
+        json!({"protobuf_request_type": "t3.Leveled", "protobuf_reject_unknown_fields": true}),
+    );
+    assert_continue(
+        open.on_final_request_body(&headers, &grpc_frame(&pb_varint_field(1, 5)))
+            .await,
+    );
+}
+
+// ─── M2: gRPC-Web responses are protobuf-validated ──────────────────────
+
+#[tokio::test]
+async fn translated_and_pass_through_grpc_web_responses_are_protobuf_validated() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = protobuf_plugin_with_method_messages();
+    let valid = grpc_frame(&encode_hello_response("Hi", true));
+    let invalid = grpc_frame(&[0xFF, 0xFE, 0xFD, 0xFC]);
+    let ok_trailer = grpc_web_trailer_frame("grpc-status: 0\r\n");
+    let error_trailer = grpc_web_trailer_frame("grpc-status: 13\r\ngrpc-message: boom\r\n");
+
+    let cases: Vec<(Vec<u8>, bool)> = vec![
+        ([valid.clone(), ok_trailer.clone()].concat(), true),
+        (valid.clone(), true),
+        ([invalid.clone(), ok_trailer.clone()].concat(), false),
+        (error_trailer.clone(), true),
+        (ok_trailer.clone(), false),
+        ([valid.clone(), valid.clone()].concat(), false),
+        ([ok_trailer.clone(), valid.clone()].concat(), false),
+    ];
+    for (binary, should_pass) in cases {
+        for (content_type, body) in [
+            ("application/grpc-web+proto", binary.clone()),
+            ("application/grpc-web", binary.clone()),
+            (
+                "application/grpc-web-text+proto",
+                BASE64.encode(binary.as_slice()).into_bytes(),
+            ),
+        ] {
+            let mut ctx = hello_ctx("/test.Greeter/SayHello");
+            let headers = content_type_headers(content_type);
+            let result = plugin
+                .finalize_client_visible_response_body(&mut ctx, 200, &headers, &body)
+                .await;
+            if should_pass {
+                assert_continue(result);
+            } else {
+                assert_reject(result, Some(502));
+            }
+        }
+    }
+
+    // The response buffering refinement keeps applicable gRPC-Web responses
+    // buffered so the final phase can see them.
+    let ctx = hello_ctx("/test.Greeter/SayHello");
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/grpc-web-text+proto"),
+        200,
+        &HashMap::new(),
+    ));
+}
+
+#[tokio::test]
+async fn pass_through_grpc_web_requests_are_protobuf_validated() {
+    let plugin = protobuf_plugin_reject_unknown();
+    let headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "application/grpc-web+proto".to_string(),
+        ),
+        (":path".to_string(), "/test.Greeter/SayHello".to_string()),
+    ]);
+    let valid = grpc_frame(&encode_hello_request("Ada", 36));
+    assert_continue(plugin.on_final_request_body(&headers, &valid).await);
+    let mut unknown = encode_hello_request("Ada", 36);
+    unknown.extend_from_slice(&[0x98, 0x06, 0x01]);
+    assert_reject(
+        plugin
+            .on_final_request_body(&headers, &grpc_frame(&unknown))
+            .await,
+        Some(400),
+    );
+    // A request carrying only a trailer frame carries no message.
+    assert_reject(
+        plugin
+            .on_final_request_body(&headers, &grpc_web_trailer_frame("grpc-status: 13\r\n"))
+            .await,
+        Some(400),
+    );
+}
+
+// ─── M3: method-aware gRPC buffering votes ──────────────────────────────
+
+#[test]
+fn grpc_buffering_votes_only_for_enrolled_methods() {
+    let plugin = protobuf_plugin_with_method_messages();
+    let mut ctx = hello_ctx("/test.Greeter/Chat");
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "an unenrolled (e.g. streaming) method must keep streaming"
+    );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+
+    ctx.path = "/test.Greeter/SayHello".to_string();
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    // A pending route-override rewrite onto an enrolled method still buffers.
+    ctx.path = "/test.Greeter/Chat".to_string();
+    ctx.route_override_path = Some("/test.Greeter/SayHello".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+
+    // A default type legitimately claims every method.
+    let default_plugin = protobuf_plugin();
+    let mut any = hello_ctx("/test.Greeter/Anything");
+    any.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(default_plugin.should_buffer_request_body(&any));
+    assert!(default_plugin.should_buffer_response_body(&any));
+}
+
+// ─── M4: partial and delta responses are fragments ──────────────────────
+
+#[tokio::test]
+async fn partial_and_delta_responses_are_not_validated_as_documents() {
+    let plugin = response_schema_plugin(json!({"type": "object", "required": ["id"]}));
+    let headers = response_json_headers();
+    for status in [206u16, 226] {
+        let mut ctx = make_response_ctx();
+        assert_continue(
+            plugin
+                .finalize_client_visible_response_body(
+                    &mut ctx,
+                    status,
+                    &headers,
+                    b"\"id\": 1, \"na",
+                )
+                .await,
+        );
+        assert!(!plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            status,
+            &headers,
+        ));
+        assert!(plugin.should_release_response_body_under_retries(&ctx, status, &headers));
+    }
+
+    // The pristine fragment stamp covers a status an earlier hook rewrote.
+    let mut stamped = make_response_ctx();
+    stamped.metadata.insert(
+        "ferrum:origin_fragment_response".to_string(),
+        "true".to_string(),
+    );
+    assert_continue(
+        plugin
+            .finalize_client_visible_response_body(&mut stamped, 200, &headers, b"\"na")
+            .await,
+    );
+
+    // A complete 200 is still validated.
+    let mut ctx = make_response_ctx();
+    assert_reject(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"{}")
+            .await,
+        Some(502),
+    );
+}
+
+// ─── M5: an unchanged request body is not validated twice ───────────────
+
+#[tokio::test]
+async fn an_unchanged_request_body_reuses_the_early_pass_and_a_change_revalidates() {
+    use ferrum_edge::_test_support::body_validator_early_pass_count_for_test as early_passes;
+
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let body = r#"{"name":"Ada"}"#;
+    let mut ctx = make_json_ctx(body);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(early_passes(&ctx), 1, "the early pass is recorded");
+
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+    // A transform that changed the bytes is re-validated.
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, br#"{"other":1}"#)
+            .await,
+        Some(400),
+    );
+    // So is a relabel of identical bytes.
+    let relabeled = content_type_headers("application/xml");
+    let xml_plugin_ctx_result = plugin
+        .on_final_request_body_with_context(&mut ctx, &relabeled, body.as_bytes())
+        .await;
+    assert_continue(xml_plugin_ctx_result); // not governed by this JSON-only rule
+
+    // A failing early verdict records nothing, and another instance never
+    // inherits this instance's pass.
+    let mut failing = make_json_ctx(r#"{"other":1}"#);
+    let mut failing_headers = make_json_headers();
+    assert_reject(
+        plugin
+            .before_proxy(&mut failing, &mut failing_headers)
+            .await,
+        Some(400),
+    );
+    assert_eq!(early_passes(&failing), 0);
+
+    let stricter = BodyValidator::new(&json!({"required_fields": ["name", "age"]})).unwrap();
+    assert_reject(
+        stricter
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
+// ─── M7: structured-suffix defaults and strict media-type admission ─────
+
+#[tokio::test]
+async fn structured_suffix_json_is_validated_by_default() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = make_json_ctx(r#"{"other":1}"#);
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/problem+json".to_string(),
+    );
+    let mut headers = content_type_headers("application/problem+json");
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    let response = response_schema_plugin(json!({"type": "object", "required": ["id"]}));
+    let mut response_ctx = make_response_ctx();
+    assert_reject(
+        response
+            .finalize_client_visible_response_body(
+                &mut response_ctx,
+                200,
+                &content_type_headers("application/vnd.acme.v2+json"),
+                b"{}",
+            )
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn strict_media_type_admission_refuses_ungoverned_request_bodies() {
+    use ferrum_edge::_test_support::set_replay_request_body_empty_proven_for_test;
+
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "reject_unsupported_media_types": true
+    }))
+    .unwrap();
+    assert!(plugin.requires_request_body_before_before_proxy());
+
+    let base = |content_type: Option<&str>| {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        if let Some(content_type) = content_type {
+            ctx.headers
+                .insert("content-type".to_string(), content_type.to_string());
+        }
+        ctx
+    };
+
+    // Unlisted, missing, malformed, and duplicate media types with a body.
+    for content_type in [
+        Some("text/plain"),
+        None,
+        Some("application json"),
+        Some("application/json, application/json"),
+    ] {
+        let mut ctx = base(content_type);
+        let mut headers = ctx.headers.clone();
+        headers.insert("content-length".to_string(), "5".to_string());
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            rejected_status(&result),
+            Some(415),
+            "content_type={content_type:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("body_validator.request_status")
+                .map(String::as_str),
+            Some("415")
+        );
+    }
+
+    // No body: Content-Length 0, or the transport's empty proof.
+    let mut ctx = base(Some("text/plain"));
+    let mut headers = ctx.headers.clone();
+    headers.insert("content-length".to_string(), "0".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = base(Some("text/plain"));
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "without framing headers the vote buffers to learn whether a body exists"
+    );
+    set_replay_request_body_empty_proven_for_test(&mut ctx, true);
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = base(Some("text/plain"));
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"abc"));
+    let mut headers = ctx.headers.clone();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(415));
+
+    // Tunnels are not request bodies.
+    let mut connect = base(None);
+    connect.method = "CONNECT".to_string();
+    let mut headers = connect.headers.clone();
+    assert_continue(plugin.before_proxy(&mut connect, &mut headers).await);
+
+    // gRPC with no protobuf request rule is unsupported.
+    let mut grpc = base(Some("application/grpc"));
+    let mut headers = grpc.headers.clone();
+    assert_reject(
+        plugin.before_proxy(&mut grpc, &mut headers).await,
+        Some(415),
+    );
+
+    // The final hook refuses a body relabeled to an ungoverned type.
+    assert_reject(
+        plugin
+            .on_final_request_body(&content_type_headers("text/plain"), b"abc")
+            .await,
+        Some(415),
+    );
+    assert_continue(
+        plugin
+            .on_final_request_body(&content_type_headers("text/plain"), b"")
+            .await,
+    );
+
+    // Governed requests are validated as before.
+    let mut ctx = make_json_ctx(r#"{"name":"Ada"}"#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Off by default.
+    let lenient = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = base(Some("text/plain"));
+    let mut headers = ctx.headers.clone();
+    headers.insert("content-length".to_string(), "5".to_string());
+    assert_continue(lenient.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!lenient.should_buffer_request_body(&base(Some("text/plain"))));
+
+    // Strict admission needs a request rule.
+    assert!(
+        BodyValidator::new(&json!({
+            "response_required_fields": ["id"],
+            "reject_unsupported_media_types": true
+        }))
+        .is_err()
+    );
+}
+
+// ─── M8: log_only enforcement and outcome metadata ──────────────────────
+
+#[tokio::test]
+async fn log_only_mode_records_violations_and_never_rejects() {
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "response_required_fields": ["id"],
+        "enforcement_mode": "log_only"
+    }))
+    .unwrap();
+
+    let mut ctx = make_json_ctx(r#"{"other":1}"#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("body_validator.request_outcome")
+            .map(String::as_str),
+        Some("would_reject")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("body_validator.request_status")
+            .map(String::as_str),
+        Some("400")
+    );
+    assert!(
+        ctx.metadata
+            .get("body_validator.request_detail")
+            .is_some_and(|detail| detail.contains("name") && !detail.contains("other"))
+    );
+
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, br#"{"other":1}"#)
+            .await,
+    );
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, br#"{"other":1}"#)
+            .await,
+    );
+
+    let mut response_ctx = make_response_ctx();
+    assert_continue(
+        plugin
+            .finalize_client_visible_response_body(
+                &mut response_ctx,
+                200,
+                &response_json_headers(),
+                b"{}",
+            )
+            .await,
+    );
+    assert_eq!(
+        response_ctx
+            .metadata
+            .get("body_validator.response_outcome")
+            .map(String::as_str),
+        Some("would_reject")
+    );
+
+    // `log_only` cannot refuse, so it never claims the representation gates;
+    // an undecoded content-coded body is recorded as uninspected.
+    let gzip_headers = encoded_headers("application/json", "gzip");
+    assert!(!plugin.enforces_final_request_body_policy(&ctx, &gzip_headers, b""));
+    let mut encoded = encoded_ctx("application/json", "gzip", &gzip_bytes(b"{}"));
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut encoded, &gzip_headers, &gzip_bytes(b"{}"))
+            .await,
+    );
+    assert_eq!(
+        encoded
+            .metadata
+            .get("body_validator.request_outcome")
+            .map(String::as_str),
+        Some("uninspected")
+    );
+
+    // The same violations block, and are recorded, in the default mode.
+    let blocking = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    assert!(blocking.enforces_final_request_body_policy(&ctx, &gzip_headers, b""));
+    let mut ctx = make_json_ctx(r#"{"other":1}"#);
+    let mut headers = make_json_headers();
+    assert_reject(
+        blocking.before_proxy(&mut ctx, &mut headers).await,
+        Some(400),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("body_validator.request_outcome")
+            .map(String::as_str),
+        Some("rejected")
+    );
+
+    assert!(
+        BodyValidator::new(&json!({"validate_xml": true, "enforcement_mode": "monitor"})).is_err()
+    );
+}
+
+#[tokio::test]
+async fn log_only_protobuf_violations_continue() {
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "protobuf_response_type": "test.HelloResponse",
+        "enforcement_mode": "log_only"
+    }))
+    .unwrap();
+    let mut headers = content_type_headers("application/grpc");
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    let mut ctx = hello_ctx("/test.Greeter/SayHello");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &[0xFF])
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("body_validator.request_outcome")
+            .map(String::as_str),
+        Some("would_reject")
+    );
+    assert_continue(
+        plugin
+            .finalize_client_visible_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("application/grpc"),
+                &[0, 0, 0, 0, 1, 0xFF],
+            )
+            .await,
+    );
+}
+
+// ─── M9: response validation is scoped to response_status_codes ─────────
+
+#[tokio::test]
+async fn backend_error_documents_keep_their_status_by_default() {
+    let plugin = response_schema_plugin(json!({"type": "object", "required": ["id"]}));
+    let headers = response_json_headers();
+    for status in [400u16, 404, 422, 500, 503] {
+        let mut ctx = make_response_ctx();
+        assert_continue(
+            plugin
+                .finalize_client_visible_response_body(
+                    &mut ctx,
+                    status,
+                    &headers,
+                    br#"{"error":"insufficient_funds"}"#,
+                )
+                .await,
+        );
+        assert!(!plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            status,
+            &headers,
+        ));
+    }
+    let mut ctx = make_response_ctx();
+    assert_reject(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"{}")
+            .await,
+        Some(502),
+    );
+
+    // Opting statuses in validates them; a list without 2XX skips successes.
+    let scoped = BodyValidator::new(&json!({
+        "response_json_schema": {"type": "object", "required": ["id"]},
+        "response_status_codes": ["2xx", 422]
+    }))
+    .unwrap();
+    let mut ctx = make_response_ctx();
+    assert_reject(
+        scoped
+            .finalize_client_visible_response_body(&mut ctx, 422, &headers, b"{}")
+            .await,
+        Some(502),
+    );
+    let errors_only = BodyValidator::new(&json!({
+        "response_json_schema": {"type": "object", "required": ["error"]},
+        "response_status_codes": ["4XX"]
+    }))
+    .unwrap();
+    let mut ctx = make_response_ctx();
+    assert_continue(
+        errors_only
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, b"{}")
+            .await,
+    );
+    let mut ctx = make_response_ctx();
+    assert_reject(
+        errors_only
+            .finalize_client_visible_response_body(&mut ctx, 404, &headers, b"{}")
+            .await,
+        Some(502),
+    );
+
+    for bad in [
+        json!([]),
+        json!([99]),
+        json!([600]),
+        json!(["6XX"]),
+        json!(["200"]),
+        json!("2XX"),
+        json!([true]),
+    ] {
+        assert!(
+            BodyValidator::new(&json!({
+                "response_required_fields": ["id"],
+                "response_status_codes": bad
+            }))
+            .is_err(),
+            "response_status_codes={bad} must be rejected"
+        );
+    }
+}
+
+// ─── M10: an empty media-type list is rejected ──────────────────────────
+
+#[test]
+fn empty_media_type_lists_are_rejected() {
+    for config in [
+        json!({"required_fields": ["name"], "content_types": []}),
+        json!({"response_required_fields": ["id"], "response_content_types": []}),
+    ] {
+        assert!(
+            BodyValidator::new(&config).is_err(),
+            "an empty list must not mean every media type: {config}"
+        );
+    }
+}
+
+// ─── M11: per-method entries are direction-authoritative ────────────────
+
+#[tokio::test]
+async fn a_single_direction_method_entry_does_not_fall_back_to_the_default_type() {
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "protobuf_response_type": "test.HelloResponse",
+        "protobuf_reject_unknown_fields": true,
+        "protobuf_method_messages": {
+            "/test.Greeter/BulkImport": {"response": "test.HelloResponse"}
+        }
+    }))
+    .unwrap();
+    // Bytes that fail the default request type (unknown field 99).
+    let mut payload = encode_hello_request("Ada", 36);
+    payload.extend_from_slice(&[0x98, 0x06, 0x01]);
+    let frame = grpc_frame(&payload);
+
+    let mut bulk = content_type_headers("application/grpc");
+    bulk.insert(":path".to_string(), "/test.Greeter/BulkImport".to_string());
+    assert_continue(plugin.on_final_request_body(&bulk, &frame).await);
+    let mut bulk_ctx = hello_ctx("/test.Greeter/BulkImport");
+    bulk_ctx
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(!plugin.should_buffer_request_body(&bulk_ctx));
+
+    // Its response direction is still validated.
+    assert_reject(
+        plugin
+            .finalize_client_visible_response_body(
+                &mut bulk_ctx,
+                200,
+                &content_type_headers("application/grpc"),
+                &grpc_frame(&[0xFF, 0xFE]),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Every other method keeps the default request type.
+    let mut other = content_type_headers("application/grpc");
+    other.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&other, &frame).await,
+        Some(400),
+    );
 }

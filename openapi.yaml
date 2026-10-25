@@ -31485,12 +31485,48 @@ components:
         validates the resulting plaintext before any byte reaches the backend,
         so a valid gzip JSON/XML upload succeeds while an undecodable coding is
         still refused. Representation-gap diagnostics are fixed strings and
-        never echo body bytes. Every constraint below mirrors a runtime
-        admission rule, so a configuration this schema accepts is one
-        BodyValidator::new accepts, except for two dependencies that are
-        node-local and cannot be expressed statically: protobuf_descriptor_path
-        must name a readable FileDescriptorSet, and every configured message
-        type must resolve inside it.
+        never echo body bytes. gRPC protobuf validation covers native gRPC and
+        gRPC-Web (binary and text) framing in both directions, including a
+        translated gRPC-Web response after the grpc_web plugin re-framed it;
+        only methods a configured descriptor applies to are buffered, so
+        unenrolled streaming RPCs keep streaming. Protobuf decoding is bounded
+        before reflection (message, value, and 32-level depth budgets, for every
+        descriptor pool) and its decompressed and reflected working set is
+        charged to the aggregate decode budget; a budget refusal is a 503 /
+        RESOURCE_EXHAUSTED capacity terminal. Response validation applies only
+        to response_status_codes (default 2XX) and never to 206/226 fragments;
+        an empty synthetic success (for example an empty response_mock body)
+        is validated like an empty backend response. Every constraint below
+        mirrors a runtime admission rule, so a configuration this schema
+        accepts is one BodyValidator::new accepts, except for two dependencies
+        that are node-local and cannot be expressed statically:
+        protobuf_descriptor_path must name a readable FileDescriptorSet, and
+        every configured message type must resolve inside it (and
+        reject_unsupported_media_types paired only with response-direction
+        protobuf_method_messages entries is refused at runtime).
+      allOf:
+        - if:
+            required: [reject_unsupported_media_types]
+            properties:
+              reject_unsupported_media_types:
+                const: true
+          then:
+            anyOf:
+              - required: [json_schema]
+              - required: [required_fields]
+                properties:
+                  required_fields:
+                    minItems: 1
+              - required: [validate_xml]
+                properties:
+                  validate_xml:
+                    const: true
+              - required: [required_xml_elements]
+                properties:
+                  required_xml_elements:
+                    minItems: 1
+              - required: [protobuf_descriptor_path, protobuf_request_type]
+              - required: [protobuf_descriptor_path, protobuf_method_messages]
       anyOf:
         - required: [json_schema]
         - required: [required_fields]
@@ -31617,18 +31653,30 @@ components:
             rather than counted as safe.
         content_types:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
-          default: ["application/json", "application/xml", "text/xml"]
+          default:
+            - application/json
+            - application/*+json
+            - application/xml
+            - application/*+xml
+            - text/xml
           description: >-
             Request media types to validate. Matching uses the Content-Type
             type/subtype essence only (parameters stripped, OWS trimmed, ASCII
-            case-insensitive). Distinct neighbors such as application/json-seq
-            and parameter values that merely contain a configured string do not
-            match. Empty or parameter-only entries are rejected; malformed
-            actual headers do not match and are skipped.
+            case-insensitive). An entry of the form type/*+suffix is an RFC
+            6838 structured-suffix pattern matching any type/name+suffix with a
+            non-empty name (for example application/problem+json), except the
+            gRPC-family types application/grpc+*, application/grpc-web+*, and
+            application/grpc-web-text+*. Distinct neighbors such as
+            application/json-seq and parameter values that merely contain a
+            configured string do not match. An empty list is rejected (omit the
+            field for the defaults), as are empty or parameter-only entries;
+            malformed actual headers do not match and are skipped (or refused
+            with 415 under reject_unsupported_media_types).
         response_json_schema:
           type: object
           minProperties: 1
@@ -31666,15 +31714,66 @@ components:
             required_xml_elements.
         response_content_types:
           type: array
+          minItems: 1
           items:
             type: string
             minLength: 1
             pattern: "^[ \t]*[0-9A-Za-z!#$%&'*+.^_`|~-]+/[0-9A-Za-z!#$%&'*+.^_`|~-]+[ \t]*(;.*)?$"
-          default: ["application/json", "application/xml", "text/xml"]
+          default:
+            - application/json
+            - application/*+json
+            - application/xml
+            - application/*+xml
+            - text/xml
           description: >-
-            Response media types to validate. Same exact type/subtype matching
-            semantics as content_types (parameters stripped; neighbors and
-            parameter collisions and malformed headers do not match).
+            Response media types to validate. Same type/subtype and
+            structured-suffix pattern matching semantics as content_types
+            (parameters stripped; neighbors, parameter collisions, and
+            malformed headers do not match). An empty list is rejected.
+        response_status_codes:
+          type: array
+          minItems: 1
+          items:
+            oneOf:
+              - type: integer
+                minimum: 100
+                maximum: 599
+              - type: string
+                pattern: "^[1-5][Xx][Xx]$"
+          default: ["2XX"]
+          description: >-
+            Upstream response statuses response validation applies to: exact
+            integer statuses and/or status classes 1XX-5XX (case-insensitive X).
+            Defaults to 2XX, so a backend error document (404, 422, 500, ...)
+            keeps its own status and body instead of being judged against the
+            success schema and replaced by a 502. Partial (206) and delta (226)
+            responses are fragments and are never validated. An empty list is
+            rejected.
+        enforcement_mode:
+          type: string
+          enum: [block, log_only]
+          default: block
+          description: >-
+            block rejects violations (400 request, 415 unsupported request
+            media type, 502 response). log_only evaluates every configured
+            rule but always continues, never claims the shared representation
+            gates (so a content-coded body is recorded as uninspected), and
+            records the would-be outcome. In both modes a violation is
+            published in transaction metadata as
+            body_validator.request_outcome / body_validator.response_outcome
+            (rejected, would_reject, uninspected, or capacity_refused) with the
+            matching _status and payload-free _detail keys.
+        reject_unsupported_media_types:
+          type: boolean
+          default: false
+          description: >-
+            Refuse with 415 a request that carries a body no configured request
+            rule inspects: a missing, malformed, or comma-joined Content-Type,
+            a media type outside content_types, an allowlisted type no rule can
+            inspect, or a gRPC request when no protobuf request rule is
+            configured. Bodyless requests (proven by Content-Length 0 or by the
+            buffered transport), CONNECT, and Upgrade requests are unaffected.
+            Requires at least one request validation rule.
         protobuf_descriptor_path:
           type: string
           minLength: 1
@@ -31725,7 +31824,12 @@ components:
             selected by the exact method lookup, so it is rejected rather than
             admitted as an inert rule. Each entry accepts only 'request' and
             'response', must set at least one of them, and any other key
-            rejects the configuration.
+            rejects the configuration. An entry is direction-authoritative: a
+            direction it omits is not validated for that method, rather than
+            falling back to protobuf_request_type / protobuf_response_type. The
+            request method is taken from the synthetic :path the native gRPC
+            ladder injects, otherwise from grpc_full_method or the request
+            path, so per-method rules apply on HTTP/3 and every dispatcher.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
@@ -31734,7 +31838,9 @@ components:
             the top level and inside every present nested, repeated, map-value,
             oneof, and extension message value, in both directions, under the
             same bounded 32-level / 50000-message walk as the initialization
-            check. The rejection carries a count only, never a field number or
+            check. A closed (proto2) enum field carrying a number outside the
+            declared set is an unknown field too (and cannot satisfy a required
+            field); open proto3 enums keep any number. The rejection carries a count only, never a field number or
             payload byte. This is independent of proto2 required-field
             initialization, which is always enforced: a decoded message that
             omits any proto2 required field, at the top level or inside a

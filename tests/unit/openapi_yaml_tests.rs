@@ -16372,6 +16372,18 @@ fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
         // Out-of-domain integers.
         json!({"validate_xml": true, "xml_max_entities": -1}),
         json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
+        // An empty media list used to mean "every valid media type".
+        json!({"validate_xml": true, "content_types": []}),
+        json!({"response_validate_xml": true, "response_content_types": []}),
+        // Enforcement, strict media-type admission, and status scope shape.
+        json!({"validate_xml": true, "enforcement_mode": "monitor"}),
+        json!({"validate_xml": true, "reject_unsupported_media_types": "yes"}),
+        json!({"response_validate_xml": true, "reject_unsupported_media_types": true}),
+        json!({"response_validate_xml": true, "response_status_codes": []}),
+        json!({"response_validate_xml": true, "response_status_codes": [99]}),
+        json!({"response_validate_xml": true, "response_status_codes": [600]}),
+        json!({"response_validate_xml": true, "response_status_codes": ["6XX"]}),
+        json!({"response_validate_xml": true, "response_status_codes": ["200"]}),
         // Malformed media types.
         json!({"validate_xml": true, "content_types": ["application"]}),
         json!({"validate_xml": true, "content_types": [""]}),
@@ -16412,10 +16424,12 @@ fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
         json!({"response_json_schema": {"type": "object"}}),
         json!({"required_xml_elements": ["item", "{}item"]}),
         json!({"response_required_xml_elements": ["{urn:x}item"]}),
-        // An empty media list means "every valid media type", and an explicit
-        // zero cap disables the decompressed ceiling; both must survive.
-        json!({"validate_xml": true, "content_types": []}),
+        // An explicit zero entity cap must survive.
         json!({"validate_xml": true, "xml_max_entities": 0}),
+        json!({"validate_xml": true, "content_types": ["application/*+json"]}),
+        json!({"validate_xml": true, "enforcement_mode": "log_only"}),
+        json!({"validate_xml": true, "reject_unsupported_media_types": true}),
+        json!({"response_validate_xml": true, "response_status_codes": ["2XX", "4xx", 500]}),
         json!({
             "validate_xml": true,
             "content_types": ["application/json; charset=utf-8"]
