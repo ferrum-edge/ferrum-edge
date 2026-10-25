@@ -2991,7 +2991,7 @@ who can read the database, a replica, or a backup file.
 |---|---|---|---|
 | `basicauth` | `hmac_sha256:<64 lowercase hex>`, derived under `FERRUM_BASIC_AUTH_HMAC_SECRET` | Verification only has to compare hashes | Nothing directly usable without the server-side HMAC secret |
 | `keyauth` | The API key verbatim | The presented key is matched against the stored key by indexed lookup | Every API key, immediately replayable against the gateway |
-| `jwt` | The HS256 shared secret verbatim | HS256 verification needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
+| `jwt` | The HMAC shared secret verbatim | HMAC verification (HS256/HS384/HS512) needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
 | `hmac_auth` | The shared secret verbatim | The request HMAC is recomputed from the secret | Every shared secret; the reader can forge accepted signatures |
 | `mtls_auth` | The certificate identity string only | Matching is on identity, not on a secret | No private key material — none is ever stored |
 

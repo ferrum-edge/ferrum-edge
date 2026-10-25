@@ -950,7 +950,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     assert_component_validity(&spec, "Consumer", &custom_credential_input, false);
 
     // Consumer JWT credentials have exactly one supported algorithm/key form:
-    // an HS256 shared secret. The input, backup, and restore surfaces all
+    // an HMAC shared secret. The input, backup, and restore surfaces all
     // accept that canonical form, while the ordinary response accepts only
     // the runtime's exact redaction placeholder.
     let jwt_input = json!({"secret": jwt_secret});
@@ -1069,7 +1069,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     assert!(hmac_backup_description.contains("at least 32 non-whitespace characters"));
 
     // Algorithm selectors and asymmetric/JWKS key material are not Consumer
-    // JWT credential forms. jwt_auth always verifies HS256 with `secret`;
+    // JWT credential forms. jwt_auth verifies `secret` with its pinned HMAC algorithm;
     // RSA/EC/JWKS verification belongs to the separate jwks_auth plugin.
     for unsupported in [
         json!({}),

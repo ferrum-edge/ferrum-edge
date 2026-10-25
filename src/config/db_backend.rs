@@ -1812,8 +1812,9 @@ impl std::error::Error for IncrementalFullReloadRequired {}
 /// Whether consumer deltas can be applied incrementally for each namespace
 /// (issue #6060).
 ///
-/// Load-time quarantine removes colliding consumers and strips weak or
-/// duplicate `hmac_auth` credentials, first-loaded consumer wins. A delta
+/// Load-time quarantine removes colliding consumers, strips weak or
+/// duplicate `hmac_auth` credentials (first-loaded consumer wins), and strips
+/// weak, malformed, or shared `jwt` credentials (from every holder). A delta
 /// patched onto that sanitized snapshot is only equivalent to a fresh full
 /// load when nothing is quarantined: then a delete or update cannot free a
 /// stripped credential or a shadowed identity, because there is none, and

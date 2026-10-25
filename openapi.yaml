@@ -11936,7 +11936,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredential"
           minItems: 1
-          description: Multiple HS256 JWT secrets for zero-downtime rotation. Each entry contains exactly one `secret` string of 32-4096 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
+          description: Multiple HMAC JWT secrets (verified with the algorithm the `jwt_auth` instance pins, HS256 by default) for zero-downtime rotation. Each entry contains exactly one `secret` string of 32-4096 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
         hmac_auth:
           type: array
           items:
@@ -11989,7 +11989,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialUpdate"
           minItems: 1
-          description: HS256 JWT entries. Each entry is a real 32-4096 character `secret` or the exact `[REDACTED]` round-trip placeholder.
+          description: HMAC JWT entries. Each entry is a real 32-4096 character `secret` or the exact `[REDACTED]` round-trip placeholder.
         hmac_auth:
           type: array
           items:
@@ -12037,7 +12037,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialRedacted"
           minItems: 1
-          description: HS256 JWT entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
+          description: HMAC JWT entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
         hmac_auth:
           type: array
           items:
@@ -12078,7 +12078,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialBackup"
           minItems: 1
-          description: Multiple canonical HS256 JWT secrets for zero-downtime rotation, unredacted.
+          description: Multiple canonical HMAC JWT secrets for zero-downtime rotation, unredacted.
         hmac_auth:
           type: array
           items:
@@ -12125,7 +12125,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialBackup"
           minItems: 1
-          description: Multiple canonical HS256 JWT secrets for zero-downtime rotation, unredacted.
+          description: Multiple canonical HMAC JWT secrets for zero-downtime rotation, unredacted.
         hmac_auth:
           type: array
           items:
@@ -12394,7 +12394,7 @@ components:
         - $ref: "#/components/schemas/JwtCredential"
         - $ref: "#/components/schemas/JwtCredentialRedacted"
       description: >-
-        `jwt` entry accepted by `PUT /consumers/{id}`: a real HS256 secret, or
+        `jwt` entry accepted by `PUT /consumers/{id}`: a real HMAC JWT secret, or
         the exact `[REDACTED]` placeholder, which is replaced with the stored
         entry's canonical `secret` at the same array index before validation.
 
@@ -12454,7 +12454,7 @@ components:
             than horizontal tab, line feed, and carriage return.
       description: >-
         `jwt` entry in backup/restore payloads: the canonical unredacted
-        stored HS256 secret. Public-key and JWKS key forms belong to the
+        stored HMAC secret. Public-key and JWKS key forms belong to the
         separate `jwks_auth` plugin configuration and are rejected here.
 
     HmacAuthCredentialBackup:

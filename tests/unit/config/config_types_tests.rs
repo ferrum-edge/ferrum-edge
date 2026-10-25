@@ -2127,6 +2127,95 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
     assert!(config.consumers[2].has_credential("jwt"));
 }
 
+/// PR #6865 review (MUSE-1): a point-loaded consumer carrying `jwt` escalates
+/// database/CP polling to a full reload, like `hmac_auth`, because only the
+/// full namespace snapshot sees every holder of a shared secret.
+#[test]
+fn test_jwt_consumer_change_requires_authoritative_reload() {
+    use ferrum_edge::config::db_backend::consumer_change_requires_authoritative_reload;
+
+    assert!(consumer_change_requires_authoritative_reload(
+        &jwt_consumer(
+            "alice",
+            "alice",
+            &["alice-jwt-secret-at-least-32-characters"]
+        )
+    ));
+    let mut keyauth_only = make_consumer("k", "k");
+    keyauth_only.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "keyauth-only-0123456789"}]),
+    );
+    assert!(!consumer_change_requires_authoritative_reload(
+        &keyauth_only
+    ));
+}
+
+/// PR #6865 review (MUSE-6): structural wiring of the JWT secret policy. The
+/// helper-level tests above call the quarantine and validators directly, so
+/// pin that every publication and admission boundary still invokes them.
+#[test]
+fn test_jwt_secret_policy_is_wired_into_every_boundary() {
+    const PROXY: &str = include_str!("../../../src/proxy/mod.rs");
+    const SQL: &str = include_str!("../../../src/config/db_loader.rs");
+    const MONGO: &str = include_str!("../../../src/config/mongo_store.rs");
+    const CRUD: &str = include_str!("../../../src/admin/crud.rs");
+    const ADMIN: &str = include_str!("../../../src/admin/mod.rs");
+
+    // Full and incremental swaps quarantine against the shared-secret
+    // history; the comparison helper uses a read-only copy of it.
+    assert_eq!(
+        PROXY
+            .matches("for message in self.quarantine_jwt_credentials(&mut new_config) {")
+            .count(),
+        2,
+        "update_config and apply_incremental must both quarantine JWT credentials"
+    );
+    let canonicalize = PROXY
+        .split("pub fn canonicalize_snapshot_for_comparison(")
+        .nth(1)
+        .expect("canonicalize_snapshot_for_comparison");
+    let canonicalize = &canonicalize[..canonicalize.find("\n    }\n").expect("function end")];
+    assert!(canonicalize.contains("quarantine_invalid_jwt_credentials_with_history"));
+
+    // Both full loaders judge JWT ownership before identity quarantine can
+    // remove a holder.
+    for (name, source) in [("SQL", SQL), ("Mongo", MONGO)] {
+        let jwt = source
+            .find("config.quarantine_invalid_jwt_credentials()")
+            .unwrap_or_else(|| panic!("{name} full load must quarantine JWT credentials"));
+        let identity = source
+            .find("config.quarantine_colliding_consumer_identities()")
+            .unwrap_or_else(|| panic!("{name} full load identity quarantine"));
+        assert!(
+            jwt < identity,
+            "{name}: JWT quarantine must run before identity quarantine"
+        );
+    }
+
+    // Admin create/update, the credential endpoints, and batch admission.
+    let after_validate = CRUD
+        .split("async fn after_validate(")
+        .find(|section| section.contains("hmac_consumer_candidate_errors(db, namespace, resource)"))
+        .expect("Consumer after_validate");
+    assert!(after_validate.contains("jwt_consumer_candidate_errors(db, namespace, resource)"));
+    let persist = ADMIN
+        .split("async fn persist_consumer_update(")
+        .nth(1)
+        .expect("persist_consumer_update");
+    let persist = &persist[..persist.find("\n}\n").expect("function end")];
+    assert!(persist.contains("ensure_jwt_consumer_candidate("));
+    assert!(
+        ADMIN.contains(".validate_unique_jwt_credentials_for_consumers(&jwt_batch_consumer_ids)")
+    );
+    let snapshot_gate = ADMIN
+        .split("fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("batch consumer snapshot gate");
+    assert!(snapshot_gate.contains("credential_entries(\"jwt\")"));
+}
+
 #[test]
 fn test_quarantine_jwt_keeps_strong_secrets_and_legacy_selector_fields() {
     // The verifier only reads `secret`, so a historical `algorithm: HS256`
