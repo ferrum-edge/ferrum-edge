@@ -1445,10 +1445,27 @@ pub(crate) fn mesh_policy_has_header_rules(
         .any(|request| !request.headers.is_empty())
 }
 
-pub(crate) fn mesh_policies_have_header_rules(
+/// The distinct, lowercase request-header names referenced by any
+/// `to.headers` predicate across `policies`, sorted.
+///
+/// `mesh_authz` precomputes this once per generation so the request path
+/// resolves only these names instead of copying the whole client header map.
+/// Empty when no policy carries a header predicate.
+pub(crate) fn mesh_policies_header_rule_names(
     policies: &[crate::modes::mesh::config::MeshPolicy],
-) -> bool {
-    policies.iter().any(mesh_policy_has_header_rules)
+) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for policy in policies
+        .iter()
+        .filter(|policy| mesh_policy_has_header_rules(policy))
+    {
+        for request in policy.rules.iter().flat_map(|rule| &rule.to) {
+            for name in request.headers.keys() {
+                names.insert(name.to_ascii_lowercase());
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// An exact `connection.sni` condition value that names a mesh service's bare

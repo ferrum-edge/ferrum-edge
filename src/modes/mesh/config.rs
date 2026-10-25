@@ -807,6 +807,48 @@ pub fn validate_mesh_ext_authz_mutable_header(name: &str) -> Result<String, Stri
     Ok(lowercase)
 }
 
+/// Validate a `headersToUpstreamOnAllow` name: a provider response header that
+/// REPLACES the backend-bound request's same-named header on an allowed check.
+///
+/// On top of [`validate_mesh_ext_authz_mutable_header`] it refuses the
+/// gateway's own identity assertions (the `x-consumer-*` namespace, the GeoIP
+/// result, route path-param captures — a provider must not impersonate the
+/// gateway's authentication result to the backend), `content-*` fields (the
+/// backend-visible body representation is the client's, not the provider's),
+/// and `set-cookie` (a response field with no meaning on a request).
+pub fn validate_mesh_ext_authz_upstream_allow_header(name: &str) -> Result<String, String> {
+    let lowercase = validate_mesh_ext_authz_mutable_header(name)?;
+    if crate::proxy::headers::is_gateway_assertion_header(&lowercase)
+        || crate::proxy::headers::is_path_param_assertion_header(&lowercase)
+    {
+        return Err(format!(
+            "{lowercase:?} is a gateway-asserted identity header and cannot be written onto the backend request by an external authorization provider"
+        ));
+    }
+    if lowercase.starts_with("content-") || lowercase == "set-cookie" {
+        return Err(format!(
+            "{lowercase:?} describes the request body or a response and cannot be written onto the backend request by an external authorization provider"
+        ));
+    }
+    Ok(lowercase)
+}
+
+/// Validate a `headersToDownstreamOnAllow` name: a provider response header
+/// added to the client-visible response of an allowed request.
+///
+/// On top of [`validate_mesh_ext_authz_mutable_header`] it refuses `content-*`
+/// fields — the response body is the backend's, and a provider-supplied
+/// `content-type` / `content-encoding` would misdescribe it to the client.
+pub fn validate_mesh_ext_authz_downstream_allow_header(name: &str) -> Result<String, String> {
+    let lowercase = validate_mesh_ext_authz_mutable_header(name)?;
+    if lowercase.starts_with("content-") {
+        return Err(format!(
+            "{lowercase:?} describes the backend response body and cannot be written onto an allowed response by an external authorization provider"
+        ));
+    }
+    Ok(lowercase)
+}
+
 /// Reduce an operator-supplied token to a bounded, control-character-free form
 /// for diagnostics. Provider configuration can embed credentials, so nothing
 /// longer than a short prefix is ever echoed.
@@ -1042,31 +1084,28 @@ impl MeshExtAuthzProvider {
             &self.include_request_headers_in_check,
             validate_mesh_ext_authz_forwarded_header,
         )?;
-        // Provider-driven mutation of the BACKEND request or of a SUCCESSFUL
-        // response is refused at admission rather than partially implemented.
-        // Ferrum's ext-authz check runs in the `authorize` phase, before route
-        // dispatch and before every request/response transformer, so a header
-        // written there would be re-ordered against operator-authored rules
-        // differently on each ingress path — a protocol-dependent mutation of
-        // an authenticated request is exactly the class of gap this feature
-        // must not introduce. Refusing is visible and fixable; silently
-        // dropping the field would let an operator believe a token-exchange
-        // contract is in force when it is not.
-        if !self.headers_to_upstream_on_allow.is_empty() {
-            return Err(format!(
-                "extensionProviders {:?} headersToUpstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate the backend-visible request",
-                sanitize_mesh_ext_authz_diagnostic(&self.name)
-            ));
-        }
-        if !self.headers_to_downstream_on_allow.is_empty() {
-            return Err(format!(
-                "extensionProviders {:?} headersToDownstreamOnAllow is not supported: Ferrum does not let an external authorization provider mutate an allowed response",
-                sanitize_mesh_ext_authz_diagnostic(&self.name)
-            ));
-        }
-        // `headersToDownstreamOnDeny` IS supported: those headers land only on
-        // the gateway-authored denial this plugin itself produces, so there is
-        // no ordering ambiguity and no authenticated request to alter.
+        // Allowed-request mutations. The check runs in `authorize`, but the
+        // result is applied by `mesh_authz`'s own `before_proxy` /
+        // `after_proxy` hooks at its fixed priority, so it lands at ONE
+        // defined point of the ordinary plugin chain on every HTTP-family
+        // ingress path: after authentication/authorization, before
+        // `mesh_route_dispatch` and every transformer. `headersToUpstreamOnAllow`
+        // names are provider-OWNED on an allowed check (the client's copy is
+        // always removed); see `docs/mesh.md`.
+        Self::validate_header_list(
+            &self.name,
+            "headersToUpstreamOnAllow",
+            &self.headers_to_upstream_on_allow,
+            validate_mesh_ext_authz_upstream_allow_header,
+        )?;
+        Self::validate_header_list(
+            &self.name,
+            "headersToDownstreamOnAllow",
+            &self.headers_to_downstream_on_allow,
+            validate_mesh_ext_authz_downstream_allow_header,
+        )?;
+        // `headersToDownstreamOnDeny` lands only on the gateway-authored denial
+        // this plugin itself produces.
         Self::validate_header_list(
             &self.name,
             "headersToDownstreamOnDeny",
@@ -7318,125 +7357,7 @@ fn validate_mesh_config_internal(
             &mut errors,
         );
         for (i, rule) in policy.rules.iter().enumerate() {
-            for (j, principal) in rule.from.iter().enumerate() {
-                if principal.spiffe_id_pattern.is_none()
-                    && principal.namespace_pattern.is_none()
-                    && principal.trust_domain.is_none()
-                    && principal.trust_domain_pattern.is_none()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}]: at least one \
-                         of spiffe_id_pattern/namespace_pattern/trust_domain/\
-                         trust_domain_pattern must be set",
-                        policy.name, i, j
-                    ));
-                }
-                if let Some(pat) = principal.spiffe_id_pattern.as_ref()
-                    && glob::Pattern::new(pat).is_err()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}].spiffe_id_pattern \
-                         {:?} is not a valid glob",
-                        policy.name, i, j, pat
-                    ));
-                }
-                if let Some(pat) = principal.namespace_pattern.as_ref()
-                    && glob::Pattern::new(pat).is_err()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}].namespace_pattern \
-                         {:?} is not a valid glob",
-                        policy.name, i, j, pat
-                    ));
-                }
-                if let Some(pat) = principal.trust_domain_pattern.as_ref()
-                    && glob::Pattern::new(pat).is_err()
-                {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].from[{}].trust_domain_pattern \
-                         {:?} is not a valid glob",
-                        policy.name, i, j, pat
-                    ));
-                }
-            }
-            for (j, request) in rule.to.iter().enumerate() {
-                let any_method = !request.methods.is_empty();
-                let any_path = !request.paths.is_empty();
-                let any_host = !request.hosts.is_empty();
-                let any_header = !request.headers.is_empty();
-                let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
-                let any_not = !request.not_methods.is_empty()
-                    || !request.not_paths.is_empty()
-                    || !request.not_hosts.is_empty()
-                    || !request.not_ports.is_empty()
-                    || !request.not_port_patterns.is_empty();
-                if !(any_method || any_path || any_host || any_header || any_port || any_not) {
-                    errors.push(format!(
-                        "MeshPolicy {:?}.rules[{}].to[{}]: at least one of \
-                         methods/paths/hosts/headers/ports or their negated \
-                         counterparts must be non-empty",
-                        policy.name, i, j
-                    ));
-                }
-                for header in request.headers.keys() {
-                    if MESH_AUTHZ_PSEUDO_HEADERS
-                        .iter()
-                        .any(|pseudo_header| header.eq_ignore_ascii_case(pseudo_header))
-                    {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].headers contains pseudo-header \
-                             {:?}, which cannot match the HTTP request header map; use \
-                             to.methods, to.paths, or to.hosts, or use the corresponding \
-                             request.headers[:path] condition for :path",
-                            policy.name, i, j, header
-                        ));
-                    }
-                }
-                for (k, host) in request.hosts.iter().enumerate() {
-                    if !is_valid_request_match_host_pattern(host) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].hosts[{}] \
-                             {:?} is not a valid host pattern \
-                             (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or `*` port)",
-                            policy.name, i, j, k, host
-                        ));
-                    }
-                }
-                for (k, host) in request.not_hosts.iter().enumerate() {
-                    if !is_valid_request_match_host_pattern(host) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].not_hosts[{}] \
-                             {:?} is not a valid host pattern \
-                             (expected hostname, [ipv6], or host:port/host:* \
-                             with u16 numeric or `*` port)",
-                            policy.name, i, j, k, host
-                        ));
-                    }
-                }
-                for (k, pattern) in request.port_patterns.iter().enumerate() {
-                    if !is_valid_request_match_port_pattern(pattern) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].port_patterns[{}] \
-                             is not an admissible port pattern \
-                             (expected `*`, `<digits>*`, or `*<digits>` that can \
-                             match a destination/listener port in 1..=65535)",
-                            policy.name, i, j, k
-                        ));
-                    }
-                }
-                for (k, pattern) in request.not_port_patterns.iter().enumerate() {
-                    if !is_valid_request_match_port_pattern(pattern) {
-                        errors.push(format!(
-                            "MeshPolicy {:?}.rules[{}].to[{}].not_port_patterns[{}] \
-                             is not an admissible port pattern \
-                             (expected `*`, `<digits>*`, or `*<digits>` that can \
-                             match a destination/listener port in 1..=65535)",
-                            policy.name, i, j, k
-                        ));
-                    }
-                }
-            }
+            validate_mesh_rule_request_matchers(&policy.name, i, rule, &mut errors);
             if rule.when.len() > MAX_MESH_RULE_CONDITIONS {
                 errors.push(format!(
                     "MeshPolicy {:?}.rules[{}].when must have at most \
@@ -8063,6 +7984,165 @@ fn validate_mesh_policy_target_refs_scope(
     if valid_attachments == 0 {
         errors.extend(unresolved);
     }
+}
+
+/// Per-rule `from` / `to` matcher validation shared by the native mesh-config
+/// boundary ([`MeshConfig::validate`]) and the `mesh_authz` plugin's own
+/// construction gate ([`validate_mesh_policy_request_matchers`]).
+///
+/// Every refusal here is a matcher that can never match a real request (an
+/// empty `from[{}]` / `to[{}]` entry, a `to.headers` pseudo-header, an invalid
+/// host pattern, an impossible port pattern). For a DENY rule that is fail-open,
+/// so the rule is refused at admission instead of being published inert.
+fn validate_mesh_rule_request_matchers(
+    policy_name: &str,
+    i: usize,
+    rule: &MeshRule,
+    errors: &mut Vec<String>,
+) {
+    for (j, principal) in rule.from.iter().enumerate() {
+        if principal.spiffe_id_pattern.is_none()
+            && principal.namespace_pattern.is_none()
+            && principal.trust_domain.is_none()
+            && principal.trust_domain_pattern.is_none()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}]: at least one \
+                 of spiffe_id_pattern/namespace_pattern/trust_domain/\
+                 trust_domain_pattern must be set",
+                policy_name, i, j
+            ));
+        }
+        if let Some(pat) = principal.spiffe_id_pattern.as_ref()
+            && glob::Pattern::new(pat).is_err()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}].spiffe_id_pattern \
+                 {:?} is not a valid glob",
+                policy_name, i, j, pat
+            ));
+        }
+        if let Some(pat) = principal.namespace_pattern.as_ref()
+            && glob::Pattern::new(pat).is_err()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}].namespace_pattern \
+                 {:?} is not a valid glob",
+                policy_name, i, j, pat
+            ));
+        }
+        if let Some(pat) = principal.trust_domain_pattern.as_ref()
+            && glob::Pattern::new(pat).is_err()
+        {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].from[{}].trust_domain_pattern \
+                 {:?} is not a valid glob",
+                policy_name, i, j, pat
+            ));
+        }
+    }
+    for (j, request) in rule.to.iter().enumerate() {
+        let any_method = !request.methods.is_empty();
+        let any_path = !request.paths.is_empty();
+        let any_host = !request.hosts.is_empty();
+        let any_header = !request.headers.is_empty();
+        let any_port = !request.ports.is_empty() || !request.port_patterns.is_empty();
+        let any_not = !request.not_methods.is_empty()
+            || !request.not_paths.is_empty()
+            || !request.not_hosts.is_empty()
+            || !request.not_ports.is_empty()
+            || !request.not_port_patterns.is_empty();
+        if !(any_method || any_path || any_host || any_header || any_port || any_not) {
+            errors.push(format!(
+                "MeshPolicy {:?}.rules[{}].to[{}]: at least one of \
+                 methods/paths/hosts/headers/ports or their negated \
+                 counterparts must be non-empty",
+                policy_name, i, j
+            ));
+        }
+        for header in request.headers.keys() {
+            if MESH_AUTHZ_PSEUDO_HEADERS
+                .iter()
+                .any(|pseudo_header| header.eq_ignore_ascii_case(pseudo_header))
+            {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].headers contains pseudo-header \
+                     {:?}, which cannot match the HTTP request header map; use \
+                     to.methods, to.paths, or to.hosts, or use the corresponding \
+                     request.headers[:path] condition for :path",
+                    policy_name, i, j, header
+                ));
+            }
+        }
+        for (k, host) in request.hosts.iter().enumerate() {
+            if !is_valid_request_match_host_pattern(host) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].hosts[{}] \
+                     {:?} is not a valid host pattern \
+                     (expected hostname, [ipv6], or host:port/host:* \
+                     with u16 numeric or `*` port)",
+                    policy_name, i, j, k, host
+                ));
+            }
+        }
+        for (k, host) in request.not_hosts.iter().enumerate() {
+            if !is_valid_request_match_host_pattern(host) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].not_hosts[{}] \
+                     {:?} is not a valid host pattern \
+                     (expected hostname, [ipv6], or host:port/host:* \
+                     with u16 numeric or `*` port)",
+                    policy_name, i, j, k, host
+                ));
+            }
+        }
+        for (k, pattern) in request.port_patterns.iter().enumerate() {
+            if !is_valid_request_match_port_pattern(pattern) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].port_patterns[{}] \
+                     is not an admissible port pattern \
+                     (expected `*`, `<digits>*`, or `*<digits>` that can \
+                     match a destination/listener port in 1..=65535)",
+                    policy_name, i, j, k
+                ));
+            }
+        }
+        for (k, pattern) in request.not_port_patterns.iter().enumerate() {
+            if !is_valid_request_match_port_pattern(pattern) {
+                errors.push(format!(
+                    "MeshPolicy {:?}.rules[{}].to[{}].not_port_patterns[{}] \
+                     is not an admissible port pattern \
+                     (expected `*`, `<digits>*`, or `*<digits>` that can \
+                     match a destination/listener port in 1..=65535)",
+                    policy_name, i, j, k
+                ));
+            }
+        }
+    }
+}
+
+/// Name/namespace and request-matcher validation for policies that reach
+/// `mesh_authz` WITHOUT passing through [`MeshConfig::validate`] — the flat
+/// `mesh_policies` operator config (file/database/admin) and an embedded
+/// `mesh_slice`.
+///
+/// This is the subset of the native per-policy checks that needs no resource
+/// graph: it deliberately omits `targetRefs` resolution (which needs the
+/// slice's services and waypoint bindings) and `when:` conditions (the plugin
+/// re-runs [`validate_mesh_condition`] itself). A policy that passes the native
+/// validator always passes this one.
+pub fn validate_mesh_policy_request_matchers(policy: &MeshPolicy) -> Vec<String> {
+    let mut errors = Vec::new();
+    validate_non_empty_string("MeshPolicy.name".to_string(), &policy.name, &mut errors);
+    validate_non_empty_string(
+        format!("MeshPolicy {:?}.namespace", policy.name),
+        &policy.namespace,
+        &mut errors,
+    );
+    for (i, rule) in policy.rules.iter().enumerate() {
+        validate_mesh_rule_request_matchers(&policy.name, i, rule, &mut errors);
+    }
+    errors
 }
 
 fn validate_non_empty_string(context: String, value: &str, errors: &mut Vec<String>) {

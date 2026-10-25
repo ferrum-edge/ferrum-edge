@@ -93,8 +93,34 @@
 //!
 //! No request body, `authorization`/`cookie` value, provider credential, or
 //! resolved provider URL is ever logged. Diagnostics carry a fixed-cardinality
-//! reason token only. Metrics are labelled by that reason and by nothing else —
-//! never by provider, namespace, route, host, principal, or a status string.
+//! reason token only. The process-wide series are labelled by that reason and
+//! by nothing else. The per-provider series add exactly one more label, the
+//! OPERATOR-ADMITTED provider name (bounded per generation by
+//! `MAX_MESH_EXT_AUTHZ_PROVIDERS` and per process by
+//! [`MAX_PROVIDER_STATS_ENTRIES`]) — never a namespace, route, host,
+//! principal, status string, or any other request-supplied value.
+//!
+//! ## What the check carries about the caller
+//!
+//! Besides the headers the operator names, every check carries the
+//! GATEWAY-ASSERTED identity the local rules were evaluated against:
+//! `x-ferrum-source-principal` (the authenticated source SPIFFE ID, after a
+//! trusted HBONE assertor's baggage rewrite), `x-ferrum-source-namespace` and
+//! `x-ferrum-source-service-account` (its Kubernetes components), and
+//! `x-ferrum-request-principal` (the validated JWT `iss/sub`). A client cannot
+//! forge them: provider admission refuses every `x-ferrum-*` name in
+//! `includeRequestHeadersInCheck` / `includeAdditionalHeadersInCheck`, and the
+//! executor removes the names before stamping them, so the provider only ever
+//! sees the gateway's own value — or no header at all when the identity is
+//! unknown.
+//!
+//! ## Allowed-request mutations
+//!
+//! `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow` are honoured on an
+//! allowed check: the named provider response headers are returned on
+//! [`MeshExtAuthzOutcome::Allow`] and `mesh_authz` applies them in its own
+//! `before_proxy` / `after_proxy` hooks (see `docs/mesh.md`). A provider's
+//! response body is still never consumed.
 
 use crate::plugins::utils::log_sampling::warn_sampled;
 
@@ -107,6 +133,7 @@ use std::time::Duration;
 use http::header::{HeaderName, HeaderValue};
 use tokio::sync::Semaphore;
 
+use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{
     MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES, MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS,
     MeshExtAuthzBodyCheck, MeshExtAuthzProvider,
@@ -148,7 +175,45 @@ pub enum MeshExtAuthzReason {
     RequestBuildFailed,
 }
 
+/// Every reason, in a fixed order. Indexes the per-provider outcome counters.
+const ALL_REASONS: [MeshExtAuthzReason; 14] = [
+    MeshExtAuthzReason::Allowed,
+    MeshExtAuthzReason::DeniedByProvider,
+    MeshExtAuthzReason::ProviderUnbound,
+    MeshExtAuthzReason::ProviderError,
+    MeshExtAuthzReason::ProviderConflict,
+    MeshExtAuthzReason::Unexecutable,
+    MeshExtAuthzReason::Timeout,
+    MeshExtAuthzReason::TransportError,
+    MeshExtAuthzReason::ResponseTooLarge,
+    MeshExtAuthzReason::ResponseReadFailed,
+    MeshExtAuthzReason::BodyUnavailable,
+    MeshExtAuthzReason::BodyTooLarge,
+    MeshExtAuthzReason::ConcurrencyExhausted,
+    MeshExtAuthzReason::RequestBuildFailed,
+];
+
 impl MeshExtAuthzReason {
+    /// Position in [`ALL_REASONS`].
+    fn index(self) -> usize {
+        match self {
+            MeshExtAuthzReason::Allowed => 0,
+            MeshExtAuthzReason::DeniedByProvider => 1,
+            MeshExtAuthzReason::ProviderUnbound => 2,
+            MeshExtAuthzReason::ProviderError => 3,
+            MeshExtAuthzReason::ProviderConflict => 4,
+            MeshExtAuthzReason::Unexecutable => 5,
+            MeshExtAuthzReason::Timeout => 6,
+            MeshExtAuthzReason::TransportError => 7,
+            MeshExtAuthzReason::ResponseTooLarge => 8,
+            MeshExtAuthzReason::ResponseReadFailed => 9,
+            MeshExtAuthzReason::BodyUnavailable => 10,
+            MeshExtAuthzReason::BodyTooLarge => 11,
+            MeshExtAuthzReason::ConcurrencyExhausted => 12,
+            MeshExtAuthzReason::RequestBuildFailed => 13,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             MeshExtAuthzReason::Allowed => "allowed",
@@ -191,11 +256,20 @@ impl MeshExtAuthzReason {
 /// The result of one external authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshExtAuthzOutcome {
-    /// The check allowed the request. Nothing is copied out of the provider
-    /// response: `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow` are
-    /// refused at admission, so an allowed request reaches the backend exactly
-    /// as the client sent it.
-    Allow { reason: MeshExtAuthzReason },
+    /// The request may continue.
+    ///
+    /// `upstream_headers` / `downstream_headers` are the provider response
+    /// headers named by `headersToUpstreamOnAllow` /
+    /// `headersToDownstreamOnAllow`, as `(lowercase name, value)` pairs (one
+    /// pair per name; repeated field lines are folded, `Set-Cookie`
+    /// newline-joined). Both are empty unless the provider ANSWERED `200` — a
+    /// `failOpen` allow carries nothing, because no provider vouched for
+    /// anything.
+    Allow {
+        reason: MeshExtAuthzReason,
+        upstream_headers: Vec<(String, String)>,
+        downstream_headers: Vec<(String, String)>,
+    },
     Deny {
         status: u16,
         headers: Vec<(String, String)>,
@@ -354,6 +428,208 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
             "ferrum_mesh_ext_authz_check_failures_total{{disposition=\"{disposition}\"{gateway_ns_label}}} {value}\n"
         ));
     }
+    render_provider_prometheus(output, gateway_ns_label);
+}
+
+// ── Per-provider attribution (bounded) ────────────────────────────────────
+
+/// Upper bound on distinct provider names that get their own per-provider
+/// series for the life of the process. One generation admits at most
+/// `MAX_MESH_EXT_AUTHZ_PROVIDERS`; this leaves room for renames across reloads
+/// while keeping the label set bounded no matter how many generations publish.
+/// Names past the cap share the [`PROVIDER_STATS_OVERFLOW_LABEL`] series.
+pub const MAX_PROVIDER_STATS_ENTRIES: usize = 64;
+
+/// Shared per-provider series label once [`MAX_PROVIDER_STATS_ENTRIES`]
+/// distinct names have been seen.
+pub const PROVIDER_STATS_OVERFLOW_LABEL: &str = "__overflow__";
+
+/// Check-duration histogram bounds, as `(microseconds, rendered seconds)`.
+/// The provider timeout ceiling is 30 s, so the top finite bucket covers it.
+const CHECK_DURATION_BUCKETS: [(u64, &str); 14] = [
+    (1_000, "0.001"),
+    (2_500, "0.0025"),
+    (5_000, "0.005"),
+    (10_000, "0.01"),
+    (25_000, "0.025"),
+    (50_000, "0.05"),
+    (100_000, "0.1"),
+    (250_000, "0.25"),
+    (500_000, "0.5"),
+    (1_000_000, "1"),
+    (2_500_000, "2.5"),
+    (5_000_000, "5"),
+    (10_000_000, "10"),
+    (30_000_000, "30"),
+];
+
+/// Outcome counters and a check-duration histogram for ONE admitted provider
+/// name. Shared by every executor generation that carries the name, so a
+/// reload does not reset the series. The request path only touches relaxed
+/// atomics through the `Arc` its `PreparedProvider` holds — never the
+/// registry lock.
+#[derive(Debug)]
+struct ProviderStats {
+    outcomes: [AtomicU64; ALL_REASONS.len()],
+    /// Non-cumulative bucket counts; [`render_provider_prometheus`] folds them.
+    duration_buckets: [AtomicU64; CHECK_DURATION_BUCKETS.len()],
+    duration_count: AtomicU64,
+    duration_sum_micros: AtomicU64,
+}
+
+impl Default for ProviderStats {
+    fn default() -> Self {
+        Self {
+            outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
+            duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            duration_count: AtomicU64::new(0),
+            duration_sum_micros: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ProviderStats {
+    fn record(&self, reason: MeshExtAuthzReason) {
+        self.outcomes[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the time from dispatch to the provider's response headers (or
+    /// to the transport failure / timeout that ended the attempt).
+    fn observe_duration(&self, elapsed: Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        if let Some(index) = CHECK_DURATION_BUCKETS
+            .iter()
+            .position(|(bound, _)| micros <= *bound)
+        {
+            self.duration_buckets[index].fetch_add(1, Ordering::Relaxed);
+        }
+        self.duration_count.fetch_add(1, Ordering::Relaxed);
+        self.duration_sum_micros
+            .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    fn outcome_total(&self) -> u64 {
+        self.outcomes
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+/// Process-wide provider-name → stats registry. Touched only on the cold
+/// paths: executor construction (get-or-insert) and `/metrics` rendering.
+static PROVIDER_STATS: std::sync::Mutex<Vec<(String, Arc<ProviderStats>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The shared stats for `name`, registering it on first sight. Past
+/// [`MAX_PROVIDER_STATS_ENTRIES`] distinct names every new name shares the
+/// overflow series, so no sequence of reloads can grow the label set.
+fn provider_stats(name: &str) -> Arc<ProviderStats> {
+    let mut registry = PROVIDER_STATS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, stats)) = registry.iter().find(|(existing, _)| existing == name) {
+        return Arc::clone(stats);
+    }
+    let label = if registry.len() < MAX_PROVIDER_STATS_ENTRIES {
+        name
+    } else {
+        PROVIDER_STATS_OVERFLOW_LABEL
+    };
+    if let Some((_, stats)) = registry.iter().find(|(existing, _)| existing == label) {
+        return Arc::clone(stats);
+    }
+    let stats = Arc::new(ProviderStats::default());
+    registry.push((label.to_string(), Arc::clone(&stats)));
+    stats
+}
+
+/// One provider's per-provider counters, for tests and diagnostics: the
+/// non-zero `(outcome, count)` pairs and the number of timed checks. `None`
+/// when the name was never registered.
+#[allow(dead_code)] // external integration-test seam; unused in the binary target
+pub fn provider_snapshot(name: &str) -> Option<(Vec<(&'static str, u64)>, u64)> {
+    let registry = PROVIDER_STATS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_, stats) = registry.iter().find(|(existing, _)| existing == name)?;
+    let outcomes = ALL_REASONS
+        .iter()
+        .filter_map(|reason| {
+            let value = stats.outcomes[reason.index()].load(Ordering::Relaxed);
+            (value > 0).then_some((reason.as_str(), value))
+        })
+        .collect();
+    Some((outcomes, stats.duration_count.load(Ordering::Relaxed)))
+}
+
+/// Append the per-provider series. Emitted only for providers that have
+/// recorded something, labelled by the admitted provider name only.
+fn render_provider_prometheus(output: &mut String, gateway_ns_label: &str) {
+    let entries: Vec<(String, Arc<ProviderStats>)> = {
+        let registry = PROVIDER_STATS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry
+            .iter()
+            .map(|(name, stats)| (name.clone(), Arc::clone(stats)))
+            .collect()
+    };
+    if entries.iter().all(|(_, stats)| stats.outcome_total() == 0) {
+        return;
+    }
+    output.push_str(
+        "# HELP ferrum_mesh_ext_authz_provider_checks_total CUSTOM external authorization check outcomes per admitted extension provider.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_ext_authz_provider_checks_total counter\n");
+    for (name, stats) in &entries {
+        let provider = crate::plugins::prometheus_metrics::escape_label_value(name);
+        for reason in ALL_REASONS {
+            let value = stats.outcomes[reason.index()].load(Ordering::Relaxed);
+            if value == 0 {
+                continue;
+            }
+            output.push_str(&format!(
+                "ferrum_mesh_ext_authz_provider_checks_total{{provider=\"{provider}\",outcome=\"{}\"{gateway_ns_label}}} {value}\n",
+                reason.as_str()
+            ));
+        }
+    }
+    if entries
+        .iter()
+        .all(|(_, stats)| stats.duration_count.load(Ordering::Relaxed) == 0)
+    {
+        return;
+    }
+    output.push_str(
+        "# HELP ferrum_mesh_ext_authz_check_duration_seconds Time from dispatching a CUSTOM external authorization check to the provider's response headers (or the failure that ended it), per admitted extension provider.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_ext_authz_check_duration_seconds histogram\n");
+    for (name, stats) in &entries {
+        let count = stats.duration_count.load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        let provider = crate::plugins::prometheus_metrics::escape_label_value(name);
+        let mut cumulative = 0u64;
+        for (index, (_, le)) in CHECK_DURATION_BUCKETS.iter().enumerate() {
+            cumulative =
+                cumulative.saturating_add(stats.duration_buckets[index].load(Ordering::Relaxed));
+            output.push_str(&format!(
+                "ferrum_mesh_ext_authz_check_duration_seconds_bucket{{provider=\"{provider}\",le=\"{le}\"{gateway_ns_label}}} {cumulative}\n"
+            ));
+        }
+        output.push_str(&format!(
+            "ferrum_mesh_ext_authz_check_duration_seconds_bucket{{provider=\"{provider}\",le=\"+Inf\"{gateway_ns_label}}} {count}\n"
+        ));
+        let sum_seconds = stats.duration_sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        output.push_str(&format!(
+            "ferrum_mesh_ext_authz_check_duration_seconds_sum{{provider=\"{provider}\"{gateway_ns_label}}} {sum_seconds}\n"
+        ));
+        output.push_str(&format!(
+            "ferrum_mesh_ext_authz_check_duration_seconds_count{{provider=\"{provider}\"{gateway_ns_label}}} {count}\n"
+        ));
+    }
 }
 
 // ── Prepared provider state ───────────────────────────────────────────────
@@ -374,6 +650,14 @@ struct PreparedProvider {
     body: Option<MeshExtAuthzBodyCheck>,
     /// Provider response headers copied onto the gateway-authored DENIAL only.
     headers_to_downstream_on_deny: Vec<HeaderName>,
+    /// `headersToUpstreamOnAllow`: provider response headers that replace the
+    /// backend-bound request's same-named headers on an allowed check.
+    headers_to_upstream_on_allow: Vec<HeaderName>,
+    /// `headersToDownstreamOnAllow`: provider response headers added to the
+    /// client-visible response of an allowed request.
+    headers_to_downstream_on_allow: Vec<HeaderName>,
+    /// Per-provider attribution, shared across generations by name.
+    stats: Arc<ProviderStats>,
 }
 
 impl PreparedProvider {
@@ -441,7 +725,21 @@ impl PreparedProvider {
             headers_to_downstream_on_deny: parse_header_names(
                 &provider.headers_to_downstream_on_deny,
             )?,
+            headers_to_upstream_on_allow: parse_header_names(
+                &provider.headers_to_upstream_on_allow,
+            )?,
+            headers_to_downstream_on_allow: parse_header_names(
+                &provider.headers_to_downstream_on_allow,
+            )?,
+            stats: provider_stats(&provider.name),
         })
+    }
+
+    /// Count one terminal outcome for this provider: once in the process-wide
+    /// fixed-cardinality series and once in this provider's own series.
+    fn record_outcome(&self, reason: MeshExtAuthzReason, failed_open: bool) {
+        record(reason, failed_open);
+        self.stats.record(reason);
     }
 
     /// Refuse a request whose body exceeds THIS provider's `maxRequestBytes`.
@@ -459,7 +757,7 @@ impl PreparedProvider {
     /// other outcome (`body_too_large`), and never as a `failOpen`/fail-closed
     /// disposition.
     fn body_too_large_refusal(&self) -> MeshExtAuthzOutcome {
-        record(MeshExtAuthzReason::BodyTooLarge, false);
+        self.record_outcome(MeshExtAuthzReason::BodyTooLarge, false);
         warn_sampled!(
             plugin = "mesh_authz",
             reason = MeshExtAuthzReason::BodyTooLarge.as_str(),
@@ -473,14 +771,21 @@ impl PreparedProvider {
     }
 
     fn failure(&self, reason: MeshExtAuthzReason) -> MeshExtAuthzOutcome {
-        record(reason, self.fail_open);
+        self.record_outcome(reason, self.fail_open);
         if self.fail_open {
             warn_sampled!(
                 plugin = "mesh_authz",
                 reason = reason.as_str(),
                 "Mesh external authorization check failed; provider is configured failOpen so the request continues"
             );
-            MeshExtAuthzOutcome::Allow { reason }
+            // No provider vouched for anything, so no provider-asserted header
+            // is carried. `mesh_authz` still strips the client's copies of the
+            // provider-owned `headersToUpstreamOnAllow` names.
+            MeshExtAuthzOutcome::Allow {
+                reason,
+                upstream_headers: Vec::new(),
+                downstream_headers: Vec::new(),
+            }
         } else {
             MeshExtAuthzOutcome::Deny {
                 status: self.status_on_error,
@@ -521,6 +826,13 @@ pub struct MeshExtAuthzCheckRequest<'a> {
     /// configured `service`/`port`, so a client-controlled authority can never
     /// re-target the provider connection.
     pub authority: Option<&'a str>,
+    /// The authenticated source identity the local rules were evaluated
+    /// against (after a trusted HBONE assertor's baggage rewrite). Stamped as
+    /// `x-ferrum-source-principal` / `-namespace` / `-service-account`.
+    pub source_principal: Option<&'a SpiffeId>,
+    /// The validated JWT request principal (`iss/sub`), when one was
+    /// established. Stamped as `x-ferrum-request-principal`.
+    pub request_principal: Option<&'a str>,
     /// Buffered request body, when the proxy retained one.
     pub body: Option<&'a [u8]>,
     /// Whether the transport PROVED the request body is empty. Distinguishes
@@ -653,6 +965,39 @@ impl MeshExtAuthzExecutor {
             .is_some_and(|provider| provider.body.is_some())
     }
 
+    /// The `headersToUpstreamOnAllow` names the named provider owns. On an
+    /// allowed check `mesh_authz` removes the client's copies of every one of
+    /// them from the backend-bound request and installs the provider's value
+    /// where it returned one.
+    pub fn upstream_allow_header_names(&self, provider_name: &str) -> &[HeaderName] {
+        self.providers
+            .get(provider_name)
+            .map(|provider| provider.headers_to_upstream_on_allow.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The union of every provider's `headersToUpstreamOnAllow` names, sorted
+    /// and deduplicated — the fixed set of request headers this generation may
+    /// change (`Plugin::modified_request_header_names`).
+    pub fn upstream_allow_header_union(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .providers
+            .values()
+            .flat_map(|provider| provider.headers_to_upstream_on_allow.iter())
+            .map(|name| name.as_str().to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Whether any provider declares `headersToDownstreamOnAllow`.
+    pub fn mutates_downstream_on_allow(&self) -> bool {
+        self.providers
+            .values()
+            .any(|provider| !provider.headers_to_downstream_on_allow.is_empty())
+    }
+
     /// Hostnames the gateway should warm DNS for.
     pub fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts: Vec<String> = self
@@ -767,6 +1112,11 @@ impl MeshExtAuthzExecutor {
         if request.proxy_hops.is_some() {
             check_headers.remove(crate::proxy::hop_limit::PROXY_HOPS_HEADER);
         }
+        stamp_identity_check_headers(
+            &mut check_headers,
+            request.source_principal,
+            request.request_principal,
+        );
         let mut builder = client
             .request(method, url.as_str())
             .timeout(provider.timeout)
@@ -790,7 +1140,8 @@ impl MeshExtAuthzExecutor {
         // when `FERRUM_PLUGIN_HTTP_MAX_RETRIES` is set, and an ext-authz check
         // is usually a GET, so the ordinary seam would silently turn one
         // client request into several authorization decisions.
-        let response = match self
+        let dispatched_at = std::time::Instant::now();
+        let result = self
             .http_client
             .execute_redacted_tracked_classified_single_attempt(
                 builder,
@@ -798,8 +1149,9 @@ impl MeshExtAuthzExecutor {
                 &provider.redacted_url,
                 latency_accumulator,
             )
-            .await
-        {
+            .await;
+        provider.stats.observe_duration(dispatched_at.elapsed());
+        let response = match result {
             Ok(response) => response,
             Err(failure) => {
                 let reason = match failure.error_class {
@@ -831,10 +1183,18 @@ impl MeshExtAuthzExecutor {
             return provider.failure(MeshExtAuthzReason::ProviderError);
         }
         let allowed = outcome_class == ProviderStatusClass::Allow;
-        let deny_headers = if allowed {
-            Vec::new()
+        let (deny_headers, upstream_headers, downstream_headers) = if allowed {
+            (
+                Vec::new(),
+                collect_headers(response.headers(), &provider.headers_to_upstream_on_allow),
+                collect_headers(response.headers(), &provider.headers_to_downstream_on_allow),
+            )
         } else {
-            collect_headers(response.headers(), &provider.headers_to_downstream_on_deny)
+            (
+                collect_headers(response.headers(), &provider.headers_to_downstream_on_deny),
+                Vec::new(),
+                Vec::new(),
+            )
         };
         // The provider response body is never consumed by the authorization
         // contract or forwarded to the client. Drain it under the fixed bound
@@ -866,12 +1226,14 @@ impl MeshExtAuthzExecutor {
         }
 
         if allowed {
-            record(MeshExtAuthzReason::Allowed, false);
+            provider.record_outcome(MeshExtAuthzReason::Allowed, false);
             MeshExtAuthzOutcome::Allow {
                 reason: MeshExtAuthzReason::Allowed,
+                upstream_headers,
+                downstream_headers,
             }
         } else {
-            record(MeshExtAuthzReason::DeniedByProvider, false);
+            provider.record_outcome(MeshExtAuthzReason::DeniedByProvider, false);
             MeshExtAuthzOutcome::Deny {
                 // Envoy forwards the provider's own status on a denial; Ferrum
                 // does the same, but deliberately does NOT forward the provider
@@ -940,16 +1302,94 @@ fn build_check_url(base: &str, path: &str) -> String {
     url
 }
 
-fn collect_headers(headers: &http::HeaderMap, allowed: &[HeaderName]) -> Vec<(String, String)> {
+/// Copy the allowlisted provider response headers, ONE `(name, value)` pair
+/// per name with EVERY field line of that name preserved.
+///
+/// `HeaderMap::get` returns only the first field line, which silently dropped
+/// a second `Set-Cookie` (a login redirect that sets a state cookie AND a nonce
+/// cookie could never complete) and every `WWW-Authenticate` challenge after
+/// the first. Lines are folded into the proxy's own multi-value
+/// representation: `Set-Cookie` newline-joined (every protocol's response
+/// builder splits it back into separate fields — see
+/// `crate::proxy::headers::apply_response_headers`), `Cookie` joined with
+/// `; `, and every other (list-valued) field joined with `, `. A field line
+/// that is not visible ASCII is skipped, as before.
+pub(crate) fn collect_headers(
+    headers: &http::HeaderMap,
+    allowed: &[HeaderName],
+) -> Vec<(String, String)> {
     let mut selected = Vec::new();
     for name in allowed {
-        if let Some(value) = headers.get(name)
-            && let Ok(value) = value.to_str()
-        {
-            selected.push((name.as_str().to_string(), value.to_string()));
+        let separator = if *name == http::header::SET_COOKIE {
+            "\n"
+        } else if *name == http::header::COOKIE {
+            "; "
+        } else {
+            ", "
+        };
+        let mut folded: Option<String> = None;
+        for value in headers.get_all(name) {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if let Some(existing) = folded.as_mut() {
+                existing.push_str(separator);
+                existing.push_str(value);
+            } else {
+                folded = Some(value.to_string());
+            }
+        }
+        if let Some(value) = folded {
+            selected.push((name.as_str().to_string(), value));
         }
     }
     selected
+}
+
+/// Gateway-asserted caller-identity headers stamped on every check.
+pub const SOURCE_PRINCIPAL_CHECK_HEADER: &str = "x-ferrum-source-principal";
+pub const SOURCE_NAMESPACE_CHECK_HEADER: &str = "x-ferrum-source-namespace";
+pub const SOURCE_SERVICE_ACCOUNT_CHECK_HEADER: &str = "x-ferrum-source-service-account";
+pub const REQUEST_PRINCIPAL_CHECK_HEADER: &str = "x-ferrum-request-principal";
+
+/// Stamp the authenticated caller identity onto the check request.
+///
+/// The names are removed first, unconditionally, so the provider can only
+/// ever see the gateway's own value: admission already refuses every
+/// `x-ferrum-*` name in `includeRequestHeadersInCheck` and
+/// `includeAdditionalHeadersInCheck`, and this keeps that true even if a
+/// future admission path forgot to. An identity the gateway does not hold is
+/// ABSENT, never empty.
+fn stamp_identity_check_headers(
+    check_headers: &mut http::HeaderMap,
+    source_principal: Option<&SpiffeId>,
+    request_principal: Option<&str>,
+) {
+    for name in [
+        SOURCE_PRINCIPAL_CHECK_HEADER,
+        SOURCE_NAMESPACE_CHECK_HEADER,
+        SOURCE_SERVICE_ACCOUNT_CHECK_HEADER,
+        REQUEST_PRINCIPAL_CHECK_HEADER,
+    ] {
+        check_headers.remove(name);
+    }
+    let mut stamp = |name: &'static str, value: &str| {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            check_headers.insert(HeaderName::from_static(name), value);
+        }
+    };
+    if let Some(principal) = source_principal {
+        stamp(SOURCE_PRINCIPAL_CHECK_HEADER, principal.as_str());
+        if let Some(namespace) = principal.namespace() {
+            stamp(SOURCE_NAMESPACE_CHECK_HEADER, namespace);
+        }
+        if let Some(service_account) = principal.service_account() {
+            stamp(SOURCE_SERVICE_ACCOUNT_CHECK_HEADER, service_account);
+        }
+    }
+    if let Some(request_principal) = request_principal {
+        stamp(REQUEST_PRINCIPAL_CHECK_HEADER, request_principal);
+    }
 }
 
 /// Materialize the check request body under the provider's declared bound.
@@ -1019,6 +1459,8 @@ mod tests {
             path: "/",
             headers,
             authority: None,
+            source_principal: None,
+            request_principal: None,
             body,
             body_proven_empty,
             proxy_hops: None,

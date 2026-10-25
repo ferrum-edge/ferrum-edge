@@ -947,7 +947,7 @@ Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream 
 | `spiffe_identity` | ✓ | | Extracts peer SPIFFE IDs from TLS/DTLS client certificates |
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
-| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. Istio `AuthorizationPolicy` is a destination-side contract, so the plugin evaluates policy only on **inbound** mesh legs; the Sidecar/Ambient outbound capture leg is not judged and egress scoping is enforced there by `mesh_outbound_registry` instead (see [mesh.md](mesh.md#which-leg-enforces-which-policy-family-issue-4158)). An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)) |
+| `mesh_authz` | ✓ | | Applies Layer 2 mesh authorization policies from SPIFFE/HBONE identity. Istio `AuthorizationPolicy` is a destination-side contract, so the plugin evaluates policy only on **inbound** mesh legs; the Sidecar/Ambient outbound capture leg is not judged and egress scoping is enforced there by `mesh_outbound_registry` instead (see [mesh.md](mesh.md#which-leg-enforces-which-policy-family-issue-4158)). An Istio `AuthorizationPolicy` with `action: CUSTOM` performs its bounded external-authorization check **in this phase** — before `before_proxy`, route dispatch, and every transformer — and fails closed on timeout/transport/oversize/malformed outcomes unless the provider sets `failOpen` (see [mesh.md](mesh.md#authorizationpolicy-action-custom-issue-3235)). An allowed check's `headersToUpstreamOnAllow` result is applied later, in this plugin's own `before_proxy` hook at 2075 (before `mesh_route_dispatch` and every request transformer), and its `headersToDownstreamOnAllow` result in its `after_proxy` / WebSocket handshake hook |
 | `tcp_connection_throttle` | ✓ | | Owns an opaque permit that caps process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP; UDP/DTLS attachment is rejected |
 | `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
@@ -990,7 +990,9 @@ reject or perform I/O after the backend has accepted the session. Ferrum then
 strips connection/framing/WebSocket transport fields, adds the authoritative
 H1 Upgrade fields or Extended CONNECT response, preserves the verified backend
 subprotocol, and appends any gateway-owned sticky cookie. `correlation_id`
-uses this boundary to echo generated and preserved IDs consistently.
+uses this boundary to echo generated and preserved IDs consistently, and
+`mesh_authz` uses it to apply an allowed CUSTOM check's
+`headersToDownstreamOnAllow` result.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -1679,7 +1681,7 @@ Given all built-in plugins enabled, the execution order is:
 | 23 | `soap_ws_security` | 1500 | authenticate, before_proxy, transform_request_body, on_final_request_body |
 | 24 | `access_control` | 2000 | authorize, on_stream_connect |
 | 25 | `tcp_connection_throttle` | 2050 | on_stream_connect (opaque connection permit releases on rejection/teardown) |
-| 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
+| 26 | `mesh_authz` | 2075 | authorize, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 27 | `opa` | 2080 | authorize |
 | 28 | `adaptive_concurrency` | 2090 | backend_admission |
 | 29 | `ai_transcript_audit` | 2740 | before_proxy, on_final_request_body, after_proxy, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |

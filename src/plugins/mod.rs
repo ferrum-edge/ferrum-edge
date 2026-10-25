@@ -3696,6 +3696,17 @@ pub(crate) struct PluginRequestState {
     /// `metadata` so authorization-phase rejection logging can never serialize
     /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// `mesh_authz` CUSTOM `headersToUpstreamOnAllow` result, staged on an
+    /// allowed check and consumed by `mesh_authz`'s own `before_proxy`. One
+    /// entry per provider-owned name: `Some(value)` installs the provider's
+    /// value, `None` only strips the client's copy. Kept out of `metadata` so
+    /// a provider-minted token can never be serialized into a transaction log.
+    pub(crate) mesh_ext_authz_upstream_headers: Vec<(String, Option<String>)>,
+    /// `mesh_authz` CUSTOM `headersToDownstreamOnAllow` result, staged on an
+    /// allowed check and applied to the client-visible response by
+    /// `mesh_authz`'s `after_proxy` / WebSocket handshake hook. Same
+    /// out-of-`metadata` reasoning (it routinely carries `Set-Cookie`).
+    pub(crate) mesh_ext_authz_downstream_headers: Vec<(String, String)>,
     /// Lowercase `claim_headers` destinations already sanitized for this
     /// request. Gateway-owned destinations are stripped exactly once, by the
     /// first plugin instance that owns them, so a later instance sharing a
@@ -5963,6 +5974,11 @@ impl RequestContext {
                 // compatibility clone would extend their lifetime unnecessarily.
                 hook_state.pending_claim_headers = HashMap::new();
                 hook_state.sanitized_claim_header_destinations = HashSet::new();
+                // Same for the `mesh_authz` ext-authz allow-header staging: it
+                // is consumed only by `before_proxy` / `after_proxy` on the
+                // live context, and may carry a provider-minted credential.
+                hook_state.mesh_ext_authz_upstream_headers = Vec::new();
+                hook_state.mesh_ext_authz_downstream_headers = Vec::new();
                 // Response caching has no final request-body hook. Its private
                 // backend-header delta remains on the live donor context for the
                 // eventual response store rather than extending raw values into

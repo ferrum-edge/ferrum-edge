@@ -25268,6 +25268,13 @@ components:
         rejected at admission rather than dropped, because every misspelling in
         an authorization grammar removes a restriction. See `docs/mesh.md` →
         "MeshPolicy" and "Rule Matching".
+
+        Matchers that could never match are rejected at plugin construction
+        too — for the flat `mesh_policies` form and an embedded `mesh_slice`
+        alike, with the same diagnostics as the native mesh validator: an
+        empty `name` / `namespace`, an empty `from[{}]` or `to[{}]` entry, a
+        `to.headers` pseudo-header, an invalid `hosts` / `not_hosts` pattern,
+        and an inadmissible `port_patterns` / `not_port_patterns` entry.
       required: [name, namespace, scope]
       additionalProperties: false
       properties:
@@ -25542,7 +25549,13 @@ components:
             type: string
           description: |
             Header name (case-insensitive, lowercased at config load) to glob
-            value pattern.
+            value pattern. The pseudo-header names `:path`, `:method`,
+            `:authority`, and `:scheme` are rejected (they are not in the
+            request header map; use `paths` / `methods` / `hosts`, or a
+            `when: request.headers[:path]` condition). A header sent as several
+            field lines is matched as ONE value — every line joined with `, `
+            (`; ` for `cookie`) — the same reading `when: request.headers[...]`
+            conditions and CUSTOM forwarded headers use.
     MeshAuthzConditionMatch:
       type: object
       description: |
@@ -25732,7 +25745,20 @@ components:
             admitted by the runtime deserializer instead, which fails the whole
             plugin generation on a malformed slice so the previous valid
             generation keeps serving. Its `mesh_policies` member follows the
-            same closed policy grammar modelled below.
+            same closed policy grammar modelled below, including the
+            never-match matcher refusals.
+
+            Its `ext_authz_providers` entries may declare
+            `headers_to_upstream_on_allow` (provider response headers that
+            replace the backend request's same-named headers on an allowed
+            CUSTOM check, applied in this plugin's `before_proxy`; client copies
+            are always removed) and `headers_to_downstream_on_allow` (added to
+            the allowed response in `after_proxy`, `Set-Cookie` appended).
+            Gateway identity assertions (`x-consumer-*`, `x-path-param-*`, …),
+            `content-*`, and (upstream) `set-cookie` are refused there. Every
+            check carries `x-ferrum-source-principal`,
+            `x-ferrum-source-namespace`, `x-ferrum-source-service-account`, and
+            `x-ferrum-request-principal`.
         mesh_policies:
           type: array
           description: |
