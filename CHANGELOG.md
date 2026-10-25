@@ -157,35 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`grpc_method_router` review hardening.**
-  - An ordinary per-method quota refusal now increments
-    `ferrum_rate_limit_exceeded_total`. Only the state-capacity `429` was
-    counted before, so the counter missed every normal gRPC method refusal
-    (which native gRPC clients see as HTTP 200 / `RESOURCE_EXHAUSTED`). A
-    `fail_closed` Redis outage `503` is still not counted there.
-  - Allow, deny, and rate rules accept a service-level `package.Service/*`
-    entry covering every method of one service, including methods shipped
-    later. The method segment must be exactly `*`; there is no other wildcard
-    or regex. Deny still wins over allow, including over an exact allow under
-    a denied service.
-  - New optional `default_rate_limit` (`{max_requests, window_seconds}`) rate
-    limits every method that no exact or service-level `method_rate_limits`
-    key covers, and counts as a configured rule on its own. Exactly one rule
-    is charged per request, the most specific one (exact, then service-level,
-    then default). Service-level and default budgets are pooled per caller
-    across the methods they cover, so request-chosen method names cannot
-    create new counters. Existing exact rules keep their per-method budgets
-    and counter keys.
-  - The backend-path metadata refresh leaves `grpc_service`, `grpc_method`,
-    and `grpc_full_method` in place when the backend-effective method matches
-    what was already published, and reuses their buffers when it changes,
-    instead of rebuilding all three strings and keys on every request.
-  - `docs/plugins.md` and `openapi.yaml` now document the rejection
-    contract: 403/429/503 mapped to `PERMISSION_DENIED` /
-    `RESOURCE_EXHAUSTED` / `UNAVAILABLE`, the `x-grpc-ratelimit-limit` /
-    `-remaining` / `-method` headers on a quota `429`, that the
-    state-capacity `429` and the `503` carry none of them, and that no retry
-    hint is sent.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
