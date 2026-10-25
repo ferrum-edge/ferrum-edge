@@ -369,18 +369,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exported generic `password` / `token` values verbatim; it is now withheld
   with `*_body_omitted_reason: unparseable_document`, a leading UTF-8 BOM is
   stripped before every parse (so BOM-prefixed MCP calls are read and
-  redacted), and a JSON-shaped SSE frame the parser refuses becomes
-  `[UNPARSEABLE]`. The unkeyed `ai_tool_governor.arguments_hashes` SHA-256
+  redacted), and SSE events are redacted as whole documents (their `data:`
+  lines joined), with a JSON-shaped event payload the parser refuses
+  replaced by one `[UNPARSEABLE]` line. The unkeyed `ai_tool_governor.arguments_hashes` SHA-256
   digest is no longer harvested into `guardrails` (an offline guessing oracle
   for small argument spaces). Under `sink.on_buffer_full: reject` or
   `sink.on_sink_error: reject` the plugin claims the finalized request
   representation of candidate-shaped `POST`s, so a gzip / deflate / br AI
   request is classified on the shared gate's decoded plaintext (an undecodable
   coding is refused with `400`) instead of bypassing fail-closed admission, and
-  a JSON-shaped body no parser can read is conservatively audited. A
-  `grpc`-enrolled instance now joins the backend-path boundary itself, so an
-  audit-only proxy with `strip_listen_path` / `backend_path` enrolls on the
-  backend-effective method rather than the client path.
+  any candidate body no parser can read (comments, UTF-16, `NaN`, …) is
+  conservatively audited. A `grpc`-enrolled instance now joins the
+  backend-path boundary itself, so an audit-only proxy with
+  `strip_listen_path` / `backend_path` enrolls on the backend-effective method
+  rather than the client path, and stages such a call there so a deferred
+  short circuit still leaves its record.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

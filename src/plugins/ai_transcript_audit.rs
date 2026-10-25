@@ -3070,15 +3070,20 @@ impl AiTranscriptAudit {
     /// Whether a candidate-typed body that no structural parse could read must
     /// still be audited as a possible AI request.
     ///
-    /// A JSON-shaped body strict parsing refuses (UTF-16 / UTF-32, `NaN`,
-    /// comments, trailing commas) can still be executed by a lenient upstream,
-    /// so under a fail-closed policy it is conservatively in scope exactly like
-    /// a body past the redaction scan ceiling: it is staged, admitted, and
-    /// recorded (its excerpt withheld as `unparseable_document`), never
-    /// silently forwarded unaudited. Fail-open policies keep the heuristic
-    /// classification. Byte checks only.
+    /// Callers reach this only for a body on the candidate surface
+    /// (a POST whose media type is JSON-ish, or a Content-Type-less body the
+    /// MCP prefilter flagged). Any such body strict parsing refuses can still
+    /// be executed by a lenient upstream — UTF-16 / UTF-32, a leading `//` or
+    /// `/* */` comment, a non-ASCII whitespace prefix, `NaN`, trailing commas —
+    /// and no byte heuristic enumerates every dialect. So under a fail-closed
+    /// policy every unreadable candidate body is conservatively in scope,
+    /// exactly like a body past the redaction scan ceiling and independent of
+    /// `capture.mcp_tool_calls`: it is staged, admitted, and recorded (its
+    /// excerpt withheld as `unparseable_document`), never silently forwarded
+    /// unaudited. Fail-open policies keep the heuristic classification.
     fn unreadable_document_in_scope(&self, body: &[u8], parsed: Option<&Value>) -> bool {
-        parsed.is_none() && self.fails_closed() && looks_like_json_document(body)
+        // An empty body carries no request at all, so it is never "unreadable".
+        !body.is_empty() && parsed.is_none() && self.fails_closed()
     }
 
     fn shape_body(
@@ -3086,6 +3091,7 @@ impl AiTranscriptAudit {
         raw: &[u8],
         max_bytes: usize,
         representation: PayloadRepresentation,
+        pre_parsed: PreParsed,
     ) -> ShapedBody {
         shape_bytes(
             self.mode,
@@ -3094,6 +3100,7 @@ impl AiTranscriptAudit {
             max_bytes,
             self.limits.max_redaction_scan_bytes,
             representation,
+            pre_parsed,
         )
     }
 
@@ -3708,9 +3715,17 @@ impl AiTranscriptAudit {
     /// ([`AuditStaging::captured`]) — so the common no-transform path performs a
     /// single keyed HMAC pass instead of hashing once at staging and again to
     /// discover the final body was unchanged.
+    ///
+    /// `document` is the caller's own parse of these exact bytes (`None` when
+    /// it was refused or skipped by the scan ceiling). It is consumed here:
+    /// model/tool metadata is read from it first (only when
+    /// `extract_metadata`; an MCP candidate's final body names neither), and
+    /// the same tree is then redacted in place for the excerpt, so one hook
+    /// never parses the same document twice.
     fn capture_request(
         &self,
-        parsed: Option<&Value>,
+        document: Option<Value>,
+        extract_metadata: bool,
         body: &[u8],
         sample_hit: bool,
         excerpt_budget: usize,
@@ -3736,6 +3751,7 @@ impl AiTranscriptAudit {
         // `hash_only` exports no model/provider/tool metadata at all
         // (`build_record` discards it), so do not extract or redact it.
         let harvests = self.mode.harvests_metadata();
+        let parsed = document.as_ref().filter(|_| extract_metadata);
         let model = if harvests {
             parsed
                 .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
@@ -3751,8 +3767,18 @@ impl AiTranscriptAudit {
             BoundedToolNames::default()
         };
         let shaped = if self.capture.request {
-            // Every request capture is a classified JSON / MCP candidate.
-            self.shape_body(body, excerpt_budget, PayloadRepresentation::JsonDocument)
+            // Every request capture is a classified JSON / MCP candidate, and
+            // the caller already parsed (or failed to parse) these bytes.
+            let pre_parsed = match document {
+                Some(document) => PreParsed::Document(document),
+                None => PreParsed::Unparseable,
+            };
+            self.shape_body(
+                body,
+                excerpt_budget,
+                PayloadRepresentation::JsonDocument,
+                pre_parsed,
+            )
         } else {
             ShapedBody::default()
         };
@@ -3823,7 +3849,7 @@ impl AiTranscriptAudit {
         } else {
             parse_json_document(body)
         };
-        // A JSON-shaped body no structural parse can read is, under a
+        // A candidate body no structural parse can read is, under a
         // fail-closed policy, conservatively a possible AI request — like a
         // scan-limited one — so it cannot bypass fail-closed admission.
         let unreadable_document =
@@ -3942,7 +3968,8 @@ impl AiTranscriptAudit {
             // from it, and its excerpt shares the request budget with the
             // argument excerpts.
             BodyPhase::Final => self.capture_request(
-                parsed.as_ref().filter(|_| mcp_section.is_none()),
+                parsed,
+                mcp_section.is_none(),
                 body,
                 sample_hit,
                 max_request_bytes.saturating_sub(mcp_arguments_bytes),
@@ -4080,7 +4107,7 @@ impl AiTranscriptAudit {
             parse_json_document(body)
         };
         // Mirror `stage_candidate`'s conservative fail-closed scope for a
-        // JSON-shaped body no structural parse can read.
+        // candidate body no structural parse can read.
         let unreadable_document =
             !scan_limited && self.unreadable_document_in_scope(body, parsed.as_ref());
         // An MCP candidate was classified from the client's JSON-RPC body when
@@ -4138,12 +4165,13 @@ impl AiTranscriptAudit {
         let max_request_bytes = self.limits.max_request_bytes;
         let mut capture = match staged_mcp {
             Some((mcp_arguments_bytes, _)) => self.capture_request(
-                None,
+                parsed,
+                false,
                 body,
                 sample_hit,
                 max_request_bytes.saturating_sub(mcp_arguments_bytes),
             ),
-            None => self.capture_request(parsed.as_ref(), body, sample_hit, max_request_bytes),
+            None => self.capture_request(parsed, true, body, sample_hit, max_request_bytes),
         };
         self.publish_request_capture(ctx, &capture);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
@@ -4702,6 +4730,7 @@ impl AiTranscriptAudit {
             serialized.as_bytes(),
             budget,
             PayloadRepresentation::JsonDocument,
+            PreParsed::NotAttempted,
         );
         let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
         *arguments_bytes = arguments_bytes.saturating_add(excerpt_bytes);
@@ -4959,6 +4988,76 @@ impl Plugin for AiTranscriptAudit {
     /// backend actually receives.
     fn requires_backend_path_resolution(&self) -> bool {
         self.active && self.grpc.is_some()
+    }
+
+    /// Stage a native-gRPC call whose BACKEND-EFFECTIVE method is enrolled
+    /// although its client-path method was not, at the moment that method
+    /// becomes authoritative.
+    ///
+    /// The selected path is pinned here and this hook runs before any deferred
+    /// `before_proxy` hook (`fault_injection`, `response_mock`, …) can
+    /// short-circuit. Staging only in the final request-body hook would lose
+    /// the call whenever such a deferred hook answers first: no final hook
+    /// runs, and the reject-path and log fallbacks capture only a candidate
+    /// that is already staged. A call `before_proxy` already staged for its
+    /// enrolled client path is left alone; the final hook (or the reject-path
+    /// refresh) re-decides it against the bound path.
+    ///
+    /// No authoritative finalized header map exists at this boundary, so the
+    /// request context's `grpc-encoding` is recorded as the framing witness a
+    /// short-circuit capture uses; ordinary dispatch still captures from the
+    /// final hook's own backend-visible header map.
+    async fn on_backend_path_resolved(
+        &self,
+        ctx: &mut RequestContext,
+        backend_path: &str,
+    ) -> PluginResult {
+        if !self.active || !ctx.is_native_grpc_request() {
+            return PluginResult::Continue;
+        }
+        let Some(grpc) = self.grpc.as_ref() else {
+            return PluginResult::Continue;
+        };
+        if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
+            return PluginResult::Continue;
+        }
+        // Same precedence as `grpc_method_path`: a published
+        // `grpc_full_method` (refreshed from this same path by an earlier
+        // `grpc_method_router` in the boundary list) wins; otherwise the path
+        // being bound is the method.
+        let enrolled = if ctx
+            .metadata
+            .get("grpc_full_method")
+            .is_some_and(|method| !method.is_empty())
+        {
+            grpc.enrolls(&Self::grpc_method_path(ctx))
+        } else {
+            grpc.enrolls(backend_path)
+        };
+        if !enrolled {
+            return PluginResult::Continue;
+        }
+        let encoding = grpc_message_encoding(&ctx.headers);
+        let stage_result = if let Some(body) = ctx.metadata.remove("request_body") {
+            let staged =
+                self.stage_grpc_candidate(ctx, body.as_bytes(), encoding, BodyPhase::Provisional);
+            ctx.metadata.insert("request_body".to_string(), body);
+            staged
+        } else if let Some(body) = ctx.request_body_bytes.clone() {
+            // `Bytes::clone` shares the already-bounded buffer.
+            self.stage_grpc_candidate(ctx, &body, encoding, BodyPhase::Provisional)
+        } else {
+            return PluginResult::Continue;
+        };
+        // Fail-closed commit admission is deliberately NOT taken here: the
+        // proxy binds the backend path only after this boundary accepts, and
+        // every later admission point — the final request-body hook on
+        // ordinary dispatch, `after_proxy` on a deferred short circuit — runs
+        // with that bound path, so it captures the call under the enrolled
+        // method. A refusal here would be finalized before the bind and the
+        // reject-path refresh would see only the unenrolled client method.
+        // `stage_result` still carries a staging-saturation refusal.
+        stage_result
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {
@@ -5671,7 +5770,12 @@ impl Plugin for AiTranscriptAudit {
                 } else {
                     PayloadRepresentation::MaybeEventStream
                 };
-                self.shape_body(body, self.limits.max_response_bytes, representation)
+                self.shape_body(
+                    body,
+                    self.limits.max_response_bytes,
+                    representation,
+                    PreParsed::NotAttempted,
+                )
             }
         } else {
             ShapedBody::default()
@@ -6304,6 +6408,7 @@ impl ResponseStreamInspector for AuditStreamInspector {
                         self.max_bytes,
                         self.max_scan_bytes,
                         PayloadRepresentation::MaybeEventStream,
+                        PreParsed::NotAttempted,
                     )
                 };
                 *capture = StreamCaptureLifecycle::Complete(Some(StreamCaptured {
@@ -6866,6 +6971,7 @@ fn shape_bytes(
     max_bytes: usize,
     max_scan_bytes: usize,
     representation: PayloadRepresentation,
+    pre_parsed: PreParsed,
 ) -> ShapedBody {
     if !mode.captures_body() {
         return ShapedBody::default();
@@ -6875,7 +6981,7 @@ fn shape_bytes(
         if raw.len() > max_scan_bytes {
             return ShapedBody::omitted(OMIT_REASON_REDACTION_SCAN_LIMIT);
         }
-        match redact_body_decoded_json_strings(redactor, raw, representation) {
+        match redact_body_decoded_json_strings(redactor, raw, representation, pre_parsed) {
             Some(redacted) => redacted,
             None => return ShapedBody::omitted(OMIT_REASON_UNPARSEABLE_DOCUMENT),
         }
@@ -6930,10 +7036,23 @@ enum PayloadRepresentation {
     /// or serialized MCP arguments. Unreadable means withheld.
     JsonDocument,
     /// A payload that may legitimately be an event stream or other text (a
-    /// streamed response). SSE frames are redacted frame by frame; anything
+    /// streamed response). SSE events are redacted event by event; anything
     /// that still looks like a JSON document is withheld; only genuinely
     /// non-JSON text falls back to pattern redaction.
     MaybeEventStream,
+}
+
+/// Whether the caller already parsed a payload's exact bytes with
+/// [`parse_json_document`], so redaction can reuse that result instead of
+/// parsing the same document again.
+enum PreParsed {
+    /// No parse of these bytes is available; redaction parses them itself.
+    NotAttempted,
+    /// The caller's parse of these exact bytes, handed over to be redacted in
+    /// place.
+    Document(Value),
+    /// The caller's parse of these exact bytes failed.
+    Unparseable,
 }
 
 /// Strip one leading UTF-8 byte-order mark. Strict JSON refuses it, while
@@ -6943,9 +7062,9 @@ fn strip_utf8_bom(raw: &[u8]) -> &[u8] {
     raw.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(raw)
 }
 
-/// Parse a whole JSON document after stripping a leading UTF-8 BOM. Every
-/// classification, extraction, and redaction parse of a captured HTTP body
-/// goes through this one helper so they all read the same document.
+/// Parse a whole JSON document after stripping a leading UTF-8 BOM. Request
+/// classification and extraction, and every excerpt redaction, go through this
+/// one helper so they all read the same document.
 fn parse_json_document(raw: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Value>(strip_utf8_bom(raw)).ok()
 }
@@ -6982,13 +7101,19 @@ fn redact_body_decoded_json_strings(
     redactor: &PiiRedactor,
     raw: &[u8],
     representation: PayloadRepresentation,
+    pre_parsed: PreParsed,
 ) -> Option<String> {
     // An empty payload (a bridged GET, an empty response) carries nothing to
     // redact or withhold.
     if raw.is_empty() {
         return Some(String::new());
     }
-    if let Some(mut json) = parse_json_document(raw) {
+    let document = match pre_parsed {
+        PreParsed::NotAttempted => parse_json_document(raw),
+        PreParsed::Document(document) => Some(document),
+        PreParsed::Unparseable => None,
+    };
+    if let Some(mut json) = document {
         redact_json_value_strings(redactor, &mut json);
         // Serializing a `Value` does not fail in practice; if it ever did, the
         // only fallback would be the raw bytes, so withhold instead.
@@ -7714,41 +7839,98 @@ fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> 
     // Leading BOMs are copied through unchanged; only the lines after them are
     // rewritten, each keeping its original terminator.
     out.push_str(&text[..text.len() - body.len()]);
+    // The lines (terminators included) of the event being accumulated. An
+    // event ends at a blank line; its payload is all of its `data:` lines
+    // joined with `\n`, exactly as `utils::sse` (and every client) reads it.
+    let mut event: Vec<&str> = Vec::new();
     for line in sse_lines_inclusive(body) {
-        let (line_no_newline, newline) = split_sse_line_terminator(line);
-        if let Some(rest) = line_no_newline
-            .strip_prefix("data: ")
-            .or_else(|| line_no_newline.strip_prefix("data:"))
-        {
-            let trimmed = rest.trim();
-            if !trimmed.is_empty() && trimmed != "[DONE]" {
-                match serde_json::from_str::<Value>(trimmed) {
-                    Ok(mut json) => {
-                        redact_json_value_strings(redactor, &mut json);
-                        if let Ok(serialized) = serde_json::to_string(&json) {
-                            out.push_str("data: ");
-                            out.push_str(&redactor.redact(&serialized));
-                            out.push_str(newline);
-                            changed = true;
-                            continue;
-                        }
-                    }
-                    // A JSON-shaped frame the parser refuses (`NaN`, a
-                    // comment) cannot receive member-name redaction, so its
-                    // bytes are replaced rather than pattern-redacted.
-                    Err(_) if looks_like_json_document(trimmed.as_bytes()) => {
-                        out.push_str("data: [UNPARSEABLE]");
-                        out.push_str(newline);
-                        changed = true;
-                        continue;
-                    }
-                    Err(_) => {}
-                }
-            }
+        if split_sse_line_terminator(line).0.is_empty() {
+            changed |= redact_sse_event(redactor, &event, &mut out);
+            event.clear();
+            out.push_str(line);
+        } else {
+            event.push(line);
         }
-        out.push_str(line);
     }
+    changed |= redact_sse_event(redactor, &event, &mut out);
     changed.then(|| redactor.redact(&out))
+}
+
+/// The value of an SSE `data` field line, or `None` for any other line. Per
+/// the event-stream grammar the value follows the first `:` minus one optional
+/// leading space, and a bare `data` line is a data field with an empty value.
+fn sse_data_value(line: &str) -> Option<&str> {
+    if line == "data" {
+        return Some("");
+    }
+    let value = line.strip_prefix("data:")?;
+    Some(value.strip_prefix(' ').unwrap_or(value))
+}
+
+/// Append one SSE event (its non-blank lines, terminators included) to `out`,
+/// redacting its payload as a whole. Returns whether the payload was replaced.
+///
+/// The payload is every `data:` line of the event joined with `\n`, so a JSON
+/// document a provider spreads over several `data:` lines is parsed — and
+/// redacted by member name — as the one document a client reads, never line
+/// by line. A JSON payload is re-emitted as one redacted `data:` line at the
+/// position of the event's first data line; a JSON-shaped payload the parser
+/// refuses is replaced by one `data: [UNPARSEABLE]` line, withholding every
+/// continuation line with it. Non-data fields (`event:`, `id:`, comments) stay
+/// in place. A payload that is not JSON at all (plain text) is copied through
+/// for the caller's pattern pass, as before.
+fn redact_sse_event(redactor: &PiiRedactor, lines: &[&str], out: &mut String) -> bool {
+    let mut data = String::new();
+    let mut data_lines = 0usize;
+    for line in lines {
+        if let Some(value) = sse_data_value(split_sse_line_terminator(line).0) {
+            if data_lines > 0 {
+                data.push('\n');
+            }
+            data.push_str(value);
+            data_lines += 1;
+        }
+    }
+    let trimmed = data.trim();
+    let replacement = if data_lines == 0 || trimmed.is_empty() || trimmed == "[DONE]" {
+        None
+    } else {
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(mut json) => {
+                redact_json_value_strings(redactor, &mut json);
+                // Serializing a `Value` does not fail in practice; if it ever
+                // did, the payload is withheld rather than copied raw.
+                Some(
+                    serde_json::to_string(&json)
+                        .map(|serialized| redactor.redact(&serialized))
+                        .unwrap_or_else(|_| "[UNPARSEABLE]".to_string()),
+                )
+            }
+            Err(_) if looks_like_json_document(trimmed.as_bytes()) => {
+                Some("[UNPARSEABLE]".to_string())
+            }
+            Err(_) => None,
+        }
+    };
+    let Some(replacement) = replacement else {
+        for line in lines {
+            out.push_str(line);
+        }
+        return false;
+    };
+    let mut emitted = false;
+    for line in lines {
+        let (content, newline) = split_sse_line_terminator(line);
+        if sse_data_value(content).is_none() {
+            out.push_str(line);
+        } else if !emitted {
+            out.push_str("data: ");
+            out.push_str(&replacement);
+            out.push_str(newline);
+            emitted = true;
+        }
+    }
+    true
 }
 
 fn response_body_capture_allowed(
