@@ -261,6 +261,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "ai_transcript_audit.sink_status",
     "ai_transcript_audit.stream_marker",
     "ai_transcript_audit.stream_request",
+    "ai_unmetered_reason",
     "authorization.termination_reason",
     "body_validator.request_detail",
     "body_validator.request_outcome",

@@ -12539,6 +12539,7 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
         json!({"buffer_streaming_responses": true}),
         json!({"cost_per_prompt_token": 0.000003}),
         json!({"cost_per_prompt_token": 18_446_744_073_709.55}),
+        json!({"model_pricing": [{"model": "gpt-4o*", "cost_per_prompt_token": 0.0000025}]}),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -12560,6 +12561,8 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
         json!({"metadata_prefix": "x".repeat(65)}),
         json!({"cost_per_prompt_token": -1}),
         json!({"cost_per_prompt_token": 18_446_744_073_710.0}),
+        json!({"model_pricing": [{"model": "gpt-4o*"}]}),
+        json!({"model_pricing": [{"model": "a..b", "cost_per_prompt_token": 1}]}),
     ] {
         assert!(
             validator.validate(&config).is_err(),

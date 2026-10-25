@@ -604,6 +604,14 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         protocol_rationale: "HTTP-only; routes final OpenAI JSON bodies to providers, normalizes bounded responses, and relays committed provider SSE incrementally",
     },
     BuiltinPluginParityMeta {
+        name: "ai_token_metrics",
+        classification: BuiltinPluginClassification::Public,
+        priority: 4070,
+        active_phases: "on_response_body, response_stream_inspector, on_response_stream_terminated",
+        matrix_protocols: HTTP_ONLY_PROTOCOLS,
+        protocol_rationale: "HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract",
+    },
+    BuiltinPluginParityMeta {
         name: "ai_response_guard",
         classification: BuiltinPluginClassification::Public,
         priority: 4075,
@@ -618,14 +626,6 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         active_phases: "after_proxy, initial response-header boundary",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "HTTP-family response security headers and fingerprint stripping",
-    },
-    BuiltinPluginParityMeta {
-        name: "ai_token_metrics",
-        classification: BuiltinPluginClassification::Public,
-        priority: 4100,
-        active_phases: "on_response_body",
-        matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract",
     },
     BuiltinPluginParityMeta {
         name: "ai_rate_limiter",
