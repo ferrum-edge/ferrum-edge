@@ -19,19 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate` and fail every request.
 - **`ldap_auth` membership modes, failover, and credential bounds** (PR
   #6846). `group_member_attribute` sets a custom DN-valued membership
-  attribute and `group_membership_mode: ad_in_chain` proves nested Active
+  attribute, `group_membership_mode: ad_in_chain` proves nested Active
   Directory membership with `LDAP_MATCHING_RULE_IN_CHAIN`
   (`1.2.840.113556.1.4.1941`) in both the group search and the custom-filter
-  recheck. The connection budget is split across screened DNS candidates so a
+  recheck, and `group_membership_mode: member_of` proves it from the user
+  entry's `memberOf` DNs matched against required groups found by name. The connection budget is split across screened DNS candidates so a
   stalled or TLS-failing address no longer starves the next, and
   `failover_ldap_urls` adds replicas tried in order on connection, transport,
   `busy` (51), or `unavailable` (52) failures (never on credential
   rejections). Opt-in `negative_cache_ttl_seconds`,
   `max_failed_attempts_per_user` / `failed_attempt_backoff_seconds`, and
   `service_connection_max_age_seconds` bound repeated bad credentials,
-  per-username failure runs, and service-account connection churn. Cache keys
-  fold login spellings like the directory, and group names compare like
-  `caseIgnoreMatch`.
+  per-username failure runs, and service-account connection churn; the
+  rejected-credential and backoff state survives compatible reloads and never
+  evicts a live block. Group names compare like `caseIgnoreMatch`.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

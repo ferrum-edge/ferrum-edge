@@ -75,8 +75,8 @@ use serde_json::Map;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
@@ -205,7 +205,16 @@ enum GroupMembershipMode {
     /// [`LDAP_MATCHING_RULE_IN_CHAIN_OID`] on `group_member_attribute`
     /// (default `member`).
     AdInChain,
+    /// Reverse membership: the authenticated user's own entry lists group DNs
+    /// in `group_member_attribute` (default `memberOf`, maintained by the
+    /// directory). A required group counts only when an entry found under
+    /// `group_base_dn` by its authoritative `group_attribute` value has a DN
+    /// equal to one of those values.
+    MemberOf,
 }
+
+/// Default user-side attribute for [`GroupMembershipMode::MemberOf`].
+const LDAP_AUTH_DEFAULT_MEMBER_OF_ATTRIBUTE: &str = "memberOf";
 
 /// One directory endpoint: `ldap_url` or a `failover_ldap_urls` entry.
 struct LdapEndpoint {
@@ -224,13 +233,10 @@ impl LdapEndpoint {
     /// Stop handing out `retired` if it is still this endpoint's shared
     /// connection. A concurrent replacement is left in place.
     fn retire_service_connection(&self, retired: &Arc<PooledServiceConnection>) {
-        if self
-            .service_connection
-            .load_full()
-            .is_some_and(|current| Arc::ptr_eq(&current, retired))
-        {
-            self.service_connection.store(None);
-        }
+        // Compare-and-swap on the exact observed `Arc`: a replacement another
+        // flow published after `retired` was observed is never cleared.
+        let observed = Some(Arc::clone(retired));
+        let _ = self.service_connection.compare_and_swap(&observed, None);
     }
 }
 
@@ -242,12 +248,32 @@ struct PooledServiceConnection {
     created_at: Instant,
 }
 
-/// A service-account connection lent to one flow.
-struct ServiceConnection {
+/// A service-account (or anonymous) connection lent to one flow.
+///
+/// Dropping a loan that was never settled through
+/// [`LdapAuth::release_service_connection`] — the flow was cancelled by the
+/// request deadline or a gRPC deadline while an operation was outstanding —
+/// retires a shared connection synchronously. Its outstanding operation then
+/// ends when the last concurrent borrower lets go and the connection closes,
+/// instead of piling more work onto a connection the concurrency bound no
+/// longer accounts for.
+struct ServiceConnection<'a> {
     ldap: Ldap,
     /// The shared connection this handle belongs to, if any. A shared
     /// connection is never unbound by the flow that borrowed it.
     pooled: Option<Arc<PooledServiceConnection>>,
+    endpoint: &'a LdapEndpoint,
+    settled: bool,
+}
+
+impl Drop for ServiceConnection<'_> {
+    fn drop(&mut self) {
+        if !self.settled
+            && let Some(pooled) = self.pooled.as_ref()
+        {
+            self.endpoint.retire_service_connection(pooled);
+        }
+    }
 }
 
 /// Recent consecutive credential failures for one presented username.
@@ -255,6 +281,209 @@ struct AccountFailures {
     consecutive: u32,
     last_failure: Instant,
     blocked_until: Option<Instant>,
+}
+
+impl AccountFailures {
+    /// Whether this state still constrains its username: an active block, or
+    /// a failure run whose quiet period has not elapsed.
+    fn is_live(&self, now: Instant, backoff: Duration) -> bool {
+        self.blocked_until.is_some_and(|until| now < until)
+            || (self.consecutive > 0 && now.saturating_duration_since(self.last_failure) < backoff)
+    }
+
+    /// Count one more credential failure observed at `now`.
+    fn record_failure(&mut self, now: Instant, threshold: u32, backoff: Duration) {
+        // A lapsed block, or a quiet period as long as the backoff, starts a
+        // new run of failures.
+        let quiet_period_elapsed = now.saturating_duration_since(self.last_failure) >= backoff;
+        let block_elapsed = self.blocked_until.is_some_and(|until| now >= until);
+        if quiet_period_elapsed || block_elapsed {
+            self.consecutive = 0;
+            self.blocked_until = None;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.last_failure = now;
+        if self.consecutive >= threshold {
+            self.blocked_until = now.checked_add(backoff);
+            self.consecutive = 0;
+        }
+    }
+}
+
+/// Entries examined when the per-username tracker is full and a new username
+/// needs a slot. Only state that no longer constrains anyone is reclaimed.
+const LDAP_AUTH_ACCOUNT_PRUNE_SCAN: usize = 16;
+
+/// Whether a presented username may reach the directory under the
+/// per-username failure bound.
+enum AccountAdmission {
+    Allowed,
+    /// Inside its failed-attempt backoff.
+    Blocked,
+    /// The tracker is full of live state, so a username it cannot track is
+    /// refused rather than given unbounded attempts.
+    Saturated,
+}
+
+/// Effective semantics a retained [`CredentialGuardState`] was built for. A
+/// rebuild with equal semantics inherits the live state; any change gets
+/// fresh state. Holds no credential, URL, or username.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CredentialGuardSemantics {
+    realm: [u8; 32],
+    negative_cache_ttl_secs: u64,
+    max_failed_attempts_per_user: u32,
+    failed_attempt_backoff_secs: u64,
+    capacity: usize,
+}
+
+/// Rejected-credential cache and per-username failure tracker.
+///
+/// Owned by the stable policy identity (namespace + plugin-config id), not by
+/// the instance a reload happens to construct: a compatible rebuild inherits
+/// active backoffs and remembered rejections, and failures still finishing on
+/// the retired generation land in the same state.
+struct CredentialGuardState {
+    semantics: CredentialGuardSemantics,
+    /// Keys every digest in this state. Zeroized on drop.
+    hmac_key: Zeroizing<[u8; 32]>,
+    negative_cache: BoundedKeyMap<Instant>,
+    account_failures: BoundedKeyMap<AccountFailures>,
+}
+
+type CredentialGuardRegistry = Mutex<HashMap<String, Vec<Weak<CredentialGuardState>>>>;
+
+/// Weak registry of [`CredentialGuardState`] by policy identity. Entries are
+/// pruned on insert, so retention is bounded by the configured policies plus
+/// in-flight holders.
+static CREDENTIAL_GUARD_STATES: OnceLock<CredentialGuardRegistry> = OnceLock::new();
+
+impl CredentialGuardState {
+    fn new(semantics: CredentialGuardSemantics, shard_amount: usize) -> Result<Arc<Self>, String> {
+        let mut hmac_key = Zeroizing::new([0u8; 32]);
+        crate::fips::backend::rand::SystemRandom::new()
+            .fill(hmac_key.as_mut())
+            .map_err(|_| "ldap_auth: failed to generate credential guard key".to_string())?;
+        Ok(Arc::new(Self {
+            semantics,
+            hmac_key,
+            negative_cache: BoundedKeyMap::new(shard_amount, semantics.capacity),
+            account_failures: BoundedKeyMap::new(shard_amount, semantics.capacity),
+        }))
+    }
+
+    /// The live state for `identity` with these semantics, or fresh state.
+    /// Without an identity (validation and direct construction) the state is
+    /// private to the instance.
+    fn retain(
+        identity: Option<&str>,
+        semantics: CredentialGuardSemantics,
+        shard_amount: usize,
+    ) -> Result<Arc<Self>, String> {
+        let Some(identity) = identity else {
+            return Self::new(semantics, shard_amount);
+        };
+        let registry = CREDENTIAL_GUARD_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|_, states| {
+            states.retain(|weak| weak.strong_count() > 0);
+            !states.is_empty()
+        });
+        if let Some(existing) = guard.get(identity).and_then(|states| {
+            states
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|state| state.semantics == semantics)
+        }) {
+            return Ok(existing);
+        }
+        let state = Self::new(semantics, shard_amount)?;
+        guard
+            .entry(identity.to_string())
+            .or_default()
+            .push(Arc::downgrade(&state));
+        Ok(state)
+    }
+
+    /// Admission for a presented username whose digest is `key`.
+    fn account_admission(&self, key: &CacheKey, now: Instant) -> AccountAdmission {
+        let backoff = Duration::from_secs(self.semantics.failed_attempt_backoff_secs);
+        if let Some(state) = self.account_failures.map.get(key) {
+            return if state.blocked_until.is_some_and(|until| now < until) {
+                AccountAdmission::Blocked
+            } else {
+                AccountAdmission::Allowed
+            };
+        }
+        if self.account_failures.entries.load(Ordering::Acquire) < self.account_failures.capacity
+            || self.prune_one_account(now, backoff)
+        {
+            AccountAdmission::Allowed
+        } else {
+            AccountAdmission::Saturated
+        }
+    }
+
+    /// Reclaim one tracked username that no longer constrains anyone.
+    /// Live counters and active blocks are never evicted.
+    fn prune_one_account(&self, now: Instant, backoff: Duration) -> bool {
+        let candidates: Vec<CacheKey> = self
+            .account_failures
+            .map
+            .iter()
+            .take(LDAP_AUTH_ACCOUNT_PRUNE_SCAN)
+            .filter(|entry| !entry.value().is_live(now, backoff))
+            .map(|entry| *entry.key())
+            .collect();
+        for key in candidates {
+            if self
+                .account_failures
+                .map
+                .remove_if(&key, |_, state| !state.is_live(now, backoff))
+                .is_some()
+            {
+                self.account_failures.release();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Count one credential failure for `key` as a single per-key operation:
+    /// concurrent first failures combine instead of overwriting each other.
+    fn record_account_failure(&self, key: CacheKey, now: Instant) {
+        let threshold = self.semantics.max_failed_attempts_per_user;
+        let backoff = Duration::from_secs(self.semantics.failed_attempt_backoff_secs);
+        if let Some(mut state) = self.account_failures.map.get_mut(&key) {
+            state.record_failure(now, threshold, backoff);
+            return;
+        }
+        if !self.account_failures.try_reserve()
+            && (!self.prune_one_account(now, backoff) || !self.account_failures.try_reserve())
+        {
+            // Full of live state: the request was already refused or counted
+            // elsewhere; never evict a live block to make room.
+            return;
+        }
+        match self.account_failures.map.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                // A concurrent first failure won the slot: add to it.
+                occupied.get_mut().record_failure(now, threshold, backoff);
+                self.account_failures.release();
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                let mut state = AccountFailures {
+                    consecutive: 0,
+                    last_failure: now,
+                    blocked_until: None,
+                };
+                state.record_failure(now, threshold, backoff);
+                vacant.insert(state);
+            }
+        }
+    }
 }
 
 /// A `DashMap` keyed by credential digests with an atomically enforced entry
@@ -456,6 +685,9 @@ pub struct LdapAuth {
     /// keeps the built-in `member` / `uniqueMember` / `memberUid` predicate.
     group_member_attribute: Option<String>,
     group_membership_mode: GroupMembershipMode,
+    /// `member_of` mode: subtree filter selecting the required groups by their
+    /// authoritative `group_attribute` value, built once at construction.
+    member_of_group_filter: Option<String>,
     /// Use STARTTLS on ldap:// connections
     starttls: bool,
     /// LDAP connection timeout
@@ -484,15 +716,13 @@ pub struct LdapAuth {
     /// How long an exact rejected credential is refused without contacting
     /// the directory (0 = disabled).
     negative_cache_ttl: Duration,
-    /// Rejected-credential digests and their expiry.
-    negative_cache: BoundedKeyMap<Instant>,
     /// Consecutive credential failures after which a presented username is
     /// refused without contacting the directory (0 = disabled).
     max_failed_attempts_per_user: u32,
-    /// How long such a username stays refused; also the quiet period after
-    /// which its failure count starts over.
-    failed_attempt_backoff: Duration,
-    account_failures: BoundedKeyMap<AccountFailures>,
+    /// Rejected-credential cache and per-username failure tracker, retained
+    /// across compatible rebuilds of the same policy. `None` when both
+    /// bounds are disabled.
+    credential_guard: Option<Arc<CredentialGuardState>>,
     /// Longest a bound service-account connection is reused for searches
     /// (0 = a fresh connection per flow).
     service_connection_max_age: Duration,
@@ -526,6 +756,20 @@ pub struct LdapAuth {
 
 impl LdapAuth {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, None)
+    }
+
+    /// Construct with the stable plugin-config id. The id, with the client's
+    /// namespace, owns the rejected-credential and per-username failure state
+    /// so a compatible reload inherits it; `None` keeps the state private.
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
+        if plugin_config_id.is_some_and(|config_id| config_id.trim().is_empty()) {
+            return Err("ldap_auth: plugin config id must not be blank".to_string());
+        }
         let config_obj = config
             .as_object()
             .ok_or_else(|| "ldap_auth: config must be an object".to_string())?;
@@ -703,23 +947,39 @@ impl LdapAuth {
         {
             None | Some(Some("direct")) => GroupMembershipMode::Direct,
             Some(Some("ad_in_chain")) => GroupMembershipMode::AdInChain,
+            Some(Some("member_of")) => GroupMembershipMode::MemberOf,
             Some(_) => {
                 return Err(
-                    "ldap_auth: `group_membership_mode` must be `direct` or `ad_in_chain`"
+                    "ldap_auth: `group_membership_mode` must be `direct`, `ad_in_chain`, or `member_of`"
                         .to_string(),
                 );
             }
         };
+        // `member_of` selects the required groups by name itself; a custom
+        // group filter would be a second, conflicting membership definition.
+        if group_membership_mode == GroupMembershipMode::MemberOf && group_filter.is_some() {
+            return Err(
+                "ldap_auth: `group_filter` cannot be combined with `group_membership_mode: member_of`"
+                    .to_string(),
+            );
+        }
+        let member_of_group_filter = (group_membership_mode == GroupMembershipMode::MemberOf
+            && !required_groups.is_empty())
+        .then(|| required_group_name_filter(&group_attribute, &required_groups));
+        if let Some(ref filter) = member_of_group_filter {
+            validate_ldap_filter_syntax(filter, "required_groups")?;
+        }
         // The membership predicate is built from validated attribute names, so
         // this only guards the composed shape (including the AD extensible
         // match) against the same grammar `ldap3` applies on the wire.
-        if parse_filter(&group_membership_filter(
-            group_membership_mode,
-            group_member_attribute.as_deref(),
-            LDAP_FILTER_VALIDATION_USER_DN,
-            LDAP_FILTER_VALIDATION_USERNAME,
-        ))
-        .is_err()
+        if group_membership_mode != GroupMembershipMode::MemberOf
+            && parse_filter(group_membership_filter(
+                group_membership_mode,
+                group_member_attribute.as_deref(),
+                LDAP_FILTER_VALIDATION_USER_DN,
+                LDAP_FILTER_VALIDATION_USERNAME,
+            ))
+            .is_err()
         {
             return Err(
                 "ldap_auth: `group_member_attribute` / `group_membership_mode` do not form a valid LDAP membership filter"
@@ -907,10 +1167,7 @@ impl LdapAuth {
             }
         }
 
-        let cache_hmac_key = if cache_ttl_secs == 0
-            && negative_cache_ttl_secs == 0
-            && max_failed_attempts_per_user == 0
-        {
+        let cache_hmac_key = if cache_ttl_secs == 0 {
             None
         } else {
             let mut key = Zeroizing::new([0u8; 32]);
@@ -973,6 +1230,28 @@ impl LdapAuth {
             );
         }
 
+        // The rejected-credential cache and the per-username tracker survive a
+        // compatible reload of this policy; a changed directory, bound, or
+        // capacity starts from fresh state.
+        let credential_guard = if negative_cache_ttl_secs == 0 && max_failed_attempts_per_user == 0
+        {
+            None
+        } else {
+            let identity = plugin_config_id
+                .map(|config_id| format!("{}\u{1f}{config_id}", http_client.namespace()));
+            Some(CredentialGuardState::retain(
+                identity.as_deref(),
+                CredentialGuardSemantics {
+                    realm: identity_realm_authority,
+                    negative_cache_ttl_secs,
+                    max_failed_attempts_per_user,
+                    failed_attempt_backoff_secs,
+                    capacity: max_cache_entries,
+                },
+                cache_shard_amount,
+            )?)
+        };
+
         let endpoints = std::iter::once(primary_url)
             .chain(failover_urls)
             .map(|endpoint| LdapEndpoint {
@@ -998,6 +1277,7 @@ impl LdapAuth {
             group_attribute,
             group_member_attribute,
             group_membership_mode,
+            member_of_group_filter,
             starttls,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
             search_time_limit_seconds,
@@ -1011,10 +1291,8 @@ impl LdapAuth {
             cache_hmac_key,
             max_cache_entries,
             negative_cache_ttl: Duration::from_secs(negative_cache_ttl_secs),
-            negative_cache: BoundedKeyMap::new(cache_shard_amount, max_cache_entries),
             max_failed_attempts_per_user,
-            failed_attempt_backoff: Duration::from_secs(failed_attempt_backoff_secs),
-            account_failures: BoundedKeyMap::new(cache_shard_amount, max_cache_entries),
+            credential_guard,
             service_connection_max_age: Duration::from_secs(service_connection_max_age_secs),
             hide_credentials,
             request_headers_to_redact: vec!["authorization".to_string()],
@@ -1029,40 +1307,8 @@ impl LdapAuth {
 
     /// Build an opaque cache key using the per-instance random HMAC key.
     fn cache_key(&self, username: &str, password: &str) -> Option<CacheKey> {
-        self.credential_key(CREDENTIAL_KEY_DOMAIN_SUCCESS, username, Some(password))
-    }
-
-    /// Keyed digest over a domain tag, the presented username, and optionally
-    /// the password.
-    ///
-    /// The username is prepared the way directories match login attributes
-    /// ([`prepare_case_ignore`]), so `alice`, `ALICE`, and ` alice` share one
-    /// entry instead of each costing a separate bind and cache slot. Keying on
-    /// the exact password as well means a folded spelling can only ever reuse
-    /// a result that the same password already earned.
-    fn credential_key(
-        &self,
-        domain: u8,
-        username: &str,
-        password: Option<&str>,
-    ) -> Option<CacheKey> {
         let key = self.cache_hmac_key.as_deref()?;
-        let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
-            warn!("ldap_auth: failed to initialize cache HMAC");
-            return None;
-        };
-        let username = prepare_case_ignore(username);
-        let username_len = u64::try_from(username.len()).ok()?;
-        mac.update([domain]);
-        mac.update(username_len.to_be_bytes());
-        mac.update(username.as_bytes());
-        if let Some(password) = password {
-            mac.update(password.as_bytes());
-        }
-        let digest = mac.finalize().into_bytes();
-        let mut cache_key = [0u8; 32];
-        cache_key.copy_from_slice(&digest);
-        Some(CacheKey(cache_key))
+        credential_digest(key, CREDENTIAL_KEY_DOMAIN_SUCCESS, username, Some(password))
     }
 
     /// `true` when this exact credential was rejected by the directory within
@@ -1071,82 +1317,80 @@ impl LdapAuth {
         if self.negative_cache_ttl.is_zero() {
             return false;
         }
-        let Some(key) =
-            self.credential_key(CREDENTIAL_KEY_DOMAIN_REJECTED, username, Some(password))
-        else {
+        let Some(guard) = self.credential_guard.as_deref() else {
             return false;
         };
-        let Some(expires_at) = self.negative_cache.get_copied(&key) else {
+        let Some(key) = credential_digest(
+            &guard.hmac_key,
+            CREDENTIAL_KEY_DOMAIN_REJECTED,
+            username,
+            Some(password),
+        ) else {
+            return false;
+        };
+        let Some(expires_at) = guard.negative_cache.get_copied(&key) else {
             return false;
         };
         if Instant::now() < expires_at {
             return true;
         }
-        self.negative_cache.remove(&key);
+        guard.negative_cache.remove(&key);
         false
     }
 
-    /// `true` while the presented username is inside a failed-attempt backoff.
-    fn account_backoff_active(&self, username: &str) -> bool {
+    /// Digest of the presented username for the per-username failure bound.
+    ///
+    /// Unlike the credential caches this key folds the username the way most
+    /// directories match logins ([`prepare_case_ignore`]). Folding here can
+    /// only make the bound stricter (spellings of one login share a budget,
+    /// so a spray cannot dodge it by varying case); it never lets one login's
+    /// result stand in for another's.
+    fn account_key(&self, guard: &CredentialGuardState, username: &str) -> Option<CacheKey> {
+        credential_digest(
+            &guard.hmac_key,
+            CREDENTIAL_KEY_DOMAIN_ACCOUNT,
+            &prepare_case_ignore(username),
+            None,
+        )
+    }
+
+    /// Admission under the per-username failure bound.
+    fn account_admission(&self, username: &str) -> AccountAdmission {
         if self.max_failed_attempts_per_user == 0 {
-            return false;
+            return AccountAdmission::Allowed;
         }
-        let Some(key) = self.credential_key(CREDENTIAL_KEY_DOMAIN_ACCOUNT, username, None) else {
-            return false;
+        let Some(guard) = self.credential_guard.as_deref() else {
+            return AccountAdmission::Allowed;
         };
-        let now = Instant::now();
-        self.account_failures
-            .map
-            .get(&key)
-            .is_some_and(|state| state.blocked_until.is_some_and(|until| now < until))
+        let Some(key) = self.account_key(guard, username) else {
+            return AccountAdmission::Allowed;
+        };
+        guard.account_admission(&key, Instant::now())
     }
 
     /// Record a directory credential rejection (wrong password or unknown
     /// user) for the negative cache and the per-username failure count.
     fn record_credential_failure(&self, username: &str, password: &str) {
+        let Some(guard) = self.credential_guard.as_deref() else {
+            return;
+        };
         let now = Instant::now();
         if !self.negative_cache_ttl.is_zero()
-            && let Some(key) =
-                self.credential_key(CREDENTIAL_KEY_DOMAIN_REJECTED, username, Some(password))
+            && let Some(key) = credential_digest(
+                &guard.hmac_key,
+                CREDENTIAL_KEY_DOMAIN_REJECTED,
+                username,
+                Some(password),
+            )
             && let Some(expires_at) = now.checked_add(self.negative_cache_ttl)
         {
-            self.negative_cache.insert(key, expires_at);
+            guard.negative_cache.insert(key, expires_at);
         }
-
-        if self.max_failed_attempts_per_user == 0 {
-            return;
+        if self.max_failed_attempts_per_user > 0
+            && let Some(key) = self.account_key(guard, username)
+        {
+            guard.record_account_failure(key, now);
         }
-        let Some(key) = self.credential_key(CREDENTIAL_KEY_DOMAIN_ACCOUNT, username, None) else {
-            return;
-        };
-        if let Some(mut state) = self.account_failures.map.get_mut(&key) {
-            // A lapsed block, or a quiet period as long as the backoff, starts
-            // a new run of failures.
-            let quiet_period_elapsed =
-                now.saturating_duration_since(state.last_failure) >= self.failed_attempt_backoff;
-            let block_elapsed = state.blocked_until.is_some_and(|until| now >= until);
-            if quiet_period_elapsed || block_elapsed {
-                state.consecutive = 0;
-                state.blocked_until = None;
-            }
-            state.consecutive = state.consecutive.saturating_add(1);
-            state.last_failure = now;
-            if state.consecutive >= self.max_failed_attempts_per_user {
-                state.blocked_until = now.checked_add(self.failed_attempt_backoff);
-                state.consecutive = 0;
-            }
-            return;
-        }
-        let mut state = AccountFailures {
-            consecutive: 1,
-            last_failure: now,
-            blocked_until: None,
-        };
-        if state.consecutive >= self.max_failed_attempts_per_user {
-            state.blocked_until = now.checked_add(self.failed_attempt_backoff);
-            state.consecutive = 0;
-        }
-        self.account_failures.insert(key, state);
     }
 
     /// A successful authentication ends the username's failure run.
@@ -1154,8 +1398,10 @@ impl LdapAuth {
         if self.max_failed_attempts_per_user == 0 {
             return;
         }
-        if let Some(key) = self.credential_key(CREDENTIAL_KEY_DOMAIN_ACCOUNT, username, None) {
-            self.account_failures.remove(&key);
+        if let Some(guard) = self.credential_guard.as_deref()
+            && let Some(key) = self.account_key(guard, username)
+        {
+            guard.account_failures.remove(&key);
         }
     }
 
@@ -1470,13 +1716,13 @@ impl LdapAuth {
     /// done. With it set, a connection younger than that age whose driver is
     /// still running is shared by concurrent searches; a new one is screened,
     /// dialed, and bound exactly like a fresh connection before it is shared.
-    async fn service_connection(
+    async fn service_connection<'a>(
         &self,
-        endpoint: &LdapEndpoint,
+        endpoint: &'a LdapEndpoint,
         service_dn: &str,
         service_password: &str,
         context: &str,
-    ) -> Result<ServiceConnection, AuthError> {
+    ) -> Result<ServiceConnection<'a>, AuthError> {
         let reuse = !self.service_connection_max_age.is_zero();
         if reuse && let Some(pooled) = endpoint.service_connection.load_full() {
             let mut ldap = pooled.ldap.clone();
@@ -1484,6 +1730,8 @@ impl LdapAuth {
                 return Ok(ServiceConnection {
                     ldap,
                     pooled: Some(pooled),
+                    endpoint,
+                    settled: false,
                 });
             }
             endpoint.retire_service_connection(&pooled);
@@ -1502,7 +1750,12 @@ impl LdapAuth {
         }
 
         if !reuse {
-            return Ok(ServiceConnection { ldap, pooled: None });
+            return Ok(ServiceConnection {
+                ldap,
+                pooled: None,
+                endpoint,
+                settled: false,
+            });
         }
         let pooled = Arc::new(PooledServiceConnection {
             ldap: ldap.clone(),
@@ -1512,6 +1765,8 @@ impl LdapAuth {
         Ok(ServiceConnection {
             ldap,
             pooled: Some(pooled),
+            endpoint,
+            settled: false,
         })
     }
 
@@ -1520,19 +1775,24 @@ impl LdapAuth {
     /// transport level, in which case it is no longer handed out.
     async fn release_service_connection(
         &self,
-        endpoint: &LdapEndpoint,
-        connection: ServiceConnection,
+        mut connection: ServiceConnection<'_>,
         error: Option<&AuthError>,
     ) {
-        let ServiceConnection { mut ldap, pooled } = connection;
-        match pooled {
+        // The operation finished: from here a cancellation (for example during
+        // the unbind below) has nothing outstanding to clean up.
+        connection.settled = true;
+        match connection.pooled.as_ref() {
             Some(pooled) => {
                 if matches!(error, Some(AuthError::Unavailable(_))) {
-                    endpoint.retire_service_connection(&pooled);
+                    connection.endpoint.retire_service_connection(pooled);
                 }
             }
             None => {
-                let _ = ldap.with_timeout(self.connect_timeout).unbind().await;
+                let _ = connection
+                    .ldap
+                    .with_timeout(self.connect_timeout)
+                    .unbind()
+                    .await;
             }
         }
     }
@@ -1637,7 +1897,7 @@ impl LdapAuth {
             .service_connection(endpoint, service_dn, service_pw, "service account bind")
             .await?;
         let search = self.search_user_entry(&mut service.ldap, username).await;
-        self.release_service_connection(endpoint, service, search.as_ref().err())
+        self.release_service_connection(service, search.as_ref().err())
             .await;
         let Some(found) = search? else {
             let search_base = self.search_base_dn.as_deref().unwrap_or_default();
@@ -1888,8 +2148,6 @@ impl LdapAuth {
             )));
         }
 
-        let filter = self.group_search_filter(user_dn, canonical_identity);
-
         // Bind with the service account when one is configured; otherwise the
         // group search runs over an ANONYMOUS-bound connection. Many directories
         // deny or restrict anonymous reads of group `member` attributes, in
@@ -1910,20 +2168,27 @@ impl LdapAuth {
                 ServiceConnection {
                     ldap: self.connect(endpoint).await?,
                     pooled: None,
+                    endpoint,
+                    settled: false,
                 },
                 false,
             )
         };
-        let membership = self
-            .search_required_groups(
+        let membership = if self.group_membership_mode == GroupMembershipMode::MemberOf {
+            self.search_member_of_groups(&mut connection.ldap, user_dn, used_service_account)
+                .await
+        } else {
+            let filter = self.group_search_filter(user_dn, canonical_identity);
+            self.search_required_groups(
                 &mut connection.ldap,
                 &filter,
                 user_dn,
                 canonical_identity,
                 used_service_account,
             )
-            .await;
-        self.release_service_connection(endpoint, connection, membership.as_ref().err())
+            .await
+        };
+        self.release_service_connection(connection, membership.as_ref().err())
             .await;
         membership
     }
@@ -2078,6 +2343,118 @@ impl LdapAuth {
         }))
     }
 
+    /// `member_of` mode: read the user's own reverse-membership attribute,
+    /// then accept a required group only when an entry under `group_base_dn`
+    /// named by its authoritative `group_attribute` value has a DN equal to one
+    /// of those values. A look-alike group elsewhere, a value that is not a
+    /// parsable DN, or a group the user's entry does not list never matches.
+    async fn search_member_of_groups(
+        &self,
+        ldap: &mut Ldap,
+        user_dn: &str,
+        used_service_account: bool,
+    ) -> Result<bool, AuthError> {
+        let attribute = self
+            .group_member_attribute
+            .as_deref()
+            .unwrap_or(LDAP_AUTH_DEFAULT_MEMBER_OF_ATTRIBUTE);
+        let user_result = ldap
+            .with_search_options(
+                SearchOptions::new()
+                    .sizelimit(LDAP_AUTH_USER_SEARCH_SIZE_LIMIT)
+                    .timelimit(self.search_time_limit_seconds),
+            )
+            .with_timeout(self.connect_timeout)
+            .search(user_dn, Scope::Base, "(objectClass=*)", vec![attribute])
+            .await
+            .map_err(|e| transport_error("group membership read", e))?;
+        if user_result.1.rc != 0 {
+            return Err(directory_result_error(
+                &user_result.1,
+                "group membership read",
+            ));
+        }
+        let mut user_entries = user_result.0;
+        let user_entry = match user_entries.len() {
+            0 => return Ok(false),
+            1 => user_entries.pop().ok_or_else(|| {
+                AuthError::Backend(
+                    "ldap_auth: group membership entry disappeared after uniqueness check"
+                        .to_string(),
+                )
+            })?,
+            _ => {
+                return Err(AuthError::Backend(
+                    "ldap_auth: base-scope group membership read returned multiple entries"
+                        .to_string(),
+                ));
+            }
+        };
+        let user_entry = SearchEntry::construct(user_entry);
+        let Some(values) = ldap_attribute_values(&user_entry.attrs, attribute, "group membership")?
+        else {
+            if !used_service_account {
+                warn!(
+                    "ldap_auth: the authenticated entry returned no '{}' values over an anonymous bind; configure a service account if the directory restricts that attribute",
+                    attribute
+                );
+            }
+            return Ok(false);
+        };
+        if values.len() > LDAP_AUTH_MAX_MEMBER_OF_VALUES {
+            return Err(AuthError::Backend(format!(
+                "ldap_auth: the authenticated entry lists more than {LDAP_AUTH_MAX_MEMBER_OF_VALUES} '{attribute}' values"
+            )));
+        }
+        let member_of: Vec<NormalizedDn> = values
+            .iter()
+            .filter_map(|value| normalize_distinguished_name(value.as_str()))
+            .collect();
+        if member_of.is_empty() {
+            return Ok(false);
+        }
+
+        let Some(filter) = self.member_of_group_filter.as_deref() else {
+            return Ok(false);
+        };
+        let group_base = self.group_base_dn.as_deref().unwrap_or_default();
+        let search_result = ldap
+            .with_search_options(
+                SearchOptions::new()
+                    .sizelimit(LDAP_AUTH_GROUP_SEARCH_SIZE_LIMIT)
+                    .timelimit(self.search_time_limit_seconds),
+            )
+            .with_timeout(self.connect_timeout)
+            .search(
+                group_base,
+                Scope::Subtree,
+                filter,
+                vec![self.group_attribute.as_str()],
+            )
+            .await
+            .map_err(|e| transport_error("group search", e))?;
+        let result_code = search_result.1.rc;
+        if result_code != 0 && result_code != 4 {
+            return Err(directory_result_error(&search_result.1, "group search"));
+        }
+        for result_entry in search_result.0 {
+            let entry = SearchEntry::construct(result_entry);
+            if self.entry_matches_required_group(&entry)?
+                && normalize_distinguished_name(&entry.dn)
+                    .is_some_and(|group_dn| member_of.contains(&group_dn))
+            {
+                return Ok(true);
+            }
+        }
+        if result_code == 4 {
+            return Err(AuthError::Backend(
+                "ldap_auth: group search exceeded the configured size limit before proving required membership"
+                    .to_string(),
+            ));
+        }
+        Ok(false)
+    }
+
     async fn returned_group_proves_membership(
         &self,
         ldap: &mut Ldap,
@@ -2139,13 +2516,16 @@ fn group_membership_filter(
 ) -> String {
     let escaped_user_dn = escape_filter_value(user_dn);
     match (mode, member_attribute) {
-        (GroupMembershipMode::Direct, None) => {
+        // `member_of` never sends a group-side predicate (it proves
+        // membership from the user's own entry); it shares the direct default
+        // only so this function stays total.
+        (GroupMembershipMode::Direct | GroupMembershipMode::MemberOf, None) => {
             let escaped_identity = escape_filter_value(canonical_identity);
             format!(
                 "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_identity}))"
             )
         }
-        (GroupMembershipMode::Direct, Some(attribute)) => {
+        (GroupMembershipMode::Direct | GroupMembershipMode::MemberOf, Some(attribute)) => {
             format!("({attribute}={escaped_user_dn})")
         }
         (GroupMembershipMode::AdInChain, attribute) => {
@@ -2716,6 +3096,105 @@ fn validate_ldap_filter_syntax(filter: &str, field: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// `member_of` mode: the subtree filter selecting `required_groups` by their
+/// `group_attribute` value. The attribute is a validated descriptor and every
+/// name is RFC 4515-escaped.
+fn required_group_name_filter(group_attribute: &str, required_groups: &[String]) -> String {
+    let mut filter = String::from("(|");
+    for group in required_groups {
+        filter.push('(');
+        filter.push_str(group_attribute);
+        filter.push('=');
+        filter.push_str(&escape_filter_value(group));
+        filter.push(')');
+    }
+    filter.push(')');
+    filter
+}
+
+/// Most reverse-membership values (`memberOf`) read from one user entry.
+const LDAP_AUTH_MAX_MEMBER_OF_VALUES: usize = 4_096;
+
+/// A DN compared component by component: attribute types lowercased, values
+/// decoded and prepared like `caseIgnoreMatch`, and multi-valued RDN
+/// components sorted.
+type NormalizedDn = Vec<Vec<(String, String)>>;
+
+/// Normalize `dn` for equality, or `None` (never a partial guess) when it is
+/// not representable as text, so callers fail closed.
+fn normalize_distinguished_name(dn: &str) -> Option<NormalizedDn> {
+    let mut rdns = Vec::new();
+    let mut avas = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in dn.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '+' => push_normalized_ava(&mut current, &mut avas)?,
+            ',' | ';' => {
+                push_normalized_ava(&mut current, &mut avas)?;
+                let mut rdn = std::mem::take(&mut avas);
+                rdn.sort();
+                rdns.push(rdn);
+            }
+            _ => current.push(ch),
+        }
+    }
+    if escaped {
+        return None;
+    }
+    push_normalized_ava(&mut current, &mut avas)?;
+    avas.sort();
+    rdns.push(avas);
+    Some(rdns)
+}
+
+/// Decode the raw `type=value` pair accumulated in `current` into `avas`.
+fn push_normalized_ava(current: &mut String, avas: &mut Vec<(String, String)>) -> Option<()> {
+    let pair = parse_rdn_pair(&std::mem::take(current))?;
+    avas.push((
+        pair.attribute_type.to_ascii_lowercase(),
+        prepare_case_ignore(&pair.value),
+    ));
+    Some(())
+}
+
+/// Keyed digest over a domain tag, a length-framed username, and optionally
+/// the password.
+///
+/// Credential caches key on the EXACT presented username: whether two
+/// spellings name one directory principal depends on the login attribute's
+/// matching rule (RFC 4517 `caseExactMatch` exists), so folding them would
+/// let one principal's cached result authenticate another.
+fn credential_digest(
+    key: &[u8; 32],
+    domain: u8,
+    username: &str,
+    password: Option<&str>,
+) -> Option<CacheKey> {
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        warn!("ldap_auth: failed to initialize cache HMAC");
+        return None;
+    };
+    let username_len = u64::try_from(username.len()).ok()?;
+    mac.update([domain]);
+    mac.update(username_len.to_be_bytes());
+    mac.update(username.as_bytes());
+    if let Some(password) = password {
+        mac.update(password.as_bytes());
+    }
+    let digest = mac.finalize().into_bytes();
+    let mut cache_key = [0u8; 32];
+    cache_key.copy_from_slice(&digest);
+    Some(CacheKey(cache_key))
+}
+
 /// Prepare a value the way LDAP `caseIgnoreMatch` compares it (RFC 4518
 /// insignificant-space handling, then case folding): surrounding whitespace
 /// is dropped, interior whitespace runs collapse to one space, and the result
@@ -3157,11 +3636,24 @@ impl AuthMechanism for LdapAuth {
         // Refuse a credential the directory just rejected, or a username in a
         // failed-attempt backoff, without spending a directory flow on it. Both
         // are opt-in; the response matches an ordinary rejection.
-        if self.credential_recently_rejected(&username, &password)
-            || self.account_backoff_active(&username)
-        {
+        if self.credential_recently_rejected(&username, &password) {
             debug!("ldap_auth: credential refused without a directory round trip");
             return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
+        }
+        match self.account_admission(&username) {
+            AccountAdmission::Allowed => {}
+            AccountAdmission::Blocked => {
+                debug!("ldap_auth: username refused inside its failed-attempt backoff");
+                return VerifyOutcome::Invalid(r#"{"error":"LDAP authentication failed"}"#.into());
+            }
+            AccountAdmission::Saturated => {
+                warn!(
+                    "ldap_auth: per-username failure tracker is full of live state; refusing an untracked username"
+                );
+                return VerifyOutcome::Internal(
+                    r#"{"error":"LDAP authentication temporarily unavailable"}"#.into(),
+                );
+            }
         }
 
         let _permit = match self.ldap_concurrency.try_acquire() {

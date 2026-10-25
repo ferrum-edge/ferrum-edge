@@ -13510,9 +13510,12 @@ pub fn create_plugin_with_http_client_and_config_id(
         "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)?))),
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)?))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)?))),
-        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new(
+        // The stable plugin-config id owns the rejected-credential cache and the
+        // per-username failure backoff, so a compatible reload inherits them.
+        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new_with_config_id(
             config,
             http_client,
+            plugin_config_id,
         )?))),
         // Same reasoning as `jwks_auth`: the stable plugin-config id is the
         // `ferrum-hmac-v2` nonce protection domain.

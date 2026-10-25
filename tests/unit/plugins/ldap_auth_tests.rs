@@ -4888,6 +4888,25 @@ fn ldaps_test_server_material(
     (ca_file, Arc::new(server_config))
 }
 
+/// One port bound on both 127.0.0.1 and ::1. The IPv4-assigned port can be
+/// taken on IPv6 by a parallel test, so retry with a fresh port.
+async fn bind_dual_family_listeners() -> (tokio::net::TcpListener, tokio::net::TcpListener, u16) {
+    use tokio::net::TcpListener;
+
+    for _ in 0..32 {
+        let v4 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind IPv4 LDAPS listener");
+        let port = v4.local_addr().expect("IPv4 LDAPS addr").port();
+        if let Ok(v6) =
+            TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)).await
+        {
+            return (v4, v6, port);
+        }
+    }
+    panic!("could not reserve one port on both loopback families");
+}
+
 /// How the first dialed candidate of a two-address answer misbehaves.
 #[derive(Clone, Copy)]
 enum FirstCandidate {
@@ -4903,18 +4922,11 @@ enum FirstCandidate {
 async fn assert_second_candidate_serves_after_first(first: FirstCandidate) {
     use std::sync::atomic::AtomicBool;
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
     let (ca_file, trusted_config) = ldaps_test_server_material("directory.test");
     let (_untrusted_ca, untrusted_config) = ldaps_test_server_material("directory.test");
-    let v4 = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind IPv4 LDAPS listener");
-    let port = v4.local_addr().expect("IPv4 LDAPS addr").port();
-    let v6 = TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port))
-        .await
-        .expect("bind IPv6 LDAPS listener on the same port");
+    let (v4, v6, port) = bind_dual_family_listeners().await;
     let first_claimed = Arc::new(AtomicBool::new(false));
     let accepted = Arc::new(AtomicUsize::new(0));
     let mut listener_tasks = Vec::new();
@@ -5012,6 +5024,10 @@ async fn test_tls_failure_on_one_candidate_tries_the_next_address() {
 
 // ─── Counting directory for reuse, caching, and backoff tests ────────────
 
+/// Canonical identity of the `Alice` principal the counting directory keeps
+/// apart from `alice`.
+const CASE_EXACT_PRIVILEGED_IDENTITY: &str = "privileged-alice-id";
+
 /// Passwords [`spawn_counting_directory`] accepts on a bind.
 const COUNTING_DIRECTORY_PASSWORDS: &[&str] = &["good-secret", "service-secret"];
 
@@ -5020,6 +5036,14 @@ const COUNTING_DIRECTORY_PASSWORDS: &[&str] = &["good-secret", "service-secret"]
 /// search under `ou=groups` returns `gateway-admins`, any other search returns
 /// Alice's entry. Counts accepted connections.
 async fn spawn_counting_directory() -> (u16, Arc<AtomicUsize>) {
+    spawn_counting_directory_with(false).await
+}
+
+/// [`spawn_counting_directory`]; with `stall_first_connection_searches` the
+/// first accepted connection never answers a search.
+async fn spawn_counting_directory_with(
+    stall_first_connection_searches: bool,
+) -> (u16, Arc<AtomicUsize>) {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -5031,11 +5055,13 @@ async fn spawn_counting_directory() -> (u16, Arc<AtomicUsize>) {
     let counter = Arc::clone(&accepted);
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            counter.fetch_add(1, Ordering::SeqCst);
+            let connection_index = counter.fetch_add(1, Ordering::SeqCst);
+            let stall_searches = stall_first_connection_searches && connection_index == 0;
             tokio::spawn(async move {
                 while let Ok(request) = try_read_ldap_message_bytes(&mut stream).await {
                     let (message_id, op) = ldap_request_id_and_op(&request);
                     match op {
+                        LDAP_OP_SEARCH_REQUEST if stall_searches => continue,
                         LDAP_OP_BIND_REQUEST => {
                             let accepted_password = COUNTING_DIRECTORY_PASSWORDS
                                 .iter()
@@ -5049,6 +5075,14 @@ async fn spawn_counting_directory() -> (u16, Arc<AtomicUsize>) {
                                     message_id,
                                     "cn=gateway-admins,ou=groups,dc=example,dc=com",
                                     &[("cn", &["gateway-admins"])],
+                                )
+                            } else if ldap_message_contains(&request, "Alice") {
+                                // A distinct principal whose login differs only
+                                // by case (a `caseExactMatch` login attribute).
+                                search_result_entry(
+                                    message_id,
+                                    "uid=Alice,ou=users,dc=example,dc=com",
+                                    &[("uid", &[CASE_EXACT_PRIVILEGED_IDENTITY])],
                                 )
                             } else {
                                 search_result_entry(
@@ -5190,7 +5224,7 @@ async fn test_negative_cache_refuses_a_repeated_bad_credential_locally() {
         Some(401),
     );
     assert_reject(
-        authenticate_as(&plugin, "ALICE", "bad-secret").await,
+        authenticate_as(&plugin, "alice", "bad-secret").await,
         Some(401),
     );
     assert_eq!(
@@ -5282,25 +5316,485 @@ fn test_rejected_credential_bounds() {
     }
 }
 
-// ─── Folded cache keys (ldap_auth-CLAUDE-7) ──────────────────────────────
+// ─── Exact cache keys (PR6846-SOL-1) ─────────────────────────────────────
 
-/// Directory-folded spellings of one login share a single cache entry and a
-/// single bind; a different password never rides on it.
+async fn authenticate_identity(
+    plugin: &LdapAuth,
+    username: &str,
+    password: &str,
+) -> (PluginResult, Option<String>) {
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header(username, password),
+    );
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    (result, ctx.authenticated_identity.clone())
+}
+
+/// `Alice` and `alice` are different principals in a directory whose login
+/// attribute is `caseExactMatch`, and here they share a password. Warming the
+/// cache with one must never authenticate the other as it.
 #[tokio::test]
-async fn test_cache_key_folds_login_spellings_like_the_directory() {
+async fn test_cache_never_merges_case_variant_principals() {
     let (port, accepted) = spawn_counting_directory().await;
     let plugin = counting_direct_bind_plugin(port, json!({"cache_ttl_seconds": 60}));
+
+    let (result, identity) = authenticate_identity(&plugin, "Alice", "good-secret").await;
+    assert_continue(result);
+    assert_eq!(identity.as_deref(), Some(CASE_EXACT_PRIVILEGED_IDENTITY));
+
+    let (result, identity) = authenticate_identity(&plugin, "alice", "good-secret").await;
+    assert_continue(result);
+    assert_eq!(
+        identity.as_deref(),
+        Some(DIRECT_BIND_CANONICAL_IDENTITY),
+        "a case variant must bind as itself, not reuse another principal's cache entry"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+    // Each exact spelling still hits its own entry.
+    let (result, identity) = authenticate_identity(&plugin, "Alice", "good-secret").await;
+    assert_continue(result);
+    assert_eq!(identity.as_deref(), Some(CASE_EXACT_PRIVILEGED_IDENTITY));
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+}
+
+/// A remembered rejection for one spelling never suppresses another
+/// principal's credential check.
+#[tokio::test]
+async fn test_negative_cache_never_merges_case_variant_principals() {
+    let (port, accepted) = spawn_counting_directory().await;
+    let plugin = counting_direct_bind_plugin(port, json!({"negative_cache_ttl_seconds": 30}));
+    assert_reject(
+        authenticate_as(&plugin, "Alice", "bad-secret").await,
+        Some(401),
+    );
     assert_continue(authenticate_as(&plugin, "alice", "good-secret").await);
-    assert_continue(authenticate_as(&plugin, "ALICE", "good-secret").await);
-    assert_continue(authenticate_as(&plugin, " Alice ", "good-secret").await);
+    assert_reject(
+        authenticate_as(&plugin, "alice", "bad-secret").await,
+        Some(401),
+    );
     assert_eq!(
         accepted.load(Ordering::SeqCst),
-        1,
-        "folded spellings must share one cached bind"
+        3,
+        "each exact login is checked by the directory"
+    );
+}
+
+// ─── Fix round 1: failure-tracker integrity (PR6846-SOL-2 / SOL-3) ───────
+
+/// A full tracker never evicts a live block to admit a new username; the new
+/// username is refused instead of getting untracked attempts.
+#[tokio::test]
+async fn test_full_failure_tracker_keeps_live_blocks() {
+    let (port, accepted) = spawn_counting_directory().await;
+    let plugin = counting_direct_bind_plugin(
+        port,
+        json!({
+            "max_cache_entries": 1,
+            "max_failed_attempts_per_user": 2,
+            "failed_attempt_backoff_seconds": 60
+        }),
+    );
+    assert_reject(authenticate_as(&plugin, "alice", "bad-1").await, Some(401));
+    assert_reject(authenticate_as(&plugin, "alice", "bad-2").await, Some(401));
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+    assert_reject(authenticate_as(&plugin, "bob", "bad-1").await, Some(500));
+    assert_reject(
+        authenticate_as(&plugin, "alice", "good-secret").await,
+        Some(401),
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "neither the untracked username nor the blocked one may reach the directory"
+    );
+}
+
+/// State that no longer constrains anyone is reclaimed for a new username.
+#[tokio::test]
+async fn test_full_failure_tracker_reclaims_quiet_state() {
+    let (port, accepted) = spawn_counting_directory().await;
+    let plugin = counting_direct_bind_plugin(
+        port,
+        json!({
+            "max_cache_entries": 1,
+            "max_failed_attempts_per_user": 2,
+            "failed_attempt_backoff_seconds": 1
+        }),
+    );
+    assert_reject(authenticate_as(&plugin, "alice", "bad-1").await, Some(401));
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_reject(authenticate_as(&plugin, "bob", "bad-1").await, Some(401));
+    assert_reject(authenticate_as(&plugin, "bob", "bad-2").await, Some(401));
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    // Bob's run reached the threshold in the reclaimed slot.
+    assert_reject(
+        authenticate_as(&plugin, "bob", "good-secret").await,
+        Some(401),
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+}
+
+/// Two first failures for one username that complete together both count:
+/// neither overwrites the other's state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_first_failures_both_count() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind concurrent-failure LDAP server");
+    let port = listener.local_addr().expect("local addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                read_ldap_message(&mut stream).await;
+                // Release both rejections only once both binds arrived.
+                barrier.wait().await;
+                let _ = stream.write_all(&bind_response(1, 49)).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    let plugin = Arc::new(counting_direct_bind_plugin(
+        port,
+        json!({
+            "max_failed_attempts_per_user": 2,
+            "failed_attempt_backoff_seconds": 60,
+            "request_timeout_seconds": 2
+        }),
+    ));
+    let first = {
+        let plugin = Arc::clone(&plugin);
+        tokio::spawn(async move { authenticate_as(&plugin, "alice", "bad-1").await })
+    };
+    let second = {
+        let plugin = Arc::clone(&plugin);
+        tokio::spawn(async move { authenticate_as(&plugin, "alice", "bad-2").await })
+    };
+    assert_reject(first.await.expect("first failure task"), Some(401));
+    assert_reject(second.await.expect("second failure task"), Some(401));
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+    assert_reject(
+        authenticate_as(&plugin, "alice", "good-secret").await,
+        Some(401),
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "two completed first failures must reach the threshold"
+    );
+}
+
+// ─── Fix round 1: cancelled pooled loans (PR6846-SOL-4) ──────────────────
+
+/// A flow cancelled by its request deadline while a search is outstanding on
+/// the shared service connection retires that connection, so the next flow
+/// gets a fresh one instead of queueing behind the abandoned operation.
+#[tokio::test]
+async fn test_cancelled_pooled_search_retires_the_shared_connection() {
+    let (port, accepted) = spawn_counting_directory_with(true).await;
+    let plugin = counting_search_bind_plugin(
+        port,
+        json!({
+            "service_connection_max_age_seconds": 300,
+            "request_timeout_seconds": 1,
+            "connect_timeout_seconds": 5
+        }),
     );
     assert_reject(
-        authenticate_as(&plugin, "ALICE", "bad-secret").await,
+        authenticate_as(&plugin, "alice", "good-secret").await,
+        Some(500),
+    );
+    assert_continue(authenticate_as(&plugin, "alice", "good-secret").await);
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        3,
+        "stalled shared connection, its replacement, and one end-user bind"
+    );
+}
+
+// ─── Fix round 1: state across compatible reloads (PR6846-SOL-5) ─────────
+
+fn ldap_policy(port: u16, config_id: &str, threshold: u64) -> Arc<dyn Plugin> {
+    ferrum_edge::plugins::create_plugin_with_http_client_and_config_id(
+        "ldap_auth",
+        &json!({
+            "ldap_url": format!("ldap://127.0.0.1:{port}"),
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+            "canonical_identity_attribute": "uid",
+            "max_failed_attempts_per_user": threshold,
+            "failed_attempt_backoff_seconds": 60
+        }),
+        http_client(),
+        Some(config_id),
+    )
+    .expect("valid ldap_auth policy")
+    .expect("ldap_auth is a built-in plugin")
+}
+
+async fn authenticate_policy_as(
+    plugin: &dyn Plugin,
+    username: &str,
+    password: &str,
+) -> PluginResult {
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header(username, password),
+    );
+    plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+}
+
+/// Rebuilding an unchanged policy (a config reload) keeps an active backoff;
+/// a changed bound or another policy starts from fresh state.
+#[tokio::test]
+async fn test_compatible_rebuild_keeps_the_failed_attempt_backoff() {
+    let (port, accepted) = spawn_counting_directory().await;
+    let previous = ldap_policy(port, "ldap-sol5-reload-policy", 2);
+    assert_reject(
+        authenticate_policy_as(previous.as_ref(), "alice", "bad-1").await,
+        Some(401),
+    );
+    assert_reject(
+        authenticate_policy_as(previous.as_ref(), "alice", "bad-2").await,
         Some(401),
     );
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+    let rebuilt = ldap_policy(port, "ldap-sol5-reload-policy", 2);
+    assert_reject(
+        authenticate_policy_as(rebuilt.as_ref(), "alice", "good-secret").await,
+        Some(401),
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "the rebuilt generation must inherit the active backoff"
+    );
+
+    let other_policy = ldap_policy(port, "ldap-sol5-reload-other-policy", 2);
+    assert_continue(authenticate_policy_as(other_policy.as_ref(), "alice", "good-secret").await);
+    let changed = ldap_policy(port, "ldap-sol5-reload-policy", 3);
+    assert_continue(authenticate_policy_as(changed.as_ref(), "alice", "good-secret").await);
+    assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    drop(previous);
+}
+
+// ─── Fix round 1: reverse membership (PR6846-SOL-6) ──────────────────────
+
+const MEMBER_OF_REAL_GROUP_DN: &str = "cn=gateway-admins,ou=groups,dc=example,dc=com";
+const MEMBER_OF_LOOK_ALIKE_DN: &str = "cn=gateway-admins,ou=delegated,ou=groups,dc=example,dc=com";
+
+/// Directory for `member_of` mode: binds succeed for the counting passwords,
+/// a search requesting `memberOf` returns Alice's entry with the current
+/// `member_of` values, a search under `ou=groups` returns the real group
+/// (`sAMAccountName=gateway-admins`) and a delegated look-alike with the same
+/// CN (`sAMAccountName=tenant-team`), and any other search returns Alice.
+async fn spawn_member_of_directory(
+    member_of: Arc<std::sync::Mutex<Vec<String>>>,
+) -> (u16, Arc<AtomicUsize>) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind memberOf LDAP server");
+    let port = listener.local_addr().expect("memberOf addr").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let member_of = Arc::clone(&member_of);
+            tokio::spawn(async move {
+                while let Ok(request) = try_read_ldap_message_bytes(&mut stream).await {
+                    let (message_id, op) = ldap_request_id_and_op(&request);
+                    match op {
+                        LDAP_OP_BIND_REQUEST => {
+                            let _ = stream.write_all(&bind_response(message_id, 0)).await;
+                        }
+                        LDAP_OP_SEARCH_REQUEST => {
+                            let mut response = Vec::new();
+                            if ldap_message_contains(&request, "memberOf") {
+                                let values = member_of.lock().expect("memberOf values").clone();
+                                let values: Vec<&str> = values.iter().map(String::as_str).collect();
+                                let attributes: Vec<(&str, &[&str])> = if values.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![("memberOf", values.as_slice())]
+                                };
+                                response.extend(search_result_entry(
+                                    message_id,
+                                    "uid=alice,ou=users,dc=example,dc=com",
+                                    &attributes,
+                                ));
+                            } else if ldap_message_contains(&request, "ou=groups") {
+                                response.extend(search_result_entry(
+                                    message_id,
+                                    MEMBER_OF_REAL_GROUP_DN,
+                                    &[
+                                        ("cn", &["gateway-admins"]),
+                                        ("sAMAccountName", &["gateway-admins"]),
+                                    ],
+                                ));
+                                response.extend(search_result_entry(
+                                    message_id,
+                                    MEMBER_OF_LOOK_ALIKE_DN,
+                                    &[
+                                        ("cn", &["gateway-admins"]),
+                                        ("sAMAccountName", &["tenant-team"]),
+                                    ],
+                                ));
+                            } else {
+                                response.extend(search_result_entry(
+                                    message_id,
+                                    "uid=alice,ou=users,dc=example,dc=com",
+                                    &[("uid", &[DIRECT_BIND_CANONICAL_IDENTITY])],
+                                ));
+                            }
+                            response.extend(search_result_done(message_id, 0));
+                            let _ = stream.write_all(&response).await;
+                        }
+                        LDAP_OP_UNBIND_REQUEST => break,
+                        _ => {}
+                    }
+                    let _ = stream.flush().await;
+                }
+            });
+        }
+    });
+    (port, accepted)
+}
+
+fn member_of_plugin(port: u16, extra: serde_json::Value) -> LdapAuth {
+    let mut config = json!({
+        "ldap_url": format!("ldap://127.0.0.1:{port}"),
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+        "canonical_identity_attribute": "uid",
+        "group_base_dn": "ou=groups,dc=example,dc=com",
+        "required_groups": ["gateway-admins"],
+        "group_membership_mode": "member_of",
+    });
+    for (key, value) in extra.as_object().expect("extra object") {
+        config[key] = value.clone();
+    }
+    LdapAuth::new(&config, http_client()).expect("valid member_of config")
+}
+
+async fn assert_member_of_result(values: &[&str], extra: serde_json::Value, status: Option<u16>) {
+    let member_of = Arc::new(std::sync::Mutex::new(
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>(),
+    ));
+    let (port, _accepted) = spawn_member_of_directory(member_of).await;
+    let plugin = member_of_plugin(port, extra);
+    let result = authenticate_as(&plugin, "alice", "good-secret").await;
+    match status {
+        None => assert_continue(result),
+        Some(status) => assert_reject(result, Some(status)),
+    }
+}
+
+#[tokio::test]
+async fn test_member_of_mode_admits_a_listed_required_group() {
+    // DN comparison is per RDN and case-insensitive.
+    assert_member_of_result(
+        &["CN=Gateway-Admins,OU=Groups,DC=example,DC=com"],
+        json!({}),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_member_of_mode_denies_an_unlisted_group() {
+    assert_member_of_result(
+        &["cn=other-team,ou=groups,dc=example,dc=com"],
+        json!({}),
+        Some(403),
+    )
+    .await;
+}
+
+/// The user's entry lists only the delegated look-alike; with the unique
+/// `sAMAccountName` authoritative, the real group's DN is not in that list.
+#[tokio::test]
+async fn test_member_of_mode_denies_a_look_alike_group() {
+    assert_member_of_result(
+        &[MEMBER_OF_LOOK_ALIKE_DN],
+        json!({"group_attribute": "sAMAccountName"}),
+        Some(403),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_member_of_mode_denies_missing_or_malformed_values() {
+    assert_member_of_result(&[], json!({}), Some(403)).await;
+    assert_member_of_result(&["not a distinguished name"], json!({}), Some(403)).await;
+}
+
+/// A due cached group re-check re-reads the user's `memberOf` values.
+#[tokio::test]
+async fn test_member_of_mode_cached_recheck_sees_removal() {
+    let member_of = Arc::new(std::sync::Mutex::new(vec![
+        MEMBER_OF_REAL_GROUP_DN.to_string(),
+    ]));
+    let (port, _accepted) = spawn_member_of_directory(Arc::clone(&member_of)).await;
+    let plugin = member_of_plugin(
+        port,
+        json!({"cache_ttl_seconds": 300, "group_cache_ttl_seconds": 0}),
+    );
+    assert_continue(authenticate_as(&plugin, "alice", "good-secret").await);
+    member_of.lock().expect("memberOf values").clear();
+    assert_reject(
+        authenticate_as(&plugin, "alice", "good-secret").await,
+        Some(403),
+    );
+}
+
+#[test]
+fn test_member_of_mode_configuration() {
+    assert!(
+        LdapAuth::new(
+            &direct_bind_config_with(json!({
+                "group_base_dn": "ou=groups,dc=example,dc=com",
+                "required_groups": ["admins"],
+                "group_membership_mode": "member_of",
+                "group_filter": "(member={user_dn})"
+            })),
+            http_client(),
+        )
+        .is_err(),
+        "member_of cannot be combined with a custom group filter"
+    );
+    assert!(
+        LdapAuth::new(
+            &direct_bind_config_with(json!({
+                "group_base_dn": "ou=groups,dc=example,dc=com",
+                "required_groups": ["admins", "ops)(cn=*"],
+                "group_membership_mode": "member_of",
+                "group_member_attribute": "isMemberOf"
+            })),
+            http_client(),
+        )
+        .is_ok()
+    );
 }

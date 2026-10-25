@@ -24949,6 +24949,11 @@ components:
                   anyOf:
                     - pattern: "^ldaps://"
                     - pattern: '^ldap://(?:127(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}|\[::1\]|(?:[^/?#@]+\.)?[lL][oO][cC][aA][lL][hH][oO][sS][tT]\.?)(?::[0-9]+)?(?:[/?#]|$)'
+        - not:
+            required: [group_filter, group_membership_mode]
+            properties:
+              group_membership_mode:
+                const: member_of
         - if:
             required: [service_connection_max_age_seconds]
             properties:
@@ -25044,12 +25049,12 @@ components:
           pattern: '^\s*(?:[A-Za-z][A-Za-z0-9-]*|(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))+)(?:;[A-Za-z0-9-]+)*\s*$'
           not:
             pattern: '^\s*1\.1\s*$'
-          description: "DN-valued attribute on group entries that lists members, used for the default group search and for the custom-filter membership recheck instead of the built-in member/uniqueMember/memberUid predicate (for example member or a custom appMember). With group_membership_mode ad_in_chain it names the link attribute evaluated transitively (default member). Must be an RFC 4512 attribute description."
+          description: "DN-valued attribute on group entries that lists members, used for the default group search and for the custom-filter membership recheck instead of the built-in member/uniqueMember/memberUid predicate (for example member or a custom appMember). With group_membership_mode ad_in_chain it names the link attribute evaluated transitively (default member); with member_of it names the attribute on the user's entry listing group DNs (default memberOf). Must be an RFC 4512 attribute description."
         group_membership_mode:
           type: string
-          enum: [direct, ad_in_chain]
+          enum: [direct, ad_in_chain, member_of]
           default: direct
-          description: "direct proves membership from the group entry's own membership attribute. ad_in_chain (Active Directory only) uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) on group_member_attribute (default member), so a user who is a member through nested groups matches; the directory evaluates the chain under the group search's size and time limits, and custom-filter matches are rechecked with the same in-chain predicate."
+          description: "member_of reads group DNs from the authenticated user's own entry (group_member_attribute, default memberOf) and accepts a required group only when an entry under group_base_dn named by its group_attribute value has a DN equal to one of them; it cannot be combined with group_filter. direct proves membership from the group entry's own membership attribute. ad_in_chain (Active Directory only) uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) on group_member_attribute (default member), so a user who is a member through nested groups matches; the directory evaluates the chain under the group search's size and time limits, and custom-filter matches are rechecked with the same in-chain predicate."
         starttls:
           type: boolean
           default: false
@@ -25098,7 +25103,7 @@ components:
           default: 10000
           minimum: 1
           maximum: 1000000
-          description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan. Cache keys fold the presented username like a directory does (trimmed, interior whitespace collapsed, lowercased) together with the exact password. The same cap bounds the rejected-credential cache and the per-username failure tracker."
+          description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan. Cache keys use the exact presented username and password. The same cap bounds the rejected-credential cache and the per-username failure tracker; the tracker never evicts live failure state, so when it is full an untracked username gets 500."
         negative_cache_ttl_seconds:
           type: integer
           format: uint64
@@ -25112,7 +25117,7 @@ components:
           default: 0
           minimum: 0
           maximum: 1000
-          description: "After this many consecutive directory credential rejections for one presented username, that username is answered 401 without contacting the directory for failed_attempt_backoff_seconds, even with the correct password (0 = disabled, maximum 1000). This keeps a spray from reaching directory lockout counters; a successful bind resets the count."
+          description: "After this many consecutive directory credential rejections for one presented username, that username is answered 401 without contacting the directory for failed_attempt_backoff_seconds, even with the correct password (0 = disabled, maximum 1000). This keeps a spray from reaching directory lockout counters; a successful bind resets the count. The count folds the username's case and whitespace, survives a compatible reload of the same plugin config, and is never evicted while live (a full tracker answers an untracked username 500)."
         failed_attempt_backoff_seconds:
           type: integer
           format: uint64

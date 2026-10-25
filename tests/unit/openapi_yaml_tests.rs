@@ -4641,6 +4641,7 @@ fn ldap_auth_value_constraints_match_runtime_admission() {
         direct_bind(json!({"group_attribute": "cn;lang-en"})),
         direct_bind(json!({"group_member_attribute": "appMember"})),
         direct_bind(json!({"group_membership_mode": "ad_in_chain"})),
+        direct_bind(json!({"group_membership_mode": "member_of"})),
         direct_bind(json!({"failover_ldap_urls": ["ldaps://ldap2.example.com:636"]})),
         direct_bind(json!({
             "ldap_url": "ldap://127.0.0.1:389",
@@ -4697,6 +4698,10 @@ fn ldap_auth_value_constraints_match_runtime_admission() {
         direct_bind(json!({"group_attribute": "01.2"})),
         direct_bind(json!({"group_member_attribute": "member)(uid=*"})),
         direct_bind(json!({"group_membership_mode": "nested"})),
+        direct_bind(json!({
+            "group_membership_mode": "member_of",
+            "group_filter": "(member={user_dn})"
+        })),
         // Failover endpoints share the scheme and the plaintext rules.
         direct_bind(json!({"failover_ldap_urls": []})),
         direct_bind(json!({"failover_ldap_urls": ["ldap://127.0.0.1:389"]})),
