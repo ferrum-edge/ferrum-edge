@@ -10920,3 +10920,41 @@ async fn mesh_authz_header_rule_resolves_its_header_among_many_unrelated_ones() 
         );
     }
 }
+
+#[tokio::test]
+async fn mesh_authz_does_not_resurrect_a_header_removed_after_materialization() {
+    // An earlier plugin materialized the request, removed the untrusted client
+    // `x-role`, and published no vetted replacement. Once headers are
+    // materialized the map is authoritative: neither `to.headers` nor a `when:`
+    // condition may read the removed value back from the raw block.
+    let mut header_allow = allow_client_policy(PolicyAction::Allow);
+    header_allow.rules[0].to = vec![RequestMatch {
+        headers: HashMap::from([("x-role".to_string(), "admin".to_string())]),
+        ..RequestMatch::default()
+    }];
+    let mut condition_allow = allow_client_policy(PolicyAction::Allow);
+    condition_allow.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-role]".to_string(),
+        values: vec!["admin".to_string()],
+        not_values: Vec::new(),
+    }];
+    for (label, policy) in [("to.headers", header_allow), ("when", condition_allow)] {
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+        for (removed, expect_allowed) in [(true, false), (false, true)] {
+            let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-role", "admin".parse().expect("header value"));
+            ctx.set_raw_headers(headers);
+            ctx.materialize_headers();
+            if removed {
+                ctx.headers.remove("x-role");
+            }
+            let result = plugin.authorize(&mut ctx).await;
+            assert_eq!(
+                matches!(result, PluginResult::Continue),
+                expect_allowed,
+                "{label}, removed={removed}: unexpected verdict {result:?}"
+            );
+        }
+    }
+}

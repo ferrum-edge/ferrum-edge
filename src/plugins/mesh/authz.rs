@@ -117,9 +117,20 @@ pub struct MeshAuthz {
     /// `before_proxy` hook; empty (the overwhelmingly common case) keeps both
     /// a no-op.
     ext_authz_upstream_allow_headers: Vec<String>,
+    /// `modified_request_header_names` for this instance: every spelling of
+    /// every provider-owned name that `before_proxy` can REMOVE (its removal
+    /// folds `_` and `-`, as CGI-style backends do), so the early route-total
+    /// preview — which compares names case-insensitively only — never treats an
+    /// underscore-spelled routing input as stable. `None` (any header may
+    /// change) when the spelling set would be too large to enumerate.
+    ext_authz_declared_modified_headers: Option<Vec<String>>,
     /// Whether any bound provider declares `headersToDownstreamOnAllow`. Arms
     /// the `after_proxy` / WebSocket handshake response hooks.
     ext_authz_mutates_downstream: bool,
+    /// Process-unique id of this instance. Keys its allowed-check staging in
+    /// the per-request plugin state, so two effective `mesh_authz` instances
+    /// on one request never overwrite or consume each other's result.
+    instance_id: u64,
     /// Body-inspecting CUSTOM rules that ONLY the NodeWaypoint capture
     /// inventory carries, each kept inside its policy (scope + those rules).
     /// Unlike `body_inspecting_custom_rules`, these request a prebuffer only
@@ -1269,17 +1280,26 @@ fn http_header_attribute(ctx: &RequestContext, name: &str) -> Option<String> {
 /// `x-tenant: ok` field line from a DENY that a later reader (or the backend)
 /// still sees.
 ///
-/// The result no longer depends on whether something earlier forced header
-/// materialization: an existing `ctx.headers` entry (the materialized value, or
-/// a gateway/plugin-inserted one) wins; otherwise the raw field lines are
-/// folded the same way materialization would, skipping a non-UTF-8 line as
-/// materialization does. Reserved gateway assertion headers are never read from
-/// the raw client block.
+/// The joined reading does not depend on whether something earlier forced
+/// header materialization:
+///
+/// * once headers ARE materialized, `ctx.headers` is the authoritative request
+///   view — an entry is the (joined) value, and an ABSENT name is absent. An
+///   earlier plugin that removed an untrusted client field (and perhaps
+///   publishes a vetted value later) must not have that removal undone here by
+///   reading the retained pristine raw block;
+/// * before materialization, an existing `ctx.headers` entry (gateway/plugin
+///   inserted) wins, and otherwise the raw field lines are folded exactly the
+///   way materialization would fold them, skipping a non-UTF-8 line as
+///   materialization does.
+///
+/// Reserved gateway assertion headers are never read from the raw client block.
 fn http_request_header_value(ctx: &RequestContext, lower: &str) -> Option<String> {
     if let Some(value) = ctx.headers.get(lower) {
         return Some(value.clone());
     }
-    if RequestContext::is_reserved_gateway_assertion_header(lower) {
+    if ctx.headers_are_materialized() || RequestContext::is_reserved_gateway_assertion_header(lower)
+    {
         return None;
     }
     let separator = crate::plugins::repeated_request_header_separator(lower);
@@ -2262,13 +2282,18 @@ impl MeshAuthz {
         let ext_authz_mutates_downstream = ext_authz
             .as_ref()
             .is_some_and(|executor| executor.mutates_downstream_on_allow());
+        let ext_authz_declared_modified_headers =
+            backend_folded_header_spellings(&ext_authz_upstream_allow_headers);
 
         Ok(Self {
             slice,
             ext_authz,
             body_inspecting_custom_rules,
             ext_authz_upstream_allow_headers,
+            ext_authz_declared_modified_headers,
             ext_authz_mutates_downstream,
+            instance_id: NEXT_MESH_AUTHZ_INSTANCE_ID
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             capture_body_inspecting_custom_policies,
             relay_policy_superset,
             ambient_udp_source_scopes,
@@ -2876,20 +2901,31 @@ impl MeshAuthz {
                 // `metadata`, so an exchanged token cannot reach a log line.
                 let owned = executor.upstream_allow_header_names(&delegation.provider);
                 if !owned.is_empty() || !downstream_headers.is_empty() {
-                    let staged_upstream: Vec<(String, Option<String>)> = owned
-                        .iter()
-                        .map(|name| {
-                            let name = name.as_str();
-                            let value = upstream_headers
-                                .iter()
-                                .find(|(returned, _)| returned == name)
-                                .map(|(_, value)| value.clone());
-                            (name.to_string(), value)
-                        })
-                        .collect();
+                    let staged_upstream: crate::plugins::mesh::ext_authz::StagedUpstreamHeaders =
+                        owned
+                            .iter()
+                            .map(|name| {
+                                let name = name.as_str();
+                                let value = upstream_headers
+                                    .iter()
+                                    .find(|(returned, _)| returned == name)
+                                    .map(|(_, value)| value.clone());
+                                (name.to_string(), value)
+                            })
+                            .collect();
+                    // Keyed by THIS instance: another effective `mesh_authz`
+                    // on the same request stages (and consumes) its own entry.
                     let state = ctx.plugin_state_mut();
-                    state.mesh_ext_authz_upstream_headers = staged_upstream;
-                    state.mesh_ext_authz_downstream_headers = downstream_headers;
+                    if !staged_upstream.is_empty() {
+                        state
+                            .mesh_ext_authz_upstream_headers
+                            .insert(self.instance_id, staged_upstream);
+                    }
+                    if !downstream_headers.is_empty() {
+                        state
+                            .mesh_ext_authz_downstream_headers
+                            .insert(self.instance_id, downstream_headers);
+                    }
                 }
                 None
             }
@@ -4195,10 +4231,12 @@ impl Plugin for MeshAuthz {
         !self.ext_authz_upstream_allow_headers.is_empty()
     }
 
-    /// Exactly the provider-owned `headersToUpstreamOnAllow` names — the only
-    /// request headers this instance can ever change.
+    /// The provider-owned `headersToUpstreamOnAllow` names in EVERY `_` / `-`
+    /// spelling `before_proxy` removes — the only request headers this
+    /// instance can ever change. `None` (conservatively "any header") when
+    /// that spelling set is too large to enumerate.
     fn modified_request_header_names(&self) -> Option<Vec<String>> {
-        Some(self.ext_authz_upstream_allow_headers.clone())
+        self.ext_authz_declared_modified_headers.clone()
     }
 
     /// Apply an allowed CUSTOM check's `headersToUpstreamOnAllow` result.
@@ -4223,10 +4261,11 @@ impl Plugin for MeshAuthz {
         if self.ext_authz_upstream_allow_headers.is_empty() {
             return PluginResult::Continue;
         }
-        let Some(staged) = ctx
-            .plugin_state_opt_mut()
-            .map(|state| std::mem::take(&mut state.mesh_ext_authz_upstream_headers))
-        else {
+        let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .mesh_ext_authz_upstream_headers
+                .remove(&self.instance_id)
+        }) else {
             return PluginResult::Continue;
         };
         if staged.is_empty() {
@@ -4258,10 +4297,11 @@ impl Plugin for MeshAuthz {
         if !self.ext_authz_mutates_downstream {
             return PluginResult::Continue;
         }
-        if let Some(staged) = ctx
-            .plugin_state_opt_mut()
-            .map(|state| std::mem::take(&mut state.mesh_ext_authz_downstream_headers))
-        {
+        if let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .mesh_ext_authz_downstream_headers
+                .remove(&self.instance_id)
+        }) {
             apply_ext_authz_downstream_allow_headers(response_headers, &staged);
         }
         PluginResult::Continue
@@ -4278,11 +4318,14 @@ impl Plugin for MeshAuthz {
         if !self.ext_authz_mutates_downstream {
             return;
         }
-        if let Some(state) = ctx.plugin_state() {
-            apply_ext_authz_downstream_allow_headers(
-                response_headers,
-                &state.mesh_ext_authz_downstream_headers,
-            );
+        // Read-only (`&RequestContext`), but only THIS instance's entry, so
+        // each provider's cookie is applied exactly once per handshake.
+        if let Some(staged) = ctx.plugin_state().and_then(|state| {
+            state
+                .mesh_ext_authz_downstream_headers
+                .get(&self.instance_id)
+        }) {
+            apply_ext_authz_downstream_allow_headers(response_headers, staged);
         }
     }
 
@@ -4757,6 +4800,49 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Source of [`MeshAuthz::instance_id`].
+static NEXT_MESH_AUTHZ_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Upper bound on the `_` / `-` spellings enumerated per provider-owned name
+/// (2^6: six separators). A longer name makes the declaration `None`.
+const MAX_DECLARED_SPELLINGS_PER_HEADER: usize = 64;
+
+/// Every spelling of `names` that differs only by `_` vs `-` at a separator
+/// position — exactly the set `before_proxy` removes via
+/// `field_names_equivalent_for_backends` (case is already compared
+/// case-insensitively by the consumers of the declaration). Sorted and
+/// deduplicated; `None` when any name has more than
+/// [`MAX_DECLARED_SPELLINGS_PER_HEADER`] spellings, which a consumer reads as
+/// "any header may change" — the conservative answer.
+fn backend_folded_header_spellings(names: &[String]) -> Option<Vec<String>> {
+    let mut spellings: Vec<String> = Vec::new();
+    for name in names {
+        let separators: Vec<usize> = name
+            .bytes()
+            .enumerate()
+            .filter(|(_, byte)| matches!(*byte, b'-' | b'_'))
+            .map(|(index, _)| index)
+            .collect();
+        let count = 1usize.checked_shl(u32::try_from(separators.len()).ok()?)?;
+        if count > MAX_DECLARED_SPELLINGS_PER_HEADER {
+            return None;
+        }
+        for mask in 0..count {
+            let mut bytes = name.as_bytes().to_vec();
+            for (bit, index) in separators.iter().enumerate() {
+                bytes[*index] = if mask & (1 << bit) == 0 { b'-' } else { b'_' };
+            }
+            // Only ASCII `-` / `_` bytes were replaced, so the result is still
+            // valid UTF-8; the lossy conversion never actually substitutes.
+            spellings.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    spellings.sort();
+    spellings.dedup();
+    Some(spellings)
 }
 
 /// Merge an allowed check's `headersToDownstreamOnAllow` result into a client

@@ -471,9 +471,13 @@ const CHECK_DURATION_BUCKETS: [(u64, &str); 14] = [
 #[derive(Debug)]
 struct ProviderStats {
     outcomes: [AtomicU64; ALL_REASONS.len()],
-    /// Non-cumulative bucket counts; [`render_provider_prometheus`] folds them.
-    duration_buckets: [AtomicU64; CHECK_DURATION_BUCKETS.len()],
-    duration_count: AtomicU64,
+    /// Non-cumulative bucket counts: one per [`CHECK_DURATION_BUCKETS`] bound,
+    /// plus a final overflow slot for observations above the largest bound.
+    /// There is deliberately NO separate count: [`render_provider_prometheus`]
+    /// derives every cumulative bucket, `+Inf`, and `_count` from ONE pass over
+    /// these slots, so a scrape racing live observations can never emit a
+    /// finite bucket above `+Inf` / `_count`.
+    duration_buckets: [AtomicU64; CHECK_DURATION_BUCKETS.len() + 1],
     duration_sum_micros: AtomicU64,
 }
 
@@ -482,7 +486,6 @@ impl Default for ProviderStats {
         Self {
             outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
             duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-            duration_count: AtomicU64::new(0),
             duration_sum_micros: AtomicU64::new(0),
         }
     }
@@ -497,15 +500,27 @@ impl ProviderStats {
     /// to the transport failure / timeout that ended the attempt).
     fn observe_duration(&self, elapsed: Duration) {
         let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        if let Some(index) = CHECK_DURATION_BUCKETS
+        // An observation past the largest bound lands in the overflow slot.
+        let index = CHECK_DURATION_BUCKETS
             .iter()
             .position(|(bound, _)| micros <= *bound)
-        {
-            self.duration_buckets[index].fetch_add(1, Ordering::Relaxed);
-        }
-        self.duration_count.fetch_add(1, Ordering::Relaxed);
+            .unwrap_or(CHECK_DURATION_BUCKETS.len());
+        self.duration_buckets[index].fetch_add(1, Ordering::Relaxed);
         self.duration_sum_micros
             .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// One consistent read of every duration slot (finite buckets, then the
+    /// overflow slot).
+    fn duration_snapshot(&self) -> [u64; CHECK_DURATION_BUCKETS.len() + 1] {
+        std::array::from_fn(|index| self.duration_buckets[index].load(Ordering::Relaxed))
+    }
+
+    /// Number of timed checks: the sum of every duration slot.
+    fn duration_total(&self) -> u64 {
+        self.duration_snapshot()
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
     }
 
     fn outcome_total(&self) -> u64 {
@@ -560,7 +575,7 @@ pub fn provider_snapshot(name: &str) -> Option<(Vec<(&'static str, u64)>, u64)> 
             (value > 0).then_some((reason.as_str(), value))
         })
         .collect();
-    Some((outcomes, stats.duration_count.load(Ordering::Relaxed)))
+    Some((outcomes, stats.duration_total()))
 }
 
 /// Append the per-provider series. Emitted only for providers that have
@@ -595,9 +610,15 @@ fn render_provider_prometheus(output: &mut String, gateway_ns_label: &str) {
             ));
         }
     }
-    if entries
+    // One read of every provider's slots, reused below, so each provider's
+    // buckets, `+Inf`, and `_count` all describe the same set of observations.
+    let durations: Vec<[u64; CHECK_DURATION_BUCKETS.len() + 1]> = entries
         .iter()
-        .all(|(_, stats)| stats.duration_count.load(Ordering::Relaxed) == 0)
+        .map(|(_, stats)| stats.duration_snapshot())
+        .collect();
+    if durations
+        .iter()
+        .all(|slots| slots.iter().all(|count| *count == 0))
     {
         return;
     }
@@ -605,16 +626,17 @@ fn render_provider_prometheus(output: &mut String, gateway_ns_label: &str) {
         "# HELP ferrum_mesh_ext_authz_check_duration_seconds Time from dispatching a CUSTOM external authorization check to the provider's response headers (or the failure that ended it), per admitted extension provider.\n",
     );
     output.push_str("# TYPE ferrum_mesh_ext_authz_check_duration_seconds histogram\n");
-    for (name, stats) in &entries {
-        let count = stats.duration_count.load(Ordering::Relaxed);
+    for ((name, stats), slots) in entries.iter().zip(&durations) {
+        let count = slots
+            .iter()
+            .fold(0u64, |total, slot| total.saturating_add(*slot));
         if count == 0 {
             continue;
         }
         let provider = crate::plugins::prometheus_metrics::escape_label_value(name);
         let mut cumulative = 0u64;
-        for (index, (_, le)) in CHECK_DURATION_BUCKETS.iter().enumerate() {
-            cumulative =
-                cumulative.saturating_add(stats.duration_buckets[index].load(Ordering::Relaxed));
+        for ((_, le), slot) in CHECK_DURATION_BUCKETS.iter().zip(slots.iter()) {
+            cumulative = cumulative.saturating_add(*slot);
             output.push_str(&format!(
                 "ferrum_mesh_ext_authz_check_duration_seconds_bucket{{provider=\"{provider}\",le=\"{le}\"{gateway_ns_label}}} {cumulative}\n"
             ));
@@ -1345,6 +1367,14 @@ pub(crate) fn collect_headers(
     }
     selected
 }
+
+/// One allowed check's staged `headersToUpstreamOnAllow` result: one
+/// `(lowercase name, value)` pair per provider-owned name, `None` meaning
+/// "strip the client's copy, install nothing".
+pub(crate) type StagedUpstreamHeaders = Vec<(String, Option<String>)>;
+
+/// One allowed check's staged `headersToDownstreamOnAllow` result.
+pub(crate) type StagedDownstreamHeaders = Vec<(String, String)>;
 
 /// Gateway-asserted caller-identity headers stamped on every check.
 pub const SOURCE_PRINCIPAL_CHECK_HEADER: &str = "x-ferrum-source-principal";

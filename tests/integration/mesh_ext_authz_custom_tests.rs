@@ -1887,14 +1887,25 @@ mod allowed_request_mutations {
         let stub = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
         let plugin = plugin(stub.port, false);
         assert!(plugin.modifies_request_headers());
-        assert_eq!(
-            plugin.modified_request_header_names(),
-            Some(vec![
-                "authorization".to_string(),
-                "x-auth-request-user".to_string()
-            ]),
-            "the only request headers this instance can change are the provider-owned names"
-        );
+        let declared = plugin
+            .modified_request_header_names()
+            .expect("a bounded spelling set is declared, not `any header`");
+        // `before_proxy` removes every `_` / `-` spelling of an owned name, so
+        // the declaration must name every one of them: 1 for `authorization`,
+        // 2^3 for `x-auth-request-user`.
+        assert_eq!(declared.len(), 9, "unexpected declaration: {declared:?}");
+        for spelling in [
+            "authorization",
+            "x-auth-request-user",
+            "x_auth_request_user",
+            "x-auth_request-user",
+            "x_auth-request_user",
+        ] {
+            assert!(
+                declared.iter().any(|name| name == spelling),
+                "{spelling} must be declared mutable: {declared:?}"
+            );
+        }
 
         let mut ctx = ctx();
         assert!(matches!(
@@ -1981,6 +1992,234 @@ mod allowed_request_mutations {
         assert_eq!(stub.calls.load(Ordering::SeqCst), 0);
     }
 
+    /// A second allowing provider: a tenant header upstream and its own cookie.
+    const TENANT_ALLOW: &str = "HTTP/1.1 200 OK\r\n\
+x-tenant: tenant-b\r\n\
+set-cookie: b-session=1; Path=/\r\n\
+content-length: 0\r\n\r\n";
+
+    fn plugin_with(
+        provider_name: &str,
+        port: u16,
+        fail_open: bool,
+        upstream: &[&str],
+        downstream: &[&str],
+    ) -> MeshAuthz {
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": provider_name } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": provider_name,
+                "service": "127.0.0.1",
+                "port": port,
+                "timeout_ms": 500,
+                "fail_open": fail_open,
+                "status_on_error": 403,
+                "headers_to_upstream_on_allow": upstream,
+                "headers_to_downstream_on_allow": downstream,
+            }],
+        });
+        match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        }
+    }
+
+    /// Two effective `mesh_authz` instances on one request (an operator global
+    /// beside the force-injected `__mesh_authz`) must each apply ONLY their own
+    /// allowed result: a shared staging slot let the second check overwrite the
+    /// first, so instance A consumed B's result and a forged A-owned header
+    /// reached the backend.
+    #[tokio::test]
+    async fn two_instances_apply_only_their_own_allowed_results() {
+        let stub_a = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+        let stub_b = start_stub(StubBehavior::Raw(TENANT_ALLOW)).await;
+        let a = plugin_with(
+            "instance-a-ext-authz",
+            stub_a.port,
+            false,
+            &["x-auth-request-user"],
+            &["set-cookie"],
+        );
+        let b = plugin_with(
+            "instance-b-ext-authz",
+            stub_b.port,
+            false,
+            &["x-tenant"],
+            &["set-cookie"],
+        );
+        let mut ctx = ctx();
+        assert!(matches!(
+            a.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            b.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+
+        let mut upstream = HashMap::from([
+            ("x-auth-request-user".to_string(), "mallory".to_string()),
+            ("X_Auth_Request_User".to_string(), "mallory".to_string()),
+            ("x-tenant".to_string(), "forged".to_string()),
+            ("x-request-id".to_string(), "abc-123".to_string()),
+        ]);
+        let _ = a.before_proxy(&mut ctx, &mut upstream).await;
+        let _ = b.before_proxy(&mut ctx, &mut upstream).await;
+        assert_eq!(
+            upstream.get("x-auth-request-user").map(String::as_str),
+            Some("alice"),
+            "instance A installs its own provider's value"
+        );
+        assert!(!upstream.contains_key("X_Auth_Request_User"));
+        assert_eq!(
+            upstream.get("x-tenant").map(String::as_str),
+            Some("tenant-b"),
+            "instance B installs its own provider's value"
+        );
+        assert_eq!(
+            upstream.get("x-request-id").map(String::as_str),
+            Some("abc-123")
+        );
+
+        // The WebSocket handshake hook reads (does not consume) the staging:
+        // each instance applies only its own cookie, exactly once.
+        let mut handshake = HashMap::new();
+        a.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake);
+        b.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake);
+        assert_eq!(
+            handshake.get("set-cookie").map(String::as_str),
+            Some("session=refreshed; Path=/\nb-session=1; Path=/")
+        );
+
+        let mut response = HashMap::from([("set-cookie".to_string(), "backend=1".to_string())]);
+        let _ = a.after_proxy(&mut ctx, 200, &mut response).await;
+        let _ = b.after_proxy(&mut ctx, 200, &mut response).await;
+        assert_eq!(
+            response.get("set-cookie").map(String::as_str),
+            Some("backend=1\nsession=refreshed; Path=/\nb-session=1; Path=/"),
+            "each provider's cookie appears exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_downstream_only_instance_cannot_erase_another_instances_fail_open_strip() {
+        // A's provider fails open: A must still strip the forged A-owned
+        // header. B is downstream-only; its staging must not overwrite A's.
+        let stub_a = start_status_stub(503).await;
+        let stub_b = start_stub(StubBehavior::Raw(TENANT_ALLOW)).await;
+        let a = plugin_with(
+            "fail-open-a-ext-authz",
+            stub_a.port,
+            true,
+            &["x-auth-request-user"],
+            &[],
+        );
+        let b = plugin_with(
+            "downstream-only-b-ext-authz",
+            stub_b.port,
+            false,
+            &[],
+            &["set-cookie"],
+        );
+        let mut ctx = ctx();
+        assert!(matches!(
+            a.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            b.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut upstream = forged_upstream_headers();
+        let _ = a.before_proxy(&mut ctx, &mut upstream).await;
+        let _ = b.before_proxy(&mut ctx, &mut upstream).await;
+        assert!(!upstream.contains_key("x-auth-request-user"));
+        assert!(!upstream.contains_key("X_Auth_Request_User"));
+        let mut response = HashMap::new();
+        let _ = a.after_proxy(&mut ctx, 200, &mut response).await;
+        let _ = b.after_proxy(&mut ctx, 200, &mut response).await;
+        assert_eq!(
+            response.get("set-cookie").map(String::as_str),
+            Some("b-session=1; Path=/")
+        );
+    }
+
+    /// A header an earlier plugin removed from the materialized request view is
+    /// not forwarded to the provider from the retained raw block.
+    #[tokio::test]
+    async fn a_header_removed_before_authorization_is_not_forwarded_to_the_provider() {
+        let stub = start_stub(StubBehavior::Allow).await;
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": "removal-ext-authz" } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": "removal-ext-authz",
+                "service": "127.0.0.1",
+                "port": stub.port,
+                "timeout_ms": 500,
+                "status_on_error": 403,
+                "include_request_headers_in_check": ["x-role", "x-request-id"],
+            }],
+        });
+        let plugin = match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        };
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/admin/reports".to_string(),
+        );
+        let mut raw = http::HeaderMap::new();
+        raw.insert("host", "api.example.com".parse().expect("header value"));
+        raw.insert("x-role", "admin".parse().expect("header value"));
+        raw.insert("x-request-id", "abc-123".parse().expect("header value"));
+        ctx.set_raw_headers(raw);
+        ctx.materialize_headers();
+        // An earlier plugin strips the untrusted client field.
+        ctx.headers.remove("x-role");
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert!(
+            seen_header_lines(&seen, "x-role").is_empty(),
+            "a removed header must not be resurrected for the provider: {seen}"
+        );
+        assert_eq!(
+            seen_header_lines(&seen, "x-request-id"),
+            vec!["abc-123".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn the_live_datapath_stamps_the_peer_identity_and_merges_denial_cookies() {
         let stub = start_stub(StubBehavior::Raw(MULTI_LINE_DENIAL)).await;
@@ -2065,14 +2304,25 @@ async fn checks_are_attributed_to_their_admitted_provider_with_a_duration() {
 
     let (outcomes, timed) = ferrum_edge::plugins::mesh::ext_authz::provider_snapshot(NAME)
         .expect("the admitted provider is registered");
-    assert_eq!(outcomes, vec![("allowed", 2)]);
+    // The stub closes each connection after answering, so a pooled second
+    // check can race that close; what is pinned here is attribution, not the
+    // stub's keep-alive behaviour.
+    assert_eq!(
+        outcomes.iter().map(|(_, count)| *count).sum::<u64>(),
+        2,
+        "both checks are attributed to the provider: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|(outcome, _)| *outcome == "allowed"),
+        "{outcomes:?}"
+    );
     assert_eq!(timed, 2, "every dispatched check records one duration");
 
     let mut rendered = String::new();
     ferrum_edge::plugins::mesh::ext_authz::render_prometheus(&mut rendered, "");
     assert!(
         rendered.contains(&format!(
-            "ferrum_mesh_ext_authz_provider_checks_total{{provider=\"{NAME}\",outcome=\"allowed\"}} 2"
+            "ferrum_mesh_ext_authz_provider_checks_total{{provider=\"{NAME}\",outcome=\"allowed\"}}"
         )),
         "per-provider outcome series missing:\n{rendered}"
     );
@@ -2088,4 +2338,73 @@ async fn checks_are_attributed_to_their_admitted_provider_with_a_duration() {
         )),
         "histogram +Inf bucket must equal the count:\n{rendered}"
     );
+}
+
+/// A scrape racing live checks must never emit a finite bucket above `+Inf`,
+/// and `+Inf` must always equal `_count`: both are derived from one read of
+/// the bucket slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scrape_racing_live_checks_keeps_the_histogram_consistent() {
+    const NAME: &str = "histogram-race-ext-authz";
+    let stub = start_stub(StubBehavior::Allow).await;
+    let mut source = provider(stub.port);
+    source.name = NAME.to_string();
+    let executor = Arc::new(executor(vec![source]));
+    let mut workers = Vec::new();
+    for _ in 0..8 {
+        let executor = Arc::clone(&executor);
+        workers.push(tokio::spawn(async move {
+            let headers = request_headers();
+            for _ in 0..25 {
+                let _ = check(&executor, NAME, &headers).await;
+            }
+        }));
+    }
+
+    let bucket_prefix =
+        format!("ferrum_mesh_ext_authz_check_duration_seconds_bucket{{provider=\"{NAME}\",le=\"");
+    let count_prefix =
+        format!("ferrum_mesh_ext_authz_check_duration_seconds_count{{provider=\"{NAME}\"}} ");
+    let mut scrapes = 0usize;
+    loop {
+        let done = workers.iter().all(|worker| worker.is_finished());
+        let mut rendered = String::new();
+        ferrum_edge::plugins::mesh::ext_authz::render_prometheus(&mut rendered, "");
+        let mut finite = Vec::new();
+        let mut inf = None;
+        let mut count = None;
+        for line in rendered.lines() {
+            if let Some(rest) = line.strip_prefix(&bucket_prefix) {
+                let (le, value) = rest.split_once("\"} ").expect("bucket line shape");
+                let value: u64 = value.parse().expect("bucket value");
+                if le == "+Inf" {
+                    inf = Some(value);
+                } else {
+                    finite.push(value);
+                }
+            } else if let Some(value) = line.strip_prefix(&count_prefix) {
+                count = Some(value.parse::<u64>().expect("count value"));
+            }
+        }
+        if let (Some(inf), Some(count)) = (inf, count) {
+            assert_eq!(inf, count, "+Inf must equal _count:\n{rendered}");
+            assert!(
+                finite.windows(2).all(|pair| pair[0] <= pair[1]),
+                "finite buckets must be cumulative:\n{rendered}"
+            );
+            assert!(
+                finite.iter().all(|bucket| *bucket <= inf),
+                "no finite bucket may exceed +Inf:\n{rendered}"
+            );
+            scrapes += 1;
+        }
+        if done {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    for worker in workers {
+        worker.await.expect("worker completes");
+    }
+    assert!(scrapes > 0, "at least one scrape observed the histogram");
 }
