@@ -194,8 +194,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after headers (previously a neutral release) is now scored a circuit failure
   from trusted dispatch/body provenance, using proxy core's post-wire
   backend-failure classes. Client disconnects, authorization-lifetime
-  terminations, gateway-local refusals, and route-rule total request deadlines
-  stay neutral, and scoring stays exactly-once.
+  terminations, and gateway-local refusals stay neutral, route deadlines are
+  settled exactly as proxy core settles them (a body cut by the route
+  deadline is neutral via a new typed `BodyOutcome::route_policy_cut` flag; a
+  pre-header expiry is charged only when the provider held the attempt), and
+  scoring stays exactly-once.
 - **`ai_federation` documents the buffered provider-error envelope.** A buffered
   provider non-2xx body is replaced by a fixed `upstream_error` envelope with the
   provider's status and safe headers; this is now stated in `docs/plugins.md`

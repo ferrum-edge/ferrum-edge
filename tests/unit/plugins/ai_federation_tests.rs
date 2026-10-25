@@ -10921,11 +10921,15 @@ async fn expire_route_total_deadline(ctx: &mut RequestContext) {
     );
 }
 
-/// PR6816-SOL-1: a route-rule total deadline that cuts a healthy provider's
-/// stream is logged as `read_write_timeout` but is gateway policy, so it must
-/// release the claim neutrally instead of opening the provider circuit.
+/// PR6816-SOL-1 / MUSE-1 / MUSE-2: federation mirrors proxy core's route
+/// deadline settlement exactly. A body the route wrapper cut (total deadline or
+/// per-attempt budget: the transport's typed `route_policy_cut` flag) is
+/// neutral; before the response head, core's own charge decides — a deadline
+/// that expired while the provider held the attempt is charged
+/// (`read_write_timeout`), one that expired before any backend held it is
+/// recorded as the neutral `dispatch_policy_rejected`.
 #[tokio::test]
-async fn streaming_route_total_deadline_cut_is_circuit_neutral() {
+async fn streaming_route_deadline_settlement_mirrors_core() {
     let plugin = streaming_circuit_plugin(json!({}));
     let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
@@ -10933,12 +10937,12 @@ async fn streaming_route_total_deadline_cut_is_circuit_neutral() {
     let _ = plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
-    expire_route_total_deadline(&mut ctx).await;
     plugin
         .on_response_stream_terminated(
             &mut ctx,
             200,
-            &BodyOutcome::error(ErrorClass::ReadWriteTimeout, 64, false),
+            &BodyOutcome::error(ErrorClass::ReadWriteTimeout, 64, false)
+                .with_route_policy_cut(true),
         )
         .await;
     assert_eq!(
@@ -10951,14 +10955,38 @@ async fn streaming_route_total_deadline_cut_is_circuit_neutral() {
         "a route policy cut must not open a healthy provider's circuit"
     );
 
-    // The same expiry before the response head is neutral too.
+    // Pre-header, charged: core cancelled the attempt the provider held.
     let plugin = streaming_circuit_plugin(json!({}));
     let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
     expire_route_total_deadline(&mut ctx).await;
     record_backend_dispatch_outcome_for_test(&mut ctx, Some(ErrorClass::ReadWriteTimeout), true);
-    // Proxy core records the route-deadline phase when it authors the 504.
     mark_route_request_timeout_in_dispatch_for_test(&mut ctx);
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 504, &mut response_headers)
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("failed"),
+        "core charges a route expiry the provider held, so federation does too"
+    );
+    drop(ctx);
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(false)
+    );
+
+    // Pre-header, uncharged: no backend held the request.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    expire_route_total_deadline(&mut ctx).await;
+    record_backend_dispatch_outcome_for_test(
+        &mut ctx,
+        Some(ErrorClass::DispatchPolicyRejected),
+        false,
+    );
     let mut response_headers = HashMap::new();
     let _ = plugin
         .after_proxy(&mut ctx, 504, &mut response_headers)
@@ -11272,12 +11300,9 @@ async fn provider_fault_observed_before_the_route_deadline_still_counts() {
             .await;
         ctx.route_override_request_timeout_ms = Some(40);
         ctx.arm_route_request_deadline(false);
-        // The provider fault is observed while the route budget still runs...
+        // The provider fault is recorded without the route-cut flag while the
+        // route budget still runs...
         let outcome = BodyOutcome::error(class, 32, false);
-        assert!(
-            ctx.route_request_deadline_at()
-                .is_some_and(|deadline| outcome.observed_at < deadline)
-        );
         // ...and the deferred termination hook only runs after it elapsed.
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         plugin
@@ -11323,6 +11348,27 @@ async fn route_policy_cut_provenance_is_typed_and_class_specific() {
         test_helpers::circuit_is_closed_for_test(&plugin, 0),
         Some(true)
     );
+
+    // Without the flag nothing is inferred from clocks: neither a timeout nor
+    // a reset recorded after the deadline elapsed is taken as the route cut.
+    for class in [ErrorClass::ReadWriteTimeout, ErrorClass::ConnectionReset] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        expire_route_total_deadline(&mut ctx).await;
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::error(class, 32, false))
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("failed"),
+            "{class:?}"
+        );
+    }
 
     // A reset observed after the deadline is not the route wrapper's cut.
     let plugin = streaming_circuit_plugin(json!({}));
@@ -11565,5 +11611,44 @@ fn close_reopen_publication_race_keeps_the_labelled_gauge_open() {
         ),
         None,
         "dropping the circuit releases its gauge series"
+    );
+}
+
+/// PR6816-MUSE-3 (round 2): a provider whose `multimodal_mode` refuses the
+/// request's content parts draws no weighted first-attempt share.
+#[test]
+fn weighted_selection_gives_no_share_to_a_multimodal_reject_provider() {
+    let plugin = streaming_plugin_with(json!({
+        "providers": [
+            named_openai("rejects", json!({
+                "priority": 1,
+                "weight": 1000,
+                "multimodal_mode": "reject"
+            })),
+            named_openai("accepts", json!({"priority": 1, "weight": 1}))
+        ]
+    }));
+    let image_body = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+            ]
+        }]
+    });
+    for roll in [0, 1, 500, 999] {
+        assert_eq!(
+            test_helpers::buffered_weighted_order_for_test(&plugin, "gpt-4o", &image_body, roll),
+            ["accepts", "rejects"],
+            "roll {roll}"
+        );
+    }
+    // A text-only request keeps the configured shares.
+    let text_body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "Hi"}]});
+    assert_eq!(
+        test_helpers::buffered_weighted_order_for_test(&plugin, "gpt-4o", &text_body, 0),
+        ["rejects", "accepts"]
     );
 }

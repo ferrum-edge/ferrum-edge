@@ -2437,7 +2437,13 @@ fn provider_embeds_model_in_url(provider_type: ProviderType) -> bool {
 
 impl AiFederation {
     /// Find all providers matching a model name, in attempt order.
-    fn find_providers_for_model(&self, model: &str) -> Vec<&ResolvedProvider> {
+    /// `eligible` is the weighted-selection eligibility rule (see
+    /// [`Self::ordered_provider_indices`]); it never filters the list.
+    fn find_providers_for_model(
+        &self,
+        model: &str,
+        eligible: impl Fn(&ResolvedProvider) -> bool,
+    ) -> Vec<&ResolvedProvider> {
         if !self.weighted_selection {
             // The common unweighted case keeps its single allocation.
             return self
@@ -2446,7 +2452,7 @@ impl AiFederation {
                 .filter(|provider| provider_matches_model(provider, model))
                 .collect();
         }
-        self.ordered_provider_indices(model, |_| true)
+        self.ordered_provider_indices(model, eligible)
             .into_iter()
             .filter_map(|index| self.providers.get(index))
             .collect()
@@ -2462,9 +2468,10 @@ impl AiFederation {
     /// both select the same way.
     ///
     /// `eligible` excludes providers the calling path could not serve this
-    /// request with (the streaming claim passes its stream-eligibility rule),
-    /// so their share is renormalized among the providers that can serve it
-    /// instead of transferring wholesale to the next one in order.
+    /// request with (a `multimodal_mode` that refuses its content parts, and
+    /// on the streaming claim also its stream-eligibility rule), so their
+    /// share is renormalized among the providers that can serve it instead of
+    /// transferring wholesale to the next one in order.
     fn ordered_provider_indices(
         &self,
         model: &str,
@@ -6748,41 +6755,27 @@ enum StreamOutcome {
 /// body wrapper reports as a disconnect), an authorization-lifetime
 /// termination, and a route-rule total request deadline
 /// ([`body_outcome_is_route_policy_cut`]).
-fn body_outcome_is_provider_fault(
-    ctx: &RequestContext,
-    outcome: &crate::proxy::deferred_log::BodyOutcome,
-) -> bool {
+fn body_outcome_is_provider_fault(outcome: &crate::proxy::deferred_log::BodyOutcome) -> bool {
     !outcome.client_disconnected
         && outcome.authorization_termination.is_none()
         && crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(
             outcome.body_error_class,
         )
-        && !body_outcome_is_route_policy_cut(ctx, outcome)
+        && !body_outcome_is_route_policy_cut(outcome)
 }
 
-/// Whether the route rule's total request deadline, not the provider, ended
-/// this body.
+/// Whether the matched route rule's deadline, not the provider, ended this
+/// body.
 ///
-/// Decided from what the transport recorded AT THE TERMINAL, never from the
-/// clock when this deferred hook happens to run: a provider reset or read
-/// timeout observed before the deadline stays a provider fault even if the
-/// termination hook is scheduled after it. The typed `route_policy_cut` bit
-/// is authoritative where the transport carries it (H1/H2 body wrapper,
-/// native HTTP/3 relays). Otherwise the route cut is recognized by its own
-/// shape — a `read_write_timeout` OBSERVED at or after the armed total
-/// deadline, which is exactly when the route wrapper fires; a provider
-/// timeout coinciding with it is indistinguishable and is treated neutrally.
-/// The provider's own `read_timeout_seconds` / `connect_timeout_seconds` are
-/// backend budgets, not route deadlines, and still score as faults.
-fn body_outcome_is_route_policy_cut(
-    ctx: &RequestContext,
-    outcome: &crate::proxy::deferred_log::BodyOutcome,
-) -> bool {
+/// Consumes the exact fired flag proxy core settles the same cut with: the
+/// transport marks [`crate::proxy::deferred_log::BodyOutcome::route_policy_cut`]
+/// when the route wrapper (the earlier of the rule's total request deadline
+/// and the committed attempt's budget) cut the body, on the H1/H2 body
+/// wrapper, the native HTTP/3 relays, and the HTTP/3 cross-protocol bridge.
+/// Nothing is inferred from clocks: a provider fault the transport recorded
+/// without that flag is the provider's, however late this hook runs.
+fn body_outcome_is_route_policy_cut(outcome: &crate::proxy::deferred_log::BodyOutcome) -> bool {
     outcome.route_policy_cut
-        || (outcome.body_error_class == Some(crate::retry::ErrorClass::ReadWriteTimeout)
-            && ctx
-                .route_request_deadline_at()
-                .is_some_and(|deadline| outcome.observed_at >= deadline))
 }
 
 impl StreamOutcome {
@@ -7845,8 +7838,19 @@ impl AiFederation {
         // instances), so selection must yield indices rather than borrows.
         // Same predicate and same attempt order (priority, then the optional
         // weighted first choice) as [`AiFederation::find_providers_for_model`].
+        // `multimodal_mode` is a PROVIDER-boundary policy, not a
+        // client-representation rule, so the buffered path's gate has to be
+        // applied here too: without it a `stream: true` request carried the
+        // image and audio parts a `reject` provider refuses — and a
+        // `text_only_with_warning` provider promises to strip — straight to that
+        // provider (GHSA-h5r4-qw2q-f277). Analyzed once and reused for every
+        // candidate, including weighted-selection eligibility; the reduction
+        // itself belongs to the body transform, which owns the
+        // provider-visible bytes.
+        let multimodal_usage = analyze_multimodal_usage(openai_body);
         let matching_providers: Vec<usize> = self.ordered_provider_indices(model, |provider| {
             stream_target_for(provider, &Self::resolve_model(provider, model)).is_ok()
+                && validate_multimodal_policy(provider, openai_body, &multimodal_usage).is_ok()
         });
         if matching_providers.is_empty() {
             if self.fail_on_no_matching_provider {
@@ -7875,16 +7879,6 @@ impl AiFederation {
                 Some("invalid_request"),
             );
         }
-
-        // `multimodal_mode` is a PROVIDER-boundary policy, not a
-        // client-representation rule, so the buffered path's gate has to be
-        // applied here too: without it a `stream: true` request carried the
-        // image and audio parts a `reject` provider refuses — and a
-        // `text_only_with_warning` provider promises to strip — straight to that
-        // provider (GHSA-h5r4-qw2q-f277). Analyzed once and reused for every
-        // candidate; the reduction itself belongs to the body transform, which
-        // owns the provider-visible bytes.
-        let multimodal_usage = analyze_multimodal_usage(openai_body);
 
         // `max_concurrent_requests` is documented as the maximum number of
         // simultaneous federation provider chains, so a stream must hold a slot
@@ -8817,14 +8811,14 @@ impl Plugin for AiFederation {
         // metadata. Gateway-local refusals and client disconnects
         // (`client_side_no_backend_signal`) stay neutral.
         if let Some(class) = ctx.last_backend_dispatch_error_class() {
-            // A route-rule total deadline that expired before the response
-            // head is gateway policy, not provider evidence. Proxy core marks
-            // that expiry on the context with a typed phase when it authors
-            // the route `504`, so the decision never depends on when this
-            // hook runs.
-            if !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class))
-                && !ctx.route_request_timeout_recorded()
-            {
+            // Mirrors proxy core's own pre-header decision exactly. A route
+            // deadline that expired while the provider held the attempt is
+            // charged to the backend (`RouteDeadlineExpiry::charged_to_backend`)
+            // and recorded as `read_write_timeout`, so it scores here too; one
+            // that expired before any backend held the request is recorded as
+            // the health-neutral `dispatch_policy_rejected`, which
+            // `client_side_no_backend_signal` already leaves unscored.
+            if !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class)) {
                 self.stage_owned_stream(ctx, StreamOutcome::Failed);
             }
             // A gateway-local refusal (policy, connection limit, trust, buffer
@@ -8947,7 +8941,7 @@ impl Plugin for AiFederation {
         let Some(lifecycle) = self.owned_stream_lifecycle(ctx) else {
             return;
         };
-        if body_outcome_is_provider_fault(ctx, outcome) {
+        if body_outcome_is_provider_fault(outcome) {
             // The provider's body died on a transport fault (read timeout,
             // reset, protocol error) that the inspector never saw: its driver
             // exits on the error without calling `on_end`, so the truncation
@@ -9135,8 +9129,13 @@ impl Plugin for AiFederation {
             );
         }
 
-        // Find matching providers
-        let matching_providers = self.find_providers_for_model(&model);
+        // Find matching providers. The multimodal analysis is pure and reused
+        // below; a provider whose `multimodal_mode` refuses these content
+        // parts draws no weighted first-attempt share.
+        let multimodal_usage = analyze_multimodal_usage(&openai_body);
+        let matching_providers = self.find_providers_for_model(&model, |provider| {
+            validate_multimodal_policy(provider, &openai_body, &multimodal_usage).is_ok()
+        });
         if matching_providers.is_empty() {
             if self.fail_on_no_matching_provider {
                 debug!(
@@ -9230,7 +9229,6 @@ impl Plugin for AiFederation {
             }
         };
 
-        let multimodal_usage = analyze_multimodal_usage(&openai_body);
         let mut last_client_rejection: Option<String> = None;
         let mut last_failure_result: Option<PluginResult> = None;
         let mut attempted_provider = false;
@@ -10028,11 +10026,41 @@ pub mod test_helpers {
         (drawn.get(), names)
     }
 
+    /// Buffered-path attempt order for `body` with the weighted first choice
+    /// decided by `roll`: a provider whose `multimodal_mode` refuses the
+    /// body's content parts gets no share.
+    pub fn buffered_weighted_order_for_test(
+        plugin: &AiFederation,
+        model: &str,
+        body: &Value,
+        roll: u64,
+    ) -> Vec<String> {
+        let usage = analyze_multimodal_usage(body);
+        let mut order: Vec<usize> = plugin
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider_matches_model(provider, model))
+            .map(|(index, _)| index)
+            .collect();
+        apply_weighted_first_choice(
+            &plugin.providers,
+            &mut order,
+            |provider| validate_multimodal_policy(provider, body, &usage).is_ok(),
+            || roll,
+        );
+        order
+            .into_iter()
+            .filter_map(|index| plugin.providers.get(index))
+            .map(|provider| provider.name.clone())
+            .collect()
+    }
+
     /// Provider names matching `model` in the order the dispatch paths use
     /// (system RNG for a weighted group).
     pub fn provider_attempt_order_for_test(plugin: &AiFederation, model: &str) -> Vec<String> {
         plugin
-            .find_providers_for_model(model)
+            .find_providers_for_model(model, |_| true)
             .into_iter()
             .map(|provider| provider.name.clone())
             .collect()
