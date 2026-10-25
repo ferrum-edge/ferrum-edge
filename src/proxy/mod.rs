@@ -37042,6 +37042,20 @@ async fn handle_proxy_request_inner(
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
+    } else if ctx.route_override_path.is_some() {
+        // A path-only route rewrite (`mesh_route_dispatch` without a header
+        // change) can select a different gRPC method or operation than the one
+        // the pre-`before_proxy` vote saw. A per-method body policy that voted
+        // "not mine" for the client path must be asked again, or the rewritten
+        // request would stream past it.
+        final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress_before_dispatch,
+        )
     } else {
         (
             initial_requires_request_body_buffering,
@@ -37345,6 +37359,48 @@ async fn handle_proxy_request_inner(
         }
         ctx.bind_authorized_backend_path(backend_path);
     }
+
+    // A per-method gRPC body policy (`body_validator` method entries) selects on
+    // the BACKEND-effective method, which exists only now: listen-path
+    // stripping plus a proxy/target base path can replace the service segment
+    // the earlier votes saw. Native gRPC consumes these requirements only after
+    // this point, so re-ask them against the bound path before choosing between
+    // the streaming fast path and the collect-and-validate path.
+    let (
+        requires_request_body_buffering,
+        final_body_before_backend_dispatch,
+        needs_final_request_body_context,
+    ) = if backend_path_is_policy_bound && is_grpc_request {
+        match owned_proxy_headers.as_mut() {
+            Some(transformed_headers) => {
+                std::mem::swap(&mut ctx.headers, transformed_headers);
+                let requirements = final_request_body_requirements(
+                    &plugins,
+                    &ctx,
+                    request_may_need_buffering,
+                    has_terminal_body_dispatch,
+                    has_contextual_final_body_hook,
+                    has_finalized_request_egress_before_dispatch,
+                );
+                std::mem::swap(&mut ctx.headers, transformed_headers);
+                requirements
+            }
+            None => final_request_body_requirements(
+                &plugins,
+                &ctx,
+                request_may_need_buffering,
+                has_terminal_body_dispatch,
+                has_contextual_final_body_hook,
+                has_finalized_request_egress_before_dispatch,
+            ),
+        }
+    } else {
+        (
+            requires_request_body_buffering,
+            final_body_before_backend_dispatch,
+            needs_final_request_body_context,
+        )
+    };
 
     if has_deferred_routing_header_hooks {
         // These hooks moved later for authorization ordering, but their

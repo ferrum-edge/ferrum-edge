@@ -220,6 +220,40 @@ pub mod _test_support {
         crate::plugins::body_validator::inherited_grpc_max_decompressed_size_bytes(raw)
     }
 
+    /// `body_validator`'s request-side gRPC protobuf validation of `body` for
+    /// `grpc_path`, in the framing `content_type` names (native gRPC or
+    /// gRPC-Web binary/text), with the aggregate decode budget bound to an
+    /// ISOLATED semaphore so a test can observe admission, refusal, and
+    /// release deterministically. Answers `"pass"`, `"invalid"`,
+    /// `"capacity"`, or `"unconfigured"` (no descriptor for the method, or not
+    /// a gRPC media type).
+    pub fn body_validator_protobuf_request_outcome_in_budget_for_test(
+        plugin: &crate::plugins::body_validator::BodyValidator,
+        probe: &ResponseBufferBudgetProbe,
+        grpc_path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> &'static str {
+        plugin.protobuf_request_outcome_in(grpc_path, content_type, body, probe.0.handle())
+    }
+
+    /// Record the genuine origin/backend HTTP status exactly as
+    /// `run_after_proxy_hooks` does before any response hook runs.
+    pub fn record_origin_http_response_status_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: u16,
+    ) {
+        ctx.record_origin_http_response_status(status);
+    }
+
+    /// How many `body_validator` instances recorded an early `before_proxy`
+    /// pass on this request (the typed digest the final hook compares against
+    /// to skip re-validating byte-identical bytes).
+    pub fn body_validator_early_pass_count_for_test(ctx: &crate::plugins::RequestContext) -> usize {
+        ctx.plugin_state()
+            .map_or(0, |state| state.body_validator_early_request_digests.len())
+    }
+
     /// The plugin material registry as `(plugin, field path, class)`, where
     /// class is `tls`, `gateway_only` or `open_map`.
     pub fn scoped_plugin_registry_for_test() -> Vec<(&'static str, &'static str, &'static str)> {
