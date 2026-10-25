@@ -596,8 +596,8 @@ impl Waf {
     /// Admission, size limits, and the scan budget remain owned by the caller.
     ///
     /// `grpc` is the message split of a framed gRPC / gRPC-Web body: the
-    /// whole-body text rules then read each message payload rather than a
-    /// stream interleaved with 5-byte frame headers, and the JSON-path pass
+    /// whole-body text rules then read each message payload as well as the
+    /// complete wire body, and the JSON-path pass
     /// reads each complete message as its own document (see
     /// [`Self::scan_json_path_body`]). Messages the caller already refused or
     /// recorded as uninspectable (compressed, over the count cap, after a
@@ -622,10 +622,9 @@ impl Waf {
             || self.specials.overlong_utf8.is_some();
         let json_paths_active =
             direction == BodyDirection::Request && !self.compiled.body_json_paths.is_empty();
-        // The whole body's wide-charset readings, decoded once: the JSON-path
-        // pass always reads them, and the text pass reads them unless it
-        // reads the messages of a framed body instead.
-        let body_views = if json_paths_active || (text_views_active && grpc.is_none()) {
+        // The whole body's wide-charset readings, decoded once and shared by
+        // the JSON-path pass and the whole-body text pass.
+        let body_views = if json_paths_active || text_views_active {
             normalize::decode_wide_charset_body_views(body, content_type)
         } else {
             normalize::WideCharsetViews::empty()
@@ -648,21 +647,19 @@ impl Waf {
         if !text_views_active {
             return outcome;
         }
-        match grpc {
-            Some(messages) => {
-                for payload in messages.payloads() {
-                    let views =
-                        normalize::decode_wide_charset_body_views(payload.bytes, content_type);
-                    self.scan_body_text_rules(
-                        &mut outcome,
-                        subject,
-                        payload.bytes,
-                        &views,
-                        direction,
-                    );
-                }
+        // The complete wire body is always scanned: the framing and the media
+        // type are client-controlled and say nothing about the backend, so a
+        // backend that ignores the envelopes consumes these raw bytes, and a
+        // token may straddle a frame header. A framed body's message payloads
+        // are scanned IN ADDITION, as the RPC backend reads them (a signature
+        // split by a frame header is whole there). Each pass is bounded by the
+        // retained body, so the text work at most doubles.
+        self.scan_body_text_rules(&mut outcome, subject, body, &body_views, direction);
+        if let Some(messages) = grpc {
+            for payload in messages.payloads() {
+                let views = normalize::decode_wide_charset_body_views(payload.bytes, content_type);
+                self.scan_body_text_rules(&mut outcome, subject, payload.bytes, &views, direction);
             }
-            None => self.scan_body_text_rules(&mut outcome, subject, body, &body_views, direction),
         }
         outcome
     }

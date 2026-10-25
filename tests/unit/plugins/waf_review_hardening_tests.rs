@@ -162,6 +162,44 @@ async fn grpc_json_messages_reach_json_path_rules() {
 }
 
 #[tokio::test]
+async fn the_raw_wire_body_of_a_framed_stream_is_still_scanned() {
+    // `nee` ends message 1 and `dle` opens message 2, so on the wire the token
+    // straddles message 2's 5-byte frame header. No payload contains it; only
+    // the raw body does, and a backend that ignores the framing reads that.
+    let plugin = waf(json!({
+        "mode": "enforce",
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "RAW-STRADDLE",
+            "name": "token across a frame header",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "regex",
+            "pattern": "nee.{5}dle",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let mut body = grpc_frame(0, b"xnee");
+    body.extend(grpc_frame(0, b"dle"));
+
+    let (result, request) = final_request_body(
+        &plugin,
+        "POST",
+        &[("content-type", "application/grpc+json")],
+        &body,
+    )
+    .await;
+
+    assert!(
+        is_reject(&result),
+        "the raw wire view must still be scanned"
+    );
+    assert_eq!(meta(&request, "waf.rule_hits"), Some("RAW-STRADDLE"));
+}
+
+#[tokio::test]
 async fn every_grpc_message_of_a_stream_is_inspected() {
     let plugin = waf(json_path_bio_rule()).unwrap();
     let mut body = grpc_frame(0, br#"{"user":{"bio":"first"}}"#);

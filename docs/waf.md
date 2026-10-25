@@ -1075,8 +1075,10 @@ body the WAF scans (the `+json` codecs by default, every gRPC type with
 `inspect_binary_body`) is split into its length-prefixed messages — a gRPC-Web
 text body is base64-decoded first — and the body rules run over each message
 payload: `body_json_path` rules parse each `+json` message as its own JSON
-document, and text, Luhn, and CIDR rules read each payload rather than a
-stream interleaved with 5-byte frame headers. The same applies to response
+document, and text, Luhn, and CIDR rules and the encoding specials read each
+payload **in addition to** the complete wire body (the framing and media type
+are client-controlled, so a backend that ignores them reads the raw bytes, and
+a token may straddle a frame header there). The same applies to response
 bodies. The wire bytes are never rewritten. At most 1024 non-empty messages
 are inspected per body. The WAF does not decode `grpc-encoding`, so a
 **compressed message** (frame flag 1), or a body with more messages than the

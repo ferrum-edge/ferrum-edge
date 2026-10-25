@@ -376,7 +376,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinary `application/grpc+json` call, and a `grpc-encoding`-compressed
   message reached the backend as octets no rule could read. Bodies are now
   split into their length-prefixed messages (gRPC-Web text is base64-decoded
-  first) and every rule runs per message, in both directions; the wire bytes
+  first) and every rule runs per message, in both directions, while the text
+  rules also keep scanning the complete wire body; the wire bytes
   are unchanged. A framing defect never reverts to a whole-document scan: the
   complete messages before it are scanned and the defect is refused under an
   enforcing body policy (`grpc_malformed_framing`). A compressed message, or more than 1024 messages, is refused
