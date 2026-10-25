@@ -448,7 +448,7 @@ fn entry_retained_bytes(
 
 /// Subtract from a byte counter without wrapping below zero.
 fn saturating_fetch_sub(counter: &AtomicUsize, amount: usize) {
-    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
         Some(value.saturating_sub(amount))
     });
 }
