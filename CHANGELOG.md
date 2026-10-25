@@ -180,6 +180,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Content-Encoding` is now undone through the strict, budget-charged decoder
   (request-decode / retained-response budgets) with a `503` capacity terminal,
   instead of a private uncharged decode.
+- **`workload_metrics` (mesh telemetry) review hardening.**
+  - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
+    request/response size, gRPC message families) gain Istio's
+    `grpc_response_status` label: the finalized gRPC status `0`–`16`
+    (out-of-range, malformed, or missing statuses as UNKNOWN `2`), empty for
+    non-gRPC requests, and never on TCP families. It is also a tag-override
+    name. Failing RPCs behind HTTP 200 no longer merge into the success series.
+  - A `response_code` tag override whose value is a status's canonical
+    decimal spelling (`set` to `"200"`, `string(response.code)`) now shares
+    that status's series instead of exposing a duplicate series with the same
+    labels.
+  - B3 propagation: with a Zipkin provider, and whenever the backend request
+    still carries B3, the active span is injected as `x-b3-*` (and `b3` when
+    the request used the single-header form) beside W3C; stale incoming B3 is
+    replaced.
+  - New `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` counts
+    spans an exporter refused at enqueue (`queue_full`, `byte_budget`,
+    `process_ceiling`, `shutting_down`, `unavailable`) or discarded at
+    delivery (`export_failed`).
+  - HBONE baggage attribution reads the same input as `mesh_authz` (wire
+    field-lines plus the folded map); a `baggage` header added by a request
+    transform after authorization is no longer honored.
+  - Mesh injection mirrors enabled proxy-/proxy-group-scoped `mesh_authz`
+    baggage gates into the auto-injected instance's conjunction (over 16
+    distinct gates locks baggage instead of failing construction).
+  - `custom_env_tags`, `custom_header_tags`, and `safe_tag_sources` reject a
+    `PAT` segment (`GITHUB_PAT`, `x-pat`) and a terminal `AUTH` segment
+    (`BASIC_AUTH`, `x-basic-auth`).
+  - No span is built when export is inactive, and the disabled-metrics marker
+    and tag-override plans are no longer re-copied on every stamp.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
@@ -401,6 +431,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. EastWestGateway keeps the unscoped fail-closed fallback.
 
 ### Security
+
+- **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
+  client credentials off tool-selected upstreams** (issue #6819). New
+  `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
+  `policy.default_prompt_action` / `policy.default_resource_action`, both
+  falling back to `policy.default_action` (default `deny`), apply to the list
+  methods and to `prompts/get` / `resources/read` (refused with JSON-RPC
+  `-32001`); set the family defaults to `allow` to keep the previous open
+  behavior. A read is refused when ANY binding of its upstream URI (an exact
+  resource or a matching template) is denied, unless the requested public URI
+  has its own entry; configured denies are decided from configuration, so they
+  hold even when a server's resource or template list has never succeeded. Aggregate-routed calls no longer carry the client's
+  `Authorization`, `Proxy-Authorization`, `Cookie`, route credential headers,
+  or any query string to the tool-selected upstream: the gateway commits an
+  empty backend query and re-asserts the header boundary over the final
+  backend headers, unless the new per-server
+  `servers.*.forward_client_credentials: true` opts in. An aggregate `DELETE`
+  without a session header now answers HTTP 400 (JSON-RPC `-32600`) instead
+  of `200`. See `docs/upgrade_guide.md`.
+- **`mcp_gateway` production-launch hardening** (issue #6819). A discovered
+  tool `inputSchema` now passes the same bounded depth / node / local-`$ref`
+  walk audit as `outputSchema` — which now also descends into schema-valued
+  `dependencies`, `additionalItems`, and `$recursiveRef` — before `jsonschema`
+  compiles it on the request worker (whether or not
+  `validation.validate_tool_arguments` is on), so a hostile upstream's long
+  flat reference chain can no longer exhaust the worker stack; only that tool
+  is omitted. A second aggregate instance on a disjoint endpoint no longer
+  consumes or clears another instance's trusted public→upstream tool rewrite.
+  A `discovery.on_schema_change: hide_until_configured` quarantine is now an
+  instance-wide gate keyed by server and public tool name, enforced live on
+  `tools/list`, `tools/call`, and final admission in every session (including
+  already-cached and last-good catalogs); only a configuration change clears
+  it, and only published (non-colliding) tools occupy its bounded table.
+- **`mcp_gateway` upstream authentication** (issue #6819). New per-server
+  `servers.*.headers` (at most 32; a value may be a whole
+  `${FERRUM_PLUGIN_SECRET_<NAME>}` reference) are sent on every
+  gateway-originated request — `initialize`, `notifications/initialized`,
+  every `*/list` page, session `DELETE` — and installed on routed calls to
+  that server, replacing any client copy, including over the final backend
+  headers. Names join the credential-header registry; gateway-owned,
+  hop-by-hop, forwarding, `x-consumer-*`, and session header names are
+  refused.
+- **`mcp_gateway` session lifecycle** (issue #6819). An enabled aggregate
+  instance now runs a background reaper (every half
+  `sessions.session_ttl_seconds`, 1–60 s) that reclaims expired sessions at
+  rest; their upstream `DELETE`s run on a separate bounded worker (8 in
+  flight, 10 s each, best-effort queue), so a slow upstream never delays the
+  next sweep. An upstream session minted by `initialize` is owned by that call
+  until it is committed: if the downstream session was removed meanwhile, or
+  `notifications/initialized` fails, or the request is cancelled, the gateway
+  deletes it instead of orphaning it. Both
+  per-server catalog and resource-template discovery fan out concurrently (up
+  to 8 servers at a time).
 
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
