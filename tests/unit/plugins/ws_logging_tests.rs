@@ -552,7 +552,7 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
                     "frames_client_to_backend": "upstream_frames",
                     "direction": "disconnect_direction",
                     "io_side": "failure_side",
-                    "connection_id": "session_id",
+                    "connection_id": "stream_ordinal",
                     "handshake_status_code": "upgrade_status"
                 },
                 "omit": ["frames_backend_to_client", "proxy_name"],
@@ -605,7 +605,7 @@ async fn test_ws_logging_custom_schema_applies_to_ws_disconnect() {
     assert!(entry.get("proxy_name").is_none());
     assert!(entry.get("metadata").is_none());
     // Session join key and handshake fields are schema-addressable natives.
-    assert_eq!(entry["session_id"], 77);
+    assert_eq!(entry["stream_ordinal"], 77);
     assert_eq!(entry["upgrade_status"], 101);
     assert_eq!(entry["http_method"], "GET");
     assert_eq!(entry["request_path"], "/");
