@@ -21663,11 +21663,11 @@ components:
             WebSocket URL (ws:// or wss://) to send transaction logs to. Must
             include a hostname, an explicit port (if any) of 1-65535, and no
             URL user information or fragment. A query parameter whose decoded
-            name marks a credential is refused at runtime: exactly `auth`,
-            `jwt`, `pass`, `pwd`, `sid`, `sig`, or `signature`; any name
+            name marks a credential is refused at runtime: exactly `jwt`,
+            `pass`, `pwd`, `sid`, `sig`, or `signature`; any name
             ending in `key`; or any name containing `access_key`,
             `accesskey`, `api-key`, `api_key`, `apikey`, `assertion`,
-            `authorization`, `bearer`, `cookie`, `credential`, `passphrase`,
+            `auth` (so also `authorization`, `x-auth`), `bearer`, `cookie`, `credential`, `passphrase`,
             `passwd`, `password`, `secret`, `session`, or `token`
             (case-insensitive; a name still percent-encoded after one decode
             is refused too). The screen is a name heuristic; send collector

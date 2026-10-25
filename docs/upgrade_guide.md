@@ -31,10 +31,10 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 ### `ws_logging`: collector credentials move to `custom_headers`; disconnect records gain fields (#6852)
 
 `ws_logging` now refuses an `endpoint_url` whose query carries a
-credential-shaped parameter name (exact `auth`, `jwt`, `pass`, `pwd`, `sid`,
+credential-shaped parameter name (exact `jwt`, `pass`, `pwd`, `sid`,
 `sig`, `signature`; any name ending in `key`; or any name containing `token`,
 `secret`, `password`, `passwd`, `passphrase`, `api_key` / `apikey` /
-`api-key`, `access_key` / `accesskey`, `assertion`, `authorization`, `bearer`,
+`api-key`, `access_key` / `accesskey`, `assertion`, `auth` (so also `authorization`, `x-auth`), `bearer`,
 `cookie`, `credential`, or `session`), a name that is still percent-encoded
 after one decode, an explicit port `0`, or a fragment. Such a config fails
 validation (Admin API `400`, file-mode/`validate` failure; `KeepLastKnownGood`

@@ -10,10 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **BREAKING — `ws_logging` refuses credential-shaped `endpoint_url` query
   parameters; collector credentials move to `custom_headers`** (issue #6852).
-  A query parameter whose decoded name is `auth`, `jwt`, `pass`, `pwd`,
+  A query parameter whose decoded name is `jwt`, `pass`, `pwd`,
   `sid`, `sig`, or `signature`, ends in `key`, or contains `token`,
   `secret`, `password`, `passwd`, `passphrase`, `api_key` / `apikey` /
-  `api-key`, `access_key` / `accesskey`, `assertion`, `authorization`,
+  `api-key`, `access_key` / `accesskey`, `assertion`, `auth` (so also `authorization`, `x-auth`),
   `bearer`, `cookie`, `credential`, or `session`, is refused at config load,
   as is a name still percent-encoded after one decode, an explicit port `0`,
   and a fragment. The new `custom_headers` object adds headers to the
@@ -44,8 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `invalidate` is unchanged). The WebSocket codec keeps an output buffer the
   size of the largest frame a connection sent, after the batch's byte leases
   are released; a kept connection now charges twice that frame against the
-  process retained-byte ceiling until it closes, and a send above 1 MiB (or
-  a charge the ceiling refuses) closes the connection instead.
+  process retained-byte ceiling until it closes. A send above 1 MiB, a charge
+  the ceiling refuses, or one that would leave less headroom than a full
+  batch of record admissions closes the connection instead, and an idle kept
+  connection closes at the next flush tick after any ceiling refusal, so the
+  retained buffer cannot starve later records.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

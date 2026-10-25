@@ -2725,19 +2725,56 @@ async fn ws_logging_header_secret_resolves_on_the_serving_node_not_at_admission(
     drop(env);
 }
 
-/// A kept connection charges its codec output buffer against the process
-/// retained-byte ceiling after the batch's own leases are released.
+fn leaked_ceiling(
+    max_bytes: usize,
+) -> &'static ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling {
+    Box::leak(Box::new(
+        ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling::new(max_bytes),
+    ))
+}
+
+fn ws_logging_with_ceiling(
+    config: serde_json::Value,
+    ceiling: &'static ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling,
+) -> WsLogging {
+    ferrum_edge::_test_support::ws_logging_with_ceiling_for_test(&config, default_client(), ceiling)
+        .expect("build plugin")
+}
+
+/// Wait until `ceiling.used()` equals `expected`, returning the last value.
+async fn wait_for_ceiling_used(
+    ceiling: &'static ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling,
+    expected: usize,
+) -> usize {
+    let start = tokio::time::Instant::now();
+    loop {
+        let used = ceiling.used();
+        if used == expected || start.elapsed() > Duration::from_secs(5) {
+            return used;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A disconnect record whose serialized JSON is roughly `bytes` long.
+fn disconnect_of_about(bytes: usize) -> WsDisconnectContext {
+    let mut ctx = test_ws_disconnect_context();
+    ctx.proxy_name = Some("p".repeat(bytes));
+    ctx
+}
+
+/// A kept connection charges its codec output buffer against the ceiling
+/// once the batch's own leases are released, exactly and only while it lives.
 #[tokio::test]
 async fn ws_logging_kept_connection_charges_codec_output_capacity() {
-    use ferrum_edge::plugins::utils::byte_budget::process_retained_bytes;
     use ferrum_edge::plugins::ws_logging::{WS_MAX_PERSISTENT_FRAME_BYTES, codec_output_charge};
 
+    let ceiling = leaked_ceiling(64 * 1024 * 1024);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let (server, mut batches) = spawn_counting_collector(listener, false);
-
-    let plugin = WsLogging::new(
-        &json!({
+    let plugin = ws_logging_with_ceiling(
+        json!({
             "endpoint_url": format!("ws://{addr}/logs"),
             "batch_size": 1,
             "flush_interval_ms": 600000,
@@ -2748,35 +2785,167 @@ async fn ws_logging_kept_connection_charges_codec_output_capacity() {
             "max_entry_bytes": 1048576,
             "buffer_max_bytes": 16777216
         }),
-        default_client(),
-    )
-    .expect("build plugin");
+        ceiling,
+    );
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
     // ~400 KiB: below the persistent-frame ceiling, so the connection is kept.
-    let mut large = test_ws_disconnect_context();
-    large.proxy_name = Some("p".repeat(400 * 1024));
-    plugin.on_ws_disconnect(&large).await;
+    plugin
+        .on_ws_disconnect(&disconnect_of_about(400 * 1024))
+        .await;
     let (first_connection, first_len) = next_batch(&mut batches, "large kept batch").await;
     assert_eq!(first_connection, 1);
     assert!(first_len < WS_MAX_PERSISTENT_FRAME_BYTES);
+    let expected = codec_output_charge(first_len);
+    assert_eq!(
+        wait_for_ceiling_used(ceiling, expected).await,
+        expected,
+        "once the batch leases drop, only the kept connection's codec charge remains"
+    );
 
-    // The single worker builds the next batch only after the first send
-    // returned, so once this arrives the first batch's leases are gone and
-    // only the connection's codec charge still covers that frame.
+    // A smaller later frame neither grows nor shrinks the charge.
     plugin.on_ws_disconnect(&test_ws_disconnect_context()).await;
     let (second_connection, _) = next_batch(&mut batches, "small batch").await;
     assert_eq!(second_connection, 1, "the connection must be kept");
-    let retained = process_retained_bytes();
-    assert!(
-        retained >= codec_output_charge(first_len),
-        "codec output capacity of the kept connection is uncharged: {retained} < {}",
-        codec_output_charge(first_len)
+    assert_eq!(wait_for_ceiling_used(ceiling, expected).await, expected);
+
+    // Dropping the sink closes the connection and releases the charge.
+    drop(plugin);
+    assert_eq!(wait_for_ceiling_used(ceiling, 0).await, 0);
+    server.abort();
+}
+
+/// PR6852-SOL-5: a kept connection must never hold so much of the ceiling
+/// that the sink's own next records cannot be admitted. With a 1 MiB ceiling
+/// and eight ~58 KiB records (all admissible: seven exact leases plus one
+/// provisional reservation fit), keeping the ~480 KiB frame's codec charge
+/// would leave less than one provisional admission; the connection must close
+/// instead, and later records must still be admitted and delivered.
+#[tokio::test]
+async fn ws_logging_codec_charge_never_starves_later_admissions() {
+    let ceiling = leaked_ceiling(1_048_576);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let (server, mut batches) = spawn_counting_collector(listener, false);
+    let plugin = ws_logging_with_ceiling(
+        json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            "batch_size": 8,
+            "flush_interval_ms": 600000,
+            "max_retries": 1,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 64
+        }),
+        ceiling,
     );
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let large = disconnect_of_about(58 * 1024);
+    for _ in 0..8 {
+        plugin.on_ws_disconnect(&large).await;
+    }
+    let (first_connection, first_len) = next_batch(&mut batches, "near-ceiling batch").await;
+    assert_eq!(first_connection, 1);
+    assert!(
+        first_len > 400 * 1024,
+        "fixture batch too small: {first_len}"
+    );
+    assert_eq!(
+        wait_for_ceiling_used(ceiling, 0).await,
+        0,
+        "a connection whose charge would starve admission must release it"
+    );
+
+    // Small records are admitted and delivered without any external
+    // disconnect.
+    let small = test_ws_disconnect_context();
+    for _ in 0..8 {
+        plugin.on_ws_disconnect(&small).await;
+    }
+    let (second_connection, _) = next_batch(&mut batches, "post-pressure batch").await;
+    assert_eq!(second_connection, 2);
 
     drop(plugin);
     server.abort();
+}
+
+/// PR6852-SOL-5 (several sinks): an idle kept connection gives its codec
+/// charge back at the next flush tick after any refusal on the shared ceiling,
+/// so idle connections cannot jointly starve admission.
+#[tokio::test]
+async fn ws_logging_idle_connection_releases_codec_charge_under_ceiling_pressure() {
+    use ferrum_edge::plugins::ws_logging::codec_output_charge;
+
+    let ceiling = leaked_ceiling(64 * 1024 * 1024);
+    let config = |addr: std::net::SocketAddr| {
+        json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 1,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16,
+            "max_entry_bytes": 1048576,
+            "buffer_max_bytes": 16777216
+        })
+    };
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.expect("bind a");
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.expect("bind b");
+    let addr_a = listener_a.local_addr().expect("addr a");
+    let addr_b = listener_b.local_addr().expect("addr b");
+    let (server_a, mut batches_a) = spawn_counting_collector(listener_a, false);
+    let (server_b, mut batches_b) = spawn_counting_collector(listener_b, false);
+    let plugin_a = ws_logging_with_ceiling(config(addr_a), ceiling);
+    let plugin_b = ws_logging_with_ceiling(config(addr_b), ceiling);
+    for plugin in [&plugin_a, &plugin_b] {
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+    }
+
+    plugin_a
+        .on_ws_disconnect(&disconnect_of_about(300 * 1024))
+        .await;
+    plugin_b
+        .on_ws_disconnect(&disconnect_of_about(300 * 1024))
+        .await;
+    let (_, len_a) = next_batch(&mut batches_a, "sink a batch").await;
+    let (_, len_b) = next_batch(&mut batches_b, "sink b batch").await;
+    let both = codec_output_charge(len_a) + codec_output_charge(len_b);
+    assert_eq!(
+        wait_for_ceiling_used(ceiling, both).await,
+        both,
+        "both idle connections are kept and charged"
+    );
+
+    // Any refusal on the shared ceiling (here a reservation larger than the
+    // whole ceiling) is pressure: both idle connections must close and give
+    // their charges back within a flush tick or two.
+    assert!(ceiling.try_acquire(usize::MAX).is_none());
+    assert_eq!(
+        wait_for_ceiling_used(ceiling, 0).await,
+        0,
+        "idle kept connections must release their codec charge under pressure"
+    );
+
+    // Both sinks still deliver afterwards, on fresh connections.
+    plugin_a
+        .on_ws_disconnect(&test_ws_disconnect_context())
+        .await;
+    plugin_b
+        .on_ws_disconnect(&test_ws_disconnect_context())
+        .await;
+    let (connection_a, _) = next_batch(&mut batches_a, "sink a after pressure").await;
+    let (connection_b, _) = next_batch(&mut batches_b, "sink b after pressure").await;
+    assert_eq!((connection_a, connection_b), (2, 2));
+
+    drop(plugin_a);
+    drop(plugin_b);
+    server_a.abort();
+    server_b.abort();
 }
 
 #[test]

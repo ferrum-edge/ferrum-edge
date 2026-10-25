@@ -48,7 +48,7 @@ use tracing::warn;
 use url::{Host, Url};
 
 use super::utils::byte_budget::{
-    GrowableProcessReservation, ProcessByteReservation, process_ceiling,
+    GrowableProcessReservation, ProcessByteReservation, RetainedByteCeiling, process_ceiling,
 };
 use super::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
@@ -168,8 +168,7 @@ const WS_RESERVED_HANDSHAKE_HEADERS: &[&str] = &[
 
 /// Exact (lowercased, decoded) `endpoint_url` query parameter names refused
 /// because they carry a reusable credential.
-const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] =
-    &["auth", "jwt", "pass", "pwd", "sid", "sig", "signature"];
+const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] = &["jwt", "pass", "pwd", "sid", "sig", "signature"];
 
 /// Substrings that mark a credential-bearing `endpoint_url` query parameter
 /// name (`access_token`, `x-api-key`, `client_secret`, `sessionid`, ...).
@@ -182,7 +181,7 @@ const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
     "api_key",
     "apikey",
     "assertion",
-    "authorization",
+    "auth",
     "bearer",
     "cookie",
     "credential",
@@ -436,6 +435,13 @@ struct WsConfig {
     reconnect_delay: Duration,
     connect_timeout: Duration,
     write_timeout: Duration,
+    /// Retained-byte ceiling for record leases and the connection codec charge.
+    ceiling: &'static RetainedByteCeiling,
+    /// Ceiling headroom a kept connection must leave after its codec charge:
+    /// one full batch of provisional record admissions
+    /// (`batch_size * 2 * (max_entry_bytes + 1)`), so retaining the codec
+    /// buffer can never starve this sink's own next batch.
+    admission_reserve_bytes: usize,
 }
 
 struct WsByteLease {
@@ -491,14 +497,23 @@ struct WsByteBudget {
     used_bytes: Arc<AtomicUsize>,
     max_bytes: usize,
     dropped_count: AtomicU64,
+    /// Retained-byte ceiling shared across sinks: the process ceiling in
+    /// production, a test-owned one under test.
+    ceiling: &'static RetainedByteCeiling,
 }
 
 impl WsByteBudget {
+    #[cfg(test)]
     fn new(max_bytes: usize) -> Self {
+        Self::with_ceiling(max_bytes, process_ceiling())
+    }
+
+    fn with_ceiling(max_bytes: usize, ceiling: &'static RetainedByteCeiling) -> Self {
         Self {
             used_bytes: Arc::new(AtomicUsize::new(0)),
             max_bytes,
             dropped_count: AtomicU64::new(0),
+            ceiling,
         }
     }
 
@@ -512,12 +527,12 @@ impl WsByteBudget {
             return Some(Arc::new(WsByteLease {
                 used_bytes: Arc::clone(&self.used_bytes),
                 bytes: AtomicUsize::new(0),
-                process: ProcessByteReservation::try_acquire(0)?,
+                process: self.ceiling.try_acquire(0)?,
             }));
         }
         // Process ceiling first: a failed aggregate reservation must never
         // leave per-instance bytes held.
-        let Some(process) = ProcessByteReservation::try_acquire(bytes) else {
+        let Some(process) = self.ceiling.try_acquire(bytes) else {
             self.record_drop(
                 SinkLossReason::ByteBudget,
                 "process-wide retained-byte ceiling exhausted",
@@ -621,6 +636,18 @@ pub struct WsLogging {
 
 impl WsLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_ceiling(config, http_client, process_ceiling())
+    }
+
+    /// Construct an instance whose record admission and connection codec
+    /// charges reserve against `ceiling`. External tests reach this through
+    /// `_test_support` with their own leaked ceiling, so assertions stay exact
+    /// while other tests in the binary use the process-global counter.
+    pub(crate) fn new_with_ceiling(
+        config: &Value,
+        http_client: PluginHttpClient,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> Result<Self, String> {
         let Some(config_obj) = config.as_object() else {
             return Err("ws_logging: config must be a JSON object".to_string());
         };
@@ -844,6 +871,9 @@ impl WsLogging {
             reconnect_delay: Duration::from_millis(reconnect_delay_ms),
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             write_timeout: Duration::from_millis(write_timeout_ms),
+            ceiling,
+            admission_reserve_bytes: retained_charge_for_serialized_len(max_entry_bytes)
+                .saturating_mul(batch_size),
         };
 
         Ok(Self {
@@ -855,7 +885,7 @@ impl WsLogging {
             commit_tx: OnceLock::new(),
             start_lock: Mutex::new(()),
             schema,
-            byte_budget: Arc::new(WsByteBudget::new(buffer_max_bytes)),
+            byte_budget: Arc::new(WsByteBudget::with_ceiling(buffer_max_bytes, ceiling)),
             max_entry_bytes,
             endpoint_hostname: Some(endpoint_hostname),
         })
@@ -1565,6 +1595,11 @@ async fn flush_loop(
 
     // Lazily connect — the first flush attempt will establish the connection.
     let mut ws_conn: Option<WsConnection> = None;
+    // Ceiling refusals seen so far. Any new refusal (from this or any other
+    // sink sharing the ceiling) means retained bytes are short, so an idle
+    // kept connection gives its codec charge back at the next tick instead of
+    // holding it until the collector disconnects.
+    let mut observed_ceiling_rejections = cfg.ceiling.rejections();
 
     loop {
         tokio::select! {
@@ -1607,6 +1642,13 @@ async fn flush_loop(
                     ws_conn = send_batch(&cfg, batch, ws_conn).await;
                     decrement_outstanding(&outstanding_count, batch_len);
                 }
+                let rejections = cfg.ceiling.rejections();
+                if rejections != observed_ceiling_rejections {
+                    observed_ceiling_rejections = rejections;
+                    if let Some(conn) = ws_conn.take_if(|conn| conn.codec_charge.held() > 0) {
+                        retire_connection(&cfg, conn).await;
+                    }
+                }
             }
 
             _ = wait_drain_done(&ws_conn) => {
@@ -1619,6 +1661,17 @@ async fn flush_loop(
             }
         }
     }
+}
+
+/// Bytes still available under `ceiling`.
+fn ceiling_headroom(ceiling: &RetainedByteCeiling) -> usize {
+    ceiling.max().saturating_sub(ceiling.used())
+}
+
+/// Close an idle kept connection gracefully (bounded by `write_timeout`),
+/// releasing its codec buffer and the charge that covers it.
+async fn retire_connection(cfg: &WsConfig, mut conn: WsConnection) {
+    let _ = tokio::time::timeout(cfg.write_timeout, conn.sink.close()).await;
 }
 
 fn decrement_outstanding(outstanding_count: &AtomicUsize, count: usize) {
@@ -1768,16 +1821,19 @@ async fn send_batch(
                     // The batch's byte leases end with `payload`; from here
                     // only the codec's output buffer still holds this frame's
                     // worth of capacity. Keep the connection only when that
-                    // capacity is charged against the process ceiling;
-                    // otherwise (frame above the persistent ceiling, or the
-                    // ceiling refuses the growth) close it, which frees the
-                    // buffer, and the next batch reconnects.
+                    // capacity is charged against the ceiling AND the ceiling
+                    // still has room for a full batch of record admissions;
+                    // otherwise (frame above the persistent ceiling, growth
+                    // refused, or too little headroom left) close it, which
+                    // frees the buffer and its charge, and the next batch
+                    // reconnects.
                     let sent_len = payload.json.len();
                     drop(payload);
                     let retained = codec_output_charge(sent_len);
                     let charged = ws.codec_charge.held();
                     let keep = sent_len <= WS_MAX_PERSISTENT_FRAME_BYTES
-                        && (retained <= charged || ws.codec_charge.try_grow(retained - charged));
+                        && (retained <= charged || ws.codec_charge.try_grow(retained - charged))
+                        && ceiling_headroom(cfg.ceiling) >= cfg.admission_reserve_bytes;
                     if !keep {
                         let _ = tokio::time::timeout(cfg.write_timeout, ws.sink.close()).await;
                         return None;
@@ -2055,7 +2111,7 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
                 sink,
                 drain: drain.abort_handle(),
                 drain_done: done_rx,
-                codec_charge: GrowableProcessReservation::new(process_ceiling()),
+                codec_charge: GrowableProcessReservation::new(cfg.ceiling),
             })
         }
         // No back-off here: the caller (`send_batch`) owns the retry ladder and
