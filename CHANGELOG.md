@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`openapi_validator` validates declared request parameters.** Generated
+  operations now carry the document's path / query / header / cookie
+  parameters (Path Item entries overridden by operation entries; Swagger 2.0
+  `collectionFormat` `csv` / `multi` mapped to `explode`), compiled at
+  construction and validated in `before_proxy` before any request transformer:
+  missing required parameters, repeated scalars, unconvertible values, and
+  schema failures are `400` (`Request parameter validation failed`) with
+  value-free diagnostics, and query / cookie scans are bounded at 1024 pairs.
+  The supported subset is each location's default serialization (`simple` /
+  `form`) over scalar, array, and object-of-scalar schemas; other styles are
+  rejected at construction, and the importer omits an unsupported optional
+  parameter but refuses the import for an unsupported required one.
+- **`openapi_validator` asserts JSON Schema `format` under every draft**,
+  including Draft 2020-12 / OpenAPI 3.1 imports, where `uuid`, `date-time`,
+  `email`, and the rest were previously annotations. Previously passing 3.1
+  traffic with malformed formatted strings is now rejected; `log_only` is the
+  migration path.
+- **`openapi_validator` admission is stricter.** Explicitly empty
+  `request_content_types` / `response_content_types` (which meant "everything")
+  are rejected, as are two operations with the same method and `path_regex`;
+  every config load (file mode included) rejects a `global` or `proxy_group`
+  instance; overlapping same-method templates are ordered by literal segments
+  left to right instead of by `operation_label` length.
+- **`openapi_validator` admits declared event streams.** A `text/event-stream`
+  response that the status-selected response object declares (the importer now
+  keeps a schemaless declaration) is released unvalidated with
+  `skip_reason = event_stream_declared` instead of being refused; undeclared
+  event streams still fail closed.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +167,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`openapi_validator` closes three body-conversion differentials.** A
+  multipart Encoding Object `contentType` is now enforced on serialized
+  (`explode: false`) collections and serialized objects, not only on scalar
+  parts; a directly converted XML array (root array or nested array) enforces
+  its item `xml.name` / `xml.namespace`; and XML string values are validated
+  untrimmed (only numeric / boolean conversion ignores surrounding XML
+  whitespace), so `<role> user </role>` no longer passes `enum: [user]`.
+  `Content-Encoding` is now undone through the strict, budget-charged decoder
+  (request-decode / retained-response budgets) with a `503` capacity terminal,
+  instead of a private uncharged decode.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

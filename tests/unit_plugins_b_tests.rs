@@ -51,6 +51,7 @@ mod unit {
         mod oidc_refresh_flight_tests;
         mod oidc_relying_party_tests;
         mod opa_tests;
+        mod openapi_validator_review_tests;
         mod openapi_validator_tests;
         mod otel_tracing_attempt_spans_tests;
         mod otel_tracing_tests;

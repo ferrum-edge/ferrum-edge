@@ -3743,9 +3743,11 @@ pub(crate) struct PluginRequestState {
     /// `ai_semantic_cache_embeddings`.
     pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
-    /// final body hooks. Kept out of public metadata so per-instance state does
-    /// not leak into transaction logs.
-    pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// final body hooks, as the `(method bucket, entry)` index into the owning
+    /// instance's immutable operation table, so later predicates index the
+    /// pinned operation instead of re-matching. Kept out of public metadata so
+    /// per-instance state does not leak into transaction logs.
+    pub(crate) openapi_validator_matches: HashMap<usize, (usize, usize)>,
     /// OpenAPI validator instances whose CLIENT-contract decision has already
     /// been made on the original client representation in
     /// `validate_client_request_body_contract`.

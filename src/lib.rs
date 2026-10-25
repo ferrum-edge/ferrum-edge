@@ -16041,6 +16041,25 @@ pub mod _test_support {
         }
     }
 
+    /// Undo a body's `Content-Encoding` exactly as `openapi_validator` does
+    /// before schema validation, charged against an ISOLATED budget.
+    ///
+    /// `Err(None)` is the decode-capacity refusal (the plugin's `503` capacity
+    /// terminal); `Err(Some(detail))` is the fixed violation detail.
+    pub fn openapi_validator_decode_body_in(
+        probe: &ResponseBufferBudgetProbe,
+        content_encoding: Option<&str>,
+        body: &[u8],
+        max_body_bytes: usize,
+    ) -> Result<Vec<u8>, Option<String>> {
+        crate::plugins::openapi_validator::decode_body_for_test(
+            content_encoding,
+            body,
+            max_body_bytes,
+            probe.0.handle(),
+        )
+    }
+
     /// The exact backend-request header filter the H3 cross-protocol bridge
     /// applies to both its plain and gRPC builders (issue #5110).
     pub fn cross_protocol_backend_header_is_stripped_for_test(name: &str) -> bool {

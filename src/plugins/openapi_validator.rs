@@ -37,12 +37,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
+use crate::proxy::response_buffer_budget::{
+    BudgetRef, REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_STATUS,
+    RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+};
 use crate::util::json_dup_keys::{self, JsonScanMemo};
 use crate::util::media_type::is_concrete_http_media_type;
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::charged_decode::{ChargedDecodeError, decode_charged_content_coding_chain};
 use super::utils::auth_flow::constant_time_eq;
-use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
+use super::utils::content_encoding::{DecodeLimits, parse_content_codings};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -97,6 +102,8 @@ const XML_COMMENT_IN_VALUE_DETAIL: &str =
 const XML_PI_IN_VALUE_DETAIL: &str =
     "XML processing instruction cannot be represented by the schema";
 const XML_DEPTH_DETAIL: &str = "XML document nesting exceeds the supported depth";
+const XML_ARRAY_ITEM_NAME_DETAIL: &str =
+    "XML array contains an element that does not match the modeled item name or namespace";
 /// XML document bounds, split across three layers because no single one is
 /// sufficient:
 ///
@@ -171,7 +178,31 @@ const OPERATION_KEYS: &[&str] = &[
     "request_required",
     "request_body",
     "responses",
+    "parameters",
 ];
+/// Closed key set of one `operations[].parameters[]` descriptor.
+const PARAMETER_KEYS: &[&str] = &["name", "in", "required", "schema", "style", "explode"];
+/// Admission bound on declared parameters per operation.
+const MAX_OPERATION_PARAMETERS: usize = 128;
+/// Admission bound on a declared parameter name.
+const MAX_PARAMETER_NAME_BYTES: usize = 256;
+/// Request-time bound on query pairs / cookie pairs scanned, and on the items
+/// of one delimited parameter value. Exceeding it fails closed.
+const MAX_PARAMETER_PAIRS: usize = 1024;
+/// Problem title for parameter violations (body violations keep theirs).
+const PARAMETER_VIOLATION_TITLE: &str = "Request parameter validation failed";
+/// Fixed-cardinality parameter diagnostics. Parameter NAMES in the other
+/// parameter diagnostics are operator-declared; no parameter VALUE is ever
+/// interpolated.
+const PATH_PARAMETERS_UNLOCATED_DETAIL: &str =
+    "Path parameters could not be located in the request path";
+const QUERY_PAIR_LIMIT_DETAIL: &str =
+    "Request query string exceeds the parameter validation pair limit";
+const COOKIE_PAIR_LIMIT_DETAIL: &str =
+    "Request Cookie header exceeds the parameter validation pair limit";
+const PARAMETER_ITEM_LIMIT_DETAIL: &str = "parameter value exceeds the item limit";
+const PARAMETER_REPEATED_DETAIL: &str = "must occur exactly once for its declared serialization";
+const PARAMETER_OBJECT_MEMBER_DETAIL: &str = "exploded object members must be name=value pairs";
 const BYPASS_KEYS: &[&str] = &["paths", "methods", "consumers", "header_present"];
 /// Minimum byte length of a `bypass.header_present` secret value.
 const MIN_BYPASS_HEADER_SECRET_BYTES: usize = 16;
@@ -282,9 +313,86 @@ impl RequestContractPhase {
 struct OperationEntry {
     operation_label: String,
     literal_segments: u16,
+    /// Per path segment: `true` for a literal segment, `false` for a whole
+    /// `{template}` segment. Compared left to right to order same-method
+    /// templates that tie on `literal_segments`, independently of labels.
+    literal_segment_flags: Vec<bool>,
     request_validators: AHashMap<String, MediaValidator>,
     request_required: bool,
     response_validators: ResponseValidators,
+    /// Declared path / query / header / cookie parameters, compiled at
+    /// construction and validated in `before_proxy`.
+    parameters: Vec<ParameterValidator>,
+    /// Capture regex derived from `path_template`; group `i + 1` captures the
+    /// `i`-th `{name}` expression. Present only when the operation declares at
+    /// least one path parameter.
+    path_parameter_regex: Option<Regex>,
+    has_query_parameters: bool,
+    has_cookie_parameters: bool,
+}
+
+/// Where an OpenAPI parameter is carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ParameterLocation {
+    Path,
+    Query,
+    Header,
+    Cookie,
+}
+
+impl ParameterLocation {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "path" => Some(Self::Path),
+            "query" => Some(Self::Query),
+            "header" => Some(Self::Header),
+            "cookie" => Some(Self::Cookie),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Query => "query",
+            Self::Header => "header",
+            Self::Cookie => "cookie",
+        }
+    }
+
+    /// `form` (query / cookie) vs `simple` (path / header) serialization.
+    fn uses_form_style(self) -> bool {
+        matches!(self, Self::Query | Self::Cookie)
+    }
+
+    /// The only `style` this validator deserializes for the location: the
+    /// OpenAPI default.
+    fn supported_style(self) -> &'static str {
+        if self.uses_form_style() {
+            "form"
+        } else {
+            "simple"
+        }
+    }
+}
+
+/// One compiled OpenAPI Parameter Object.
+struct ParameterValidator {
+    /// Declared name, used verbatim for path / query / cookie matching and in
+    /// diagnostics (operator-declared, never payload-derived).
+    name: String,
+    /// Lookup key: the ASCII-lowercased name for headers, `name` otherwise.
+    lookup_name: String,
+    location: ParameterLocation,
+    required: bool,
+    explode: bool,
+    /// Capture-group index into `OperationEntry::path_parameter_regex`
+    /// (zero-based; group `index + 1`). Path parameters only.
+    path_capture: Option<usize>,
+    schema: Arc<Value>,
+    conversion: ConversionPlan,
+    validator: jsonschema::Validator,
+    safe_names: SafeFieldNames,
 }
 
 struct OperationBucket {
@@ -532,7 +640,13 @@ struct ParsedOperation {
     entry: OperationEntry,
 }
 
+/// A resolved operation together with its stable position in this
+/// instance's immutable operation table, so a request can pin the match once
+/// and later predicates index it directly instead of re-running the
+/// method-bucket scan and `RegexSet` match.
+#[derive(Clone, Copy)]
 struct OperationMatch<'a> {
+    index: (usize, usize),
     entry: &'a OperationEntry,
 }
 
@@ -584,18 +698,7 @@ impl ResponseValidators {
     /// `default`. A miss on media type inside the selected object never falls
     /// through to a less specific response object.
     fn select(&self, status: u16, content_type: Option<&str>) -> ResponseSelection<'_> {
-        let selected = self
-            .exact
-            .get(&status)
-            .or_else(|| {
-                self.ranges
-                    .iter()
-                    .filter(|range| (range.start..=range.end).contains(&status))
-                    .min_by_key(|range| range.end.saturating_sub(range.start))
-                    .map(|range| &range.validators)
-            })
-            .or(self.default.as_ref());
-        let Some(validators) = selected else {
+        let Some(validators) = self.select_object(status) else {
             return ResponseSelection::NoResponseObject;
         };
         if validators.is_empty() {
@@ -605,6 +708,31 @@ impl ResponseValidators {
             Some(validator) => ResponseSelection::Media(validator),
             None => ResponseSelection::MediaMismatch,
         }
+    }
+
+    /// The response object (media map) selected by status alone: exact, then
+    /// the narrowest declared range, then `default`.
+    fn select_object(&self, status: u16) -> Option<&AHashMap<String, MediaValidator>> {
+        self.exact
+            .get(&status)
+            .or_else(|| {
+                self.ranges
+                    .iter()
+                    .filter(|range| (range.start..=range.end).contains(&status))
+                    .min_by_key(|range| range.end.saturating_sub(range.start))
+                    .map(|range| &range.validators)
+            })
+            .or(self.default.as_ref())
+    }
+
+    /// Whether the response object selected for `status` itself declares a
+    /// `text/event-stream` representation.
+    fn declares_event_stream(&self, status: u16) -> bool {
+        self.select_object(status).is_some_and(|validators| {
+            validators
+                .keys()
+                .any(|media_type| is_text_event_stream_media_type(media_type))
+        })
     }
 }
 
@@ -618,7 +746,10 @@ pub struct OpenapiValidator {
     max_body_bytes: usize,
     request_content_types: Vec<String>,
     response_content_types: Vec<String>,
-    ops_by_method: AHashMap<String, OperationBucket>,
+    /// Method buckets in a fixed order. Immutable after construction, so a
+    /// `(bucket, entry)` index pinned on a request stays valid for this
+    /// instance's whole lifetime.
+    ops_by_method: Vec<(String, OperationBucket)>,
     has_any_request_schema: bool,
     /// At least one operation declares `request_required`. Presence enforcement
     /// is independent of any declared media type, so a document that declares a
@@ -709,23 +840,45 @@ impl OpenapiValidator {
         let mut has_any_request_schema = false;
         let mut has_any_required_request_body = false;
         let mut has_any_response_schema = false;
+        let mut has_any_parameters = false;
         for (index, operation) in operations.iter().enumerate() {
             let parsed = parse_operation(operation, index, schema_draft)?;
             has_any_request_schema |= parsed.entry.has_request_schema();
             has_any_required_request_body |= parsed.entry.request_required;
             has_any_response_schema |= parsed.entry.has_response_schema();
+            has_any_parameters |= !parsed.entry.parameters.is_empty();
             grouped_ops
                 .entry(parsed.method)
                 .or_default()
                 .push((parsed.path_regex, parsed.entry));
         }
-        let mut ops_by_method: AHashMap<String, OperationBucket> = AHashMap::new();
+        // Deterministic bucket order (the map above iterates arbitrarily).
+        let mut grouped_ops: Vec<(String, Vec<(String, OperationEntry)>)> =
+            grouped_ops.into_iter().collect();
+        grouped_ops.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut ops_by_method: Vec<(String, OperationBucket)> =
+            Vec::with_capacity(grouped_ops.len());
         for (method, mut entries) in grouped_ops {
+            // Two entries with the same method and the same anchored regex
+            // match exactly the same requests; only one could ever be
+            // selected, so the other's contract would be silently inert.
+            let mut seen_patterns = HashSet::with_capacity(entries.len());
+            for (pattern, _) in &entries {
+                if !seen_patterns.insert(pattern.as_str()) {
+                    return Err(format!(
+                        "openapi_validator: `operations` declares more than one {method} operation with the same path_regex; merge them into one operation"
+                    ));
+                }
+            }
+            // Specificity order, independent of `operation_label` (display
+            // metadata) and of document order: more literal segments first,
+            // then the template whose earliest differing segment is literal.
+            // `sort_by` is stable, so a remaining tie keeps document order.
             entries.sort_by(|(_, left), (_, right)| {
                 right
                     .literal_segments
                     .cmp(&left.literal_segments)
-                    .then_with(|| right.operation_label.len().cmp(&left.operation_label.len()))
+                    .then_with(|| right.literal_segment_flags.cmp(&left.literal_segment_flags))
             });
             let patterns = entries.iter().map(|(pattern, _)| pattern.as_str());
             let path_regexes = RegexSet::new(patterns).map_err(|_| {
@@ -734,17 +887,18 @@ impl OpenapiValidator {
                 )
             })?;
             let entries = entries.into_iter().map(|(_, entry)| entry).collect();
-            ops_by_method.insert(
+            ops_by_method.push((
                 method,
                 OperationBucket {
                     path_regexes,
                     entries,
                 },
-            );
+            ));
         }
         if !has_any_request_schema
             && !has_any_required_request_body
             && !has_any_response_schema
+            && !has_any_parameters
             && !fail_on_unknown_operation
         {
             return Err(
@@ -842,7 +996,7 @@ impl OpenapiValidator {
     pub(crate) fn schema_type_cache_stats_for_test(&self) -> (usize, usize) {
         let mut cached_nodes = 0usize;
         let mut fallback_computes = 0usize;
-        for bucket in self.ops_by_method.values() {
+        for (_, bucket) in &self.ops_by_method {
             for entry in &bucket.entries {
                 for media in entry.request_validators.values() {
                     cached_nodes =
@@ -897,49 +1051,59 @@ impl OpenapiValidator {
     }
 
     fn match_operation(&self, method: &str, path: &str) -> Option<OperationMatch<'_>> {
-        let (_, bucket) = self
+        let bucket_index = self
             .ops_by_method
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(method))?;
-        let index = bucket.path_regexes.matches(path).into_iter().next()?;
-        bucket
-            .entries
-            .get(index)
-            .map(|entry| OperationMatch { entry })
+            .position(|(key, _)| key.eq_ignore_ascii_case(method))?;
+        let entry_index = self
+            .ops_by_method
+            .get(bucket_index)?
+            .1
+            .path_regexes
+            .matches(path)
+            .into_iter()
+            .next()?;
+        self.operation_at((bucket_index, entry_index))
     }
 
-    fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<&'a OperationEntry> {
-        if let Some((method, path)) = ctx
+    fn operation_at(&self, index: (usize, usize)) -> Option<OperationMatch<'_>> {
+        let (bucket_index, entry_index) = index;
+        self.ops_by_method
+            .get(bucket_index)
+            .and_then(|(_, bucket)| bucket.entries.get(entry_index))
+            .map(|entry| OperationMatch { index, entry })
+    }
+
+    /// The operation this request is pinned to, or a fresh match.
+    ///
+    /// Once an operation has been marked for this instance, the pinned
+    /// `(bucket, entry)` index is read back directly: every later predicate
+    /// (buffering votes, release decisions, the response hooks) is O(1)
+    /// instead of re-running the method scan and the bucket's `RegexSet`.
+    fn operation_for_context<'a>(&'a self, ctx: &RequestContext) -> Option<OperationMatch<'a>> {
+        if let Some(index) = ctx
             .plugin_state()
             .and_then(|state| state.openapi_validator_matches.get(&self.instance_id))
         {
-            return self
-                .match_operation(method, path)
-                .map(|matched| matched.entry);
+            return self.operation_at(*index);
         }
         self.match_operation(&ctx.method, &ctx.path)
-            .map(|matched| matched.entry)
     }
 
     fn mark_operation(&self, ctx: &mut RequestContext, operation: OperationMatch<'_>) {
-        self.mark_operation_entry(ctx, operation.entry);
-    }
-
-    fn mark_operation_entry(&self, ctx: &mut RequestContext, operation: &OperationEntry) {
         self.mark_mode(ctx);
         if !ctx.plugin_state().is_some_and(|state| {
             state
                 .openapi_validator_matches
                 .contains_key(&self.instance_id)
         }) {
-            let matched = (ctx.method.clone(), ctx.path.clone());
             ctx.plugin_state_mut()
                 .openapi_validator_matches
-                .insert(self.instance_id, matched);
+                .insert(self.instance_id, operation.index);
         }
         ctx.metadata.insert(
             "openapi_validator.matched_operation".to_string(),
-            operation.operation_label.clone(),
+            operation.entry.operation_label.clone(),
         );
     }
 
@@ -1189,7 +1353,7 @@ impl OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self.operation_for_context(ctx) else {
+        let Some(matched) = self.operation_for_context(ctx) else {
             if phase == RequestContractPhase::Client {
                 // Unknown-operation admission belongs to `before_proxy`, which
                 // runs immediately after this phase. Deciding it here as well
@@ -1209,11 +1373,12 @@ impl OpenapiValidator {
         // has taken no request-contract decision and must remain eligible for
         // the backend-final fallback if a later before_proxy rewrite selects
         // one of its request-contract operations.
+        let operation = matched.entry;
         if !Self::operation_has_request_contract(operation) {
             return PluginResult::Continue;
         }
         self.mark_decided(ctx, phase);
-        self.mark_operation_entry(ctx, operation);
+        self.mark_operation(ctx, matched);
         ctx.metadata
             .insert(CONTRACT_PHASE_KEY.to_string(), phase.as_str().to_string());
         if body.is_empty() {
@@ -1266,12 +1431,52 @@ impl OpenapiValidator {
         );
         match result {
             Ok(()) => PluginResult::Continue,
-            Err(error) => self.handle_violation(
+            Err(MediaFailure::Violation(error)) => self.handle_violation(
                 ctx,
                 ValidationSide::Request,
                 Some(&operation.operation_label),
                 error,
             ),
+            Err(MediaFailure::Capacity) => {
+                self.decode_capacity_refusal(ctx, ValidationSide::Request)
+            }
+        }
+    }
+
+    /// The aggregate decode budget could not admit a body's decode working set.
+    ///
+    /// The representation is not at fault and no contract was evaluated, so
+    /// this is the gateway-local capacity terminal (`503` with the shared fixed
+    /// body and typed provenance) rather than a schema violation. `log_only`
+    /// records the condition and continues, as it does for every decision.
+    fn decode_capacity_refusal(
+        &self,
+        ctx: &mut RequestContext,
+        side: ValidationSide,
+    ) -> PluginResult {
+        self.mark_mode(ctx);
+        let (error_key, status_code, body) = match side {
+            ValidationSide::Request => (
+                "openapi_validator.request_error",
+                REQUEST_DECODE_OVERLOAD_STATUS,
+                REQUEST_DECODE_OVERLOAD_BODY,
+            ),
+            ValidationSide::Response => (
+                "openapi_validator.response_error",
+                RESPONSE_BUFFER_OVERLOAD_STATUS,
+                RESPONSE_BUFFER_OVERLOAD_BODY,
+            ),
+        };
+        ctx.metadata
+            .insert(error_key.to_string(), DECODE_CAPACITY_DETAIL.to_string());
+        if self.mode != EnforcementMode::Block {
+            return PluginResult::Continue;
+        }
+        ctx.mark_gateway_capacity_response_selected();
+        PluginResult::Reject {
+            status_code,
+            body: body.to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         }
     }
 }
@@ -1329,6 +1534,28 @@ impl Plugin for OpenapiValidator {
         match self.match_operation(&ctx.method, &ctx.path) {
             Some(operation) => {
                 self.mark_operation(ctx, operation);
+                if self.validate_request && !operation.entry.parameters.is_empty() {
+                    // Parameters are part of the CLIENT request contract. They
+                    // are read from the canonical policy path, the client's raw
+                    // query string, and this phase's header map, before any
+                    // request transformer (priority 3000+) can rewrite them.
+                    let result = validate_request_parameters(
+                        operation.entry,
+                        &ctx.path,
+                        ctx.raw_query_string(),
+                        headers,
+                    );
+                    if let Err(detail) = result {
+                        return self.handle_violation_with_status(
+                            ctx,
+                            ValidationSide::Request,
+                            Some(&operation.entry.operation_label),
+                            detail,
+                            None,
+                            Some(PARAMETER_VIOLATION_TITLE),
+                        );
+                    }
+                }
                 PluginResult::Continue
             }
             None if self.fail_on_unknown_operation => {
@@ -1379,7 +1606,7 @@ impl Plugin for OpenapiValidator {
             return false;
         }
         self.operation_for_context(ctx)
-            .is_some_and(Self::operation_has_request_contract)
+            .is_some_and(|matched| Self::operation_has_request_contract(matched.entry))
     }
 
     async fn validate_client_request_body_contract(
@@ -1424,8 +1651,8 @@ impl Plugin for OpenapiValidator {
         self.requires_response_body_buffering()
             && !request_method_omits_response_body(&ctx.method)
             && self.bypass_reason(ctx).is_none()
-            && self.operation_for_context(ctx).is_some_and(|operation| {
-                operation.has_response_schema() || self.fail_on_missing_response_schema
+            && self.operation_for_context(ctx).is_some_and(|matched| {
+                matched.entry.has_response_schema() || self.fail_on_missing_response_schema
             })
     }
 
@@ -1485,9 +1712,26 @@ impl Plugin for OpenapiValidator {
             && !synthetic_response_omits_body(&ctx.method, response_status)
             && original_response_is_event_stream(ctx, response_headers)
         {
-            let operation_label = self
-                .operation_for_context(ctx)
-                .map(|operation| operation.operation_label.as_str());
+            let operation = self.operation_for_context(ctx).map(|matched| matched.entry);
+            // The imported document itself declares an event stream for the
+            // status-selected response object: the operator's contract admits
+            // an unbounded stream here, so it is released unvalidated (with a
+            // recorded skip reason) instead of being refused as uninspectable.
+            // An event stream the selected response object does NOT declare
+            // still fails closed below. Request-side validation is unaffected.
+            if operation.is_some_and(|operation| {
+                operation
+                    .response_validators
+                    .declares_event_stream(response_status)
+            }) {
+                self.mark_mode(ctx);
+                ctx.metadata.insert(
+                    SKIP_REASON_KEY.to_string(),
+                    "event_stream_declared".to_string(),
+                );
+                return PluginResult::Continue;
+            }
+            let operation_label = operation.map(|operation| operation.operation_label.as_str());
             return self.handle_violation(
                 ctx,
                 ValidationSide::Response,
@@ -1512,14 +1756,15 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, reason);
             return PluginResult::Continue;
         }
-        let Some(operation) = self.operation_for_context(ctx) else {
+        let Some(matched) = self.operation_for_context(ctx) else {
             if self.fail_on_unknown_operation {
                 return self.handle_unknown_operation_violation(ctx, ValidationSide::Response);
             }
             self.mark_skip(ctx, "no_match");
             return PluginResult::Continue;
         };
-        self.mark_operation_entry(ctx, operation);
+        let operation = matched.entry;
+        self.mark_operation(ctx, matched);
         // Explicit body-absence semantics. RFC 9110 forbids a body for these,
         // so no representation is expected and none of the strict paths below
         // apply. Every other status reaches media selection even with an empty
@@ -1602,12 +1847,15 @@ impl Plugin for OpenapiValidator {
         );
         match result {
             Ok(()) => PluginResult::Continue,
-            Err(error) => self.handle_violation(
+            Err(MediaFailure::Violation(error)) => self.handle_violation(
                 ctx,
                 ValidationSide::Response,
                 Some(&operation.operation_label),
                 error,
             ),
+            Err(MediaFailure::Capacity) => {
+                self.decode_capacity_refusal(ctx, ValidationSide::Response)
+            }
         }
     }
 }
@@ -1677,6 +1925,18 @@ fn parse_operation(
     }
     let response_validators =
         parse_response_validators(object.get("responses"), index, schema_draft)?;
+    let (parameters, path_parameter_regex) = parse_parameters(
+        object.get("parameters"),
+        index,
+        &path_template,
+        schema_draft,
+    )?;
+    let has_query_parameters = parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Query);
+    let has_cookie_parameters = parameters
+        .iter()
+        .any(|parameter| parameter.location == ParameterLocation::Cookie);
 
     Ok(ParsedOperation {
         method,
@@ -1684,11 +1944,524 @@ fn parse_operation(
         entry: OperationEntry {
             operation_label,
             literal_segments: literal_segment_count(&path_template),
+            literal_segment_flags: literal_segment_flags(&path_template),
             request_validators,
             request_required,
             response_validators,
+            parameters,
+            path_parameter_regex,
+            has_query_parameters,
+            has_cookie_parameters,
         },
     })
+}
+
+/// Whether `openapi_validator` can deserialize a parameter declared with this
+/// location, `style`, `explode`, and schema shape.
+///
+/// Shared with the API spec importer so the generated operation table and the
+/// constructor can never disagree about what is enforceable. The supported
+/// subset is each location's OpenAPI default serialization — `simple` for path
+/// and header parameters, `form` for query and cookie parameters — over
+/// scalar, array-of-scalar, and object-of-scalar schemas. A `form` +
+/// `explode: true` object is refused: its members are spread across unrelated
+/// query keys that cannot be attributed to it unambiguously.
+pub(crate) fn parameter_serialization_support(
+    location: &str,
+    style: Option<&str>,
+    explode: Option<bool>,
+    schema: &Value,
+) -> Result<(), String> {
+    let Some(location) = ParameterLocation::parse(location) else {
+        return Err("`in` must be one of path, query, header, or cookie".to_string());
+    };
+    let supported = location.supported_style();
+    if let Some(style) = style
+        && style != supported
+    {
+        return Err(format!(
+            "style {style:?} is not supported for {} parameters (supported: {supported})",
+            location.as_str()
+        ));
+    }
+    let explode = explode.unwrap_or(location.uses_form_style());
+    let types = collect_schema_types(schema);
+    if types.contains(ScalarType::Array) {
+        let item_types = collect_schema_types(&build_array_item_schema_for_conversion(schema));
+        if item_types.contains(ScalarType::Array) || item_types.contains(ScalarType::Object) {
+            return Err(format!(
+                "array {} parameters whose items are arrays or objects are not supported",
+                location.as_str()
+            ));
+        }
+    } else if types.contains(ScalarType::Object) && location.uses_form_style() && explode {
+        return Err(format!(
+            "object {} parameters with style form and explode=true are not supported; declare explode: false",
+            location.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// Compile `operations[].parameters` and, when a path parameter is declared,
+/// the capture regex that locates path parameter values.
+fn parse_parameters(
+    value: Option<&Value>,
+    operation_index: usize,
+    path_template: &str,
+    schema_draft: SchemaDraft,
+) -> Result<(Vec<ParameterValidator>, Option<Regex>), String> {
+    let Some(value) = value else {
+        return Ok((Vec::new(), None));
+    };
+    let base = format!("config.operations[{operation_index}].parameters");
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("{ERROR_PREFIX}`{base}` must be an array"))?;
+    if entries.len() > MAX_OPERATION_PARAMETERS {
+        return Err(format!(
+            "{ERROR_PREFIX}`{base}` must not exceed {MAX_OPERATION_PARAMETERS} entries"
+        ));
+    }
+    let declares_path_parameter = entries
+        .iter()
+        .any(|entry| entry.get("in").and_then(Value::as_str) == Some("path"));
+    let template = if declares_path_parameter {
+        Some(path_template_capture(path_template).map_err(|error| {
+            format!("{ERROR_PREFIX}`config.operations[{operation_index}].path_template` {error}")
+        })?)
+    } else {
+        None
+    };
+    let mut seen = HashSet::with_capacity(entries.len());
+    let mut parameters = Vec::with_capacity(entries.len());
+    for (parameter_index, entry) in entries.iter().enumerate() {
+        let path = format!("{base}[{parameter_index}]");
+        let object = entry
+            .as_object()
+            .ok_or_else(|| format!("{ERROR_PREFIX}`{path}` must be an object"))?;
+        reject_unknown_keys(
+            object,
+            &path,
+            PARAMETER_KEYS,
+            &format!("{ERROR_PREFIX}`{path}`: "),
+        )?;
+        let name = match object.get("name") {
+            Some(Value::String(name)) if !name.is_empty() => name.as_str(),
+            _ => {
+                return Err(format!(
+                    "{ERROR_PREFIX}`{path}.name` must be a nonempty string"
+                ));
+            }
+        };
+        if name.len() > MAX_PARAMETER_NAME_BYTES || name.chars().any(char::is_control) {
+            return Err(format!(
+                "{ERROR_PREFIX}`{path}.name` must be at most {MAX_PARAMETER_NAME_BYTES} bytes without control characters"
+            ));
+        }
+        let location_raw = match object.get("in") {
+            Some(Value::String(raw)) => raw.as_str(),
+            _ => return Err(format!("{ERROR_PREFIX}`{path}.in` must be a string")),
+        };
+        let location = ParameterLocation::parse(location_raw).ok_or_else(|| {
+            format!("{ERROR_PREFIX}`{path}.in` must be one of path, query, header, or cookie")
+        })?;
+        let required = match object.get("required") {
+            None => location == ParameterLocation::Path,
+            Some(Value::Bool(required)) => *required,
+            Some(_) => {
+                return Err(format!("{ERROR_PREFIX}`{path}.required` must be a boolean"));
+            }
+        };
+        if location == ParameterLocation::Path && !required {
+            return Err(format!(
+                "{ERROR_PREFIX}`{path}.required` must be true for a path parameter"
+            ));
+        }
+        let style = match object.get("style") {
+            None => None,
+            Some(Value::String(style)) => Some(style.as_str()),
+            Some(_) => return Err(format!("{ERROR_PREFIX}`{path}.style` must be a string")),
+        };
+        let explode = match object.get("explode") {
+            None => None,
+            Some(Value::Bool(explode)) => Some(*explode),
+            Some(_) => {
+                return Err(format!("{ERROR_PREFIX}`{path}.explode` must be a boolean"));
+            }
+        };
+        let schema_value = object
+            .get("schema")
+            .filter(|schema| schema.is_object() || schema.is_boolean())
+            .ok_or_else(|| {
+                format!(
+                    "{ERROR_PREFIX}`{path}.schema` is required and must be a JSON Schema object or boolean"
+                )
+            })?;
+        parameter_serialization_support(location_raw, style, explode, schema_value)
+            .map_err(|error| format!("{ERROR_PREFIX}`{path}`: {error}"))?;
+        let lookup_name = if location == ParameterLocation::Header {
+            let lowered = name.to_ascii_lowercase();
+            if http::header::HeaderName::from_bytes(lowered.as_bytes()).is_err() {
+                return Err(format!(
+                    "{ERROR_PREFIX}`{path}.name` must be a valid HTTP header name"
+                ));
+            }
+            if matches!(
+                lowered.as_str(),
+                "accept" | "content-type" | "authorization"
+            ) {
+                return Err(format!(
+                    "{ERROR_PREFIX}`{path}.name`: OpenAPI ignores header parameters named Accept, Content-Type, or Authorization; remove the descriptor"
+                ));
+            }
+            lowered
+        } else {
+            name.to_string()
+        };
+        if !seen.insert((location, lookup_name.clone())) {
+            return Err(format!(
+                "{ERROR_PREFIX}`{base}` declares {} parameter {name:?} more than once",
+                location.as_str()
+            ));
+        }
+        let path_capture = match (&template, location) {
+            (Some((_, names)), ParameterLocation::Path) => Some(
+                names
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .ok_or_else(|| {
+                        format!(
+                            "{ERROR_PREFIX}`{path}`: path parameter {name:?} has no matching {{name}} expression in path_template"
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
+        let validator = compile_schema(schema_value, schema_draft)
+            .map_err(|error| format!("{ERROR_PREFIX}`{path}.schema` is invalid: {error}"))?;
+        let schema = Arc::new(schema_value.clone());
+        let conversion = ConversionPlan::compile(schema.as_ref(), schema_draft)
+            .map_err(|error| format!("{ERROR_PREFIX}`{path}.schema` is invalid: {error}"))?;
+        parameters.push(ParameterValidator {
+            name: name.to_string(),
+            lookup_name,
+            location,
+            required,
+            explode: explode.unwrap_or(location.uses_form_style()),
+            path_capture,
+            schema,
+            conversion,
+            validator,
+            safe_names: SafeFieldNames::from_schema(schema_value),
+        });
+    }
+    Ok((parameters, template.map(|(regex, _)| regex)))
+}
+
+/// Build an anchored capture regex from an OpenAPI path template: literal text
+/// is escaped and each `{name}` expression captures one `[^/]+` run, so group
+/// `i + 1` is the value of the `i`-th expression. Returns the expression names
+/// in template order.
+fn path_template_capture(path_template: &str) -> Result<(Regex, Vec<String>), String> {
+    let mut pattern = String::from("^");
+    let mut names: Vec<String> = Vec::new();
+    let mut literal = String::new();
+    let mut chars = path_template.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                pattern.push_str(&regex::escape(&literal));
+                literal.clear();
+                let mut name = String::new();
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                    if inner == '{' || inner == '/' {
+                        break;
+                    }
+                    name.push(inner);
+                }
+                if !closed || name.is_empty() {
+                    return Err("contains a malformed {name} expression".to_string());
+                }
+                if names.contains(&name) {
+                    return Err("repeats a {name} expression".to_string());
+                }
+                names.push(name);
+                pattern.push_str("([^/]+)");
+            }
+            '}' => return Err("contains an unbalanced `}`".to_string()),
+            _ => literal.push(ch),
+        }
+    }
+    pattern.push_str(&regex::escape(&literal));
+    pattern.push('$');
+    let regex = Regex::new(&pattern)
+        .map_err(|_| "cannot be compiled into a path parameter matcher".to_string())?;
+    Ok((regex, names))
+}
+
+/// One occurrence of a parameter on the wire.
+struct ParameterOccurrence<'a> {
+    /// Decoded value (`+` / percent-decoded for query parameters).
+    decoded: Cow<'a, str>,
+    /// Wire spelling, used to find `form` delimiters before decoding so an
+    /// encoded `%2C` stays data.
+    raw: &'a str,
+}
+
+impl<'a> ParameterOccurrence<'a> {
+    fn verbatim(value: &'a str) -> Self {
+        Self {
+            decoded: Cow::Borrowed(value),
+            raw: value,
+        }
+    }
+}
+
+/// `application/x-www-form-urlencoded` component decoding, borrowing when the
+/// component carries no escape.
+fn decode_query_component(raw: &str) -> Cow<'_, str> {
+    if raw.bytes().any(|byte| byte == b'%' || byte == b'+') {
+        Cow::Owned(decode_raw_form_component(raw))
+    } else {
+        Cow::Borrowed(raw)
+    }
+}
+
+/// Validate every declared parameter of `operation` against the request.
+///
+/// Values come from the canonical policy path (already percent-decoded and
+/// structure-checked), the client's raw query string, and the header map.
+/// Parsing is bounded: at most [`MAX_PARAMETER_PAIRS`] query or cookie pairs
+/// are scanned, only pairs whose name is declared are retained, and a
+/// delimited value splits into at most [`MAX_PARAMETER_PAIRS`] items; every
+/// overrun fails closed. Diagnostics carry the declared parameter name and a
+/// fixed category, never a parameter value.
+fn validate_request_parameters(
+    operation: &OperationEntry,
+    path: &str,
+    raw_query: Option<&str>,
+    headers: &HashMap<String, String>,
+) -> Result<(), String> {
+    let path_captures = match &operation.path_parameter_regex {
+        Some(regex) => Some(
+            regex
+                .captures(path)
+                .ok_or_else(|| PATH_PARAMETERS_UNLOCATED_DETAIL.to_string())?,
+        ),
+        None => None,
+    };
+    let mut query = if operation.has_query_parameters {
+        collect_query_occurrences(raw_query, &operation.parameters)?
+    } else {
+        Vec::new()
+    };
+    let mut cookies = if operation.has_cookie_parameters {
+        collect_cookie_occurrences(header_value(headers, "cookie"), &operation.parameters)?
+    } else {
+        Vec::new()
+    };
+    for (index, parameter) in operation.parameters.iter().enumerate() {
+        let occurrences: Vec<ParameterOccurrence<'_>> = match parameter.location {
+            ParameterLocation::Path => path_captures
+                .as_ref()
+                .zip(parameter.path_capture)
+                .and_then(|(captures, capture)| captures.get(capture + 1))
+                .map(|matched| vec![ParameterOccurrence::verbatim(matched.as_str())])
+                .unwrap_or_default(),
+            ParameterLocation::Query => {
+                query.get_mut(index).map(std::mem::take).unwrap_or_default()
+            }
+            ParameterLocation::Header => header_value(headers, &parameter.lookup_name)
+                .map(|value| vec![ParameterOccurrence::verbatim(value)])
+                .unwrap_or_default(),
+            ParameterLocation::Cookie => cookies
+                .get_mut(index)
+                .map(std::mem::take)
+                .unwrap_or_default(),
+        };
+        validate_parameter(parameter, &occurrences)?;
+    }
+    Ok(())
+}
+
+/// Bounded scan of the raw query string, retaining only declared query
+/// parameters, indexed like `parameters`.
+fn collect_query_occurrences<'a>(
+    raw_query: Option<&'a str>,
+    parameters: &[ParameterValidator],
+) -> Result<Vec<Vec<ParameterOccurrence<'a>>>, String> {
+    let mut out: Vec<Vec<ParameterOccurrence<'a>>> =
+        parameters.iter().map(|_| Vec::new()).collect();
+    let Some(raw_query) = raw_query else {
+        return Ok(out);
+    };
+    for (count, pair) in raw_query.split('&').enumerate() {
+        if count >= MAX_PARAMETER_PAIRS {
+            return Err(QUERY_PAIR_LIMIT_DETAIL.to_string());
+        }
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_query_component(raw_key);
+        for (slot, parameter) in out.iter_mut().zip(parameters) {
+            if parameter.location == ParameterLocation::Query && parameter.name == *key {
+                slot.push(ParameterOccurrence {
+                    decoded: decode_query_component(raw_value),
+                    raw: raw_value,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Bounded scan of the `Cookie` header, retaining only declared cookie
+/// parameters, indexed like `parameters`. Cookie names match exactly.
+fn collect_cookie_occurrences<'a>(
+    cookie_header: Option<&'a str>,
+    parameters: &[ParameterValidator],
+) -> Result<Vec<Vec<ParameterOccurrence<'a>>>, String> {
+    let mut out: Vec<Vec<ParameterOccurrence<'a>>> =
+        parameters.iter().map(|_| Vec::new()).collect();
+    let Some(cookie_header) = cookie_header else {
+        return Ok(out);
+    };
+    for (count, pair) in cookie_header.split(';').enumerate() {
+        if count >= MAX_PARAMETER_PAIRS {
+            return Err(COOKIE_PAIR_LIMIT_DETAIL.to_string());
+        }
+        let Some((name, value)) = pair.trim().split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        for (slot, parameter) in out.iter_mut().zip(parameters) {
+            if parameter.location == ParameterLocation::Cookie && parameter.name == name {
+                slot.push(ParameterOccurrence::verbatim(value));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn validate_parameter(
+    parameter: &ParameterValidator,
+    occurrences: &[ParameterOccurrence<'_>],
+) -> Result<(), String> {
+    let location = parameter.location.as_str();
+    let name = parameter.name.as_str();
+    if occurrences.is_empty() {
+        if parameter.required {
+            return Err(bound_detail(&format!(
+                "Required {location} parameter '{name}' is missing"
+            )));
+        }
+        return Ok(());
+    }
+    let value = parameter_to_schema_value(parameter, occurrences).map_err(|error| {
+        bound_detail(&format!(
+            "{location} parameter '{name}' could not be converted: {error}"
+        ))
+    })?;
+    parameter.validator.validate(&value).map_err(|error| {
+        let keyword = safe_keyword(error.schema_path().as_str());
+        let instance_location =
+            safe_location(error.instance_path().as_str(), &parameter.safe_names);
+        bound_detail(&format!(
+            "{location} parameter '{name}' does not satisfy its schema at {instance_location} (keyword '{keyword}')"
+        ))
+    })
+}
+
+/// Deserialize a parameter's occurrences per its location's default style.
+fn parameter_to_schema_value(
+    parameter: &ParameterValidator,
+    occurrences: &[ParameterOccurrence<'_>],
+) -> Result<Value, String> {
+    let schema = parameter.schema.as_ref();
+    let conversion = &parameter.conversion;
+    if conversion.accepts_array(schema) {
+        let item_schema = array_item_schema_for_conversion(schema, conversion);
+        let mut items = Vec::new();
+        if parameter.explode && parameter.location.uses_form_style() {
+            // `form` + explode: one item per occurrence (`?id=1&id=2`).
+            for occurrence in occurrences {
+                items.push(scalar_to_schema_value(
+                    &occurrence.decoded,
+                    item_schema,
+                    conversion,
+                )?);
+            }
+        } else {
+            let [occurrence] = occurrences else {
+                return Err(PARAMETER_REPEATED_DETAIL.to_string());
+            };
+            for token in delimited_parameter_tokens(parameter.location, occurrence)? {
+                items.push(scalar_to_schema_value(&token, item_schema, conversion)?);
+            }
+        }
+        return Ok(Value::Array(items));
+    }
+    let [occurrence] = occurrences else {
+        return Err(PARAMETER_REPEATED_DETAIL.to_string());
+    };
+    if conversion.accepts_object(schema) {
+        let members = delimited_parameter_tokens(parameter.location, occurrence)?;
+        let tokens = if parameter.explode {
+            // `simple` + explode: `name=value` members.
+            let mut tokens = Vec::with_capacity(members.len().saturating_mul(2));
+            for member in members {
+                let (member_name, member_value) = member
+                    .split_once('=')
+                    .ok_or_else(|| PARAMETER_OBJECT_MEMBER_DETAIL.to_string())?;
+                tokens.push(member_name.to_string());
+                tokens.push(member_value.to_string());
+            }
+            tokens
+        } else {
+            // Alternating `name,value` items.
+            members
+        };
+        return object_tokens_to_value(tokens, schema, conversion);
+    }
+    scalar_to_schema_value(&occurrence.decoded, schema, conversion)
+}
+
+/// Split one comma-delimited parameter value into decoded items.
+fn delimited_parameter_tokens(
+    location: ParameterLocation,
+    occurrence: &ParameterOccurrence<'_>,
+) -> Result<Vec<String>, String> {
+    // Query delimiters are found on the wire spelling, before decoding; the
+    // other locations carry no percent-encoding of their own.
+    let source: &str = if location == ParameterLocation::Query {
+        occurrence.raw
+    } else {
+        &occurrence.decoded
+    };
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tokens = Vec::new();
+    for (count, token) in source.split(',').enumerate() {
+        if count >= MAX_PARAMETER_PAIRS {
+            return Err(PARAMETER_ITEM_LIMIT_DETAIL.to_string());
+        }
+        tokens.push(match location {
+            ParameterLocation::Query => decode_query_component(token).into_owned(),
+            // HTTP list members carry optional whitespace around the comma.
+            ParameterLocation::Header => token.trim().to_string(),
+            ParameterLocation::Path | ParameterLocation::Cookie => token.to_string(),
+        });
+    }
+    Ok(tokens)
 }
 
 fn parse_request_validators(
@@ -1972,16 +2745,29 @@ fn insert_media_validator(
     Ok(())
 }
 
+/// Compile one operation schema under the configured draft.
+///
+/// `format` is an ASSERTION under every selector. Draft 2020-12 (and `auto`,
+/// which resolves to it for documents without `$schema`) otherwise treats
+/// `format` as an annotation, so the same imported `format: uuid` /
+/// `date-time` / `email` constraint would be enforced for a Swagger 2.0 or
+/// OpenAPI 3.0 document but silently inert for an OpenAPI 3.1 one. Format names
+/// the validator does not implement (OpenAPI's `int32`, `int64`, `float`,
+/// `double`, `byte`, `binary`, `password`) remain annotations, as the
+/// specification requires for unknown formats.
 fn compile_schema(
     schema: &Value,
     schema_draft: SchemaDraft,
 ) -> Result<jsonschema::Validator, String> {
-    match schema_draft {
-        SchemaDraft::Auto => jsonschema::validator_for(schema),
-        SchemaDraft::Draft7 => jsonschema::draft7::options().build(schema),
-        SchemaDraft::Draft202012 => jsonschema::draft202012::options().build(schema),
-    }
-    .map_err(|_| "invalid JSON Schema".to_string())
+    let options = match schema_draft {
+        SchemaDraft::Auto => jsonschema::options(),
+        SchemaDraft::Draft7 => jsonschema::draft7::options(),
+        SchemaDraft::Draft202012 => jsonschema::draft202012::options(),
+    };
+    options
+        .should_validate_formats(true)
+        .build(schema)
+        .map_err(|_| "invalid JSON Schema".to_string())
 }
 
 fn compile_media_validator(
@@ -2540,36 +3326,88 @@ fn property_schema_from_object<'a>(schema: &'a Value, property: &str) -> Option<
         })
 }
 
+/// Why a media body could not be turned into a validated schema instance.
+enum MediaFailure {
+    /// A contract violation with a payload-free diagnostic.
+    Violation(String),
+    /// The aggregate decode budget could not admit this body's decode working
+    /// set. A GATEWAY capacity condition, never blamed on the peer.
+    Capacity,
+}
+
+/// Fixed diagnostic recorded when the aggregate decode budget refuses a body.
+const DECODE_CAPACITY_DETAIL: &str = "Body decode capacity is temporarily exhausted";
+const CONTENT_ENCODING_DETAIL: &str = "Content-Encoding could not be decoded";
+
+/// Undo `Content-Encoding` for validation through the strict, budget-charged
+/// decoder shared with the representation gates.
+///
+/// The decode working set (the active decoder's heap and every output growth)
+/// is reserved against `budget` BEFORE it is allocated, so concurrent
+/// validations of small, highly compressed bodies are bounded by the
+/// process-wide decode budget rather than only per request. A refused
+/// reservation is [`MediaFailure::Capacity`], not a representation error.
 fn decode_body<'a>(
     headers: &HashMap<String, String>,
     body: &'a [u8],
     max_body_bytes: usize,
-) -> Result<Cow<'a, [u8]>, String> {
+    budget: BudgetRef<'_>,
+) -> Result<Cow<'a, [u8]>, MediaFailure> {
     if body.len() > max_body_bytes {
-        return Err(format!(
+        return Err(MediaFailure::Violation(format!(
             "Body exceeds max_body_bytes of {max_body_bytes} bytes"
-        ));
+        )));
+    }
+    let Some(header) = header_value(headers, "content-encoding") else {
+        return Ok(Cow::Borrowed(body));
+    };
+    // Every refusal collapses to a fixed category at this plugin boundary so
+    // neither the request problem body nor transaction metadata can reproduce
+    // a hostile coding token (`GHSA-5p2h-fq6q-gwh9`).
+    let violation = || MediaFailure::Violation(CONTENT_ENCODING_DETAIL.to_string());
+    let codings = parse_content_codings(header).map_err(|_| violation())?;
+    if codings.len() > MAX_CONTENT_CODINGS {
+        return Err(violation());
+    }
+    if codings.iter().all(|coding| coding == "identity") {
+        return Ok(Cow::Borrowed(body));
+    }
+    if codings.iter().any(|coding| coding == "identity") {
+        return Err(violation());
     }
     // Enforce `max_body_bytes` on every decoded layer. Cumulative work is capped
-    // at layers × max so a stacked chain cannot bypass the per-layer ceiling
-    // while still failing closed on amplification across the full list.
-    let max_cumulative_bytes = max_body_bytes.saturating_mul(MAX_CONTENT_CODINGS);
-    // The shared decoder's errors can echo a hostile coding token. Collapse to
-    // a fixed category at this plugin boundary so neither the request problem
-    // body nor transaction metadata can reproduce it (`GHSA-5p2h-fq6q-gwh9`).
-    // Response conversion already has a coarser outer collapse; request must
-    // be safe here too. The shared utility stays detailed for other plugins.
-    decode_content_encoding(
-        header_value(headers, "content-encoding"),
-        body,
-        DecodeLimits {
-            max_decoded_bytes: max_body_bytes,
-            max_cumulative_bytes,
-            max_codings: MAX_CONTENT_CODINGS,
-            max_amplification_ratio: 0,
-        },
-    )
-    .map_err(|_| "Content-Encoding could not be decoded".to_string())
+    // at layers × max so a stacked chain cannot bypass the per-layer ceiling.
+    let limits = DecodeLimits {
+        max_decoded_bytes: max_body_bytes,
+        max_cumulative_bytes: max_body_bytes.saturating_mul(MAX_CONTENT_CODINGS),
+        max_codings: MAX_CONTENT_CODINGS,
+        max_amplification_ratio: 0,
+    };
+    match decode_charged_content_coding_chain(&codings, body, limits, budget) {
+        Ok(plaintext) => Ok(Cow::Owned(plaintext)),
+        Err(ChargedDecodeError::CapacityRefused) => Err(MediaFailure::Capacity),
+        Err(_) => Err(violation()),
+    }
+}
+
+/// External-test seam: run [`decode_body`] against a caller-supplied budget.
+/// `Err(None)` is the capacity refusal; `Err(Some(detail))` a violation.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn decode_body_for_test(
+    content_encoding: Option<&str>,
+    body: &[u8],
+    max_body_bytes: usize,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, Option<String>> {
+    let mut headers = HashMap::new();
+    if let Some(value) = content_encoding {
+        headers.insert("content-encoding".to_string(), value.to_string());
+    }
+    match decode_body(&headers, body, max_body_bytes, budget) {
+        Ok(decoded) => Ok(decoded.into_owned()),
+        Err(MediaFailure::Capacity) => Err(None),
+        Err(MediaFailure::Violation(detail)) => Err(Some(detail)),
+    }
 }
 
 enum SchemaInstance {
@@ -2599,50 +3437,56 @@ fn validate_media_body(
     max_body_bytes: usize,
     side: ValidationSide,
     json_scan_memo: Option<&mut JsonScanMemo>,
-) -> Result<(), String> {
-    let instance = body_to_schema_instance(
-        headers,
-        body,
-        content_type,
-        validator,
-        max_body_bytes,
-        json_scan_memo,
-    )
-    .map_err(|error| match side {
+) -> Result<(), MediaFailure> {
+    // Every conversion helper is now payload-free by construction
+    // (`GHSA-5p2h-fq6q-gwh9`), so this collapse is no longer the
+    // confidentiality mechanism. It is retained as a second, coarser
+    // response-side boundary: the *class* of a decode failure still describes
+    // the shape of an upstream representation the client was never entitled to
+    // observe, and a future helper that regresses cannot reach the client
+    // through this path.
+    let side_detail = |error: String| match side {
         ValidationSide::Request => error,
         ValidationSide::Response => {
-            // Every conversion helper is now payload-free by construction
-            // (`GHSA-5p2h-fq6q-gwh9`), so this collapse is no longer the
-            // confidentiality mechanism. It is retained as a second, coarser
-            // response-side boundary: the *class* of a decode failure still
-            // describes the shape of an upstream representation the client was
-            // never entitled to observe, and a future helper that regresses
-            // cannot reach the client through this path.
             "Response body could not be safely decoded or converted for schema validation"
                 .to_string()
         }
-    })?;
+    };
+    // Request decodes charge the request-decode budget; response decodes charge
+    // the retained-response budget the response representation gate uses.
+    let budget = match side {
+        ValidationSide::Request => BudgetRef::request_decode(),
+        ValidationSide::Response => BudgetRef::global(),
+    };
+    let decoded = match decode_body(headers, body, max_body_bytes, budget) {
+        Ok(decoded) => decoded,
+        Err(MediaFailure::Violation(error)) => {
+            return Err(MediaFailure::Violation(side_detail(error)));
+        }
+        Err(MediaFailure::Capacity) => return Err(MediaFailure::Capacity),
+    };
+    let instance =
+        body_to_schema_instance(decoded.as_ref(), content_type, validator, json_scan_memo)
+            .map_err(|error| MediaFailure::Violation(side_detail(error)))?;
     match instance {
-        SchemaInstance::Value(instance) => validator
-            .validator
-            .validate(&instance)
-            .map_err(|error| format_schema_error(&error, side, &validator.safe_names)),
+        SchemaInstance::Value(instance) => {
+            validator.validator.validate(&instance).map_err(|error| {
+                MediaFailure::Violation(format_schema_error(&error, side, &validator.safe_names))
+            })
+        }
         SchemaInstance::ValidatedBinary => Ok(()),
     }
 }
 
 fn body_to_schema_instance(
-    headers: &HashMap<String, String>,
-    body: &[u8],
+    decoded: &[u8],
     content_type: Option<&str>,
     validator: &MediaValidator,
-    max_body_bytes: usize,
     json_scan_memo: Option<&mut JsonScanMemo>,
 ) -> Result<SchemaInstance, String> {
     let schema = validator.schema.as_ref();
     let encoding = &validator.encoding;
     let conversion = &validator.conversion;
-    let decoded = decode_body(headers, body, max_body_bytes)?;
     let media_type = content_type_base(content_type)
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
@@ -2653,20 +3497,20 @@ fn body_to_schema_instance(
         // forwarding the original bytes lets a first-key-wins backend act on a
         // schema-forbidden earlier value, so ambiguity is rejected outright
         // rather than canonicalized.
-        if let Some(reason) = screen_json_ambiguity(decoded.as_ref(), json_scan_memo) {
+        if let Some(reason) = screen_json_ambiguity(decoded, json_scan_memo) {
             return Err(reason.to_string());
         }
-        return serde_json::from_slice(decoded.as_ref())
+        return serde_json::from_slice(decoded)
             .map(SchemaInstance::Value)
             .map_err(|error| format!("Invalid JSON body: {error}"));
     }
     if is_xml_media_type(&media_type) {
-        let body = std::str::from_utf8(decoded.as_ref())
+        let body = std::str::from_utf8(decoded)
             .map_err(|error| format!("Invalid XML body encoding: {error}"))?;
         return xml_body_to_value(body, schema, conversion).map(SchemaInstance::Value);
     }
     if media_type == "application/x-www-form-urlencoded" {
-        let body = std::str::from_utf8(decoded.as_ref())
+        let body = std::str::from_utf8(decoded)
             .map_err(|error| format!("Invalid form body encoding: {error}"))?;
         return form_urlencoded_to_value(body, schema, encoding, conversion)
             .map(SchemaInstance::Value);
@@ -2674,15 +3518,15 @@ fn body_to_schema_instance(
     if media_type == "multipart/form-data" {
         let boundary = multipart_boundary(content_type.unwrap_or(""))?
             .ok_or_else(|| "Multipart body is missing boundary parameter".to_string())?;
-        return multipart_to_value(decoded.as_ref(), &boundary, schema, encoding, conversion)
+        return multipart_to_value(decoded, &boundary, schema, encoding, conversion)
             .map(SchemaInstance::Value);
     }
     if is_text_media_type(&media_type) {
-        let body = std::str::from_utf8(decoded.as_ref())
+        let body = std::str::from_utf8(decoded)
             .map_err(|error| format!("Invalid text body encoding: {error}"))?;
         return scalar_to_schema_value(body, schema, conversion).map(SchemaInstance::Value);
     }
-    binary_body_to_schema_instance(decoded.as_ref(), schema)
+    binary_body_to_schema_instance(decoded, schema)
 }
 
 fn xml_body_to_value(
@@ -2736,11 +3580,29 @@ fn xml_node_to_value(
     if conversion.accepts_array(schema) {
         validate_xml_array_container(node)?;
         let item_schema = array_item_schema_for_conversion(schema, conversion);
-        let values = node
-            .children()
-            .filter(roxmltree::Node::is_element)
-            .map(|child| xml_node_to_value(child, item_schema, conversion, depth + 1))
-            .collect::<Result<Vec<_>, _>>()?;
+        // A directly converted array (a root array, an array item that is
+        // itself an array, or an additional member with an array schema) is
+        // held to the same item expanded-name contract as a property array:
+        // when the item schema declares `xml.name` / `xml.namespace`, every
+        // child must carry exactly that local name / namespace URI. Without a
+        // declared item name the historical any-child behavior is preserved.
+        let item_local = xml_name(item_schema, None);
+        let item_namespace = xml_namespace(item_schema);
+        let mut values = Vec::new();
+        for child in node.children().filter(roxmltree::Node::is_element) {
+            let local_matches = item_local.is_none_or(|local| child.tag_name().name() == local);
+            let namespace_matches = item_namespace
+                .is_none_or(|namespace| child.tag_name().namespace() == Some(namespace));
+            if !local_matches || !namespace_matches {
+                return Err(XML_ARRAY_ITEM_NAME_DETAIL.to_string());
+            }
+            values.push(xml_node_to_value(
+                child,
+                item_schema,
+                conversion,
+                depth + 1,
+            )?);
+        }
         return Ok(Value::Array(values));
     }
     let object_schema = object_schema_for_conversion(schema, conversion);
@@ -2759,7 +3621,7 @@ fn xml_node_to_value(
                 if let Some(value) = xml_attribute_value(node, attr_namespace, attr_local) {
                     out.insert(
                         property_name.clone(),
-                        scalar_to_schema_value(value, property_schema, conversion)?,
+                        xml_scalar_to_schema_value(value, property_schema, conversion)?,
                     );
                 }
                 continue;
@@ -2820,7 +3682,7 @@ fn xml_node_to_value(
                 .pattern_property_schema(object_schema, attr.name())
                 .or_else(|| additional_schema.flatten());
             let value = match member_schema {
-                Some(schema) => scalar_to_schema_value(attr.value(), schema, conversion)?,
+                Some(schema) => xml_scalar_to_schema_value(attr.value(), schema, conversion)?,
                 _ => Value::String(attr.value().to_string()),
             };
             additional_attribute_locals.insert(attr.name().to_string());
@@ -2871,7 +3733,34 @@ fn xml_node_to_value(
         return Ok(Value::Object(out));
     }
     let text = xml_scalar_element_text(node)?;
-    scalar_to_schema_value(&text, schema, conversion)
+    xml_scalar_to_schema_value(&text, schema, conversion)
+}
+
+/// XML whitespace (`S` in XML 1.0 §2.3): space, tab, CR, LF. Narrower than
+/// Rust's Unicode `trim`, so a non-breaking space stays character data.
+fn trim_xml_whitespace(value: &str) -> &str {
+    value.trim_matches(|ch: char| matches!(ch, ' ' | '\t' | '\r' | '\n'))
+}
+
+/// Convert XML character data to a schema value without losing string data.
+///
+/// The original character data is what the backend receives, so a string
+/// candidate is validated EXACTLY as written: leading/trailing whitespace is
+/// part of the value `enum`, `pattern`, `minLength`, and `maxLength` judge.
+/// Only the lexical forms of numbers and booleans ignore surrounding XML
+/// whitespace, as XML Schema's whitespace-collapsing numeric types do.
+fn xml_scalar_to_schema_value(
+    value: &str,
+    schema: &Value,
+    conversion: &ConversionPlan,
+) -> Result<Value, String> {
+    scalar_candidates_to_schema_value(
+        value,
+        trim_xml_whitespace(value),
+        schema,
+        conversion.schema_types(schema),
+        conversion.composed_scalar_validator(schema),
+    )
 }
 
 fn xml_array_values(
@@ -3023,12 +3912,13 @@ fn xml_direct_text_children(node: roxmltree::Node<'_, '_>) -> Result<String, Str
     Ok(text)
 }
 
-/// Trimmed character data of a scalar element with no structural members.
+/// Exact (untrimmed) character data of a scalar element with no structural
+/// members. Callers trim only for numeric/boolean lexical conversion.
 fn xml_scalar_element_text(node: roxmltree::Node<'_, '_>) -> Result<String, String> {
     if node.attributes().next().is_some() || node.children().any(|child| child.is_element()) {
         return Err("XML scalar element has unmodeled attributes or child elements".to_string());
     }
-    Ok(xml_direct_text_children(node)?.trim().to_string())
+    xml_direct_text_children(node)
 }
 
 /// Trimmed `#text` for mixed-content elements that also carry child elements.
@@ -3060,11 +3950,13 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>, depth: usize) -> Res
         .filter(roxmltree::Node::is_element)
         .collect();
     if children.is_empty() {
-        let text = xml_direct_text_children(node)?.trim().to_string();
+        // A generic leaf keeps its exact character data: it feeds
+        // additional/pattern-property assertions as a string.
+        let text = xml_direct_text_children(node)?;
         if out.is_empty() {
             return Ok(Value::String(text));
         }
-        if !text.is_empty() {
+        if !trim_xml_whitespace(&text).is_empty() {
             out.insert("#text".to_string(), Value::String(text));
         }
         return Ok(Value::Object(out));
@@ -4174,6 +5066,13 @@ fn header_content_to_schema_value(
     Ok(Value::String(value.to_string()))
 }
 
+/// Enforce the part-level Encoding Object contract — `contentType` and every
+/// declared Header Object — for one multipart part.
+///
+/// This is the single per-part gate: scalar parts, exploded and serialized
+/// (`explode: false`) collections, serialized objects, and deepObject members
+/// all pass through it, so a collection branch can never skip the declared
+/// `contentType` restriction that an ordinary scalar part enforces.
 fn validate_multipart_part_headers(
     part: &MultipartPart,
     encoding: Option<&PropertyEncoding>,
@@ -4223,6 +5122,19 @@ fn validate_multipart_part_headers(
                         "Multipart field header '{header_name}' failed validation at {location} (keyword '{keyword}')"
                     )
                 })?;
+        }
+    }
+    if let Some(expected) = encoding.and_then(|encoding| encoding.content_type.as_ref()) {
+        let actual = part
+            .content_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("text/plain");
+        if !content_type_matches_encoding(actual, expected) {
+            return Err(format!(
+                "Multipart field content type does not match encoding contentType '{expected}'"
+            ));
         }
     }
     Ok(())
@@ -4279,19 +5191,6 @@ fn multipart_part_to_schema_value(
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
     validate_multipart_part_headers(part, encoding)?;
-    if let Some(expected) = encoding.and_then(|encoding| encoding.content_type.as_ref()) {
-        let actual = part
-            .content_type
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("text/plain");
-        if !content_type_matches_encoding(actual, expected) {
-            return Err(format!(
-                "Multipart field content type does not match encoding contentType '{expected}'"
-            ));
-        }
-    }
 
     if conversion.accepts_object(schema) || schema.get("properties").is_some() {
         if part.filename.is_none()
@@ -4448,6 +5347,21 @@ fn scalar_to_schema_value_with_types(
     types: SchemaTypeSet,
     composed_validator: Option<&jsonschema::Validator>,
 ) -> Result<Value, String> {
+    scalar_candidates_to_schema_value(value, value, schema, types, composed_validator)
+}
+
+/// Scalar conversion with distinct string and lexical spellings.
+///
+/// `value` is the exact text a string candidate carries; `lexical` is the
+/// spelling integer / number / boolean parsing reads. Every caller except XML
+/// passes the same text for both.
+fn scalar_candidates_to_schema_value(
+    value: &str,
+    lexical: &str,
+    schema: &Value,
+    types: SchemaTypeSet,
+    composed_validator: Option<&jsonschema::Validator>,
+) -> Result<Value, String> {
     if types.is_empty() {
         return Ok(Value::String(value.to_string()));
     }
@@ -4466,18 +5380,18 @@ fn scalar_to_schema_value_with_types(
         // parse succeeded even though its branch constraints failed while a
         // string/boolean candidate would have satisfied another branch.
         if types.contains(ScalarType::Integer)
-            && let Ok(candidate) = parse_integer_value(value)
+            && let Ok(candidate) = parse_integer_value(lexical)
         {
             parsed.push(candidate);
         }
         if types.contains(ScalarType::Number)
-            && let Ok(candidate) = parse_number_value(value)
+            && let Ok(candidate) = parse_number_value(lexical)
             && !parsed.contains(&candidate)
         {
             parsed.push(candidate);
         }
         if types.contains(ScalarType::Boolean)
-            && let Ok(candidate) = parse_boolean_value(value)
+            && let Ok(candidate) = parse_boolean_value(lexical)
         {
             parsed.push(candidate);
         }
@@ -4498,21 +5412,21 @@ fn scalar_to_schema_value_with_types(
 
     // Deterministic try order — never depends on oneOf/anyOf branch order.
     if types.contains(ScalarType::Integer) {
-        match parse_integer_value(value) {
+        match parse_integer_value(lexical) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
     if types.contains(ScalarType::Number) {
-        match parse_number_value(value) {
+        match parse_number_value(lexical) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
     if types.contains(ScalarType::Boolean) {
-        match parse_boolean_value(value) {
+        match parse_boolean_value(lexical) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
@@ -4973,20 +5887,30 @@ fn media_range_validator<'a>(
     validators.get("*/*")
 }
 
+/// Whether `content_type` is inside a configured inspection scope. The scope
+/// lists are never empty (an empty list is refused at construction), so an
+/// absent match always means "out of scope".
 fn content_type_in_scope(configured: &[String], content_type: Option<&str>) -> bool {
     let Some(base) = content_type_base(content_type) else {
         return false;
     };
-    configured.is_empty()
-        || configured
-            .iter()
-            .any(|expected| media_type_matches(expected, base))
+    configured
+        .iter()
+        .any(|expected| media_type_matches(expected, base))
 }
 
 fn normalize_configured_media_types(
     values: Vec<String>,
     field: &'static str,
 ) -> Result<Vec<String>, String> {
+    // An explicitly empty scope list is ambiguous: it reads as "inspect
+    // nothing" but historically meant "inspect everything". Refuse it so the
+    // operator states the scope they mean.
+    if values.is_empty() {
+        return Err(format!(
+            "{ERROR_PREFIX}`{field}` must not be empty; omit it for the default scope or list the media types to validate"
+        ));
+    }
     let mut normalized = Vec::with_capacity(values.len());
     let mut seen = HashSet::with_capacity(values.len());
     for (index, value) in values.into_iter().enumerate() {
@@ -5891,6 +6815,16 @@ fn literal_segment_count(path_template: &str) -> u16 {
         .filter(|segment| !(segment.starts_with('{') && segment.ends_with('}')))
         .count()
         .min(u16::MAX as usize) as u16
+}
+
+/// Per-segment literal flags for segment-wise specificity ordering, using the
+/// same segment classification as [`literal_segment_count`].
+fn literal_segment_flags(path_template: &str) -> Vec<bool> {
+    path_template
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| !(segment.starts_with('{') && segment.ends_with('}')))
+        .collect()
 }
 
 fn parse_mode(raw: &str) -> Result<EnforcementMode, String> {
