@@ -224,8 +224,8 @@ pub enum SampleInput<'a> {
 }
 
 impl<'a> SampleInput<'a> {
-    pub fn proxy_id(&self) -> Option<&str> {
-        match self {
+    pub fn proxy_id(&self) -> Option<&'a str> {
+        match *self {
             Self::Http(s) => s.proxy_id.as_deref(),
             Self::Stream(s) => Some(s.proxy_id.as_str()),
             Self::WebSocket(s) => Some(s.proxy_id.as_str()),
@@ -240,16 +240,16 @@ impl<'a> SampleInput<'a> {
         }
     }
 
-    pub fn proxy_name(&self) -> Option<&str> {
-        match self {
+    pub fn proxy_name(&self) -> Option<&'a str> {
+        match *self {
             Self::Http(s) => s.proxy_name.as_deref(),
             Self::Stream(s) => s.proxy_name.as_deref(),
             Self::WebSocket(s) => s.proxy_name.as_deref(),
         }
     }
 
-    pub fn namespace(&self) -> &str {
-        match self {
+    pub fn namespace(&self) -> &'a str {
+        match *self {
             Self::Http(s) => s.namespace.as_str(),
             Self::Stream(s) => s.namespace.as_str(),
             Self::WebSocket(s) => s.namespace.as_str(),
