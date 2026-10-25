@@ -26,7 +26,8 @@
 //! complete final post-transform size before committing a response; this adds
 //! route-bounded buffering overhead and refuses indefinite SSE streams whose
 //! complete size cannot be proven. An event stream whose backend declared one
-//! exact, in-limit `Content-Length` has proven its size and is admitted.
+//! exact, in-limit `Content-Length` has proven its size and is admitted, unless
+//! a streaming response inspector on the route can rewrite its bytes.
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -84,7 +85,17 @@ impl ResponseSizeLimiting {
 impl ResponseSizeLimiting {
     /// Whether a strict-mode event stream proves its complete size before
     /// commit: it declares exactly one agreed `Content-Length` within
-    /// `max_bytes`, and that is the length the BACKEND sent.
+    /// `max_bytes`, that is the length the BACKEND sent, and nothing on this
+    /// route can change the byte count after this hook.
+    ///
+    /// A streaming response inspector (an `sse` `retry_ms` prefix, an `ai_*`
+    /// stream inspector) rewrites the stream only after headers commit, so the
+    /// backend length no longer describes what the client receives. Whether
+    /// the route can attach one is precomputed at plugin-cache build
+    /// (`RequestContext::route_may_rewrite_response_stream`); an unstamped
+    /// context counts as "may rewrite". Such a route keeps the pre-commit
+    /// refusal. Buffered body transforms do not apply here: the event stream is
+    /// released to stream.
     ///
     /// The live header map is hook-writable, so on a backend response the
     /// declared length must equal the pristine snapshot captured before any
@@ -98,6 +109,9 @@ impl ResponseSizeLimiting {
         ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
     ) -> bool {
+        if ctx.route_may_rewrite_response_stream != Some(false) {
+            return false;
+        }
         let Some(ContentLength::Exact(declared)) = declared_content_length(response_headers) else {
             return false;
         };

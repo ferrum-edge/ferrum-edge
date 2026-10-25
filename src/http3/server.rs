@@ -4485,8 +4485,9 @@ async fn handle_h3_request(
     // frame is read or any response byte is retained, so native H3 and the H3
     // cross-protocol bridge bound themselves at the route limit rather than only
     // at the global one (`GHSA-xrfj-852f-645j`).
-    ctx.route_request_body_limit_bytes = plugin_cache_view.enforced_request_body_limit();
-    ctx.route_response_body_limit_bytes = plugin_cache_view.enforced_response_body_limit();
+    // The same stamp records whether a streaming response inspector may
+    // rewrite this route's client-visible bytes after `after_proxy`.
+    plugin_cache_view.stamp_route_body_policy(&mut ctx);
     // Folded once for this request. `0` still means unlimited, and an absent
     // route ceiling leaves each global knob exactly as configured, so a proxy
     // without a size-limiting plugin is byte-for-byte unchanged.

@@ -730,6 +730,71 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
 
 // === Strict mode: an event stream that proves its size is admitted ===
 
+/// A request context stamped by the PRODUCTION route-policy stamp
+/// (`PluginCacheRequestView::stamp_route_body_policy`) for a proxy whose
+/// plugin chain is exactly `plugins` (`(name, config)` pairs).
+fn route_stamped_ctx(plugins: &[(&str, serde_json::Value)]) -> RequestContext {
+    use chrono::Utc;
+    use ferrum_edge::config::types::{
+        GatewayConfig, PluginAssociation, PluginConfig, PluginScope, default_namespace,
+    };
+
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    let plugin_configs: Vec<PluginConfig> = plugins
+        .iter()
+        .enumerate()
+        .map(|(index, (name, config))| PluginConfig {
+            labels: Default::default(),
+            id: format!("plugin-{index}"),
+            namespace: default_namespace(),
+            plugin_name: (*name).to_string(),
+            config: config.clone(),
+            scope: PluginScope::Proxy,
+            proxy_id: Some(proxy.id.clone()),
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .collect();
+    proxy.plugins = plugin_configs
+        .iter()
+        .map(|plugin| PluginAssociation {
+            plugin_config_id: plugin.id.clone(),
+        })
+        .collect();
+    let proxy_id = proxy.id.clone();
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy],
+        plugin_configs,
+        loaded_at: Utc::now(),
+        ..Default::default()
+    };
+    let cache = ferrum_edge::PluginCache::new(&config).expect("route plugin chain must admit");
+    let mut ctx = make_ctx();
+    cache
+        .request_view(
+            &default_namespace(),
+            &proxy_id,
+            ferrum_edge::plugins::ProxyProtocol::Http,
+        )
+        .stamp_route_body_policy(&mut ctx);
+    ctx
+}
+
+/// A strict 1024-byte limiter alone: nothing on the route rewrites the stream.
+fn pass_through_route_ctx() -> RequestContext {
+    let ctx = route_stamped_ctx(&[(
+        "response_size_limiting",
+        json!({"max_bytes": 1024, "require_buffered_check": true}),
+    )]);
+    assert_eq!(ctx.route_may_rewrite_response_stream, Some(false));
+    ctx
+}
+
 fn strict_limiter(max_bytes: u64) -> ResponseSizeLimiting {
     ResponseSizeLimiting::new(&json!({"max_bytes": max_bytes, "require_buffered_check": true}))
         .unwrap()
@@ -769,7 +834,7 @@ async fn strict_sse_with_exact_in_limit_content_length_is_admitted() {
     for declared in ["512", "1024"] {
         let mut headers = sse_headers_with_length(Some(declared));
         // A backend response: the pristine snapshot carries the same length.
-        let mut ctx = make_ctx();
+        let mut ctx = pass_through_route_ctx();
         ferrum_edge::_test_support::stamp_original_response_metadata_for_test(
             &mut ctx, 200, &headers,
         );
@@ -782,7 +847,7 @@ async fn strict_sse_with_exact_in_limit_content_length_is_admitted() {
         );
         // A synthetic response has no backend snapshot; its live map is the
         // representation.
-        let mut ctx = make_ctx();
+        let mut ctx = pass_through_route_ctx();
         assert!(matches!(
             plugin.after_proxy(&mut ctx, 200, &mut headers).await,
             PluginResult::Continue
@@ -799,7 +864,7 @@ async fn strict_sse_without_a_provable_backend_length_is_still_refused() {
     let plugin = strict_limiter(1024);
 
     let mut absent = sse_headers_with_length(None);
-    let mut ctx = make_ctx();
+    let mut ctx = pass_through_route_ctx();
     ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &absent);
     assert_unverifiable_stream_refusal(
         plugin.after_proxy(&mut ctx, 200, &mut absent).await,
@@ -807,7 +872,7 @@ async fn strict_sse_without_a_provable_backend_length_is_still_refused() {
     );
 
     // The backend sent no length; a hook then wrote one into the live map.
-    let mut ctx = make_ctx();
+    let mut ctx = pass_through_route_ctx();
     ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &absent);
     let mut hook_authored = sse_headers_with_length(Some("10"));
     assert_unverifiable_stream_refusal(
@@ -817,7 +882,7 @@ async fn strict_sse_without_a_provable_backend_length_is_still_refused() {
 
     // The backend declared one length; a hook shrank it in the live map.
     let backend = sse_headers_with_length(Some("900"));
-    let mut ctx = make_ctx();
+    let mut ctx = pass_through_route_ctx();
     ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &backend);
     let mut shrunk = sse_headers_with_length(Some("10"));
     assert_unverifiable_stream_refusal(
@@ -828,11 +893,109 @@ async fn strict_sse_without_a_provable_backend_length_is_still_refused() {
     // Ambiguous and over-limit declarations are refused by the fast path.
     for declared in ["512, 513", "2048"] {
         let mut headers = sse_headers_with_length(Some(declared));
-        let mut ctx = make_ctx();
+        let mut ctx = pass_through_route_ctx();
         match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
             PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
             other => panic!("{declared}: expected a fast-path refusal, got {other:?}"),
         }
+    }
+}
+
+/// PR6880-SOL-1: a backend `Content-Length` proves only the BACKEND bytes. An
+/// `sse` instance with `retry_ms` prepends `retry: 1000\n` to the stream after
+/// headers commit, so a 1024-byte backend body becomes 1036 client bytes;
+/// strict mode must refuse it before commit instead of cutting it mid-stream.
+#[tokio::test]
+async fn strict_sse_length_is_not_a_proof_when_a_stream_inspector_rewrites_it() {
+    let plugin = strict_limiter(1024);
+    let mut ctx = route_stamped_ctx(&[
+        (
+            "response_size_limiting",
+            json!({"max_bytes": 1024, "require_buffered_check": true}),
+        ),
+        (
+            "sse",
+            json!({"retry_ms": 1000, "strip_content_length": false}),
+        ),
+    ]);
+    assert_eq!(
+        ctx.route_may_rewrite_response_stream,
+        Some(true),
+        "an sse retry prefix is a streaming response rewrite"
+    );
+    let mut headers = sse_headers_with_length(Some("1024"));
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    assert_unverifiable_stream_refusal(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        "1024",
+    );
+
+    // The same plugin without a stream rewrite leaves the proof intact.
+    let mut ctx = route_stamped_ctx(&[
+        (
+            "response_size_limiting",
+            json!({"max_bytes": 1024, "require_buffered_check": true}),
+        ),
+        ("sse", json!({"strip_content_length": false})),
+    ]);
+    assert_eq!(ctx.route_may_rewrite_response_stream, Some(false));
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+/// A context no handler stamped cannot prove that nothing rewrites the stream.
+#[tokio::test]
+async fn strict_sse_length_is_not_a_proof_on_an_unstamped_route() {
+    let plugin = strict_limiter(1024);
+    let mut ctx = make_ctx();
+    assert_eq!(ctx.route_may_rewrite_response_stream, None);
+    let mut headers = sse_headers_with_length(Some("512"));
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    assert_unverifiable_stream_refusal(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        "1024",
+    );
+}
+
+/// PR6880-SOL-2: agreeing repeated `Content-Length` members are one exact
+/// length to the canonical parser, so the pristine snapshot records it and the
+/// proof holds; disagreeing members stay refused.
+#[tokio::test]
+async fn strict_sse_with_agreeing_repeated_content_length_is_admitted() {
+    let plugin = strict_limiter(1024);
+    let mut headers = sse_headers_with_length(Some("512, 512"));
+    let mut ctx = pass_through_route_ctx();
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(&mut ctx, 200, &headers);
+    assert_eq!(
+        ctx.metadata
+            .get("ferrum:original_response_content_length")
+            .map(String::as_str),
+        Some("512"),
+        "the pristine snapshot must record the folded length"
+    );
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut disagreeing = sse_headers_with_length(Some("512, 513"));
+    let mut ctx = pass_through_route_ctx();
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(
+        &mut ctx,
+        200,
+        &disagreeing,
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ferrum:original_response_content_length"),
+        "disagreeing members are no length at all"
+    );
+    match plugin.after_proxy(&mut ctx, 200, &mut disagreeing).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        other => panic!("expected the ambiguous-length refusal, got {other:?}"),
     }
 }
 

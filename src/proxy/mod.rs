@@ -699,9 +699,11 @@ pub(crate) fn stamp_original_response_metadata(
     }
     ctx.metadata
         .remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
-    if let Some(content_length) = response_headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
+    // The canonical folded-field parser: agreeing repeats (`512, 512`) are one
+    // exact length, while disagreeing, malformed, or signed members are no
+    // length at all, exactly as every size decision reads the field.
+    if let Some(crate::util::body_limit::ContentLength::Exact(content_length)) =
+        crate::util::body_limit::declared_content_length(response_headers)
     {
         ctx.metadata.insert(
             ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
@@ -35692,8 +35694,9 @@ async fn handle_proxy_request_inner(
     // than the global one bounds unbuffered uploads and buffered responses
     // instead of only being checked in a body hook that a streaming request
     // never reaches (`GHSA-xrfj-852f-645j`).
-    ctx.route_request_body_limit_bytes = plugin_cache_view.enforced_request_body_limit();
-    ctx.route_response_body_limit_bytes = plugin_cache_view.enforced_response_body_limit();
+    // The same stamp records whether a streaming response inspector may
+    // rewrite this route's client-visible bytes after `after_proxy`.
+    plugin_cache_view.stamp_route_body_policy(&mut ctx);
     // Folded once per request for this handler's own dispatch/collection sites.
     // `0` still means unlimited, and an absent route ceiling leaves each global
     // knob exactly as configured.

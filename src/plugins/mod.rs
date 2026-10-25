@@ -3381,6 +3381,16 @@ pub struct RequestContext {
     /// or `None` when no matched plugin enforces one. Same fold-at-use contract
     /// as [`Self::route_request_body_limit_bytes`].
     pub route_response_body_limit_bytes: Option<u64>,
+    /// Whether this request's matched plugin view can attach a streaming
+    /// response inspector that rewrites the client-visible bytes after
+    /// `after_proxy` (`PluginCapabilities::HAS_RESPONSE_STREAM_HOOKS`, e.g. an
+    /// `sse` `retry_ms` prefix or an `ai_*` stream inspector). Precomputed at
+    /// plugin-cache build and stamped with the route body ceilings by
+    /// `PluginCacheRequestView::stamp_route_body_policy`. `None` means the
+    /// context was never stamped and must be read as "may rewrite": a strict
+    /// whole-body policy then cannot treat a backend `Content-Length` as a
+    /// proof of the final size.
+    pub route_may_rewrite_response_stream: Option<bool>,
     /// Shared counter for request body bytes received from the client,
     /// populated by proxy body handlers and read by the summary builders.
     ///
@@ -4642,6 +4652,7 @@ impl RequestContext {
             inbound_request_body_may_follow: None,
             route_request_body_limit_bytes: None,
             route_response_body_limit_bytes: None,
+            route_may_rewrite_response_stream: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_request_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grpc_response_messages_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6297,6 +6308,7 @@ impl RequestContext {
             // cannot silently fall back to the global allowance.
             route_request_body_limit_bytes: self.route_request_body_limit_bytes,
             route_response_body_limit_bytes: self.route_response_body_limit_bytes,
+            route_may_rewrite_response_stream: self.route_may_rewrite_response_stream,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             grpc_request_messages_observed: Arc::clone(&self.grpc_request_messages_observed),
             grpc_response_messages_observed: Arc::clone(&self.grpc_response_messages_observed),

@@ -32522,8 +32522,11 @@ components:
             SSE streams whose complete size cannot be proven, including the
             gateway-generated mcp_gateway aggregate SSE listener (HTTP 502
             before commit). An event stream whose backend declared one exact
-            Content-Length within max_bytes, matching the pristine backend
-            response, has proven its size and is admitted.
+            Content-Length within max_bytes (agreeing repeated members count as
+            one), matching the pristine backend response, has proven its size
+            and is admitted when no streaming response inspector on the route
+            (for example an sse retry_ms prefix or an ai_* stream inspector)
+            can rewrite its bytes.
 
     FaultInjectionConfig:
       type: object

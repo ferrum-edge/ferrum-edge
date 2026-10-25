@@ -6977,6 +6977,18 @@ impl PluginCacheRequestView {
         self.enforced_response_body_limit
     }
 
+    /// Publish this view's precomputed route body policy on the request
+    /// context, before any body is forwarded, retained, or collected: the
+    /// route request/response ceilings (`GHSA-xrfj-852f-645j`) and whether a
+    /// streaming response inspector may rewrite the client-visible bytes.
+    /// Every handler (H1/H2 and native H3) stamps through this one call, so
+    /// the fields cannot drift apart. Three copies, no lookup, no allocation.
+    pub fn stamp_route_body_policy(&self, ctx: &mut RequestContext) {
+        ctx.route_request_body_limit_bytes = self.enforced_request_body_limit;
+        ctx.route_response_body_limit_bytes = self.enforced_response_body_limit;
+        ctx.route_may_rewrite_response_stream = Some(self.requires_response_stream_hooks());
+    }
+
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)
