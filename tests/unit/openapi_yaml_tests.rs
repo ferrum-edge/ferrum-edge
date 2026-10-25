@@ -17262,6 +17262,7 @@ fn mesh_plugin_config_roots_are_closed_and_match_openapi() {
         "reject_status",
         "outbound_listen_ports",
         "namespace",
+        "wildcard_match",
     ];
 
     let spec: serde_json::Value =

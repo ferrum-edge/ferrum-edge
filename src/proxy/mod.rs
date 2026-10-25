@@ -35356,6 +35356,13 @@ async fn handle_proxy_request_inner(
                             reject_status,
                             "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
                         );
+                        crate::plugins::mesh::outbound_registry::warn_http_registry_deny(
+                            request_host.as_deref(),
+                            authority_port,
+                            Some(listen_port),
+                            &ctx.client_ip,
+                            crate::plugins::mesh::outbound_registry::DENY_SOURCE_ROUTE_MISS,
+                        );
                         ctx.terminal_record.mark_counted();
                         state.request_count.fetch_add(1, Ordering::Relaxed);
                         let status =

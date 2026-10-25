@@ -3421,7 +3421,12 @@ paths:
               properties:
                 host:
                   type: string
-                  description: Destination host (FQDN or short name). Required, non-empty.
+                  description: |
+                    Destination host (FQDN or short name). Required, non-empty.
+                    May embed a port using the data-plane grammar (decimal
+                    1–65535); an explicit `port` overrides it. Any other
+                    suffix (`:0`, `:+8080`) stays part of the host and the
+                    candidate is reported as `deny`.
                 port:
                   type: integer
                   minimum: 1
@@ -3451,7 +3456,7 @@ paths:
                   dry_run:
                     type: boolean
         "400":
-          description: Malformed JSON body, empty/missing host, or port 0
+          description: Malformed JSON body, empty/missing host, or `port` 0
           content:
             application/json:
               schema:
@@ -26408,7 +26413,12 @@ components:
         Matches against four kinds of entries: bare hostnames (no Host port),
         explicit `host:port` pairs, `host:*` (any explicit Host port), and
         wildcard hosts (`*.example.com`, `*.example.com:443`,
-        `*.example.com:*`). Empty registry fails closed.
+        `*.example.com:*`). Empty registry fails closed. Request `Host`
+        ports use the registry grammar (decimal 1–65535); `:0`, signed, or
+        non-numeric ports are denied. Mesh-derived registries drop slice
+        hosts outside this grammar with a warning (they stay denied) instead
+        of failing the whole config; operator-authored entries stay strict.
+        Denials log a rate-limited warning naming the denied host.
       additionalProperties: false
       properties:
         registry:
@@ -26425,8 +26435,8 @@ components:
             Known destinations. Bare hostnames match requests with no
             explicit `Host` port. `host:port` entries match only that port.
             `host:*` entries match any explicit port. Wildcard entries
-            (`*.example.com[:port|:*]`) match one DNS label below the
-            suffix. Hostname labels use ASCII letters, digits, and interior
+            (`*.example.com[:port|:*]`) match per `wildcard_match` (one
+            DNS label below the suffix by default). Hostname labels use ASCII letters, digits, and interior
             hyphens; supply internationalized names in punycode. IPv4 names
             and IPv6 literals are supported; bracket IPv6 when specifying a
             numeric port. Bare IPv6 and IPv6:* are also accepted.
@@ -26472,6 +26482,23 @@ components:
             explicitly supplies the runtime namespace. Direct instances use
             this config value (default ferrum), independently of the enclosing
             PluginConfig resource namespace.
+        wildcard_match:
+          type: string
+          enum: [one_label, dns_suffix]
+          default: one_label
+          description: |
+            How `*.suffix` registry entries match request hosts.
+            `one_label` (default) matches exactly one DNS label below the
+            suffix (`api.example.com`, not `a.b.example.com`); this is the
+            Ferrum mesh wildcard contract shared with Sidecar egress scoping,
+            the mesh DNS proxy, and the stream-family REGISTRY_ONLY lane, so
+            mesh auto-injection always uses it. `dns_suffix` matches any DNS
+            name below the suffix (`a.b.example.com` too), like Envoy
+            virtual-host domains and Istio's host matcher. The base domain
+            never matches either mode. In `dns_suffix` mode an authority
+            over 253 bytes or with an empty label never matches a wildcard,
+            and probing stops at the deepest configured suffix's label
+            count.
 
     MeshRouteDispatchConfig:
       type: object
