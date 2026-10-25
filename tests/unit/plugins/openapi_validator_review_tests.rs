@@ -169,6 +169,111 @@ async fn cookie_parameter_is_validated() {
     );
 }
 
+fn wire_headers(pairs: &[(&'static str, &'static str)]) -> http::HeaderMap {
+    let mut map = http::HeaderMap::new();
+    for &(name, value) in pairs {
+        map.append(name, http::HeaderValue::from_static(value));
+    }
+    map
+}
+
+#[tokio::test]
+async fn header_parameters_are_read_from_the_pristine_wire_headers() {
+    let plugin = OpenapiValidator::new(&orders_parameter_config("block")).unwrap();
+
+    // An earlier before_proxy hook (e.g. a request_transformer with a lower
+    // priority_override) ADDED the required header to the mutable map: the
+    // client never sent it, so the request is still refused.
+    let mut ctx = ctx_for("GET", "/orders/5");
+    ctx.set_raw_headers(wire_headers(&[]));
+    let mut transformed = HashMap::from([("x-tenant-id".to_string(), "acme".to_string())]);
+    assert_reject(
+        plugin.before_proxy(&mut ctx, &mut transformed).await,
+        Some(400),
+    );
+    assert_eq!(
+        request_error(&ctx),
+        Some("Required header parameter 'X-Tenant-Id' is missing")
+    );
+
+    // An earlier hook REMOVED or rewrote an invalid client value: the client's
+    // own value is what is validated.
+    let mut ctx = ctx_for("GET", "/orders/5");
+    ctx.set_raw_headers(wire_headers(&[("x-tenant-id", "NOT VALID")]));
+    let mut transformed = HashMap::from([("x-tenant-id".to_string(), "acme".to_string())]);
+    assert_reject(
+        plugin.before_proxy(&mut ctx, &mut transformed).await,
+        Some(400),
+    );
+
+    // Same for cookies.
+    let mut ctx = ctx_for("GET", "/orders/5");
+    ctx.set_raw_headers(wire_headers(&[
+        ("x-tenant-id", "acme"),
+        ("cookie", "session=ab"),
+    ]));
+    let mut transformed = HashMap::from([
+        ("x-tenant-id".to_string(), "acme".to_string()),
+        ("cookie".to_string(), "session=abcdef".to_string()),
+    ]);
+    assert_reject(
+        plugin.before_proxy(&mut ctx, &mut transformed).await,
+        Some(400),
+    );
+
+    // A conforming client request passes whatever the mutable map says, and
+    // repeated cookie field lines are folded like the gateway folds them.
+    let mut ctx = ctx_for("GET", "/orders/5");
+    ctx.set_raw_headers(wire_headers(&[
+        ("x-tenant-id", "acme"),
+        ("cookie", "theme=dark"),
+        ("cookie", "session=abcdef"),
+    ]));
+    let mut transformed = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut transformed).await);
+}
+
+#[tokio::test]
+async fn cookie_parameters_are_percent_decoded_per_form_serialization() {
+    let plugin = OpenapiValidator::new(&json!({
+        "schema_draft": "draft2020-12",
+        "operations": [{
+            "method": "GET", "path_template": "/c", "path_regex": "^/c$",
+            "parameters": [
+                {"name": "tag", "in": "cookie",
+                 "schema": {"type": "string", "enum": ["a,b", "a+b"], "maxLength": 3}},
+                {"name": "ids", "in": "cookie", "explode": false,
+                 "schema": {"type": "array", "items": {"type": "string", "maxLength": 3}}}
+            ]
+        }]
+    }))
+    .unwrap();
+    let run = |cookie: &str| {
+        let mut ctx = ctx_for("GET", "/c");
+        ctx.headers.insert("cookie".to_string(), cookie.to_string());
+        ctx
+    };
+    for (cookie, accepted) in [
+        ("tag=a%2Cb", true),
+        ("tag=a+b", true),
+        ("tag=a%2Bb", true),
+        ("tag=a%2", false),
+        ("tag=%zz", false),
+        ("tag=%FF", false),
+        // Delimiters are found before decoding: `%2C` stays inside one item.
+        ("ids=a%2Cb,c", true),
+        ("ids=a%2Cbc", false),
+    ] {
+        let mut ctx = run(cookie);
+        let result = run_before_proxy(&plugin, &mut ctx).await;
+        if accepted {
+            assert_continue(result);
+        } else {
+            assert_reject(result, Some(400));
+        }
+    }
+}
+
 #[tokio::test]
 async fn parameter_violations_follow_mode_and_validate_request() {
     let plugin = OpenapiValidator::new(&orders_parameter_config("log_only")).unwrap();
@@ -615,20 +720,28 @@ fn body_decoding_is_charged_to_the_decode_budget_and_released() {
     // Identity bodies never touch the budget.
     assert_eq!(
         openapi_validator_decode_body_in(&tight, Some("identity"), &plaintext, 1024 * 1024),
-        Ok(plaintext.clone())
+        Ok((plaintext.clone(), UNIT))
     );
 
     let generous =
         ResponseBufferBudgetProbe::new(UNIT, RESPONSE_DECODE_BROTLI_SCRATCH_BYTES + 64 * UNIT);
     let total = generous.available_bytes();
+    let (decoded, available_while_held) =
+        openapi_validator_decode_body_in(&generous, Some("gzip"), &encoded, 1024 * 1024)
+            .expect("gzip body decodes");
+    assert_eq!(decoded, plaintext);
+    // The surviving plaintext stays charged while it is inspected (one block
+    // covers this small body); only the transient decoder working set is
+    // returned before inspection.
     assert_eq!(
-        openapi_validator_decode_body_in(&generous, Some("gzip"), &encoded, 1024 * 1024),
-        Ok(plaintext)
+        available_while_held,
+        total - UNIT,
+        "decoded plaintext must stay charged during inspection"
     );
     assert_eq!(
         generous.available_bytes(),
         total,
-        "the decode working set is released when the plaintext is handed back"
+        "the plaintext's charge is released when inspection ends"
     );
 
     // Representation faults keep the fixed, payload-free category.
@@ -845,6 +958,58 @@ async fn declared_event_stream_responses_are_released_while_undeclared_ones_fail
             .after_proxy(&mut ctx, 500, &mut response_headers)
             .await,
         Some(502),
+    );
+
+    // The buffered / synthetic final-body path applies the same exemption,
+    // even with a schema that raw SSE text could never satisfy.
+    let strict = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "GET", "path_template": "/events", "path_regex": "^/events$",
+            "responses": {
+                "200": {"text/event-stream": {"type": "object"},
+                        "application/json": {"type": "object"}},
+                "default": {"application/json": {"type": "object"}}
+            }
+        }]
+    }))
+    .unwrap();
+    let sse_body = b"data: {\"ok\":true}\n\n";
+    let sse_headers = content_type_headers("text/event-stream");
+    let mut ctx = ctx_for("GET", "/events");
+    assert_continue(
+        strict
+            .on_final_response_body(&mut ctx, 200, &sse_headers, sse_body)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("event_stream_declared")
+    );
+    // A relabeled (non-SSE) final representation is validated normally.
+    let mut ctx = ctx_for("GET", "/events");
+    assert_reject(
+        strict
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("application/json"),
+                b"[]",
+            )
+            .await,
+        Some(502),
+    );
+    // A status whose response object does not declare SSE is not exempted.
+    let mut ctx = ctx_for("GET", "/events");
+    let _ = strict
+        .on_final_response_body(&mut ctx, 500, &sse_headers, sse_body)
+        .await;
+    assert_ne!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("event_stream_declared")
     );
 
     // Request-side validation on the same operation still blocks.

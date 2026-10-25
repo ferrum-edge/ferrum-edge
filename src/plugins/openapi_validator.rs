@@ -39,15 +39,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
 use crate::proxy::response_buffer_budget::{
     BudgetRef, REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_STATUS,
-    RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+    RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS, ResponseBufferReservation,
 };
 use crate::util::json_dup_keys::{self, JsonScanMemo};
 use crate::util::media_type::is_concrete_http_media_type;
 use crate::util::unknown_keys::reject_unknown_keys;
 
-use super::charged_decode::{ChargedDecodeError, decode_charged_content_coding_chain};
+use super::charged_decode::{ChargedDecodeError, decode_one_coding};
 use super::utils::auth_flow::constant_time_eq;
-use super::utils::content_encoding::{DecodeLimits, parse_content_codings};
+use super::utils::content_encoding::parse_content_codings;
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -203,6 +203,9 @@ const COOKIE_PAIR_LIMIT_DETAIL: &str =
 const PARAMETER_ITEM_LIMIT_DETAIL: &str = "parameter value exceeds the item limit";
 const PARAMETER_REPEATED_DETAIL: &str = "must occur exactly once for its declared serialization";
 const PARAMETER_OBJECT_MEMBER_DETAIL: &str = "exploded object members must be name=value pairs";
+const PARAMETER_HEADER_NOT_UTF8_DETAIL: &str = "Request header parameter value is not UTF-8";
+const COOKIE_PERCENT_ENCODING_DETAIL: &str =
+    "cookie parameter value contains malformed percent-encoding";
 const BYPASS_KEYS: &[&str] = &["paths", "methods", "consumers", "header_present"];
 /// Minimum byte length of a `bypass.header_present` secret value.
 const MIN_BYPASS_HEADER_SECRET_BYTES: usize = 16;
@@ -1443,6 +1446,32 @@ impl OpenapiValidator {
         }
     }
 
+    /// Whether this response is an event stream (by its ORIGINAL
+    /// representation — the pristine backend stamp, or the live headers of a
+    /// synthetic response) that the status-selected response object of the
+    /// pinned operation itself declares. Decided from trusted operation and
+    /// representation state, never from public skip metadata.
+    fn declared_event_stream_response(
+        &self,
+        ctx: &RequestContext,
+        operation: &OperationEntry,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        original_response_is_event_stream(ctx, response_headers)
+            && operation
+                .response_validators
+                .declares_event_stream(response_status)
+    }
+
+    fn mark_event_stream_declared(&self, ctx: &mut RequestContext) {
+        self.mark_mode(ctx);
+        ctx.metadata.insert(
+            SKIP_REASON_KEY.to_string(),
+            "event_stream_declared".to_string(),
+        );
+    }
+
     /// The aggregate decode budget could not admit a body's decode working set.
     ///
     /// The representation is not at fault and no contract was evaluated, so
@@ -1537,13 +1566,22 @@ impl Plugin for OpenapiValidator {
                 if self.validate_request && !operation.entry.parameters.is_empty() {
                     // Parameters are part of the CLIENT request contract. They
                     // are read from the canonical policy path, the client's raw
-                    // query string, and this phase's header map, before any
-                    // request transformer (priority 3000+) can rewrite them.
+                    // query string, and the pristine wire header block — never
+                    // from this phase's mutable header map, which an earlier
+                    // `before_proxy` hook (for example a `request_transformer`
+                    // with a lower `priority_override`) can add to, rewrite, or
+                    // strip. The map is consulted only when no wire block was
+                    // retained (synthetic contexts).
+                    let wire_headers = ctx.raw_headers_snapshot();
+                    let header_source = match wire_headers.as_deref() {
+                        Some(wire) => ParameterHeaders::Wire(wire),
+                        None => ParameterHeaders::Map(&*headers),
+                    };
                     let result = validate_request_parameters(
                         operation.entry,
                         &ctx.path,
                         ctx.raw_query_string(),
-                        headers,
+                        header_source,
                     );
                     if let Err(detail) = result {
                         return self.handle_violation_with_status(
@@ -1719,16 +1757,14 @@ impl Plugin for OpenapiValidator {
             // recorded skip reason) instead of being refused as uninspectable.
             // An event stream the selected response object does NOT declare
             // still fails closed below. Request-side validation is unaffected.
+            // (The original representation was established as an event
+            // stream by the enclosing condition.)
             if operation.is_some_and(|operation| {
                 operation
                     .response_validators
                     .declares_event_stream(response_status)
             }) {
-                self.mark_mode(ctx);
-                ctx.metadata.insert(
-                    SKIP_REASON_KEY.to_string(),
-                    "event_stream_declared".to_string(),
-                );
+                self.mark_event_stream_declared(ctx);
                 return PluginResult::Continue;
             }
             let operation_label = operation.map(|operation| operation.operation_label.as_str());
@@ -1775,6 +1811,17 @@ impl Plugin for OpenapiValidator {
             return PluginResult::Continue;
         }
         let content_type = header_value(response_headers, "content-type");
+        // A buffered (or gateway-synthesized) event stream that the
+        // status-selected response object declares gets the same treatment as
+        // the streamed path in `after_proxy`: released unvalidated. Both the
+        // original representation and the final one must still be an event
+        // stream, so a relabeled response is validated normally.
+        if self.declared_event_stream_response(ctx, operation, response_status, response_headers)
+            && content_type.is_some_and(is_text_event_stream_media_type)
+        {
+            self.mark_event_stream_declared(ctx);
+            return PluginResult::Continue;
+        }
         let missing_schema_detail = |reason: &str| {
             // `Content-Type` is backend-controlled. Report only whether it was
             // present; never reflect its raw value into the client problem body
@@ -2221,6 +2268,48 @@ impl<'a> ParameterOccurrence<'a> {
             raw: value,
         }
     }
+
+    /// A header value. Headers carry no percent-encoding of their own, so only
+    /// `decoded` is read; `raw` (consulted solely for query / cookie
+    /// delimiters) stays empty.
+    fn decoded_only(value: Cow<'a, str>) -> Self {
+        Self {
+            decoded: value,
+            raw: "",
+        }
+    }
+}
+
+/// Where header and cookie parameter values are read from.
+#[derive(Clone, Copy)]
+enum ParameterHeaders<'a> {
+    /// The pristine wire header block the frontend retained: immune to any
+    /// `before_proxy` mutation, whatever the plugin priorities.
+    Wire(&'a http::HeaderMap),
+    /// The materialized map, used only when no wire block exists.
+    Map(&'a HashMap<String, String>),
+}
+
+impl<'a> ParameterHeaders<'a> {
+    /// The value of header `name` (lowercase), with repeated field lines
+    /// folded by `separator` exactly as the gateway materializes them.
+    fn value(self, name: &str, separator: &str) -> Result<Option<Cow<'a, str>>, String> {
+        match self {
+            Self::Map(map) => Ok(header_value(map, name).map(Cow::Borrowed)),
+            Self::Wire(map) => {
+                let mut folded: Option<Cow<'a, str>> = None;
+                for value in map.get_all(name) {
+                    let text = std::str::from_utf8(value.as_bytes())
+                        .map_err(|_| PARAMETER_HEADER_NOT_UTF8_DETAIL.to_string())?;
+                    folded = Some(match folded {
+                        None => Cow::Borrowed(text),
+                        Some(previous) => Cow::Owned(format!("{previous}{separator}{text}")),
+                    });
+                }
+                Ok(folded)
+            }
+        }
+    }
 }
 
 /// `application/x-www-form-urlencoded` component decoding, borrowing when the
@@ -2246,7 +2335,7 @@ fn validate_request_parameters(
     operation: &OperationEntry,
     path: &str,
     raw_query: Option<&str>,
-    headers: &HashMap<String, String>,
+    headers: ParameterHeaders<'_>,
 ) -> Result<(), String> {
     let path_captures = match &operation.path_parameter_regex {
         Some(regex) => Some(
@@ -2261,8 +2350,13 @@ fn validate_request_parameters(
     } else {
         Vec::new()
     };
+    let cookie_header = if operation.has_cookie_parameters {
+        headers.value("cookie", "; ")?
+    } else {
+        None
+    };
     let mut cookies = if operation.has_cookie_parameters {
-        collect_cookie_occurrences(header_value(headers, "cookie"), &operation.parameters)?
+        collect_cookie_occurrences(cookie_header.as_deref(), &operation.parameters)?
     } else {
         Vec::new()
     };
@@ -2277,8 +2371,9 @@ fn validate_request_parameters(
             ParameterLocation::Query => {
                 query.get_mut(index).map(std::mem::take).unwrap_or_default()
             }
-            ParameterLocation::Header => header_value(headers, &parameter.lookup_name)
-                .map(|value| vec![ParameterOccurrence::verbatim(value)])
+            ParameterLocation::Header => headers
+                .value(&parameter.lookup_name, ", ")?
+                .map(|value| vec![ParameterOccurrence::decoded_only(value)])
                 .unwrap_or_default(),
             ParameterLocation::Cookie => cookies
                 .get_mut(index)
@@ -2322,8 +2417,23 @@ fn collect_query_occurrences<'a>(
     Ok(out)
 }
 
+/// Undo the RFC 6570 percent-encoding of a `form`-style cookie component.
+///
+/// Unlike query decoding, `+` is literal data (no plus-to-space). A truncated
+/// or non-hex escape, or an escape sequence that is not UTF-8, fails closed.
+fn decode_cookie_component(raw: &str) -> Result<Cow<'_, str>, String> {
+    if !raw.contains('%') {
+        return Ok(Cow::Borrowed(raw));
+    }
+    validate_percent_encoding(raw).map_err(|_| COOKIE_PERCENT_ENCODING_DETAIL.to_string())?;
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map_err(|_| COOKIE_PERCENT_ENCODING_DETAIL.to_string())
+}
+
 /// Bounded scan of the `Cookie` header, retaining only declared cookie
-/// parameters, indexed like `parameters`. Cookie names match exactly.
+/// parameters, indexed like `parameters`. Cookie names match exactly; values
+/// are percent-decoded per the `form` serialization.
 fn collect_cookie_occurrences<'a>(
     cookie_header: Option<&'a str>,
     parameters: &[ParameterValidator],
@@ -2344,7 +2454,10 @@ fn collect_cookie_occurrences<'a>(
         let value = value.trim();
         for (slot, parameter) in out.iter_mut().zip(parameters) {
             if parameter.location == ParameterLocation::Cookie && parameter.name == name {
-                slot.push(ParameterOccurrence::verbatim(value));
+                slot.push(ParameterOccurrence {
+                    decoded: decode_cookie_component(value)?,
+                    raw: value,
+                });
             }
         }
     }
@@ -2439,9 +2552,10 @@ fn delimited_parameter_tokens(
     location: ParameterLocation,
     occurrence: &ParameterOccurrence<'_>,
 ) -> Result<Vec<String>, String> {
-    // Query delimiters are found on the wire spelling, before decoding; the
-    // other locations carry no percent-encoding of their own.
-    let source: &str = if location == ParameterLocation::Query {
+    // Query and cookie delimiters are found on the wire spelling, before
+    // decoding, so an encoded `%2C` stays item data; path and header values
+    // carry no percent-encoding of their own.
+    let source: &str = if location.uses_form_style() {
         occurrence.raw
     } else {
         &occurrence.decoded
@@ -2456,9 +2570,10 @@ fn delimited_parameter_tokens(
         }
         tokens.push(match location {
             ParameterLocation::Query => decode_query_component(token).into_owned(),
+            ParameterLocation::Cookie => decode_cookie_component(token)?.into_owned(),
             // HTTP list members carry optional whitespace around the comma.
             ParameterLocation::Header => token.trim().to_string(),
-            ParameterLocation::Path | ParameterLocation::Cookie => token.to_string(),
+            ParameterLocation::Path => token.to_string(),
         });
     }
     Ok(tokens)
@@ -3339,27 +3454,51 @@ enum MediaFailure {
 const DECODE_CAPACITY_DETAIL: &str = "Body decode capacity is temporarily exhausted";
 const CONTENT_ENCODING_DETAIL: &str = "Content-Encoding could not be decoded";
 
+/// A body ready for inspection: the original bytes, or decoded plaintext that
+/// carries its own aggregate-budget charge.
+enum DecodedBody<'a> {
+    Identity(&'a [u8]),
+    /// The reservation is held for exactly as long as the plaintext: it is
+    /// dropped together with the buffer when inspection ends, on success,
+    /// conversion failure, and schema rejection alike, so concurrent
+    /// validations cannot each keep an uncharged plaintext resident.
+    Charged {
+        plaintext: Vec<u8>,
+        _reservation: ResponseBufferReservation,
+    },
+}
+
+impl DecodedBody<'_> {
+    fn as_bytes(&self) -> &[u8] {
+        match *self {
+            Self::Identity(body) => body,
+            Self::Charged { ref plaintext, .. } => plaintext.as_slice(),
+        }
+    }
+}
+
 /// Undo `Content-Encoding` for validation through the strict, budget-charged
-/// decoder shared with the representation gates.
+/// codec primitive shared with the representation gates.
 ///
-/// The decode working set (the active decoder's heap and every output growth)
-/// is reserved against `budget` BEFORE it is allocated, so concurrent
-/// validations of small, highly compressed bodies are bounded by the
-/// process-wide decode budget rather than only per request. A refused
-/// reservation is [`MediaFailure::Capacity`], not a representation error.
+/// The decode working set (the active decoder's heap, every output growth, and
+/// a stacked list's still-resident previous pass) is reserved against `budget`
+/// BEFORE it is allocated. The reservation is then narrowed to the surviving
+/// plaintext's capacity and returned WITH it, so the plaintext stays charged
+/// while it is parsed, converted, and validated. A refused reservation is
+/// [`MediaFailure::Capacity`], not a representation error.
 fn decode_body<'a>(
     headers: &HashMap<String, String>,
     body: &'a [u8],
     max_body_bytes: usize,
     budget: BudgetRef<'_>,
-) -> Result<Cow<'a, [u8]>, MediaFailure> {
+) -> Result<DecodedBody<'a>, MediaFailure> {
     if body.len() > max_body_bytes {
         return Err(MediaFailure::Violation(format!(
             "Body exceeds max_body_bytes of {max_body_bytes} bytes"
         )));
     }
     let Some(header) = header_value(headers, "content-encoding") else {
-        return Ok(Cow::Borrowed(body));
+        return Ok(DecodedBody::Identity(body));
     };
     // Every refusal collapses to a fixed category at this plugin boundary so
     // neither the request problem body nor transaction metadata can reproduce
@@ -3370,41 +3509,84 @@ fn decode_body<'a>(
         return Err(violation());
     }
     if codings.iter().all(|coding| coding == "identity") {
-        return Ok(Cow::Borrowed(body));
+        return Ok(DecodedBody::Identity(body));
     }
     if codings.iter().any(|coding| coding == "identity") {
         return Err(violation());
     }
     // Enforce `max_body_bytes` on every decoded layer. Cumulative work is capped
     // at layers × max so a stacked chain cannot bypass the per-layer ceiling.
-    let limits = DecodeLimits {
-        max_decoded_bytes: max_body_bytes,
-        max_cumulative_bytes: max_body_bytes.saturating_mul(MAX_CONTENT_CODINGS),
-        max_codings: MAX_CONTENT_CODINGS,
-        max_amplification_ratio: 0,
+    let max_cumulative_bytes = max_body_bytes.saturating_mul(MAX_CONTENT_CODINGS);
+    let mut reservation = ResponseBufferReservation::new();
+    let mut current: Option<Vec<u8>> = None;
+    let mut cumulative = 0usize;
+    for coding in codings.iter().rev() {
+        // The previous pass's buffer is this pass's input and stays resident
+        // for the whole pass, so it is charged concurrently with the output.
+        // The reservation only grows, so it holds the peak across passes.
+        let (input, concurrent) = match current.as_ref() {
+            Some(previous) => (previous.as_slice(), previous.capacity()),
+            None => (body, 0),
+        };
+        let decoded = decode_one_coding(
+            coding,
+            input,
+            max_body_bytes,
+            concurrent,
+            &mut reservation,
+            budget,
+        )
+        .map_err(charged_decode_failure)?;
+        cumulative = cumulative.saturating_add(decoded.len());
+        if cumulative > max_cumulative_bytes {
+            return Err(violation());
+        }
+        current = Some(decoded);
+    }
+    let Some(plaintext) = current else {
+        return Err(violation());
     };
-    match decode_charged_content_coding_chain(&codings, body, limits, budget) {
-        Ok(plaintext) => Ok(Cow::Owned(plaintext)),
-        Err(ChargedDecodeError::CapacityRefused) => Err(MediaFailure::Capacity),
-        Err(_) => Err(violation()),
+    // Confirm the charge covers the surviving allocation's actual capacity,
+    // then hand back the transient peak surplus: what stays charged during
+    // inspection is the plaintext itself.
+    if !reservation.reserve_in(budget, plaintext.capacity())
+        || !reservation.narrow_to_covered(plaintext.capacity())
+    {
+        return Err(MediaFailure::Capacity);
+    }
+    Ok(DecodedBody::Charged {
+        plaintext,
+        _reservation: reservation,
+    })
+}
+
+/// Map a charged-codec refusal: a refused reservation is gateway capacity,
+/// every other refusal a fixed-category representation violation.
+fn charged_decode_failure(error: ChargedDecodeError) -> MediaFailure {
+    match error {
+        ChargedDecodeError::CapacityRefused => MediaFailure::Capacity,
+        _ => MediaFailure::Violation(CONTENT_ENCODING_DETAIL.to_string()),
     }
 }
 
-/// External-test seam: run [`decode_body`] against a caller-supplied budget.
-/// `Err(None)` is the capacity refusal; `Err(Some(detail))` a violation.
+/// External-test seam: run [`decode_body`] against a caller-supplied budget
+/// and call `inspect` while the decoded body (and its charge) is still alive,
+/// as validation does. `Err(None)` is the capacity refusal;
+/// `Err(Some(detail))` a violation.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
-pub(crate) fn decode_body_for_test(
+pub(crate) fn decode_body_for_test<R>(
     content_encoding: Option<&str>,
     body: &[u8],
     max_body_bytes: usize,
     budget: BudgetRef<'_>,
-) -> Result<Vec<u8>, Option<String>> {
+    inspect: impl FnOnce(&[u8]) -> R,
+) -> Result<R, Option<String>> {
     let mut headers = HashMap::new();
     if let Some(value) = content_encoding {
         headers.insert("content-encoding".to_string(), value.to_string());
     }
     match decode_body(&headers, body, max_body_bytes, budget) {
-        Ok(decoded) => Ok(decoded.into_owned()),
+        Ok(decoded) => Ok(inspect(decoded.as_bytes())),
         Err(MediaFailure::Capacity) => Err(None),
         Err(MediaFailure::Violation(detail)) => Err(Some(detail)),
     }
@@ -3465,8 +3647,10 @@ fn validate_media_body(
         }
         Err(MediaFailure::Capacity) => return Err(MediaFailure::Capacity),
     };
+    // `decoded` (and any decode charge it carries) lives until this function
+    // returns, i.e. through conversion and schema validation.
     let instance =
-        body_to_schema_instance(decoded.as_ref(), content_type, validator, json_scan_memo)
+        body_to_schema_instance(decoded.as_bytes(), content_type, validator, json_scan_memo)
             .map_err(|error| MediaFailure::Violation(side_detail(error)))?;
     match instance {
         SchemaInstance::Value(instance) => {

@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing required parameters, repeated scalars, unconvertible values, and
   schema failures are `400` (`Request parameter validation failed`) with
   value-free diagnostics, and query / cookie scans are bounded at 1024 pairs.
+  Header and cookie values come from the pristine wire headers, so an earlier
+  `before_proxy` hook cannot satisfy or erase a client parameter; cookie values
+  are percent-decoded per the `form` serialization.
   The supported subset is each location's default serialization (`simple` /
   `form`) over scalar, array, and object-of-scalar schemas; other styles are
   rejected at construction, and the importer omits an unsupported optional

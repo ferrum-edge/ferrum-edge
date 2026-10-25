@@ -32211,8 +32211,10 @@ components:
         construction (the importer omits such a parameter when it is optional
         and refuses the import when it is required). Path values come from the
         canonical request path, query values from the client's raw query string
-        (at most 1024 pairs), header values from the request headers, and
-        cookie values from the `Cookie` header (at most 1024 pairs); a value
+        (at most 1024 pairs), header values from the pristine wire request
+        headers (never a header map an earlier `before_proxy` hook mutated),
+        and cookie values from the wire `Cookie` header, percent-decoded per
+        the `form` serialization (at most 1024 pairs); a value
         that repeats for a non-array schema, a missing required parameter, a
         value that cannot be converted, or a schema failure is a request
         violation with `error_response.request_status_code` and the problem

@@ -2951,7 +2951,18 @@ fn extract_operation_parameters(
             }
             // An optional parameter the validator cannot deserialize stays
             // unvalidated, exactly as before parameter validation existed.
-            Err(_) => continue,
+            // The omission is announced at import time (spec-declared names
+            // only, never request data) and documented in the guide.
+            Err(reason) => {
+                tracing::warn!(
+                    operation = %location,
+                    parameter = %name,
+                    location = %location_in,
+                    %reason,
+                    "x-ferrum-validate: optional parameter is not validated by openapi_validator"
+                );
+                continue;
+            }
         };
         let mut entry = Map::new();
         entry.insert("name".to_string(), Value::String(name.to_string()));
