@@ -381,6 +381,9 @@ pub(crate) struct StagedCompression {
     /// without markers to remove); only the observed counters are reused.
     output: Option<Vec<u8>>,
     stats: Option<CompressionStats>,
+    /// Why statistical work was skipped for the staged result, restored with
+    /// the stage so wire-path reuse keeps the authoritative skip reason.
+    skipped: Option<SkipReason>,
 }
 
 struct CompressionOutput {
@@ -1090,27 +1093,40 @@ impl AiPromptCompressor {
     /// Verify that the exact final representation carries no configured marker
     /// in an admitted string value. Bounded like sanitation itself: the body
     /// ceiling and the non-waiting sanitation lane both fail closed.
+    ///
+    /// `decoded` is the representation gate's charged plaintext view of a
+    /// content-coded body, and `body` the finalized bytes otherwise. The
+    /// charged owner is MOVED into the worker (an `O(1)` share of the one
+    /// charged allocation), so no uncharged duplicate of an amplified body is
+    /// minted and the charge is held until the worker finishes, even if the
+    /// awaiting request is dropped. Only an originally borrowed plaintext body
+    /// is copied.
     async fn verify_final_markers(
         &self,
+        decoded: Option<bytes::Bytes>,
         body: &[u8],
         request_path: Option<&str>,
     ) -> Result<(), MarkerSanitizationError> {
         if self.preserve_tags.is_none() {
             return Ok(());
         }
-        if body.len() > HARD_MAX_SCAN_BYTES {
+        let view: &[u8] = decoded.as_deref().unwrap_or(body);
+        if view.len() > HARD_MAX_SCAN_BYTES {
             return Err(MarkerSanitizationError::BodyTooLarge);
         }
         // Every marker begins with `<`, which a JSON string can only spell as a
-        // literal byte or a `<` escape. Without either, no marker exists.
-        if !may_contain_marker_start(body) {
+        // literal byte or a `\u003c` escape. Without either, no marker exists.
+        if !may_contain_marker_start(view) {
             return Ok(());
         }
         let permit = Arc::clone(&MARKER_SANITIZATION_BUDGET)
             .try_acquire_owned()
             .map_err(|_| MarkerSanitizationError::WorkerUnavailable)?;
         let worker = self.clone();
-        let body = body.to_vec();
+        let body = match decoded {
+            Some(charged) => charged,
+            None => bytes::Bytes::copy_from_slice(body),
+        };
         let request_path = request_path.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -1690,7 +1706,7 @@ fn strip_markers_from_json_strings_once(body: &[u8], tags: &(String, String)) ->
 }
 
 /// Cheap linear pre-check: every configured marker starts with `<`, which a
-/// JSON string can spell only as a literal byte or a `<` escape.
+/// JSON string can spell only as a literal byte or a `\u003c` escape.
 fn may_contain_marker_start(body: &[u8]) -> bool {
     body.contains(&b'<')
         || body
@@ -2068,6 +2084,21 @@ impl Plugin for AiPromptCompressor {
         }
 
         let sampled = self.sampled(ctx);
+        if !ctx.metadata.contains_key("request_body") {
+            // A declared oversized candidate deliberately bypasses buffering
+            // without a preserve tag; record why it was not compressed.
+            if self.preserve_tags.is_none()
+                && content_length_exceeds(&ctx.headers, self.max_scan_bytes)
+                && (self.request_family != RequestFamilyPolicy::Auto
+                    || self
+                        .classification_path(ctx)
+                        .and_then(standard_path_family)
+                        .is_some())
+            {
+                record_skip_metadata(ctx, &self.metadata_keys, SkipReason::WorkLimit);
+            }
+            return PluginResult::Continue;
+        }
         let Some(body) = ctx.metadata.get("request_body") else {
             return PluginResult::Continue;
         };
@@ -2083,7 +2114,8 @@ impl Plugin for AiPromptCompressor {
             Ok(attempt) => attempt,
             Err(error) => return marker_sanitization_reject(error),
         };
-        if let Some(reason) = attempt.skipped {
+        let skipped = attempt.skipped;
+        if let Some(reason) = skipped {
             record_skip_metadata(ctx, &self.metadata_keys, reason);
         }
         let Some(compression) = attempt.output else {
@@ -2111,6 +2143,7 @@ impl Plugin for AiPromptCompressor {
                             source_sha256: compression.source_sha256,
                             output: Some(output),
                             stats: compression.stats.clone(),
+                            skipped,
                         },
                     );
                 } else if let Some(state) = ctx.plugin_state_opt_mut() {
@@ -2127,6 +2160,7 @@ impl Plugin for AiPromptCompressor {
                         source_sha256: compression.source_sha256,
                         output: None,
                         stats: compression.stats.clone(),
+                        skipped,
                     },
                 );
             }
@@ -2208,6 +2242,9 @@ impl Plugin for AiPromptCompressor {
                 if let Some(stats) = staged.stats.as_ref() {
                     record_stats_metadata(ctx, &self.metadata_keys, stats);
                 }
+                if let Some(reason) = staged.skipped {
+                    record_skip_metadata(ctx, &self.metadata_keys, reason);
+                }
                 return staged.output;
             }
         } else if let Some(state) = ctx.plugin_state_opt_mut() {
@@ -2263,8 +2300,7 @@ impl Plugin for AiPromptCompressor {
                 let result = if decoded.is_none() && has_non_identity_content_encoding(headers) {
                     Err(MarkerSanitizationError::Unsanitizable)
                 } else {
-                    let view: &[u8] = decoded.as_deref().unwrap_or(body);
-                    self.verify_final_markers(view, self.classification_path(ctx))
+                    self.verify_final_markers(decoded, body, self.classification_path(ctx))
                         .await
                 };
                 match result {
@@ -2448,8 +2484,7 @@ fn optional_usize(config: &Value, field: &'static str) -> Result<Option<usize>, 
                     Some(float)
                         if float.is_finite()
                             && float.fract() == 0.0
-                            && float >= 0.0
-                            && float <= MAX_INTEGRAL_FLOAT =>
+                            && (0.0..=MAX_INTEGRAL_FLOAT).contains(&float) =>
                     {
                         float as u64
                     }

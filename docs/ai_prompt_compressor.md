@@ -343,7 +343,10 @@ other than ordinary ineligibility, the instance records
   output bound;
 - `not_sampled` — the request fell outside `sample_rate`.
 
-A short, ineligible, or within-budget request records no skip reason.
+A short, ineligible, or within-budget request records no skip reason. The
+reason survives reuse of a staged `before_proxy` result on the wire, and a
+declared-oversized candidate that bypasses buffering (no `preserve_tag`)
+records `work_limit` from `before_proxy`.
 
 ## Safety and limitations
 

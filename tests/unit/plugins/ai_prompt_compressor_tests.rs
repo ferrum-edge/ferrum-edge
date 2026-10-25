@@ -2107,7 +2107,7 @@ async fn marker_removal_reaches_a_fixpoint_on_the_fallback_path() {
     assert_eq!(compressed_content(&out), "secret");
 
     // The escaped spelling synthesizes a literal marker the next pass removes.
-    let raw = br#"{"messages":[{"role":"user","content":"<ke<keep>ep>secret"}]}"#;
+    let raw = br#"{"messages":[{"role":"user","content":"<ke\u003ckeep\u003eep>secret"}]}"#;
     let output = plugin
         .transform_request_body(raw, Some("application/json"), &json_headers())
         .await
@@ -2117,13 +2117,36 @@ async fn marker_removal_reaches_a_fixpoint_on_the_fallback_path() {
         br#"{"messages":[{"role":"user","content":"secret"}]}"#.to_vec()
     );
 
-    // The statistical path's reserialized output reaches the same fixpoint.
+    // Below-floor cleanup reaches the same fixpoint.
     let plugin = AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap();
     let nested = format!("{}secret", self_synthesizing_marker(4));
     let out = transform(&plugin, &chat_body("user", &nested))
         .await
         .expect("markers must be removed");
     assert_eq!(compressed_content(&out), "secret");
+
+    // So does genuine statistical compression with a synthesizing marker.
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 1,
+        "target_ratio": 0.5
+    }))
+    .unwrap();
+    let prose = format!(
+        "{} {}secret",
+        long_prompt_text(),
+        self_synthesizing_marker(4)
+    );
+    let out = transform(&plugin, &chat_body("user", &prose))
+        .await
+        .expect("statistical compression should apply");
+    let compressed = compressed_content(&out);
+    assert!(!compressed.contains("<keep>") && !compressed.contains("</keep>"));
+    assert!(compressed.contains("secret"));
+    assert!(
+        compressed.chars().count() < prose.chars().count(),
+        "fixture must exercise statistical compression: {compressed:?}"
+    );
 }
 
 #[tokio::test]
@@ -2271,7 +2294,11 @@ async fn final_marker_check_leaves_unadmitted_and_member_name_markers_alone() {
 
     // Escaped markers in values are still found.
     let mut ctx = post_ctx(&chat_body("user", "plain"));
-    let raw = br#"{"messages":[{"role":"user","content":"<keep>value"}]}"#;
+    let raw = br#"{"messages":[{"role":"user","content":"\u003Ckeep\u003Evalue"}]}"#;
+    assert!(
+        !raw.contains(&b'<'),
+        "fixture must exercise the escaped pre-scan"
+    );
     assert_reject(
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, raw)
@@ -2632,4 +2659,86 @@ async fn anthropic_messages_family_compresses_system_and_text_blocks() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn staged_marker_cleanup_keeps_its_skip_reason_through_the_wire_stage() {
+    // PR6854-SOL-2: before_proxy stages a marker-only result skipped for
+    // `work_limit`; reusing that stage on the wire must keep the reason.
+    let plugin =
+        AiPromptCompressor::new(&json!({"preserve_tag": "keep", "max_scan_bytes": 1})).unwrap();
+    let body = chat_body("user", "<keep>critical</keep>");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        instance_metadata_value(&ctx, ".skipped"),
+        Some("work_limit")
+    );
+
+    let output = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("the staged marker-free body is reused");
+    let parsed: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(first_message_content(&parsed), "critical");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &output)
+            .await,
+    );
+    assert_eq!(
+        instance_metadata_value(&ctx, ".skipped"),
+        Some("work_limit"),
+        "staged reuse must restore the authoritative skip reason"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn declared_oversized_unbuffered_candidate_records_work_limit() {
+    let plugin = AiPromptCompressor::new(&json!({"max_scan_bytes": 100})).unwrap();
+    let mut ctx = post_ctx(&chat_body("user", "placeholder"));
+    ctx.metadata.remove("request_body");
+    ctx.headers
+        .insert("content-length".to_string(), "1000".to_string());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        instance_metadata_value(&ctx, ".skipped"),
+        Some("work_limit")
+    );
+
+    // An unrelated operation path is not a candidate and records nothing.
+    let mut other = post_ctx(&chat_body("user", "placeholder"));
+    other.metadata.remove("request_body");
+    other.path = "/v1/images/generations".to_string();
+    other
+        .headers
+        .insert("content-length".to_string(), "1000".to_string());
+    assert_continue(plugin.before_proxy(&mut other, &mut headers).await);
+    assert_eq!(instance_metadata_value(&other, ".skipped"), None);
+}
+
+#[test]
+fn final_marker_verification_moves_the_charged_decoded_view() {
+    // PR6854-SOL-3: copying the gate's charged plaintext view out would mint
+    // an uncharged duplicate of an attacker-amplified body.
+    let source = include_str!("../../../src/plugins/ai_prompt_compressor.rs");
+    let verifier = source
+        .split_once("async fn verify_final_markers(")
+        .and_then(|(_, rest)| rest.split_once("fn verify_final_markers_blocking"))
+        .map(|(body, _)| body)
+        .expect("final marker verifier source region");
+    assert!(verifier.contains("decoded: Option<bytes::Bytes>"));
+    assert!(verifier.contains("Some(charged) => charged"));
+    assert!(!verifier.contains(".to_vec()"));
+    let hook = source
+        .split_once("async fn on_final_request_body_with_context(")
+        .map(|(_, rest)| rest)
+        .expect("final hook source region");
+    assert!(hook.contains("inspectable_final_request_body_owned()"));
 }
