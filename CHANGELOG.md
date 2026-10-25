@@ -8,14 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **`waf` records the matched field names.** `waf.matched_fields` lists the
-  `query:` / `header:` / `cookie:` / `response_header:` NAMES that rule hits
-  came from (percent-encoded, at most 16 per scan, each cut at 128 bytes;
-  detection-band hits in `waf.detection_matched_fields`) so a
-  false positive can be tuned with `rule_overrides.<id>.exclude` without
-  reproducing the request. Values are never recorded. JSON-path-only policies
-  no longer normalize the entire raw body when no whole-body text rule or
-  encoding special consumes it.
 - **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
   `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
   most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
@@ -435,50 +427,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `waf` inspects gRPC bodies message by message** (issue n/a,
-  PR #6813). A framed gRPC or
-  gRPC-Web body the WAF scans (the `+json` codecs by default) was scanned as
-  one stream, so every `body_json_path` rule saw invalid JSON and passed an
-  ordinary `application/grpc+json` call, and a `grpc-encoding`-compressed
-  message reached the backend as octets no rule could read. Bodies are now
-  split into their length-prefixed messages (gRPC-Web text is base64-decoded
-  first) and every rule runs per message, in both directions, while the text
-  rules also keep scanning the complete wire body; the wire bytes
-  are unchanged. A framing defect never reverts to a whole-document scan: the
-  complete messages before it are scanned and the defect is refused under an
-  enforcing body policy (`grpc_malformed_framing`). A compressed message, or more than 1024 messages, is refused
-  when an enforcing body policy applies
-  (`waf.block_reason=grpc_message_uninspectable`) and recorded as
-  `waf.body_uninspected=grpc_compressed` / `grpc_message_count` otherwise.
-- **`waf` judges a bounded response relabeled `text/event-stream`.** The final
-  response-body phase skipped every `text/event-stream` body, so a finite
-  `text/plain` response wrapped by the `sse` plugin's `wrap_non_sse_responses`
-  (or relabeled by a response transformer) escaped both the response-body
-  rules and `on_unlisted_response_content_type`. Only a pristine origin event
-  stream is skipped now; a relabeled body is judged by the scan scope of the
-  origin media type, and the representation claim uses the same origin type
-  so an origin `Content-Encoding` is decoded (or refused) before the scan.
-- **BREAKING — `waf` governs request bodies on every method** (issue n/a,
-  PR #6813). Bodies were buffered and
-  scanned only for `body_methods`, so a payload an enforcing rule refused on
-  `POST` reached a body-parsing backend unscanned as `GET`/`SEARCH`/`PROPFIND`.
-  A request on any method (except `CONNECT`) is now governed whenever a body
-  may follow its head: a `Content-Type`, declared HTTP/1.1 framing, an HTTP/2
-  HEADERS frame without END_STREAM, or any HTTP/3 request (the transport's own
-  end-of-stream evidence, recorded on the request context, so omitting
-  `Content-Length` / `Content-Type` is no bypass). Any non-empty finalized body
-  is decided; `body_methods` now names methods that are always buffered.
-  `body_methods: []` no longer stops `on_unlisted_content_type: block` from
-  being an admission enforcement path.
-- **`waf` `global_exemptions.header_present` also suppresses the strict
-  `block` dispositions** of `on_body_too_large`, `on_unlisted_content_type`,
-  and `on_unlisted_response_content_type`, and `on_scan_timeout: block` (HTTP
-  and WebSocket), matching the
-  rule hits and `fail_closed` decisions it already suppressed.
-- **BREAKING — `waf` rejects non-canonical `global_exemptions.paths`** (issue
-  n/a, PR #6813): exact and `prefix*`
-  entries at construction, as `conditions.paths` already did; such an entry
-  could never match the canonical request path and silently exempted nothing.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with

@@ -358,33 +358,6 @@ These plugin fields are now refused at admission above a hard ceiling:
 
 An omitted `body_validator` value inherited from a larger `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` is clamped to the ceiling instead of refused. Lower any configured value above its ceiling before upgrading; otherwise the plugin config is rejected (`400` on the Admin API, startup failure in file mode).
 
-### `waf` governs bodies on every method and inspects gRPC per message (PR #6813)
-
-- Request bodies are no longer gated by `body_methods`: a request on any
-  method except `CONNECT` is buffered and scanned whenever a body may follow
-  its head (a `Content-Type`, HTTP/1.1 `Content-Length` > 0 /
-  `Transfer-Encoding`, an HTTP/2 HEADERS frame without END_STREAM, or any
-  HTTP/3 request), and any non-empty finalized body is decided. Under an
-  enforcing body policy this buffers HTTP/3 `GET`s too. A `GET` / `SEARCH` / `PROPFIND` body that an enforcing rule (or
-  `on_unlisted_content_type`) would refuse on `POST` is now refused too.
-- Framed gRPC / gRPC-Web bodies the WAF scans (`application/grpc+json`,
-  `application/grpc-web+json`, or every gRPC type with `inspect_binary_body`)
-  are inspected per message. Under an enforcing body policy a
-  `grpc-encoding`-compressed message is refused (`403` /
-  `PERMISSION_DENIED`); have clients of those routes send uncompressed
-  messages, or exempt the route. A body under such a type that is not a
-  well-formed frame sequence is refused the same way rather than scanned as
-  one document.
-- A response relabeled `text/event-stream` by the `sse` plugin's
-  `wrap_non_sse_responses` (or a response transformer) is now scanned by the
-  response-body rules instead of skipped.
-- `global_exemptions.header_present` now also suppresses the `block` values of
-  `on_body_too_large`, `on_unlisted_content_type`,
-  `on_unlisted_response_content_type`, and `on_scan_timeout`.
-- Non-canonical exact or `prefix*` `global_exemptions.paths` entries (a percent
-  escape, `\`, a dot segment, or `//`) are refused at load. They never matched;
-  replace them with the canonical path.
-
 ### `waf` exemption and unlisted-content-type defaults are stricter (PR #6646)
 
 - `global_exemptions.header_present` values must be shared secrets of at
