@@ -76,6 +76,8 @@ use tracing::debug;
 use crate::util::body_limit::{ContentLength, parse_content_length};
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::prometheus_metrics::MetricsRegistry;
+use super::utils::cache_headers;
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
 use super::utils::runtime_bool_gate::GatePolicyStamp;
 use super::{Plugin, PluginResult, RequestContext};
@@ -125,6 +127,7 @@ pub const RESPONSE_CACHING_CONFIG_KEYS: &[&str] = &[
     "cache_key_include_query",
     "cacheable_methods",
     "cacheable_status_codes",
+    "ignore_request_headers",
     "invalidate_on_unsafe_methods",
     "max_entries",
     "max_entry_size_bytes",
@@ -328,66 +331,42 @@ const NEVER_CACHED_RESPONSE_HEADERS: [&str; 9] = [
 /// * `304 Not Modified` is validator metadata used to freshen an existing
 ///   stored representation (RFC 9111 §4.3.4), never a representation of its
 ///   own; storing one hands later callers an empty body under a `304` status.
+/// * `401 Unauthorized` / `407 Proxy Authentication Required` are only valid
+///   with their authentication challenge (RFC 9110 §15.5.2 / §15.5.8), and a
+///   shared cache cannot retain that challenge safely: `WWW-Authenticate` is
+///   per-response state under the shared replay-sanitation policy (a Digest
+///   challenge carries a per-response nonce) and `Proxy-Authenticate` is
+///   hop-scoped. A stored copy would therefore replay a challenge-less `401` /
+///   `407` that clients cannot act on, and the gateway deliberately never
+///   invents a challenge for an origin-authored replay.
 /// * `1xx` are interim responses and never final.
 ///
 /// These are rejected at configuration admission *and* refused again at store
-/// time, so neither an operator config nor a backend can turn a validator-only
-/// or partial payload into a reusable entry.
-const UNSUPPORTED_CACHEABLE_STATUS_CODES: [u16; 2] = [206, 304];
+/// time, so neither an operator config nor a backend can turn a validator-only,
+/// partial, or challenge-dependent payload into a reusable entry.
+const UNSUPPORTED_CACHEABLE_STATUS_CODES: [u16; 4] = [206, 304, 401, 407];
 
 fn is_supported_cacheable_status(status: u16) -> bool {
     status >= 200 && !UNSUPPORTED_CACHEABLE_STATUS_CODES.contains(&status)
 }
 
-/// Exact (case-insensitive) rate-limit field names a shared cache never
-/// retains: the combined IETF `RateLimit` structured field
-/// (draft-ietf-httpapi-ratelimit-headers, e.g. `RateLimit: "api";r=0;t=60`).
-const RATE_LIMIT_EXACT_HEADERS: [&str; 1] = ["ratelimit"];
-
-/// Case-insensitive prefixes for rate-limit field families a shared cache
-/// never retains: the split IETF `RateLimit-*` fields (`-Limit`, `-Remaining`,
-/// `-Reset`, `-Policy`), the de-facto `X-RateLimit-*` family (including
-/// provider suffix variants such as `X-RateLimit-Remaining-Tokens`), Ferrum
-/// Edge's own `X-AI-RateLimit-*`, and Anthropic's `Anthropic-RateLimit-*`.
-const RATE_LIMIT_HEADER_PREFIXES: [&str; 4] = [
-    "ratelimit-",
-    "x-ratelimit-",
-    "x-ai-ratelimit-",
-    "anthropic-ratelimit-",
-];
-
-/// Whether `name` is a rate-limit field that describes the quota state of the
-/// client whose request produced the response, at the moment it was produced.
-///
-/// RFC 9111 lets a shared cache store any field that is not connection-scoped
-/// or origin-qualified, but these fields are neither representation metadata
-/// nor valid for anyone else: a HIT consumes no origin quota, belongs to a
-/// different client (and possibly a different quota partition or policy
-/// tier), and arrives after the relative reset (`t=` / `-Reset`) has already
-/// elapsed. Replaying them would tell every later client the original
-/// caller's `r=0`. `RateLimit-Policy` is dropped with the family because a
-/// policy may be selected per client and can carry a partition key. Matching
-/// is allocation-free: byte-slice `eq_ignore_ascii_case` on ASCII names.
-fn is_rate_limit_response_header(name: &str) -> bool {
-    if RATE_LIMIT_EXACT_HEADERS
-        .iter()
-        .any(|exact| name.eq_ignore_ascii_case(exact))
-    {
-        return true;
-    }
-    let name = name.as_bytes();
-    RATE_LIMIT_HEADER_PREFIXES.iter().any(|prefix| {
-        let prefix = prefix.as_bytes();
-        name.get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-    })
-}
-
 /// Strip everything that must not be retained from the representation about to
 /// be stored: connection-scoped and proxy-authentication fields, every field
 /// nominated by this response's own `Connection` header, every field the
-/// origin qualified with `private="…"` / `no-cache="…"`, and every per-client
-/// rate-limit field ([`is_rate_limit_response_header`]).
+/// origin qualified with `private="…"` / `no-cache="…"`, and every field the
+/// shared replay-sanitation policy ([`cache_headers::is_sensitive_header`])
+/// classifies as per-response or per-client state.
+///
+/// That shared policy is the one `ai_semantic_cache` and
+/// `request_deduplication` apply, so every replaying plugin agrees on what is
+/// unsafe to hand a later caller: session state (`Set-Cookie`, `Set-Cookie2`,
+/// `WWW-Authenticate`, response credentials), per-request trace / correlation
+/// identifiers (`traceparent`, `tracestate`, `b3`, `x-b3-*`, `x-request-id`,
+/// `x-correlation-id`, …), the relative `Retry-After`, and every rate-limit
+/// family (`RateLimit`, `RateLimit-*`, `X-RateLimit-*`, `X-AI-RateLimit-*`,
+/// `Anthropic-RateLimit-*`). A HIT consumes no origin quota, belongs to a
+/// different request, and arrives after any relative reset has elapsed, so
+/// none of those values describes the response a later client receives.
 ///
 /// The client-visible response for the miss that produced these bytes is
 /// untouched — only the retained copy is narrowed, which is exactly the
@@ -420,7 +399,7 @@ fn sanitize_cached_response_headers(
             && !directives
                 .qualified_protected_fields()
                 .any(|protected| name.eq_ignore_ascii_case(protected))
-            && !is_rate_limit_response_header(name)
+            && !cache_headers::is_sensitive_header(name)
     });
 }
 
@@ -652,6 +631,10 @@ struct CacheControlDirectives {
     must_revalidate: bool,
     max_age: Option<u64>,
     s_maxage: Option<u64>,
+    /// Request-only `min-fresh` (RFC 9111 §5.2.1.3): the client wants a stored
+    /// response that stays fresh for at least this many more seconds. Parsed
+    /// from responses too, where it has no meaning and is never read.
+    min_fresh: Option<u64>,
     /// Lowercased field names carried by a qualified `private="…"` argument.
     private_fields: Vec<String>,
     /// Lowercased field names carried by a qualified `no-cache="…"` argument.
@@ -854,6 +837,8 @@ fn apply_cache_control_directive(
         merge_delta_seconds(&mut directives.s_maxage, argument);
     } else if name.eq_ignore_ascii_case("max-age") {
         merge_delta_seconds(&mut directives.max_age, argument);
+    } else if name.eq_ignore_ascii_case("min-fresh") {
+        merge_min_fresh_seconds(&mut directives.min_fresh, argument);
     }
 }
 
@@ -906,6 +891,20 @@ fn merge_delta_seconds(slot: &mut Option<u64>, argument: Option<&CacheControlArg
     // Keep the shortest duplicate; an invalid explicit lifetime means expired,
     // never absent metadata that could fall back to a longer heuristic TTL.
     *slot = Some(slot.map_or(seconds, |existing| existing.min(seconds)));
+}
+
+/// `min-fresh` asks for *more* remaining freshness, so the most restrictive
+/// duplicate is the largest one, and an unusable argument is treated as the
+/// largest representable demand: it can only cost a refetch, never serve a
+/// representation the client may have refused.
+fn merge_min_fresh_seconds(slot: &mut Option<u64>, argument: Option<&CacheControlArgument<'_>>) {
+    let seconds = match argument {
+        Some(CacheControlArgument::Token(token)) => parse_delta_seconds(token),
+        Some(CacheControlArgument::Quoted(value)) => parse_delta_seconds(value),
+        Some(CacheControlArgument::Malformed) | None => None,
+    }
+    .unwrap_or(MAX_DELTA_SECONDS);
+    *slot = Some(slot.map_or(seconds, |existing| existing.max(seconds)));
 }
 
 fn parse_delta_seconds(value: &str) -> Option<u64> {
@@ -995,6 +994,11 @@ struct ResponseCachingConfig {
     respect_cache_control: bool,
     respect_no_cache: bool,
     vary_by_headers: Vec<String>,
+    /// Operator-attested request headers that are removed from the request
+    /// before the cache key is derived, and therefore never reach the origin
+    /// either. Lowercased, sorted, and de-duplicated; see
+    /// [`parse_ignored_request_headers`].
+    ignore_request_headers: Vec<String>,
     cache_key_include_query: bool,
     cache_key_include_consumer: bool,
     add_cache_status_header: bool,
@@ -1019,6 +1023,7 @@ impl ResponseCachingConfig {
         let cacheable_status_codes = parse_status_code_list(config, "cacheable_status_codes")?
             .unwrap_or_else(|| vec![200, 301, 404]);
         let vary_by_headers = parse_header_list(config, "vary_by_headers")?.unwrap_or_default();
+        let ignore_request_headers = parse_ignored_request_headers(config, &vary_by_headers)?;
 
         Ok(Self {
             ttl_seconds: optional_u64(config, "ttl_seconds")?.unwrap_or(DEFAULT_TTL_SECONDS),
@@ -1032,6 +1037,7 @@ impl ResponseCachingConfig {
             respect_cache_control: optional_bool(config, "respect_cache_control")?.unwrap_or(true),
             respect_no_cache: optional_bool(config, "respect_no_cache")?.unwrap_or(true),
             vary_by_headers,
+            ignore_request_headers,
             cache_key_include_query: optional_bool(config, "cache_key_include_query")?
                 .unwrap_or(true),
             cache_key_include_consumer: optional_bool(config, "cache_key_include_consumer")?
@@ -1177,8 +1183,10 @@ fn parse_status_code_list(config: &Value, field: &'static str) -> Result<Option<
             return Err(format!(
                 "response_caching: `{field}[{index}]` (\"{code}\") has caching semantics this plugin \
                  does not implement and cannot be marked cacheable — 1xx responses are interim, \
-                 206 requires range/validator/completeness tracking, and 304 is validator \
-                 metadata for an existing stored representation rather than a representation"
+                 206 requires range/validator/completeness tracking, 304 is validator \
+                 metadata for an existing stored representation rather than a representation, \
+                 and 401/407 are only valid with an authentication challenge a shared cache \
+                 cannot retain"
             ));
         }
         status_codes.push(code);
@@ -1212,6 +1220,159 @@ fn parse_header_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
         headers.push(header_name.to_string());
     }
     Ok(Some(headers))
+}
+
+/// Request headers `ignore_request_headers` may never name, because this cache,
+/// the proxy, or a later response-shaping plugin derives behavior from them
+/// that stripping would silently change or desynchronize:
+///
+/// * cache entry operations and request directives this plugin interprets
+///   (`Cache-Control`, `Pragma`, the conditional and range preconditions);
+/// * request framing and representation metadata (`Content-*`, `Expect`);
+/// * content negotiation the gateway itself acts on after lookup (`Accept`
+///   selects event-stream handling, `Accept-Encoding` selects `compression`
+///   output that a HIT would then replay to a client that cannot decode it);
+/// * forwarding identity the proxy regenerates for the origin.
+///
+/// Host and hop-by-hop framing fields are refused separately through
+/// [`replay_partition::is_non_backend_visible_request_header`], the families in
+/// [`NON_IGNORABLE_REQUEST_HEADER_PREFIXES`] by prefix, gateway-owned
+/// assertions that proxy core re-asserts after lookup through
+/// [`ignored_request_header_refusal`], and every credential / session header
+/// there too. Every comparison folds `_` to `-` as CGI-style backends do.
+const NON_IGNORABLE_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "cache-control",
+    "expect",
+    "forwarded",
+    "max-forwards",
+    "pragma",
+    "range",
+    "via",
+    "x-real-ip",
+];
+
+/// Header-name families `ignore_request_headers` may never name, matched as
+/// case-insensitive prefixes (`_` folded to `-`):
+///
+/// * `content-` — request representation metadata and framing;
+/// * `if-` — every conditional precondition;
+/// * `x-forwarded-` — the proxy-owned forwarding identity family, including
+///   members the gateway does not itself regenerate (`X-Forwarded-Prefix`);
+/// * `x-ferrum-` — the gateway's own namespace (the hop count it re-asserts
+///   after every `before_proxy` hook, mesh protocol and internal markers);
+/// * `x-consumer-` / `x-path-param-` — gateway assertions; proxy core scrubs
+///   and re-writes the authoritative values after lookup, so stripping them
+///   here would leave an origin-visible dimension the key never bound.
+const NON_IGNORABLE_REQUEST_HEADER_PREFIXES: &[&str] = &[
+    "content-",
+    "if-",
+    "x-consumer-",
+    "x-ferrum-",
+    "x-forwarded-",
+    "x-path-param-",
+];
+
+/// ASCII case-insensitive prefix test with `_` treated as `-`, the folding
+/// CGI-style backends apply. Allocation-free.
+fn has_backend_folded_prefix(name: &str, prefix: &str) -> bool {
+    let Some(head) = name.as_bytes().get(..prefix.len()) else {
+        return false;
+    };
+    head.iter()
+        .zip(prefix.as_bytes())
+        .all(|(&byte, &expected)| {
+            let folded = if byte == b'_' {
+                b'-'
+            } else {
+                byte.to_ascii_lowercase()
+            };
+            folded == expected
+        })
+}
+
+/// Why `header` cannot be listed in `ignore_request_headers`, or `None` when it
+/// may be. The reason is static text and never echoes the configured name.
+fn ignored_request_header_refusal(header: &str) -> Option<&'static str> {
+    // Gateway-owned names proxy core re-asserts on the outbound map after every
+    // `before_proxy` hook: the forwarded hop count and the authenticated /
+    // GeoIP / path-param assertions. Stripping one here would remove it from
+    // the key while dispatch puts it back, leaving an origin-visible dimension
+    // the key never bound.
+    if crate::proxy::hop_limit::is_proxy_hops_header(header)
+        || RequestContext::is_reserved_gateway_assertion_header(header)
+    {
+        return Some(
+            "names a gateway-owned header that the proxy re-asserts on the backend request \
+             after cache lookup (the forwarded hop count or a gateway identity, GeoIP, or \
+             path-parameter assertion), so it cannot be ignored",
+        );
+    }
+    if replay_partition::is_non_backend_visible_request_header(header)
+        || NON_IGNORABLE_REQUEST_HEADERS.iter().any(|refused| {
+            crate::proxy::headers::field_names_equivalent_for_backends(header, refused)
+        })
+        || NON_IGNORABLE_REQUEST_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| has_backend_folded_prefix(header, prefix))
+    {
+        return Some(
+            "names a request header the cache or the proxy interprets (Host, hop-by-hop \
+             framing, Cache-Control/Pragma, If-*, Range, Content-*, Expect, Max-Forwards, \
+             Accept/Accept-Encoding, X-Ferrum-*, or proxy-owned forwarding identity such as \
+             X-Forwarded-*), so it cannot be ignored",
+        );
+    }
+    if is_auto_sensitive_vary_header(header)
+        || replay_partition::is_credential_context_header(header)
+        || super::utils::metadata_redaction::is_sensitive_header_name(header)
+    {
+        return Some(
+            "names a credential or session header, which always partitions the cache and \
+             cannot be ignored",
+        );
+    }
+    None
+}
+
+/// Parse `ignore_request_headers`: an operator attestation that the named
+/// request headers never select the origin's response.
+///
+/// Excluding a header from the key is only sound if the origin cannot observe
+/// it, so an ignored header is not merely left out of the digest — it is
+/// removed from the backend-visible request before the key is derived. The key
+/// therefore still binds every header the origin actually receives. Names that
+/// carry caller identity, cache semantics, framing, negotiation the gateway acts
+/// on, or forwarding identity are refused ([`ignored_request_header_refusal`]),
+/// and so is a name also listed in `vary_by_headers`.
+fn parse_ignored_request_headers(
+    config: &Value,
+    vary_by_headers: &[String],
+) -> Result<Vec<String>, String> {
+    let Some(mut headers) = parse_header_list(config, "ignore_request_headers")? else {
+        return Ok(Vec::new());
+    };
+    for (index, header) in headers.iter().enumerate() {
+        if let Some(reason) = ignored_request_header_refusal(header) {
+            return Err(format!(
+                "response_caching: `ignore_request_headers[{index}]` {reason}"
+            ));
+        }
+        if vary_by_headers
+            .iter()
+            .any(|vary| vary.eq_ignore_ascii_case(header))
+        {
+            return Err(format!(
+                "response_caching: `ignore_request_headers[{index}]` is also listed in \
+                 `vary_by_headers`; a declared Vary dimension cannot be stripped from the \
+                 origin request"
+            ));
+        }
+    }
+    headers.sort_unstable();
+    headers.dedup();
+    Ok(headers)
 }
 
 /// Bounded FIFO tracker of keys known to be uncacheable.
@@ -1392,6 +1553,10 @@ pub struct ResponseCaching {
     /// uncacheable predictor. Retained so tests can prove construction
     /// honored the gateway's configured `FERRUM_POOL_SHARD_AMOUNT`.
     shard_amount: usize,
+    /// Process-global Prometheus registry, resolved once at construction so a
+    /// lookup outcome is one padded atomic increment rather than a registry
+    /// handle clone per request.
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl ResponseCaching {
@@ -1467,6 +1632,7 @@ impl ResponseCaching {
             clock_offset_nanos: Arc::new(AtomicU64::new(0)),
             uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100), shard_amount),
             shard_amount,
+            metrics: super::prometheus_metrics::global_registry(),
         })
     }
 
@@ -1492,12 +1658,16 @@ impl ResponseCaching {
         staging_metadata_key(self.instance_id, suffix)
     }
 
+    /// Record this instance's lookup outcome. Every `before_proxy` exit sets it
+    /// exactly once, so this is also where the bounded
+    /// `ferrum_response_cache_lookups_total{status}` counter is taken.
     fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
         ctx.metadata
             .insert(self.meta_status.clone(), status.to_string());
         if matches!(status, "HIT" | "REVALIDATED") {
             ctx.mark_response_cache_hit();
         }
+        self.metrics.record_response_cache_lookup(status);
     }
 
     fn cache_status<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
@@ -1571,8 +1741,10 @@ impl ResponseCaching {
         //    a `Content-Range` partial answer, are refused before any invalidating
         //    branch and are deliberately NOT predictor signals: the very next
         //    unconditional request may store the full representation.
+        // Case-insensitive: a plugin-written response header map is not
+        // guaranteed to carry canonical lowercase keys.
         if !is_supported_cacheable_status(response_status)
-            || response_headers.contains_key("content-range")
+            || header_value(response_headers, "content-range").is_some()
         {
             return FinalHeaderDecision::Inert;
         }
@@ -1596,8 +1768,10 @@ impl ResponseCaching {
             return FinalHeaderDecision::InvalidateZeroFreshness;
         }
 
-        // 5. `Set-Cookie` is per-client and never stored (RFC 9111 §8).
-        if response_headers.contains_key("set-cookie") {
+        // 5. `Set-Cookie` is per-client and never stored (RFC 9111 §8). Matched
+        //    case-insensitively so a plugin-written `Set-Cookie` key cannot slip
+        //    past the refusal.
+        if header_value(response_headers, "set-cookie").is_some() {
             return FinalHeaderDecision::MarkUncacheable;
         }
 
@@ -2006,6 +2180,7 @@ impl ResponseCaching {
     ) -> Result<String, replay_partition::PartitionRefusal> {
         let mut hasher = PartitionHasher::new(RESPONSE_CACHING_BASE_KEY_DOMAIN);
         replay_partition::append_destination_partition(&mut hasher, ctx);
+        append_request_construction_partition(&mut hasher, ctx);
 
         // This legacy option no longer permits an origin-visible query to be
         // omitted from a replay key. Keep the setting in the digest so changing
@@ -2834,6 +3009,90 @@ impl ResponseCaching {
         directives.public || directives.must_revalidate || directives.s_maxage.is_some()
     }
 
+    /// Stage everything the storage side needs, once `before_proxy` knows this
+    /// request will reach the origin (a MISS, or an honored request
+    /// `Cache-Control: no-cache` refresh).
+    ///
+    /// Nothing here is needed to *look up*: the lookup key is derived from the
+    /// live `headers` argument directly. A HIT / REVALIDATED, a
+    /// `PREDICTED-BYPASS`, and a request `no-store` therefore never pay for the
+    /// header delta (a deep copy of the request headers on the common
+    /// moved-header-map path), the reduced JSON snapshot, or the other staging
+    /// strings, only to discard them.
+    fn stage_store_inputs(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        base_key: String,
+        cache_key: String,
+        request_time: Duration,
+    ) {
+        ctx.metadata.insert(self.meta_base_key.clone(), base_key);
+        // Stage the client-facing path this key was derived from. A
+        // route-dispatch rewrite is folded into `ctx.path` only after
+        // `before_proxy` returns, so the storage side must index the entry
+        // under this value rather than the then-current path — see
+        // `CACHE_LOOKUP_PATH_SUFFIX`.
+        ctx.metadata
+            .insert(self.meta_lookup_path.clone(), ctx.path.clone());
+        self.stash_request_started_at(ctx, request_time);
+        // Preserve the complete backend-visible header view privately so
+        // `on_final_response_body` can key arbitrary origin-supplied Vary
+        // fields from the same values that reached the backend. A reduced,
+        // redaction-safe metadata snapshot also supports direct compatibility
+        // hook contexts. By storage time `ctx.headers` alone is the original,
+        // untransformed map.
+        self.stash_request_headers_snapshot(ctx, headers);
+        // The full cache key (with Vary dimensions), so the header phase can
+        // mark the correct variant-specific key in the uncacheable predictor.
+        ctx.metadata
+            .insert(self.meta_predict_key.clone(), cache_key);
+    }
+
+    /// Whether a fresh `entry` also satisfies the client's own freshness
+    /// requirements (RFC 9111 §5.2.1): `max-age` bounds the acceptable age,
+    /// `min-fresh` demands remaining freshness. `None` means the request carried
+    /// no honored directives. Ages are compared at full precision, so a request
+    /// `max-age=0` always refetches.
+    fn entry_satisfies_request_freshness(
+        directives: Option<&CacheControlDirectives>,
+        entry: &CacheEntry,
+        current_age: Duration,
+    ) -> bool {
+        let Some(directives) = directives else {
+            return true;
+        };
+        if directives
+            .max_age
+            .is_some_and(|max_age| current_age > Duration::from_secs(max_age))
+        {
+            return false;
+        }
+        if let Some(min_fresh) = directives.min_fresh {
+            let remaining = entry.freshness_lifetime.saturating_sub(current_age);
+            if remaining < Duration::from_secs(min_fresh) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Remove every configured `ignore_request_headers` name from the
+    /// backend-visible request map, case-insensitively. A no-op (and no map
+    /// walk) when the list is empty, which is the default.
+    fn strip_ignored_request_headers(&self, headers: &mut HashMap<String, String>) {
+        if self.config.ignore_request_headers.is_empty() {
+            return;
+        }
+        headers.retain(|name, _| {
+            !self
+                .config
+                .ignore_request_headers
+                .iter()
+                .any(|ignored| name.eq_ignore_ascii_case(ignored))
+        });
+    }
+
     /// Stash the transformed-header values `before_proxy` saw for every
     /// key that can land in the cache key — `host`, the sensitive
     /// credential/session headers in [`SENSITIVE_VARY_HEADERS`]
@@ -2956,6 +3215,42 @@ impl ResponseCaching {
             headers,
             cache_key_ready_headers,
         }
+    }
+}
+
+/// Bind the request-construction inputs the shared destination partition does
+/// not, but which still change what the origin receives for an otherwise
+/// identical client request:
+///
+/// * **Effective frontend scheme** (`RequestContext::request_is_secure`). The
+///   proxy regenerates `X-Forwarded-Proto` (and `Forwarded: proto=`) from it on
+///   every backend request, after this plugin captured the request-header
+///   view, so the header partition can never witness it. Without this, an
+///   HTTPS-only representation stored for a TLS request would be replayed to a
+///   plaintext request for the same authority, and an HTTP redirect could be
+///   replayed onto HTTPS (an RFC 9111 §2 target-URI dimension, and NGINX's
+///   default `$scheme` key component). Read from private connection
+///   provenance, never from a client-supplied forwarding header.
+/// * **Matched-proxy path assembly** (`backend_path`, `strip_listen_path`) and
+///   **outbound `Host` policy** (`preserve_host_header`). A proxy-only reload
+///   can change any of these without changing the proxy id, listen path,
+///   backend host/port/scheme, or plugins, and a retained *global* cache
+///   instance survives that rebuild — so without binding them an entry stored
+///   for `/blue/items` keeps answering after the route now assembles
+///   `/green/items`.
+///
+/// Every field is a borrowed value or a fixed-width scalar, so this adds no
+/// allocation to the lookup path.
+fn append_request_construction_partition(hasher: &mut PartitionHasher, ctx: &RequestContext) {
+    hasher.bool_value("rc.frontend_secure", ctx.request_is_secure);
+    match ctx.matched_proxy.as_ref() {
+        Some(proxy) => {
+            hasher.bool_value("rc.proxy_construction", true);
+            hasher.optional_text("rc.backend_path", proxy.backend_path.as_deref());
+            hasher.bool_value("rc.strip_listen_path", proxy.strip_listen_path);
+            hasher.bool_value("rc.preserve_host_header", proxy.preserve_host_header);
+        }
+        None => hasher.bool_value("rc.proxy_construction", false),
     }
 }
 
@@ -3117,6 +3412,18 @@ impl Plugin for ResponseCaching {
 
     fn requires_response_body_buffering(&self) -> bool {
         true
+    }
+
+    /// Only an `ignore_request_headers` list makes this instance remove request
+    /// headers (in `before_proxy`, before the key is derived), so only then
+    /// does it need the cloned header map and the replay/cache ordering
+    /// admission that applies to header mutators.
+    fn modifies_request_headers(&self) -> bool {
+        !self.config.ignore_request_headers.is_empty()
+    }
+
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        Some(self.config.ignore_request_headers.clone())
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
@@ -3314,6 +3621,13 @@ impl Plugin for ResponseCaching {
         // other than the one whose transformer instances shape this response.
         let presentation_digest = ctx.response_presentation_policy_digest;
 
+        // Operator-attested `ignore_request_headers` leave the backend-visible
+        // request before anything below reads it, so the key, the Vary tuple,
+        // the private storage-side view, and the origin all see the same
+        // stripped request. Removing a header the origin would otherwise
+        // receive is what makes leaving it out of the key sound.
+        self.strip_ignored_request_headers(headers);
+
         // Method safety is independent of storage eligibility (RFC 9111 §4.4 /
         // RFC 9110 §9.2.1). An unsafe method listed in `cacheable_methods`
         // (e.g. POST) must still stage authority-scoped invalidation; a safe
@@ -3382,23 +3696,10 @@ impl Plugin for ResponseCaching {
                 return PluginResult::Continue;
             }
         };
-        ctx.metadata
-            .insert(self.meta_base_key.clone(), base_key.clone());
-        // Stage the client-facing path this key was derived from. A
-        // route-dispatch rewrite is folded into `ctx.path` only after
-        // `before_proxy` returns, so the storage side must index the entry
-        // under this value rather than the then-current path — see
-        // `CACHE_LOOKUP_PATH_SUFFIX`.
-        ctx.metadata
-            .insert(self.meta_lookup_path.clone(), ctx.path.clone());
-        self.stash_request_started_at(ctx, self.now_monotonic());
-        // Preserve the complete backend-visible header view privately so
-        // `on_final_response_body` can key arbitrary origin-supplied Vary
-        // fields from the same values that reached the backend. A reduced,
-        // redaction-safe metadata snapshot also supports direct compatibility
-        // hook contexts. By storage time `ctx.headers` alone is the original,
-        // untransformed map.
-        self.stash_request_headers_snapshot(ctx, headers);
+        // Request time for response-delay accounting is taken here, before
+        // origin contact, exactly as before; it is only *staged* once this
+        // request is known to reach the origin (see `stage_store_inputs`).
+        let request_time = self.now_monotonic();
 
         let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
         // Every internal key and every retained response uses the same fixed
@@ -3409,15 +3710,19 @@ impl Plugin for ResponseCaching {
         self.merge_mandatory_sensitive_vary_headers(&mut vary_headers);
         let cache_key =
             self.extend_base_key_with_vary(ctx, base_key.clone(), &vary_headers, headers, None);
-        // Store the full cache key (with Vary dimensions) so on_final_response_body
-        // can mark the correct variant-specific key in the uncacheable predictor.
-        ctx.metadata
-            .insert(self.meta_predict_key.clone(), cache_key.clone());
 
-        if self.config.respect_no_cache
-            && let Some(cc) = headers.get("cache-control")
-        {
-            let directives = parse_cache_control(cc);
+        // Client request directives are honored only under `respect_no_cache`;
+        // otherwise the whole request `Cache-Control` value is a bound key
+        // dimension and never an instruction to this cache.
+        let request_directives = if self.config.respect_no_cache {
+            headers
+                .get("cache-control")
+                .map(String::as_str)
+                .map(parse_cache_control)
+        } else {
+            None
+        };
+        if let Some(directives) = request_directives.as_ref() {
             if directives.no_store {
                 // RFC 9111 §5.2.1.5: a cache MUST NOT store any part of a
                 // request carrying `no-store`, or of the response to it. That
@@ -3432,11 +3737,13 @@ impl Plugin for ResponseCaching {
                 return PluginResult::Continue;
             }
             if directives.request_bypasses_cache() {
-                // Keep this instance's staged base/snapshot/predict so a
-                // no-cache refresh can still store the replacement response
-                // under the same instance-owned key inputs. Pending unsafe
-                // invalidation (if any) is retained — the request contacts
-                // the origin.
+                // Stage this instance's base/snapshot/predict so a no-cache
+                // refresh can still store the replacement response under the
+                // same instance-owned key inputs, and so `after_proxy`
+                // publishes the downstream Vary contract on it. Pending unsafe
+                // invalidation (if any) is retained — the request contacts the
+                // origin.
+                self.stage_store_inputs(ctx, headers, base_key, cache_key, request_time);
                 self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
             }
@@ -3499,6 +3806,20 @@ impl Plugin for ResponseCaching {
                          runtime-overlay response policy, refetching"
                     );
                 }
+            } else if !Self::entry_satisfies_request_freshness(
+                request_directives.as_ref(),
+                &entry,
+                current_age,
+            ) {
+                // RFC 9111 §5.2.1.1 / §5.2.1.3: the entry is fresh for the cache
+                // but older (`max-age`) or closer to expiry (`min-fresh`) than
+                // this client accepts. It is not evicted — it is still a valid
+                // answer for other requests — and this request refetches; the
+                // origin's replacement is stored under the same key.
+                debug!(
+                    "response_caching: cached representation does not satisfy the request's \
+                     max-age / min-fresh, refetching"
+                );
             } else {
                 // Never log the cache key: it is the replay partition itself.
                 debug!("response_caching: cache HIT");
@@ -3544,6 +3865,7 @@ impl Plugin for ResponseCaching {
             }
         }
 
+        self.stage_store_inputs(ctx, headers, base_key, cache_key, request_time);
         self.set_cache_status(ctx, "MISS");
         PluginResult::Continue
     }
@@ -3575,12 +3897,20 @@ impl Plugin for ResponseCaching {
             // state and overwrite that instance's client-visible header.
             return PluginResult::Continue;
         };
-        let is_miss = status == "MISS";
+        let publishes_partition = matches!(status, "MISS" | "BYPASS");
         self.add_cache_status_header(response_headers, status);
-        if is_miss {
-            // Every other status either replays an entry that already carries
-            // the list (HIT / REVALIDATED) or established no partition at all
-            // (BYPASS / PREDICTED-BYPASS).
+        if publishes_partition {
+            // A MISS, and an honored request `Cache-Control: no-cache` refresh
+            // (labelled BYPASS but deliberately keeping its staged base key so
+            // the replacement is stored under the same partition), both emit a
+            // freshly fetched, publicly cacheable response that a downstream
+            // shared cache may store — so both must carry the contract the
+            // retained copy will carry. `publish_downstream_vary_contract`
+            // publishes only when this instance staged a base key, so every
+            // other BYPASS (non-cacheable method, unproven body, refused
+            // partition, request no-store, SSE) still establishes no partition
+            // and is left untouched, as is PREDICTED-BYPASS. HIT / REVALIDATED
+            // replay an entry that already carries the list.
             self.publish_downstream_vary_contract(ctx, response_headers);
         }
         PluginResult::Continue
@@ -3703,7 +4033,7 @@ impl Plugin for ResponseCaching {
         // Never cache responses with Set-Cookie headers. These are
         // per-client and replaying them from a shared cache would leak
         // session cookies to other users (RFC 7234 §8).
-        if response_headers.contains_key("set-cookie") {
+        if header_value(response_headers, "set-cookie").is_some() {
             debug!("response_caching: skipping cache — response contains Set-Cookie header");
             return PluginResult::Continue;
         }

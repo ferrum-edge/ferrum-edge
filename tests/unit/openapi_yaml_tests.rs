@@ -16254,10 +16254,14 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     // constructor does.
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["items"]["not"]["enum"],
-        json!([206, 304])
+        json!([206, 304, 401, 407])
     );
     assert_eq!(
         schema["properties"]["vary_by_headers"]["items"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+    assert_eq!(
+        schema["properties"]["ignore_request_headers"]["items"]["pattern"],
         json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
     );
 
@@ -16306,6 +16310,9 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": [200, 599]}),
         // An explicitly empty Vary list is accepted (no extra key dimensions).
         json!({"vary_by_headers": []}),
+        // Operator-attested ignored request headers.
+        json!({"ignore_request_headers": []}),
+        json!({"ignore_request_headers": ["x-request-id", "X-Cdn-Hop"]}),
         json!({
             "ttl_seconds": 60,
             "max_entries": 100,
@@ -16367,8 +16374,14 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": [206]}),
         json!({"cacheable_status_codes": [304]}),
         json!({"cacheable_status_codes": [200, 206]}),
+        // PR #6830: challenge-dependent statuses cannot be retained.
+        json!({"cacheable_status_codes": [401]}),
+        json!({"cacheable_status_codes": [200, 407]}),
         json!({"vary_by_headers": [""]}),
         json!({"vary_by_headers": ["bad header"]}),
+        json!({"ignore_request_headers": [""]}),
+        json!({"ignore_request_headers": ["bad header"]}),
+        json!({"ignore_request_header": ["x-request-id"]}),
         // Issue #5144: body-bearing and non-retrieval methods are refused by
         // the constructor and must fail the schema too.
         json!({"cacheable_methods": ["POST"]}),
@@ -16446,6 +16459,7 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         "cacheable_methods",
         "cacheable_status_codes",
         "vary_by_headers",
+        "ignore_request_headers",
     ] {
         let mut config = json!({});
         config
