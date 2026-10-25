@@ -13818,8 +13818,8 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 #[test]
 fn transaction_debugger_schema_matches_closed_runtime_surface() {
     use ferrum_edge::plugins::transaction_debugger::{
-        DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, TRANSACTION_DEBUGGER_CONFIG_KEYS,
-        TransactionDebugger,
+        DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, MAX_CAPTURE_SELECTOR_VALUE_BYTES,
+        TRANSACTION_DEBUGGER_CONFIG_KEYS, TransactionDebugger,
     };
 
     let spec: serde_json::Value =
@@ -13851,9 +13851,29 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         );
         assert_eq!(schema["properties"][field]["minimum"], json!(1));
     }
-    for field in ["log_request_body", "log_response_body"] {
+    for field in [
+        "log_request_body",
+        "log_response_body",
+        "capture_body_prefix",
+    ] {
         assert_eq!(schema["properties"][field]["default"], json!(false));
     }
+    let sample_rate = &schema["properties"]["capture_sample_rate"];
+    assert_eq!(sample_rate["default"], json!(1));
+    assert_eq!(sample_rate["exclusiveMinimum"], json!(0));
+    assert_eq!(sample_rate["maximum"], json!(1));
+    assert_eq!(
+        schema["properties"]["capture_request_header"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+    assert_eq!(
+        schema["properties"]["capture_request_header_value"]["maxLength"],
+        json!(MAX_CAPTURE_SELECTOR_VALUE_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["capture_expires_at"]["format"],
+        json!("date-time")
+    );
     let header_items = &schema["properties"]["redacted_headers"]["items"];
     assert_eq!(header_items["minLength"], json!(1));
     assert_eq!(
@@ -13879,7 +13899,7 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
     let admission_rules = schema["allOf"]
         .as_array()
         .expect("TransactionDebuggerConfig admission allOf");
-    assert_eq!(admission_rules.len(), 5);
+    assert_eq!(admission_rules.len(), 10);
 
     let description = schema["description"]
         .as_str()
@@ -13925,6 +13945,11 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         "typed request provenance",
         "metadata: {mode: omit}",
         "default unprojected",
+        // Built-in inventories must list everything the code redacts.
+        "`last-event-id`",
+        "`embeddingkey`",
+        "not_selected",
+        "capture_expired",
     ] {
         assert!(
             plugin_docs.contains(contract),
@@ -13963,6 +13988,16 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
             "log_request_body": true,
             "redacted_body_fields": [padded_body_field]
         }),
+        json!({"capture_body_prefix": false}),
+        json!({
+            "log_response_body": true,
+            "capture_body_prefix": true,
+            "capture_sample_rate": 0.25,
+            "capture_request_header": "X-Debug-Capture",
+            "capture_request_header_value": "incident 42",
+            "capture_expires_at": "2026-12-31T23:59:59Z"
+        }),
+        json!({"log_request_body": true, "capture_sample_rate": 1}),
     ] {
         assert_component_validity(&spec, "TransactionDebuggerConfig", &valid, true);
         TransactionDebugger::new(&valid)
@@ -14000,6 +14035,25 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
             "log_request_body": true,
             "safe_text_fields": ["bad name"]
         }),
+        json!({"capture_body_prefix": true}),
+        json!({"capture_sample_rate": 0.5}),
+        json!({"capture_request_header": "x-debug"}),
+        json!({"capture_expires_at": "2026-12-31T23:59:59Z"}),
+        json!({"log_request_body": true, "capture_sample_rate": 0}),
+        json!({"log_request_body": true, "capture_sample_rate": 1.5}),
+        json!({"log_request_body": true, "capture_request_header": "bad header"}),
+        json!({"log_request_body": true, "capture_request_header_value": "x"}),
+        json!({
+            "log_request_body": true,
+            "capture_request_header": "x-debug",
+            "capture_request_header_value": " padded"
+        }),
+        json!({
+            "log_request_body": true,
+            "capture_request_header": "x-debug",
+            "capture_request_header_value": "x".repeat(MAX_CAPTURE_SELECTOR_VALUE_BYTES + 1)
+        }),
+        json!({"log_request_body": true, "capture_body_prefix": null}),
     ] {
         assert_component_validity(&spec, "TransactionDebuggerConfig", &invalid, false);
         assert!(
