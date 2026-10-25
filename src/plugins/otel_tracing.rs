@@ -2403,11 +2403,12 @@ async fn deliver_trace_payload(
     record_mesh_trace_batch_discard(cfg, entry_count);
 }
 
-/// Count a batch [`deliver_trace_payload`] permanently discarded on the mesh
+/// Count spans [`deliver_trace_payload`] permanently lost on the mesh
 /// span-drop counter (`reason="export_failed"`), once per lost span, for
-/// `workload_metrics` exporters only.
+/// `workload_metrics` exporters only: a discarded batch, or the spans an OTLP
+/// HTTP-200 partial-success response reports as rejected.
 fn record_mesh_trace_batch_discard(cfg: &TraceHttpExporterConfig, entry_count: usize) {
-    if !cfg.mesh_span_drop_accounting {
+    if !cfg.mesh_span_drop_accounting || entry_count == 0 {
         return;
     }
     use crate::plugins::mesh::prometheus_helpers::{
@@ -2521,6 +2522,11 @@ async fn handle_otlp_partial_success(
             }
         },
     };
+    // Bounded by the batch: a collector cannot claim more lost spans than sent.
+    record_mesh_trace_batch_discard(
+        cfg,
+        usize::try_from(rejected).map_or(entry_count, |n| n.min(entry_count)),
+    );
     let message_value = partial
         .get("errorMessage")
         .or_else(|| partial.get("error_message"));

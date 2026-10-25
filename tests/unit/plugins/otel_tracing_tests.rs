@@ -2947,3 +2947,58 @@ async fn workload_metrics_counts_spans_discarded_after_collector_failure() {
         "a span discarded on a terminal collector failure must be counted ({before} -> {after})"
     );
 }
+
+/// PR6817-SOL-3: an OTLP collector that answers HTTP 200 with a partial
+/// success rejecting spans lost them as surely as a 400; the rejected count is
+/// recorded as `reason="export_failed"` for workload_metrics exporters.
+#[tokio::test]
+async fn workload_metrics_counts_otlp_partial_success_rejected_spans() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/traces"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"partialSuccess": {"rejectedSpans": 1}})),
+        )
+        .mount(&mock_server)
+        .await;
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "max_retries": 0,
+        "tracing_providers": [{
+            "kind": "opentelemetry",
+            "config": {"endpoint": format!("{}/v1/traces", mock_server.uri())}
+        }]
+    }))
+    .expect("workload metrics with otlp provider");
+    let count = || {
+        prometheus_helpers::mesh_tracing_spans_dropped_count(
+            MeshTracingProvider::OpenTelemetry,
+            MeshTracingSpanDropReason::ExportFailed,
+        )
+    };
+    let before = count();
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    // Completion barrier: the collector saw the batch, then the counter moves.
+    let _ = received_json(&mock_server).await;
+    let mut after = count();
+    for _ in 0..100 {
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        after = count();
+    }
+    assert!(
+        after > before,
+        "spans an OTLP partial success rejected must be counted ({before} -> {after})"
+    );
+}
