@@ -13748,6 +13748,15 @@ components:
               scope:
                 const: global
         - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: openapi_validator
+          then:
+            properties:
+              scope:
+                const: proxy
+        - if:
             required: [scope]
             properties:
               scope:
@@ -13967,25 +13976,31 @@ components:
     WsRateLimitingConfig:
       type: object
       description: |
-        Configuration for the `ws_rate_limiting` plugin. Enforces per-connection
-        frame rate limiting using a token-bucket algorithm. When the bucket is
+        Configuration for the `ws_rate_limiting` plugin. Enforces WebSocket
+        frame rate limiting using a token-bucket algorithm, per connection by
+        default or as an aggregate budget shared by every session of one
+        consumer, client IP, or proxy (`limit_by`). When the bucket is
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
-        (client→backend and backend→client) consume from the same per-connection
-        bucket. `frames_per_second` and `burst_size` must form an integer-multiple
-        refill window of at most 3600 seconds (and stay within 1–1000000) so Redis
-        two-window enforcement cannot over-admit or under-admit relative to the
-        local token bucket, including across Redis failure/recovery. Redis mode
-        (`sync_mode: "redis"`) externalizes those per-connection counters under a
-        per-plugin/gateway-instance key namespace; it does not coordinate a portable
-        frame budget across gateway instances, reconnects, or plugin rebuilds.
-        `sync_mode` is parsed case-insensitively (`LOCAL`, `Redis`); `redis`
-        requires `redis_url`. Unknown top-level keys are rejected by the runtime
-        and by this schema. Counter storage supports only local memory and Redis;
-        database-backed counters are intentionally unsupported. Residual admission
-        rules this schema cannot express, enforced by the constructor alone:
-        `burst_size` must be >= `frames_per_second`, an integer multiple of it,
-        and `burst_size / frames_per_second` must be at most 3600 seconds.
+        (client→backend and backend→client) consume from the same bucket. Both
+        values stay within 1–1000000. With `sync_mode: "redis"`,
+        `frames_per_second` and `burst_size` must also form an integer-multiple
+        refill window of at most 3600 seconds so Redis two-window enforcement
+        cannot over-admit or under-admit relative to the local token bucket,
+        including across Redis failure/recovery; a local-only policy accepts any
+        capacity/refill pair. Redis mode externalizes those per-connection
+        counters under a per-plugin/gateway-instance key namespace; it does not
+        coordinate a portable per-connection frame budget across gateway
+        instances, reconnects, or plugin rebuilds. Aggregate `limit_by` budgets
+        are keyed by their portable identity instead, so replicas of one policy
+        share them. `sync_mode` is parsed case-insensitively (`LOCAL`, `Redis`);
+        `redis` requires `redis_url`. Unknown top-level keys are rejected by the
+        runtime and by this schema. Counter storage supports only local memory
+        and Redis; database-backed counters are intentionally unsupported.
+        Residual admission rules this schema cannot express, enforced by the
+        constructor alone: with `sync_mode: "redis"`, `burst_size` must be >=
+        `frames_per_second`, an integer multiple of it, and
+        `burst_size / frames_per_second` must be at most 3600 seconds.
       additionalProperties: false
       allOf:
         - if:
@@ -14005,9 +14020,9 @@ components:
           description: >-
             Token refill rate per second. Range 1–1000000. Must be greater than
             zero — configs with `frames_per_second: 0` are rejected at config
-            load time. Together with `burst_size`, must yield an integer-multiple
-            refill window of at most 3600 seconds so Redis and local sustained
-            rates match.
+            load time. With `sync_mode: redis`, together with `burst_size`, must
+            yield an integer-multiple refill window of at most 3600 seconds so
+            Redis and local sustained rates match.
         burst_size:
           type: integer
           format: uint64
@@ -14016,11 +14031,14 @@ components:
           description: >-
             Maximum burst capacity (tokens). Range 1–1000000. Defaults to the
             value of `frames_per_second` when not explicitly set. Must be greater
-            than zero, greater than or equal to `frames_per_second`, an integer
-            multiple of `frames_per_second`, and yield a refill window
-            (`burst_size / frames_per_second`) of at most 3600 seconds. Configs
-            that Redis cannot represent without over-admitting or under-admitting
-            relative to the local token bucket are rejected at config load time.
+            than zero. With `sync_mode: redis` it must also be greater than or
+            equal to `frames_per_second`, an integer multiple of
+            `frames_per_second`, and yield a refill window
+            (`burst_size / frames_per_second`) of at most 3600 seconds: configs
+            that Redis cannot represent without over-admitting or
+            under-admitting relative to the local token bucket are rejected at
+            config load time. A local-only policy accepts any pair, including a
+            burst smaller than the sustained rate.
         close_reason:
           type: string
           default: "Frame rate exceeded"
@@ -14028,6 +14046,20 @@ components:
             Close-frame reason text sent when the frame rate is exceeded.
             Truncated on a UTF-8 char boundary to 123 bytes (the RFC 6455 §5.5
             control-frame payload limit) so the frame stays well-formed.
+        limit_by:
+          type: string
+          enum: [connection, consumer, ip, service]
+          default: connection
+          description: >-
+            Budget dimension. `connection` (default) gives every WebSocket
+            session its own bucket. `consumer` shares one bucket across every
+            session of the authenticated identity (mapped Consumer username,
+            else the external authenticated identity); anonymous sessions share
+            their client IP's bucket. `ip` shares one bucket per resolved client
+            IP. `service` shares one bucket per proxy. The identity is resolved
+            once at upgrade admission. Aggregate budgets use the same 50,000-key
+            local cap; with `sync_mode: redis` they are keyed by that identity
+            (no per-instance UUID), so replicas of one policy share them.
         sync_mode:
           type: string
           pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
@@ -14036,8 +14068,12 @@ components:
             Frame counter storage: 'local' (in-memory) or 'redis' (externalized
             per-connection counters namespaced per plugin/gateway instance; not
             a portable cross-instance budget), parsed case-insensitively.
-            `redis` additionally requires `redis_url`. Database-backed counters
-            are unsupported. Any RESP-compatible server works.
+            `redis` additionally requires `redis_url`. With an aggregate
+            `limit_by` (`consumer`, `ip`, `service`) the Redis counter is keyed
+            by that identity and shared by every replica of the policy; a
+            refused frame batch is handed back, so refusals never consume the
+            shared budget. Database-backed counters are unsupported. Any
+            RESP-compatible server works.
         redis_url:
           type: string
           minLength: 1
@@ -14064,10 +14100,11 @@ components:
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
             independent policies of this plugin type in one namespace do not
             share the surrounding key namespace. Must be non-empty when set.
-            This plugin still prepends a per-instance UUID to every logical
-            connection key, so an explicit shared prefix does not opt two
-            plugin or gateway instances into a shared per-connection frame
-            budget.
+            In the default `limit_by: connection` mode this plugin still
+            prepends a per-instance UUID to every logical connection key, so an
+            explicit shared prefix does not opt two plugin or gateway instances
+            into a shared per-connection frame budget. Aggregate `limit_by`
+            keys carry no instance UUID.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -22148,7 +22185,9 @@ components:
         are rejected. Body capture is opt-in and default off. It never forces an
         ineligible message to buffer: a body is sampled only when the message
         declares an identity Content-Encoding, a Content-Length that fits inside
-        the configured cap, and a capturable textual Content-Type
+        the configured cap (or, with the explicit capture_body_prefix opt-in, a
+        text/plain or form Content-Length up to 1048576 bytes), and a
+        capturable textual Content-Type
         (application/json, +json, text/json,
         application/x-www-form-urlencoded, text/plain). gRPC
         (application/grpc*), SSE (text/event-stream), WebSocket upgrades
@@ -22178,6 +22217,22 @@ components:
         omitted. When the transaction_debug DEBUG target is disabled no body is
         buffered for capture. Captured bytes go only to the transaction_debug
         tracing target and are never written into transaction-log metadata.
+        Values are also screened by shape regardless of field or header name:
+        compact JWS/JWE tokens (recognized from the base64url-decoded JSON
+        protected header, so whitespace inside the header does not evade it),
+        well-known provider API keys, AWS access key ids, and PEM private-key
+        blocks are redacted in captured bodies and in header dumps. Exactly one
+        capture record is emitted per enabled direction even when a transform
+        flips the decision between the header phase and the final body hook.
+        Capture can be targeted with capture_request_header (plus an optional
+        exact capture_request_header_value), capture_sample_rate, and
+        capture_expires_at; a request outside the target never buffers and is
+        reported as omitted with reason not_selected or capture_expired.
+        capture_body_prefix opts text/plain and form bodies whose declared
+        Content-Length exceeds the cap (up to 1048576 bytes) into buffering
+        and renders a redacted prefix of complete lines or pairs marked
+        truncated; JSON, chunked/unknown-length, and larger bodies are
+        unchanged.
       allOf:
         - if:
             required: [max_request_body_bytes]
@@ -22225,9 +22280,112 @@ components:
                 properties:
                   log_response_body:
                     const: true
+        - if:
+            required: [capture_body_prefix]
+            properties:
+              capture_body_prefix:
+                const: true
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_sample_rate]
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_request_header]
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_expires_at]
+          then:
+            anyOf:
+              - required: [log_request_body]
+                properties:
+                  log_request_body:
+                    const: true
+              - required: [log_response_body]
+                properties:
+                  log_response_body:
+                    const: true
+        - if:
+            required: [capture_request_header_value]
+          then:
+            required: [capture_request_header]
         - not:
             required: [schema, schema_ref]
       properties:
+        capture_body_prefix:
+          type: boolean
+          default: false
+          description: >-
+            Admit text/plain and application/x-www-form-urlencoded bodies whose
+            declared Content-Length exceeds the capture cap (up to 1048576
+            bytes) and render a redacted prefix of the complete lines / pairs
+            that fit inside the cap, marked truncated. JSON bodies, which need
+            the whole document for field redaction, and chunked/unknown-length
+            bodies are unchanged. True requires log_request_body or
+            log_response_body true. Null is rejected.
+        capture_sample_rate:
+          type: number
+          default: 1
+          exclusiveMinimum: 0
+          maximum: 1
+          description: >-
+            Fraction of requests whose bodies are captured, chosen
+            deterministically per request so both directions agree. Requests
+            that are not sampled never buffer and report reason not_selected.
+            Requires log_request_body or log_response_body true.
+        capture_request_header:
+          type: string
+          minLength: 1
+          pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          description: >-
+            Capture only requests that carry this request header (an HTTP
+            header token, compared case-insensitively). Other requests never
+            buffer and report reason not_selected. Requires log_request_body
+            or log_response_body true.
+        capture_request_header_value:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[!-~](?:[ -~]*[!-~])?$'
+          description: >-
+            Exact value capture_request_header must carry (compared after
+            trimming the received value). 1-256 visible ASCII characters
+            without surrounding spaces. When set, the selector header is
+            redacted from header dumps. Requires capture_request_header.
+        capture_expires_at:
+          type: string
+          format: date-time
+          description: >-
+            RFC 3339 instant after which capture stops: requests received at or
+            after it never buffer and report reason capture_expired. A past
+            instant is accepted. Requires log_request_body or
+            log_response_body true.
         redacted_headers:
           type: array
           items:
@@ -22557,7 +22715,7 @@ components:
             method: POST
             headers:
               Content-Type: application/json
-            body_template: '{"routing_key":"$ROUTING_KEY","event_action":"${event_action}","payload":{"summary":"${rule_name}: ${reason}","source":"${proxy_name}","severity":"${severity}"}}'
+            body_template: '{"routing_key":"$ROUTING_KEY","event_action":"${event_action}","dedup_key":"${incident_key}","payload":{"summary":"${rule_name}: ${reason}","source":"${proxy_name}","severity":"${severity}"}}'
         rules:
           - name: proxy_5xx_spike
             enabled: true
@@ -22748,8 +22906,12 @@ components:
           description: |
             Template body. Supports generic notification variables plus
             proxy_alerts variables such as `${rule_name}`, `${proxy_name}`,
-            `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`,
-            and `${reason}`. Empty strings are allowed. Unbalanced `${`
+            `${incident_key}` (stable per plugin config + namespace + proxy +
+            rule; use it as the receiver's correlation key, e.g. PagerDuty
+            `dedup_key`),
+            `${observed}`, `${threshold}`, `${sample_count}` (total samples in
+            the rule window), `${window_seconds}`, and `${reason}`. Empty
+            strings are allowed. Unbalanced `${`
             placeholders are rejected at construction; JSON Schema cannot
             express balanced-placeholder syntax.
 
@@ -24048,6 +24210,8 @@ components:
             oneOf:
               - required: [introspection_endpoint]
               - required: [discovery_url]
+            dependentRequired:
+              discovery_refresh_interval_secs: [discovery_url]
             properties:
               introspection_endpoint:
                 type: string
@@ -24080,8 +24244,11 @@ components:
                 pattern: '\S'
                 description: >-
                   Expected iss claim in active introspection responses. Trimmed;
-                  a blank value is rejected. Also used as the audience of a
-                  private_key_jwt client assertion.
+                  a blank value is rejected. Independent of the private_key_jwt
+                  assertion audience (see client_auth.client_assertion_audience).
+                  When omitted, each active response's string iss joins the
+                  external identity realm, so equal subjects asserted for
+                  different issuers are different principals.
               audiences:
                 type: array
                 items:
@@ -24162,6 +24329,17 @@ components:
                     default: RS256
                   private_key_jwt_kid:
                     type: string
+                  client_assertion_audience:
+                    type: string
+                    pattern: '\S'
+                    description: >-
+                      aud of private_key_jwt client assertions. Trimmed; a
+                      blank value is rejected. Defaults to the resolved
+                      introspection endpoint URL (the configured
+                      introspection_endpoint, or the endpoint discovery
+                      resolved). Independent of issuer: set it when the
+                      authorization server requires another audience, such as
+                      its issuer identifier.
               from_headers:
                 type: array
                 items:
@@ -24213,6 +24391,41 @@ components:
                 minimum: 100
                 maximum: 30000
                 description: Per-introspection-request timeout, in milliseconds.
+              max_concurrent_introspections:
+                type: integer
+                format: uint64
+                default: 32
+                minimum: 1
+                maximum: 1024
+                description: >-
+                  Uncached introspection calls this provider may have in
+                  flight. Non-queuing: a lookup that finds the limit exhausted
+                  fails fast with 503. Also bounded by the plugin-level
+                  max_concurrent_introspections and a fixed process-wide
+                  ceiling of 1024.
+              discovery_refresh_interval_secs:
+                type: integer
+                format: uint64
+                default: 900
+                minimum: 1
+                maximum: 86400
+                description: >-
+                  Seconds between discovery document re-fetches after a
+                  successful resolution. A failed refresh keeps serving the
+                  last known endpoint and retries with capped exponential
+                  backoff. Only valid with discovery_url.
+              accept_mtls_bound_tokens:
+                type: boolean
+                default: false
+                description: >-
+                  Admit RFC 8705 certificate-bound tokens whose cnf is exactly
+                  one non-empty x5t#S256 member, only when the request's
+                  frontend client certificate has that base64url SHA-256
+                  thumbprint; a missing or different certificate is a bearer
+                  401. Re-verified on every request, including cache hits.
+                  Any other cnf (DPoP jkt, jwk, extra members) and any
+                  non-Bearer token_type still fail closed. A null cnf or
+                  token_type is treated as absent.
               max_cache_entries:
                 type: integer
                 format: uint64
@@ -24322,6 +24535,17 @@ components:
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.
+        max_concurrent_introspections:
+          type: integer
+          format: uint64
+          default: 128
+          minimum: 1
+          maximum: 1024
+          description: >-
+            Uncached introspection calls this plugin instance may have in
+            flight across all of its providers. Non-queuing: a lookup that
+            finds the limit exhausted fails fast with 503. A fixed
+            process-wide ceiling of 1024 applies across every instance.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -24359,7 +24583,8 @@ components:
         header kid that selects exactly one current trusted JWKS key; missing,
         empty, and unknown kid values are rejected with no all-keys fallback.
         Optional string fields accept null as "unset", matching constructor
-        admission.
+        admission. Sessions too large for one browser cookie are split across
+        bounded `<cookie_name>.N` chunk cookies.
       required: [providers, session]
       properties:
         providers:
@@ -24371,15 +24596,29 @@ components:
             additionalProperties: false
             required: [issuer, client_id, redirect_uri, scopes, client_auth]
             oneOf:
+              # A present `null` counts as "unset" (constructor admission), so
+              # the alternatives constrain non-null presence rather than key
+              # presence.
               - required: [discovery_url]
-                not:
-                  anyOf:
-                    - required: [authorization_endpoint]
-                    - required: [token_endpoint]
-                    - required: [jwks_uri]
+                properties:
+                  discovery_url:
+                    type: string
+                  authorization_endpoint:
+                    type: "null"
+                  token_endpoint:
+                    type: "null"
+                  jwks_uri:
+                    type: "null"
               - required: [authorization_endpoint, token_endpoint, jwks_uri]
-                not:
-                  required: [discovery_url]
+                properties:
+                  authorization_endpoint:
+                    type: string
+                  token_endpoint:
+                    type: string
+                  jwks_uri:
+                    type: string
+                  discovery_url:
+                    type: "null"
             properties:
               issuer:
                 type: string
@@ -24388,11 +24627,13 @@ components:
                   Expected ID token issuer, compared as an exact case-sensitive
                   string. Per RFC 7519 section 4.1.1 a present iss must be a
                   single string; an array, object, number, boolean, or null iss
-                  is rejected.
+                  is rejected. A discovery document is used only when its own
+                  `issuer` member is exactly this value (OpenID Connect
+                  Discovery section 4.3).
               discovery_url:
                 type: [string, "null"]
                 minLength: 1
-                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri.
+                description: OIDC discovery URL. Mutually exclusive with authorization_endpoint, token_endpoint, and jwks_uri. The document must carry an `issuer` exactly equal to `issuer`. Its endpoints must use HTTPS and may live on other origins (Google and Microsoft Entra ID publish cross-origin endpoints); plain HTTP is accepted only for a loopback development discovery_url and only on its own origin.
               authorization_endpoint:
                 type: [string, "null"]
                 minLength: 1
@@ -24467,14 +24708,16 @@ components:
                 description: Absolute callback URI registered with the provider, with no fragment (RFC 6749 §3.1.2). Before issuing a browser challenge, Ferrum requires its host to match the validated request Host/:authority; DNS comparison is case-insensitive, IP literals compare by address, and ports are ignored. Trailing-dot DNS callback hosts and missing, malformed, or cross-host request authorities fail closed before state or cookies are issued.
               callback_path:
                 type: [string, "null"]
-                pattern: '^/[^\s?#;,]*$'
+                minLength: 1
+                pattern: '^(/[^\s?#;,%\\/]+)*/?$'
                 default: /oauth/callback
-                description: Callback path handled by Ferrum; must equal the path in redirect_uri. Also the correlation cookie's Path attribute, so it carries cookie-path syntax rules.
+                description: Callback path handled by Ferrum; must equal the path in redirect_uri. Also the correlation cookie's Path attribute, so it carries cookie-path syntax rules. Must already be a canonical request path (no percent-escapes, empty segments, dot segments, or backslashes), because it is compared with the frontend's canonical request path; dot segments are refused by the constructor.
               logout_path:
                 type: [string, "null"]
-                pattern: '^/[^\s?#;,]*$'
+                minLength: 1
+                pattern: '^(/[^\s?#;,%\\/]+)*/?$'
                 default: /oauth/logout
-                description: Must not resolve to the same path as callback_path; the callback branch is evaluated first.
+                description: Must not resolve to the same path as callback_path; the callback branch is evaluated first. Must be a canonical request path, like callback_path. Logout is state-changing, so GET/HEAD requests must carry `Sec-Fetch-Site` same-origin or none, a POST is refused only when the browser reports cross-site or same-site, and other methods answer 405; a refused request clears nothing and contacts no provider.
               scopes:
                 type: array
                 minItems: 1
@@ -24557,6 +24800,58 @@ components:
                   session.ttl_secs or the access-token lifetime. The session is
                   still additionally capped by session.ttl_secs and
                   session.idle_ttl_secs.
+              authorization_params:
+                type: [object, "null"]
+                maxProperties: 16
+                propertyNames:
+                  minLength: 1
+                  maxLength: 512
+                  pattern: '^[!-~]+$'
+                  not:
+                    enum:
+                      - response_type
+                      - client_id
+                      - redirect_uri
+                      - scope
+                      - state
+                      - nonce
+                      - code_challenge
+                      - code_challenge_method
+                      - max_age
+                      - response_mode
+                      - request
+                      - request_uri
+                additionalProperties:
+                  type: string
+                  maxLength: 512
+                description: >-
+                  Static extra authorization-request parameters, such as
+                  `prompt`, `acr_values`, `login_hint`, or `ui_locales`, appended
+                  after the parameters the plugin owns. Names the plugin sets
+                  (response_type, client_id, redirect_uri, scope, state, nonce,
+                  code_challenge, code_challenge_method, max_age, response_mode,
+                  request, request_uri) are rejected case-insensitively; values
+                  must not contain control characters.
+              max_age_secs:
+                type: [integer, "null"]
+                format: uint64
+                minimum: 0
+                maximum: 31536000
+                description: >-
+                  OpenID Connect `max_age`. When set it is sent on the
+                  authorization request, the callback requires an ID token
+                  `auth_time` no older than this (plus id_token_clock_skew_secs),
+                  and a session whose login is older re-challenges instead of
+                  refreshing.
+              forward_access_token:
+                type: boolean
+                default: false
+                description: >-
+                  Relay the session's current (refreshed) access token to the
+                  backend as `Authorization: Bearer <token>`. When enabled the
+                  backend Authorization header is gateway-owned on this route:
+                  every client-supplied copy is removed first, so a request whose
+                  accepted principal is not this session forwards none.
         session:
           type: object
           additionalProperties: false
@@ -24576,7 +24871,7 @@ components:
               type: string
               minLength: 32
               format: password
-              description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes and must not be a known published or placeholder value (including the documented `${OIDC_SESSION_SECRET_32_BYTES_MIN}` placeholder, the key Ferrum Foundry's OIDC template published, Ferrum's own sequential example/test secrets, and obvious placeholders such as changeme, change-me, replace-me, placeholder, example, or your-secret). Screening covers both the supplied value and the effective key material (standard Base64 decoded only when it yields at least 32 bytes, otherwise raw bytes before HKDF), including Base64 spellings of denied values and unresolved `${...}` templates anywhere in either textual value. A rejected value returns 400 naming this field without revealing the secret.
+              description: AEAD key material for durable session cookies and sealed pending authorization-code correlation cookies; must be at least 32 bytes and must not be a known published or placeholder value (including the documented `${OIDC_SESSION_SECRET_32_BYTES_MIN}` placeholder, the key Ferrum Foundry's OIDC template published, Ferrum's own sequential example/test secrets, and obvious placeholders such as changeme, change-me, replace-me, placeholder, or your-secret). Screening covers both the supplied value and the effective key material (standard Base64 decoded only when it yields at least 32 bytes, otherwise raw bytes before HKDF), including Base64 spellings of denied values and unresolved `${...}` templates anywhere in either textual value. A rejected value returns 400 naming this field without revealing the secret.
             encryption_secret_previous:
               type: [string, "null"]
               minLength: 32
@@ -24609,7 +24904,7 @@ components:
               default: 8000
               minimum: 1024
               maximum: 8000
-              description: Maximum encoded size for sealed session cookies and sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes.
+              description: "Maximum encoded size of the sealed session value and of sealed pending-flow correlation cookies. The minimum is what a sealed pending authorization flow needs before any original-URL bytes. A session whose complete Set-Cookie line would exceed 4000 bytes is split across `<cookie_name>.0`…`<cookie_name>.N` chunk cookies (at most 9) that each fit a browser cookie; a session above this cap is refused at the callback with a named error instead of being emitted. Every session cookie carries Max-Age equal to the remaining absolute session lifetime. Not part of the session context, and it bounds only what is issued: existing sessions and in-flight logins up to the 8000-byte admission maximum stay readable after it is lowered."
             secure:
               type: boolean
               default: true
@@ -24661,13 +24956,13 @@ components:
               format: uint64
               default: 10000
               minimum: 1
-              description: Per-instance maximum number of pending browser authorization flows this plugin instance will start (DoS admission). Cross-replica callbacks use the sealed correlation cookie and do not require a shared state cache.
+              description: Per-instance size of the pending-login replay cache (DoS admission). When it is full, further logins are still started as sealed-only flows (no local replay entry), each charged to its source under state_cache_max_entries_per_source, up to one more state_cache_max_entries; beyond that new login starts answer 503. Cross-replica callbacks use the sealed correlation cookie and do not require a shared state cache.
             state_cache_max_entries_per_source:
               type: integer
               format: uint64
               default: 32
               minimum: 1
-              description: Per-instance maximum pending browser authorization flows started per resolved client IP; must not exceed state_cache_max_entries.
+              description: Per-instance maximum pending browser authorization flows started per resolved client IP, enforced whether or not the replay cache is full; must not exceed state_cache_max_entries.
             post_login_redirect_param:
               type: [string, "null"]
               minLength: 1
@@ -24677,6 +24972,7 @@ components:
               items:
                 type: string
                 minLength: 1
+              description: Origins a post-login redirect may target, as `host` (the redirect_uri scheme's default port only) or `host:port`; an explicit default port (`host:443` for https) names the same origin as `host`. Hosts compare case-insensitively; an entry that is not a bare authority (path, query, fragment, or userinfo) is rejected. A target must also use redirect_uri's scheme and carry no userinfo; anything else lands on post_login_default_path.
             refresh_skew_secs:
               type: integer
               format: uint64
@@ -30203,11 +30499,11 @@ components:
         require_get_method:
           type: boolean
           default: true
-          description: "Reject non-GET requests with 405 (SSE is read-only)"
+          description: "Reject non-GET requests with 405 (SSE is read-only). While this or require_accept_header is enabled, the checks are route admission policy: a native gRPC or WebSocket request to the route, which runs only plain-HTTP plugins, is refused with 403 (rejection phase route_protocol_admission) instead of skipping them."
         require_accept_header:
           type: boolean
           default: true
-          description: "Require an affirmative Accept: text/event-stream entry (406 otherwise; q=0, malformed, or duplicate quality is not affirmative)"
+          description: "Require an affirmative Accept: text/event-stream entry (406 otherwise; q=0, malformed, or duplicate quality is not affirmative). While this or require_get_method is enabled, native gRPC and WebSocket requests to the route are refused with 403 (rejection phase route_protocol_admission)."
         strip_accept_encoding:
           type: boolean
           default: true
@@ -30225,15 +30521,15 @@ components:
           format: uint64
           minimum: 1
           maximum: 18446744073709551615
-          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping. Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
+          description: "EventSource reconnection hint in milliseconds, prepended as a retry: field when wrapping, and written once ahead of the first bytes of a streamed genuine backend text/event-stream 2xx response (as its own line, so it dispatches no event; a later backend retry: field overrides it). Never written into a stream under a non-identity Content-Encoding, a Cache-Control: no-transform stream, or a 206/226 response. Admitted over the JSON numeric VALUE, so an exact integer-valued number (2500.0) is accepted exactly as 2500 is; fractional values and magnitudes outside the unsigned 64-bit range above are rejected."
         force_sse_content_type:
           type: boolean
           default: false
-          description: "Force Content-Type: text/event-stream even if backend returns something else. Not applied to a response carrying Cache-Control: no-transform (RFC 9110 section 7.7 forbids an intermediary changing Content-Type on one)."
+          description: "Force Content-Type: text/event-stream even if backend returns something else. Not applied to a response carrying Cache-Control: no-transform (RFC 9110 section 7.7 forbids an intermediary changing Content-Type on one), to 206/226 responses, or to bodies under a non-identity Content-Encoding, whether or not wrap_non_sse_responses is enabled."
         wrap_non_sse_responses:
           type: boolean
           default: false
-          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type. Wrapping and its relabel are declined together — the origin representation is forwarded unchanged — for 206/226 responses, responses carrying Cache-Control: no-transform (RFC 9110 section 7.7, which also blocks force_sse_content_type), and bodies under a non-identity Content-Encoding. A framed event that exceeds the effective response-body ceiling returns the gateway capacity refusal instead of the unframed body."
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering). Implies client-visible text/event-stream for wrapped responses and composes with force_sse_content_type. Wrapping and its relabel are declined together — the origin representation is forwarded unchanged — for 206/226 responses, responses carrying Cache-Control: no-transform (RFC 9110 section 7.7, which also blocks force_sse_content_type), and bodies under a non-identity Content-Encoding. A framed event that exceeds the effective response-body ceiling returns the gateway capacity refusal instead of the unframed body. Only responses this plugin's after_proxy relabelled are framed, so synthetic responses (response_mock, terminate-mode serverless_function, cache hits) keep their own body and media type."
 
     RateLimitingRuleConfig:
       type: object
@@ -31883,10 +32179,14 @@ components:
       additionalProperties: false
       required: [operations]
       description: |
-        Plugin: openapi_validator — validates request and response bodies
-        against operation schemas generated from an attached OpenAPI/Swagger
-        document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. Multipart Content-Disposition accepts ordinary
+        Plugin: openapi_validator — validates request parameters (path, query,
+        header, cookie) and request and response bodies against operation
+        schemas generated from an attached OpenAPI/Swagger document. Supports
+        JSON, XML, form-urlencoded, multipart, text, and binary media types.
+        JSON Schema `format` is asserted under every `schema_draft` (unknown
+        formats such as OpenAPI's int32/int64/byte/password stay annotations).
+        Must be proxy-scoped; every config load rejects global and
+        proxy_group scope. Multipart Content-Disposition accepts ordinary
         `filename` or a single bounded RFC 5987/8187 `filename*` (UTF-8 only;
         unquoted ext-value) and rejects continuations, quoted `filename*`,
         bare/non-token parameter segments, conflicts, and hostile extended
@@ -31937,13 +32237,16 @@ components:
         validate_request:
           type: boolean
           default: true
-          description: Validate request bodies when an operation has a request schema.
+          description: >-
+            Validate request bodies when an operation has a request schema, and
+            request parameters when an operation declares `parameters`.
         validate_response:
           type: boolean
           default: true
           description: Validate response bodies when an operation has a response schema.
         request_content_types:
           type: array
+          minItems: 1
           uniqueItems: true
           items:
             $ref: "#/components/schemas/OpenapiValidatorMediaType"
@@ -31955,9 +32258,10 @@ components:
             - multipart/form-data
             - text/plain
             - application/octet-stream
-          description: Request media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types.
+          description: Request media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types. An explicitly empty list is rejected; omit the field for the default scope.
         response_content_types:
           type: array
+          minItems: 1
           uniqueItems: true
           items:
             $ref: "#/components/schemas/OpenapiValidatorMediaType"
@@ -31969,7 +32273,7 @@ components:
             - multipart/form-data
             - text/plain
             - application/octet-stream
-          description: Response media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types.
+          description: Response media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types. An explicitly empty list is rejected; omit the field for the default scope.
         fail_on_unknown_operation:
           type: boolean
           default: true
@@ -32017,7 +32321,11 @@ components:
             direct plugin configuration; POST /api-specs and PUT
             /api-specs/{id} generate it from the attached document when
             x-ferrum-validate is enabled. The importer replaces this from the
-            spec on every spec PUT.
+            spec on every spec PUT. Two operations with the same method and the
+            same path_regex are rejected. Within a method, overlapping
+            operations are ordered by literal-segment count, then by the
+            leftmost differing segment (literal before `{template}`), then by
+            document order; `operation_label` never affects selection.
         bypass:
           type: object
           additionalProperties: false
@@ -32242,6 +32550,17 @@ components:
                 Alternate single-schema form encoding map. Only valid with
                 application/x-www-form-urlencoded or multipart/form-data.
           description: Request body schemas by media type.
+        parameters:
+          type: array
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/OpenapiValidatorParameter"
+          description: >-
+            Declared OpenAPI parameters, validated in `before_proxy` when
+            `validate_request` is true. Generated from the operation's and its
+            Path Item's `parameters` (operation entries override Path Item
+            entries with the same `name` and `in`). `in` + `name` must be
+            unique (header names case-insensitively).
         responses:
           type: object
           propertyNames:
@@ -32261,6 +32580,79 @@ components:
             so the precedence rule holds. A status entry may alternatively use the
             OpenAPI Response Object shape `{description?, content: {mediaType: schema}}`;
             that form is closed and rejects any other key.
+
+    OpenapiValidatorParameter:
+      type: object
+      additionalProperties: false
+      required: [name, in, schema]
+      allOf:
+        - if:
+            properties:
+              in:
+                enum: [path, header]
+          then:
+            properties:
+              style:
+                const: simple
+        - if:
+            properties:
+              in:
+                enum: [query, cookie]
+          then:
+            properties:
+              style:
+                const: form
+        - if:
+            properties:
+              in:
+                const: path
+          then:
+            properties:
+              required:
+                const: true
+      description: >-
+        One OpenAPI Parameter Object in the validator's supported subset: each
+        location's default serialization (`simple` for path and header,
+        `form` for query and cookie) over scalar, array-of-scalar, and
+        object-of-scalar schemas. Anything else — another `style`, an array of
+        arrays/objects, or a `form` + `explode: true` object — is rejected at
+        construction (the importer omits such a parameter when it is optional
+        and refuses the import when it is required). Path values come from the
+        canonical request path, query values from the client's raw query string
+        (at most 1024 pairs), header values from the pristine wire request
+        headers (never a header map an earlier `before_proxy` hook mutated),
+        and cookie values from the wire `Cookie` header, percent-decoded per
+        the `form` serialization (at most 1024 pairs); a value
+        that repeats for a non-array schema, a missing required parameter, a
+        value that cannot be converted, or a schema failure is a request
+        violation with `error_response.request_status_code` and the problem
+        title "Request parameter validation failed". Diagnostics name the
+        declared parameter and never contain its value.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            Parameter name, at most 256 bytes without control characters. Path
+            parameters must match a `{name}` expression of `path_template`;
+            header names must be valid HTTP field names other than Accept,
+            Content-Type, or Authorization (which OpenAPI ignores).
+        in:
+          type: string
+          enum: [path, query, header, cookie]
+        required:
+          type: boolean
+          description: Defaults to true for path parameters (which must be required) and false otherwise.
+        schema:
+          $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+        style:
+          type: string
+          enum: [simple, form]
+          description: Only the location's default style is accepted (`simple` for path/header, `form` for query/cookie).
+        explode:
+          type: boolean
+          description: Defaults to true for query/cookie (`form`) and false for path/header (`simple`).
 
     OpenapiValidatorResponse:
       description: >
@@ -33517,7 +33909,12 @@ components:
         pre_proxy accepts only 2xx as approval, while terminate may
         intentionally return only final 2xx-5xx statuses (200-599).
         Informational and out-of-range three-digit function statuses follow the
-        configured error path.
+        configured error path. For aws_lambda, every non-2xx Lambda Invoke API
+        status (throttling, access denied, a missing function, an oversized
+        payload, a service fault) is authored by the Lambda service rather than
+        by the function, so it is an invocation failure
+        (`lambda_service_error`) under `on_error` / `error_status_code` in
+        every mode, and the AWS error body is never returned.
       required:
         - provider
       properties:
@@ -33543,10 +33940,11 @@ components:
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars. The default endpoint is partition-aware: cn-* regions derive lambda.<region>.amazonaws.com.cn and every other region derives lambda.<region>.amazonaws.com. The air-gapped ISO partitions and the AWS European Sovereign Cloud are not derived and require an explicit aws_endpoint_url. When the key id or secret resolves from the process environment, the region must be a lowercase commercial, GovCloud, or China region (see allow_custom_endpoint_with_ambient_credentials)."
         aws_access_key_id:
           type: string
-          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var. The key id is interpolated into the SigV4 Authorization header, so the effective config or environment value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); validated whenever supplied, whichever provider is selected. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials). Not allowed with aws_credentials: default_chain."
         aws_secret_access_key:
           type: string
-          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials). Not allowed with aws_credentials: default_chain."
         aws_function_name:
           type: string
           minLength: 1
@@ -33555,7 +33953,8 @@ components:
           description: "Lambda function name, partial ARN, or full ARN (aws_lambda only), matching the Lambda Invoke API FunctionName grammar. Falls back to AWS_LAMBDA_FUNCTION_NAME env var; the environment value is held to the same grammar. Validated whenever supplied, whichever provider is selected. Existence and invoke permission are not checked at admission."
         aws_session_token:
           type: string
-          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. A process-environment token may only be sent to an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. Sent verbatim as x-amz-security-token, so the effective value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab). A process-environment token may only be sent to an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials). Not allowed with aws_credentials: default_chain."
         aws_qualifier:
           type: string
           minLength: 1
@@ -33581,6 +33980,32 @@ components:
             field); an `AWS_LAMBDA_ENDPOINT_URL` fallback is set by the same
             environment owner and is trusted like the environment
             credentials.
+        aws_credentials:
+          type: string
+          enum: [static, default_chain]
+          default: static
+          description: >-
+            aws_lambda only. `static` (default) signs with a literal key pair
+            from the config or from the AWS_ACCESS_KEY_ID /
+            AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) environment
+            variables, resolved once when the plugin is built.
+            `default_chain` signs with the gateway process's own AWS identity
+            from the AWS SDK default credential chain — environment variables,
+            shared config/credentials profiles, web identity (EKS IRSA), ECS
+            container credentials, and EC2 instance metadata (IMDSv2) — cached
+            and refreshed in the background before expiry, so temporary
+            workload credentials keep working without a reload. A request
+            waits (bounded) only when no usable credential is cached;
+            expired credentials are never used, and an unavailable chain is an
+            invocation failure (`aws_credentials_unavailable`) under
+            `on_error`. `default_chain` may not be combined with
+            aws_access_key_id, aws_secret_access_key, or aws_session_token,
+            and is subject to the same ambient endpoint scope as
+            process-environment credentials (see
+            allow_custom_endpoint_with_ambient_credentials). It requires a
+            build with the `secrets-aws` (or `cloud-secrets`) Cargo feature:
+            CP/admin shape-only admission accepts the row, and a serving node
+            built without the feature refuses to construct it.
         allow_custom_endpoint_with_ambient_credentials:
           type: boolean
           default: false
@@ -33588,7 +34013,8 @@ components:
             aws_lambda only. When `aws_access_key_id` or
             `aws_secret_access_key` is omitted from the config and resolves
             from the gateway process environment (`AWS_SESSION_TOKEN` is then
-            used too; it never completes a config key pair), `aws_region` must
+            used too; it never completes a config key pair), or when
+            `aws_credentials` is `default_chain`, `aws_region` must
             be a lowercase commercial, GovCloud, or China region, and the
             config-chosen Lambda endpoint (the host derived from `aws_region`,
             or the `aws_endpoint_url` override) must be an official AWS Lambda
@@ -33619,6 +34045,32 @@ components:
           type: string
           pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
           description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to the FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var (never the ambient GCP_CLOUD_FUNCTIONS_BEARER_TOKEN). The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
+        payload_format:
+          type: string
+          enum: [ferrum, aws_api_gateway_v2]
+          default: ferrum
+          description: >-
+            `ferrum` (default) sends the Ferrum invocation payload and uses the
+            Ferrum response contracts. `aws_api_gateway_v2` (aws_lambda with
+            mode terminate only) sends an API Gateway HTTP API proxy event,
+            payload format 2.0 (`version`, `routeKey`, `rawPath`,
+            `rawQueryString`, `cookies`, `headers`, `queryStringParameters`,
+            `requestContext`, `body`, `isBase64Encoded`), built from the same
+            finalized request view and the same fail-closed forward_headers /
+            forward_query_params / forward_body selection, and maps the
+            function result like an API Gateway proxy integration: a JSON
+            object with `statusCode` (integer 200-599) is a structured
+            response with optional `headers`, `multiValueHeaders`, `cookies`
+            (one Set-Cookie each), `body`, and `isBase64Encoded`, with an
+            identical name/value pair in `headers` and `multiValueHeaders`
+            merged into one field line and at most 128 header field lines /
+            32 KiB of header names and values; a JSON string result is
+            returned as the decoded string and any other JSON value as its JSON
+            text, both with status 200 and content-type application/json. Mapped headers are sanitized like provider
+            response headers. A duplicate-member or malformed result fails
+            with `invalid_api_gateway_response` under `on_error`. Native gRPC
+            terminate requests are refused before invocation with
+            `unsupported_grpc_payload_format`.
         forward_body:
           type: boolean
           default: false
@@ -33638,16 +34090,16 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 900000
           default: 5000
-          description: "Function invocation timeout in milliseconds. Must be > 0 and representable as a u64; a larger integer is rejected before the plugin constructor sees it."
+          description: "Function invocation timeout in milliseconds, 1-900000 (15 minutes, the AWS Lambda synchronous invocation maximum). A larger value is rejected at admission."
         max_response_body_bytes:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 67108864
           default: 10485760
-          description: "Max function response body size (10 MiB default). Must be > 0 and representable as a u64 (and as a usize on the serving platform); a larger integer is rejected before the plugin constructor sees it."
+          description: "Max function response body size (10 MiB default), 1-67108864 (64 MiB). The response is buffered whole, so this is the per-invocation retained-memory ceiling; a larger value is rejected at admission."
         on_error:
           type: string
           enum: [reject, continue]
@@ -33675,6 +34127,31 @@ components:
             properties:
               function_url:
                 type: string
+        # The API Gateway proxy contract is a Lambda terminate contract.
+        - if:
+            required: [payload_format]
+            properties:
+              payload_format:
+                const: aws_api_gateway_v2
+          then:
+            required: [provider, mode]
+            properties:
+              provider:
+                const: aws_lambda
+              mode:
+                const: terminate
+        # The default chain supplies the credentials; literal ones conflict.
+        - if:
+            required: [aws_credentials]
+            properties:
+              aws_credentials:
+                const: default_chain
+          then:
+            not:
+              anyOf:
+                - required: [aws_access_key_id]
+                - required: [aws_secret_access_key]
+                - required: [aws_session_token]
         # Cleartext to anything but a loopback IP literal needs the opt-in.
         - if:
             required: [function_url]
@@ -35590,12 +36067,20 @@ components:
         max_total_size_bytes (including omitted defaults), the 32 UTF-8 byte
         redis_integrity_key minimum, platform-sized integer limits, URL parsing,
         and the deployment backend egress policy. These residual checks are not
-        fully expressible in this schema. Provider-managed Responses conversations
-        and Gemini retained contexts bypass replay; other unmodeled root context
-        is canonically bound to exact and semantic identities. Cohere SYSTEM
-        history is retained as exact instruction state in semantic scopes.
-        Cache hits preserve finalized application bodies while current response
-        enforcement, live header rules, and negotiated compression still run.
+        fully expressible in this schema. Provider-managed Responses conversations,
+        Gemini retained contexts, and Cohere conversation_id requests bypass
+        replay; other unmodeled root context is canonically bound to exact and
+        semantic identities. Request bodies with duplicate JSON members, a
+        request Cache-Control no-store/no-cache, or an unprovable
+        response-presentation policy also bypass. Instruction state (system,
+        developer, instructions, systemInstruction, preamble, Cohere SYSTEM
+        history) is bound byte-exactly in semantic scopes. Exact keys and
+        semantic scopes bind the request's response-policy provenance (RTDS
+        gate content and static presentation-policy digest). Responses with
+        Cache-Control no-store/private or Set-Cookie are not stored;
+        provider-backed ai_federation answers are. Cache hits preserve
+        finalized application bodies while current response enforcement, live
+        header rules, and negotiated compression still run.
       allOf:
         - if:
             required: [semantic_similarity_enabled]
@@ -36905,7 +37390,7 @@ components:
     AiFederationConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. A claimed stream consumes one `max_concurrent_requests` permit and one real provider-circuit admission for the whole life of the response, and both are released exactly once on completion, client disconnect, downstream policy cut, backend error, or cancellation; a 2xx stream is scored a circuit success only after a valid terminal `data: [DONE]`. The selected provider's `multimodal_mode` is applied to a streamed request exactly as to a buffered one: a reject-mode provider declines the request during pre-commit selection and the next matching provider is considered, a text_only_with_warning provider has the non-text content parts removed from the provider-visible body, and the finalized body is re-checked before egress so a later transform cannot reintroduce content the committed provider forbids. The provider-visible top-level `model` is rewritten to the value `model_mapping` / `default_model` resolved, and the committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the streaming route's dispatch budgets instead of the matched proxy's. Provider response headers on a claimed stream are reduced to the same bounded safe allowlist the buffered path publishes plus a gateway-authored `Content-Type: text/event-stream` — provider cookies, redirects, auth challenges, validators/digests, and unknown metadata never reach the client. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses and proven pre-wire transport failures; a completed 2xx that cannot be normalized is TERMINAL and returns 502 (response_normalization_failed) without calling another provider, because that generation has already been performed. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply."
+      description: "Plugin: ai_federation — HTTP-family OpenAI Chat Completions gateway. Dispatches from the finalized-request-egress phase after request-body transforms and the complete final request-policy hook pass, so priority_override cannot move provider I/O ahead of WAF/OpenAPI/body/size policy. Translates final request bodies to provider-native JSON with a 64 MiB serialization cap and normalizes bounded, non-streaming responses back to OpenAI format. Native gRPC is not supported or advertised. Provider and OAuth redirects are never followed. Configuration is strict: unknown root, provider, and circuit fields are rejected. Streaming Chat Completions (`stream: true`) are served by a separate non-buffering path that is OFF by default: with the root `streaming` block enabled, before_proxy commits exactly ONE provider before any downstream-visible byte and rewrites the routing decision through route_override_* so the ordinary dispatch path relays provider SSE incrementally. Provider fallback for a stream happens only during that pre-commit selection (open circuit, ineligible provider, unusable endpoint); after the commit no second provider is ever spliced into the same logical stream, and a post-commit failure truncates with one gateway-authored terminal SSE `error` event. Streaming eligibility is narrow: only providers whose native streaming wire format already is the OpenAI Chat Completions SSE contract (openai, mistral, xai, deepseek, meta_llama, hugging_face, azure_openai) with a static header credential. anthropic, google_gemini, google_vertex, aws_bedrock, and cohere, and any provider using AWS SigV4 or Google OAuth2, fail closed with a field-specific 501 — use ai_stream_router for Anthropic/Gemini streaming translation. With `streaming.enabled` the plugin declares a backend-boundary header policy plus request header/destination mutation, so it can no longer be composed with request_deduplication or response_caching on the same proxy. A claimed stream consumes one `max_concurrent_requests` permit and one real provider-circuit admission for the whole life of the response, and both are released exactly once on completion, client disconnect, downstream policy cut, backend error, or cancellation; a 2xx stream is scored a circuit success only after a valid terminal `data: [DONE]`. The selected provider's `multimodal_mode` is applied to a streamed request exactly as to a buffered one: a reject-mode provider declines the request during pre-commit selection and the next matching provider is considered, a text_only_with_warning provider has the non-text content parts removed from the provider-visible body, and the finalized body is re-checked before egress so a later transform cannot reintroduce content the committed provider forbids. The provider-visible top-level `model` is rewritten to the value `model_mapping` / `default_model` resolved, and the committed provider's `connect_timeout_seconds` / `read_timeout_seconds` become the streaming route's dispatch budgets instead of the matched proxy's. Provider response headers on a claimed stream are reduced to the same bounded safe allowlist the buffered path publishes plus a gateway-authored `Content-Type: text/event-stream` — provider cookies, redirects, auth challenges, validators/digests, and unknown metadata never reach the client. Streaming is disabled by default and `stream: true` then returns 501 as before. Priority fallback is allowed for configured statuses and proven pre-wire transport failures; a completed 2xx that cannot be normalized is TERMINAL and returns 502 (response_normalization_failed) without calling another provider, because that generation has already been performed. Ambiguous POST outcomes are not replayed by default. Fails closed by default when a JSON POST cannot be inspected, lacks a string `model`, or has no matching provider. Outbound calls use the shared PluginHttpClient and global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY); per-proxy backend TLS overrides do not apply. On the buffered path a provider non-2xx response body is never relayed: the client receives a fixed OpenAI-shaped envelope (`error.type`/`error.code` `upstream_error`, message naming only the status) plus the bounded safe provider headers, so provider error codes such as context_length_exceeded do not reach the client (a claimed stream relays the provider's own error envelope instead). Translating providers (anthropic, google_gemini, google_vertex, aws_bedrock) map messages, max_tokens/max_completion_tokens, temperature, top_p, stop, tools, and tool_choice; google_gemini/google_vertex additionally map response_format json_object/json_schema (responseMimeType application/json plus responseJsonSchema; a json_schema needs a schema object, and a strict one may only use the Gemini-enforced keyword subset listed in docs/plugins.md), n > 1 (candidateCount), seed, and non-zero presence/frequency penalties, and anthropic maps parallel_tool_calls false. Any other semantic control that a translating provider cannot represent (response_format JSON modes, n > 1, seed, or non-zero penalties on anthropic/aws_bedrock; parallel_tool_calls false on google_*/aws_bedrock; logprobs true, top_logprobs, a non-empty logit_bias, tools[].function.strict true, reasoning_effort, reasoning, verbosity, audio, prediction, web_search_options, legacy functions/function_call, or non-text modalities on all three) is refused before provider I/O; the next matching provider is tried and otherwise the request fails 400 provider_translation_failed. Gemini/Vertex function-call thought signatures are exported on the tool call as `extra_content.google.thought_signature` (Google's OpenAI-compatibility convention, at most 64 KiB) and restored on the native functionCall part when the client sends that assistant message back."
       required: [providers]
       properties:
         providers:
@@ -36944,11 +37429,16 @@ components:
                 type: integer
                 minimum: 0
                 maximum: 4294967295
-                description: "Lower = tried first. Defaults to provider's index + 1."
+                description: "Lower = tried first. Defaults to provider's index + 1. Providers with equal priority keep configuration order unless one of them sets `weight`."
+              weight:
+                type: integer
+                minimum: 1
+                maximum: 1000
+                description: "Optional weighted-selection share. When any provider in the leading equal-`priority` group of a request's matching providers sets `weight`, the FIRST attempt is chosen at random in proportion to the weights (an unset weight counts as 1; a provider whose circuit cannot currently admit, whose multimodal_mode refuses the request's content parts, or on the streaming path a streaming-ineligible provider, gets no share); the remaining attempts keep the deterministic priority/configuration order. A random value is drawn only when at least two providers of the group can take the first attempt. Applies to buffered and streaming selection alike. When no provider sets `weight`, selection is fully deterministic."
               api_key:
                 type: string
                 minLength: 1
-                description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT). An empty value is treated as absent and fails configuration admission; the resolved value must also be a valid HTTP header value (no newlines or control characters).
+                description: "API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT). An empty value is treated as absent and fails configuration admission; the resolved value must also be a valid HTTP header value (no newlines or control characters). A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference (uppercase `[A-Z_][A-Z0-9_]*`) is resolved from the gateway process environment at construction, so the secret need not be stored in plugin configuration (the namespace is materializable from Vault/AWS/Azure/GCP/file at startup); a `${...}` reference to any other variable, or to an unset/empty one, is refused at admission without echoing it."
               model_patterns:
                 type: array
                 maxItems: 128
@@ -36993,11 +37483,13 @@ components:
               connect_timeout_seconds:
                 type: integer
                 minimum: 1
+                maximum: 86400
                 default: 5
                 description: Per-provider TCP + TLS handshake timeout for outbound provider calls.
               read_timeout_seconds:
                 type: integer
                 minimum: 1
+                maximum: 86400
                 default: 60
                 description: Overall per-request deadline for outbound provider calls.
               max_response_body_bytes:
@@ -37052,7 +37544,7 @@ components:
               google_service_account_json:
                 type: string
                 minLength: 1
-                description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow. An empty value is treated as absent and fails configuration admission.
+                description: "Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow. An empty value is treated as absent and fails configuration admission. A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference (uppercase `[A-Z_][A-Z0-9_]*`) is resolved from the gateway process environment at construction, so the secret need not be stored in plugin configuration (the namespace is materializable from Vault/AWS/Azure/GCP/file at startup); a `${...}` reference to any other variable, or to an unset/empty one, is refused at admission without echoing it."
               aws_region:
                 type: string
                 minLength: 1
@@ -37061,13 +37553,13 @@ components:
                 description: "AWS region for Bedrock (e.g. us-east-1). Required for aws_bedrock unless AWS_DEFAULT_REGION/AWS_REGION env var is set. The default endpoint is partition-aware: cn-* regions derive bedrock-runtime.<region>.amazonaws.com.cn and every other region derives bedrock-runtime.<region>.amazonaws.com. When the key id or secret resolves from the process environment, the region must be a lowercase commercial, GovCloud, or China region (see allow_custom_endpoint_with_ambient_credentials)."
               aws_access_key_id:
                 type: string
-                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials). A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference (uppercase `[A-Z_][A-Z0-9_]*`) is resolved from the gateway process environment at construction, so the secret need not be stored in plugin configuration (the namespace is materializable from Vault/AWS/Azure/GCP/file at startup); a `${...}` reference to any other variable, or to an unset/empty one, is refused at admission without echoing it. A referenced value counts as provider-config credentials, not ambient ones."
               aws_secret_access_key:
                 type: string
-                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials). A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference (uppercase `[A-Z_][A-Z0-9_]*`) is resolved from the gateway process environment at construction, so the secret need not be stored in plugin configuration (the namespace is materializable from Vault/AWS/Azure/GCP/file at startup); a `${...}` reference to any other variable, or to an unset/empty one, is refused at admission without echoing it. A referenced value counts as provider-config credentials, not ambient ones."
               aws_session_token:
                 type: string
-                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. A process-environment token may only be sent to an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. A process-environment token may only be sent to an official Bedrock Runtime endpoint (see allow_custom_endpoint_with_ambient_credentials). A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference (uppercase `[A-Z_][A-Z0-9_]*`) is resolved from the gateway process environment at construction, so the secret need not be stored in plugin configuration (the namespace is materializable from Vault/AWS/Azure/GCP/file at startup); a `${...}` reference to any other variable, or to an unset/empty one, is refused at admission without echoing it."
               allow_custom_endpoint_with_ambient_credentials:
                 type: boolean
                 default: false
@@ -37098,7 +37590,7 @@ components:
               circuit_breaker:
                 type: object
                 additionalProperties: false
-                description: Optional passive circuit. State belongs to this resolved provider instance and is discarded on configuration reload.
+                description: "Optional passive circuit. State belongs to this resolved provider instance and is discarded on configuration reload. Transitions are exported both in the aggregate ferrum_ai_federation_circuits_* series and per configured provider name in ferrum_ai_federation_provider_circuits_open / _opened_total / _closed_total (label `provider`). On a claimed stream, a provider transport fault (a dispatch timeout/reset/refusal answered by a gateway-authored 502/504 before any provider header, or a body that dies on a read timeout/reset after headers) scores a circuit failure regardless of fallback_on_status_codes (body-phase classes match proxy core's post-wire backend-failure set); client disconnects, authorization-lifetime terminations, and gateway-local refusals stay neutral, and route deadlines are settled exactly as proxy core settles them (a body cut by the route deadline is neutral; a pre-header expiry is charged only when the provider held the attempt)."
                 properties:
                   failure_threshold:
                     type: integer

@@ -570,6 +570,17 @@ where
         self.state.contains_key(key)
     }
 
+    /// Drop one key's state and release its reserved capacity slot.
+    ///
+    /// Only for a key no live caller can charge again (a finished WebSocket
+    /// session's process-unique connection id). Removing a key a live caller
+    /// still charges would hand it a fresh budget.
+    pub fn remove_key(&self, key: &K) {
+        if self.state.remove(key).is_some() {
+            self.release_entry_slot();
+        }
+    }
+
     fn release_entry_slot(&self) {
         let _ = self
             .entry_count
@@ -928,6 +939,11 @@ where
 
     pub fn contains_local_key(&self, key: &K) -> bool {
         self.fallback.contains_key(key)
+    }
+
+    /// See [`LocalLimiter::remove_key`].
+    pub fn remove_local_key(&self, key: &K) {
+        self.fallback.remove_key(key);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -1375,10 +1391,10 @@ impl SharedLocalLimiterState for AiTokenRateAlgorithm {
 }
 
 impl SharedLocalLimiterState for WsFrameRateAlgorithm {
-    type Key = u64;
+    type Key = WsRateLimitKey;
 
-    fn registry() -> &'static LocalLimiterRegistry<u64, Self> {
-        static REGISTRY: LocalLimiterRegistry<u64, WsFrameRateAlgorithm> =
+    fn registry() -> &'static LocalLimiterRegistry<WsRateLimitKey, Self> {
+        static REGISTRY: LocalLimiterRegistry<WsRateLimitKey, WsFrameRateAlgorithm> =
             LocalLimiterRegistry::new();
         &REGISTRY
     }
@@ -1729,6 +1745,16 @@ where
         match self {
             Self::Local(local) => local.contains_key(key),
             Self::Failover(failover) => failover.contains_local_key(key),
+        }
+    }
+
+    /// Release one local/fallback key that can never be charged again. See
+    /// [`LocalLimiter::remove_key`]; centralized Redis counters are left to
+    /// their own TTL.
+    pub fn remove_local_key(&self, key: &K) {
+        match self {
+            Self::Local(local) => local.remove_key(key),
+            Self::Failover(failover) => failover.remove_local_key(key),
         }
     }
 
@@ -3460,6 +3486,20 @@ impl WsRateLimitOp {
     }
 }
 
+/// Local/fallback state key for `ws_rate_limiting`.
+///
+/// `Connection` is the default per-session budget, keyed by the process-local
+/// monotonic WebSocket connection id (never reused within a process).
+/// `Aggregate` is a budget shared by every session bound to one
+/// `limit_by` identity (`consumer:…`, `ip:…`, `service:…`), captured once at
+/// upgrade admission; cloning it per frame is a reference-count bump, never an
+/// allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WsRateLimitKey {
+    Connection(u64),
+    Aggregate(Arc<str>),
+}
+
 #[derive(Debug, Clone)]
 pub struct WsFrameRateAlgorithm {
     frames_per_second: f64,
@@ -3492,26 +3532,15 @@ pub const WS_FRAME_REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
 /// Rejecting unrepresentable configs is fail-closed: Redis never silently
 /// raises the configured frame rate, and Redis failure/recovery cannot change
 /// the effective sustained-rate policy for an accepted config.
+///
+/// The burst/refill relations exist only for the Redis two-window
+/// approximation. A `sync_mode: local` policy runs the token bucket alone and
+/// validates with [`validate_ws_frame_rate_bounds`] instead.
 pub fn validate_ws_frame_rate_params(
     frames_per_second: u64,
     burst_size: u64,
 ) -> Result<(), String> {
-    if frames_per_second == 0 {
-        return Err("ws_rate_limiting: `frames_per_second` must be greater than zero".to_string());
-    }
-    if burst_size == 0 {
-        return Err("ws_rate_limiting: `burst_size` must be greater than zero".to_string());
-    }
-    if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
-        return Err(format!(
-            "ws_rate_limiting: `frames_per_second` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{frames_per_second}\""
-        ));
-    }
-    if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
-        return Err(format!(
-            "ws_rate_limiting: `burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{burst_size}\""
-        ));
-    }
+    validate_ws_frame_rate_bounds(frames_per_second, burst_size)?;
     if burst_size < frames_per_second {
         return Err("ws_rate_limiting: `burst_size` must be >= `frames_per_second`".to_string());
     }
@@ -3531,6 +3560,66 @@ pub fn validate_ws_frame_rate_params(
         ));
     }
     Ok(())
+}
+
+/// Operational bounds every `ws_rate_limiting` policy must satisfy, whatever
+/// its `sync_mode`: both values in `1..=MAX_RATE_LIMIT_MAX_REQUESTS`.
+///
+/// A local token bucket represents any capacity/refill pair, so a
+/// `sync_mode: local` policy needs nothing more; the Redis-only relations live
+/// in [`validate_ws_frame_rate_params`].
+pub fn validate_ws_frame_rate_bounds(
+    frames_per_second: u64,
+    burst_size: u64,
+) -> Result<(), String> {
+    if frames_per_second == 0 {
+        return Err("ws_rate_limiting: `frames_per_second` must be greater than zero".to_string());
+    }
+    if burst_size == 0 {
+        return Err("ws_rate_limiting: `burst_size` must be greater than zero".to_string());
+    }
+    if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: `frames_per_second` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{frames_per_second}\""
+        ));
+    }
+    if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: `burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{burst_size}\""
+        ));
+    }
+    Ok(())
+}
+
+/// Hand back a refused `ws_rate_limiting` frame charge.
+///
+/// Issued from a DETACHED task that owns a clone of the client `Arc`, so a
+/// session teardown that drops the frame hook cannot strand the charge, and the
+/// refused frame does not wait a second round trip. `INCRBY -charge` rides with
+/// `EXPIRE` in one transaction so a key that expired in between is recreated
+/// with a TTL (its negative value reads as zero usage). A hand-back that cannot
+/// be delivered is reported through the client's ordinary command-failure path,
+/// so `redis_failure_policy` governs the next decision; the refusal itself
+/// already stands. Without a Tokio runtime the hand-back is awaited inline,
+/// because spawning would panic.
+async fn uncharge_ws_frames(
+    redis: &Arc<RedisRateLimitClient>,
+    current_key: String,
+    charge: i64,
+    ttl_seconds: u64,
+) {
+    let client = Arc::clone(redis);
+    let refund = async move {
+        let _ = client
+            .incrby_with_expire(&current_key, charge.saturating_neg(), ttl_seconds)
+            .await;
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(refund);
+        }
+        Err(_) => refund.await,
+    }
 }
 
 impl WsFrameRateAlgorithm {
@@ -3624,6 +3713,16 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         // than the configured sustained rate.
         let (window_seconds, limit) = self.redis_window_derivation();
 
+        // A batch larger than the whole window budget can never be admitted
+        // (the local bucket refuses it the same way), so it is refused before
+        // it can touch the shared counter at all.
+        if op.frame_count() > limit {
+            return Ok(RateLimitOutcome::deny()
+                .with_limit(limit)
+                .with_window(window_seconds)
+                .with_remaining(0));
+        }
+
         let progress = RedisRateLimitClient::window_progress(window_seconds);
         let curr_idx = progress.index;
         let prev_idx = curr_idx.saturating_sub(1);
@@ -3639,13 +3738,24 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         let (prev_count, curr_count) = redis
             .sliding_window_increment_by(&prev_key, &curr_key, charge, ttl)
             .await?;
-        let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
+        // A counter recreated by a hand-back that outlived its key reads
+        // negative; it is zero usage, never credit.
+        let weighted =
+            weighted_window_count(prev_count.max(0), curr_count.max(0), elapsed_fraction);
         let allowed = weighted <= limit as f64;
         let remaining = ((limit as f64) - weighted).max(0.0) as u64;
 
         let outcome = if allowed {
             RateLimitOutcome::allow()
         } else {
+            // Charge-then-compensate, like request-quota admission: the charge
+            // precedes the decision so racing sessions and replicas cannot all
+            // admit against one stale read, and a refusal then hands back
+            // exactly what it charged. Without this, every refused batch stayed
+            // on the shared counter, and on an aggregate `limit_by` key (shared
+            // by reconnects and replicas) each refusal fed the next one,
+            // starving the budget for every session that shares it.
+            uncharge_ws_frames(redis, curr_key, charge, ttl).await;
             RateLimitOutcome::deny()
         };
         Ok(outcome

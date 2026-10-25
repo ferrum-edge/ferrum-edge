@@ -15,7 +15,7 @@ use futures_util::future::join_all;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2719,4 +2719,699 @@ async fn introspection_call_carries_the_proxy_hop_count() {
             .collect();
         assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes
+// ---------------------------------------------------------------------------
+
+/// The `token` form field of a recorded introspection request.
+fn introspected_token(request: &wiremock::Request) -> String {
+    url::form_urlencoded::parse(&request.body)
+        .find_map(|(key, value)| (key == "token").then(|| value.into_owned()))
+        .unwrap_or_default()
+}
+
+/// One form field of a recorded introspection request.
+fn introspection_form_field(request: &wiremock::Request, field: &str) -> Option<String> {
+    url::form_urlencoded::parse(&request.body)
+        .find_map(|(key, value)| (key == field).then(|| value.into_owned()))
+}
+
+/// An introspection service answering for several issuers: the token prefix
+/// selects the asserted `iss`, and every token asserts the same subject.
+async fn multi_issuer_introspection_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(|request: &wiremock::Request| {
+            let token = introspected_token(request);
+            let mut body = json!({"active": true, "username": "alice", "sub": "42"});
+            if token.starts_with("issuer-a") {
+                body["iss"] = json!("https://issuer-a.example");
+            } else if token.starts_with("issuer-b") {
+                body["iss"] = json!("https://issuer-b.example");
+            }
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+/// oauth2_introspection-SOL-1: a provider that pins no issuer must not collapse
+/// equal subjects asserted for different issuers into one principal, on cache
+/// misses and cache hits alike.
+#[tokio::test]
+async fn unpinned_provider_binds_the_response_issuer_into_the_identity_realm() {
+    let server = multi_issuer_introspection_server().await;
+    let endpoint = format!("{}/introspect", server.uri());
+
+    let plugin = introspection_plugin(config(&endpoint));
+    let a_cold = introspected_realm(&plugin, "issuer-a-1").await;
+    let a_warm = introspected_realm(&plugin, "issuer-a-1").await;
+    let a_other_token = introspected_realm(&plugin, "issuer-a-2").await;
+    let b_cold = introspected_realm(&plugin, "issuer-b-1").await;
+    let b_warm = introspected_realm(&plugin, "issuer-b-1").await;
+    let without_iss = introspected_realm(&plugin, "no-iss-1").await;
+
+    assert_eq!(a_cold, a_warm, "a cache hit commits the miss's realm");
+    assert_eq!(a_cold, a_other_token, "one issuer is one realm");
+    assert_eq!(b_cold, b_warm, "a cache hit commits the miss's realm");
+    assert_ne!(
+        a_cold, b_cold,
+        "equal subjects from different issuers are different principals"
+    );
+    assert_ne!(a_cold, without_iss);
+    assert_ne!(b_cold, without_iss);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        4,
+        "the warm lookups must be served from the positive cache"
+    );
+
+    // Pinned control: the configured issuer decides the realm and a
+    // mismatched response issuer is still refused.
+    let mut pinned = config(&endpoint);
+    pinned["providers"][0]["issuer"] = json!("https://issuer-a.example");
+    let plugin = introspection_plugin(pinned);
+    let pinned_realm = introspected_realm(&plugin, "issuer-a-3").await;
+    assert_ne!(pinned_realm, a_cold);
+    assert_bearer_reject(
+        plugin
+            .authenticate(&mut make_ctx("issuer-b-2"), &ConsumerIndex::new(&[]))
+            .await,
+        401,
+        "invalid_token",
+    );
+}
+
+/// The decoded payload of the `client_assertion` a recorded request carried.
+fn client_assertion_claims(request: &wiremock::Request) -> serde_json::Value {
+    let assertion = introspection_form_field(request, "client_assertion")
+        .expect("private_key_jwt sends a client assertion");
+    let payload = assertion
+        .split('.')
+        .nth(1)
+        .expect("the client assertion is a compact JWT");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("the assertion payload is base64url");
+    serde_json::from_slice(&bytes).expect("the assertion payload is JSON")
+}
+
+/// oauth2_introspection-SOL-2: pinning the response issuer no longer forces the
+/// `private_key_jwt` assertion audience. The default is the introspection
+/// endpoint, and `client_assertion_audience` selects another value, while the
+/// pinned issuer keeps rejecting a mismatched response `iss`.
+#[tokio::test]
+async fn private_key_jwt_assertion_audience_is_independent_of_the_issuer_pin() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(|request: &wiremock::Request| {
+            let issuer = if introspected_token(request).starts_with("wrong-issuer") {
+                "https://other.example"
+            } else {
+                "https://issuer.example"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "active": true,
+                "username": "u",
+                "iss": issuer
+            }))
+        })
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/introspect", server.uri());
+    let pem = generated_private_key_pem(&rcgen::PKCS_ECDSA_P256_SHA256);
+    let provider_config = |audience: Option<&str>| {
+        let mut client_auth = json!({
+            "method": "private_key_jwt",
+            "client_id": "ferrum-edge",
+            "private_key_jwt_alg": "ES256",
+            "private_key_pem": pem
+        });
+        if let Some(audience) = audience {
+            client_auth["client_assertion_audience"] = json!(audience);
+        }
+        json!({
+            "providers": [{
+                "introspection_endpoint": endpoint,
+                "issuer": "https://issuer.example",
+                "client_auth": client_auth
+            }]
+        })
+    };
+
+    let plugin = introspection_plugin(provider_config(None));
+    assert_continue(
+        plugin
+            .authenticate(&mut make_ctx("default-audience"), &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_bearer_reject(
+        plugin
+            .authenticate(
+                &mut make_ctx("wrong-issuer-default"),
+                &ConsumerIndex::new(&[]),
+            )
+            .await,
+        401,
+        "invalid_token",
+    );
+
+    let plugin = introspection_plugin(provider_config(Some("  https://issuer.example  ")));
+    assert_continue(
+        plugin
+            .authenticate(&mut make_ctx("explicit-audience"), &ConsumerIndex::new(&[]))
+            .await,
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let audience_for = |token: &str| {
+        let request = requests
+            .iter()
+            .find(|request| introspected_token(request) == token)
+            .unwrap_or_else(|| panic!("no introspection request for {token}"));
+        let claims = client_assertion_claims(request);
+        assert_eq!(claims["iss"], json!("ferrum-edge"));
+        assert_eq!(claims["sub"], json!("ferrum-edge"));
+        claims["aud"].clone()
+    };
+    assert_eq!(audience_for("default-audience"), json!(endpoint));
+    assert_eq!(audience_for("wrong-issuer-default"), json!(endpoint));
+    assert_eq!(
+        audience_for("explicit-audience"),
+        json!("https://issuer.example")
+    );
+
+    let mut blank = provider_config(None);
+    blank["providers"][0]["client_auth"]["client_assertion_audience"] = json!("   ");
+    let Err(error) = Oauth2Introspection::new(&blank, PluginHttpClient::default()) else {
+        panic!("a blank client_assertion_audience must be rejected");
+    };
+    assert!(
+        error.contains("client_assertion_audience"),
+        "unexpected error: {error}"
+    );
+}
+
+/// oauth2_introspection-CLAUDE-1: a JSON `null` `cnf` or `token_type` is an
+/// omitted member, not a sender constraint or a malformed response.
+#[tokio::test]
+async fn null_cnf_and_token_type_read_as_omitted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = match introspected_token(request).as_str() {
+                "null-cnf" => json!({"active": true, "username": "u", "cnf": null}),
+                "null-token-type" => {
+                    json!({"active": true, "username": "u", "token_type": null})
+                }
+                _ => json!({
+                    "active": true,
+                    "username": "u",
+                    "cnf": null,
+                    "token_type": null
+                }),
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = introspection_plugin(config(&endpoint));
+    for token in ["null-cnf", "null-token-type", "null-both"] {
+        let mut ctx = make_ctx(token);
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("u"), "{token}");
+    }
+}
+
+/// oauth2_introspection-CLAUDE-3 (certificate-bound tokens): with
+/// `accept_mtls_bound_tokens`, a `cnf."x5t#S256"` token is admitted only on a
+/// connection presenting the bound certificate. The binding is re-verified on
+/// every use, cache hits included, and before a cached scope verdict is
+/// revealed; any other confirmation still fails closed.
+#[tokio::test]
+async fn certificate_bound_tokens_require_the_bound_client_certificate() {
+    use ferrum_edge::plugins::utils::cert_hash::sha256_base64url_no_pad;
+
+    let bound_cert = b"oauth2 introspection bound client certificate".to_vec();
+    let other_cert = b"oauth2 introspection other client certificate".to_vec();
+    let thumbprint = sha256_base64url_no_pad(&bound_cert);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with({
+            let thumbprint = thumbprint.clone();
+            move |request: &wiremock::Request| {
+                let token = introspected_token(request);
+                let cnf = if token.starts_with("multi-confirmation") {
+                    json!({"x5t#S256": thumbprint, "jkt": "dpop-thumbprint"})
+                } else if token.starts_with("dpop-bound") {
+                    json!({"jkt": "dpop-thumbprint"})
+                } else {
+                    json!({"x5t#S256": thumbprint})
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "active": true,
+                    "username": "alice",
+                    "scope": "orders:read",
+                    "cnf": cnf
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/introspect", server.uri());
+    let mut accepting = config(&endpoint);
+    accepting["providers"][0]["accept_mtls_bound_tokens"] = json!(true);
+    let plugin = introspection_plugin(accepting.clone());
+
+    let with_cert = |token: &str, cert: Option<&Vec<u8>>| {
+        let mut ctx = make_ctx(token);
+        ctx.tls_client_cert_der = cert.map(|der| Arc::new(der.clone()));
+        ctx
+    };
+    let assert_binding_mismatch = |result: PluginResult| match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 401);
+            assert_eq!(body, r#"{"error":"mTLS binding mismatch"}"#);
+            assert_eq!(
+                headers.get("www-authenticate").map(String::as_str),
+                Some(r#"Bearer error="invalid_token""#)
+            );
+        }
+        other => panic!("expected an mTLS binding rejection, got {other:?}"),
+    };
+
+    // Cold lookup without a certificate: introspected and cached, refused.
+    assert_binding_mismatch(
+        plugin
+            .authenticate(&mut with_cert("bound", None), &ConsumerIndex::new(&[]))
+            .await,
+    );
+    // Cache hits: a different certificate is refused, the bound one admitted.
+    assert_binding_mismatch(
+        plugin
+            .authenticate(
+                &mut with_cert("bound", Some(&other_cert)),
+                &ConsumerIndex::new(&[]),
+            )
+            .await,
+    );
+    let mut ctx = with_cert("bound", Some(&bound_cert));
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+    assert_binding_mismatch(
+        plugin
+            .authenticate(&mut with_cert("bound", None), &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| introspected_token(request) == "bound")
+            .count(),
+        1,
+        "every later use of the token is a cache hit that re-verifies the binding"
+    );
+
+    // A cached scope refusal is not revealed without the bound certificate.
+    let mut scoped = accepting;
+    scoped["providers"][0]["required_scopes"] = json!(["orders:write"]);
+    let scoped_plugin = introspection_plugin(scoped);
+    assert_binding_mismatch(
+        scoped_plugin
+            .authenticate(
+                &mut with_cert("scoped-bound", None),
+                &ConsumerIndex::new(&[]),
+            )
+            .await,
+    );
+    match scoped_plugin
+        .authenticate(
+            &mut with_cert("scoped-bound", Some(&bound_cert)),
+            &ConsumerIndex::new(&[]),
+        )
+        .await
+    {
+        PluginResult::Reject {
+            status_code: 403, ..
+        } => {}
+        other => panic!("the bound certificate reaches the scope check, got {other:?}"),
+    }
+
+    // Confirmations this plugin cannot verify still fail closed.
+    for token in ["multi-confirmation", "dpop-bound"] {
+        let result = plugin
+            .authenticate(
+                &mut with_cert(token, Some(&bound_cert)),
+                &ConsumerIndex::new(&[]),
+            )
+            .await;
+        assert_reject_body(
+            result,
+            r#"{"error":"Sender-constrained tokens are not supported"}"#,
+        );
+    }
+
+    // Default posture: certificate-bound tokens are not accepted at all.
+    let default_plugin = introspection_plugin(config(&endpoint));
+    assert_reject_body(
+        default_plugin
+            .authenticate(
+                &mut with_cert("default-bound", Some(&bound_cert)),
+                &ConsumerIndex::new(&[]),
+            )
+            .await,
+        r#"{"error":"Sender-constrained tokens are not supported"}"#,
+    );
+}
+
+/// Drive `count` distinct uncached tokens through `plugin` concurrently and
+/// return how many were refused with the backpressure `503`.
+async fn unique_token_flood(
+    plugin: &Arc<Oauth2Introspection>,
+    prefix: &str,
+    count: usize,
+) -> usize {
+    let results = join_all((0..count).map(|index| {
+        let plugin = Arc::clone(plugin);
+        let token = format!("{prefix}-{index}");
+        async move {
+            plugin
+                .authenticate(&mut make_ctx(&token), &ConsumerIndex::new(&[]))
+                .await
+        }
+    }))
+    .await;
+    let mut unavailable = 0usize;
+    for result in results {
+        match result {
+            PluginResult::Continue => {}
+            PluginResult::Reject {
+                status_code: 503, ..
+            } => unavailable += 1,
+            other => panic!("unexpected flood result: {other:?}"),
+        }
+    }
+    unavailable
+}
+
+async fn slow_introspection_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(300))
+                .set_body_json(json!({"active": true, "username": "u"})),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// oauth2_introspection-CLAUDE-2: the provider and plugin-level concurrency
+/// limits are configurable, bounded, and enforced without queueing.
+#[tokio::test]
+async fn introspection_concurrency_limits_are_configurable_and_enforced() {
+    // A raised provider limit admits more than the default 32 at once.
+    let server = slow_introspection_server().await;
+    let mut raised = config(&format!("{}/introspect", server.uri()));
+    raised["providers"][0]["max_concurrent_introspections"] = json!(48);
+    let plugin = Arc::new(introspection_plugin(raised));
+    assert_eq!(unique_token_flood(&plugin, "raised-provider", 40).await, 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 40);
+
+    // A lowered provider limit refuses the excess with 503.
+    let server = slow_introspection_server().await;
+    let mut lowered = config(&format!("{}/introspect", server.uri()));
+    lowered["providers"][0]["max_concurrent_introspections"] = json!(4);
+    let plugin = Arc::new(introspection_plugin(lowered));
+    assert!(unique_token_flood(&plugin, "lowered-provider", 12).await > 0);
+    assert!(server.received_requests().await.unwrap().len() <= 4);
+
+    // The plugin-level limit bounds every provider of the instance together.
+    let server = slow_introspection_server().await;
+    let mut instance = config(&format!("{}/introspect", server.uri()));
+    instance["max_concurrent_introspections"] = json!(3);
+    let plugin = Arc::new(introspection_plugin(instance));
+    assert!(unique_token_flood(&plugin, "instance-limit", 12).await > 0);
+    assert!(server.received_requests().await.unwrap().len() <= 3);
+
+    // Both knobs are range-checked at admission.
+    let endpoint = "http://127.0.0.1:8181/introspect";
+    for (label, patch_provider, value) in [
+        ("provider zero", true, json!(0)),
+        ("provider above range", true, json!(1025)),
+        ("provider wrong type", true, json!("32")),
+        ("plugin zero", false, json!(0)),
+        ("plugin above range", false, json!(1025)),
+    ] {
+        let mut invalid = config(endpoint);
+        if patch_provider {
+            invalid["providers"][0]["max_concurrent_introspections"] = value;
+        } else {
+            invalid["max_concurrent_introspections"] = value;
+        }
+        let Err(error) = Oauth2Introspection::new(&invalid, PluginHttpClient::default()) else {
+            panic!("{label}: an out-of-range concurrency limit must be rejected");
+        };
+        assert!(
+            error.contains("max_concurrent_introspections"),
+            "{label}: unexpected error: {error}"
+        );
+    }
+}
+
+/// Deadlock bound for the discovery tests' waits. Elapsed time is never the
+/// evidence of completion; each wait observes the outcome it needs.
+const DISCOVERY_WAIT_BOUND: Duration = Duration::from_secs(20);
+
+/// Authenticate one token repeatedly until discovery has resolved an endpoint.
+/// An unresolved endpoint answers `503` without contacting any provider.
+async fn authenticate_once_discovery_resolves(plugin: &Oauth2Introspection, token: &str) {
+    let deadline = tokio::time::Instant::now() + DISCOVERY_WAIT_BOUND;
+    loop {
+        match plugin
+            .authenticate(&mut make_ctx(token), &ConsumerIndex::new(&[]))
+            .await
+        {
+            PluginResult::Continue => return,
+            PluginResult::Reject {
+                status_code: 503, ..
+            } => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "discovery never resolved an introspection endpoint"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => panic!("unexpected result while discovery resolves: {other:?}"),
+        }
+    }
+}
+
+fn introspection_posts(requests: &[wiremock::Request], endpoint_path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST" && request.url.path() == endpoint_path)
+        .count()
+}
+
+/// A discovery document that advertises `/introspect-a` until the test sets
+/// `rotate`, then answers every later fetch with `rotated`. It records the
+/// 1-based ordinal of the first fetch that received the rotated answer, so the
+/// test can wait for the worker to finish processing exactly that fetch.
+struct RotatingDiscovery {
+    server: MockServer,
+    rotate: Arc<AtomicBool>,
+    first_rotated_fetch: Arc<AtomicUsize>,
+}
+
+async fn rotating_discovery_server(rotated: fn(&str) -> ResponseTemplate) -> RotatingDiscovery {
+    let server = MockServer::start().await;
+    let uri = server.uri();
+    let rotate = Arc::new(AtomicBool::new(false));
+    let first_rotated_fetch = Arc::new(AtomicUsize::new(0));
+    let fetches = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with({
+            let rotate = Arc::clone(&rotate);
+            let first_rotated_fetch = Arc::clone(&first_rotated_fetch);
+            move |_: &wiremock::Request| {
+                let ordinal = fetches.fetch_add(1, Ordering::SeqCst) + 1;
+                if rotate.load(Ordering::SeqCst) {
+                    // Only the first rotated fetch is recorded.
+                    let _ = first_rotated_fetch.compare_exchange(
+                        0,
+                        ordinal,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                    rotated(&uri)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "introspection_endpoint": format!("{uri}/introspect-a")
+                    }))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    for endpoint_path in ["/introspect-a", "/introspect-b"] {
+        Mock::given(method("POST"))
+            .and(path(endpoint_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"active": true, "username": "u"})),
+            )
+            .mount(&server)
+            .await;
+    }
+    RotatingDiscovery {
+        server,
+        rotate,
+        first_rotated_fetch,
+    }
+}
+
+/// Release the rotated discovery answer and wait until the worker has fully
+/// processed the first fetch that received it — published the new endpoint,
+/// or handled the failure — using the plugin's completed-attempt counter.
+/// The worker fetches sequentially, so fetch `n` is processed exactly when the
+/// counter reaches `n`.
+async fn rotate_and_wait_for_processed_refresh(
+    discovery: &RotatingDiscovery,
+    plugin: &Oauth2Introspection,
+) {
+    discovery.rotate.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + DISCOVERY_WAIT_BOUND;
+    loop {
+        let rotated_fetch = discovery.first_rotated_fetch.load(Ordering::SeqCst) as u64;
+        if rotated_fetch > 0 && plugin.completed_discovery_attempts()[0] >= rotated_fetch {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the discovery worker never processed a rotated refresh"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn refreshing_discovery_plugin(server: &MockServer) -> Oauth2Introspection {
+    introspection_plugin(json!({
+        "providers": [{
+            "discovery_url": format!("{}/.well-known/openid-configuration", server.uri()),
+            "discovery_refresh_interval_secs": 1,
+            "client_auth": {"method": "none"}
+        }]
+    }))
+}
+
+/// oauth2_introspection-CLAUDE-5: discovery keeps refreshing after its first
+/// resolution, so a moved endpoint is picked up without a rebuild.
+#[tokio::test]
+async fn discovery_refresh_moves_to_a_republished_endpoint() {
+    let discovery = rotating_discovery_server(|uri| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "introspection_endpoint": format!("{uri}/introspect-b")
+        }))
+    })
+    .await;
+    let plugin = refreshing_discovery_plugin(&discovery.server);
+    assert_eq!(plugin.completed_discovery_attempts(), vec![0]);
+    plugin.start_background_tasks().unwrap();
+
+    // Every fetch advertises A until rotation, so this lookup uses A.
+    authenticate_once_discovery_resolves(&plugin, "before-refresh").await;
+    rotate_and_wait_for_processed_refresh(&discovery, &plugin).await;
+    assert_continue(
+        plugin
+            .authenticate(&mut make_ctx("after-refresh"), &ConsumerIndex::new(&[]))
+            .await,
+    );
+
+    let requests = discovery.server.received_requests().await.unwrap();
+    assert_eq!(introspection_posts(&requests, "/introspect-a"), 1);
+    assert_eq!(introspection_posts(&requests, "/introspect-b"), 1);
+}
+
+/// oauth2_introspection-CLAUDE-5: a failed refresh keeps serving the last
+/// known endpoint instead of dropping back to `503`.
+#[tokio::test]
+async fn failed_discovery_refresh_keeps_the_last_known_endpoint() {
+    let discovery = rotating_discovery_server(|_| ResponseTemplate::new(503)).await;
+    let plugin = refreshing_discovery_plugin(&discovery.server);
+    plugin.start_background_tasks().unwrap();
+
+    authenticate_once_discovery_resolves(&plugin, "before-failed-refresh").await;
+    // Retention is asserted only after the failed refresh was processed.
+    rotate_and_wait_for_processed_refresh(&discovery, &plugin).await;
+    assert_continue(
+        plugin
+            .authenticate(
+                &mut make_ctx("after-failed-refresh"),
+                &ConsumerIndex::new(&[]),
+            )
+            .await,
+    );
+
+    let requests = discovery.server.received_requests().await.unwrap();
+    assert_eq!(introspection_posts(&requests, "/introspect-a"), 2);
+    assert_eq!(introspection_posts(&requests, "/introspect-b"), 0);
+}
+
+#[test]
+fn discovery_refresh_interval_is_bounded_and_requires_discovery() {
+    let discovery = |interval: serde_json::Value| {
+        json!({
+            "providers": [{
+                "discovery_url": "http://127.0.0.1:8181/.well-known/openid-configuration",
+                "discovery_refresh_interval_secs": interval,
+                "client_auth": {"method": "none"}
+            }]
+        })
+    };
+    for valid in [json!(1), json!(900), json!(86_400)] {
+        Oauth2Introspection::new(&discovery(valid.clone()), PluginHttpClient::default())
+            .unwrap_or_else(|error| panic!("interval {valid} must be admitted: {error}"));
+    }
+    for invalid in [json!(0), json!(86_401), json!("900")] {
+        assert!(
+            Oauth2Introspection::new(&discovery(invalid.clone()), PluginHttpClient::default())
+                .is_err(),
+            "interval {invalid} must be rejected"
+        );
+    }
+    let mut direct = config("http://127.0.0.1:8181/introspect");
+    direct["providers"][0]["discovery_refresh_interval_secs"] = json!(900);
+    let Err(error) = Oauth2Introspection::new(&direct, PluginHttpClient::default()) else {
+        panic!("a refresh interval without discovery_url must be rejected");
+    };
+    assert!(
+        error.contains("discovery_refresh_interval_secs"),
+        "unexpected error: {error}"
+    );
 }
