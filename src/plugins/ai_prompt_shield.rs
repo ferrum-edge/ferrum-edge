@@ -490,7 +490,7 @@ fn redact_text_bounded(text: &str, patterns: &[PiiPattern], budget: &RedactionBu
 /// live-capacity bound AND a per-walk search-work bound.
 ///
 /// The allocation contract is exactly
-/// [`super::ai_response_guard::replace_sequentially_bounded`]'s: each pass
+/// `ai_response_guard`'s sequential bounded replacement: each pass
 /// reads the previous pass's output while writing the next, so the new buffer
 /// may use only `limit` minus the capacity of the still-resident intermediate;
 /// replacement is literal; a zero-width match is refused; the result is
