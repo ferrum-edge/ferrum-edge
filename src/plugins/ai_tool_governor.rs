@@ -7999,14 +7999,15 @@ fn parse_json_within_limit(body: &[u8]) -> Option<Value> {
     serde_json::from_slice(strip_json_bom(body)).ok()
 }
 
-/// Decompress a gateway-encoded response body (the same `gzip`/`br` encodings
-/// the `compression` plugin produces), bounded by [`MAX_PARSE_BYTES`] so a
-/// decompression bomb cannot blow up memory. Returns `None` for unsupported
-/// encodings, decode errors, or output past the limit.
+/// Decompress a gateway-encoded response body (the same `gzip`/`br`/`zstd`
+/// encodings the `compression` plugin produces), bounded by [`MAX_PARSE_BYTES`]
+/// so a decompression bomb cannot blow up memory. Returns `None` for
+/// unsupported encodings, decode errors, or output past the limit.
 fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
     let coding = match encoding.trim().to_ascii_lowercase().as_str() {
         "gzip" | "x-gzip" => "gzip",
         "br" => "br",
+        "zstd" => "zstd",
         _ => return None,
     };
     super::charged_decode::decode_charged_content_coding_chain(

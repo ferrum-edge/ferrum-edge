@@ -4288,6 +4288,7 @@ fn request_deduplication_schema_matches_runtime_validation() {
         "ttl_seconds",
         "inflight_ttl_seconds",
         "max_entries",
+        "max_inflight_entries",
         "max_entry_size_bytes",
         "max_total_size_bytes",
     ] {
@@ -4389,6 +4390,10 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!({"anonymous_caller_scope": "caller_address"}),
         json!({"anonymous_caller_scope": "caller-address"}),
         json!({"anonymous_caller_scope": "shared"}),
+        json!({"caller_partition": "credential"}),
+        json!({"caller_partition": "authenticated_identity"}),
+        json!({"max_inflight_entries": 1}),
+        json!({"max_entries": 10, "max_inflight_entries": 500}),
     ];
     for config in &accepted {
         assert!(
@@ -4460,6 +4465,11 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!({"max_entries": 0}),
         json!({"max_entry_size_bytes": 0}),
         json!({"max_total_size_bytes": 0}),
+        json!({"max_inflight_entries": 0}),
+        json!({"max_inflight_entries": "100"}),
+        json!({"caller_partition": "identity"}),
+        json!({"caller_partition": "AUTHENTICATED_IDENTITY"}),
+        json!({"caller_partition": null}),
     ];
     for config in &rejected {
         assert!(
@@ -5263,6 +5273,9 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
             "fail_on_no_matching_provider": null,
             "inject_usage_options": null,
             "normalize_response_stream": null,
+            "max_stream_bytes": null,
+            "max_stream_events": null,
+            "max_normalized_stream_bytes": null,
             "providers": [{
                 "name": "p",
                 "provider_type": "anthropic",
@@ -5272,8 +5285,18 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
                 "priority": null,
                 "allow_plaintext": null,
                 "anthropic_version": null,
+                "default_max_tokens": null,
                 "inherit_backend_tls": null
             }]
+        }),
+        provider_with(json!({"provider_type": "azure_openai"})),
+        provider_with(json!({"provider_type": "openai", "default_max_tokens": null})),
+        provider_with(json!({"provider_type": "anthropic", "default_max_tokens": 32000})),
+        json!({
+            "max_stream_bytes": 33554432,
+            "max_stream_events": 500000,
+            "max_normalized_stream_bytes": 67108864,
+            "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]
         }),
         // Plaintext with the opt-in the constructor requires.
         provider_with(json!({
@@ -5288,6 +5311,18 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
     for invalid in [
         provider_with(json!({"priority": 4294967296u64})),
         provider_with(json!({"name": ""})),
+        provider_with(json!({"provider_type": "anthropic", "anthropic_version": ""})),
+        provider_with(json!({"provider_type": "anthropic", "default_max_tokens": 0})),
+        // Runtime parity: default_max_tokens is refused on every non-anthropic
+        // provider type.
+        provider_with(json!({"provider_type": "openai", "default_max_tokens": 4096})),
+        provider_with(json!({"provider_type": "openai_compatible", "default_max_tokens": 4096})),
+        provider_with(json!({"provider_type": "azure_openai", "default_max_tokens": 4096})),
+        provider_with(json!({"provider_type": "google_gemini", "default_max_tokens": 4096})),
+        json!({
+            "max_stream_events": 10,
+            "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]
+        }),
         provider_with(json!({"api_key": ""})),
         provider_with(json!({"model_patterns": [""]})),
         provider_with(json!({"endpoint": "not-url"})),
@@ -5794,6 +5829,18 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     assert_eq!(
         schema["properties"]["providers"]["items"]["properties"]["dpop_clock_skew_secs"]["maximum"],
         json!(ferrum_edge::plugins::utils::dpop::MAX_DPOP_CLOCK_SKEW_SECS)
+    );
+    assert_eq!(
+        schema["properties"]["clock_skew_seconds"]["default"],
+        json!(0)
+    );
+    assert_eq!(
+        schema["properties"]["clock_skew_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_JWT_CLOCK_SKEW_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["clock_skew_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_JWT_CLOCK_SKEW_SECONDS)
     );
     // The removed replay knobs must not reappear: retention is a fixed horizon
     // derived from the clock-skew ceiling, not a configured value.
@@ -9922,6 +9969,14 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         );
     }
 
+    let content_type_rules = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|index| format!("application/x-{index}"))
+            .collect()
+    };
+    let over_cap_content_types = content_type_rules(65);
+    let at_cap_content_types = content_type_rules(64);
+
     // Constructor admission is the source of truth; the schema previously
     // ACCEPTED each of these while `validate` exited 1 (issue #5095), and
     // accepted content-type rules the matcher can never equal (issue #5096).
@@ -9938,6 +9993,16 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         json!({"max_decompressed_request_size": 0}),
         json!({"max_decompressed_request_size": 33_554_433}),
         json!({"brotli_quality": 12}),
+        json!({"zstd_level": 0}),
+        json!({"zstd_level": 20}),
+        json!({"weaken_strong_etag": "yes"}),
+        json!({"algorithms": ["gzip", "gzip"]}),
+        json!({"algorithms": ["lz4"]}),
+        json!({"content_types": ["*/*"]}),
+        json!({"content_types": ["*/json"]}),
+        json!({"content_types": ["application/vnd.*+json"]}),
+        json!({"content_types": ["text/html", "text/html"]}),
+        json!({ "content_types": over_cap_content_types }),
     ] {
         assert_component_validity(&spec, "CompressionConfig", &config, false);
         assert!(
@@ -9970,6 +10035,8 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         "brotli_quality",
         "remove_accept_encoding",
         "decompress_request",
+        "zstd_level",
+        "weaken_strong_etag",
     ] {
         let mut object = serde_json::Map::new();
         object.insert(field.to_string(), serde_json::Value::Null);
@@ -9989,6 +10056,13 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         json!({"max_decompressed_request_size": 1}),
         json!({"max_decompressed_request_size": 33_554_432}),
         json!({"brotli_quality": 11}),
+        json!({"algorithms": ["zstd", "gzip", "br"]}),
+        json!({"algorithms": ["brotli"]}),
+        json!({"zstd_level": 1}),
+        json!({"zstd_level": 19}),
+        json!({"weaken_strong_etag": true}),
+        json!({"content_types": ["text/*", "application/json"]}),
+        json!({ "content_types": at_cap_content_types }),
     ] {
         assert_component_validity(&spec, "CompressionConfig", &config, true);
         assert!(
@@ -10524,10 +10598,15 @@ fn grpc_deadline_schema_matches_runtime_validation_contract() {
         (json!({"reject_no_deadline": 1}), false),
         (json!({"reject_no_deadline": false}), false),
         (json!({"subtract_gateway_processing": false}), false),
+        (json!({"headroom_ms": 0}), false),
+        (json!({"headroom_ms": null}), false),
+        (json!({"headroom_ms": "250"}), false),
         (
             json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
             false,
         ),
+        (json!({"headroom_ms": 250}), true),
+        (json!({"max_deadline_ms": 30000, "headroom_ms": 250}), true),
         (json!({"max_deadline_ms": 30000}), true),
         (json!({"default_deadline_ms": 5000}), true),
         (json!({"reject_no_deadline": true}), true),
@@ -10556,6 +10635,12 @@ fn grpc_deadline_schema_matches_runtime_validation_contract() {
         .err()
         .expect("runtime rejects default above max");
     assert!(runtime_error.contains("cannot exceed"));
+    let headroom_cross_field = json!({"max_deadline_ms": 500, "headroom_ms": 500});
+    let headroom_error =
+        ferrum_edge::plugins::create_plugin("grpc_deadline", &headroom_cross_field)
+            .err()
+            .expect("runtime rejects headroom that consumes the whole cap");
+    assert!(headroom_error.contains("must be less than `max_deadline_ms`"));
     assert!(
         component
             .get("description")
@@ -17262,6 +17347,18 @@ fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
         // Out-of-domain integers.
         json!({"validate_xml": true, "xml_max_entities": -1}),
         json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": -1}),
+        // An empty media list used to mean "every valid media type".
+        json!({"validate_xml": true, "content_types": []}),
+        json!({"response_validate_xml": true, "response_content_types": []}),
+        // Enforcement, strict media-type admission, and status scope shape.
+        json!({"validate_xml": true, "enforcement_mode": "monitor"}),
+        json!({"validate_xml": true, "reject_unsupported_media_types": "yes"}),
+        json!({"response_validate_xml": true, "reject_unsupported_media_types": true}),
+        json!({"response_validate_xml": true, "response_status_codes": []}),
+        json!({"response_validate_xml": true, "response_status_codes": [99]}),
+        json!({"response_validate_xml": true, "response_status_codes": [600]}),
+        json!({"response_validate_xml": true, "response_status_codes": ["6XX"]}),
+        json!({"response_validate_xml": true, "response_status_codes": ["200"]}),
         // Malformed media types.
         json!({"validate_xml": true, "content_types": ["application"]}),
         json!({"validate_xml": true, "content_types": [""]}),
@@ -17302,10 +17399,12 @@ fn body_validator_schema_admits_exactly_what_the_constructor_admits() {
         json!({"response_json_schema": {"type": "object"}}),
         json!({"required_xml_elements": ["item", "{}item"]}),
         json!({"response_required_xml_elements": ["{urn:x}item"]}),
-        // An empty media list means "every valid media type", and an explicit
-        // zero cap disables the decompressed ceiling; both must survive.
-        json!({"validate_xml": true, "content_types": []}),
+        // An explicit zero entity cap must survive.
         json!({"validate_xml": true, "xml_max_entities": 0}),
+        json!({"validate_xml": true, "content_types": ["application/*+json"]}),
+        json!({"validate_xml": true, "enforcement_mode": "log_only"}),
+        json!({"validate_xml": true, "reject_unsupported_media_types": true}),
+        json!({"response_validate_xml": true, "response_status_codes": ["2XX", "4xx", 500]}),
         json!({
             "validate_xml": true,
             "content_types": ["application/json; charset=utf-8"]
@@ -18251,6 +18350,8 @@ fn jwks_auth_schema_matches_runtime_admission() {
         remote(json!({"required_scopes": ["admin"], "scope_claim": "realm.scope"})),
         remote(json!({"jwks_max_stale_seconds": 600})),
         remote(json!({"output_claim_headers": [{"header": "x-claim", "claim": "sub"}]})),
+        remote(json!({"clock_skew_seconds": 300})),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "clock_skew_seconds": 30}),
         local(json!({})),
         json!({"providers": [{"discovery_url": DISCOVERY_URL}]}),
         json!({"providers": [{"jwks_uri": "http://127.0.0.1:9000/jwks"}]}),
@@ -18285,6 +18386,8 @@ fn jwks_auth_schema_matches_runtime_admission() {
         local(json!({"dpop_replay_scope": "process"})),
         json!({"providers": [{"jwks_uri": JWKS_URI}], "scope_claim": "a..b"}),
         json!({"providers": [{"jwks_uri": JWKS_URI}], "claim_headers_separator": ""}),
+        remote(json!({"clock_skew_seconds": 301})),
+        json!({"providers": [{"jwks_uri": JWKS_URI}], "clock_skew_seconds": 301}),
     ];
     for config in &rejected {
         assert_component_validity(&spec, "JwksAuthConfig", config, false);

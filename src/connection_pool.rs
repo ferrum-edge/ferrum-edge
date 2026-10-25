@@ -87,14 +87,16 @@ impl ReqwestPoolManager {
         let verify = proxy.resolved_tls.verify_server_cert
             && (!self.global_env_config.tls_no_verify
                 || !proxy.resolved_tls.allows_global_no_verify());
-        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_cert_path
-            .as_deref());
-        let effective_client_key_path = proxy.resolved_tls.client_key_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_key_path
-            .as_deref());
+        let effective_client_cert_path = proxy.resolved_tls.effective_client_cert_path(
+            self.global_env_config
+                .backend_tls_client_cert_path
+                .as_deref(),
+        );
+        let effective_client_key_path = proxy.resolved_tls.effective_client_key_path(
+            self.global_env_config
+                .backend_tls_client_key_path
+                .as_deref(),
+        );
         let svid_generation = backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.workload_svid_cert_path.as_deref(),
@@ -335,14 +337,16 @@ impl PoolManager for ReqwestPoolManager {
         let verify = proxy.resolved_tls.verify_server_cert
             && (!self.global_env_config.tls_no_verify
                 || !proxy.resolved_tls.allows_global_no_verify());
-        let effective_client_cert_path = proxy.resolved_tls.client_cert_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_cert_path
-            .as_deref());
-        let effective_client_key_path = proxy.resolved_tls.client_key_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_key_path
-            .as_deref());
+        let effective_client_cert_path = proxy.resolved_tls.effective_client_cert_path(
+            self.global_env_config
+                .backend_tls_client_cert_path
+                .as_deref(),
+        );
+        let effective_client_key_path = proxy.resolved_tls.effective_client_key_path(
+            self.global_env_config
+                .backend_tls_client_key_path
+                .as_deref(),
+        );
         let svid_generation = backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.workload_svid_cert_path.as_deref(),

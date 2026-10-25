@@ -1,7 +1,10 @@
 //! Compression plugin — compresses response bodies and decompresses request bodies.
 //!
-//! Supports gzip and brotli algorithms. Response compression is negotiated via
-//! the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Request
+//! Supports gzip and brotli algorithms, plus opt-in Zstandard (`zstd`, RFC 9659)
+//! when an instance lists it in `algorithms`. Response compression is negotiated
+//! against the client's own `Accept-Encoding` — the pristine value captured at
+//! request init, so an earlier header transform cannot change which codings the
+//! client accepted (RFC 9110 §12.5.3). Request
 //! decompression is opt-in: when enabled, `Content-Encoding` is parsed as an
 //! ordered coding list (OWS-tolerant), supported chains are decoded in reverse
 //! application order under per-layer/cumulative/amplification limits, and
@@ -38,9 +41,13 @@
 //! acceptable or replace with 406 when identity was refused. When one instance
 //! declines to encode an already-admitted body it clears ownership but leaves
 //! the buffer permit on the context so a later sibling can take the same slot.
-//! Response compression is also disabled when the gateway response-body limit is
-//! unlimited or exceeds the 32 MiB compression safety ceiling, so every body
-//! admitted to compression buffering has a hard per-response byte bound.
+//! When the gateway response-body limit is unlimited or exceeds the 32 MiB
+//! compression safety ceiling, the limit no longer bounds a compression buffer,
+//! so compression becomes length-gated: only a response whose backend-declared
+//! `Content-Length` fits the ceiling (and the buffered-response fallback) is
+//! collected and encoded, and every other response streams identity. Every body
+//! admitted to compression buffering therefore still has a hard per-response
+//! byte bound.
 //!
 //! Multiple effective instances compose with first-wins ownership: one instance
 //! owns request decode and one owns response encode per request so Content-
@@ -63,13 +70,15 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
-use crate::util::http_headers::{headers_have_cache_control_directive, headers_have_strong_etag};
+use crate::util::http_headers::{
+    etag_value_is_strong, headers_have_cache_control_directive, headers_have_strong_etag,
+};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::charged_decode::{ChargedDecodeError, decode_charged_content_coding_chain};
-use super::utils::content_encoding::{DecodeLimits, parse_content_codings};
+use super::utils::content_encoding::{DecodeLimits, parse_content_codings_including_zstd};
 use super::{Plugin, PluginResult, RequestContext};
 use crate::proxy::response_buffer_budget::{
     BudgetRef, REQUEST_DECODE_OVERLOAD_BODY, REQUEST_DECODE_OVERLOAD_STATUS,
@@ -88,7 +97,22 @@ pub const COMPRESSION_CONFIG_KEYS: &[&str] = &[
     "max_decompressed_request_size",
     "min_content_length",
     "remove_accept_encoding",
+    "weaken_strong_etag",
+    "zstd_level",
 ];
+
+/// Most `content_types` rules one instance accepts. Every eligibility check
+/// scans the list, so admission bounds it instead of letting a generated
+/// config lengthen each per-response decision.
+pub const MAX_CONTENT_TYPE_RULES: usize = 64;
+
+/// Default and inclusive range of `zstd_level`.
+///
+/// Capped at 19 because levels 20–22 raise the encoder window above the 8 MB
+/// that RFC 9659 §3 allows for the `zstd` HTTP content coding; at 19 and below
+/// libzstd's own parameter table keeps the window at or under `1 << 23`.
+const DEFAULT_ZSTD_LEVEL: u32 = 3;
+const MAX_ZSTD_LEVEL: u32 = 19;
 
 /// Deployment-safe hard ceiling for `max_decompressed_request_size` (32 MiB).
 ///
@@ -175,6 +199,8 @@ where
 enum Algorithm {
     Gzip,
     Brotli,
+    /// Zstandard (RFC 9659). Opt-in: never part of the default `algorithms`.
+    Zstd,
 }
 
 impl fmt::Display for Algorithm {
@@ -188,6 +214,21 @@ impl Algorithm {
         match self {
             Algorithm::Gzip => "gzip",
             Algorithm::Brotli => "br",
+            Algorithm::Zstd => "zstd",
+        }
+    }
+
+    /// The algorithm a final response `Content-Encoding` names, when it is one
+    /// this plugin can produce (ASCII case-insensitive).
+    fn from_content_encoding(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("gzip") {
+            Some(Algorithm::Gzip)
+        } else if value.eq_ignore_ascii_case("br") {
+            Some(Algorithm::Brotli)
+        } else if value.eq_ignore_ascii_case("zstd") {
+            Some(Algorithm::Zstd)
+        } else {
+            None
         }
     }
 }
@@ -232,14 +273,57 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
-/// The client's original `Accept-Encoding`, saved in `before_proxy` before
+/// The `Accept-Encoding` compression saw in `before_proxy`, saved before
 /// `remove_accept_encoding` can strip it from the backend-bound request.
 ///
-/// Response-side readers must prefer this over `ctx.headers["accept-encoding"]`:
-/// the `before_proxy` header map *is* `ctx.headers` (taken and restored around
-/// the hook), so a strip here is visible to every later phase, and only this
-/// snapshot still describes what the client actually negotiated.
+/// Kept for observability and as a fallback only. It is a copy of the
+/// `before_proxy` header map, so an earlier `request_transformer` rule (priority
+/// 3000) may already have rewritten or removed the client's value by then;
+/// negotiation reads [`client_accept_encoding`], which prefers the pristine
+/// request-init snapshot over this key.
 pub(crate) const REQUEST_ACCEPT_ENCODING_METADATA_KEY: &str = "compression:accept_encoding";
+
+/// The origin's validator, recorded when `weaken_strong_etag` commits a coding.
+///
+/// Used ONLY by abort recovery, and only while the live `ETag` is still exactly
+/// the weak form compression wrote: that proves no semantic transform replaced
+/// the body (the shared lifecycle deletes validators when one does) and no later
+/// hook replaced the field, so the restored identity body really is the bytes
+/// the origin validator describes.
+const WEAKENED_ETAG_ORIGIN_METADATA_KEY: &str = "compression:weakened_etag_origin";
+
+/// The live `ETag` captured immediately before the gateway encodes, under
+/// `weaken_strong_etag`.
+///
+/// Captured at encode time rather than at commit time, after every semantic
+/// transform and header hook: a body rewrite earlier in the transform phase has
+/// already retired the origin validator, so nothing is captured and nothing is
+/// re-attached for a document the origin never served. Consumed by
+/// `on_response_body_transformed`, which re-attaches its weak form after the
+/// lifecycle's own validator cleanup for the encoded bytes.
+const ENCODE_ETAG_METADATA_KEY: &str = "compression:encode_etag";
+
+/// The client's own `Accept-Encoding` for response negotiation.
+///
+/// Precedence mirrors the representation gate's identity-acceptability check:
+///
+/// 1. the pristine value the proxy captured from the raw wire headers at
+///    request init (`RequestContext::original_accept_encoding`), which no plugin
+///    can rewrite. `request_transformer` runs before compression's
+///    `before_proxy`, so a backend-facing `Accept-Encoding` rule must not decide
+///    which codings the CLIENT accepted or refused;
+/// 2. compression's own `before_proxy` snapshot, for direct callers that never
+///    ran the request-init stamp;
+/// 3. the live request header.
+pub(crate) fn client_accept_encoding(ctx: &RequestContext) -> Option<&str> {
+    ctx.original_accept_encoding()
+        .or_else(|| {
+            ctx.metadata
+                .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
+                .map(String::as_str)
+        })
+        .or_else(|| ctx.headers.get("accept-encoding").map(String::as_str))
+}
 
 /// Set when configured request decompression replaced the buffered body with
 /// validated plaintext before `before_proxy`. Later transforms must not decode
@@ -338,10 +422,16 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
     }
     ctx.metadata.remove(RESPONSE_ALGORITHM_METADATA_KEY);
     ctx.clear_gateway_response_compression();
-    let identity_unacceptable = ctx
-        .metadata
-        .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
-        .is_some_and(|value| identity_coding_quality(value) == 0.0);
+    // `weaken_strong_etag` rewrote the origin validator to its weak form for the
+    // coded variant. The aborted encode serves the identity body instead, which
+    // is the origin's bytes ONLY if nothing rewrote them in between — so the
+    // origin validator comes back only while the live field is still exactly
+    // the weak form compression wrote (a semantic rewrite deleted it; a later
+    // hook replaced it). Otherwise the live field is left as it is.
+    ctx.metadata.remove(ENCODE_ETAG_METADATA_KEY);
+    let weakened_origin_etag = ctx.metadata.remove(WEAKENED_ETAG_ORIGIN_METADATA_KEY);
+    let identity_unacceptable =
+        client_accept_encoding(ctx).is_some_and(|value| identity_coding_quality(value) == 0.0);
     if identity_unacceptable {
         *response_status = 406;
         response_headers.clear();
@@ -362,12 +452,43 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
         "content-length".to_string(),
         response_body.len().to_string(),
     );
+    if let Some(origin_etag) = weakened_origin_etag {
+        let live_is_compressions_weak_form = response_headers
+            .get("etag")
+            .is_some_and(|live| etag_weak_form(&origin_etag).as_deref() == Some(live.as_str()));
+        if live_is_compressions_weak_form {
+            response_headers.insert("etag".to_string(), origin_etag);
+        }
+    }
     warn_sampled!(
         "compression: restored identity response after failed gateway content coding \
          (body_len={})",
         response_body.len()
     );
     false
+}
+
+/// Warn, once per constructed instance, when the process-wide response-body
+/// limit puts compression in its length-gated mode.
+///
+/// An unlimited (`0`) or larger-than-32 MiB `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`
+/// cannot bound a compression buffer, so only responses whose backend declares a
+/// `Content-Length` within the ceiling are compressed; chunked or larger
+/// responses stream identity (or receive `406` when the client refused
+/// identity). That is a deliberate safety bound, not a misconfiguration, but it
+/// is invisible per response, so it is stated at configuration build. A route
+/// response ceiling at or below 32 MiB restores full compression on that route.
+pub(crate) fn warn_if_response_limit_gates_compression(max_response_body_size_bytes: usize) {
+    if (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE).contains(&max_response_body_size_bytes) {
+        return;
+    }
+    warn!(
+        max_response_body_size_bytes,
+        compression_ceiling_bytes = HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE,
+        "compression: FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES is unlimited or above the compression \
+         ceiling, so only responses with a declared Content-Length within the ceiling (and the \
+         buffered-response fallback) are compressed; other responses stream uncompressed"
+    );
 }
 
 struct CompressionConfig {
@@ -377,13 +498,21 @@ struct CompressionConfig {
     /// opt-in request decompression.
     gzip_enabled: bool,
     brotli_enabled: bool,
+    /// `zstd` has no process-wide gate: it is opt-in per instance, so it is
+    /// enabled for request decompression exactly when `algorithms` lists it.
+    zstd_enabled: bool,
 
     // -- Response compression --
     min_content_length: usize,
+    /// Lowercased `type/subtype` or `type/*` rules, deduplicated at admission.
     content_types: Vec<String>,
     /// Remove `Accept-Encoding` from the backend request so the backend always
     /// sends an uncompressed response for us to compress.
     remove_accept_encoding: bool,
+    /// Compress a response that carries a strong `ETag` by rewriting the
+    /// validator to its weak form (`W/"…"`) on the coded variant, instead of
+    /// skipping compression to preserve it.
+    weaken_strong_etag: bool,
 
     // -- Request decompression --
     decompress_request: bool,
@@ -393,6 +522,8 @@ struct CompressionConfig {
     // -- Algorithm tuning --
     gzip_level: u32,
     brotli_quality: u32,
+    /// `1..=MAX_ZSTD_LEVEL`, so the cast to libzstd's `i32` is lossless.
+    zstd_level: i32,
 }
 
 pub struct CompressionPlugin {
@@ -464,14 +595,15 @@ impl CompressionPlugin {
         // instead of producing a partially-functional plugin.
         let mut algorithms: Vec<Algorithm> = match config.get("algorithms") {
             Some(Value::Array(arr)) => {
-                let mut algos = Vec::with_capacity(arr.len());
+                let mut algos = Vec::with_capacity(arr.len().min(3));
                 for (idx, v) in arr.iter().enumerate() {
-                    match v.as_str() {
-                        Some("gzip") => algos.push(Algorithm::Gzip),
-                        Some("br") | Some("brotli") => algos.push(Algorithm::Brotli),
+                    let algorithm = match v.as_str() {
+                        Some("gzip") => Algorithm::Gzip,
+                        Some("br") | Some("brotli") => Algorithm::Brotli,
+                        Some("zstd") => Algorithm::Zstd,
                         Some(other) => {
                             return Err(format!(
-                                "compression: `algorithms[{idx}]`: unknown algorithm {other:?} (expected `gzip` or `br`)"
+                                "compression: `algorithms[{idx}]`: unknown algorithm {other:?} (expected `gzip`, `br`, or `zstd`)"
                             ));
                         }
                         None => {
@@ -479,7 +611,16 @@ impl CompressionPlugin {
                                 "compression: `algorithms[{idx}]` must be a string"
                             ));
                         }
+                    };
+                    // The list is a preference ORDER, so a repeat is ambiguous
+                    // (which position wins?) rather than harmless. `brotli` is
+                    // an alias of `br`, so the two count as the same entry.
+                    if algos.contains(&algorithm) {
+                        return Err(format!(
+                            "compression: `algorithms[{idx}]` repeats `{algorithm}`; list each algorithm at most once (`brotli` is an alias of `br`)"
+                        ));
                     }
+                    algos.push(algorithm);
                 }
                 algos
             }
@@ -497,6 +638,8 @@ impl CompressionPlugin {
         algorithms.retain(|algorithm| match algorithm {
             Algorithm::Gzip => gzip_enabled,
             Algorithm::Brotli => brotli_enabled,
+            // Opt-in per instance; there is no process-wide gate to apply.
+            Algorithm::Zstd => true,
         });
         // Revalidate after process-wide gates so an instance with no usable
         // codec fails admission instead of remaining effectful-but-inert.
@@ -507,12 +650,16 @@ impl CompressionPlugin {
             );
         }
 
+        let zstd_enabled = algorithms.contains(&Algorithm::Zstd);
+
         let content_types = parse_content_types(config)?;
 
         let min_content_length = optional_usize(config, "min_content_length")?.unwrap_or(256);
 
         let remove_accept_encoding =
             optional_bool(config, "remove_accept_encoding")?.unwrap_or(true);
+
+        let weaken_strong_etag = optional_bool(config, "weaken_strong_etag")?.unwrap_or(false);
 
         let decompress_request = optional_bool(config, "decompress_request")?.unwrap_or(false);
 
@@ -554,19 +701,36 @@ impl CompressionPlugin {
             .transpose()?
             .unwrap_or(4);
 
+        let zstd_level = optional_u64(config, "zstd_level")?
+            .map(|value| {
+                if (1..=u64::from(MAX_ZSTD_LEVEL)).contains(&value) {
+                    // In range, so the value fits both `u32` and `i32`.
+                    Ok(value as i32)
+                } else {
+                    Err(format!(
+                        "compression: `zstd_level` must be between 1 and {MAX_ZSTD_LEVEL}"
+                    ))
+                }
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_ZSTD_LEVEL as i32);
+
         let instance_id = NEXT_COMPRESSION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             config: CompressionConfig {
                 algorithms,
                 gzip_enabled,
                 brotli_enabled,
+                zstd_enabled,
                 min_content_length,
                 content_types,
                 remove_accept_encoding,
+                weaken_strong_etag,
                 decompress_request,
                 max_decompressed_request_size,
                 gzip_level,
                 brotli_quality,
+                zstd_level,
             },
             instance_id,
         })
@@ -599,7 +763,10 @@ impl CompressionPlugin {
     /// gates. Fail closed on malformed/unsupported lists when decompression is
     /// enabled; identity-only lists need no body rewrite.
     fn classify_request_content_encoding(&self, value: &str) -> Result<RequestCodingPlan, String> {
-        let codings = parse_content_codings(value)?;
+        // `zstd` is admitted by the grammar here and then gated below on this
+        // instance's own `algorithms`, like gzip/br are gated on the
+        // process-wide switches.
+        let codings = parse_content_codings_including_zstd(value)?;
         if codings.len() > REQUEST_DECODE_MAX_CODINGS {
             return Err(format!(
                 "content-encoding has more than {REQUEST_DECODE_MAX_CODINGS} coding layers"
@@ -617,8 +784,10 @@ impl CompressionPlugin {
             match coding.as_str() {
                 "gzip" if self.config.gzip_enabled => {}
                 "br" if self.config.brotli_enabled => {}
+                "zstd" if self.config.zstd_enabled => {}
                 "gzip" => return Err("unsupported content-encoding 'gzip'".to_string()),
                 "br" => return Err("unsupported content-encoding 'br'".to_string()),
+                "zstd" => return Err("unsupported content-encoding 'zstd'".to_string()),
                 _ => return Err("unsupported content-encoding token".to_string()),
             }
         }
@@ -868,6 +1037,7 @@ impl CompressionPlugin {
         // [`identity_coding_quality`] (first identity entry wins).
         let mut explicit_gzip: Option<f32> = None;
         let mut explicit_br: Option<f32> = None;
+        let mut explicit_zstd: Option<f32> = None;
         let mut wildcard: Option<f32> = None;
 
         for part in accept_encoding.split(',') {
@@ -886,6 +1056,8 @@ impl CompressionPlugin {
                 explicit_gzip = Some(quality);
             } else if encoding.eq_ignore_ascii_case("br") {
                 explicit_br = Some(quality);
+            } else if encoding.eq_ignore_ascii_case("zstd") {
+                explicit_zstd = Some(quality);
             } else if encoding == "*" {
                 wildcard = Some(quality);
             }
@@ -901,6 +1073,7 @@ impl CompressionPlugin {
             let explicit = match algo {
                 Algorithm::Gzip => explicit_gzip,
                 Algorithm::Brotli => explicit_br,
+                Algorithm::Zstd => explicit_zstd,
             };
             // Explicit entry takes precedence over the wildcard fallback.
             let effective_q = explicit.or(wildcard).unwrap_or(0.0);
@@ -931,25 +1104,103 @@ impl CompressionPlugin {
 
     /// The client's negotiated `Accept-Encoding` for response compression.
     ///
-    /// Prefers the snapshot saved in `before_proxy` (the live header may then be
-    /// stripped by `remove_accept_encoding`, and `ctx.headers` may be empty on
-    /// the zero-clone request fast path). Falls back to the live request header
-    /// for the rare paths where no snapshot was staged. Response-buffer,
-    /// reservation, and `after_proxy` negotiation all read through here so the
-    /// three decisions stay consistent for one request.
+    /// Reads [`client_accept_encoding`]: the pristine request-init value first,
+    /// so a `request_transformer` rule that rewrites or removes the
+    /// backend-facing header cannot make the gateway emit a coding the client
+    /// refused (or forget an `identity;q=0`). Response-buffer, reservation,
+    /// `after_proxy`, and abort recovery all read through the same source so
+    /// the decisions stay consistent for one request.
     fn negotiated_accept_encoding(ctx: &RequestContext) -> Option<&str> {
-        ctx.metadata
-            .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
-            .map(String::as_str)
-            .or_else(|| ctx.headers.get("accept-encoding").map(String::as_str))
+        client_accept_encoding(ctx)
     }
 
-    fn response_body_limit_allows_compression(ctx: &RequestContext) -> bool {
-        // Effective ceiling (global narrowed by any active route ceiling) so a
-        // strict route limit governs compression admission the same way a strict
-        // global limit does (`GHSA-xrfj-852f-645j`).
+    /// Whether the effective response-body limit by itself bounds a compression
+    /// buffer: finite and no larger than [`HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE`].
+    ///
+    /// Effective ceiling (global narrowed by any active route ceiling) so a
+    /// strict route limit governs compression admission the same way a strict
+    /// global limit does (`GHSA-xrfj-852f-645j`). When this is `false` the
+    /// request is LENGTH-GATED: see [`Self::length_gated_compression_ceiling`].
+    fn response_limit_bounds_compression_buffer(ctx: &RequestContext) -> bool {
         (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE)
             .contains(&ctx.effective_max_response_body_size_bytes())
+    }
+
+    /// The largest backend-declared `Content-Length` a length-gated request may
+    /// collect for compression.
+    ///
+    /// An unlimited (`0`) or larger-than-32 MiB limit no longer bounds the
+    /// collection, so the response's own declared length has to. It must fit
+    /// the hard compression ceiling AND the retained-response ceiling the
+    /// buffered collector will enforce (the fail-closed fallback when the limit
+    /// is `0`), so an admitted response can always be collected.
+    fn length_gated_compression_ceiling(ctx: &RequestContext) -> usize {
+        HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE.min(ctx.retained_response_body_ceiling())
+    }
+
+    /// Whether this request may be admitted onto the compression buffered path
+    /// before any response header is known.
+    ///
+    /// A length-gated native gRPC exchange is refused here: its response is
+    /// `application/grpc` framing, which compression does not encode, and the
+    /// native gRPC dispatch has no header-time refinement that would release a
+    /// server stream pinned under the buffered-response fallback.
+    fn request_admits_response_compression_buffer(ctx: &RequestContext) -> bool {
+        Self::response_limit_bounds_compression_buffer(ctx) || !ctx.is_native_grpc_request()
+    }
+
+    /// Header-time length admission used by the buffering refinements: always
+    /// true when the limit bounds the buffer, otherwise the declared
+    /// `Content-Length` must be known and fit
+    /// [`Self::length_gated_compression_ceiling`].
+    fn declared_response_length_admits_compression(
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        Self::response_limit_bounds_compression_buffer(ctx)
+            || declared_content_length(response_headers)
+                .is_some_and(|len| len <= Self::length_gated_compression_ceiling(ctx))
+    }
+
+    /// `after_proxy`'s length admission: at least as strict as the refinement,
+    /// so a length-gated coding is never committed for a body that streams.
+    ///
+    /// The live `Content-Length` alone is not enough: an earlier `after_proxy`
+    /// hook can ADD one to a chunked backend response the refinement already
+    /// released. So a length-gated commit also requires the backend's own
+    /// declared length (stamped before any `after_proxy` hook) to be present and
+    /// identical. An unstamped path simply does not compress length-gated
+    /// responses.
+    fn committed_response_length_admits_compression(
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if Self::response_limit_bounds_compression_buffer(ctx) {
+            return true;
+        }
+        let backend_declared = ctx
+            .metadata
+            .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY)
+            .and_then(|value| value.parse::<usize>().ok());
+        match (declared_content_length(response_headers), backend_declared) {
+            (Some(live), Some(backend)) => {
+                live == backend && live <= Self::length_gated_compression_ceiling(ctx)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the length gate releases this response from compression
+    /// buffering. Once the gateway committed its own coding, `after_proxy`
+    /// removed `Content-Length` itself, so the gate no longer applies — on the
+    /// paths where `after_proxy` runs before the refinement, reading it back
+    /// would release the very body the committed coding must be produced from.
+    fn declines_unbounded_response_length(
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        ctx.gateway_response_compression_algorithm().is_none()
+            && !Self::declared_response_length_admits_compression(ctx, response_headers)
     }
 
     /// Reserve one response-buffer permit for this request when this
@@ -976,7 +1227,7 @@ impl CompressionPlugin {
         if !selects_coding {
             return;
         }
-        if !Self::response_body_limit_allows_compression(ctx) {
+        if !Self::request_admits_response_compression_buffer(ctx) {
             ctx.mark_compression_response_admission_declined();
             return;
         }
@@ -1036,11 +1287,12 @@ impl CompressionPlugin {
         !on_rejection
             && !Self::is_protocol_hard_skip(ctx, response_status, response_headers)
             && !Self::is_non_transformable_range_or_delta(ctx, response_status, response_headers)
-            && !Self::response_forbids_transform(ctx, response_headers)
+            && !self.response_forbids_transform(ctx, response_headers)
             && self.is_compression_eligible(response_headers)
     }
 
     fn response_forbids_transform(
+        &self,
         ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
     ) -> bool {
@@ -1055,13 +1307,57 @@ impl CompressionPlugin {
                 .metadata
                 .contains_key(crate::proxy::LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY)
             || headers_have_cache_control_directive(response_headers, "no-transform")
-            || ctx
+            || self.strong_etag_forbids_transform(ctx, response_headers)
+    }
+
+    /// Whether an `ETag` validator keeps this response uncoded.
+    ///
+    /// By default every strong validator does — the live header, the backend's
+    /// own (stamped before any hook, so removing the header does not unlock
+    /// compression), and one a later hook will add.
+    ///
+    /// With `weaken_strong_etag` the coded variant keeps a WEAK form of the
+    /// validator instead, so only what cannot be weakened still blocks: a later
+    /// hook's strong `ETag` (it is written after this decision), and a live
+    /// field that is not a single well-formed entity-tag (a malformed or
+    /// list-valued `ETag` has no weak form). A backend validator a transformer
+    /// already removed leaves nothing to preserve.
+    fn strong_etag_forbids_transform(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::LATER_STRONG_ETAG_RESPONSE_METADATA_KEY)
+        {
+            return true;
+        }
+        if self.config.weaken_strong_etag {
+            return !etags_have_weak_form(response_headers);
+        }
+        ctx.metadata
+            .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
+            || headers_have_strong_etag(response_headers)
+    }
+
+    /// Whether a strong `ETag` lets the buffering refinements release the body.
+    ///
+    /// With `weaken_strong_etag` a strong validator does not, by itself, rule
+    /// compression out, so the body stays collected and `after_proxy` decides;
+    /// declining there merely serves the collected identity body. Releasing
+    /// here while `after_proxy` later weakened and committed would label a
+    /// streamed plaintext body as coded.
+    fn strong_etag_releases_response_buffer(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        !self.config.weaken_strong_etag
+            && (ctx
                 .metadata
                 .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::LATER_STRONG_ETAG_RESPONSE_METADATA_KEY)
-            || headers_have_strong_etag(response_headers)
+                || headers_have_strong_etag(response_headers))
     }
 
     /// Hard protocol cases where Ferrum must not rewrite the representation
@@ -1203,6 +1499,10 @@ impl CompressionPlugin {
     ///
     /// An empty or whitespace-only media-type token (e.g. `; charset=utf-8` or
     /// an empty `Content-Type`) fails closed: it matches nothing.
+    ///
+    /// A `type/*` rule matches every subtype of that top-level type, provided
+    /// the response token is itself a `type/subtype` pair with a non-empty
+    /// subtype. `*/*` is refused at admission, so no rule matches everything.
     fn is_compressible_content_type(&self, content_type: &str) -> bool {
         let media_type = content_type.split(';').next().unwrap_or("").trim();
         if media_type.is_empty() {
@@ -1211,34 +1511,37 @@ impl CompressionPlugin {
         self.config
             .content_types
             .iter()
-            .any(|rule| media_type.eq_ignore_ascii_case(rule))
+            .any(|rule| match rule.strip_suffix("/*") {
+                Some(rule_type) => {
+                    media_type
+                        .split_once('/')
+                        .is_some_and(|(media_top, media_sub)| {
+                            !media_sub.is_empty() && media_top.eq_ignore_ascii_case(rule_type)
+                        })
+                }
+                None => media_type.eq_ignore_ascii_case(rule),
+            })
     }
 
     async fn compress_response_body(
         &self,
         body: &[u8],
-        encoding: &str,
+        algo: Algorithm,
         permit: OwnedSemaphorePermit,
         ceiling: usize,
     ) -> Option<Vec<u8>> {
-        let algo = match encoding {
-            "gzip" => Algorithm::Gzip,
-            "br" => Algorithm::Brotli,
-            _ => {
-                drop(permit);
-                return None;
-            }
-        };
         let gzip_level = self.config.gzip_level;
         let brotli_quality = self.config.brotli_quality;
+        let zstd_level = self.config.zstd_level;
         let data = body.to_vec();
-        let encoding_owned = encoding.to_string();
+        let encoding_owned = algo.content_encoding();
 
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             match algo {
                 Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level, ceiling),
                 Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality, ceiling),
+                Algorithm::Zstd => compress_zstd_blocking(&data, zstd_level, ceiling),
             }
         })
         .await;
@@ -1445,6 +1748,32 @@ fn compress_brotli_blocking(
         .ok_or_else(|| "brotli compression exceeded the retained response ceiling".to_string())
 }
 
+/// Encode one `zstd` frame (RFC 9659) into a sink bounded by the retained
+/// ceiling, like the gzip/Brotli encoders above.
+///
+/// The pledged source size puts the content size in the frame header (so a
+/// decoder sizes its window to the body rather than to the format maximum) and
+/// lets libzstd shrink its parameters for small bodies. `zstd_level` is capped
+/// at admission so the encoder window never exceeds the 8 MB RFC 9659 allows.
+fn compress_zstd_blocking(data: &[u8], zstd_level: i32, ceiling: usize) -> Result<Vec<u8>, String> {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+    let sink = BoundedResponseBodySink::with_ceiling(ceiling);
+    let mut encoder = zstd::stream::write::Encoder::new(sink, zstd_level)
+        .map_err(|e| format!("zstd encoder setup failed: {e}"))?;
+    encoder
+        .set_pledged_src_size(u64::try_from(data.len()).ok())
+        .map_err(|e| format!("zstd encoder setup failed: {e}"))?;
+    encoder
+        .write_all(data)
+        .map_err(|e| format!("zstd compression write failed: {e}"))?;
+    encoder
+        .finish()
+        .map_err(|e| format!("zstd compression finish failed: {e}"))?
+        .finish()
+        .ok_or_else(|| "zstd compression exceeded the retained response ceiling".to_string())
+}
+
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
     match config.get(field) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -1498,8 +1827,15 @@ fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
     if values.is_empty() {
         return Err("compression: `content_types` must not be empty".to_string());
     }
+    if values.len() > MAX_CONTENT_TYPE_RULES {
+        return Err(format!(
+            "compression: `content_types` lists {} rules; at most {MAX_CONTENT_TYPE_RULES} are accepted \
+             (use a `type/*` rule to cover a whole top-level type)",
+            values.len()
+        ));
+    }
 
-    let mut content_types = Vec::with_capacity(values.len());
+    let mut content_types: Vec<String> = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
         let Some(content_type) = value.as_str() else {
             return Err(format!(
@@ -1523,31 +1859,111 @@ fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
         // while still stripping `Accept-Encoding` from backend requests
         // (issue #5096). Reject those rules at construction with an indexed
         // diagnostic instead.
-        if !is_media_type_token(content_type) {
+        if !is_media_type_rule(content_type) {
             return Err(format!(
                 "compression: `content_types[{index}]` must be a bare `type/subtype` media type \
-                 with no whitespace and no parameters (use `application/json`, not \
-                 `application/json; charset=utf-8`)"
+                 or a `type/*` range, with no whitespace, no parameters, and no other `*` \
+                 (use `application/json`, not `application/json; charset=utf-8`; `*/*` is not \
+                 accepted)"
             ));
         }
-        content_types.push(content_type.to_ascii_lowercase());
+        let rule = content_type.to_ascii_lowercase();
+        // Matching is ASCII case-insensitive, so `Text/HTML` and `text/html` are
+        // one rule; a repeat is a config mistake, not a second rule.
+        if content_types.contains(&rule) {
+            return Err(format!(
+                "compression: `content_types[{index}]` repeats an earlier entry (rules are \
+                 compared case-insensitively)"
+            ));
+        }
+        content_types.push(rule);
     }
 
     Ok(content_types)
 }
 
-/// True when `value` is a bare `type/subtype` media type: exactly one `/`, both
-/// halves non-empty RFC 9110 §5.6.2 tokens, and therefore no surrounding
-/// whitespace, no `;` parameter section, and no quoted string.
+/// True when `value` is a rule the response matcher can actually match: a bare
+/// `type/subtype` media type, or a `type/*` range covering one top-level type.
+///
+/// Both halves must be non-empty RFC 9110 §5.6.2 tokens (so no surrounding
+/// whitespace, no `;` parameter section, no quoted string). `*` IS a token
+/// character, but the matcher compares a response token against the rule
+/// verbatim except for a whole-subtype `*`, so a `*` anywhere else — `*/*`,
+/// `*/json`, `application/vnd.*+json` — could never match a real media type
+/// and is refused rather than admitted inert. `*/*` would also compress every
+/// representation, including already-compressed images and archives.
 ///
 /// This is the grammar the response matcher can actually produce: it takes the
 /// response `Content-Type`, cuts at the first `;`, and trims. Admission and
 /// matching must describe the same shape, or a configured rule is inert.
-fn is_media_type_token(value: &str) -> bool {
+fn is_media_type_rule(value: &str) -> bool {
     let Some((type_, subtype)) = value.split_once('/') else {
         return false;
     };
-    !subtype.contains('/') && is_http_token(type_) && is_http_token(subtype)
+    if subtype.contains('/') || !is_http_token(type_) || type_.contains('*') {
+        return false;
+    }
+    subtype == "*" || (is_http_token(subtype) && !subtype.contains('*'))
+}
+
+/// The response's declared `Content-Length`, when it is a single decimal value.
+///
+/// A missing, list-valued, or otherwise unparseable field is "unknown", which
+/// every caller treats as the conservative answer.
+fn declared_content_length(response_headers: &HashMap<String, String>) -> Option<usize> {
+    response_headers
+        .get("content-length")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+/// The weak form of one `ETag` field value, or `None` when it has none.
+///
+/// An already-weak validator is its own weak form. A strong one must be a
+/// single well-formed RFC 9110 §8.8.3 `entity-tag` — `"` + `etagc`* + `"` — and
+/// becomes `W/` + that tag. Anything else (unquoted, list-valued, embedded
+/// quote or whitespace) is not a validator Ferrum can rewrite safely.
+fn etag_weak_form(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !etag_value_is_strong(value) {
+        return Some(value.to_string());
+    }
+    let opaque = value.strip_prefix('"')?.strip_suffix('"')?;
+    opaque
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x7e | 0x80..=0xff))
+        .then(|| format!("W/{value}"))
+}
+
+/// Whether every `ETag` field on the response has a weak form (vacuously true
+/// when there is none).
+fn etags_have_weak_form(response_headers: &HashMap<String, String>) -> bool {
+    response_headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .all(|(_, value)| etag_weak_form(value).is_some())
+}
+
+/// Rewrite every `ETag` field to its weak form for a coded variant, recording
+/// the origin's canonical `etag` value for abort recovery (see
+/// [`WEAKENED_ETAG_ORIGIN_METADATA_KEY`]). What survives to the encode is
+/// captured separately, at encode time.
+///
+/// Callers have already proven [`etags_have_weak_form`]; a field without one is
+/// left untouched rather than guessed at.
+fn weaken_response_etag(ctx: &mut RequestContext, response_headers: &mut HashMap<String, String>) {
+    if let Some(origin) = response_headers.get("etag") {
+        ctx.metadata.insert(
+            WEAKENED_ETAG_ORIGIN_METADATA_KEY.to_string(),
+            origin.clone(),
+        );
+    }
+    for (name, value) in response_headers.iter_mut() {
+        if name.eq_ignore_ascii_case("etag")
+            && let Some(weak) = etag_weak_form(value)
+        {
+            *value = weak;
+        }
+    }
 }
 
 /// True when `value` is an HTTP `token` (RFC 9110 §5.6.2).
@@ -1852,12 +2268,16 @@ impl Plugin for CompressionPlugin {
         // no-transform opts out of gateway response compression; neither pins
         // the body onto the buffered path (preserving backend representation
         // metadata / RFC 9111).
+        // A length-gated request (unlimited or >32 MiB limit) still votes to
+        // buffer here: whether its response fits is only knowable from the
+        // response headers, and the header-time refinement releases every
+        // response whose declared length does not.
         if ctx.method.eq_ignore_ascii_case("HEAD")
             || ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
             || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
-            || !Self::response_body_limit_allows_compression(ctx)
+            || !Self::request_admits_response_compression_buffer(ctx)
         {
             return false;
         }
@@ -1912,12 +2332,10 @@ impl Plugin for CompressionPlugin {
             || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
             || headers_have_cache_control_directive(response_headers, "no-transform")
-            || headers_have_strong_etag(response_headers)
+            || self.strong_etag_releases_response_buffer(ctx, response_headers)
             || self.declines_already_encoded_or_undersized(ctx, response_headers)
+            || Self::declines_unbounded_response_length(ctx, response_headers)
         {
             return false;
         }
@@ -1940,12 +2358,38 @@ impl Plugin for CompressionPlugin {
             || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
             || headers_have_cache_control_directive(response_headers, "no-transform")
-            || headers_have_strong_etag(response_headers)
+            || self.strong_etag_releases_response_buffer(ctx, response_headers)
             || self.declines_already_encoded_or_undersized(ctx, response_headers)
+            || Self::declines_unbounded_response_length(ctx, response_headers)
+    }
+
+    /// A length-gated request must not be pinned onto the buffered path just
+    /// because retries are configured: without this, every negotiated response
+    /// would be collected under the buffered-response fallback and a large
+    /// download that used to stream identity would be refused instead. Bounded
+    /// requests keep the conservative default (no release under retries).
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        !Self::response_limit_bounds_compression_buffer(ctx)
+            && self.should_buffer_response_body(ctx)
+    }
+
+    /// The complete header-time answer for a length-gated request under
+    /// retries: release whenever this instance would not keep the body for
+    /// THIS response — which includes an unknown or oversized declared length.
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.may_release_response_body_under_retries(ctx)
+            && !self.should_buffer_response_body_for_content_type(
+                ctx,
+                response_headers.get("content-type").map(String::as_str),
+                response_status,
+                response_headers,
+            )
     }
 
     fn should_release_response_body_for_later_no_transform(
@@ -2160,11 +2604,17 @@ impl Plugin for CompressionPlugin {
                 let identity_unacceptable =
                     accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0);
 
+                // The length gate is evaluated separately so a decline for that
+                // reason can return the buffer slot below: it holds for every
+                // sibling alike (none can compress a response whose length is
+                // unbounded), so nothing is left to hand the slot to.
+                let length_admitted = Self::request_admits_response_compression_buffer(ctx)
+                    && Self::committed_response_length_admits_compression(ctx, response_headers);
                 let can_encode = !on_rejection
                     && !range_or_delta
                     && !ctx.has_compression_response_encode_owner()
-                    && Self::response_body_limit_allows_compression(ctx)
-                    && !Self::response_forbids_transform(ctx, response_headers)
+                    && length_admitted
+                    && !self.response_forbids_transform(ctx, response_headers)
                     && self.is_compression_eligible(response_headers);
                 if can_encode {
                     // Consume the response-buffer reservation for this coding.
@@ -2255,6 +2705,16 @@ impl Plugin for CompressionPlugin {
                     );
                     response_headers.remove("content-length");
 
+                    // `weaken_strong_etag`: the coded variant carries the weak
+                    // form of the origin validator (eligibility above already
+                    // proved every `ETag` field has one). The body transform
+                    // retires content-bound validators once the bytes change, so
+                    // the origin value is recorded for abort recovery; the value
+                    // re-attached after encoding is captured at encode time.
+                    if self.config.weaken_strong_etag {
+                        weaken_response_etag(ctx, response_headers);
+                    }
+
                     // Compressed variants nominate the same Vary dimension as
                     // eligible identity/default responses above.
                     ensure_vary_accept_encoding(response_headers);
@@ -2277,6 +2737,29 @@ impl Plugin for CompressionPlugin {
                 {
                     ctx.release_compression_response_admission_if_owner(self.instance_id);
                     return not_acceptable_reject();
+                }
+                if !length_admitted {
+                    // Length-gated decline: the response streams (or was
+                    // collected for another plugin) and no sibling can encode
+                    // it either, so return the slot now rather than idle it for
+                    // the rest of a possibly long transfer.
+                    debug!(
+                        "compression: response length is unknown or above the length-gated \
+                         compression ceiling; serving identity response"
+                    );
+                    ctx.release_compression_response_admission_if_owner(self.instance_id);
+                    if !ctx.has_compression_response_admission_owner() {
+                        drop(ctx.take_compression_response_buffer_permit());
+                    }
+                    if self.should_nominate_accept_encoding_vary(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        on_rejection,
+                    ) {
+                        ensure_vary_accept_encoding(response_headers);
+                    }
+                    return PluginResult::Continue;
                 }
                 ctx.relinquish_compression_response_admission_ownership_if_owner(self.instance_id);
                 PluginResult::Continue
@@ -2365,6 +2848,35 @@ impl Plugin for CompressionPlugin {
         true
     }
 
+    /// Re-attach the weak validator `weaken_strong_etag` keeps on the coded
+    /// variant.
+    ///
+    /// The shared lifecycle has just retired every content-bound validator for
+    /// the encoded bytes, which is right for a strong `ETag`; its weak form
+    /// still names a semantically equivalent representation, so the coded
+    /// variant keeps it (RFC 9110 §8.8.1). Only the encode owner re-attaches,
+    /// and only the validator that was live on the body it ENCODED (captured
+    /// at encode time), never the origin's: a semantic rewrite earlier in the
+    /// transform phase already retired that one, and resurrecting it would
+    /// equate the origin's document with a different one.
+    fn on_response_body_transformed(
+        &self,
+        ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if !self.config.weaken_strong_etag || !self.is_response_encode_owner(ctx) {
+            return;
+        }
+        ctx.metadata.remove(WEAKENED_ETAG_ORIGIN_METADATA_KEY);
+        if let Some(weak) = ctx
+            .metadata
+            .remove(ENCODE_ETAG_METADATA_KEY)
+            .and_then(|live| etag_weak_form(&live))
+        {
+            response_headers.insert("etag".to_string(), weak);
+        }
+    }
+
     async fn transform_response_body(
         &self,
         _body: &[u8],
@@ -2402,11 +2914,23 @@ impl Plugin for CompressionPlugin {
         if !self.is_response_encode_owner(ctx) {
             return None;
         }
-        let encoding = if encoding.eq_ignore_ascii_case("gzip") {
-            "gzip"
-        } else if encoding.eq_ignore_ascii_case("br") {
-            "br"
-        } else {
+        // The final header wins between the codings this instance can produce
+        // (a later hook may swap one enabled coding for another). Any other
+        // label — a later hook renamed the committed coding to something
+        // unknown, or to a codec this instance (or the process-wide gate) has
+        // not enabled — is an aborted encode, not a silent no-op: returning
+        // `None` without the abort flag would publish this plaintext body under
+        // that label. The shared loops then restore identity (or answer 406
+        // when the client refused identity), exactly as for a codec failure.
+        let Some(algo) = Algorithm::from_content_encoding(encoding)
+            .filter(|algo| self.config.algorithms.contains(algo))
+        else {
+            drop(ctx.take_compression_response_buffer_permit());
+            warn_sampled!(
+                "compression: final Content-Encoding no longer names a coding this plugin can \
+                 produce; restoring the identity representation"
+            );
+            ctx.mark_compression_response_encode_aborted();
             return None;
         };
 
@@ -2417,11 +2941,27 @@ impl Plugin for CompressionPlugin {
         // exceed the response-buffer semaphore it is supposed to bound.
         let Some(buffer_permit) = ctx.take_compression_response_buffer_permit() else {
             error!(
-                "compression: missing response-buffer admission permit for committed Content-Encoding '{encoding}'"
+                "compression: missing response-buffer admission permit for committed Content-Encoding '{}'",
+                algo.content_encoding()
             );
             ctx.mark_compression_response_encode_aborted();
             return None;
         };
+        // Defense in depth for the length gate: `after_proxy` admitted this
+        // length-gated body on its declared length, so the collected body
+        // cannot be larger — but if it were, encoding it would exceed the bound
+        // the gate exists to keep. Abort to identity instead.
+        if !Self::response_limit_bounds_compression_buffer(ctx)
+            && body.len() > Self::length_gated_compression_ceiling(ctx)
+        {
+            drop(buffer_permit);
+            warn_sampled!(
+                "compression: collected body exceeds the length-gated compression ceiling; \
+                 restoring the identity representation"
+            );
+            ctx.mark_compression_response_encode_aborted();
+            return None;
+        }
         // Codec CPU admission is acquired only here, immediately before the
         // blocking worker, so a slow backend holding a buffer slot never pins a
         // codec permit and cannot starve request decompression. Saturation after
@@ -2454,8 +2994,23 @@ impl Plugin for CompressionPlugin {
         // ceiling — the same size as the window the transform phase reserved —
         // so an expanding encode is refused during construction rather than
         // after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
+        // `weaken_strong_etag`: record the validator that is live on the body
+        // being encoded — after every semantic transform and header hook — so
+        // only that one is re-attached once the lifecycle retires validators
+        // for the encoded bytes.
+        if self.config.weaken_strong_etag {
+            match response_headers.get("etag") {
+                Some(live) => {
+                    ctx.metadata
+                        .insert(ENCODE_ETAG_METADATA_KEY.to_string(), live.clone());
+                }
+                None => {
+                    ctx.metadata.remove(ENCODE_ETAG_METADATA_KEY);
+                }
+            }
+        }
         let compressed = self
-            .compress_response_body(body, encoding, permit, ctx.retained_response_body_ceiling())
+            .compress_response_body(body, algo, permit, ctx.retained_response_body_ceiling())
             .await;
         // Release the buffer slot only once the compressed copy exists (or the
         // encode failed): from here on nothing further is retained under this
