@@ -8,34 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `oauth2_introspection` `private_key_jwt` assertions default to
-  the introspection endpoint audience** (issue #6840). A provider that pinned
-  `issuer` used to sign its client assertion with `aud` = `issuer`, so an
-  authorization server requiring the introspection URL (Okta, for example)
-  refused every call while the issuer pin was on. The assertion `aud` is now
-  the new `client_auth.client_assertion_audience` when set, otherwise the
-  resolved introspection endpoint, independent of `issuer`. Providers whose
-  server requires the issuer as the assertion audience must set
-  `client_assertion_audience` to it.
-- **`oauth2_introspection` concurrency limits are configurable.** The fixed
-  32-per-provider / 128-per-process caps on uncached introspection calls are
-  replaced by `providers[].max_concurrent_introspections` (default `32`) and a
-  plugin-level `max_concurrent_introspections` (default `128`, shared by one
-  instance's providers), both `1..=1024`, under a fixed process-wide ceiling
-  of 1024. Limits stay non-queuing: an exhausted limit fails fast with `503`.
-  Several instances no longer share one 128-call process budget.
-- **`oauth2_introspection` refreshes OIDC discovery.** A `discovery_url`
-  provider now re-fetches its discovery document every
-  `providers[].discovery_refresh_interval_secs` (default `900`, `1..=86400`)
-  after the first resolution, so a moved introspection endpoint is picked up
-  without a reload. A failed refresh keeps serving the last known endpoint and
-  retries with the existing capped backoff.
-- **`oauth2_introspection` can admit RFC 8705 certificate-bound tokens.** With
-  `providers[].accept_mtls_bound_tokens: true`, an active response whose `cnf`
-  is exactly one `x5t#S256` member is admitted only when the frontend client
-  certificate has that SHA-256 thumbprint, re-verified on every request
-  (cache hits included) before any scope or role verdict. DPoP-bound and other
-  confirmations still fail closed; the default is unchanged.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -167,10 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`oauth2_introspection` reads a null `cnf` or `token_type` as omitted.**
-  An authorization server that serializes unset optional members as `null`
-  previously had every token rejected (`401` for `cnf: null`, `503` for
-  `token_type: null`), like the null temporal members fixed in #6611.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -423,13 +427,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`oauth2_introspection` binds the response issuer into an unpinned
-  provider's identity realm.** A provider without `issuer` committed one realm
-  for every accepted token, so the same `sub` asserted for two issuers behind
-  one introspection service became one principal to realm-aware consumers such
-  as `mcp_gateway` session ownership. Each active response's string `iss` now
-  joins the realm, on cache misses and hits alike; a pinned `issuer` is
-  unchanged.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
