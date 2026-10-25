@@ -7,18 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **`fault_injection` blast-radius bounds.** Optional `match.headers` (1-16
-  header name → exact value pairs, matched against the client-sent field
-  lines) confines an HTTP-family experiment to marked traffic such as
-  `x-chaos-test: 1`; unmatched requests are never faulted and consume no
-  sampler roll, and a header-targeted instance never faults raw TCP or
-  UDP/DTLS traffic. Optional `expires_at` (RFC 3339) ends an experiment: from
-  that instant every hook is a no-op, so a forgotten fault cannot persist
-  across reloads and restarts. Past timestamps are accepted and leave the
-  instance inert. `match.headers` values are redacted in non-admin config
-  projections.
-
 ### Changed
 - **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
   `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
@@ -169,16 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`fault_injection` no longer rolls the UDP/DTLS abort twice for a new
-  client's first datagram.** Plain-UDP session setup runs `on_stream_connect`
-  and then the datagram hook on the same opening packet, and a terminating-DTLS
-  session rolls admission at handshake accept and again on its first
-  application datagram; both rolled `abort.percentage`, so the effective
-  first-contact failure rate was `1-(1-p)^2` (75% at a configured 50%). Stream
-  connect now owns the abort decision for that first datagram and the datagram
-  hook decides only its delay; the proxy marks it with the new
-  `UdpDatagramContext::admission_datagram` field (`false` for every later and
-  every backend→client datagram).
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
