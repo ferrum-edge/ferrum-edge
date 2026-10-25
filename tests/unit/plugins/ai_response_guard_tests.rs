@@ -8933,3 +8933,146 @@ async fn prompt_shield_detects_new_card_and_key_formats() {
         );
     }
 }
+
+// ─── PR #6839 fix round 1 ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn card_followed_by_a_short_numeric_token_is_still_confirmed() {
+    // PR6839-SOL-1: the greedy 17–19-digit tail absorbs ` 123`; the 16-digit
+    // card before it must still be a finding.
+    let card_and_code = "card 4111 1111 1111 1111 123";
+    assert!(builtin_finds("credit_card", card_and_code));
+    assert!(
+        builtin_finds("credit_card", "6205500000000000004"),
+        "a true 19-digit card"
+    );
+    assert!(!builtin_finds("credit_card", "ref 4111 1111 1111 1112 123"));
+
+    let plugin = make_plugin(json!({"pii_patterns": ["credit_card"], "action": "reject"}));
+    let body =
+        serde_json::to_vec(&json!({"choices": [{"message": {"content": card_and_code}}]})).unwrap();
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let (status, _, delivered) = publish_guarded_response(
+        json!({"pii_patterns": ["credit_card"], "action": "redact"}),
+        "application/json",
+        None,
+        body,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let delivered: serde_json::Value = serde_json::from_slice(&delivered).unwrap();
+    assert_eq!(
+        delivered["choices"][0]["message"]["content"],
+        "card [REDACTED:pii:credit_card]"
+    );
+
+    let redactor = ferrum_edge::plugins::utils::ai_pii::PiiRedactor::from_config(
+        &["credit_card".to_string()],
+        &[],
+        "[REDACTED:{type}]",
+        false,
+        None,
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        redactor.redact(card_and_code),
+        "card [REDACTED:credit_card]"
+    );
+    assert_eq!(
+        redactor.redact("ref 4111 1111 1111 1112 123"),
+        "ref 4111 1111 1111 1112 123"
+    );
+}
+
+#[test]
+fn api_keys_ending_in_token_punctuation_are_matched_in_full() {
+    // PR6839-SOL-2: a 39-character Google key may end in `-` (no word boundary
+    // follows it), and provider keys may carry `--` or end in `_`.
+    let google_dash = format!("AIza{}-", "A".repeat(34));
+    let google_underscore = format!("AIza{}_", "A".repeat(34));
+    let doubled = format!("sk-ant-api03-{}--x_y_", "A".repeat(30));
+    let trailing_underscore = format!("sk-{}_", "A".repeat(25));
+    let regex = builtin_regex("api_key");
+    for key in [
+        &google_dash,
+        &google_underscore,
+        &doubled,
+        &trailing_underscore,
+    ] {
+        for (before, after) in [("", ""), ("key ", " end"), ("{\"k\":\"", "\"}")] {
+            let text = format!("{before}{key}{after}");
+            assert_eq!(
+                regex.replace_all(&text, "[R]"),
+                format!("{before}[R]{after}"),
+                "{text}"
+            );
+        }
+    }
+    let redactor = ferrum_edge::plugins::utils::ai_pii::PiiRedactor::from_config(
+        &["api_key".to_string()],
+        &[],
+        "[REDACTED:{type}]",
+        false,
+        None,
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        redactor.redact(&format!("key {google_dash}")),
+        "key [REDACTED:api_key]"
+    );
+}
+
+#[tokio::test]
+async fn guard_redacts_a_google_key_ending_in_a_hyphen() {
+    let key = format!("AIza{}-", "A".repeat(34));
+    let (status, _, delivered) = publish_guarded_response(
+        json!({"pii_patterns": ["api_key"], "action": "redact"}),
+        "application/json",
+        None,
+        serde_json::to_vec(&json!({"choices": [{"message": {"content": key}}]})).unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let delivered: serde_json::Value = serde_json::from_slice(&delivered).unwrap();
+    assert_eq!(
+        delivered["choices"][0]["message"]["content"],
+        "[REDACTED:pii:api_key]"
+    );
+}
+
+#[test]
+fn trailing_zero_compressed_ipv6_is_matched() {
+    // PR6839-SOL-3: three to seven explicit groups followed by `::`.
+    let regex = builtin_regex("ip_address");
+    for address in [
+        "2001:db8:1234::",
+        "2001:db8:1234:5::",
+        "2001:db8:1:2:3::",
+        "2001:db8:1:2:3:4::",
+        "1:2:3:4:5:6:7::",
+    ] {
+        for (before, after) in [("", ""), ("host ", " up"), ("{\"ip\":\"", "\"}")] {
+            let text = format!("{before}{address}{after}");
+            assert_eq!(
+                regex.replace_all(&text, "[R]"),
+                format!("{before}[R]{after}"),
+                "{text}"
+            );
+        }
+    }
+    // A following group is still matched as part of the address, and the
+    // excluded two-group and code-like forms stay unmatched.
+    assert_eq!(regex.replace_all("2001:db8:1::5", "[R]"), "[R]");
+    for text in ["fe80:1::", "use std::fmt::Display", "a::b::c"] {
+        assert!(!regex.is_match(text), "{text}");
+    }
+}

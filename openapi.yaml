@@ -36245,7 +36245,7 @@ components:
             type: string
             enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: []
-          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban). Each name at most once. credit_card covers Visa, Mastercard (including the 2221-2720 2-series), Discover, UnionPay, JCB, American Express (contiguous, 4-6-5, or 4-4-4-3), and Diners Club numbers and is confirmed with a Luhn checksum; api_key covers multi-segment sk-proj-/sk-ant-api03- style keys plus GitHub, Google, and Slack token formats; ip_address covers IPv4 (octets 0-255) and IPv6 (full, or ::-compressed with at least three groups); iban accepts compact or space-grouped IBANs with a registry country code."
+          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban). Each name at most once. credit_card covers Visa, Mastercard (including the 2221-2720 2-series), Discover, UnionPay, JCB, American Express (contiguous, 4-6-5, or 4-4-4-3), and Diners Club numbers and is confirmed with a Luhn checksum; api_key covers multi-segment sk-proj-/sk-ant-api03- style keys plus GitHub, Google, and Slack token formats; ip_address covers IPv4 (octets 0-255) and IPv6 (full, or ::-compressed, inner or trailing, with at least three groups); iban accepts compact or space-grouped IBANs with a registry country code."
         custom_pii_patterns:
           type: array
           maxItems: 256

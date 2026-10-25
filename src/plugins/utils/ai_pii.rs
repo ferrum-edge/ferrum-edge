@@ -56,17 +56,21 @@ fn fallback_hmac_key(plugin_name: &str) -> Result<&'static [u8; 32], String> {
 ///   contiguous or 4-6-4. Groups may be separated by `-`, `.`, or whitespace.
 ///   The regex is a candidate shape only: consumers that can confirm a match
 ///   apply [`builtin_pii_validator`] (a Luhn checksum) so ordinary long
-///   reference numbers are not reported.
+///   reference numbers are not reported. A separate 1–3 digit token right
+///   after a complete card (`… 1111 123`) is absorbed into the match and the
+///   card is still confirmed (see [`luhn_valid_card_number`]).
 /// - `api_key`: a `sk`/`pk`/`rk`/`api`/`key`/`token`/`secret`/`password`
 ///   prefix, up to three short hyphen/underscore segments (`sk-proj-…`,
 ///   `sk-ant-api03-…`, `sk-svcacct-…`), a run of at least 20 alphanumerics,
-///   and every further `-`/`_` segment of the same token, so redaction removes
-///   the whole credential rather than its first segment. GitHub
+///   and every further `-`/`_` segment (consecutive separators and trailing
+///   underscores included) of the same token, so redaction removes the whole
+///   credential rather than its first segment. GitHub
 ///   (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`, `github_pat_`), Google (`AIza`), and
-///   Slack (`xox[abposr]-`) token formats are covered too.
+///   Slack (`xox[abposr]-`) token formats are covered too; a 39-character
+///   Google key ending in `-` is matched in full.
 /// - `ip_address`: dotted-quad IPv4 with every octet in `0`–`255` (leading
 ///   zeros allowed), plus IPv6 in full eight-group form or `::`-compressed form
-///   with at least three groups. A bare `::`, a leading-`::` address such as
+///   (inner or trailing, as in `2001:db8:1234::`) with at least three groups. A bare `::`, a leading-`::` address such as
 ///   `::1`, and two-group compressions such as `fe80::1` are deliberately not
 ///   matched: they are indistinguishable from `Type::member` paths in code.
 /// - `iban`: an IBAN-registry country code, two check digits, and an 11–30
@@ -89,10 +93,13 @@ pub fn builtin_pii_pattern(name: &str) -> Option<&'static str> {
         "api_key" => Some(concat!(
             r"\b(?:",
             r"(?:sk|pk|rk|api|key|token|secret|password)(?:[-_][A-Za-z0-9]{1,10}){0,3}",
-            r"[-_]?[A-Za-z0-9]{20,}(?:[-_][A-Za-z0-9]+)*",
+            r"[-_]?[A-Za-z0-9]{20,}(?:[-_]+[A-Za-z0-9]+)*_*",
             r"|gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}",
-            r"|AIza[0-9A-Za-z_-]{35}|xox[abposr]-[A-Za-z0-9-]{10,}",
+            r"|xox[abposr]-[A-Za-z0-9-]{10,}",
             r")\b",
+            // A Google key is exactly 39 characters and may END in `-`, after
+            // which no word boundary exists; its end is the fixed length.
+            r"|\bAIza[0-9A-Za-z_-]{34}(?:[0-9A-Za-z_]\b|-)",
         )),
         "aws_key" => Some(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
         "ip_address" => Some(concat!(
@@ -102,6 +109,11 @@ pub fn builtin_pii_pattern(name: &str) -> Option<&'static str> {
             r"|(?:[0-9A-Fa-f]{1,4}:){1,5}[0-9A-Fa-f]{1,4}::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){0,4}",
             r"|[0-9A-Fa-f]{1,4}::[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){1,5}",
             r")\b",
+            // Trailing zero compression (`2001:db8:1234::`): three to seven
+            // explicit groups and a final `::`, after which no word boundary
+            // exists. Tried only after the forms above, so a following group
+            // is matched by them instead.
+            r"|\b(?:[0-9A-Fa-f]{1,4}:){2,6}[0-9A-Fa-f]{1,4}::",
         )),
         "iban" => Some(concat!(
             r"\b(?:AD|AE|AL|AT|AZ|BA|BE|BG|BH|BI|BR|BY|CH|CR|CY|CZ|DE|DJ|DK|DO|EE|EG|ES",
@@ -129,12 +141,37 @@ pub fn builtin_pii_validator(name: &str) -> Option<fn(&str) -> bool> {
     }
 }
 
-/// Luhn checksum over the digits of a `credit_card` match.
+/// Whether a `credit_card` match holds a Luhn-valid card number.
+///
+/// The pattern's optional 17–19-digit tail can absorb a separate short numeric
+/// token after a complete 16-digit card (`4111 1111 1111 1111 123`, a card
+/// followed by its security code). The regex engine commits to that longer
+/// match, so a candidate is valid when either its complete digit sequence or
+/// the digits before a separated trailing 1–3 digit group pass the checksum.
+/// A confirming redactor then replaces the whole match, trailing group
+/// included, rather than leaving the card in place.
+pub fn luhn_valid_card_number(candidate: &str) -> bool {
+    luhn_valid_digits(candidate)
+        || without_separated_trailing_group(candidate).is_some_and(luhn_valid_digits)
+}
+
+/// `candidate` minus a final separator and the 1–3 ASCII digits after it.
+fn without_separated_trailing_group(candidate: &str) -> Option<&str> {
+    let (position, separator) = candidate
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| *ch == '-' || *ch == '.' || ch.is_whitespace())?;
+    let tail = &candidate[position + separator.len_utf8()..];
+    ((1..=3).contains(&tail.len()) && tail.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(&candidate[..position])
+}
+
+/// Luhn checksum over the digits of a card candidate.
 ///
 /// Separators the pattern admits (`-`, `.`, any whitespace) are skipped; any
 /// other character — including a non-ASCII digit the Unicode `\d` class
 /// accepted — makes the candidate invalid. Card numbers are 13–19 digits.
-pub fn luhn_valid_card_number(candidate: &str) -> bool {
+fn luhn_valid_digits(candidate: &str) -> bool {
     let mut sum = 0u32;
     let mut digits = 0usize;
     let mut double = false;
