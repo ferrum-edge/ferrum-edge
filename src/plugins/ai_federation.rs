@@ -534,10 +534,23 @@ struct TokenCounts {
     model: Option<String>,
 }
 
+/// Request metadata `ai_federation` sets to `"true"` only on the successful
+/// buffered return of a provider answer whose ORIGINAL response headers allowed
+/// a shared cache to retain it: no `Cache-Control: no-store` / `private`
+/// (bare or qualified) and no `Set-Cookie` / `Set-Cookie2`. The client-visible
+/// header map is sanitized before normalization and drops those fields, so
+/// `ai_semantic_cache` relies on this marker (and stores nothing without it).
+/// It is cleared whenever this plugin starts a provider dispatch.
+pub(crate) const PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY: &str =
+    "ferrum:provider_response_retainable";
+
 struct ProviderResponse {
     status: u16,
     headers: HashMap<String, String>,
     body: Bytes,
+    /// Whether the provider's original (pre-sanitization) headers permitted
+    /// shared-cache retention; see [`PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY`].
+    retainable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5518,6 +5531,7 @@ impl AiFederation {
             })?;
 
         let status = resp.status().as_u16();
+        let retainable = provider_response_headers_allow_retention(resp.headers());
         let headers = safe_provider_response_headers(resp.headers());
         let body_read_started = std::time::Instant::now();
         let body_result = read_response_body_bounded(resp, provider.max_response_body_bytes).await;
@@ -5541,6 +5555,7 @@ impl AiFederation {
             status,
             headers,
             body: resp_body,
+            retainable,
         })
     }
 
@@ -5602,6 +5617,27 @@ fn validate_dispatch_url(url: &str) -> Result<Url, String> {
         return Err("ai_federation: rendered provider endpoint violates URL policy".to_string());
     }
     Ok(parsed)
+}
+
+/// Whether a provider's ORIGINAL response headers allow a shared cache to
+/// retain the answer. Conservative: an unreadable `Cache-Control` value, any
+/// `no-store` / `private` member (members split on every comma, so a quoted
+/// comma can only add a refusal), or any `Set-Cookie` / `Set-Cookie2` refuses.
+fn provider_response_headers_allow_retention(headers: &reqwest::header::HeaderMap) -> bool {
+    if headers.contains_key(reqwest::header::SET_COOKIE) || headers.contains_key("set-cookie2") {
+        return false;
+    }
+    headers
+        .get_all(reqwest::header::CACHE_CONTROL)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|value| {
+                !value.split(',').any(|member| {
+                    let name = member.split('=').next().unwrap_or("").trim();
+                    name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("private")
+                })
+            })
+        })
 }
 
 fn safe_provider_response_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
@@ -8076,6 +8112,9 @@ impl Plugin for AiFederation {
         let mut last_failure_result: Option<PluginResult> = None;
         let mut attempted_provider = false;
         let mut skipped_open_circuit = false;
+        // Only a successful return below re-establishes retention eligibility.
+        ctx.metadata
+            .remove(PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY);
 
         for (idx, provider) in matching_providers.iter().enumerate() {
             let has_later_provider = matching_providers[idx + 1..].iter().any(|candidate| {
@@ -8524,6 +8563,12 @@ impl Plugin for AiFederation {
                             );
                         }
                     };
+                    if response.retainable {
+                        ctx.metadata.insert(
+                            PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY.to_string(),
+                            "true".to_string(),
+                        );
+                    }
                     let mut resp_headers = response.headers;
                     resp_headers.insert("content-type".to_string(), "application/json".to_string());
 

@@ -28,45 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `request_transformer`: stricter admission, WebSocket handshakes, request digests (#6858)
+### `cors` method and header lists are bounded (#6844)
 
-Check every `request_transformer` config with `ferrum-edge validate` before
-upgrading:
-
-- Header add/update/rename destinations under `x-path-param-*` are refused, and
-  so are `_` spellings of gateway-owned destinations (`X_Forwarded_For`,
-  `x_forwarded_proto`, `content_length`, `transfer_encoding`, …). Remove those
-  rules; the router owns path captures and the gateway owns forwarding
-  identity and framing.
-- Body `key` / `new_key` paths with an empty dot-segment (`""`, `user.`,
-  `.user`, `a..b`) are refused in `request_transformer` and
-  `response_transformer`. Fix the typo, or escape a literal dot as `\.`.
-- A header or query `value` containing `$(` is now a template. Replace a
-  literal `$(` with `$$(`; an unknown variable, or a credential-class source
-  name (`$(header.authorization)`, `$(query.access_token)`, …), is refused at
-  load.
-- `mesh_route_dispatch` `request_transform` add/update destinations under
-  `x-path-param-*` are refused. The translators refuse the offending resource
-  only: an HTTPRoute/GRPCRoute `RequestHeaderModifier` `set`/`add` of such a
-  name reports `Accepted=False` (`UnsupportedValue`), and a VirtualService
-  `headers.request.set`/`add` of an `x-path-param-*` or `x-consumer-*` name
-  is refused at translation; the rest of the cluster's config still loads.
-
-Behaviour changes that need no config edit but may matter downstream:
-
-- Header and query rules, and `mesh_route_dispatch` route-header transforms,
-  now apply to WebSocket upgrade handshakes on the same route. A transformer
-  meant only for plain HTTP requests needs a route that does not serve
-  WebSocket.
-- When an instance has body rules, `Content-Digest`, `Repr-Digest`,
-  `Digest`, and `Content-MD5` are removed from any request whose FINAL
-  outbound `Content-Type` is JSON (or absent) and whose body is not proven
-  empty by `Content-Length: 0` (including a lengthless HTTP/2 or HTTP/3
-  `GET`) — even when the rules end up not changing it. A backend that requires request digests cannot sit behind body
-  rules.
-- Transaction logs gain `request_transformer.rule_skipped` and
-  `request_transformer.body_skipped` metadata when a rule or body pass did not
-  apply.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
@@ -201,6 +173,36 @@ A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
 answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
+
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
 
 ### Backend idle connections: higher default ceiling (#6793)
 

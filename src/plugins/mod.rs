@@ -3750,6 +3750,13 @@ pub(crate) struct PluginRequestState {
     /// Per-instance semantic-cache scope keys paired with
     /// `ai_semantic_cache_embeddings`.
     pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
+    /// Per-`ai_semantic_cache`-instance provider-backed synthetic responses
+    /// staged by its final-response-body hook and published (or dropped) by
+    /// its committed-response hook, once the synthetic path's late reject
+    /// `after_proxy` header hooks have produced the final client-visible
+    /// headers. Dropped with the request when no committed hook runs.
+    pub(crate) ai_semantic_cache_pending_stores:
+        HashMap<u64, crate::plugins::ai_semantic_cache::PendingSemanticCacheStore>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.

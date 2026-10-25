@@ -6248,7 +6248,8 @@ pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
 /// would be accepted by `CorsPlugin` construction: the plugin rejects padded
 /// or empty values, invalid HTTP methods, and invalid
 /// header names (shared `plugins::cors::{validate_method,validate_header_name}`
-/// admission — do not fork). `cors_string_array` emits the collected strings
+/// admission — do not fork), plus the shared per-list entry bound
+/// (`plugins::cors::validate_token_list_count`). `cors_string_array` emits the collected strings
 /// verbatim, so a bad token would otherwise fail plugin construction AFTER
 /// translation instead of deferring the policy here. An absent list is
 /// projected as explicit empty so Istio omission is preserved.
@@ -6257,12 +6258,13 @@ fn cors_string_arrays_plugin_valid(cors: &Value) -> bool {
         match cors.get(key) {
             None => true,
             Some(Value::Array(_)) => cors_string_array(cors, key).is_some_and(|values| {
-                values.iter().all(|value| {
-                    let trimmed = value.trim();
-                    !trimmed.is_empty()
-                        && trimmed.len() == value.len()
-                        && validate(key, value).is_ok()
-                })
+                crate::plugins::cors::validate_token_list_count(key, values.len()).is_ok()
+                    && values.iter().all(|value| {
+                        let trimmed = value.trim();
+                        !trimmed.is_empty()
+                            && trimmed.len() == value.len()
+                            && validate(key, value).is_ok()
+                    })
             }),
             _ => false,
         }
