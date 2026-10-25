@@ -386,9 +386,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     condition, or a foreign element — rejects the assertion before its id is
     claimed instead of being ignored.
   - **Namespace resolution is charged to a per-message allowance** (scanned
-    entries × compared prefix bytes, 32 × decoded body, floor 4 194 304), so
-    inherited declarations and long prefixes cannot multiply canonicalization
-    CPU on `SignedInfo` before the signature is checked.
+    entries × compared prefix bytes, plus the length of every compared
+    namespace URI; 32 × decoded body, floor 4 194 304), so inherited
+    declarations, long prefixes, and long inherited URIs cannot multiply
+    canonicalization CPU on `SignedInfo` before the signature is checked.
   - **Linear-time MTOM boundary search** (`memchr::memmem`) replaces a
     window search that was O(body × boundary) on near-match payloads.
 - **`soap_ws_security` correctness and interop.**

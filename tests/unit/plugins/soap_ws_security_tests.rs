@@ -11435,6 +11435,35 @@ fn namespace_resolution_work_is_bounded_independently_of_bytes() {
         "got: {error}"
     );
 
+    // A long URI costs a byte comparison on every descendant that resolves its
+    // prefix, even though the binding is inherited and emits nothing after the
+    // first element: one long declaration on an ancestor, one short inclusive
+    // prefix, and many tiny descendants must be refused by the allowance.
+    let long_uri = format!("urn:{}", "A".repeat(200_000));
+    let long_uri_xml = format!(
+        "<root xmlns:p=\"{long_uri}\"><SignedInfo>{}</SignedInfo></root>",
+        "<a/>".repeat(2_000)
+    );
+    let error = soap_exclusive_canonicalize_element_for_test(&long_uri_xml, "SignedInfo", "p")
+        .expect_err("repeated long-URI comparison work must be charged");
+    assert!(
+        error.contains("namespace-resolution work budget"),
+        "got: {error}"
+    );
+    // The same shape over an ordinary URI is unaffected, and still renders the
+    // inclusive binding exactly once.
+    let short_uri_xml = format!(
+        "<root xmlns:p=\"urn:p\"><SignedInfo>{}</SignedInfo></root>",
+        "<a/>".repeat(2_000)
+    );
+    let canonical = soap_exclusive_canonicalize_element_for_test(&short_uri_xml, "SignedInfo", "p")
+        .expect("an ordinary inherited URI fits the allowance");
+    assert_eq!(
+        canonical.matches("xmlns:p=\"urn:p\"").count(),
+        1,
+        "{canonical}"
+    );
+
     // An ordinary namespaced subtree is unaffected.
     let ordinary =
         format!("<root{declarations}><SignedInfo><p1:a/><p2:b p3:c=\"v\"/></SignedInfo></root>");

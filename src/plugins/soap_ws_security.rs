@@ -6896,9 +6896,9 @@ fn parse_inclusive_namespaces(
     Ok(prefixes)
 }
 
-fn exclusive_canonicalize(
+fn exclusive_canonicalize<'a>(
     xml: &str,
-    root: Node<'_, '_>,
+    root: Node<'a, '_>,
     inclusive_prefixes: &[String],
     excluded_node: Option<NodeId>,
     budget: &mut WorkBudget,
@@ -6918,11 +6918,10 @@ fn exclusive_canonicalize(
     let source_len = root.range().len();
     budget.charge(source_len)?;
     let mut output = BoundedCanonicalOutput::new(budget, source_len);
-    let mut rendered_namespaces = HashMap::new();
-    rendered_namespaces.insert(
-        "xml".to_string(),
-        "http://www.w3.org/XML/1998/namespace".to_string(),
-    );
+    // Rendered URIs borrow the parsed document rather than owning copies, so
+    // an inherited binding is never re-copied per descendant.
+    let mut rendered_namespaces: HashMap<String, &'a str> = HashMap::new();
+    rendered_namespaces.insert("xml".to_string(), "http://www.w3.org/XML/1998/namespace");
     canonicalize_node(
         xml,
         root,
@@ -7007,13 +7006,13 @@ pub(crate) fn exclusive_canonicalize_element_for_test(
     String::from_utf8(canonical).map_err(|_| "WS-Security: canonical XML was not UTF-8".to_string())
 }
 
-fn canonicalize_node(
+fn canonicalize_node<'a>(
     xml: &str,
-    node: Node<'_, '_>,
+    node: Node<'a, '_>,
     inclusive_prefixes: &[String],
     excluded_node: Option<NodeId>,
     depth: usize,
-    rendered_namespaces: &mut HashMap<String, String>,
+    rendered_namespaces: &mut HashMap<String, &'a str>,
     output: &mut BoundedCanonicalOutput<'_>,
 ) -> Result<(), String> {
     if depth > MAX_CANONICALIZATION_DEPTH {
@@ -7107,27 +7106,24 @@ fn canonicalize_node(
             continue;
         };
 
-        let already_rendered = rendered_namespaces
-            .get(prefix)
-            .map(String::as_str)
-            .unwrap_or("");
-        if namespace_uri != already_rendered {
-            namespace_declarations.push((prefix.to_string(), namespace_uri.to_string()));
+        let already_rendered = rendered_namespaces.get(prefix).copied().unwrap_or("");
+        if !namespace_uris_equal(namespace_uri, already_rendered, output)? {
+            namespace_declarations.push((prefix.to_string(), namespace_uri));
         }
     }
     namespace_declarations.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut namespace_history = Vec::new();
     for (prefix, uri) in namespace_declarations {
-        namespace_history.push((prefix.clone(), rendered_namespaces.get(&prefix).cloned()));
-        rendered_namespaces.insert(prefix.clone(), uri.clone());
+        namespace_history.push((prefix.clone(), rendered_namespaces.get(&prefix).copied()));
+        rendered_namespaces.insert(prefix.clone(), uri);
         output.push_str(" xmlns")?;
         if !prefix.is_empty() {
             output.push(':')?;
             output.push_str(&prefix)?;
         }
         output.push_str("=\"")?;
-        output.push_attribute_value(&uri)?;
+        output.push_attribute_value(uri)?;
         output.push('"')?;
     }
 
@@ -7165,6 +7161,29 @@ fn canonicalize_node(
         }
     }
     Ok(())
+}
+
+/// Whether a resolved namespace URI equals the one already rendered for its
+/// prefix, charging the byte comparison to the namespace-resolution allowance
+/// before it runs.
+///
+/// URIs are caller-chosen and unbounded in length, and an unchanged inherited
+/// binding emits nothing, so neither the source charge (the declaration sits on
+/// an ancestor, outside the canonicalized subtree) nor the output charge sees a
+/// comparison repeated on every descendant. Unequal lengths decide without
+/// reading the bytes and cost nothing; an equal-length comparison is charged
+/// its full length, whether or not the two borrows share storage, so the bound
+/// is a property of the input rather than of the parser's internal layout.
+fn namespace_uris_equal(
+    resolved: &str,
+    rendered: &str,
+    output: &mut BoundedCanonicalOutput<'_>,
+) -> Result<bool, String> {
+    if resolved.len() != rendered.len() {
+        return Ok(false);
+    }
+    output.charge_namespace_scan(1, resolved.len())?;
+    Ok(resolved == rendered)
 }
 
 fn add_required_prefix<'a>(prefixes: &mut Vec<(&'a str, bool)>, prefix: &'a str, required: bool) {
