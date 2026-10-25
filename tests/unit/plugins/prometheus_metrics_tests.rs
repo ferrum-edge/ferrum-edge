@@ -1458,7 +1458,15 @@ fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
     assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
     assert!(output.contains("ferrum_ai_federation_circuit_half_open_probes_total 1"));
     assert!(output.contains("ferrum_ai_federation_circuit_open_skips_total 1"));
-    assert!(!output.contains("provider="));
+    // The aggregate circuit families stay provider-free; other families in the
+    // shared registry (e.g. mesh tracing span drops) may legitimately carry a
+    // `provider` label.
+    assert!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("ferrum_ai_federation_circuit"))
+            .all(|line| !line.contains("provider="))
+    );
 
     registry.record_ai_federation_circuit_opened();
     registry.release_ai_federation_open_circuit();
