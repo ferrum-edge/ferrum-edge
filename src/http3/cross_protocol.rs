@@ -7221,7 +7221,7 @@ where
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
-        route_deadline_cut: route_deadline_cut,
+        route_deadline_cut,
     })
 }
 
