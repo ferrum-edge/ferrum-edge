@@ -1080,7 +1080,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 
 | Plugin | Hook | Description |
 |--------|------|-------------|
-| `ip_restriction` | `on_stream_connect` | Block connections from denied IPs |
+| `ip_restriction` | `on_stream_connect` | Block new connections/sessions from denied IPs (admission-only; see notes) |
 | `mtls_auth` | `on_stream_connect` | Map TCP+TLS or UDP+DTLS client certificates to Consumers |
 | `access_control` | `on_stream_connect` | Consumer allow/deny after a stream auth plugin identifies the caller |
 | `tcp_connection_throttle` | `on_stream_connect` + connection permit | Cap process-local active TCP/TCP+TLS connections per Consumer, else canonical client IP. UDP/DTLS attachment is rejected; each replica enforces an independent limit |
@@ -1096,6 +1096,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per-plugin protocol matrix.
 
 Notes:
+- `ip_restriction` is admission-only on stream proxies: `on_stream_connect` runs once per TCP/TLS connection or UDP/DTLS session and is never repeated. A reload that adds a client to `deny` (or removes it from `allow`) rejects that client's new connections and sessions, but an established session keeps relaying until it closes on its own, idles out, or the process restarts. Sessions admitted only by IP policy are unauthenticated, so the authenticated-stream lifetime bound does not apply to them. See [docs/plugins.md](plugins.md#ip_restriction).
 - `tcp_connection_throttle` is TCP/TCP+TLS-only. Explicit proxy/proxy-group attachment to any other protocol fails configuration admission and plugin-cache validation instead of silently claiming protection. A global policy with a nonempty effective target set must cover at least one TCP/TCP+TLS proxy; mixed global scope is applied only to its TCP-family listeners. In particular, it does not protect UDP/DTLS; use `udp_rate_limiting` for datagram/session admission. Its counters are process-local, so a replicated deployment's aggregate allowance can reach the configured limit per replica.
 - `udp_rate_limiting` runs on every UDP/DTLS datagram (`on_udp_datagram`) in both directions. Steady-path capacity admission uses an atomic resident-entry count coordinated with insert/remove — it does not call `DashMap::len()` or lock every state shard per packet (local and Redis-fallback). On the plain-UDP frontend path, client→backend hooks for established sessions run on the per-session ingress worker described under [UDP Session Management](#udp-session-management) so a slow Redis round-trip for one client cannot stall the shared recv loop for every other session. See [docs/plugins.md](plugins.md#udp_rate_limiting).
 - `access_control` applies to both TCP and UDP stream proxies. For TCP+TLS and UDP+DTLS, pair with `mtls_auth` for certificate-based consumer identification → ACL group/username authorization.

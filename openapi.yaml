@@ -29182,16 +29182,21 @@ components:
       description: >-
         One IP or CIDR rule admitted by `ip_restriction`. Surrounding whitespace
         follows Rust `str::trim` Unicode `White_Space` semantics. IPv4 octets
-        must be canonical unsigned decimal (no leading zeros, no `+`). Native
-        IPv6 may be bracketed and may carry a zone identifier; CIDR prefixes
-        sit outside the brackets. IPv4 CIDR prefixes are `/0`–`/32`; native
-        IPv6 prefixes are `/0`–`/128`. IPv4-mapped IPv6 (`::ffff:a.b.c.d` and
-        the uncompressed `0:0:0:0:0:ffff:…` form) accept exact addresses or
-        CIDR `/96`–`/128` only.
+        must be canonical unsigned decimal (no leading zeros, no `+`), and CIDR
+        prefixes must be canonical unsigned decimal too (`/8`, never `/08`,
+        `/+8`, or `/008`). Native IPv6 follows the standard textual grammar,
+        including `::` compression in front of an embedded dotted IPv4 tail
+        (`2001:db8::1:192.0.2.1`). It may be bracketed and may carry a zone
+        identifier, which must be non-empty and contain no whitespace, `/`,
+        or `]`; CIDR prefixes sit outside the brackets. IPv4 CIDR prefixes are
+        `/0`–`/32`; native IPv6 prefixes are `/0`–`/128`. IPv4-mapped IPv6 —
+        any spelling whose value lies in `::ffff:0:0/96`, such as
+        `::ffff:a.b.c.d`, `0::ffff:c000:201`, or `0:0:0:0:0:ffff::` — accepts
+        exact addresses or CIDR `/96`–`/128` only.
       allOf:
-        - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3}(?:/(?:3[0-2]|[12]?[0-9]))?|(?:(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:(?:[0-9A-Fa-f]{1,4}:){6}|(?:[0-9A-Fa-f]{1,4}:){1,5}:|::(?:[Ff]{4}:)?)(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3})(?:%[^/\]]+)?|\[(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:(?:[0-9A-Fa-f]{1,4}:){6}|(?:[0-9A-Fa-f]{1,4}:){1,5}:|::(?:[Ff]{4}:)?)(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3})(?:%[^/\]]+)?\])(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+        - pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3}(?:/(?:3[0-2]|[12]?[0-9]))?|(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:)|(?:(?:[0-9A-Fa-f]{1,4}:){6}|::(?:[0-9A-Fa-f]{1,4}:){0,5}|[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,4}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,3}|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,2}|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:)?|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::)(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3})(?:%[^/\]\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+)?|\[(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:)|(?:(?:[0-9A-Fa-f]{1,4}:){6}|::(?:[0-9A-Fa-f]{1,4}:){0,5}|[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,4}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,3}|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0,2}|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:)?|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::)(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3})(?:%[^/\]\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+)?\])(?:/(?:12[0-8]|1[01][0-9]|[1-9]?[0-9]))?)[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
         - not:
-            pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*\[?(?:::[Ff]{4}:|(?:0{1,4}:){5}[Ff]{4}:)(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4})(?:%[^/\]]+)?\]?/(?:[0-8]?[0-9]|9[0-5])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
+            pattern: '^[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*\[?(?:(?:0{1,4}:){5}[Ff]{4}(?::(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3}|:[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}|:[0-9A-Fa-f]{1,4}::|::[0-9A-Fa-f]{1,4}|::)|(?:0{1,4}(?::0{1,4})*)?::(?:0{1,4}:)*[Ff]{4}:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]?|0)){3}|[0-9A-Fa-f]{1,4}:[0-9A-Fa-f]{1,4}))(?:%[^/\]\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+)?\]?/(?:[0-8]?[0-9]|9[0-5])[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$'
 
     IpRestrictionConfig:
       type: object
@@ -29217,11 +29222,21 @@ components:
         Supports IPv4 exact and CIDR (`/0`-`/32`) and native IPv6 exact and CIDR
         (`/0`-`/128`). IPv4-mapped IPv6 rules normalize to IPv4, so mapped CIDRs
         accept only `/96`-`/128` (equivalent to IPv4 `/0`-`/32`); shorter mapped
-        prefixes are rejected as ambiguous. IPv6 zone identifiers (e.g. `%eth0`)
-        on rules or client IPs are stripped before matching. Runs on every
-        protocol — HTTP, gRPC, WebSocket, TCP, UDP, and DTLS. Config must be an
-        object, unknown properties and null values are rejected, and at least
-        one of `allow` or `deny` must be non-empty.
+        prefixes are rejected as ambiguous. CIDR prefixes must be canonical
+        unsigned decimal (`/08`, `/+8`, and `/096` are rejected). IPv6 zone
+        identifiers (e.g. `%eth0`) on rules or client IPs are stripped before
+        matching; a rule's zone must be non-empty. Runs on every protocol —
+        HTTP, gRPC, WebSocket, TCP, UDP, and DTLS. HTTP-family requests are
+        checked per request; TCP/TLS, UDP/DTLS, and WebSocket sessions are
+        checked once at admission, and an established session is not
+        re-evaluated when a reload changes the policy. Responses the gateway
+        produces before this plugin runs — route 404/405, gRPC method
+        admission, a `cors` preflight answer, `request_termination` — still
+        reach a denied client. Every rejection records
+        `ip_restriction.reason` (`unparseable_client_ip`,
+        `not_in_allow_list`, or `ip_denied`) in transaction-log metadata.
+        Config must be an object, unknown properties and null values are
+        rejected, and at least one of `allow` or `deny` must be non-empty.
       properties:
         allow:
           type: array

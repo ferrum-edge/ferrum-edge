@@ -331,6 +331,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "hbone_datagram",
     "http_method",
     "io_side",
+    "ip_restriction.reason",
     "mcp.admission_violation",
     "mcp.arguments",
     "mcp.arguments_hash",
