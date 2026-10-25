@@ -47,8 +47,8 @@ use super::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
 };
 use super::utils::log_schema::{
-    DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
-    SummarySchema, TimestampFormat, resolve_schema,
+    DerivedKind, EmittedKeys, MetadataPolicy, NativeText, SchemaCapabilities, SchemaSerializable,
+    SchemaView, SummarySchema, TimestampFormat, resolve_schema,
 };
 use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
@@ -168,6 +168,19 @@ impl SchemaSerializable for WsDisconnectLogEntry<'_> {
         super::utils::log_schema::WS_DISCONNECT_FIELDS
             .iter()
             .any(|f| f.name == source)
+    }
+
+    fn native_text(&self, source: &str) -> NativeText<'_> {
+        match source {
+            "client_ip" => NativeText::Text(self.client_ip),
+            "consumer_username" => NativeText::from_option(self.consumer_username),
+            "backend_target" => NativeText::Text(self.backend_target),
+            _ => NativeText::NotTransformable,
+        }
+    }
+
+    fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     fn serialize_native<S>(

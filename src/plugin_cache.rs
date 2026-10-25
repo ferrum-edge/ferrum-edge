@@ -4460,6 +4460,38 @@ fn create_adaptive_concurrency_plugin(
 struct ProxyGroupPluginInstance {
     plugin: Arc<dyn Plugin>,
     config: PluginConfig,
+    /// Raw named-schema definition the instance's `schema_ref` resolved to
+    /// when it was constructed (`None` when the config carries no
+    /// `schema_ref`, or the name was unresolved). Loggers compile `schema_ref`
+    /// once at construction, so the referenced definition is part of what the
+    /// shared instance IS: an incremental rebuild must not retain a group
+    /// instance whose own row is unchanged when the definition it resolved has
+    /// since changed.
+    schema_ref_definition: Option<Arc<serde_json::Value>>,
+}
+
+impl ProxyGroupPluginInstance {
+    /// Record a freshly constructed group instance together with the
+    /// named-schema definition its `schema_ref` resolves to right now. Called
+    /// on the same thread, inside the same reload bracket, as the
+    /// construction itself, so the captured definition is the one the
+    /// constructor compiled.
+    fn new(plugin: Arc<dyn Plugin>, config: PluginConfig) -> Self {
+        let schema_ref_definition = proxy_group_schema_ref_definition(&config);
+        Self {
+            plugin,
+            config,
+            schema_ref_definition,
+        }
+    }
+}
+
+/// The raw named-schema definition a plugin config's `schema_ref` resolves to
+/// in the registry view of the calling thread (the open reload staging map on
+/// the reload thread, the live map elsewhere).
+fn proxy_group_schema_ref_definition(config: &PluginConfig) -> Option<Arc<serde_json::Value>> {
+    let name = config.config.get("schema_ref")?.as_str()?;
+    crate::plugins::utils::log_schema::registry::lookup_named_raw(name)
 }
 
 /// Built-in plugin types whose constructed instance can participate in a
@@ -7581,6 +7613,19 @@ impl PluginCache {
                 HashMap::new()
             };
 
+        // Unwind-safety net for the named-schema reload bracket opened below:
+        // the explicit commit/abort calls on every normal path disarm it, and
+        // its `Drop` discards the staging map if construction panics before
+        // either runs (see `registry::begin_reload_guarded`).
+        let _schema_reload_guard = if rebuild_globals {
+            Some(
+                crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                    .map_err(|error| format!("Config reload rejected: {error}"))?,
+            )
+        } else {
+            None
+        };
+
         // Rebuild globals if any global plugin config changed
         let mut new_globals = if rebuild_globals {
             let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
@@ -7597,9 +7642,8 @@ impl PluginCache {
             // `transaction_log_schema` itself changed — the bracket is
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
-            // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload()
-                .map_err(|error| format!("Config reload rejected: {error}"))?;
+            // was the trigger for the rebuild. The bracket itself was opened
+            // just above, guarded against unwinding.
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -7763,6 +7807,16 @@ impl PluginCache {
         // instances that are still referenced in the post-delta config. This
         // keeps state shared with unchanged proxies but drops cascade-deleted
         // group state once the last proxy association is removed.
+        //
+        // A retained instance must also still resolve the same named-schema
+        // definition: loggers compile `schema_ref` at construction, so when a
+        // global `transaction_log_schema` change re-staged the registry
+        // (`rebuild_globals`) and the definition a group instance resolved has
+        // changed, retaining it would keep emitting the old output contract
+        // (for example a newly added privacy `omit`) indefinitely. Such groups
+        // are reconstructed against the staged registry below, and every proxy
+        // associated with them is rebuilt so they keep sharing one instance.
+        let mut schema_invalidated_groups: Vec<NamespacedResourceId> = Vec::new();
         let mut group_plugin_instances: ProxyGroupInstanceMap = current
             .proxy_group_plugins
             .iter()
@@ -7771,6 +7825,12 @@ impl PluginCache {
                     return None;
                 }
                 let pc = proxy_group_configs.get(identity)?;
+                if rebuild_globals
+                    && proxy_group_schema_ref_definition(pc) != existing.schema_ref_definition
+                {
+                    schema_invalidated_groups.push(identity.clone());
+                    return None;
+                }
                 if pc.plugin_name == "adaptive_concurrency"
                     && !adaptive_concurrency_instances
                         .contains_key(&adaptive_concurrency_policy_id(pc))
@@ -7790,6 +7850,22 @@ impl PluginCache {
                 }
             })
             .collect();
+        if !schema_invalidated_groups.is_empty() {
+            for proxy in &config.proxies {
+                let references_invalidated_group = proxy.plugins.iter().any(|assoc| {
+                    schema_invalidated_groups.iter().any(|identity| {
+                        *identity
+                            == NamespacedResourceId::new(
+                                proxy.namespace.as_str(),
+                                assoc.plugin_config_id.as_str(),
+                            )
+                    })
+                });
+                if references_invalidated_group {
+                    proxy_ids_to_rebuild.insert(proxy_namespaced_id(proxy));
+                }
+            }
+        }
         if let Some(forced) = forced_country_mmdb_instances {
             for (id, plugin_config) in &active_country_mmdb_configs {
                 if plugin_config.scope != PluginScope::ProxyGroup {
@@ -7801,10 +7877,7 @@ impl PluginCache {
                             plugin_config.namespace.as_str(),
                             plugin_config.id.as_str(),
                         ),
-                        ProxyGroupPluginInstance {
-                            plugin: Arc::clone(plugin),
-                            config: (*plugin_config).clone(),
-                        },
+                        ProxyGroupPluginInstance::new(Arc::clone(plugin), (*plugin_config).clone()),
                     );
                 }
             }
@@ -7919,10 +7992,10 @@ impl PluginCache {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
@@ -8527,8 +8600,11 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload()
-            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        // The guard is an unwind-safety net only: the explicit commit/abort
+        // calls below close the bracket on every normal path.
+        let _schema_reload_guard =
+            crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -8708,10 +8784,10 @@ impl PluginCache {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);

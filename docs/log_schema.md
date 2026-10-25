@@ -123,6 +123,16 @@ any plugin that uses `schema_ref:`, so reload ordering is automatic. The
 named-schemas registry is fully replaced on every config reload — renamed
 or removed schemas do not leak.
 
+Loggers resolve `schema_ref:` once, at construction. When a reload changes a
+named definition, every referrer is reconstructed against the new definition
+before the new cache is published — including `proxy_group`-scoped loggers,
+whose single shared instance is otherwise retained across incremental reloads
+when their own config row is unchanged. A group logger whose referenced
+definition is byte-for-byte unchanged keeps its instance (and any state it
+holds); one whose definition changed is rebuilt once and shared again by every
+associated proxy, so a newly added `omit` reaches every sink on the next
+reload.
+
 `schema:` and `schema_ref:` are mutually exclusive on a single plugin.
 
 ### Admin-API prospective graph validation
@@ -198,6 +208,19 @@ against the static field metadata in `fields.rs`.
 | `derived_fields` | `[{name, kind}]` | `[]` | Computed values; see [Derived Kinds](#derived-kinds). |
 | `metadata` | object | `{mode: nested}` | How to render the `metadata` map: `nested` / `omit` / `flatten`. |
 | `timestamp_format` | `rfc3339` / `epoch_ms` / `epoch_s` | `rfc3339` | Conversion for timestamp string fields. Parse failures fall back to the raw string. |
+| `transforms` | `{field: {type, …}}` | `{}` | Per-field value transforms (`truncate`, `ip_prefix`, `hash`); see [Value Transforms](#value-transforms). |
+
+Bounds (checked at construction, mirrored in `openapi.yaml`): `omit` and
+`order` take at most 256 entries and `rename` at most 256 pairs; rename
+targets, `static_fields` keys, and `derived_fields` names are at most 128
+bytes; `static_fields` takes at most 64 entries whose keys and values together
+serialize to at most 16384 bytes of JSON, with values nested at most 8
+objects/arrays deep; `derived_fields` takes at most 32 entries; and
+`metadata.prefix` is at most 64 bytes. A `transaction_log_schema` config
+declares at most 256 named schemas with names of at most 128 bytes. Static
+fields are stamped into every record on every sink using the schema, so these
+bounds keep a shared schema from turning into per-record serialization cost
+(or into a record that can never fit a bounded sink's entry cap).
 
 ### WebSocket Disconnect Fields (`ws_logging` only)
 
@@ -264,8 +287,18 @@ schema raises.)
   - `prefix:` (optional string prepended to every flattened key, e.g.
     `"meta_"` → `meta_trace_id`).
   - `on_collision:` — `skip` (default; existing key wins) or
-    `overwrite` (metadata entry replaces — implemented as a duplicate
-    key, which most JSON parsers resolve as "last wins").
+    `overwrite` (the metadata entry replaces the colliding field's value
+    **in place**, so the record still carries each key exactly once and its
+    meaning does not depend on how a downstream parser treats duplicate
+    keys). The replacing value is redaction-filtered like every flattened
+    value, so a non-allowlisted metadata key overwrites with `"[REDACTED]"`.
+
+`omit` and `rename` of the native `metadata` field apply only to the nested
+object. Under `mode: flatten`, `omit: [metadata]` (which would otherwise
+silently promote every entry to the top level — the opposite of what it says)
+and `rename: {metadata: …}` are rejected; under `mode: omit`, `rename:
+{metadata: …}` is rejected. `omit: [metadata]` together with `mode: omit` is
+redundant but consistent and is accepted.
 
 `prefix` and `on_collision` only take effect under `flatten`, but they are
 type- and value-checked in **every** mode. A `nested` or `omit` schema
@@ -280,6 +313,62 @@ way to bypass redaction through the schema. Request-private lifecycle keys
 under the `_dedup_` prefix, and the gRPC-Web request-trailer staging container
 `grpc_web.request_trailers`, are **omitted entirely** (not redacted) from every
 summary projection.
+
+### Value Transforms
+
+`transforms` minimizes selected string values at the point of emission instead
+of shipping them raw or dropping them entirely. Keys are native **source**
+field names (before `rename`); the transformed value is emitted under the
+field's output key.
+
+```yaml
+schema:
+  summary_type: both
+  transforms:
+    client_ip: { type: ip_prefix, ipv4_bits: 24, ipv6_bits: 48 }
+    request_user_agent: { type: truncate, max_bytes: 128 }
+    consumer_username:
+      type: hash
+      secret_ref: "${FERRUM_PLUGIN_SECRET_LOG_PSEUDONYM_KEY}"
+```
+
+| `type` | Options | Output |
+|---|---|---|
+| `truncate` | `max_bytes` (required, 1–65536) | The longest prefix of at most `max_bytes` bytes that ends on a UTF-8 character boundary. |
+| `ip_prefix` | `ipv4_bits` (0–32, default 24), `ipv6_bits` (0–128, default 48) | The network prefix with the host bits zeroed (`203.0.113.0`, `2001:db8:1::`). IPv4-mapped IPv6 is masked as IPv4. A value that is not an IP address (or `ip:port`) is emitted as `null`, never raw. Only `client_ip` and `backend_resolved_ip`. |
+| `hash` | `secret_ref` (required) | Lowercase hex HMAC-SHA-256 of the value under the referenced secret: stable for a given key (joinable across records and sinks) and not reversible without it. |
+
+Transformable fields: `client_ip`, `consumer_username`, `request_path`,
+`request_user_agent`, `backend_target`, `backend_resolved_ip`, and
+`sni_hostname` (each only where the selected `summary_type` carries it). A
+field that is absent on a record (`None`) keeps its native null-or-skip
+output. A transformed field may not also be omitted.
+
+`secret_ref` must be exactly a `${FERRUM_PLUGIN_SECRET_<NAME>}` reference: a
+literal key is refused so the secret never lands in stored plugin config, and
+no other environment variable can be named (see
+[`FERRUM_PLUGIN_SECRET_<NAME>`](configuration.md)). The variable is resolved
+when the schema compiles — at admission, on reload, and on every node that
+loads the config (including a CP that validates it) — and must hold at least
+32 bytes; an unset, empty, or short value fails construction. The value is
+never echoed in diagnostics. Rotating the secret changes every pseudonym.
+
+Scope and limits:
+
+- Transforms apply to the JSON projection of the transaction-summary loggers
+  (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_logging`,
+  `ws_logging`, `kafka_logging`, `loki_logging`). `kafka_logging` partition
+  keys and `loki_logging` labels read typed fields and are **not**
+  transformed; do not key Kafka partitions by `client_ip` if the raw address
+  must not leave the gateway. `statsd_logging` ignores `transforms` (no statsd
+  tag is backed by a transformable field).
+- `api_chargeback`, `api_chargeback_sink`, and `transaction_debugger` reject
+  `transforms`.
+- Under `metadata: { mode: flatten, on_collision: overwrite }`, a metadata
+  entry that overwrites a transformed field replaces it with the (redacted)
+  metadata value.
+- Transforms are compiled and keyed once. The emit path does no allocation and
+  no regex work: a boundary scan, an address parse and mask, or one HMAC.
 
 ### Fail-closed metadata allowlist
 
@@ -476,15 +565,15 @@ list and serializes as `[REDACTED]`.
 | `tcp_logging` | Full | NDJSON, one line per entry. |
 | `udp_logging` | Full | Batched JSON array per UDP datagram. Operators should keep per-summary size under MTU. |
 | `ws_logging` | Full | HTTP / WebSocket entries use `summary_type: http`; TCP / UDP / DTLS entries use `summary_type: stream`. WebSocket disconnect fields and derived-value behavior are documented above. |
-| `kafka_logging` | Full | One JSON message per summary. Partition key (`client_ip` / `proxy_id`) still reads typed fields, so partition keys are NOT affected by `rename:`. |
-| `loki_logging` | Full | Schema-customized JSON appears inside the Loki log line. Loki **labels** (`build_http_labels` / `build_stream_labels`) keep reading typed fields, so labels are NOT affected by `rename:`. |
+| `kafka_logging` | Full | One JSON message per summary. Partition key (`client_ip` / `proxy_id`) still reads typed fields, so partition keys are NOT affected by `rename:` or `transforms:`. |
+| `loki_logging` | Full | Schema-customized JSON appears inside the Loki log line. Loki **labels** (`build_http_labels` / `build_stream_labels`) keep reading typed fields, so labels are NOT affected by `rename:` or `transforms:`. |
 | `statsd_logging` | Tag rename / omit only | See [statsd_logging schema support](#statsd_logging-schema-support). |
 
 ### statsd_logging schema support
 
 StatsD is a line protocol, not JSON, so only `summary_type`, `rename`, and
 `omit` affect its output. `static_fields`, `derived_fields`, `metadata`,
-`timestamp_format`, and `order` are no-ops; when an inline `schema:` carries
+`timestamp_format`, `order`, and `transforms` are no-ops; when an inline `schema:` carries
 any of them the plugin logs a `warn!` at construction. `schema_ref:` is not
 inspected (per-referrer warnings would be noisy), so check a shared schema's
 intent at its `transaction_log_schema` definition.
@@ -523,9 +612,9 @@ at construction with a plugin- and field-specific diagnostic — never ignored.
 
 | Plugin | Projected surface | Field inventory | Rejected for this family |
 |---|---|---|---|
-| `api_chargeback` | The per-proxy billing row inside `GET /charges` (`consumers.<consumer>.proxies.<key>`) | `proxy_id`, `namespace`, `proxy_name`, `currency`, `protocol_family`, `total_calls`, `total_charges`, `by_status`, `bandwidth`, `stream` | `summary_type`, `timestamp_format`, `metadata`, `order`, every derived kind except `summary_kind` |
-| `api_chargeback_sink` | The exported charge event — the JSONEachRow row delivered to ClickHouse and the durable spool artifact that replays it | `event_id`, `received_at`, `node_id`, `namespace`, `consumer_id`, `consumer_name`, `proxy_id`, `proxy_name`, `route_id`, `status_code`, `http_status_code`, `grpc_status`, `protocol`, `call_count`, `charge_call`, `bytes_sent`, `bytes_received`, `charge_bytes_sent`, `charge_bytes_received`, `charge_total`, `currency`, `pricing_version`, `request_id`, `trace_id`, `snapshot_id` | `summary_type`, `timestamp_format`, `metadata`, the `backend_host` derived kind |
-| `transaction_debugger` | The terminal diagnostic records on the `transaction_debug` tracing target (HTTP, stream, WebSocket disconnect) | its own diagnostic names — `outcome`, `method`, `path`, `status`, `rejection_phase`, `latency_plugin_ms`, `latency_gw_overhead_ms`, `metadata`, … — **not** the transaction-summary names | — (full contract, including `summary_type` and `metadata`) |
+| `api_chargeback` | The per-proxy billing row inside `GET /charges` (`consumers.<consumer>.proxies.<key>`) | `proxy_id`, `namespace`, `proxy_name`, `currency`, `protocol_family`, `total_calls`, `total_charges`, `by_status`, `bandwidth`, `stream` | `summary_type`, `timestamp_format`, `metadata`, `order`, `transforms`, every derived kind except `summary_kind` |
+| `api_chargeback_sink` | The exported charge event — the JSONEachRow row delivered to ClickHouse and the durable spool artifact that replays it | `event_id`, `received_at`, `node_id`, `namespace`, `consumer_id`, `consumer_name`, `proxy_id`, `proxy_name`, `route_id`, `status_code`, `http_status_code`, `grpc_status`, `protocol`, `call_count`, `charge_call`, `bytes_sent`, `bytes_received`, `charge_bytes_sent`, `charge_bytes_received`, `charge_total`, `currency`, `pricing_version`, `request_id`, `trace_id`, `snapshot_id` | `summary_type`, `timestamp_format`, `metadata`, `transforms`, the `backend_host` derived kind |
+| `transaction_debugger` | The terminal diagnostic records on the `transaction_debug` tracing target (HTTP, stream, WebSocket disconnect) | its own diagnostic names — `outcome`, `method`, `path`, `status`, `rejection_phase`, `latency_plugin_ms`, `latency_gw_overhead_ms`, `metadata`, … — **not** the transaction-summary names | `transforms` (otherwise the full contract, including `summary_type` and `metadata`) |
 
 Shared rules for all three:
 
@@ -626,17 +715,29 @@ suggestion where applicable):
 15. Unknown top-level schema keys (typo guard).
 16. `schema:` and `schema_ref:` both present on the same plugin.
 17. `schema_ref:` pointing at a name absent from the prospective namespace.
+18. `omit: [metadata]` or `rename: {metadata: …}` under `metadata.mode:
+    flatten`, and `rename: {metadata: …}` under `metadata.mode: omit`.
+19. Lists, maps, keys, and static payloads beyond the bounds listed under
+    [Schema Fields](#schema-fields).
+20. `transforms` naming an unknown, non-transformable, or omitted field; an
+    unknown `type` or option key; `ip_prefix` on a non-IP field; out-of-range
+    `max_bytes` / `ipv4_bits` / `ipv6_bits`; a `hash` `secret_ref` that is not
+    a `${FERRUM_PLUGIN_SECRET_<NAME>}` reference or that resolves to an unset,
+    empty, or shorter-than-32-byte value; and `transforms` on a non-summary
+    record family.
 
 For named schemas:
 
-18. `transaction_log_schema` with `scope: proxy` or `scope: proxy_group`
+21. `transaction_log_schema` with `scope: proxy` or `scope: proxy_group`
     is rejected at the admin write path (`PluginConfig::validate_fields`,
     returning a `400`) and by the runtime rejecting contract
     (`validate_plugin_references`). Both surfaces agree so an admitted write can
     never be rejected by a later full-config load (which would wedge the DB poll
     loop read-only — see issue #2158).
-19. Two enabled `transaction_log_schema` instances in the same namespace
+22. Two enabled `transaction_log_schema` instances in the same namespace
     defining the same name.
+23. More than 256 named schemas in one config, or a name longer than 128
+    bytes.
 
 ## Performance
 

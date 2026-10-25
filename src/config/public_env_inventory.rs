@@ -42,7 +42,8 @@ pub const TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV: &str = "FERRUM_TRANSCRIPT_SINK_SEC
 /// (`api_chargeback_sink` `clickhouse.password_ref`, `ai_semantic_firewall`
 /// `provider.api_key_env`, `ai_stream_router` `${...}` API keys,
 /// `workload_metrics` Lightstep `access_token_env`, `proxy_alerts` channel
-/// `*_env` fields, and the `serverless_function` Azure/GCP fallbacks) resolves
+/// `*_env` fields, log-schema `transforms.<field>.secret_ref` `${...}` hash
+/// keys, and the `serverless_function` Azure/GCP fallbacks) resolves
 /// ONLY this namespace, where `<NAME>` is any uppercase `[A-Z_][A-Z0-9_]*`
 /// suffix (see `crate::plugins::utils::plugin_secret_env`). The namespace has
 /// no fixed key set; this representative key is its machine-checkable

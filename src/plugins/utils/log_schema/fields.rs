@@ -85,6 +85,17 @@ impl RecordFamily {
         matches!(self, Self::TransactionSummary | Self::DebugDiagnostic)
     }
 
+    /// `true` when per-field value `transforms` are supported.
+    ///
+    /// Only the shipping transaction-summary family exposes its string fields
+    /// to the transform path (`SchemaSerializable::native_text`). The
+    /// chargeback families carry identifiers whose exact values are billing
+    /// keys, and the debugger's diagnostic names are a different inventory, so
+    /// a transform there is rejected rather than silently not applied.
+    pub const fn supports_transforms(self) -> bool {
+        matches!(self, Self::TransactionSummary)
+    }
+
     /// `true` when `kind` is representable from this family's records.
     ///
     /// A derived kind that has no source field on the family is rejected at

@@ -550,8 +550,9 @@ fn test_flatten_collision_semantics_are_unchanged_by_precomputation() {
     assert_eq!(text_at(&skipped, "client_ip"), Some("10.0.0.1"));
     assert_eq!(text_at(&skipped, "trace_id"), Some("abc-123"));
 
-    // `overwrite`: the metadata entry is emitted as a duplicate key, and
-    // last-wins parsing surfaces the metadata value.
+    // `overwrite`: the metadata value replaces the native value in place
+    // (see `test_flatten_overwrite_replaces_in_place_without_duplicate_keys`
+    // for the single-key guarantee on the serialized line).
     let overwritten = project(
         &summary,
         json!({
@@ -765,4 +766,558 @@ fn startup_diagnostics_preserve_named_schema_enum_paths() {
             assert!(!rendered.contains(hidden), "{rendered}");
         }
     }
+}
+
+// ── `metadata` directives that contradict the metadata mode ─────────
+
+#[test]
+fn test_metadata_directives_contradicting_the_mode_are_rejected() {
+    // `omit: [metadata]` under flatten would promote every metadata entry to
+    // the top level — the opposite of what it says — and was silently
+    // accepted; `rename` of `metadata` under flatten / omit was a silent
+    // no-op. All three are rejected now.
+    let error = compile(json!({
+        "omit": ["metadata"],
+        "metadata": { "mode": "flatten", "prefix": "meta_" }
+    }))
+    .unwrap_err();
+    assert_contains(&error, "`omit` lists `metadata`");
+    assert_contains(&error, "metadata.mode: omit");
+
+    let error = compile(json!({
+        "rename": { "metadata": "attrs" },
+        "metadata": { "mode": "flatten" }
+    }))
+    .unwrap_err();
+    assert_contains(&error, "`rename` of `metadata` has no effect");
+    assert_contains(&error, "metadata.mode: flatten");
+
+    let error = compile(json!({
+        "rename": { "metadata": "attrs" },
+        "metadata": { "mode": "omit" }
+    }))
+    .unwrap_err();
+    assert_contains(&error, "`rename` of `metadata` has no effect");
+    assert_contains(&error, "metadata.mode: omit");
+
+    // The named-schema admission path refuses the same contradiction.
+    assert!(
+        validate_plugin_config(
+            "transaction_log_schema",
+            &json!({ "schemas": { "audit": {
+                "omit": ["metadata"],
+                "metadata": { "mode": "flatten" }
+            } } }),
+        )
+        .is_err()
+    );
+
+    // Consistent combinations keep compiling: a redundant omit under
+    // `mode: omit`, and nested-mode rename / omit.
+    compile(json!({ "omit": ["metadata"], "metadata": { "mode": "omit" } }))
+        .expect("omit + mode omit is redundant but consistent");
+    compile(json!({ "rename": { "metadata": "attrs" } })).expect("nested rename still compiles");
+    compile(json!({ "omit": ["metadata"], "metadata": { "mode": "nested" } }))
+        .expect("nested omit still compiles");
+}
+
+// ── flatten + overwrite replaces in place ───────────────────────────
+
+fn line(summary: &TransactionSummary, schema: Value) -> String {
+    let compiled = compile(schema).expect("schema compiles");
+    serde_json::to_string(&SchemaView {
+        summary,
+        schema: &compiled,
+    })
+    .expect("schema view serializes")
+}
+
+fn key_count(line: &str, key: &str) -> usize {
+    line.matches(&format!("\"{key}\":")).count()
+}
+
+#[test]
+fn test_flatten_overwrite_replaces_in_place_without_duplicate_keys() {
+    // `on_collision: overwrite` used to append a second JSON key with the
+    // same name, so the record meant different things to last-wins,
+    // first-wins, and duplicate-rejecting parsers. The serialized line (not a
+    // `serde_json::Value`, which hides duplicates) must carry each key once.
+    let summary = TransactionSummary {
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
+            ("client_ip".to_string(), "from-metadata".to_string()),
+            ("trace_id".to_string(), "abc-123".to_string()),
+            ("edge".to_string(), "from-metadata".to_string()),
+            ("only_in_metadata".to_string(), "x".to_string()),
+        ]),
+        ..grpc_summary()
+    };
+    let schema = json!({
+        "summary_type": "http",
+        "static_fields": { "trace_id": "static-value" },
+        "derived_fields": [{ "name": "edge", "kind": "backend_host" }],
+        "metadata": { "mode": "flatten", "on_collision": "overwrite" }
+    });
+    let rendered = line(&summary, schema.clone());
+    for key in ["client_ip", "trace_id", "edge", "only_in_metadata"] {
+        assert_eq!(key_count(&rendered, key), 1, "{key} in {rendered}");
+    }
+    let parsed: Value = serde_json::from_str(&rendered).expect("line parses");
+    // Native collision: the metadata value (redacted: `client_ip` is not an
+    // allowlisted metadata key) replaces the native value...
+    assert_eq!(text_at(&parsed, "client_ip"), Some("[REDACTED]"));
+    // ...in the native field's position, ahead of later native fields.
+    let client_ip_at = rendered.find("\"client_ip\":").expect("client_ip");
+    let method_at = rendered.find("\"http_method\":").expect("http_method");
+    assert!(client_ip_at < method_at, "{rendered}");
+    // Static and derived collisions are replaced in place too.
+    assert_eq!(text_at(&parsed, "trace_id"), Some("abc-123"));
+    assert!(text_at(&parsed, "edge").is_some());
+    assert_ne!(text_at(&parsed, "edge"), Some("backend.internal"));
+
+    // `skip` is unchanged: the schema's own field keeps every key, once.
+    let skipped = line(
+        &summary,
+        json!({
+            "summary_type": "http",
+            "static_fields": { "trace_id": "static-value" },
+            "metadata": { "mode": "flatten", "on_collision": "skip" }
+        }),
+    );
+    assert_eq!(key_count(&skipped, "client_ip"), 1);
+    assert_eq!(key_count(&skipped, "trace_id"), 1);
+    let parsed: Value = serde_json::from_str(&skipped).expect("line parses");
+    assert_eq!(text_at(&parsed, "client_ip"), Some("10.0.0.1"));
+    assert_eq!(text_at(&parsed, "trace_id"), Some("static-value"));
+}
+
+#[test]
+fn test_flatten_overwrite_honors_the_prefix() {
+    let summary = TransactionSummary {
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
+            ("trace_id".to_string(), "abc-123".to_string()),
+            ("_dedup_key".to_string(), "internal".to_string()),
+        ]),
+        ..grpc_summary()
+    };
+    // `meta_trace_id` (static) collides with the promoted `trace_id`.
+    let rendered = line(
+        &summary,
+        json!({
+            "summary_type": "http",
+            "static_fields": { "meta_trace_id": "static", "trace_id": "unprefixed" },
+            "metadata": { "mode": "flatten", "prefix": "meta_", "on_collision": "overwrite" }
+        }),
+    );
+    assert_eq!(key_count(&rendered, "meta_trace_id"), 1, "{rendered}");
+    assert_eq!(key_count(&rendered, "trace_id"), 1, "{rendered}");
+    let parsed: Value = serde_json::from_str(&rendered).expect("line parses");
+    assert_eq!(text_at(&parsed, "meta_trace_id"), Some("abc-123"));
+    // The unprefixed static key is not the promoted key, so it is untouched.
+    assert_eq!(text_at(&parsed, "trace_id"), Some("unprefixed"));
+    // Internal-only lifecycle metadata is never emitted.
+    assert!(!rendered.contains("internal"), "{rendered}");
+}
+
+// ── Compiler bounds ─────────────────────────────────────────────────
+
+#[test]
+fn test_schema_compiler_bounds_are_enforced() {
+    use ferrum_edge::plugins::utils::log_schema::{
+        MAX_DERIVED_FIELDS, MAX_METADATA_PREFIX_BYTES, MAX_OUTPUT_KEY_BYTES,
+        MAX_SCHEMA_LIST_ENTRIES, MAX_STATIC_FIELD_DEPTH, MAX_STATIC_FIELDS,
+        MAX_STATIC_FIELDS_BYTES,
+    };
+
+    // List lengths.
+    let omit = vec![json!("proxy_id"); MAX_SCHEMA_LIST_ENTRIES + 1];
+    assert_contains(&compile(json!({ "omit": omit })).unwrap_err(), "`omit` has");
+    let order = vec![json!("*"); MAX_SCHEMA_LIST_ENTRIES + 1];
+    assert_contains(
+        &compile(json!({ "order": order })).unwrap_err(),
+        "`order` has",
+    );
+
+    // Output-key lengths.
+    let long_key = "k".repeat(MAX_OUTPUT_KEY_BYTES + 1);
+    let max_key = "k".repeat(MAX_OUTPUT_KEY_BYTES);
+    assert_contains(
+        &compile(json!({ "rename": { "proxy_id": long_key } })).unwrap_err(),
+        "at most",
+    );
+    compile(json!({ "rename": { "proxy_id": max_key } })).expect("128-byte rename target");
+    assert_contains(
+        &compile(json!({ "static_fields": { (long_key.clone()): "v" } })).unwrap_err(),
+        "at most",
+    );
+    assert_contains(
+        &compile(json!({ "derived_fields": [{ "name": long_key, "kind": "outcome" }] }))
+            .unwrap_err(),
+        "at most",
+    );
+
+    // Static field count, total bytes, and nesting depth.
+    let many: serde_json::Map<String, Value> = (0..=MAX_STATIC_FIELDS)
+        .map(|index| (format!("stamp_{index}"), json!("v")))
+        .collect();
+    assert_contains(
+        &compile(json!({ "static_fields": many })).unwrap_err(),
+        "`static_fields` has",
+    );
+    let at_cap: serde_json::Map<String, Value> = (0..MAX_STATIC_FIELDS)
+        .map(|index| (format!("stamp_{index}"), json!("v")))
+        .collect();
+    compile(json!({ "static_fields": at_cap })).expect("64 static fields compile");
+    assert_contains(
+        &compile(json!({ "static_fields": { "blob": "x".repeat(MAX_STATIC_FIELDS_BYTES) } }))
+            .unwrap_err(),
+        "serialize to more than",
+    );
+    compile(json!({ "static_fields": { "blob": "x".repeat(MAX_STATIC_FIELDS_BYTES / 2) } }))
+        .expect("a static payload under the byte cap compiles");
+    let nested = |levels: usize| {
+        let mut value = json!("leaf");
+        for _ in 0..levels {
+            value = json!([value]);
+        }
+        value
+    };
+    compile(json!({ "static_fields": { "deep": nested(MAX_STATIC_FIELD_DEPTH) } }))
+        .expect("nesting at the cap compiles");
+    assert_contains(
+        &compile(json!({ "static_fields": { "deep": nested(MAX_STATIC_FIELD_DEPTH + 1) } }))
+            .unwrap_err(),
+        "nests deeper than",
+    );
+
+    // Derived field count.
+    let derived: Vec<Value> = (0..=MAX_DERIVED_FIELDS)
+        .map(|index| json!({ "name": format!("derived_{index}"), "kind": "outcome" }))
+        .collect();
+    assert_contains(
+        &compile(json!({ "derived_fields": derived })).unwrap_err(),
+        "`derived_fields` has",
+    );
+
+    // Metadata prefix length.
+    assert_contains(
+        &compile(json!({
+            "metadata": { "mode": "flatten", "prefix": "p".repeat(MAX_METADATA_PREFIX_BYTES + 1) }
+        }))
+        .unwrap_err(),
+        "`metadata.prefix` must be at most",
+    );
+}
+
+#[test]
+fn test_named_schema_count_and_name_length_are_bounded() {
+    use ferrum_edge::plugins::transaction_log_schema::{MAX_NAMED_SCHEMAS, MAX_SCHEMA_NAME_BYTES};
+
+    let schemas = |count: usize| -> serde_json::Map<String, Value> {
+        (0..count)
+            .map(|index| (format!("schema_{index}"), json!({})))
+            .collect()
+    };
+    let error = validate_plugin_config(
+        "transaction_log_schema",
+        &json!({ "schemas": schemas(MAX_NAMED_SCHEMAS + 1) }),
+    )
+    .unwrap_err();
+    assert_contains(&error, "named schemas (maximum");
+    validate_plugin_config(
+        "transaction_log_schema",
+        &json!({ "schemas": schemas(MAX_NAMED_SCHEMAS) }),
+    )
+    .expect("the maximum number of named schemas is admitted");
+
+    let long_name = "n".repeat(MAX_SCHEMA_NAME_BYTES + 1);
+    let error = validate_plugin_config(
+        "transaction_log_schema",
+        &json!({ "schemas": { (long_name): {} } }),
+    )
+    .unwrap_err();
+    assert_contains(&error, "schema names must be at most");
+    validate_plugin_config(
+        "transaction_log_schema",
+        &json!({ "schemas": { ("n".repeat(MAX_SCHEMA_NAME_BYTES)): {} } }),
+    )
+    .expect("a maximum-length name is admitted");
+}
+
+// ── Reload bracket unwind safety ────────────────────────────────────
+
+#[test]
+fn test_a_panicking_reload_does_not_wedge_the_registry() {
+    let _g = registry_lock();
+    registry::reset_for_tests();
+
+    // A constructor panicking mid-reload used to skip commit/abort, leaving
+    // this thread's bracket marked open (and the serializer held), so every
+    // later reload on the thread failed as "nested".
+    let outcome: std::thread::Result<()> = std::panic::catch_unwind(|| {
+        let _bracket = registry::begin_reload_guarded().expect("bracket opens");
+        TransactionLogSchema::new(&json!({ "schemas": { "staged": {} } }))
+            .expect("definition stages");
+        assert!(registry::lookup_named("staged").is_some());
+        panic!("simulated plugin constructor panic during a reload");
+    });
+    assert!(outcome.is_err(), "the closure panicked");
+
+    // The staged definition was discarded rather than promoted...
+    assert!(registry::lookup_named("staged").is_none());
+    // ...and a fresh reload opens, stages, and commits on the same thread.
+    registry::begin_reload().expect("a later reload is not refused as nested");
+    TransactionLogSchema::new(&json!({ "schemas": { "after": {} } })).expect("stages");
+    registry::commit_reload().expect("commits");
+    assert!(registry::lookup_named("after").is_some());
+
+    // A guard whose bracket was closed normally is inert on drop.
+    let bracket = registry::begin_reload_guarded().expect("bracket opens");
+    TransactionLogSchema::new(&json!({ "schemas": { "committed": {} } })).expect("stages");
+    registry::commit_reload().expect("commits");
+    assert!(!bracket.is_open());
+    drop(bracket);
+    assert!(registry::lookup_named("committed").is_some());
+}
+
+// ── Value transforms ────────────────────────────────────────────────
+
+const HASH_SECRET_ENV: &str = "FERRUM_PLUGIN_SECRET_LOG_SCHEMA_TEST_KEY";
+const HASH_SECRET: &str = "0123456789abcdef0123456789abcdef-log-schema";
+
+fn expected_hmac_hex(secret: &str, value: &str) -> String {
+    let mut mac = ferrum_edge::fips::approved::HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("hmac key");
+    mac.update(value.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+#[test]
+fn test_truncate_transform_cuts_on_a_character_boundary() {
+    let summary = TransactionSummary {
+        request_path: "/caf\u{e9}/menu".into(),
+        request_user_agent: Some("Mozilla/5.0 (X11; Linux x86_64)".into()),
+        ..grpc_summary()
+    };
+    let projected = project(
+        &summary,
+        json!({
+            "summary_type": "http",
+            "transforms": {
+                // "/caf" is 4 bytes and "é" spans bytes 4..6, so a 5-byte
+                // cut must back off to the boundary at 4.
+                "request_path": { "type": "truncate", "max_bytes": 5 },
+                "request_user_agent": { "type": "truncate", "max_bytes": 7 }
+            }
+        }),
+    );
+    assert_eq!(text_at(&projected, "request_path"), Some("/caf"));
+    assert_eq!(text_at(&projected, "request_user_agent"), Some("Mozilla"));
+    // Shorter values pass through unchanged.
+    let projected = project(
+        &summary,
+        json!({
+            "summary_type": "http",
+            "transforms": { "request_path": { "type": "truncate", "max_bytes": 4096 } }
+        }),
+    );
+    assert_eq!(text_at(&projected, "request_path"), Some("/caf\u{e9}/menu"));
+}
+
+#[test]
+fn test_ip_prefix_transform_zeroes_host_bits() {
+    let with_ip = |ip: &str| TransactionSummary {
+        client_ip: ip.into(),
+        backend_resolved_ip: Some("192.0.2.200".into()),
+        ..grpc_summary()
+    };
+    let schema = json!({
+        "summary_type": "http",
+        "rename": { "client_ip": "ip" },
+        "transforms": {
+            "client_ip": { "type": "ip_prefix", "ipv4_bits": 24, "ipv6_bits": 48 },
+            "backend_resolved_ip": { "type": "ip_prefix" }
+        }
+    });
+    let projected = project(&with_ip("203.0.113.77"), schema.clone());
+    assert_eq!(text_at(&projected, "ip"), Some("203.0.113.0"));
+    assert!(projected.get("client_ip").is_none(), "rename still applies");
+    // Defaults are /24 and /48.
+    assert_eq!(
+        text_at(&projected, "backend_resolved_ip"),
+        Some("192.0.2.0")
+    );
+
+    let projected = project(&with_ip("2001:db8:1234:5678::1"), schema.clone());
+    assert_eq!(text_at(&projected, "ip"), Some("2001:db8:1234::"));
+
+    // IPv4-mapped IPv6 is masked as IPv4.
+    let projected = project(&with_ip("::ffff:198.51.100.9"), schema.clone());
+    assert_eq!(text_at(&projected, "ip"), Some("198.51.100.0"));
+
+    // A value that is not an address is never emitted raw.
+    let projected = project(&with_ip("not-an-address"), schema);
+    assert_eq!(projected.get("ip"), Some(&Value::Null));
+    assert!(!projected.to_string().contains("not-an-address"));
+}
+
+#[test]
+fn test_hash_transform_is_keyed_stable_and_never_raw() {
+    crate::unit::env_lock::with_env_vars(&[(HASH_SECRET_ENV, HASH_SECRET)], || {
+        let summary = TransactionSummary {
+            consumer_username: Some("alice@example.com".into()),
+            ..grpc_summary()
+        };
+        let schema = json!({
+            "summary_type": "http",
+            "transforms": {
+                "consumer_username": {
+                    "type": "hash",
+                    "secret_ref": format!("${{{HASH_SECRET_ENV}}}")
+                }
+            }
+        });
+        let first = project(&summary, schema.clone());
+        let second = project(&summary, schema.clone());
+        let digest = text_at(&first, "consumer_username").expect("hashed value");
+        assert_eq!(digest, expected_hmac_hex(HASH_SECRET, "alice@example.com"));
+        assert_eq!(digest.len(), 64);
+        assert_eq!(text_at(&second, "consumer_username"), Some(digest));
+        assert!(!first.to_string().contains("alice"));
+
+        // An absent value keeps native serialization (`null`), not a hash of
+        // the empty string.
+        let anonymous = TransactionSummary {
+            consumer_username: None,
+            ..grpc_summary()
+        };
+        let projected = project(&anonymous, schema.clone());
+        assert_eq!(projected.get("consumer_username"), Some(&Value::Null));
+
+        // The compiled schema never prints the key.
+        let compiled = compile(schema).expect("schema compiles");
+        let debug = format!("{compiled:?}");
+        assert!(!debug.contains(HASH_SECRET), "{debug}");
+    });
+}
+
+#[test]
+fn test_hash_transform_requires_a_plugin_secret_reference() {
+    let hash = |secret_ref: Value| json!({ "transforms": { "client_ip": { "type": "hash", "secret_ref": secret_ref } } });
+    // Literal secrets are refused outright.
+    let error = compile(hash(json!(HASH_SECRET))).unwrap_err();
+    assert_contains(&error, "literal secrets are not accepted");
+    assert!(!error.contains(HASH_SECRET), "{error}");
+    // Only the plugin-secret namespace may be referenced.
+    let error = compile(hash(json!("${FERRUM_ADMIN_JWT_SECRET}"))).unwrap_err();
+    assert_contains(&error, "FERRUM_PLUGIN_SECRET_");
+    // Missing `secret_ref`.
+    assert_contains(
+        &compile(json!({ "transforms": { "client_ip": { "type": "hash" } } })).unwrap_err(),
+        "secret_ref",
+    );
+    // Unset and too-short values fail construction.
+    crate::unit::env_lock::without_env_vars(&[HASH_SECRET_ENV], || {
+        let error = compile(hash(json!(format!("${{{HASH_SECRET_ENV}}}")))).unwrap_err();
+        assert_contains(&error, "is not set");
+    });
+    crate::unit::env_lock::with_env_vars(&[(HASH_SECRET_ENV, "too-short")], || {
+        let error = compile(hash(json!(format!("${{{HASH_SECRET_ENV}}}")))).unwrap_err();
+        assert_contains(&error, "shorter than 32 bytes");
+        assert!(!error.contains("too-short"), "{error}");
+    });
+}
+
+#[test]
+fn test_transform_admission_is_fail_closed() {
+    for (schema, needle) in [
+        (
+            json!({ "transforms": { "clientip": { "type": "truncate", "max_bytes": 4 } } }),
+            "`transforms` references unknown field",
+        ),
+        (
+            json!({ "transforms": { "http_method": { "type": "truncate", "max_bytes": 4 } } }),
+            "cannot transform field",
+        ),
+        (
+            json!({ "transforms": { "request_path": { "type": "ip_prefix" } } }),
+            "applies only to IP address fields",
+        ),
+        (
+            json!({
+                "omit": ["client_ip"],
+                "transforms": { "client_ip": { "type": "ip_prefix" } }
+            }),
+            "both omitted and transformed",
+        ),
+        (
+            json!({ "transforms": { "client_ip": { "type": "mask" } } }),
+            "must be `truncate`, `ip_prefix`, or `hash`",
+        ),
+        (
+            json!({ "transforms": { "client_ip": { "max_bytes": 4 } } }),
+            "missing `type`",
+        ),
+        (
+            json!({ "transforms": { "client_ip": { "type": "truncate", "max_bytes": 4, "x": 1 } } }),
+            "unknown schema key",
+        ),
+        (
+            json!({ "transforms": { "client_ip": { "type": "truncate", "max_bytes": 0 } } }),
+            "max_bytes must be an integer between 1 and",
+        ),
+        (
+            json!({ "transforms": { "client_ip": { "type": "truncate", "max_bytes": 65537 } } }),
+            "max_bytes must be an integer between 1 and",
+        ),
+        (
+            json!({ "transforms": { "client_ip": { "type": "ip_prefix", "ipv4_bits": 33 } } }),
+            "ipv4_bits must be an integer between 0 and 32",
+        ),
+        (
+            json!({ "transforms": { "client_ip": { "type": "ip_prefix", "ipv6_bits": 129 } } }),
+            "ipv6_bits must be an integer between 0 and 128",
+        ),
+        (
+            json!({ "summary_type": "stream",
+                    "transforms": { "request_path": { "type": "truncate", "max_bytes": 4 } } }),
+            "`transforms` references unknown field",
+        ),
+        (
+            json!({ "transforms": [] }),
+            "`transforms` must be an object",
+        ),
+    ] {
+        let error = match compile(schema.clone()) {
+            Ok(_) => panic!("must reject {schema}"),
+            Err(error) => error,
+        };
+        assert_contains(&error, needle);
+    }
+
+    // Families that cannot honor a transform reject the key.
+    for caps in [
+        SchemaCapabilities::API_CHARGEBACK,
+        SchemaCapabilities::API_CHARGEBACK_SINK,
+        SchemaCapabilities::TRANSACTION_DEBUGGER,
+    ] {
+        let error = SummarySchema::compile(
+            &json!({ "transforms": { "proxy_id": { "type": "truncate", "max_bytes": 4 } } }),
+            "test",
+            caps,
+        )
+        .unwrap_err();
+        assert_contains(&error, "`transforms` is not supported for this plugin");
+    }
+
+    // Named definitions admit transforms like inline schemas do.
+    validate_plugin_config(
+        "transaction_log_schema",
+        &json!({ "schemas": { "minimized": {
+            "transforms": {
+                "client_ip": { "type": "ip_prefix" },
+                "request_user_agent": { "type": "truncate", "max_bytes": 64 }
+            }
+        } } }),
+    )
+    .expect("named schema with transforms is admitted");
 }

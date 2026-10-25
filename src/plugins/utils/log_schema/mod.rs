@@ -29,7 +29,33 @@ pub const SUMMARY_LOG_SCHEMA_KEYS: &[&str] = &[
     "derived_fields",
     "metadata",
     "timestamp_format",
+    "transforms",
 ];
+
+/// Upper bound on `omit` / `order` entries and `rename` pairs. Each list names
+/// fields from a bounded inventory, so a longer list can only be repetition.
+pub const MAX_SCHEMA_LIST_ENTRIES: usize = 256;
+
+/// Upper bound on an operator-chosen output key (`rename` target,
+/// `static_fields` key, `derived_fields` name), in bytes.
+pub const MAX_OUTPUT_KEY_BYTES: usize = 128;
+
+/// Upper bound on `static_fields` entries.
+pub const MAX_STATIC_FIELDS: usize = 64;
+
+/// Upper bound on the serialized JSON size of all `static_fields` keys and
+/// values together. Static fields are re-serialized into every record on
+/// every sink that uses the schema, so this is a per-record cost cap.
+pub const MAX_STATIC_FIELDS_BYTES: usize = 16 * 1024;
+
+/// Upper bound on object/array nesting inside one `static_fields` value.
+pub const MAX_STATIC_FIELD_DEPTH: usize = 8;
+
+/// Upper bound on `derived_fields` entries.
+pub const MAX_DERIVED_FIELDS: usize = 32;
+
+/// Upper bound on `metadata.prefix`, in bytes.
+pub const MAX_METADATA_PREFIX_BYTES: usize = 64;
 
 /// Fixed-shape keys accepted for each `derived_fields` entry.
 pub const DERIVED_FIELD_KEYS: &[&str] = &["name", "kind"];
@@ -39,6 +65,7 @@ pub const METADATA_POLICY_KEYS: &[&str] = &["mode", "prefix", "on_collision"];
 
 pub mod fields;
 pub mod registry;
+pub mod transform;
 pub mod view;
 
 // Re-exports for downstream consumers (integration tests, custom plugins,
@@ -50,6 +77,8 @@ pub use fields::{
     DEBUG_WS_FIELDS, FieldMeta, HTTP_FIELDS, RecordFamily, STREAM_FIELDS, SchemaCapabilities,
     WS_DISCONNECT_FIELDS,
 };
+#[allow(unused_imports)]
+pub use transform::{NativeText, ValueTransform};
 #[allow(unused_imports)]
 pub use view::{EmittedKeys, SchemaSerializable, SchemaView};
 
@@ -133,6 +162,10 @@ pub enum FieldSpec {
         /// kind that actually owns them. Always `false` for BASE callers, so
         /// non-`ws_logging` plugins behave exactly as before.
         extension: bool,
+        /// Optional value transform (`schema.transforms`) applied to this
+        /// field's string value at emit time. `None` for every field without
+        /// one, which keeps the untransformed emit path unchanged.
+        transform: Option<ValueTransform>,
     },
     Static {
         out_key: String,
@@ -320,6 +353,11 @@ impl SummarySchema {
                     "{plugin_name}: schema rename target for {source:?} must be a non-empty string"
                 ));
             }
+            if target.len() > MAX_OUTPUT_KEY_BYTES {
+                return Err(format!(
+                    "{plugin_name}: schema rename target for {source:?} must be at most {MAX_OUTPUT_KEY_BYTES} bytes"
+                ));
+            }
             // The rename target is the operator-visible JSON key. If it
             // matches a sensitive-data substring, downstream log
             // redactors keyed on field name will silently drop legitimate
@@ -355,6 +393,49 @@ impl SummarySchema {
             ));
         }
         let metadata = parse_metadata_policy(raw.get("metadata"), plugin_name)?;
+
+        // `omit` / `rename` of the native `metadata` field only mean something
+        // for the nested object. Under `flatten` / `omit` the native field is
+        // not emitted at all, so those directives would be silently ignored —
+        // and `omit: [metadata]` with `mode: flatten` would promote every
+        // metadata entry to the top level, the opposite of what it says.
+        // Reject the contradiction instead.
+        match &metadata {
+            MetadataPolicy::Nested => {}
+            MetadataPolicy::Flatten { .. } => {
+                if omit.iter().any(|name| name == "metadata") {
+                    return Err(format!(
+                        "{plugin_name}: schema `omit` lists `metadata`, but `metadata.mode: flatten` \
+                         promotes every metadata entry to a top-level field; use `metadata.mode: omit` \
+                         to drop metadata"
+                    ));
+                }
+                if rename.contains_key("metadata") {
+                    return Err(format!(
+                        "{plugin_name}: schema `rename` of `metadata` has no effect under \
+                         `metadata.mode: flatten` (no nested metadata object is emitted); use \
+                         `metadata.prefix` or `metadata.mode: nested`"
+                    ));
+                }
+            }
+            MetadataPolicy::Omit => {
+                if rename.contains_key("metadata") {
+                    return Err(format!(
+                        "{plugin_name}: schema `rename` of `metadata` has no effect under \
+                         `metadata.mode: omit` (metadata is not emitted); remove the rename or use \
+                         `metadata.mode: nested`"
+                    ));
+                }
+            }
+        }
+
+        let mut transforms = transform::parse_transforms(
+            raw.get("transforms"),
+            plugin_name,
+            summary_type,
+            caps,
+            &omit,
+        )?;
 
         let timestamp_format = match raw.get("timestamp_format") {
             Some(_) if !caps.family.supports_timestamp_format() => {
@@ -412,9 +493,18 @@ impl SummarySchema {
                     out_key,
                     is_timestamp: f.is_timestamp,
                     extension: !base_field_names.contains(f.name),
+                    transform: transforms.remove(f.name),
                 }
             })
             .collect();
+        // Every transform targets a validated, non-omitted native field of
+        // this schema, so all of them were attached above. Fail closed if one
+        // was not rather than shipping that field untransformed.
+        if let Some(field) = transforms.keys().next() {
+            return Err(format!(
+                "{plugin_name}: schema `transforms` targets field `{field}`, which this schema does not emit"
+            ));
+        }
 
         let static_specs: Vec<FieldSpec> = static_fields
             .into_iter()
@@ -613,6 +703,12 @@ fn parse_string_array(
     let arr = v
         .as_array()
         .ok_or_else(|| format!("{plugin_name}: schema `{key}` must be an array of strings"))?;
+    if arr.len() > MAX_SCHEMA_LIST_ENTRIES {
+        return Err(format!(
+            "{plugin_name}: schema `{key}` has {} entries (maximum {MAX_SCHEMA_LIST_ENTRIES})",
+            arr.len()
+        ));
+    }
     let mut out = Vec::with_capacity(arr.len());
     for entry in arr {
         let s = entry
@@ -639,6 +735,12 @@ fn parse_string_map(
     let obj = v
         .as_object()
         .ok_or_else(|| format!("{plugin_name}: schema `{key}` must be an object"))?;
+    if obj.len() > MAX_SCHEMA_LIST_ENTRIES {
+        return Err(format!(
+            "{plugin_name}: schema `{key}` has {} entries (maximum {MAX_SCHEMA_LIST_ENTRIES})",
+            obj.len()
+        ));
+    }
     let mut out = HashMap::with_capacity(obj.len());
     for (k, val) in obj {
         let s = val.as_str().ok_or_else(|| {
@@ -659,11 +761,23 @@ fn parse_static_fields(
     let obj = v
         .as_object()
         .ok_or_else(|| format!("{plugin_name}: schema `static_fields` must be an object"))?;
+    if obj.len() > MAX_STATIC_FIELDS {
+        return Err(format!(
+            "{plugin_name}: schema `static_fields` has {} entries (maximum {MAX_STATIC_FIELDS})",
+            obj.len()
+        ));
+    }
     let mut out = Vec::with_capacity(obj.len());
+    let mut serialized_bytes: usize = 0;
     for (k, val) in obj {
         if k.is_empty() {
             return Err(format!(
                 "{plugin_name}: schema `static_fields` keys must be non-empty"
+            ));
+        }
+        if k.len() > MAX_OUTPUT_KEY_BYTES {
+            return Err(format!(
+                "{plugin_name}: schema `static_fields` keys must be at most {MAX_OUTPUT_KEY_BYTES} bytes"
             ));
         }
         if val.is_null() {
@@ -676,14 +790,41 @@ fn parse_static_fields(
                 "{plugin_name}: schema `static_fields` key {k:?} matches a sensitive-data substring and would always be redacted; pick a different name"
             ));
         }
-        // Defense in depth: walk nested structures, reject sensitive keys.
-        reject_sensitive_in_value(val, plugin_name, k)?;
+        // Defense in depth: walk nested structures, reject sensitive keys and
+        // excessive nesting.
+        reject_sensitive_in_value(val, plugin_name, k, 0)?;
+        // Every static value is re-serialized into every record, so bound the
+        // total per-record stamp at the boundary.
+        let value_bytes = serde_json::to_string(val)
+            .map_err(|error| {
+                format!("{plugin_name}: schema `static_fields` value for {k:?} cannot be serialized: {error}")
+            })?
+            .len();
+        serialized_bytes = serialized_bytes
+            .saturating_add(k.len())
+            .saturating_add(value_bytes);
+        if serialized_bytes > MAX_STATIC_FIELDS_BYTES {
+            return Err(format!(
+                "{plugin_name}: schema `static_fields` serialize to more than {MAX_STATIC_FIELDS_BYTES} bytes; \
+                 static fields are stamped into every record, so keep them small"
+            ));
+        }
         out.push((k.clone(), val.clone()));
     }
     Ok(out)
 }
 
-fn reject_sensitive_in_value(value: &Value, plugin_name: &str, parent: &str) -> Result<(), String> {
+fn reject_sensitive_in_value(
+    value: &Value,
+    plugin_name: &str,
+    parent: &str,
+    depth: usize,
+) -> Result<(), String> {
+    if matches!(value, Value::Object(_) | Value::Array(_)) && depth >= MAX_STATIC_FIELD_DEPTH {
+        return Err(format!(
+            "{plugin_name}: schema `static_fields` value for {parent:?} nests deeper than {MAX_STATIC_FIELD_DEPTH} levels"
+        ));
+    }
     match value {
         Value::Object(obj) => {
             for (k, v) in obj {
@@ -692,12 +833,12 @@ fn reject_sensitive_in_value(value: &Value, plugin_name: &str, parent: &str) -> 
                         "{plugin_name}: schema `static_fields` value for {parent:?} contains nested key {k:?} that matches a sensitive-data substring"
                     ));
                 }
-                reject_sensitive_in_value(v, plugin_name, parent)?;
+                reject_sensitive_in_value(v, plugin_name, parent, depth + 1)?;
             }
         }
         Value::Array(arr) => {
             for v in arr {
-                reject_sensitive_in_value(v, plugin_name, parent)?;
+                reject_sensitive_in_value(v, plugin_name, parent, depth + 1)?;
             }
         }
         Value::String(s) => {
@@ -808,6 +949,12 @@ fn parse_derived_fields(
     let arr = v
         .as_array()
         .ok_or_else(|| format!("{plugin_name}: schema `derived_fields` must be an array"))?;
+    if arr.len() > MAX_DERIVED_FIELDS {
+        return Err(format!(
+            "{plugin_name}: schema `derived_fields` has {} entries (maximum {MAX_DERIVED_FIELDS})",
+            arr.len()
+        ));
+    }
     let mut out = Vec::with_capacity(arr.len());
     for (index, entry) in arr.iter().enumerate() {
         let obj = entry.as_object().ok_or_else(|| {
@@ -836,6 +983,11 @@ fn parse_derived_fields(
         let kind = DerivedKind::parse(kind_str).map_err(|error| {
             format!("{plugin_name}: schema `derived_fields[{index}].kind`: {error}")
         })?;
+        if name.len() > MAX_OUTPUT_KEY_BYTES {
+            return Err(format!(
+                "{plugin_name}: schema `derived_fields[{index}]` name must be at most {MAX_OUTPUT_KEY_BYTES} bytes"
+            ));
+        }
         if is_sensitive_metadata_key(name) {
             return Err(format!(
                 "{plugin_name}: schema `derived_fields` name {name:?} matches a sensitive-data substring and would always be redacted; pick a different name"
@@ -894,6 +1046,11 @@ fn parse_metadata_policy(
             if s.chars().any(|c| c.is_control()) {
                 return Err(format!(
                     "{plugin_name}: schema `metadata.prefix` must not contain control characters"
+                ));
+            }
+            if s.len() > MAX_METADATA_PREFIX_BYTES {
+                return Err(format!(
+                    "{plugin_name}: schema `metadata.prefix` must be at most {MAX_METADATA_PREFIX_BYTES} bytes"
                 ));
             }
             Some(s.clone())

@@ -141,8 +141,9 @@ fn reject_unknown_config_keys(config: &serde_json::Map<String, Value>) -> Result
 /// Emit a `warn!` for any inline `schema:` keys that the statsd
 /// emitter does not honor. Only `rename`, `omit`, and `summary_type`
 /// have an effect — everything else (`static_fields`, `derived_fields`,
-/// `metadata`, `timestamp_format`, `order`) is silently dropped because
-/// statsd is line protocol, not JSON.
+/// `metadata`, `timestamp_format`, `order`, `transforms`) is silently dropped
+/// because statsd is line protocol, not JSON. (No statsd tag is backed by a
+/// transformable field, so `transforms` cannot leave a raw value in a tag.)
 fn warn_on_unsupported_inline_schema_keys(config: &Value) {
     const UNSUPPORTED: &[&str] = &[
         "static_fields",
@@ -150,6 +151,7 @@ fn warn_on_unsupported_inline_schema_keys(config: &Value) {
         "metadata",
         "timestamp_format",
         "order",
+        "transforms",
     ];
     let Some(inline) = config.get("schema").and_then(Value::as_object) else {
         return;
