@@ -4392,6 +4392,18 @@ pub mod _test_support {
         )
     }
 
+    // ── plugins/ws_logging ──────────────────────────────────────────────────
+    /// Construct WebSocket logging against a test-owned retained-byte ceiling,
+    /// covering both record admission and the persistent connection's codec
+    /// output charge.
+    pub fn ws_logging_with_ceiling_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+    ) -> Result<crate::plugins::ws_logging::WsLogging, String> {
+        crate::plugins::ws_logging::WsLogging::new_with_ceiling(config, http_client, ceiling)
+    }
+
     /// Deterministic probe: an immediate librdkafka `QueueFull` waits for
     /// queue space within `budget` instead of dropping the record at once, and
     /// a saturated producer stops waiting until an enqueue succeeds.
