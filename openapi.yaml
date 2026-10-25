@@ -33404,11 +33404,38 @@ components:
         applied exactly once to the synthetic cohort as well. Synthetic and
         fan-out requests are sent over HTTP/1.1 so the preserved Host is the
         request authority; over HTTP/2 the two would disagree and ingress
-        validation would correctly reject every replay.
+        validation would correctly reject every replay. A trigger declaring a
+        Content-Length above the 10 MiB replay ceiling is not buffered: it is
+        forwarded under the ordinary request-body limits and no load test
+        starts. Known limitation: an undeclared-length (chunked, or H2/H3
+        without Content-Length) trigger body above 10 MiB is refused with 413,
+        since the ceiling also bounds collection. Fan-out peers acknowledge an admitted trigger with 204
+        plus X-Loadtesting-Ack echoing the controller's X-Loadtesting-Run-Id;
+        a request carrying X-Loadtesting-Fanout whose key fails is refused
+        with 403 before backend dispatch.
       required:
         - key
         - concurrent_clients
         - duration_seconds
+      allOf:
+        # Cleartext fan-out to anything but a loopback IP literal needs the
+        # explicit opt-in: fan-out carries the trigger key and the triggering
+        # request's credentials.
+        - if:
+            required: [gateway_addresses]
+            properties:
+              gateway_addresses:
+                type: array
+                contains:
+                  type: string
+                  pattern: '^[hH][tT][tT][pP]:'
+                  not:
+                    pattern: '^[hH][tT][tT][pP]://(?:127(?:\.[0-9]{1,3}){3}|\[::1\])(?::[0-9]*)?(?:/|$)'
+          then:
+            required: [allow_plaintext]
+            properties:
+              allow_plaintext:
+                const: true
       properties:
         key:
           type: string
@@ -33420,7 +33447,10 @@ components:
             printable ASCII HTTP field-value characters with no leading or
             trailing space. The gateway never echoes the value in validation
             errors and strips this reserved header on matching and non-matching
-            paths before later deferred plugins or backend dispatch.
+            paths before later deferred plugins or backend dispatch. Underscore
+            spellings (X_Loadtesting_Key and similar), which CGI-style backends
+            fold onto the same variable, are stripped and redacted too but
+            never authenticate a trigger.
         concurrent_clients:
           type: integer
           format: uint64
@@ -33502,7 +33532,19 @@ components:
             userinfo, query, or fragment. Local-loopback aliases of the
             selected local target (127/8, IPv4-mapped loopback, ::1,
             localhost, and names beneath .localhost with matching scheme and
-            effective port) are rejected.
+            effective port) are rejected. Fan-out sends the trigger key and the
+            triggering request's headers (credentials included) and body, so an
+            http:// entry is admitted only to a loopback IP literal written as
+            a dotted-quad 127.d.d.d or [::1] unless allow_plaintext is true.
+            Each fan-out call is a single attempt bounded by duration_seconds
+            and cancelled with the local run.
+        allow_plaintext:
+          type: [boolean, "null"]
+          default: false
+          description: >-
+            Admit an http:// gateway_addresses entry whose host is not a
+            loopback IP literal. The trigger key and the triggering request's
+            credentials then cross the network in clear.
 
     RequestMirrorConfig:
       type: object
