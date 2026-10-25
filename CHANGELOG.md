@@ -8,31 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `ldap_auth` validates DNs, attribute names, and ports at load**
-  (issue n/a, PR #6846). `search_base_dn`, `group_base_dn`, and DN-shaped
-  `bind_dn_template` / `service_account_dn` values must be RFC 4514
-  distinguished names (an unescaped `=` inside a value is refused as a likely
-  missing comma; AD userPrincipalName and down-level bind names stay
-  accepted), `canonical_identity_attribute` / `group_attribute` /
-  `group_member_attribute` must be RFC 4512 attribute descriptions (`1.1` is
-  refused), and an `ldap_url` port of `0` is refused. Such values used to pass
-  `validate` and fail every request.
-- **`ldap_auth` membership modes, failover, and credential bounds** (PR
-  #6846). `group_member_attribute` sets a custom DN-valued membership
-  attribute, `group_membership_mode: ad_in_chain` proves nested Active
-  Directory membership with `LDAP_MATCHING_RULE_IN_CHAIN`
-  (`1.2.840.113556.1.4.1941`) in both the group search and the custom-filter
-  recheck, and `group_membership_mode: member_of` has the directory confirm
-  that the user entry's `memberOf` lists a required group found by name. The connection budget is split across screened DNS candidates so a
-  stalled or TLS-failing address no longer starves the next, and
-  `failover_ldap_urls` adds replicas tried in order on connection, transport,
-  `busy` (51), or `unavailable` (52) failures (never on credential
-  rejections). Opt-in `negative_cache_ttl_seconds`,
-  `max_failed_attempts_per_user` / `failed_attempt_backoff_seconds`, and
-  `service_connection_max_age_seconds` bound repeated bad credentials,
-  per-username failure runs, and service-account connection churn; the
-  rejected-credential and backoff state survives compatible reloads and never
-  evicts a live block. Group names compare like `caseIgnoreMatch`.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -164,6 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -416,16 +427,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `ldap_auth` treats `group_attribute` as authoritative** (issue
-  n/a, PR #6846). A group entry whose returned `group_attribute` value did not
-  match `required_groups` still passed through its CN RDN, so with
-  `group_attribute: sAMAccountName` a caller able to create groups in a
-  delegated OU could satisfy `gateway-admins` with a look-alike
-  `CN=gateway-admins,OU=Delegated,…`. Now only the returned attribute's values
-  decide; the entry's own first RDN stands in only when `group_attribute` is
-  `cn` and the directory omits it, and then only a `cn`-typed component. Any
-  other omitted `group_attribute` fails closed (`403`). Cached group re-checks
-  follow the same rule.
+- **BREAKING — `ai_semantic_cache` hardening from the production-launch
+  review** (issue #6822). Exact keys and semantic scopes now bind the request's complete
+  response-side policy provenance (RTDS gate content plus the static
+  response-presentation digest), so an entry retained under an earlier
+  `response_transformer` rule — locally or by another replica in Redis — can no
+  longer replay past a new field-removal rule; a request whose presentation
+  policy is unprovable bypasses. Instruction state (`system`/`developer`
+  messages, Anthropic `system`, Responses `instructions` and
+  `system`/`developer` `input` items, Gemini `systemInstruction`, Cohere
+  `preamble`) is bound byte-exactly in semantic scopes and Responses
+  instruction items leave the embedding input. Cohere v1 `conversation_id`
+  requests, request bodies with duplicate JSON members, and requests carrying
+  `Cache-Control: no-store`/`no-cache` bypass lookup and storage; responses
+  with `Cache-Control: no-store`/`private` or `Set-Cookie` are never stored.
+  Composition admission refuses any final-request-body policy plugin ordered at
+  or after an `ai_semantic_cache` instance by `priority_override`. Key domains
+  move to v4, so previously retained entries are unreachable.
+- **`ai_semantic_cache` populates from `ai_federation` and tolerates replica
+  clock skew.** A provider-backed `ai_federation` 2xx answer (proven by
+  federation's internal external-operation provenance) is now stored, so the
+  documented cache-before-federation chain hits on repeats, but only when
+  federation recorded that the provider's original headers carried no
+  `Cache-Control: no-store`/`private` or `Set-Cookie`, and only from the
+  committed-response hook once the final synthetic headers (late
+  `after_proxy` header rules, rotated cookies) also allow it; fabricated
+  synthetic bodies remain ineligible. An authenticated Redis envelope sealed up
+  to 60 seconds in the reader's future is admitted, and an authentic envelope
+  that is expired or further in the future is a plain miss instead of being
+  quarantined and deleted. Canonical `"stream": true` requests skip the
+  embedding call.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
