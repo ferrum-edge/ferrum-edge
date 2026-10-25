@@ -6898,13 +6898,29 @@ Configuration must be a top-level object. The only accepted keys are `max_bytes`
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_bytes` | u64 | — (required, > 0) | Maximum allowed response body size in bytes. The plugin errors at construction if absent or zero. |
-| `require_buffered_check` | bool | `false` | Force route-bounded whole-body buffering so the complete final post-transform size is proven before response headers are committed. Unknown-length streams are already bounded frame by frame when this is false. Enabling it adds memory overhead and rejects indefinite SSE streams whose complete size cannot be proven. |
+| `require_buffered_check` | bool | `false` | Force route-bounded whole-body buffering so the complete final post-transform size is proven before response headers are committed. Unknown-length streams are already bounded frame by frame when this is false. Enabling it adds memory overhead and rejects indefinite SSE streams whose complete size cannot be proven, including the gateway-generated `mcp_gateway` aggregate SSE listener. An event stream whose backend declared one exact `Content-Length` within `max_bytes` has proven its size and is admitted, unless a streaming response inspector on the route (for example an `sse` `retry_ms` prefix or an `ai_*` stream inspector) can rewrite it. |
 
 Enforcement happens in four places:
 - **The effective collection/streaming ceiling.** The configured `max_bytes` is published to the proxy core and folded into the bound of every response path across H1/H2, native H3 and the H3 cross-protocol bridge, buffered and streaming gRPC, retry replays, the response coalescers, mesh mTLS, and HBONE. Buffered collection **aborts at this ceiling** rather than retaining up to the generally larger global allowance and only then failing the final check, so concurrent requests cannot amplify retained gateway memory toward the global allowance each. Unknown-length streaming paths engage the size-limited (frame-by-frame) adapter at this ceiling; known-length paths reject an over-limit declaration before forwarding the body. A representation `Content-Length` on a bodyless response (`HEAD`, `1xx`, `204`/`205`/`304`) is not compared against this ceiling on any of those dispatch paths.
 - **Already-buffered synthetic responses.** A body produced by a gateway short-circuit (mock, serverless, cache, federation, dedup replay) is checked against the ceiling regardless of whether any plugin activated the response body-hook gate. Previously a default (non-buffering) instance had no hook on that path unless some *other* plugin independently elected response buffering. The check runs after any body transform, so a transform expansion cannot escape the ceiling either.
 - `after_proxy` rejects oversized `Content-Length` via the fast path when the response can transfer a body (no body buffering required). Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a representation `Content-Length` while transferring zero body bytes and are not rejected on that declaration alone; body-bearing responses (including `206`) keep exact-boundary enforcement (`Content-Length == max_bytes` passes).
 - `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
+
+**Streaming rewrites are charged on the bytes the client receives.** A response
+rewrite that changes the byte count while streaming cannot use an in-limit
+source to deliver more than the effective ceiling. Every streaming
+response-inspector driver counts every released `Forward` window, every
+`Terminate` payload, and the end-of-stream flush. That covers the H1/H2 reqwest
+path, the direct-H2 proxy-body path, the native HTTP/3 frontend relay, and the
+HTTP/3 cross-protocol relay. Incremental gRPC-Web translation counts base64 text
+expansion and the generated trailer frame, on the H1/H2 funnels and the native-H3
+cross-protocol relay alike. The gateway-generated `mcp_gateway` aggregate SSE
+listener counts its greeting, every replayed or live event, and every keepalive
+comment. The backend's own bytes stay bounded by the source adapters as before.
+The frame that would cross the ceiling is never sent. The response headers are
+already committed, so the body ends with the `ResponseBodyTooLarge` stream
+error: an HTTP/1.1 abort, or an HTTP/2 or HTTP/3 stream reset. The boundary is
+inclusive, so exactly `max_bytes` bytes are delivered.
 
 **Interaction with the global limit.** The effective ceiling is the strictest
 *active* (nonzero) bound of `max_bytes` and
@@ -6934,6 +6950,25 @@ it. A pristine backend `text/event-stream` response is rejected with HTTP 502
 before headers are committed because the complete route-bounded size cannot be
 proven without collecting an unbounded stream; the generally larger global
 streaming ceiling is not silently substituted for the configured route limit.
+The one exception is an event stream that already proves its size. Its backend
+declared exactly one agreed `Content-Length` within `max_bytes`; agreeing
+repeated members such as `512, 512` count as one length. The declaration matches
+the pristine backend snapshot taken before any `after_proxy` hook ran, so a hook
+can neither invent nor shrink it. And no streaming response inspector on the
+route can change the byte count after headers commit. That last condition is
+precomputed at plugin-cache build from the route's plugin capabilities: an `sse`
+instance with `retry_ms` (its `retry:` prefix) or any `ai_*` stream inspector
+disqualifies the route. Such a stream is admitted and forwarded under its
+decoder-enforced length. An absent, ambiguous, or over-limit declaration, or a
+route that can rewrite the stream, is still refused.
+
+The `mcp_gateway` aggregate SSE listener (`GET` with `sessions.sse_multiplexing`)
+is an indefinite stream the gateway itself generates behind an empty `200`
+placeholder. A strict instance refuses it with the same HTTP 502
+`Streaming response size cannot be verified` body, before the stream commits,
+on H1/H2 and native H3 alike, and the session's single-listener slot is released
+so the client can reattach. A default instance admits the listener and bounds
+its cumulative bytes by the effective ceiling as described above.
 
 ### `response_caching`
 

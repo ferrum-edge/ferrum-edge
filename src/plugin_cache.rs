@@ -1725,6 +1725,13 @@ impl Plugin for PluginInstanceWrapper {
     fn enforced_response_body_limit(&self) -> Option<u64> {
         self.inner.enforced_response_body_limit()
     }
+    fn refuses_unprovable_response_stream(&self, ctx: &RequestContext) -> Option<u64> {
+        // A skipped instance enforces nothing.
+        if !self.runs_cached(ctx) {
+            return None;
+        }
+        self.inner.refuses_unprovable_response_stream(ctx)
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -7250,6 +7257,18 @@ impl PluginCacheRequestView {
     /// proxy/protocol pair, or `None` when no matched plugin enforces one.
     pub fn enforced_response_body_limit(&self) -> Option<u64> {
         self.enforced_response_body_limit
+    }
+
+    /// Publish this view's precomputed route body policy on the request
+    /// context, before any body is forwarded, retained, or collected: the
+    /// route request/response ceilings (`GHSA-xrfj-852f-645j`) and whether a
+    /// streaming response inspector may rewrite the client-visible bytes.
+    /// Every handler (H1/H2 and native H3) stamps through this one call, so
+    /// the fields cannot drift apart. Three copies, no lookup, no allocation.
+    pub fn stamp_route_body_policy(&self, ctx: &mut RequestContext) {
+        ctx.route_request_body_limit_bytes = self.enforced_request_body_limit;
+        ctx.route_response_body_limit_bytes = self.enforced_response_body_limit;
+        ctx.route_may_rewrite_response_stream = Some(self.requires_response_stream_hooks());
     }
 
     /// Get pre-resolved protocol-filtered plugins from this request view.

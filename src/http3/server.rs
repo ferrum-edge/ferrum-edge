@@ -4505,8 +4505,9 @@ async fn handle_h3_request(
     // frame is read or any response byte is retained, so native H3 and the H3
     // cross-protocol bridge bound themselves at the route limit rather than only
     // at the global one (`GHSA-xrfj-852f-645j`).
-    ctx.route_request_body_limit_bytes = plugin_cache_view.enforced_request_body_limit();
-    ctx.route_response_body_limit_bytes = plugin_cache_view.enforced_response_body_limit();
+    // The same stamp records whether a streaming response inspector may
+    // rewrite this route's client-visible bytes after `after_proxy`.
+    plugin_cache_view.stamp_route_body_policy(&mut ctx);
     // Folded once for this request. `0` still means unlimited, and an absent
     // route ceiling leaves each global knob exactly as configured, so a proxy
     // without a size-limiting plugin is byte-for-byte unchanged.
@@ -9292,6 +9293,35 @@ async fn handle_h3_request(
                 }
             };
         }
+        // Output-side response ceiling for inspector releases. `total_streamed`
+        // bounds the backend's own DATA; an inspector may release more than it
+        // received (an `sse` `retry:` prefix, an `ai_*` envelope, a terminal
+        // event), so every `Forward`, `Terminate` payload, and end-of-stream
+        // release is charged against the bytes already written through the
+        // shared boundary before it is sent. On crossing, the release is
+        // withheld and the committed stream is reset with
+        // `ResponseBodyTooLarge` — no clean FIN, no trailers. `true` means the
+        // caller must leave the relay loop.
+        macro_rules! inspected_output_exceeds_ceiling {
+            ($len:expr) => {{
+                if crate::proxy::body::response_output_crosses_ceiling(
+                    effective_max_response_body_size_bytes,
+                    bytes_streamed,
+                    $len,
+                ) {
+                    warn!(
+                        "Inspected HTTP/3 response exceeded {} byte limit during streaming",
+                        effective_max_response_body_size_bytes
+                    );
+                    coalesce_buf.clear();
+                    stream.abort_committed();
+                    body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                    true
+                } else {
+                    false
+                }
+            }};
+        }
         // Skipped entirely when send_response already failed or the
         // authorization bound cancelled the HEADERS write — the relay loop
         // would only rediscover the dead stream on its first send_data and
@@ -9408,6 +9438,9 @@ async fn handle_h3_request(
                                 match inspector.on_chunk(&chunk_bytes).await {
                                     ResponseStreamAction::Forward(out) => {
                                         if !out.is_empty() {
+                                            if inspected_output_exceeds_ceiling!(out.len()) {
+                                                break 'outer;
+                                            }
                                             let out_len = out.len() as u64;
                                             if let Some(observer) = grpc_web_passthrough.as_mut() {
                                                 observer.push(&out);
@@ -9431,6 +9464,9 @@ async fn handle_h3_request(
                                         if let Some(fb) = final_bytes
                                             && !fb.is_empty()
                                         {
+                                            if inspected_output_exceeds_ceiling!(fb.len()) {
+                                                break 'outer;
+                                            }
                                             let fb_len = fb.len() as u64;
                                             if let Some(observer) = grpc_web_passthrough.as_mut() {
                                                 observer.push(&fb);
@@ -9574,6 +9610,9 @@ async fn handle_h3_request(
                     match inspector.on_end().await {
                         ResponseStreamAction::Forward(out) => {
                             if !out.is_empty() {
+                                if inspected_output_exceeds_ceiling!(out.len()) {
+                                    break 'outer;
+                                }
                                 let out_len = out.len() as u64;
                                 if let Some(observer) = grpc_web_passthrough.as_mut() {
                                     observer.push(&out);
@@ -9588,6 +9627,9 @@ async fn handle_h3_request(
                             if let Some(fb) = final_bytes
                                 && !fb.is_empty()
                             {
+                                if inspected_output_exceeds_ceiling!(fb.len()) {
+                                    break 'outer;
+                                }
                                 let fb_len = fb.len() as u64;
                                 if let Some(observer) = grpc_web_passthrough.as_mut() {
                                     observer.push(&fb);
@@ -20059,6 +20101,10 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
     // stream and no gateway terminal replaced it. Anything else drops the lease,
     // which releases the session's single-listener slot so the client can
     // reattach, and falls through to the ordinary buffered writers.
+    //
+    // A strict `require_buffered_check` policy already refused the listener in
+    // the shared synthetic finalizer; an adopted one is bounded by this
+    // request's effective route/global response ceiling, exactly as on H1/H2.
     if let Some(listener) = ctx.mcp_aggregate_sse.take() {
         let representation_intact = matches!(flavor, HttpFlavor::Plain)
             && grpc_web_response_content_type.is_none()
@@ -20066,7 +20112,12 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             && http_status == StatusCode::OK
             && body.is_empty()
             && crate::proxy::response_headers_select_event_stream(headers);
-        if representation_intact && let Some(sse_body) = listener.take_body() {
+        let response_byte_ceiling = ctx.effective_max_response_body_size_bytes();
+        if representation_intact
+            && let Some(sse_body) = listener
+                .take_body()
+                .map(|sse_body| sse_body.with_response_byte_ceiling(response_byte_ceiling))
+        {
             return send_h3_aggregate_sse_response(stream, ctx, headers, sse_body, halt_recv).await;
         }
     }
@@ -20322,11 +20373,15 @@ async fn send_h3_aggregate_sse_response(
         }
     }
 
+    // The body's only error is its response-size ceiling: the next frame would
+    // cross the adopting request's effective limit. The head is committed, so
+    // that ends in a stream reset below rather than a clean FIN that would
+    // read as a complete event stream.
+    let mut body_failed = false;
     let pump = async {
         while let Some(frame) = body.next().await {
             let Ok(frame) = frame else {
-                // The broker never produces a body error; ending the stream is
-                // still preferable to inventing an event for the client.
+                body_failed = true;
                 break;
             };
             let Ok(data) = frame.into_data() else {
@@ -20368,6 +20423,11 @@ async fn send_h3_aggregate_sse_response(
     // blocked past that grace resets.
     if let Some(termination) = aggregate_sse_bound.expired_authorization() {
         ctx.record_authorization_termination_once(termination, auth_family);
+        crate::http3::stream_util::abort_response_stream(stream);
+    } else if body_failed {
+        warn!(
+            "Aggregate MCP SSE listener reached the response size limit; resetting the H3 stream"
+        );
         crate::http3::stream_util::abort_response_stream(stream);
     } else {
         match crate::http3::stream_util::await_post_deadline_terminal_response_write(

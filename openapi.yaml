@@ -33152,6 +33152,13 @@ components:
         member and compared against the limit; a declared length that cannot be
         reduced to one agreed value fails closed with HTTP 502. Bodyless
         semantics (HEAD, 1xx, 204/205/304) are exempt from both checks.
+        Streaming rewrites are charged on the client-visible bytes: response
+        stream inspectors (every Forward, Terminate payload, and end-of-stream
+        flush), incremental gRPC-Web translation (base64 text expansion and the
+        generated trailer frame), and the gateway-generated mcp_gateway
+        aggregate SSE listener (greeting, events, keepalives) cannot deliver
+        more than the effective ceiling; the crossing frame is withheld and the
+        committed stream ends with a ResponseBodyTooLarge abort/reset.
         Unknown keys and non-object configs are rejected. Explicit null
         members are rejected; omitted keys keep defaults.
       required:
@@ -33174,7 +33181,14 @@ components:
             post-transform size is proven before response headers are committed.
             Unknown-length streams are already bounded frame by frame when this
             is false. Enabling it adds memory overhead and rejects indefinite
-            SSE streams whose complete size cannot be proven.
+            SSE streams whose complete size cannot be proven, including the
+            gateway-generated mcp_gateway aggregate SSE listener (HTTP 502
+            before commit). An event stream whose backend declared one exact
+            Content-Length within max_bytes (agreeing repeated members count as
+            one), matching the pristine backend response, has proven its size
+            and is admitted when no streaming response inspector on the route
+            (for example an sse retry_ms prefix or an ai_* stream inspector)
+            can rewrite its bytes.
 
     FaultInjectionConfig:
       type: object

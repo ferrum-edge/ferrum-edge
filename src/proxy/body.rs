@@ -547,6 +547,15 @@ fn decode_passthrough_grpc_status(value: u64) -> Option<PassthroughGrpcStatus> {
 /// gRPC-Web trailer DATA frame. Clean EOF without trailers also emits one
 /// synthesized terminal frame, while backend errors propagate unchanged and
 /// never gain a false clean status.
+///
+/// Every DATA frame it releases — translated (base64-expanded in text mode)
+/// message bytes, a gateway deadline terminal, and the generated trailer frame
+/// — is charged against the effective response ceiling through
+/// [`response_output_crosses_ceiling`]. The backend body below is already
+/// bounded on its own bytes; this bounds the translated representation the
+/// client actually receives. A frame that would cross ends the body with the
+/// shared `ResponseBodyTooLarge` error instead (an H1 abort / H2 reset), and no
+/// terminal status is recorded for a trailer frame that was never sent.
 struct GrpcWebStreamingBody {
     inner: ProxyBody,
     text_mode: bool,
@@ -555,6 +564,10 @@ struct GrpcWebStreamingBody {
     terminal_status: Arc<AtomicU64>,
     terminal_emitted: bool,
     failed: bool,
+    /// Effective client-facing response ceiling (`0` = unlimited).
+    max_response_body_size_bytes: usize,
+    /// Translated DATA bytes released to the client so far.
+    emitted_bytes: u64,
     /// The backend/intermediary answered with an HTTP error whose entity is not
     /// a gRPC message stream (a `text/plain` or `text/html` error document).
     ///
@@ -568,19 +581,47 @@ struct GrpcWebStreamingBody {
 }
 
 impl GrpcWebStreamingBody {
+    /// Charge `len` translated bytes against the output ceiling. `false` means
+    /// the frame must not be released; the body is then failed.
+    fn charge_output(&mut self, len: usize) -> bool {
+        if response_output_crosses_ceiling(
+            self.max_response_body_size_bytes,
+            self.emitted_bytes,
+            len,
+        ) {
+            self.failed = true;
+            return false;
+        }
+        self.emitted_bytes = self.emitted_bytes.saturating_add(len as u64);
+        true
+    }
+
+    /// Release one translated message DATA frame under the output ceiling.
+    fn release_data(&mut self, data: Bytes) -> Poll<Option<Result<Frame<Bytes>, ProxyBodyError>>> {
+        if !self.charge_output(data.len()) {
+            return Poll::Ready(Some(Err(response_body_too_large_error())));
+        }
+        Poll::Ready(Some(Ok(Frame::data(data))))
+    }
+
     fn terminal_data(
         &mut self,
         trailers: std::collections::HashMap<String, String>,
-    ) -> Frame<Bytes> {
+    ) -> Poll<Option<Result<Frame<Bytes>, ProxyBodyError>>> {
         let (data, grpc_status) = crate::plugins::grpc_web::build_streaming_trailer_data(
             &trailers,
             self.http_status,
             self.text_mode,
         );
+        // The generated trailer frame is client-visible DATA too: an in-limit
+        // message body cannot carry it past the ceiling.
+        if !self.charge_output(data.len()) {
+            return Poll::Ready(Some(Err(response_body_too_large_error())));
+        }
         self.terminal_status
             .store(u64::from(grpc_status), Ordering::Release);
         self.terminal_emitted = true;
-        Frame::data(data)
+        Poll::Ready(Some(Ok(Frame::data(data))))
     }
 }
 
@@ -638,6 +679,9 @@ impl http_body::Body for GrpcWebStreamingBody {
                         } else {
                             crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED
                         };
+                        if !this.charge_output(data.len()) {
+                            return Poll::Ready(Some(Err(response_body_too_large_error())));
+                        }
                         this.terminal_status
                             .store(u64::from(terminal_status), Ordering::Release);
                         this.terminal_emitted = true;
@@ -649,9 +693,9 @@ impl http_body::Body for GrpcWebStreamingBody {
                     if this.suppress_backend_entity {
                         continue;
                     }
-                    return Poll::Ready(Some(Ok(Frame::data(
-                        crate::plugins::grpc_web::encode_streaming_data(data, this.text_mode),
-                    ))));
+                    let encoded =
+                        crate::plugins::grpc_web::encode_streaming_data(data, this.text_mode);
+                    return this.release_data(encoded);
                 }
                 Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
                     let trailers = match frame.into_trailers() {
@@ -665,7 +709,7 @@ impl http_body::Body for GrpcWebStreamingBody {
                     };
                     let mut collected = std::collections::HashMap::new();
                     super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
-                    return Poll::Ready(Some(Ok(this.terminal_data(collected))));
+                    return this.terminal_data(collected);
                 }
                 Poll::Ready(Some(Ok(_))) => {
                     this.failed = true;
@@ -675,7 +719,7 @@ impl http_body::Body for GrpcWebStreamingBody {
                 }
                 Poll::Ready(None) => {
                     let trailers = this.initial_terminal_metadata.take().unwrap_or_default();
-                    return Poll::Ready(Some(Ok(this.terminal_data(trailers))));
+                    return this.terminal_data(trailers);
                 }
             }
         }
@@ -973,12 +1017,16 @@ impl ProxyBody {
     /// text expansion and terminal DATA bytes are counted exactly once.
     /// `suppress_backend_entity` drops a non-gRPC HTTP error entity instead of
     /// framing it; see [`GrpcWebStreamingBody::suppress_backend_entity`].
+    /// `max_response_body_size_bytes` is the request's effective response
+    /// ceiling (`0` = unlimited), charged against the TRANSLATED bytes the
+    /// client receives, including the generated trailer frame.
     pub(crate) fn into_grpc_web_streaming(
         self,
         content_type: &str,
         http_status: u16,
         initial_terminal_metadata: Option<std::collections::HashMap<String, String>>,
         suppress_backend_entity: bool,
+        max_response_body_size_bytes: usize,
     ) -> Self {
         let mut inner = self;
         let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
@@ -996,6 +1044,8 @@ impl ProxyBody {
             terminal_status: Arc::clone(&terminal_status),
             terminal_emitted: false,
             failed: false,
+            max_response_body_size_bytes,
+            emitted_bytes: 0,
             suppress_backend_entity,
         };
         let mut body = Self::streaming(Box::pin(adapter));
@@ -6264,6 +6314,10 @@ pub(crate) fn inspected_streaming_body(
 /// session's single-listener slot. `content_length` is deliberately `None` —
 /// the reject builder pairs this with `ClientResponseFraming::Streaming`, so no
 /// length is published for bytes that have not been written yet.
+///
+/// The source may end with a terminal body error (the aggregate SSE body's
+/// response-size ceiling), so its committed head is flushed before that error
+/// exactly like every other committed streaming body.
 pub(crate) fn gateway_streaming_body<S>(stream: S) -> ProxyBody
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, BoxError>> + Send + Unpin + 'static,
@@ -6272,7 +6326,7 @@ where
         inner: stream,
         content_length: None,
     };
-    ProxyBody::streaming(Box::pin(body))
+    ProxyBody::streaming(Box::pin(FlushBeforeTerminalError::new(body)))
 }
 
 /// Drive a streaming-response [`crate::plugins::ResponseStreamInspector`] over a
@@ -6289,7 +6343,12 @@ where
 /// `max_response_body_size_bytes` (`0` = unlimited) bounds total bytes received
 /// from the backend, mirroring the non-inspected `size_limited_streaming_body`
 /// path: an SSE response that exceeds it is terminated with a body error rather
-/// than forwarded unbounded just because each window was clean. A live
+/// than forwarded unbounded just because each window was clean. The same
+/// ceiling independently bounds the bytes the inspector RELEASES (every
+/// `Forward`, every `Terminate` payload, and the `on_end()` flush), exactly as
+/// [`run_proxy_body_response_inspection`] does: a normalizer that expands its
+/// input (an envelope per delta) cannot deliver more than the operator limit
+/// just because the backend's own bytes fit. A live
 /// `backend_read_timeout_ms` is an idle-between-chunks bound on `stream.next()`
 /// only — inspector time is not charged, and `0` leaves the wait unbounded.
 ///
@@ -6311,6 +6370,8 @@ pub(crate) async fn run_response_inspection(
 
     let mut stream = reqwest_response_frames(response, trailers);
     let mut total_received: usize = 0;
+    // Client-visible DATA released so far (the output-side ceiling).
+    let mut emitted_bytes: u64 = 0;
     let mut trailing_frame: Option<Frame<Bytes>> = None;
     // Built ONLY when the bound is live (issue #4074): `0` is the documented
     // opt-out that long-lived SSE routes rely on, and an unconditional `Sleep`
@@ -6389,14 +6450,33 @@ pub(crate) async fn run_response_inspection(
         };
         match action {
             ResponseStreamAction::Forward(out) => {
-                if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                    return; // client dropped the receiver
+                if !out.is_empty() {
+                    if response_output_crosses_ceiling(
+                        max_response_body_size_bytes,
+                        emitted_bytes,
+                        out.len(),
+                    ) {
+                        let _ = tx.send(Err(response_body_too_large_error())).await;
+                        return;
+                    }
+                    emitted_bytes = emitted_bytes.saturating_add(out.len() as u64);
+                    if tx.send(Ok(Frame::data(out))).await.is_err() {
+                        return; // client dropped the receiver
+                    }
                 }
             }
             ResponseStreamAction::Terminate(final_bytes) => {
                 if let Some(fb) = final_bytes
                     && !fb.is_empty()
                 {
+                    if response_output_crosses_ceiling(
+                        max_response_body_size_bytes,
+                        emitted_bytes,
+                        fb.len(),
+                    ) {
+                        let _ = tx.send(Err(response_body_too_large_error())).await;
+                        return;
+                    }
                     let _ = tx.send(Ok(Frame::data(fb))).await;
                 }
                 return; // drop tx → downstream EOF; drop stream → cancel backend
@@ -6411,8 +6491,19 @@ pub(crate) async fn run_response_inspection(
     };
     match action {
         ResponseStreamAction::Forward(out) => {
-            if !out.is_empty() && tx.send(Ok(Frame::data(out))).await.is_err() {
-                return;
+            if !out.is_empty() {
+                if response_output_crosses_ceiling(
+                    max_response_body_size_bytes,
+                    emitted_bytes,
+                    out.len(),
+                ) {
+                    // The backend's trailer section never follows a size cut.
+                    let _ = tx.send(Err(response_body_too_large_error())).await;
+                    return;
+                }
+                if tx.send(Ok(Frame::data(out))).await.is_err() {
+                    return;
+                }
             }
             if let Some(frame) = trailing_frame {
                 let _ = tx.send(Ok(frame)).await;
@@ -6423,10 +6514,50 @@ pub(crate) async fn run_response_inspection(
             if let Some(fb) = final_bytes
                 && !fb.is_empty()
             {
+                if response_output_crosses_ceiling(
+                    max_response_body_size_bytes,
+                    emitted_bytes,
+                    fb.len(),
+                ) {
+                    let _ = tx.send(Err(response_body_too_large_error())).await;
+                    return;
+                }
                 let _ = tx.send(Ok(Frame::data(fb))).await;
             }
         }
     }
+}
+
+/// Whether releasing `len` more client-visible DATA bytes, after `emitted`
+/// bytes already released, would cross the effective response ceiling
+/// `max_response_body_size_bytes` (`0` = unlimited).
+///
+/// This is the OUTPUT-side boundary every response rewrite that can change the
+/// byte count shares: every response-inspector driver (reqwest, proxy-body,
+/// the native H3 frontend relay, the H3 cross-protocol relay), the incremental
+/// gRPC-Web translator (base64 text expansion and the generated terminal
+/// trailer frame), the native-H3 cross-protocol gRPC-Web relay, and the
+/// gateway-generated aggregate MCP SSE body. The source adapters still bound
+/// the backend's own bytes; this bounds what the client receives after
+/// inspection and protocol translation, so an in-limit source cannot expand
+/// past the operator limit. The boundary is inclusive: exactly
+/// `max_response_body_size_bytes` bytes pass.
+#[inline]
+pub(crate) fn response_output_crosses_ceiling(
+    max_response_body_size_bytes: usize,
+    emitted: u64,
+    len: usize,
+) -> bool {
+    max_response_body_size_bytes > 0
+        && emitted.saturating_add(len as u64) > max_response_body_size_bytes as u64
+}
+
+/// The body error a committed streaming response ends with when its
+/// client-visible DATA would cross the effective response ceiling. The message
+/// is the one `classify_body_error` maps to `ResponseBodyTooLarge`, shared with
+/// the source-side size-limited adapters.
+pub(crate) fn response_body_too_large_error() -> BoxError {
+    Box::<dyn std::error::Error + Send + Sync>::from("response body exceeds maximum size")
 }
 
 /// Drive a response-stream inspector over an already constructed proxy body.
@@ -6452,7 +6583,7 @@ pub(crate) async fn run_proxy_body_response_inspection(
     use http_body_util::BodyExt;
 
     let mut trailing_frame: Option<Frame<Bytes>> = None;
-    let mut emitted_bytes: usize = 0;
+    let mut emitted_bytes: u64 = 0;
     loop {
         let frame = tokio::select! {
             biased;
@@ -6469,18 +6600,15 @@ pub(crate) async fn run_proxy_body_response_inspection(
                 } {
                     ResponseStreamAction::Forward(out) => {
                         if !out.is_empty() {
-                            if max_response_body_size_bytes > 0
-                                && emitted_bytes.saturating_add(out.len())
-                                    > max_response_body_size_bytes
-                            {
-                                let _ = tx
-                                    .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                                        "response body exceeds maximum size",
-                                    ) as BoxError))
-                                    .await;
+                            if response_output_crosses_ceiling(
+                                max_response_body_size_bytes,
+                                emitted_bytes,
+                                out.len(),
+                            ) {
+                                let _ = tx.send(Err(response_body_too_large_error())).await;
                                 return;
                             }
-                            emitted_bytes = emitted_bytes.saturating_add(out.len());
+                            emitted_bytes = emitted_bytes.saturating_add(out.len() as u64);
                             if tx.send(Ok(Frame::data(out))).await.is_err() {
                                 return;
                             }
@@ -6490,15 +6618,12 @@ pub(crate) async fn run_proxy_body_response_inspection(
                         if let Some(bytes) = final_bytes
                             && !bytes.is_empty()
                         {
-                            if max_response_body_size_bytes > 0
-                                && emitted_bytes.saturating_add(bytes.len())
-                                    > max_response_body_size_bytes
-                            {
-                                let _ = tx
-                                    .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                                        "response body exceeds maximum size",
-                                    ) as BoxError))
-                                    .await;
+                            if response_output_crosses_ceiling(
+                                max_response_body_size_bytes,
+                                emitted_bytes,
+                                bytes.len(),
+                            ) {
+                                let _ = tx.send(Err(response_body_too_large_error())).await;
                                 return;
                             }
                             let _ = tx.send(Ok(Frame::data(bytes))).await;
@@ -6529,14 +6654,12 @@ pub(crate) async fn run_proxy_body_response_inspection(
     match action {
         ResponseStreamAction::Forward(out) => {
             if !out.is_empty() {
-                if max_response_body_size_bytes > 0
-                    && emitted_bytes.saturating_add(out.len()) > max_response_body_size_bytes
-                {
-                    let _ = tx
-                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                            "response body exceeds maximum size",
-                        ) as BoxError))
-                        .await;
+                if response_output_crosses_ceiling(
+                    max_response_body_size_bytes,
+                    emitted_bytes,
+                    out.len(),
+                ) {
+                    let _ = tx.send(Err(response_body_too_large_error())).await;
                     return;
                 }
                 if tx.send(Ok(Frame::data(out))).await.is_err() {
@@ -6551,14 +6674,12 @@ pub(crate) async fn run_proxy_body_response_inspection(
             if let Some(bytes) = final_bytes
                 && !bytes.is_empty()
             {
-                if max_response_body_size_bytes > 0
-                    && emitted_bytes.saturating_add(bytes.len()) > max_response_body_size_bytes
-                {
-                    let _ = tx
-                        .send(Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                            "response body exceeds maximum size",
-                        ) as BoxError))
-                        .await;
+                if response_output_crosses_ceiling(
+                    max_response_body_size_bytes,
+                    emitted_bytes,
+                    bytes.len(),
+                ) {
+                    let _ = tx.send(Err(response_body_too_large_error())).await;
                     return;
                 }
                 let _ = tx.send(Ok(Frame::data(bytes))).await;

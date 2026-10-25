@@ -1297,9 +1297,37 @@ pub mod _test_support {
             failed_websocket_handshake: false,
             body_disposition: disposition,
             grpc_trailers: HashMap::new(),
-            aggregate_sse: Some(listener),
+            aggregate_sse: Some(crate::proxy::AdoptedAggregateSse {
+                listener,
+                response_byte_ceiling: 0,
+            }),
         };
         crate::proxy::build_response_from_normalized_reject(reject).into_parts()
+    }
+
+    /// Run a plugin rejection through the production H1/H2 reject lifecycle
+    /// (`finalize_reject_response_with_after_proxy_hooks`: the shared synthetic
+    /// finalizer, the reject-path hooks, and the aggregate SSE adoption gate)
+    /// and build the client response exactly as the H1/H2 writer does.
+    pub async fn finalize_and_build_plugin_reject_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> (http::response::Parts, crate::proxy::body::ProxyBody) {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            panic!("finalize_and_build_plugin_reject_response_for_test needs a rejection");
+        };
+        let status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        let normalized = crate::proxy::finalize_reject_response_with_after_proxy_hooks(
+            plugins,
+            ctx,
+            status,
+            parts.body,
+            parts.headers,
+            false,
+        )
+        .await;
+        crate::proxy::build_response_from_normalized_reject(normalized).into_parts()
     }
 
     /// Whether a finalized reject header map still selects the gateway-authored
@@ -15114,7 +15142,33 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, false)
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            false,
+            0,
+        )
+    }
+
+    /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
+    /// request's effective response ceiling (`0` = unlimited) charged against
+    /// the translated bytes the client receives, exactly as the H1/H2 response
+    /// funnels install it.
+    pub fn proxy_body_into_grpc_web_streaming_with_response_limit_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+        max_response_body_size_bytes: usize,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            false,
+            max_response_body_size_bytes,
+        )
     }
 
     /// Same as [`proxy_body_into_grpc_web_streaming_for_test`], with the
@@ -15126,7 +15180,13 @@ pub mod _test_support {
         http_status: u16,
         initial_terminal_metadata: Option<HashMap<String, String>>,
     ) -> crate::proxy::ProxyBody {
-        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata, true)
+        body.into_grpc_web_streaming(
+            content_type,
+            http_status,
+            initial_terminal_metadata,
+            true,
+            0,
+        )
     }
 
     /// Wrap a body in the pass-through gRPC-Web relay, exactly as the H1/H2
@@ -15387,6 +15447,31 @@ pub mod _test_support {
             tx,
             0,
             crate::proxy::LoadBalancerConnectionGuard::new(None, None),
+        ));
+        crate::proxy::body::inspected_streaming_body(rx)
+    }
+
+    /// Drive the PRODUCTION reqwest response-inspection task
+    /// (`run_response_inspection`, the H1/H2 inspect path) over a scripted
+    /// backend body of `chunks`, with the request's effective response ceiling
+    /// `max_response_body_size_bytes` (`0` = unlimited), and return the
+    /// client-visible inspected body.
+    pub fn reqwest_inspected_response_body_for_test(
+        chunks: &[&'static [u8]],
+        inspector: Box<dyn crate::plugins::ResponseStreamInspector>,
+        max_response_body_size_bytes: usize,
+    ) -> crate::proxy::ProxyBody {
+        let response = reqwest_response_with_trailers_for_test(chunks, &[]);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(crate::proxy::body::run_response_inspection(
+            response,
+            inspector,
+            tx,
+            max_response_body_size_bytes,
+            0,
+            None,
+            crate::proxy::LoadBalancerConnectionGuard::new(None, None),
+            crate::proxy::body::ReqwestResponseTrailers::drop_all(),
         ));
         crate::proxy::body::inspected_streaming_body(rx)
     }
