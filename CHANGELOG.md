@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING (custom plugins) — WebSocket decision observers get the final
+  policy Close through `on_ws_policy_close`** (issue/PR #6862).
+  `Plugin::prepare_ws_frame_delivery` now takes `connection_id` and
+  `direction` before the message. Plugins returning `true` from
+  `observes_ws_frame_decisions()` no longer receive the terminal Close through
+  `on_ws_frame`: the chain stops at the first terminal Close for every later
+  plugin, and the relay calls the new `on_ws_policy_close` once per relay-half
+  decision after the full pass, whatever the observer's priority. That call
+  also covers fragment-budget Closes and parser rejections (size ceilings,
+  incomplete-message bounds, terminated `permessage-deflate` faults), which no
+  observer previously saw. `ws_frame_logging` uses the new hook, so its
+  `outcome=policy_close` records no longer disappear when `priority_override`
+  orders it before the rejecting plugin.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +152,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`ws_frame_logging` review hardening** (PR #6862).
+  - `outcome=policy_close` is recorded for every gateway-published policy
+    Close, including `ws_message_size_limiting` and global size ceilings,
+    incomplete-message bounds, fragment budgets, and plugins ordered after the
+    logger. Disconnect records gain `termination_reason` (the relay's bounded
+    session-end classification), so idle/drain/lifetime stops are visible.
+  - HTTP/3: the relay settles the bridge send pump before `on_ws_disconnect`,
+    so a client QUIC write/FIN failure (for example `STOP_SENDING`) after the
+    final Close is attributed as `backend_to_client` / `write` instead of a
+    clean close. An expired pump drain grace is recorded as
+    `read_write_timeout`.
+  - New `sample_rate` (deterministic per connection), `direction`, and
+    `max_records_per_connection` options bound `delivered` records. A capped
+    session emits one `event=record_cap_reached` record. `policy_close` and
+    disconnect records are never sampled, filtered, or capped.
+  - Every record carries `plugin_id` (the plugin-config id), so multiple
+    instances on one proxy stay distinguishable.
+  - Docs now state the real granularity: one record per reassembled message,
+    not per wire frame. `frames_*` count delivered messages.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

@@ -28,6 +28,28 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### WebSocket decision observers and `ws_frame_logging` records (#6862)
+
+Custom plugins that implement `Plugin::prepare_ws_frame_delivery` must add the
+new `connection_id: u64` and `direction: WebSocketFrameDirection` parameters
+before `message`. Custom plugins that return `true` from
+`observes_ws_frame_decisions()` and recorded the terminal Close from
+`on_ws_frame` must move that logic to the new `on_ws_policy_close(proxy_id,
+connection_id, direction, close)` hook. The relay no longer invokes any plugin,
+observers included, for a message after a terminal Close. It reports the final
+decision to every observer exactly once, also for fragment-budget and parser
+rejections. Observers still receive ordinary messages through `on_ws_frame`.
+
+`ws_frame_logging` configs need no change. Log consumers will see:
+
+- a new `plugin_id` field on every record;
+- a new `termination_reason` field on disconnect records;
+- `outcome=policy_close` for parser, fragment, and priority-reordered
+  rejections that previously produced no record.
+
+The new `sample_rate`, `direction`, and `max_records_per_connection` options
+default to the previous behavior (everything is logged).
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now
