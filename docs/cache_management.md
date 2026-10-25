@@ -122,11 +122,11 @@ When the cache reaches the max entry count, new circuit breaker entries for prev
 
 **What it stores:** Per-key (IP or consumer) rate counters with sliding window timestamps or token bucket state. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
-**Default limit:** 100,000 entries (hardcoded `MAX_STATE_ENTRIES`).
+**Default limit:** 100,000 entries (`DEFAULT_MAX_STATE_ENTRIES`).
 
-**Config field:** N/A (hardcoded constant).
+**Config field:** `max_state_entries` (default `100000`, range `1..=10000000`). It is read on every admission and is not part of the local-state compatibility fingerprint, so resizing it on a live policy keeps consumed budgets.
 
-**Cleanup mechanism:** Sampled piggyback sweeps during normal request processing (every 1,024 requests, cooldown-gated to at most once per second) prune idle keys even while the map is below the 100,000 hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed. Cleanup never force-evicts still-active budgets (that would reset consumed windows). When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback (subject to the same below-cap stale prune and atomic admission rules). `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
+**Cleanup mechanism:** Sampled piggyback sweeps during normal request processing (every 1,024 requests, cooldown-gated to at most once per second) prune idle keys even while the map is below the `max_state_entries` hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed. Cleanup never force-evicts still-active budgets (that would reset consumed windows). When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback (subject to the same below-cap stale prune and atomic admission rules). `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
 
 ### AI Rate Limiter
 
@@ -324,6 +324,7 @@ at construction without disclosing credentials.
 | `request_deduplication` | `max_inflight_entries` | `max_entries` | Hard ceiling on live in-flight markers (executing plus interrupted requests retained until `inflight_ttl_seconds`); a new key past it gets `503` |
 | `request_deduplication` | `max_entry_size_bytes` | `1048576` | Maximum retained completed response entry |
 | `request_deduplication` | `max_total_size_bytes` | `104857600` | Exact maximum retained local completed response-entry bytes |
+| `rate_limiting` | `max_state_entries` | `100000` | Hard ceiling on distinct local/Redis-fallback rate-limit keys (1–10,000,000); unseen keys are refused at the cap |
 | `soap_ws_security` | `nonce.max_cache_size` | `100000` | Maximum tracked nonces |
 | `soap_ws_security` | *(fixed, not configurable)* | `93601`s | Nonce claim retention — `max created_max_age_seconds + 2 x max created_clock_skew_seconds + 1`, the widest window the schema admits, so a later reload cannot outlive a claim |
 | `soap_ws_security` | `nonce.max_encoded_length` | `512` | Maximum encoded `wsse:Nonce` length |
@@ -344,4 +345,4 @@ at construction without disclosing credentials.
 | `api_chargeback` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |
 | `prometheus_metrics` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |
 
-Rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) use hardcoded maximum entry constants (50,000-100,000) and are not configurable via plugin config. These limits are intentionally high to avoid false rejections under normal traffic patterns while still preventing unbounded growth from IP/key churn. Counter storage supports only local memory and Redis; there is no database-backed counter policy.
+Rate limiting plugins (`ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `graphql`, `grpc_method_router`) use hardcoded maximum entry constants (50,000-100,000) and are not configurable via plugin config; `rate_limiting` alone exposes its cap as `max_state_entries` (default 100,000). These limits are intentionally high to avoid false rejections under normal traffic patterns while still preventing unbounded growth from IP/key churn. Counter storage supports only local memory and Redis; there is no database-backed counter policy.

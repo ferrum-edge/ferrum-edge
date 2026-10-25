@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{
     Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
@@ -92,6 +93,10 @@ struct BracketKeeper {
     /// True only while this thread owns an actual begin/commit-or-abort reload
     /// pass. `lock_for_tests()` increments `depth` without setting this flag.
     reload_open: bool,
+    /// Incremented by every successful `begin_reload` on this thread. A
+    /// [`ReloadBracketGuard`] records the epoch it opened so its unwind
+    /// cleanup can never abort a later, unrelated bracket on the same thread.
+    reload_epoch: u64,
 }
 
 thread_local! {
@@ -99,6 +104,7 @@ thread_local! {
         outer_guard: None,
         depth: 0,
         reload_open: false,
+        reload_epoch: 0,
     }) };
 }
 
@@ -199,8 +205,72 @@ pub fn begin_reload() -> Result<(), String> {
         );
     }
 
-    KEEPER.with(|keeper| keeper.borrow_mut().reload_open = true);
+    KEEPER.with(|keeper| {
+        let mut keeper = keeper.borrow_mut();
+        keeper.reload_open = true;
+        keeper.reload_epoch = keeper.reload_epoch.wrapping_add(1);
+    });
     Ok(())
+}
+
+/// Open a reload bracket exactly like [`begin_reload`], returning a guard that
+/// aborts it if the owning code never reaches [`commit_reload`] /
+/// [`abort_reload`].
+///
+/// The plugin-cache builds and prospective graph validation hold an open
+/// bracket across arbitrary plugin construction on pooled runtime threads. A
+/// panic there (in a build that unwinds) used to skip the paired
+/// commit/abort, leaving the thread-local keeper marked open and the
+/// process-wide serializer held for the life of the thread, so every later
+/// reload either deadlocked or failed as "nested". Callers keep their explicit
+/// commit/abort calls for the normal paths; the guard's `Drop` is only a
+/// safety net that discards the staging map and releases the serializer when
+/// the bracket it opened is still open. It is deliberately `!Send`: the
+/// bracket is owned by the thread that opened it.
+pub fn begin_reload_guarded() -> Result<ReloadBracketGuard, String> {
+    begin_reload()?;
+    let epoch = KEEPER.with(|keeper| keeper.borrow().reload_epoch);
+    Ok(ReloadBracketGuard {
+        epoch,
+        _thread_bound: PhantomData,
+    })
+}
+
+/// Unwind-safety guard returned by [`begin_reload_guarded`].
+#[must_use = "dropping the guard immediately aborts the reload bracket it opened"]
+pub struct ReloadBracketGuard {
+    epoch: u64,
+    _thread_bound: PhantomData<*const ()>,
+}
+
+impl ReloadBracketGuard {
+    /// `true` while the bracket this guard opened has not been committed or
+    /// aborted on this thread.
+    pub fn is_open(&self) -> bool {
+        KEEPER
+            .try_with(|keeper| {
+                keeper
+                    .try_borrow()
+                    .map(|keeper| keeper.reload_open && keeper.reload_epoch == self.epoch)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for ReloadBracketGuard {
+    fn drop(&mut self) {
+        if !self.is_open() {
+            return;
+        }
+        tracing::warn!(
+            "log_schema::registry: discarding a named-schema reload bracket that was never \
+             committed or aborted (the build that opened it did not finish)"
+        );
+        // Best effort: the only failure mode is "no open bracket", which
+        // `is_open` just ruled out.
+        let _ = abort_reload();
+    }
 }
 
 /// Register a named schema into the in-progress reload staging area.

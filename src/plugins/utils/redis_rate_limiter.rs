@@ -1052,7 +1052,14 @@ impl RedisConfig {
         })?;
 
         Ok(Some(RedisConfig {
-            url: url.to_string(),
+            // Stored with a lowercase scheme. `validate_redis_url` admits any
+            // letter case (URL schemes are case-insensitive and `Url::scheme()`
+            // normalizes them), but every later consumer — the `redis_tls`
+            // upgrade, SNI preservation, and the CA-bundle / skip-verify TLS
+            // policy — reads this string, so `REDIS://` must not silently skip
+            // the TLS upgrade and `REDISS://` must not lose SNI or the
+            // configured TLS verification policy.
+            url: normalize_redis_url_scheme(url),
             tls,
             key_prefix,
             pool_size,
@@ -1065,11 +1072,17 @@ impl RedisConfig {
 
     /// Build the effective Redis URL, upgrading to TLS scheme if needed.
     fn effective_url(&self) -> String {
-        if self.tls && self.url.starts_with("redis://") {
-            self.url.replacen("redis://", "rediss://", 1)
-        } else {
-            self.url.clone()
+        // Case-insensitive: `from_plugin_config` already lowercases the scheme,
+        // and this keeps a directly constructed config on the same contract.
+        if self.tls
+            && let Some(rest) = strip_redis_scheme_prefix(&self.url, "redis://")
+        {
+            let mut url = String::with_capacity(self.url.len() + 1);
+            url.push_str("rediss://");
+            url.push_str(rest);
+            return url;
         }
+        self.url.clone()
     }
 
     /// Extract the hostname from the Redis URL for DNS pre-warming.
@@ -1130,7 +1143,7 @@ impl RedisConfig {
 
         // Don't replace hostname for TLS — SNI needs the original hostname (see
         // the ACCEPTED LIMITATION note above on the residual rebinding gap).
-        if url.starts_with("rediss://") {
+        if redis_url_scheme_is_tls(&url) {
             return url;
         }
 
@@ -1197,6 +1210,35 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
         ));
     }
     parsed.to_string()
+}
+
+/// `raw_url` without its `prefix` scheme, compared ASCII case-insensitively.
+fn strip_redis_scheme_prefix<'a>(raw_url: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = raw_url.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    raw_url.get(prefix.len()..)
+}
+
+/// Whether a Redis URL uses the TLS scheme, in any letter case.
+fn redis_url_scheme_is_tls(raw_url: &str) -> bool {
+    strip_redis_scheme_prefix(raw_url, "rediss://").is_some()
+}
+
+/// Lowercase the scheme of an admitted `redis_url`, leaving the rest
+/// byte-for-byte unchanged (userinfo, host, and path keep their spelling).
+fn normalize_redis_url_scheme(raw_url: &str) -> String {
+    match raw_url.split_once("://") {
+        Some((scheme, rest)) => {
+            let mut url = String::with_capacity(raw_url.len());
+            url.push_str(&scheme.to_ascii_lowercase());
+            url.push_str("://");
+            url.push_str(rest);
+            url
+        }
+        None => raw_url.to_string(),
+    }
 }
 
 fn validate_redis_url(raw_url: &str) -> Result<(), String> {
@@ -1329,7 +1371,7 @@ fn open_screened_redis_client(
 ) -> Result<redis::Client, redis::RedisError> {
     use redis::IntoConnectionInfo;
 
-    let is_tls = url.starts_with("rediss://");
+    let is_tls = redis_url_scheme_is_tls(url);
     let without_fragment = url.split_once('#').map(|(base, _)| base).unwrap_or(url);
     let conn_info_url = if is_tls && tls_no_verify {
         format!("{without_fragment}#insecure")

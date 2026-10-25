@@ -217,7 +217,7 @@ async fn jwt_auth_admits_a_far_future_exp_without_an_effective_deadline() {
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
     let token = create_hs256_token(
         &json!({"sub": "testuser", "exp": i64::MAX}),
-        "test-jwt-secret",
+        "test-jwt-secret-0123456789abcdefghij",
     );
     let mut ctx = make_ctx();
     ctx.headers
@@ -235,7 +235,7 @@ async fn jwt_auth_still_publishes_a_representable_exp_as_a_deadline() {
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
     let token = create_hs256_token(
         &json!({"sub": "testuser", "exp": 9_999_999_999u64}),
-        "test-jwt-secret",
+        "test-jwt-secret-0123456789abcdefghij",
     );
     let mut ctx = make_ctx();
     ctx.headers
@@ -432,7 +432,10 @@ async fn jwt_auth_publishes_a_fractional_exp_as_a_deadline() {
     let plugin = JwtAuth::new(&json!({})).expect("default jwt_auth config");
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
     let exp = chrono::Utc::now().timestamp() as f64 + 3_600.25;
-    let token = create_hs256_token(&json!({"sub": "testuser", "exp": exp}), "test-jwt-secret");
+    let token = create_hs256_token(
+        &json!({"sub": "testuser", "exp": exp}),
+        "test-jwt-secret-0123456789abcdefghij",
+    );
     let mut ctx = make_ctx();
     ctx.headers
         .insert("authorization".to_string(), format!("Bearer {token}"));

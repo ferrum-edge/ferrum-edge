@@ -105,6 +105,19 @@ pub struct HmacAuthCredential {
     /// shared replay authority. `None` under the legacy `ferrum-hmac-v1`
     /// profile, which accepts no nonce and provides no single-use guarantee.
     pub nonce: Option<String>,
+    /// Canonical values of the policy's `signed_headers`, in configuration
+    /// order, appended to the Ferrum signing base. Empty when the policy
+    /// requires no extra headers, and always empty under `rfc9421`, whose
+    /// covered header values are already part of [`Self::rfc9421_base`].
+    pub signed_header_values: Vec<String>,
+    /// Complete RFC 9421 signature base derived from the request, present
+    /// exactly when the policy uses the `rfc9421` profile. The HMAC is computed
+    /// over this instead of the Ferrum signing base.
+    pub rfc9421_base: Option<String>,
+    /// RFC 9421 `created` signature parameter (UNIX seconds). `rfc9421` only.
+    pub created: Option<i64>,
+    /// RFC 9421 `expires` signature parameter (UNIX seconds), when sent.
+    pub expires: Option<i64>,
     /// SHA-256 of the sole forwarding buffer, when the proxy has actually
     /// hashed those bytes. `None` means the body was not collected — never
     /// treated as the empty-body digest.
@@ -132,6 +145,15 @@ impl fmt::Debug for HmacAuthCredential {
             .field("digest_header", &"[REDACTED]")
             .field("digest_is_rfc9530", &self.digest_is_rfc9530)
             .field("nonce", &self.nonce.as_ref().map(|_| "[REDACTED]"))
+            // Header values and the RFC 9421 base can carry application data
+            // and the raw query; only their shape is observable.
+            .field("signed_header_values", &self.signed_header_values.len())
+            .field(
+                "rfc9421_base",
+                &self.rfc9421_base.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("created", &self.created)
+            .field("expires", &self.expires)
             .field(
                 "request_body_sha256",
                 &self.request_body_sha256.as_ref().map(|_| "[REDACTED]"),

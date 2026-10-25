@@ -34,7 +34,7 @@ use super::plugin_utils::{
 /// Secret `create_test_consumer`'s Basic password hash was derived with.
 const BASIC_HASH_SECRET: &str = "test-hmac-secret-for-basic-auth-unit-tests";
 /// Secret `create_test_consumer`'s JWT credential carries.
-const JWT_SECRET: &str = "test-jwt-secret";
+const JWT_SECRET: &str = "test-jwt-secret-0123456789abcdefghij";
 
 const SCRIPTED_CHALLENGE: &str = r#"Scripted realm="ferrum-edge""#;
 const SCRIPTED_INVALID_FORMAT: &str = r#"Scripted error="invalid_request""#;

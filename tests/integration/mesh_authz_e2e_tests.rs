@@ -107,6 +107,7 @@ fn prepared_mesh_plugin_configs(
 ) -> Vec<ferrum_edge::config::types::PluginConfig> {
     let config = ferrum_edge::config::types::GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "test".to_string(),
         proxies: Vec::new(),
         upstreams: Vec::new(),
@@ -1904,6 +1905,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
     let mesh = mesh_config_with(Vec::new(), Vec::new(), vec![allow]);
     let config = ferrum_edge::config::types::GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "test".to_string(),
         proxies: Vec::new(),
         upstreams: Vec::new(),

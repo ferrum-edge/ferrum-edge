@@ -3202,3 +3202,205 @@ async fn consumer_delta_introducing_shared_api_key_is_rejected() {
         Some("c-a")
     );
 }
+
+fn jwt_test_consumer(id: &str, secret: &str) -> Consumer {
+    let mut consumer = test_consumer(id, id);
+    consumer
+        .credentials
+        .insert("jwt".to_string(), serde_json::json!([{ "secret": secret }]));
+    consumer
+}
+
+fn delta_with_consumers(consumers: Vec<Consumer>) -> IncrementalResult {
+    IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: consumers,
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: Utc::now(),
+    }
+}
+
+fn live_has_jwt(state: &ProxyState, id: &str) -> bool {
+    state
+        .config
+        .load()
+        .consumers
+        .iter()
+        .find(|consumer| consumer.id == id)
+        .expect("consumer present")
+        .credentials
+        .contains_key("jwt")
+}
+
+/// PR #6865 review (SOL-2): successive consumer deltas must not reactivate a
+/// JWT secret two Consumers shared. The first delta strips it from both
+/// holders; a later point delta re-delivering one holder unchanged lands on a
+/// snapshot that no longer shows the other holder, and must stay quarantined.
+#[tokio::test(flavor = "multi_thread")]
+async fn successive_consumer_deltas_cannot_reactivate_a_shared_jwt_secret() {
+    const SHARED: &str = "shared-jwt-secret-0123456789abcdefghij";
+    const EVE_OWN: &str = "eve-own-jwt-secret-0123456789abcdefghi";
+    const ALICE_NEW: &str = "alice-new-jwt-secret-0123456789abcdefg";
+    let state = proxy_state_with_config(GatewayConfig {
+        consumers: vec![
+            jwt_test_consumer("alice", SHARED),
+            jwt_test_consumer("eve", EVE_OWN),
+        ],
+        ..GatewayConfig::default()
+    });
+    assert!(live_has_jwt(&state, "alice") && live_has_jwt(&state, "eve"));
+
+    // Delta 1: Eve is re-provisioned out of band with Alice's secret.
+    assert_eq!(
+        state
+            .apply_incremental(delta_with_consumers(vec![jwt_test_consumer("eve", SHARED)]))
+            .await,
+        ConfigApplyOutcome::Applied
+    );
+    assert!(!live_has_jwt(&state, "alice"));
+    assert!(!live_has_jwt(&state, "eve"));
+
+    // Delta 2: a metadata-only update re-delivers Alice with the same secret.
+    let mut alice = jwt_test_consumer("alice", SHARED);
+    alice.acl_groups = vec!["paid".to_string()];
+    let _ = state
+        .apply_incremental(delta_with_consumers(vec![alice]))
+        .await;
+    assert!(
+        !live_has_jwt(&state, "alice"),
+        "a once-shared secret must stay quarantined across deltas"
+    );
+    let reactivated = state
+        .consumer_index
+        .find_by_identity("alice")
+        .is_some_and(|consumer| consumer.credentials.contains_key("jwt"));
+    assert!(!reactivated, "the published index must not carry the key");
+
+    // A new, distinct secret restores Alice.
+    assert_eq!(
+        state
+            .apply_incremental(delta_with_consumers(vec![jwt_test_consumer(
+                "alice", ALICE_NEW
+            )]))
+            .await,
+        ConfigApplyOutcome::Applied
+    );
+    assert!(live_has_jwt(&state, "alice"));
+}
+
+/// The full-snapshot path records the shared secret too, so a delta after a
+/// quarantining full reload cannot reactivate it either.
+#[tokio::test(flavor = "multi_thread")]
+async fn delta_after_quarantining_full_snapshot_keeps_shared_jwt_secret_out() {
+    const SHARED: &str = "shared-jwt-secret-0123456789abcdefghij";
+    let state = empty_proxy_state();
+    let full = GatewayConfig {
+        consumers: vec![
+            jwt_test_consumer("alice", SHARED),
+            jwt_test_consumer("eve", SHARED),
+        ],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let _ = state.update_config(full);
+    assert!(!live_has_jwt(&state, "alice"));
+    assert!(!live_has_jwt(&state, "eve"));
+
+    let _ = state
+        .apply_incremental(delta_with_consumers(vec![jwt_test_consumer(
+            "alice", SHARED,
+        )]))
+        .await;
+    assert!(!live_has_jwt(&state, "alice"));
+}
+
+/// PR #6865 review (SOL-4 / MUSE-2): a snapshot a full loader already
+/// stripped carries the stripped shared secrets to `ProxyState`, so a later
+/// raw delta re-delivering one holder stays quarantined.
+#[tokio::test(flavor = "multi_thread")]
+async fn loader_stripped_full_snapshot_seeds_the_shared_secret_history() {
+    const SHARED: &str = "loader-shared-jwt-secret-0123456789abcdef";
+    let mut loaded = GatewayConfig {
+        consumers: vec![
+            jwt_test_consumer("alice", SHARED),
+            jwt_test_consumer("eve", SHARED),
+        ],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    // What the SQL/Mongo full loaders do before returning the snapshot.
+    let outcome = loaded.quarantine_invalid_jwt_credentials_against(
+        &ferrum_edge::config::types::JwtSharedSecretHistory::default(),
+    );
+    loaded.quarantined_jwt_shared_secrets = outcome.shared;
+    assert!(
+        loaded
+            .consumers
+            .iter()
+            .all(|c| !c.credentials.contains_key("jwt"))
+    );
+
+    let state = empty_proxy_state();
+    assert!(state.update_config(loaded).accepted());
+    assert_eq!(
+        state
+            .jwt_shared_secret_history
+            .lock()
+            .expect("history lock")
+            .len(),
+        1
+    );
+
+    let _ = state
+        .apply_incremental(delta_with_consumers(vec![jwt_test_consumer(
+            "alice", SHARED,
+        )]))
+        .await;
+    assert!(!live_has_jwt(&state, "alice"));
+}
+
+/// PR #6865 review (SOL-5 / MUSE-4): a candidate that is rejected for any
+/// reason records nothing into the shared-secret history.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_candidate_does_not_record_shared_jwt_secrets() {
+    const SHARED: &str = "rejected-shared-jwt-secret-0123456789abcd";
+    let state = empty_proxy_state();
+    let mut p1 = test_proxy("p1", "/dup");
+    let mut p2 = test_proxy("p2", "/dup");
+    p1.hosts = vec![];
+    p2.hosts = vec![];
+    let rejected = GatewayConfig {
+        proxies: vec![p1, p2],
+        consumers: vec![
+            jwt_test_consumer("alice", SHARED),
+            jwt_test_consumer("eve", SHARED),
+        ],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert!(matches!(
+        state.update_config(rejected),
+        ConfigApplyOutcome::Rejected { .. }
+    ));
+    assert!(
+        state
+            .jwt_shared_secret_history
+            .lock()
+            .expect("history lock")
+            .is_empty()
+    );
+
+    // With nothing recorded, Alice alone with the secret is published.
+    let _ = state
+        .apply_incremental(delta_with_consumers(vec![jwt_test_consumer(
+            "alice", SHARED,
+        )]))
+        .await;
+    assert!(live_has_jwt(&state, "alice"));
+}

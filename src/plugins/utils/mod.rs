@@ -53,6 +53,7 @@ pub mod sink_loss;
 pub mod size_limit;
 pub mod socket_host;
 pub mod sse;
+pub mod structured_fields;
 pub mod summary_log_budget;
 pub mod synthetic_response;
 pub mod tcp_endpoint;
