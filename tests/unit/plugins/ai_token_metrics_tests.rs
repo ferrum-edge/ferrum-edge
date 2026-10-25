@@ -2623,3 +2623,155 @@ fn model_pricing_admission_matches_openapi() {
         assert_eq!(validator.is_valid(&config), accepted, "schema {config}");
     }
 }
+
+/// PR #6857 review MUSE-1: under a retry configuration the proxy releases a
+/// response to stream only when this plugin confirms it, so the vote must
+/// accept every representation the stream observer meters — AWS event-stream
+/// (Bedrock streams, which send no SSE `Accept` hint) as well as SSE — while
+/// JSON stays buffered for inspection.
+#[test]
+fn retry_release_confirms_every_observer_metered_stream_representation() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    // An AWS SDK request: JSON body, no `Accept: text/event-stream`, no
+    // `stream: true` marker, so the pre-header decision buffers.
+    let ctx = ctx_with_content_type("POST", "application/json");
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(plugin.may_release_response_body_under_retries(&ctx));
+    for (content_type, released) in [
+        ("application/vnd.amazon.eventstream", true),
+        ("Application/VND.Amazon.EventStream; charset=binary", true),
+        ("text/event-stream", true),
+        ("application/json", false),
+        ("text/plain", false),
+    ] {
+        let headers = HashMap::from([("Content-Type".to_string(), content_type.to_string())]);
+        assert_eq!(
+            plugin.should_release_response_body_under_retries(&ctx, 200, &headers),
+            released,
+            "{content_type}"
+        );
+        // Released representations are also not collected without retries.
+        if released {
+            assert!(!plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &headers
+            ));
+        }
+    }
+}
+
+/// A collected AWS event-stream body (buffered by a sibling, a route policy,
+/// or a retry decision) is metered by the same bounded extractor.
+#[tokio::test]
+async fn collected_aws_event_stream_body_is_metered() {
+    let inner = serde_json::to_vec(&json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 30, "outputTokenCount": 20}
+    }))
+    .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+    let payload = serde_json::to_vec(&json!({"bytes": encoded})).unwrap();
+    let message =
+        ferrum_edge::_test_support::encode_aws_event_stream_message_for_test(b"", &payload);
+    let plugin = priced_streaming_plugin(json!({}));
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/vnd.amazon.eventstream".to_string(),
+    )]);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &message)
+            .await,
+    );
+    assert_eq!(ctx.metadata["ai_streaming"], "true");
+    assert_usage_and_metrics(&ctx, "bedrock", Some(30), 20, Some(50), "0.000070");
+
+    // A collected event stream without usage is labelled, not silent.
+    let empty = ferrum_edge::_test_support::encode_aws_event_stream_message_for_test(
+        b"",
+        br#"{"bytes":"e30="}"#,
+    );
+    let mut ctx = create_test_context();
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, &empty)
+        .await;
+    assert!(ctx.authoritative_ai_usage_export().is_none());
+    assert_eq!(ctx.metadata["ai_unmetered_reason"], "no_usage");
+}
+
+const INVALIDATED_ANTHROPIC_STREAM: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",",
+    "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+    "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":20,",
+    "\"cache_read_input_tokens\":\"bad\",\"output_tokens\":5}}\n\n",
+);
+
+/// PR #6857 review SOL-1: a stream whose malformed categories invalidated
+/// every counter was observed but carries no usable usage. Both the live
+/// observer and buffered SSE must label it unmetered (and must not clear a
+/// stale reason or claim a metered stream), while an explicit zero is still
+/// metered.
+#[tokio::test]
+async fn invalidated_stream_usage_is_labelled_unmetered_on_both_paths() {
+    // Live observation.
+    let plugin = priced_streaming_plugin(json!({}));
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_unmetered_reason".to_string(), "no_usage".to_string());
+    drive_token_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[INVALIDATED_ANTHROPIC_STREAM.as_bytes()],
+        true,
+    )
+    .await
+    .expect("observer attaches");
+    assert!(ctx.authoritative_ai_usage_export().is_none());
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+    assert!(!ctx.metadata.contains_key("ai_streaming"));
+    assert_eq!(ctx.metadata["ai_unmetered_reason"], "stream_without_usage");
+
+    // Buffered SSE.
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    plugin
+        .on_response_body(
+            &mut ctx,
+            200,
+            &mut headers,
+            INVALIDATED_ANTHROPIC_STREAM.as_bytes(),
+        )
+        .await;
+    assert!(ctx.authoritative_ai_usage_export().is_none());
+    assert!(!ctx.metadata.contains_key("ai_streaming"));
+    assert_eq!(ctx.metadata["ai_unmetered_reason"], "no_usage");
+
+    // Control: an explicit zero report is usage, on both paths.
+    let zero =
+        "data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n";
+    let mut ctx = create_test_context();
+    drive_token_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[zero.as_bytes()],
+        true,
+    )
+    .await
+    .expect("observer attaches");
+    assert_eq!(ctx.metadata["ai_total_tokens"], "0");
+    assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+    let mut ctx = create_test_context();
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, zero.as_bytes())
+        .await;
+    assert_eq!(ctx.metadata["ai_total_tokens"], "0");
+    assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+}

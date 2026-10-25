@@ -1388,6 +1388,153 @@ async fn ai_token_metrics_retry_sse_release_honors_origin_headers_and_opt_in() {
     }
 }
 
+// ai_token_metrics meters AWS event-stream (Bedrock InvokeModelWithResponseStream
+// / ConverseStream) incrementally, so a retry-enabled route must release it to
+// stream exactly like SSE (PR #6857 review MUSE-1). The AWS SDK sends neither
+// `Accept: text/event-stream` nor `stream: true`, so only the post-header
+// retry-release vote can keep the stream live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn ai_token_metrics_retry_releases_aws_event_stream() {
+    use base64::Engine;
+
+    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
+    const FIRST_MESSAGE_DEADLINE: Duration = Duration::from_millis(2500);
+    let bedrock_message = |inner: serde_json::Value| {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&inner).expect("inner chunk"));
+        let payload = serde_json::to_vec(&json!({"bytes": encoded})).expect("payload");
+        ferrum_edge::_test_support::encode_aws_event_stream_message_for_test(b"", &payload)
+    };
+    let first = bedrock_message(json!({
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": "hello"}
+    }));
+    let last = bedrock_message(json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 30, "outputTokenCount": 20}
+    }));
+
+    for retry_first in [false, true] {
+        let reservation = reserve_port().await.expect("reserve backend port");
+        let backend_port = reservation.port;
+        let mut scripts = Vec::new();
+        if retry_first {
+            scripts.push(vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/invoke")),
+                HttpStep::RespondStatus {
+                    status: 503,
+                    reason: "Service Unavailable".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Connection".into(),
+                    value: "close".into(),
+                },
+                HttpStep::RespondBodyChunk(b"{}".to_vec()),
+                HttpStep::RespondBodyEnd,
+            ]);
+        }
+        scripts.push(vec![
+            HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/invoke")),
+            HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Content-Type".into(),
+                value: "application/vnd.amazon.eventstream".into(),
+            },
+            HttpStep::RespondHeader {
+                name: "Connection".into(),
+                value: "close".into(),
+            },
+            HttpStep::RespondBodyChunk(first.clone()),
+            HttpStep::Sleep(MID_STREAM_PAUSE),
+            HttpStep::RespondBodyChunk(last.clone()),
+            HttpStep::RespondBodyEnd,
+        ]);
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .connection_scripts(scripts)
+            .spawn()
+            .expect("spawn backend");
+        let config = json!({
+            "version": "1",
+            "proxies": [{
+                "id": "token-retry-aws",
+                "listen_path": "/invoke",
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": backend_port,
+                "strip_listen_path": false,
+                "backend_read_timeout_ms": 0,
+                "retry": {
+                    "max_retries": 2,
+                    "retryable_status_codes": [503],
+                    "retryable_methods": ["POST"],
+                    "retry_on_connect_failure": false,
+                },
+                "plugins": [{"plugin_config_id": "tokens"}],
+            }],
+            "consumers": [],
+            "upstreams": [],
+            "plugin_configs": [{
+                "id": "tokens",
+                "proxy_id": "token-retry-aws",
+                "plugin_name": "ai_token_metrics",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {},
+            }],
+        });
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(to_file_mode_yaml(&config))
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let request_body = json!({"inputText": "hello"}).to_string();
+        let client = harness.http_client().expect("client");
+        let request = client
+            .request(reqwest::Method::POST, &harness.proxy_url("/invoke"))
+            .header("content-type", "application/json")
+            .body(request_body.clone());
+        let (mut response, mut body) = tokio::time::timeout(FIRST_MESSAGE_DEADLINE, async {
+            let mut response = request.send().await.expect("response headers");
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = Vec::new();
+            while body.len() < first.len() {
+                let chunk = response
+                    .chunk()
+                    .await
+                    .expect("read message")
+                    .expect("message");
+                body.extend_from_slice(&chunk);
+            }
+            (response, body)
+        })
+        .await
+        .expect("first event-stream message arrives before the backend's mid-stream pause ends");
+        assert_eq!(body, first, "retry_first={retry_first}");
+        tokio::time::timeout(MID_STREAM_PAUSE + Duration::from_secs(5), async {
+            while let Some(chunk) = response.chunk().await.expect("drain event stream") {
+                body.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("stream finishes");
+        let mut expected = first.clone();
+        expected.extend_from_slice(&last);
+        assert_eq!(body, expected, "every byte is forwarded unchanged");
+        assert_eq!(
+            backend.received_requests().await.len(),
+            if retry_first { 2 } else { 1 }
+        );
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // a2a_gateway + retries — unexpected SSE must stream incrementally (#2169).
 // ────────────────────────────────────────────────────────────────────────────

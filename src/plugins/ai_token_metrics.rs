@@ -18,6 +18,7 @@
 //! transaction is logged. A streamed request (client `Accept:
 //! text/event-stream` or a `stream: true` request another AI plugin flagged)
 //! is therefore never buffered by default, on every backend dispatch path.
+//! Under retries the plugin also confirms release of both stream framings.
 //! `buffer_streaming_responses: true` instead collects the complete SSE
 //! response before inspection (disabling live delivery); buffered SSE joins
 //! each event's `data:` fields as JSON and merges provider cumulative/partial
@@ -570,6 +571,15 @@ impl AiTokenMetrics {
         }
     }
 
+    /// An explicitly configured provider labels extractor-observed usage, as
+    /// it does for buffered JSON responses.
+    fn label_stream_usage(&self, mut usage: AiTokenUsage) -> AiTokenUsage {
+        if let Some(provider) = self.fixed_provider {
+            usage.provider = Some(provider);
+        }
+        usage
+    }
+
     /// Label a 2xx response this instance could not meter.
     fn record_unmetered(&self, ctx: &mut RequestContext, reason: &'static str) {
         debug!(reason, "ai_token_metrics: response not metered");
@@ -584,6 +594,15 @@ impl AiTokenMetrics {
             .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
             .is_some_and(|content_type| stream_usage_format(content_type).is_some())
     }
+}
+
+/// Whether extracted usage carries at least one usable counter (explicit zero
+/// included). Malformed categories can invalidate every counter of a report
+/// that was nonetheless observed.
+fn has_usable_counter(usage: &AiTokenUsage) -> bool {
+    usage.prompt_tokens.is_some()
+        || usage.completion_tokens.is_some()
+        || usage.total_tokens.is_some()
 }
 
 /// Incremental usage framing for a streamed response content type.
@@ -753,9 +772,12 @@ impl Plugin for AiTokenMetrics {
         _response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
+        // Confirm every streamed representation the observer meters (SSE and
+        // AWS event-stream), so a retry-enabled route keeps live delivery for
+        // Bedrock streams as well as SSE.
         self.may_release_response_body_under_retries(ctx)
             && header_value(response_headers, "content-type")
-                .is_some_and(is_event_stream_content_type)
+                .is_some_and(|content_type| stream_usage_format(content_type).is_some())
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -863,15 +885,12 @@ impl Plugin for AiTokenMetrics {
             Ok(usage) => usage.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
-        if !accumulated.observed() {
+        let usage = self.label_stream_usage(accumulated.token_usage());
+        // A report that malformed categories invalidated is observed but
+        // carries no usable counter; it is unmetered, not a success.
+        if !has_usable_counter(&usage) {
             self.record_unmetered(ctx, UNMETERED_STREAM_WITHOUT_USAGE);
             return;
-        }
-        let mut usage = accumulated.token_usage();
-        // An explicitly configured provider labels the exported usage, as it
-        // does for buffered responses.
-        if let Some(provider) = self.fixed_provider {
-            usage.provider = Some(provider);
         }
         self.write_metadata(ctx, &usage);
         ctx.metadata
@@ -937,7 +956,8 @@ impl Plugin for AiTokenMetrics {
         // here regardless of `buffer_streaming_responses`; otherwise a
         // sibling's buffering would silently drop the request's usage.
         let is_sse = is_event_stream_content_type(content_type);
-        if !is_sse && !is_json_content_type(content_type) {
+        let is_aws_event_stream = is_aws_event_stream_content_type(content_type);
+        if !is_sse && !is_aws_event_stream && !is_json_content_type(content_type) {
             debug!(
                 "ai_token_metrics: skipping non-JSON response (content-type: {})",
                 content_type
@@ -980,7 +1000,29 @@ impl Plugin for AiTokenMetrics {
         // Handle SSE streaming responses
         if is_sse {
             debug!("ai_token_metrics: parsing SSE streaming response");
-            if let Some(usage) = self.extract_from_sse(&inspection_body) {
+            if let Some(usage) = self
+                .extract_from_sse(&inspection_body)
+                .filter(has_usable_counter)
+            {
+                self.write_metadata(ctx, &usage);
+                ctx.metadata
+                    .insert(self.streaming_key.clone(), "true".to_string());
+            } else {
+                self.record_unmetered(ctx, UNMETERED_NO_USAGE);
+            }
+            return PluginResult::Continue;
+        }
+
+        // A collected AWS event-stream body (a sibling, a route policy, or a
+        // retry decision buffered it) is parsed with the same bounded
+        // extractor the live observer uses.
+        if is_aws_event_stream {
+            let mut extractor =
+                UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, self.fixed_provider);
+            extractor.push(&inspection_body);
+            extractor.finish();
+            let usage = self.label_stream_usage(extractor.usage().token_usage());
+            if has_usable_counter(&usage) {
                 self.write_metadata(ctx, &usage);
                 ctx.metadata
                     .insert(self.streaming_key.clone(), "true".to_string());
