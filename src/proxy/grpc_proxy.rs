@@ -237,7 +237,7 @@ pub enum GrpcBody {
         /// backend exchange alive past the RPC budget. At the deadline this
         /// body ends in an ERROR, so hyper sends RST_STREAM and both halves of
         /// the backend stream end. `None` without a deadline.
-        rpc_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+        rpc_deadline: Option<crate::proxy::body::UploadRpcDeadline>,
         bytes_seen: usize,
         max_bytes: usize,
         exceeded: Arc<AtomicBool>,
@@ -327,8 +327,8 @@ pub(crate) fn attach_grpc_upload_deadline(
 /// the upload completes.
 pub(crate) fn streaming_upload_rpc_deadline(
     deadline: Option<tokio::time::Instant>,
-) -> Option<Pin<Box<tokio::time::Sleep>>> {
-    deadline.map(|at| Box::pin(tokio::time::sleep_until(at)))
+) -> Option<crate::proxy::body::UploadRpcDeadline> {
+    deadline.map(crate::proxy::body::UploadRpcDeadline::new)
 }
 
 impl Drop for GrpcBody {
@@ -420,7 +420,7 @@ impl http_body::Body for GrpcBody {
                 // an error here makes hyper reset the backend stream, which is
                 // the only way to end BOTH halves of a duplex exchange.
                 if let Some(deadline) = rpc_deadline.as_mut()
-                    && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
+                    && deadline.expired(cx)
                 {
                     if let Some(accounting) = request_bytes.as_mut() {
                         accounting.publish(*bytes_seen as u64);

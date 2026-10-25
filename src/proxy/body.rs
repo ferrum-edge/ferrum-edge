@@ -2618,6 +2618,38 @@ impl UploadAuthDeadline {
     }
 }
 
+/// The client RPC deadline (`grpc-timeout` / `grpc_deadline` budget) on a
+/// native-gRPC streaming upload body (`GrpcBody::Streaming`): the same armed-
+/// once, latched upload bound as [`UploadAuthDeadline`], without
+/// authorization accounting. An expired bound ends the upload in an error, so
+/// hyper resets the backend stream.
+#[doc(hidden)]
+pub struct UploadRpcDeadline {
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    fired: bool,
+}
+
+impl UploadRpcDeadline {
+    pub(crate) fn new(at: tokio::time::Instant) -> Self {
+        Self {
+            sleep: Box::pin(tokio::time::sleep_until(at)),
+            fired: false,
+        }
+    }
+
+    /// Poll the absolute bound. `true` once it has elapsed; latched.
+    pub(crate) fn expired(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.fired {
+            return true;
+        }
+        if std::future::Future::poll(self.sleep.as_mut(), cx).is_pending() {
+            return false;
+        }
+        self.fired = true;
+        true
+    }
+}
+
 // -- Request-trailer trust boundary -------------------------------------------
 
 /// Apply the canonical backend request-trailer filter to one client request
