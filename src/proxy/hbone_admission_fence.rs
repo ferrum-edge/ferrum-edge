@@ -179,6 +179,7 @@
 //! ext_authz delegation is not re-consulted (below). See `docs/mesh.md` →
 //! "HBONE Admission Fence".
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -198,7 +199,7 @@ use super::{
     mesh_egress_udp_destination_allowed, mesh_inbound_peer_auth_transport_mismatch_for_policy,
     sidecar_inbound_refuses_matched_http_connect,
 };
-use crate::config::types::{Proxy, UpstreamTarget};
+use crate::config::types::{Consumer, Proxy, UpstreamTarget};
 use crate::plugin_cache::PluginCacheRequestView;
 use crate::plugins::mesh::authz::MESH_AUTHZ_REEVALUATION_METADATA_KEY;
 use crate::plugins::{HboneReuseContext, Plugin, PluginResult, ProxyProtocol, RequestContext};
@@ -713,7 +714,10 @@ pub(crate) fn parse_leaf_credential_deadline(
 /// so a sweep can re-run the same decision against a later generation.
 pub struct HboneAdmissionSnapshot {
     /// Request context after the authorize and `before_proxy` phases. Cloned
-    /// per sweep because `authorize` takes `&mut`.
+    /// per sweep because `authorize` takes `&mut`. Its `identified_consumer` is
+    /// the record admission read; a sweep replaces it, in the clone, with the
+    /// judged generation's record for the same `namespace` + `id` (see
+    /// `AdmittedConsumerLookup`).
     pub ctx: RequestContext,
     /// The effective (post-route-override) proxy the relay dialed through.
     pub proxy: Arc<Proxy>,
@@ -1986,6 +1990,10 @@ impl HboneAdmissionFence {
             .filter_map(|entry| entry.value().upgrade())
             .map(|inner| AdmittedHboneTunnel { inner })
             .collect();
+        // Built once per sweep, from the generation being judged, and only when
+        // some live tunnel was admitted as a mapped Consumer.
+        let all_consumers = epoch.consumer_index.consumers();
+        let consumers = AdmittedConsumerLookup::build(all_consumers.as_slice(), &live);
         let mut revoked = 0usize;
         for tunnel in live {
             // Cheap pre-filter only: a tunnel that retires or is claimed after
@@ -2003,7 +2011,8 @@ impl HboneAdmissionFence {
             // The shipped `release` profile is `panic = "abort"`, so this is the
             // dev/test-profile net; under `abort` the process is gone and no
             // tunnel is left silently unfenced either way.
-            let reevaluate = self.reevaluate(&tunnel.inner, &epoch, &policy, trust.as_ref());
+            let reevaluate =
+                self.reevaluate(&tunnel.inner, &epoch, &consumers, &policy, trust.as_ref());
             let outcome = std::panic::AssertUnwindSafe(reevaluate)
                 .catch_unwind()
                 .await;
@@ -2094,6 +2103,7 @@ impl HboneAdmissionFence {
         &self,
         tunnel: &AdmittedHboneTunnelInner,
         epoch: &RequestEpoch,
+        consumers: &AdmittedConsumerLookup<'_>,
         policy: &MeshInboundTlsPolicy,
         trust: Option<&InboundTrustSnapshot>,
     ) -> Option<HboneRevocationReason> {
@@ -2134,7 +2144,20 @@ impl HboneAdmissionFence {
             return Some(HboneRevocationReason::AuthorizationDenied);
         }
 
-        if self.authorize_chain_denies(snapshot, &view).await {
+        // The authorize chain judges the CURRENT Consumer record, not the one
+        // admission read: an ACL group removal or a username change is a
+        // Consumer edit, not a plugin-config edit, and a fresh CONNECT from the
+        // same credential would see it. A tunnel whose admitting Consumer the
+        // judged generation no longer carries is revoked outright — the
+        // credential that admitted it maps to nobody now, so the peer's next
+        // CONNECT cannot be admitted as that principal by any chain.
+        let consumer = match consumers.resolve(snapshot) {
+            AdmittedConsumer::Unmapped => None,
+            AdmittedConsumer::Current(current) => Some(current),
+            AdmittedConsumer::Withdrawn => return Some(HboneRevocationReason::AuthorizationDenied),
+        };
+
+        if self.authorize_chain_denies(snapshot, &view, consumer).await {
             return Some(HboneRevocationReason::AuthorizationDenied);
         }
 
@@ -2241,6 +2264,7 @@ impl HboneAdmissionFence {
         &self,
         snapshot: &HboneAdmissionSnapshot,
         view: &PluginCacheRequestView,
+        consumer: Option<Arc<Consumer>>,
     ) -> bool {
         let proxy = &snapshot.proxy;
         // Only plugins whose `authorize` is free of side effects and external
@@ -2259,6 +2283,7 @@ impl HboneAdmissionFence {
         }
         self.reevaluations.fetch_add(1, Ordering::Relaxed);
         let mut ctx = snapshot.ctx.clone();
+        ctx.identified_consumer = consumer;
         ctx.metadata.insert(
             MESH_AUTHZ_REEVALUATION_METADATA_KEY.to_string(),
             "true".to_string(),
@@ -2283,6 +2308,67 @@ impl HboneAdmissionFence {
             }
         }
         false
+    }
+}
+
+/// What the generation a sweep judges carries for the Consumer a tunnel was
+/// admitted as.
+enum AdmittedConsumer {
+    /// The tunnel was not admitted as a mapped Consumer.
+    Unmapped,
+    /// The judged generation's record for the admitted `namespace` + `id`.
+    Current(Arc<Consumer>),
+    /// The judged generation carries no Consumer with the admitted
+    /// `namespace` + `id`.
+    Withdrawn,
+}
+
+/// The judged generation's Consumers keyed by their stable identity
+/// (`namespace`, then `id`), for re-resolving the Consumer each live tunnel was
+/// admitted as.
+///
+/// The admission snapshot holds the `Arc<Consumer>` the CONNECT path mapped,
+/// which no later publication rewrites; re-running the authorize chain against
+/// it would judge a de-provisioned principal by its old ACL groups forever.
+/// Built once per sweep and empty unless some live tunnel carries a mapped
+/// Consumer, so a sweep over SPIFFE-only tunnels does no work here. Keyed in
+/// two levels so lookups borrow the snapshot's strings without allocating.
+struct AdmittedConsumerLookup<'a> {
+    by_namespace: HashMap<&'a str, ConsumersById<'a>>,
+}
+
+/// One namespace's Consumers, keyed by record id.
+type ConsumersById<'a> = HashMap<&'a str, &'a Arc<Consumer>>;
+
+impl<'a> AdmittedConsumerLookup<'a> {
+    fn build(consumers: &'a [Arc<Consumer>], live: &[AdmittedHboneTunnel]) -> Self {
+        let mut by_namespace: HashMap<&'a str, ConsumersById<'a>> = HashMap::new();
+        if live
+            .iter()
+            .any(|tunnel| tunnel.inner.snapshot.ctx.identified_consumer.is_some())
+        {
+            for consumer in consumers {
+                by_namespace
+                    .entry(consumer.namespace.as_str())
+                    .or_default()
+                    .insert(consumer.id.as_str(), consumer);
+            }
+        }
+        Self { by_namespace }
+    }
+
+    fn resolve(&self, snapshot: &HboneAdmissionSnapshot) -> AdmittedConsumer {
+        let Some(admitted) = snapshot.ctx.identified_consumer.as_deref() else {
+            return AdmittedConsumer::Unmapped;
+        };
+        match self
+            .by_namespace
+            .get(admitted.namespace.as_str())
+            .and_then(|by_id| by_id.get(admitted.id.as_str()))
+        {
+            Some(current) => AdmittedConsumer::Current(Arc::clone(*current)),
+            None => AdmittedConsumer::Withdrawn,
+        }
     }
 }
 

@@ -83,7 +83,7 @@ use tokio::sync::watch;
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope, Proxy};
+use ferrum_edge::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::identity::{
@@ -3646,6 +3646,159 @@ async fn an_access_control_chain_refuses_the_connect_it_would_have_let_reuse() {
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
     conn_task.abort();
+}
+
+/// A globally scoped `access_control` row that admits only Consumers in the
+/// `engineering` ACL group.
+fn access_control_engineering_plugin() -> PluginConfig {
+    PluginConfig {
+        labels: Default::default(),
+        id: "operator-access-control-engineering".to_string(),
+        plugin_name: "access_control".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        config: json!({ "allowed_groups": ["engineering"] }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn fence_acl_consumer(id: &str, username: &str, groups: &[&str]) -> Consumer {
+    Consumer {
+        labels: Default::default(),
+        id: id.to_string(),
+        username: username.to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: groups.iter().map(|group| group.to_string()).collect(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// The Consumer the fence ACL fixtures admit, with the given ACL groups.
+fn fence_alice(groups: &[&str]) -> Consumer {
+    fence_acl_consumer("fence-acl-alice", "alice", groups)
+}
+
+/// [`prepared_config_with`] carrying the `engineering` ACL policy and the given
+/// Consumer records.
+fn consumer_acl_config(app_port: u16, consumers: Vec<Consumer>) -> GatewayConfig {
+    let mut config = prepared_config_with(
+        Some(app_port),
+        None,
+        vec![allow_client()],
+        vec![access_control_engineering_plugin()],
+    );
+    config.consumers = consumers;
+    config
+}
+
+/// [`dual_gate_snapshot`] admitted as a mapped Consumer — what `mtls_auth`
+/// leaves in the CONNECT context. Under the default PERMISSIVE posture only the
+/// authorize gate is armed.
+fn consumer_mapped_snapshot(
+    proxy: Arc<Proxy>,
+    consumer: Consumer,
+    admission_sweep_epoch: u64,
+) -> HboneAdmissionSnapshot {
+    let mut snapshot = dual_gate_snapshot(proxy, admission_sweep_epoch);
+    snapshot.ctx.identified_consumer = Some(Arc::new(consumer));
+    snapshot
+}
+
+/// The sweep must judge the CURRENT Consumer record, not the `Arc<Consumer>`
+/// the CONNECT captured: removing the admitting Consumer from the ACL group the
+/// policy allows is a Consumer edit, and a fresh CONNECT would be refused for
+/// it, so the live tunnel must be revoked too. An unrelated Consumer edit
+/// re-judges the tunnel and keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_admitting_consumers_acl_group_revokes_a_live_tunnel() {
+    const APP_PORT: u16 = 8080;
+    let state = build_state(consumer_acl_config(
+        APP_PORT,
+        vec![fence_alice(&["engineering"])],
+    ));
+    let fence = &state.hbone_admission_fence;
+    let proxy = Arc::new(create_mesh_proxy(APP_PORT));
+
+    let tunnel = fence.admit(consumer_mapped_snapshot(
+        proxy,
+        fence_alice(&["engineering"]),
+        fence.sweep_epoch(),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    let completed_before = fence.sweeps_completed();
+    let reevaluations_before = fence.reevaluations();
+    let outcome = state.update_config(consumer_acl_config(
+        APP_PORT,
+        vec![
+            fence_alice(&["engineering"]),
+            fence_acl_consumer("fence-acl-bob", "bob", &[]),
+        ],
+    ));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_sweep_after(&state, completed_before).await;
+    assert!(
+        fence.reevaluations() > reevaluations_before,
+        "the publication must re-judge the live tunnel"
+    );
+    assert_eq!(
+        tunnel.revoked_reason(),
+        None,
+        "an unrelated Consumer edit must keep a tunnel whose Consumer is still allowed"
+    );
+
+    let outcome = state.update_config(consumer_acl_config(APP_PORT, vec![fence_alice(&[])]));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::AuthorizationDenied),
+        "the admitting Consumer left the allowed group, so access_control must deny the \
+         re-judged tunnel"
+    );
+    assert_eq!(
+        revocation_counts(&state),
+        [0, 0, 0, 0, 1, 0, 0, 0, 0],
+        "exactly one authorization_denied revocation"
+    );
+}
+
+/// A tunnel whose admitting Consumer the published generation no longer
+/// carries is revoked: the credential that admitted it maps to nobody now.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_the_admitting_consumer_revokes_a_live_tunnel() {
+    const APP_PORT: u16 = 8080;
+    let state = build_state(consumer_acl_config(
+        APP_PORT,
+        vec![fence_alice(&["engineering"])],
+    ));
+    let fence = &state.hbone_admission_fence;
+    let proxy = Arc::new(create_mesh_proxy(APP_PORT));
+
+    let tunnel = fence.admit(consumer_mapped_snapshot(
+        proxy,
+        fence_alice(&["engineering"]),
+        fence.sweep_epoch(),
+    ));
+    assert_eq!(tunnel.revoked_reason(), None);
+
+    let outcome = state.update_config(consumer_acl_config(APP_PORT, Vec::new()));
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+    wait_for_revocation(&tunnel).await;
+    assert_eq!(
+        tunnel.revoked_reason(),
+        Some(HboneRevocationReason::AuthorizationDenied)
+    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 1, 0, 0, 0, 0]);
 }
 
 /// The datagram CONNECT path never advertises reuse, whatever its admitting

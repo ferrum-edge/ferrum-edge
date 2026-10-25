@@ -534,7 +534,14 @@ BEFORE the session's capability set exists, so a skipped instance forces neither
 framing nor a parser ceiling and cannot pull a session off the raw tunnel path;
 UDP/DTLS decisions filter the session's datagram-hook list ONCE at first-datagram
 admission (`plugins::admitted_datagram_plugins`), so nothing is evaluated,
-allocated, hashed, or locked per packet. Carriers are non-serialized,
+allocated, hashed, or locked per packet. The session also carries a
+`UdpDatagramPolicyFence` (`src/proxy/udp_proxy.rs`): two atomic loads (verified
+vs published config generation) per check; when it moves, the proxy's
+precomputed datagram-hook POLICY digest (`plugin_cache::udp_datagram_policy_digest`,
+per-config digests registered at `finalize_created_plugin`, so identical full
+rebuilds compare equal — never `Arc` identity) is compared and a changed policy ENDS
+the session (never swaps hooks in place — trigger decisions belong to the
+admission generation), so the next datagram is re-admitted under the new policy. Carriers are non-serialized,
 crate-constructed, keyed by the compiled gate's process-local token (never chain
 position, load order, plugin name, or plugin-writable metadata), and owned by the
 plugin generation that minted the gate. Explicit `false` skips, explicit `true`
@@ -673,6 +680,9 @@ on a native-gRPC request.
 - Default path must remain byte-for-byte identical and zero allocation when no schema is configured.
 - Metadata redaction must apply for renamed metadata and flattened metadata too.
 - `transaction_log_schema` is global-only and constructed first during plugin-cache rebuild so later plugins can resolve `schema_ref`.
+- Loggers compile `schema_ref` at construction, so a retained instance is only valid while its referenced definition is unchanged: `ProxyGroupPluginInstance` records the raw definition it resolved, and the delta build drops (and rebuilds every associated proxy for) a group whose definition changed when `rebuild_globals` re-staged the registry.
+- Production reload brackets open through `registry::begin_reload_guarded()` (RAII abort on unwind); keep the explicit commit/abort calls on normal paths.
+- `transforms` (`truncate` / `ip_prefix` / keyed `hash`) are transaction-summary-family only. A `SchemaSerializable` entry kind must expose every transformable field through `native_text`; the default `NotTransformable` drops a transformed field rather than emitting it raw. `flatten` + `overwrite` substitutes in place via `metadata_value`, never a duplicate key.
 - `prometheus_metrics` still rejects `schema:` / `schema_ref:` — its label names are baked into the time-series store.
 - `SchemaCapabilities.family` (`RecordFamily`) selects the field inventory. Non-summary families: `api_chargeback` (the `/charges` per-proxy billing row), `api_chargeback_sink` (the exported `ChargeEvent`), `transaction_debugger` (its own HTTP/stream/WS diagnostic names). A family rejects, with a plugin- and field-specific diagnostic, whatever it cannot express: `summary_type`, `timestamp_format`, and `metadata` for the two chargeback families, `order` for the chargeback report (sorted `serde_json::Map` document), `backend_host` for charge events, and every derived kind but `summary_kind` for the billing row.
 - Projection applies only at the externally emitted representation. It must never reach billing identity, charge accounting, registry/accumulator/snapshot keys, Prometheus labels, or spool ownership.
@@ -1024,7 +1034,7 @@ on a native-gRPC request.
 - Add unit tests for valid and invalid configs in `tests/unit/plugins/` and register the module.
 - Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
-- Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`stdout_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
+- Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`http_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
 - Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup.
 - A plugin config field that names a process environment variable (credential
   or URL) resolves it ONLY through `plugins::utils::plugin_secret_env`

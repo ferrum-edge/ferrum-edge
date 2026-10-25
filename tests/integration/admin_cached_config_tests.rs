@@ -7720,6 +7720,131 @@ async fn test_consumer_delete_referenced_by_access_control_returns_409() {
     );
 }
 
+/// A rename detaches every byte-for-byte `access_control` entry naming the old
+/// username, so `PUT /consumers/{id}` that changes the username is refused with
+/// `409` while one does — on the deny side as well as the allow side, because a
+/// renamed principal would otherwise silently escape its revocation.
+#[tokio::test]
+async fn test_consumer_rename_referenced_by_access_control_returns_409() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let consumer = json!({
+        "id": "acl-rename-cs",
+        "username": "mallory"
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    let proxy = json!({
+        "id": "acl-rename-px",
+        "listen_path": "/acl-rename",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    let deny_only = json!({
+        "id": "acl-rename-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-rename-px",
+        "enabled": true,
+        "config": {"disallowed_consumers": ["mallory"]}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &deny_only).await;
+    assert_eq!(status, 201, "Create plugin failed: {:?}", body);
+
+    let renamed = json!({
+        "id": "acl-rename-cs",
+        "username": "m.reyes"
+    });
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &renamed).await;
+    assert_eq!(
+        status, 409,
+        "a rename must be refused while disallowed_consumers names the old username: {:?}",
+        body
+    );
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "Consumer is referenced by one or more access_control plugin_configs and cannot be renamed",
+        "409 body must use the documented error string: {:?}",
+        body
+    );
+    let (status, consumer_body, _) = admin_get(&base_url, "/consumers/acl-rename-cs", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        consumer_body["username"], "mallory",
+        "a refused rename must leave the consumer unchanged: {:?}",
+        consumer_body
+    );
+
+    // An update that keeps the username is unaffected by the guard.
+    let regrouped = json!({
+        "id": "acl-rename-cs",
+        "username": "mallory",
+        "acl_groups": ["contractors"]
+    });
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &regrouped).await;
+    assert_eq!(status, 200, "a non-rename update must succeed: {:?}", body);
+
+    // The allow side pins the username too.
+    let allow_only = json!({
+        "id": "acl-rename-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-rename-px",
+        "enabled": true,
+        "config": {"allowed_consumers": ["mallory"]}
+    });
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/acl-rename-pc?expected_proxy_ids=",
+        &token,
+        &allow_only,
+    )
+    .await;
+    assert_eq!(status, 200, "Updating access_control failed: {:?}", body);
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &renamed).await;
+    assert_eq!(
+        status, 409,
+        "a rename must be refused while allowed_consumers names the old username: {:?}",
+        body
+    );
+
+    // Once the policy names the new username, the rename succeeds.
+    let retargeted = json!({
+        "id": "acl-rename-pc",
+        "plugin_name": "access_control",
+        "scope": "proxy",
+        "proxy_id": "acl-rename-px",
+        "enabled": true,
+        "config": {"allowed_consumers": ["m.reyes"]}
+    });
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/acl-rename-pc?expected_proxy_ids=",
+        &token,
+        &retargeted,
+    )
+    .await;
+    assert_eq!(status, 200, "Updating access_control failed: {:?}", body);
+    let (status, body) = admin_put(&base_url, "/consumers/acl-rename-cs", &token, &renamed).await;
+    assert_eq!(
+        status, 200,
+        "a rename of an unreferenced username must succeed: {:?}",
+        body
+    );
+    let (status, consumer_body, _) = admin_get(&base_url, "/consumers/acl-rename-cs", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(consumer_body["username"], "m.reyes");
+}
+
 #[tokio::test]
 async fn test_delete_hand_managed_proxy_orphan_cleans_last_referenced_hand_owned_upstream() {
     let tc = TestConfig::default();

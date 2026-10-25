@@ -7658,6 +7658,15 @@ pub struct ProxyState {
     /// release) → SVID material (install, then release) → request epoch
     /// (commit). No helper called inside this boundary reacquires publication.
     pub gateway_trust_publication_lock: Arc<std::sync::Mutex<()>>,
+    /// Consumer `jwt` secrets this process has seen configured on more than
+    /// one Consumer of a namespace (namespace-bound digests only). Every
+    /// full and incremental swap quarantines against it, so a later point
+    /// delta cannot reactivate a key another Consumer is known to hold after
+    /// the live snapshot already stripped that other holder. Locked only on
+    /// the config-swap cold path, never on the request path. Only accepted
+    /// candidates record into it, and it is bounded per namespace.
+    pub jwt_shared_secret_history:
+        Arc<std::sync::Mutex<crate::config::types::JwtSharedSecretHistory>>,
     /// Whether this process cannot know its namespace's AUTHORITATIVE gateway
     /// trust state (issue #3727).
     ///
@@ -10579,6 +10588,13 @@ impl ProxyState {
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
         reserved_gateway_ports: HashSet<u16>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        // Seed the shared-secret history from the shared JWT secrets the
+        // full loader already stripped from this initial snapshot.
+        let mut initial_jwt_history = crate::config::types::JwtSharedSecretHistory::default();
+        let initial_jwt_shared = std::mem::take(&mut config.quarantined_jwt_shared_secrets);
+        if initial_jwt_history.merge(&initial_jwt_shared) > 0 {
+            warn_jwt_shared_secret_history_evicted();
+        }
         if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
             for msg in &errors {
                 error!("Initial config rejected: {}", msg);
@@ -11288,6 +11304,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
+            jwt_shared_secret_history: Arc::new(std::sync::Mutex::new(initial_jwt_history)),
             gateway_trust_authority_unresolved: Arc::new(AtomicBool::new(false)),
             mesh_trust_registry,
             mesh_inbound_tls,
@@ -14026,6 +14043,28 @@ impl ProxyState {
         trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
         explicit_trust: Option<GatewayTrustCommit>,
     ) -> ConfigApplyOutcome {
+        // Weak, malformed, or cross-Consumer shared JWT secrets (including
+        // ones shared in an earlier accepted generation) never reach the
+        // ConsumerIndex. Shared secrets this candidate reveals are recorded
+        // only if the candidate is accepted.
+        let jwt_shared = self.quarantine_jwt_credentials(&mut new_config, Some("Config reload"));
+        let outcome = self.update_config_with_mesh_ids_quarantined(
+            new_config,
+            trusted_mesh_ids,
+            explicit_trust,
+        );
+        if outcome.accepted() {
+            self.record_jwt_shared_secrets(&jwt_shared);
+        }
+        outcome
+    }
+
+    fn update_config_with_mesh_ids_quarantined(
+        &self,
+        mut new_config: GatewayConfig,
+        trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+        explicit_trust: Option<GatewayTrustCommit>,
+    ) -> ConfigApplyOutcome {
         use crate::config_delta::ConfigDelta;
 
         // Normalize hostnames (ASCII-lowercase) and pre-compute each
@@ -14720,6 +14759,34 @@ impl ProxyState {
             u64,
         )>,
     ) -> IncrementalApplyResult {
+        let mut jwt_shared = crate::config::types::JwtSharedSecretRecords::default();
+        let applied = self
+            .apply_incremental_staged(
+                result,
+                explicit_trust,
+                database_topology_fence,
+                &mut jwt_shared,
+            )
+            .await;
+        if matches!(&applied, IncrementalApplyResult::Outcome(outcome) if outcome.accepted()) {
+            self.record_jwt_shared_secrets(&jwt_shared);
+        }
+        applied
+    }
+
+    /// [`Self::apply_incremental_inner`] without the history commit: shared
+    /// JWT secrets the patched snapshot reveals are written to `jwt_shared`
+    /// and recorded by the caller only if the delta is accepted.
+    async fn apply_incremental_staged(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+        explicit_trust: Option<GatewayTrustCommit>,
+        database_topology_fence: Option<(
+            &Arc<dyn crate::config::db_backend::DatabaseBackend>,
+            u64,
+        )>,
+        jwt_shared: &mut crate::config::types::JwtSharedSecretRecords,
+    ) -> IncrementalApplyResult {
         if result.is_empty() {
             // An empty resource delta still has to commit an explicit trust
             // decision: a CP trust-only update carries no resources at all.
@@ -14886,6 +14953,13 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Incremental config: {}", message);
         }
+        // Consumer `jwt` secrets get the same fail-closed treatment on the
+        // patched snapshot, so a delta that introduces a shared secret strips
+        // it from every Consumer holding it, not only the delta's rows. The
+        // patched snapshot no longer shows holders an earlier generation
+        // already stripped, so the process-local shared-secret history is
+        // what keeps a later delta from reactivating such a key.
+        *jwt_shared = self.quarantine_jwt_credentials(&mut new_config, Some("Incremental config"));
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -15255,12 +15329,56 @@ impl ProxyState {
         self.config.load_full()
     }
 
+    /// Quarantine weak, malformed, and shared Consumer `jwt` credentials in
+    /// a candidate about to be swapped, against this process's shared-secret
+    /// history, logging each quarantine under `context` (`None` discards the
+    /// diagnostics, for read-only comparison). Returns the shared
+    /// secrets the candidate revealed, including those its full loader
+    /// already stripped, for [`Self::record_jwt_shared_secrets`] once the
+    /// candidate is accepted. Cold path only.
+    fn quarantine_jwt_credentials(
+        &self,
+        config: &mut GatewayConfig,
+        context: Option<&str>,
+    ) -> crate::config::types::JwtSharedSecretRecords {
+        let mut shared = std::mem::take(&mut config.quarantined_jwt_shared_secrets);
+        let outcome = {
+            let history = self
+                .jwt_shared_secret_history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            config.quarantine_invalid_jwt_credentials_against(&history)
+        };
+        if let Some(context) = context {
+            for message in &outcome.messages {
+                error!("{}: {}", context, message);
+            }
+        }
+        shared.extend(outcome.shared);
+        shared
+    }
+
+    /// Merge shared JWT secrets from an accepted candidate into the history.
+    fn record_jwt_shared_secrets(&self, shared: &crate::config::types::JwtSharedSecretRecords) {
+        if shared.is_empty() {
+            return;
+        }
+        let evicted = self
+            .jwt_shared_secret_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .merge(shared);
+        if evicted > 0 {
+            warn_jwt_shared_secret_history_evicted();
+        }
+    }
+
     /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
     /// does before it swaps, so the result is content-comparable against
     /// [`Self::current_config`].
     ///
     /// `update_config` normalizes fields, resolves upstream TLS, quarantines
-    /// invalid HMAC credentials, and injects gateway workload-metrics identity
+    /// invalid HMAC and JWT credentials, and injects gateway workload-metrics identity
     /// **before** storing the snapshot. A raw CP-delivered candidate has not
     /// been through those node-local steps, so comparing it directly against
     /// the applied config reports a spurious mismatch on any node whose
@@ -15282,6 +15400,12 @@ impl ProxyState {
         candidate.normalize_fields();
         candidate.resolve_upstream_tls();
         let _ = candidate.quarantine_invalid_hmac_credentials();
+        // Quarantine against the live history without cloning it (diagnostics
+        // discarded like the HMAC ones above). Shared secrets a raw candidate
+        // reveals are kept: the source really assigns them to several
+        // Consumers, so recording them only fails closed.
+        let shared = self.quarantine_jwt_credentials(&mut candidate, None);
+        self.record_jwt_shared_secrets(&shared);
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
             &self.gateway_svid_bundle,
@@ -15289,6 +15413,16 @@ impl ProxyState {
         );
         candidate
     }
+}
+
+/// Warn that the bounded shared-secret history evicted older digests.
+fn warn_jwt_shared_secret_history_evicted() {
+    warn!(
+        "jwt_auth shared-secret history reached its per-namespace bound of {} digests; the \
+         oldest remembered shared secrets were forgotten. Replace shared Consumer JWT secrets \
+         on every former holder.",
+        crate::config::types::JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE
+    );
 }
 
 /// Drives the per-IP cleanup interval loop.
@@ -25052,6 +25186,54 @@ pub async fn log_rejected_request(
         false,
     )
     .await;
+}
+
+/// Deliver the terminal summary of a request that matched no proxy (the
+/// route-miss `404`) to the generation's global access logs
+/// (`PluginCacheInner::unrouted_transaction_log_plugins`).
+///
+/// Callers reach this only when such a logger exists, so the no-logger route
+/// miss keeps its allocation-free fast path. No request hook ran, so the
+/// summary has no proxy, backend, consumer, or plugin time; it carries
+/// `metadata.rejection_phase = "route_not_found"`. The routing diagnostic was
+/// already recorded by `record_route_miss`, so this does not record another.
+///
+/// `namespace` is the gateway's serving namespace (`FERRUM_NAMESPACE`), the
+/// only namespace a request that matched no proxy can be attributed to; never
+/// the resource-deserialization default.
+pub async fn log_unrouted_request(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    namespace: &str,
+    status_code: u16,
+    start_time: Instant,
+) {
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let mut metadata = clone_log_metadata(ctx);
+    metadata.insert(
+        "rejection_phase".to_string(),
+        crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE.to_string(),
+    );
+    let summary = TransactionSummary {
+        namespace: namespace.to_owned(),
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        http_method: ctx.method.clone(),
+        request_path: ctx.path.clone(),
+        response_status_code: status_code,
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: total_ms,
+        latency_backend_ttfb_ms: -1.0,
+        latency_backend_total_ms: -1.0,
+        latency_gateway_overhead_ms: total_ms,
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        bytes_sent: ctx
+            .bytes_sent_observed
+            .load(std::sync::atomic::Ordering::Acquire),
+        metadata,
+        ..TransactionSummary::default()
+    };
+    crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
 /// Run logging plugins for a rejection that occurred before backend contact.
@@ -35480,6 +35662,26 @@ async fn handle_proxy_request_inner(
                         response.status().as_u16(),
                     );
                     record_status(&state, response.status().as_u16());
+                    // Global access logs still record the miss (scanner and
+                    // stale-route traffic). Without one this stays the
+                    // allocation-free fast path: one pointer check. The
+                    // summary keeps the routing status (404) even when native
+                    // gRPC reshapes the head to trailers-only 200.
+                    if let Some(unrouted_log_plugins) =
+                        epoch.plugin_cache.unrouted_transaction_log_plugins()
+                    {
+                        ctx.materialize_headers();
+                        // Boxed: keep the logging future's state off the
+                        // request handler's (worker-stack) state machine.
+                        Box::pin(log_unrouted_request(
+                            &unrouted_log_plugins,
+                            &ctx,
+                            &state.env_config.namespace,
+                            StatusCode::NOT_FOUND.as_u16(),
+                            start_time,
+                        ))
+                        .await;
+                    }
                     return Ok(response);
                 }
             }
@@ -75905,6 +76107,7 @@ mod tests {
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
         GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies,
             consumers: vec![],

@@ -389,7 +389,7 @@ the full execution order and protocol support matrix.
 
 Plugins for AI and agent gateway use cases — transcript audit, cost visibility, budget enforcement, semantic policy, request policy, PII protection, output guardrails, prompt compression, streaming and non-streaming provider routing, MCP tool routing, and response caching:
 
-- **`ai_token_metrics`** — Extract token usage from LLM responses for observability only (SSE metrics require explicit buffered opt-in)
+- **`ai_token_metrics`** — Extract token usage from LLM responses for observability only (streamed SSE / AWS event-stream responses are metered incrementally without buffering; optional per-model pricing)
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
 - **`ai_rate_limiter`** — Enforce token budgets with pre-request reservation and response reconciliation (HTTP-only; native gRPC is unsupported) (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn

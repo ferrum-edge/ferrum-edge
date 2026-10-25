@@ -40,6 +40,14 @@ use crate::plugins::utils::log_schema::{
 /// itself remains an intentionally open map keyed by operator-defined names.
 pub const TRANSACTION_LOG_SCHEMA_CONFIG_KEYS: &[&str] = &["schemas"];
 
+/// Upper bound on the named schemas one `transaction_log_schema` config may
+/// declare. Every definition is compiled at admission, on every graph
+/// validation, and on every reload, so the count is bounded at the boundary.
+pub const MAX_NAMED_SCHEMAS: usize = 256;
+
+/// Upper bound on a named-schema name, in bytes.
+pub const MAX_SCHEMA_NAME_BYTES: usize = 128;
+
 #[derive(Debug)]
 pub struct TransactionLogSchema {
     /// Per-construction handle to every compiled schema. The registry retains
@@ -96,12 +104,23 @@ impl TransactionLogSchema {
                     .to_string(),
             );
         }
+        if obj.len() > MAX_NAMED_SCHEMAS {
+            return Err(format!(
+                "transaction_log_schema: `schemas` declares {} named schemas (maximum {MAX_NAMED_SCHEMAS})",
+                obj.len()
+            ));
+        }
 
         let mut entries = Vec::with_capacity(obj.len());
         let mut seen_names = BTreeSet::new();
         for (name, schema_value) in obj {
             if name.is_empty() {
                 return Err("transaction_log_schema: schema names must be non-empty".to_string());
+            }
+            if name.len() > MAX_SCHEMA_NAME_BYTES {
+                return Err(format!(
+                    "transaction_log_schema: schema names must be at most {MAX_SCHEMA_NAME_BYTES} bytes"
+                ));
             }
             if !seen_names.insert(name.clone()) {
                 return Err(format!(
@@ -179,12 +198,18 @@ pub(crate) fn validate_config_graph(
     let mut errors = Vec::new();
 
     for namespace in namespaces {
-        if let Err(error) = registry::begin_reload() {
-            errors.push(format!(
-                "transaction-log schema registry could not begin validation for namespace {namespace:?}: {error}"
-            ));
-            continue;
-        }
+        // The guard only matters if a constructor below unwinds: the explicit
+        // `abort_reload` at the end of this iteration closes the bracket on
+        // every normal path.
+        let _validation_bracket = match registry::begin_reload_guarded() {
+            Ok(guard) => guard,
+            Err(error) => {
+                errors.push(format!(
+                    "transaction-log schema registry could not begin validation for namespace {namespace:?}: {error}"
+                ));
+                continue;
+            }
+        };
 
         for plugin in config.plugin_configs.iter().filter(|plugin| {
             plugin.enabled

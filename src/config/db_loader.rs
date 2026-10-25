@@ -641,12 +641,8 @@ fn mesh_route_dispatch_referenced_upstream(
 /// (byte-for-byte). A delete must refuse while any plugin config in the
 /// namespace still authorizes that username; the operator's policy is not
 /// rewritten.
-fn access_control_plugin_allows_consumer(plugin: &PluginConfig, username: &str) -> bool {
-    if plugin.plugin_name != "access_control" {
-        return false;
-    }
-    plugin
-        .config
+fn access_control_plugin_allows_consumer(config: &serde_json::Value, username: &str) -> bool {
+    config
         .get("allowed_consumers")
         .and_then(|value| value.as_array())
         .is_some_and(|consumers| {
@@ -2723,6 +2719,30 @@ impl DatabaseStore {
             .run()?;
         Self::reject_invalid_gateway_plugin_references("load_full_config", &config)?;
 
+        // Fail-closed Consumer `jwt` secret policy: strip weak, malformed, or
+        // cross-Consumer shared JWT secrets (on every Consumer sharing one)
+        // instead of publishing them behind the warning-only field validation
+        // below. Admin write-time validation rejects new violations; this
+        // guard covers stored rows. It runs BEFORE identity quarantine: a
+        // consumer that identity quarantine removes still knows its secrets,
+        // so it must count as a holder when shared-key ownership is judged.
+        let jwt_outcome = config.quarantine_invalid_jwt_credentials_against(
+            &crate::config::types::JwtSharedSecretHistory::default(),
+        );
+        // Hand the stripped shared secrets to the serving `ProxyState`, which
+        // would otherwise receive this snapshot with no trace of them.
+        config.quarantined_jwt_shared_secrets = jwt_outcome.shared;
+        let jwt_quarantined = jwt_outcome.messages;
+        if !jwt_quarantined.is_empty() {
+            for message in &jwt_quarantined {
+                error!("{}", crate::startup::sanitize_startup_cause(message, &[]));
+            }
+            error!(
+                "Quarantined {} jwt credential(s) during full config load",
+                jwt_quarantined.len()
+            );
+        }
+
         // Fail-closed consumer identity handling (issue #2121): quarantine
         // (remove) consumers whose id/username/custom_id collides with an
         // earlier-loaded consumer instead of warn-and-overwrite, which
@@ -2755,7 +2775,9 @@ impl DatabaseStore {
                 hmac_quarantined.len()
             );
         }
-        let consumer_quarantine_active = !quarantined.is_empty() || !hmac_quarantined.is_empty();
+
+        let consumer_quarantine_active =
+            !quarantined.is_empty() || !hmac_quarantined.is_empty() || !jwt_quarantined.is_empty();
 
         ValidationPipeline::new(&mut config)
             .resolve_upstream_tls()
@@ -4607,19 +4629,41 @@ impl DatabaseStore {
         // identical values would falsely report 0 for an existing row.
         // FOR UPDATE locks the row against a concurrent delete until commit.
         let exists_sql = if self.db_type == "sqlite" {
-            self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ?")
+            self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ?")
         } else {
-            self.q("SELECT id FROM consumers WHERE id = ? AND namespace = ? FOR UPDATE")
+            self.q("SELECT id, username FROM consumers WHERE id = ? AND namespace = ? FOR UPDATE")
         };
         let existing: Option<AnyRow> = sqlx::query(&exists_sql)
             .bind(&consumer.id)
             .bind(&consumer.namespace)
             .fetch_optional(&mut *tx)
             .await?;
-        if existing.is_none() {
+        let Some(existing) = existing else {
             tx.rollback().await?;
             self.check_slow_query("update_consumer", start);
             return Ok(false);
+        };
+        // A rename detaches every byte-for-byte `access_control` entry naming
+        // the old username, so it is refused while one does (the delete guard's
+        // sibling; see `access_control::config_names_consumer_username`).
+        let previous_username: String = existing.try_get("username")?;
+        if previous_username != consumer.username
+            && let Some(plugin) = self
+                .find_access_control_consumer_ref_tx(
+                    &mut tx,
+                    &consumer.namespace,
+                    &previous_username,
+                    crate::plugins::access_control::config_names_consumer_username,
+                )
+                .await?
+        {
+            tx.rollback().await?;
+            anyhow::bail!(
+                "Consumer {:?} is referenced by access_control plugin_config {:?} and cannot be \
+                 renamed",
+                consumer.id,
+                plugin.id
+            );
         }
         self.delete_consumer_credential_index_tx(&mut tx, &consumer.namespace, &consumer.id)
             .await?;
@@ -4683,7 +4727,12 @@ impl DatabaseStore {
         };
         let username: String = existing.try_get("username")?;
         if let Some(plugin) = self
-            .find_access_control_consumer_ref_tx(&mut tx, namespace, &username)
+            .find_access_control_consumer_ref_tx(
+                &mut tx,
+                namespace,
+                &username,
+                access_control_plugin_allows_consumer,
+            )
             .await?
         {
             tx.rollback().await?;
@@ -6092,11 +6141,14 @@ impl DatabaseStore {
         }))
     }
 
+    /// First `access_control` plugin config in `namespace` whose config
+    /// `references` reports as naming `username`.
     async fn find_access_control_consumer_ref_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         username: &str,
+        references: fn(&serde_json::Value, &str) -> bool,
     ) -> Result<Option<PluginConfig>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query(
             &self.q("SELECT * FROM plugin_configs WHERE plugin_name = ? AND namespace = ?"),
@@ -6108,7 +6160,7 @@ impl DatabaseStore {
 
         for row in &rows {
             let plugin = row_to_plugin_config(row)?;
-            if access_control_plugin_allows_consumer(&plugin, username) {
+            if plugin.plugin_name == "access_control" && references(&plugin.config, username) {
                 return Ok(Some(plugin));
             }
         }

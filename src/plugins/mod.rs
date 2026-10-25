@@ -1358,6 +1358,11 @@ pub struct UdpDatagramContext<'a> {
     /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
     /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
+    /// The same canonical client identity as a typed address, computed once
+    /// per session alongside [`Self::client_ip`], so a hook that keys or masks
+    /// by address (for example `udp_rate_limiting`'s IPv6 prefix grouping)
+    /// never re-parses or re-allocates per datagram.
+    pub client_ip_addr: std::net::IpAddr,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
@@ -10735,7 +10740,7 @@ pub struct StreamTransactionSummary {
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), request_deduplication (3010), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_token_metrics (4070), ai_response_guard (4075), security_headers (4080), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
 pub mod priority {
@@ -10855,13 +10860,20 @@ pub mod priority {
     ///   hit short-circuits before that later external side effect.
     pub const AI_SEMANTIC_CACHE: u16 = 4057;
     pub const AI_FEDERATION: u16 = 4060;
+    /// `ai_token_metrics`: observability-only usage extraction. Pinned after
+    /// `ai_federation` (4060), which stages its typed usage first, and BEFORE
+    /// `ai_response_guard` (4075): a guard rejection breaks the
+    /// `on_response_body` loop and replaces a provider-consumed 2xx body, and
+    /// on a stream a guard cut stops later inspectors from seeing the terminal
+    /// usage event. Observing first keeps the billed generation's tokens and
+    /// cost in metadata and Prometheus even when policy then refuses it.
+    pub const AI_TOKEN_METRICS: u16 = 4070;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
     /// `security_headers`: injects response security headers and strips
     /// fingerprinting headers in `after_proxy`. Runs late in the response band
     /// so it is authoritative over `response_transformer` (4000) and
     /// `compression` (4050) header changes.
     pub const SECURITY_HEADERS: u16 = 4080;
-    pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const STATSD_LOGGING: u16 = 9075;
@@ -14539,7 +14551,9 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
         "transaction_log_schema",
         PluginFailurePolicy::KeepLastKnownGood,
     ),
-    builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
+    // The access log is an audit trail: a reload that cannot construct it keeps
+    // the previous generation instead of publishing one without it.
+    builtin_plugin("stdout_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("tcp_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),

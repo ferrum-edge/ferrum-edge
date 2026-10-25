@@ -462,6 +462,36 @@ pub trait RateLimitAlgorithm: Send + Sync + 'static {
     fn check_local(&self, state: &mut Self::State, op: &Self::Op, now: Instant)
     -> RateLimitOutcome;
 
+    /// Whether [`Self::check_local_shared`] can decide an existing key's
+    /// admission through a shared map reference for THIS policy. When `false`
+    /// (the default) [`LocalLimiter`] never takes the shared-reference lookup,
+    /// so the other algorithms keep their single exclusive-guard lookup
+    /// unchanged. Return `true` only when one atomic read-modify-write decides
+    /// the operation, so concurrent shared decisions still have a valid
+    /// serial order.
+    fn admits_shared_state_check(&self) -> bool {
+        false
+    }
+
+    /// Decide an existing key's admission while holding only a SHARED map
+    /// reference, so concurrent checks of one key — and of unrelated keys on
+    /// its shard — do not serialize on an exclusive shard guard.
+    ///
+    /// Return `None` whenever the decision needs exclusive access (for
+    /// example a window rollover that resets several counters together); the
+    /// caller then retries through [`Self::check_local`] under the exclusive
+    /// entry guard. Only consulted when [`Self::admits_shared_state_check`]
+    /// is true.
+    fn check_local_shared(
+        &self,
+        state: &Self::State,
+        op: &Self::Op,
+        now: Instant,
+    ) -> Option<RateLimitOutcome> {
+        let _ = (state, op, now);
+        None
+    }
+
     async fn check_redis(
         &self,
         redis: &Arc<RedisRateLimitClient>,
@@ -487,6 +517,11 @@ where
     /// never increment this; tests assert it stays flat under admission.
     #[cfg(debug_assertions)]
     all_shard_len_calls: AtomicUsize,
+    /// Counts exclusive `DashMap::entry` acquisitions. Tests assert that steady
+    /// occupied-key admission for a policy whose
+    /// [`RateLimitAlgorithm::admits_shared_state_check`] is true leaves it flat.
+    #[cfg(debug_assertions)]
+    exclusive_entry_calls: AtomicUsize,
     #[cfg(test)]
     shard_amount: usize,
 }
@@ -509,6 +544,8 @@ where
             entry_count: AtomicUsize::new(0),
             #[cfg(debug_assertions)]
             all_shard_len_calls: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            exclusive_entry_calls: AtomicUsize::new(0),
             #[cfg(test)]
             shard_amount,
         }
@@ -535,6 +572,20 @@ where
         max_entries: usize,
     ) -> Option<RateLimitOutcome> {
         use dashmap::mapref::entry::Entry;
+        // Steady occupied-key fast path for algorithms whose state is fully
+        // atomic: a shared shard reference, not the exclusive entry guard.
+        // A rollover (or any decision the algorithm declines to take shared)
+        // falls through to the exclusive path below, which re-checks from
+        // scratch. Exclusive writers cannot run while this reference is held,
+        // so the shared decision never interleaves with a reset.
+        if self.algorithm.admits_shared_state_check()
+            && let Some(existing) = self.state.get(&key)
+            && let Some(outcome) = self.algorithm.check_local_shared(existing.value(), op, now)
+        {
+            return Some(outcome);
+        }
+        #[cfg(debug_assertions)]
+        self.exclusive_entry_calls.fetch_add(1, Ordering::Relaxed);
         match self.state.entry(key) {
             Entry::Occupied(mut occupied) => {
                 Some(self.algorithm.check_local(occupied.get_mut(), op, now))
@@ -632,6 +683,19 @@ where
         #[cfg(debug_assertions)]
         {
             self.all_shard_len_calls.load(Ordering::Relaxed)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
+    }
+
+    /// Number of exclusive entry-guard acquisitions since construction.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn exclusive_entry_calls_for_test(&self) -> usize {
+        #[cfg(debug_assertions)]
+        {
+            self.exclusive_entry_calls.load(Ordering::Relaxed)
         }
         #[cfg(not(debug_assertions))]
         {
@@ -1421,10 +1485,13 @@ impl SharedLocalLimiterState for WsFrameRateAlgorithm {
 }
 
 impl SharedLocalLimiterState for UdpRateLimitAlgorithm {
-    type Key = Arc<str>;
+    /// The masked client address itself (IPv4 host, IPv6 `ipv6_prefix`
+    /// network): fixed-size and `Copy`, so a datagram's key is never parsed,
+    /// formatted, or allocated on the hot path.
+    type Key = std::net::IpAddr;
 
-    fn registry() -> &'static LocalLimiterRegistry<Arc<str>, Self> {
-        static REGISTRY: LocalLimiterRegistry<Arc<str>, UdpRateLimitAlgorithm> =
+    fn registry() -> &'static LocalLimiterRegistry<std::net::IpAddr, Self> {
+        static REGISTRY: LocalLimiterRegistry<std::net::IpAddr, UdpRateLimitAlgorithm> =
             LocalLimiterRegistry::new();
         &REGISTRY
     }
@@ -1589,6 +1656,12 @@ where
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn shares_local_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(self.local_state_arc(), other.local_state_arc())
+    }
+
+    /// Exclusive entry-guard acquisitions on the local/fallback map.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn exclusive_entry_calls_for_test(&self) -> usize {
+        self.local_state_arc().exclusive_entry_calls_for_test()
     }
 
     fn local_state_arc(&self) -> &Arc<LocalLimiter<K, A>> {
@@ -4068,28 +4141,29 @@ impl UdpRateLimitAlgorithm {
             epoch_base,
         }
     }
-}
 
-#[async_trait]
-impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
-    type State = UdpWindowState;
-    type Op = UdpRateLimitOp;
-
-    /// A plain fixed window with no previous-window term and no sub-buckets.
-    const REQUIRES_SERVER_CLOCK: bool = false;
-
-    fn new_state(&self) -> Self::State {
-        UdpWindowState::new(0, 0)
+    /// Seconds since this algorithm's epoch base, and the fixed window index
+    /// they fall in.
+    #[inline]
+    fn window_position(&self, now: Instant) -> (u64, u64) {
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
+        (now_secs, now_secs / self.window_seconds)
     }
 
-    fn check_local(
+    /// Charge one datagram to `state` and decide it.
+    ///
+    /// The rollover reset (`window_epoch` CAS, then zeroing `count` and
+    /// `bytes`) is a multi-atomic step that is only race-free under the
+    /// map's exclusive entry guard. [`RateLimitAlgorithm::check_local_shared`]
+    /// therefore calls this only after proving no rollover is due, and
+    /// rollover is never attempted while another holder has the state shared.
+    fn charge_window(
         &self,
-        state: &mut Self::State,
-        op: &Self::Op,
-        now: Instant,
+        state: &UdpWindowState,
+        op: &UdpRateLimitOp,
+        now_secs: u64,
+        current_epoch: u64,
     ) -> RateLimitOutcome {
-        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
-        let current_epoch = now_secs / self.window_seconds;
         let stored_epoch = state.window_epoch.load(Ordering::Acquire);
 
         if current_epoch > stored_epoch
@@ -4137,6 +4211,62 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
         }
 
         RateLimitOutcome::allow()
+    }
+}
+
+#[async_trait]
+impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
+    type State = UdpWindowState;
+    type Op = UdpRateLimitOp;
+
+    /// A plain fixed window with no previous-window term and no sub-buckets.
+    const REQUIRES_SERVER_CLOCK: bool = false;
+
+    fn new_state(&self) -> Self::State {
+        UdpWindowState::new(0, 0)
+    }
+
+    fn check_local(
+        &self,
+        state: &mut Self::State,
+        op: &Self::Op,
+        now: Instant,
+    ) -> RateLimitOutcome {
+        let (now_secs, current_epoch) = self.window_position(now);
+        self.charge_window(state, op, now_secs, current_epoch)
+    }
+
+    /// Every field of [`UdpWindowState`] is atomic, but a datagram charges the
+    /// count and the byte total with two separate atomic additions. With ONE
+    /// axis bounded, the decision rests on a single read-modify-write, so
+    /// concurrent shared decisions serialize in that counter's order. With
+    /// BOTH bounded, two datagrams could each take an earlier position on a
+    /// different counter and both be refused where every serial order admits
+    /// one of them, so a two-axis policy keeps the exclusive entry guard.
+    fn admits_shared_state_check(&self) -> bool {
+        self.datagrams_per_window.is_none() || self.bytes_per_window.is_none()
+    }
+
+    fn check_local_shared(
+        &self,
+        state: &Self::State,
+        op: &Self::Op,
+        now: Instant,
+    ) -> Option<RateLimitOutcome> {
+        // Defensive: a caller that skipped `admits_shared_state_check` still
+        // cannot take an incoherent two-axis decision here.
+        if !self.admits_shared_state_check() {
+            return None;
+        }
+        let (now_secs, current_epoch) = self.window_position(now);
+        // A due rollover resets several counters together; leave it to the
+        // exclusive path. Under this shared reference no exclusive holder can
+        // advance the epoch, so `charge_window` sees the same stored epoch and
+        // never attempts the reset itself.
+        if current_epoch > state.window_epoch.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(self.charge_window(state, op, now_secs, current_epoch))
     }
 
     async fn check_redis(

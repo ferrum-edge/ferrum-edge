@@ -1812,8 +1812,9 @@ impl std::error::Error for IncrementalFullReloadRequired {}
 /// Whether consumer deltas can be applied incrementally for each namespace
 /// (issue #6060).
 ///
-/// Load-time quarantine removes colliding consumers and strips weak or
-/// duplicate `hmac_auth` credentials, first-loaded consumer wins. A delta
+/// Load-time quarantine removes colliding consumers, strips weak or
+/// duplicate `hmac_auth` credentials (first-loaded consumer wins), and strips
+/// weak, malformed, or shared `jwt` credentials (from every holder). A delta
 /// patched onto that sanitized snapshot is only equivalent to a fresh full
 /// load when nothing is quarantined: then a delete or update cannot free a
 /// stripped credential or a shadowed identity, because there is none, and
@@ -1827,9 +1828,11 @@ impl std::error::Error for IncrementalFullReloadRequired {}
 /// unknown namespace escalates, so a missed record costs one extra full
 /// reload, never a stale credential.
 ///
-/// Independently of this state, a changed consumer carrying `hmac_auth` always
-/// escalates ([`consumer_change_requires_authoritative_reload`]): which of two
-/// consumers keeps a shared secret depends on full-load order.
+/// Independently of this state, a changed consumer carrying `hmac_auth` or
+/// `jwt` always escalates ([`consumer_change_requires_authoritative_reload`]):
+/// which of two consumers keeps a shared HMAC secret depends on full-load
+/// order, and a shared JWT secret quarantines every holder, which only the
+/// full namespace snapshot can see.
 #[derive(Debug, Default)]
 pub struct ConsumerQuarantineTracker {
     clean_namespaces: std::sync::Mutex<HashSet<String>>,
@@ -1866,7 +1869,7 @@ impl ConsumerQuarantineTracker {
 /// Whether a changed consumer carries a credential that load-time quarantine
 /// judges against other consumers, so only a full load decides its outcome.
 pub fn consumer_change_requires_authoritative_reload(consumer: &Consumer) -> bool {
-    consumer.credentials.contains_key("hmac_auth")
+    consumer.credentials.contains_key("hmac_auth") || consumer.credentials.contains_key("jwt")
 }
 
 /// Whether an incremental-load error is the expected consumer-change
