@@ -83,6 +83,63 @@ pub fn log_level_reloader() -> Option<&'static dyn LogLevelReloader> {
     RELOADER.get().map(|reloader| reloader.as_ref())
 }
 
+/// Dependency log targets whose records render credential-bearing protocol
+/// bytes verbatim, each with the level from which its records are dropped.
+/// The gateway never emits those records, whatever `RUST_LOG`,
+/// `FERRUM_LOG_LEVEL`, or an RTDS `ferrum.log.level` reload requests.
+///
+/// - `tungstenite::handshake::client`, from DEBUG: logs the complete
+///   serialized WebSocket upgrade request at TRACE, meaning the request target
+///   (path and query) and every header, including a proxied client's
+///   `Authorization` / `Cookie` and the `ws_logging` `custom_headers` collector
+///   credentials. Its only other record is a DEBUG "handshake done" line.
+/// - `tungstenite::protocol` (including `::frame`), at TRACE: renders every
+///   received message and every sent/received frame with its full payload,
+///   which carries in-band WebSocket credentials and every `ws_logging` batch.
+///   The module's DEBUG close-frame lines stay available.
+///
+/// Neither module logs at INFO or above, so no warning or error is lost.
+pub const CREDENTIAL_DUMPING_LOG_TARGETS: &[(&str, tracing::Level)] = &[
+    ("tungstenite::handshake::client", tracing::Level::DEBUG),
+    ("tungstenite::protocol", tracing::Level::TRACE),
+];
+
+/// Whether `target` is `module` or one of its submodules.
+fn log_target_within(target: &str, module: &str) -> bool {
+    target
+        .strip_prefix(module)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+/// Whether a record with this metadata belongs to a
+/// [`CREDENTIAL_DUMPING_LOG_TARGETS`] target at or below its drop level.
+/// `log`-crate records bridged into `tracing` carry the emitting module path
+/// as their target, so they match the same way as native events.
+pub fn is_credential_dumping_log_record(metadata: &tracing::Metadata<'_>) -> bool {
+    CREDENTIAL_DUMPING_LOG_TARGETS
+        .iter()
+        .any(|(module, from_level)| {
+            log_target_within(metadata.target(), module) && *metadata.level() >= *from_level
+        })
+}
+
+fn allows_non_credential_dumping_record(metadata: &tracing::Metadata<'_>) -> bool {
+    !is_credential_dumping_log_record(metadata)
+}
+
+/// Per-layer filter that drops [`is_credential_dumping_log_record`] records.
+///
+/// The binary composes it with `.with_filter(...)` *outside* the reloadable
+/// `EnvFilter` on every output layer, so the two filters are AND-ed. No
+/// directive can re-enable these records: not a target, span-scoped, or
+/// field-scoped one (`tungstenite::handshake::client[{message}]=trace`), and
+/// not an RTDS reload, which replaces only the inner `EnvFilter`.
+pub fn credential_dumping_log_filter() -> tracing_subscriber::filter::FilterFn {
+    tracing_subscriber::filter::filter_fn(
+        allows_non_credential_dumping_record as fn(&tracing::Metadata<'_>) -> bool,
+    )
+}
+
 /// Process-global, non-blocking sink for transaction access logs.
 ///
 /// The `stdout_logging` plugin writes one JSON line per proxied transaction

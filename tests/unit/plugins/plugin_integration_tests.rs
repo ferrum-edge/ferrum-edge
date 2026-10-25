@@ -1847,13 +1847,13 @@ async fn response_cache_misses_when_route_override_backend_tls_differs() {
     let path = "/route-override-backend-tls";
 
     let mut store_ctx = create_response_context(path);
-    store_ctx.route_override_resolved_tls = Some(tls_a.clone());
+    store_ctx.route_override_resolved_tls = Some(Arc::new(tls_a.clone()));
     store_route_override_entry(&plugins, &mut store_ctx).await;
 
     // Control: the unchanged TLS identity still addresses the stored entry, so
     // each miss below is caused by the TLS difference rather than a failed store.
     let mut hit_ctx = create_response_context(path);
-    hit_ctx.route_override_resolved_tls = Some(tls_a.clone());
+    hit_ctx.route_override_resolved_tls = Some(Arc::new(tls_a.clone()));
     assert!(
         route_override_replay_hit(&plugins, &mut hit_ctx).await,
         "the unchanged backend TLS override must replay the stored representation"
@@ -1901,7 +1901,7 @@ async fn response_cache_misses_when_route_override_backend_tls_differs() {
     ];
     for (label, tls) in variants {
         let mut miss_ctx = create_response_context(path);
-        miss_ctx.route_override_resolved_tls = tls;
+        miss_ctx.route_override_resolved_tls = tls.map(Arc::new);
         assert!(
             !route_override_replay_hit(&plugins, &mut miss_ctx).await,
             "the retained representation must miss under a {label}"
@@ -2267,7 +2267,10 @@ async fn test_request_size_limiting_checks_transformed_body() {
     let (status_code, body, _) =
         reject_parts(result).expect("expected transformed request body to be rejected");
     assert_eq!(status_code, 413);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(parsed["error"], "Request body too large");
-    assert_eq!(parsed["limit"], 20);
+    // The plugin's 413 is the proxy core's shared request-body-size body, so
+    // the limit is not disclosed in it.
+    assert_eq!(
+        body,
+        ferrum_edge::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY.as_bytes()
+    );
 }

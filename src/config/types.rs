@@ -311,11 +311,215 @@ pub(crate) const SUPPORTED_GEO_COUNTRY_CODES: &[u8] = concat!(
 )
 .as_bytes();
 
-/// Effective strength of an hmac_auth secret: whitespace does not count
-/// toward [`MIN_HMAC_SECRET_LENGTH`]. Shared by admission-time field
-/// validation and the full-load quarantine so the two policies cannot drift.
+/// Effective strength of an hmac_auth secret, a Consumer `jwt` secret, or a
+/// keyauth key: whitespace does not count toward the type's minimum. Shared
+/// by admission-time field validation, the full-load quarantines, and the
+/// `jwt_auth` verifier so the policies cannot drift.
 pub(crate) fn hmac_secret_strength(secret: &str) -> usize {
     secret.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+
+/// Whether a Consumer `jwt` secret carries at least [`MIN_JWT_SECRET_LENGTH`]
+/// non-whitespace characters. The single predicate behind JWT credential
+/// admission, the full-load/swap quarantine, and the `jwt_auth` verifier's
+/// refusal to sign-check against a weaker stored key.
+pub(crate) fn jwt_secret_meets_minimum_strength(secret: &str) -> bool {
+    hmac_secret_strength(secret) >= MIN_JWT_SECRET_LENGTH
+}
+
+/// Every `secret` string a stored Consumer `jwt` credential value carries,
+/// whatever its shape: each array element's `secret` (malformed or weak
+/// entries included) or a legacy single object's `secret`. Ownership checks
+/// use this rather than the verifier-eligible entries, because a holder knows
+/// a secret whether or not its own entry is usable.
+pub(crate) fn jwt_credential_secret_values(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .filter_map(|entry| entry.get("secret").and_then(serde_json::Value::as_str))
+            .collect(),
+        serde_json::Value::Object(object) => object
+            .get("secret")
+            .and_then(serde_json::Value::as_str)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a stored Consumer `jwt` credential value is a non-empty array of
+/// objects whose every `secret` is a string meeting the strength floor.
+fn jwt_credential_value_is_admissible(value: &serde_json::Value) -> bool {
+    match value.as_array() {
+        Some(entries) if !entries.is_empty() => entries.iter().all(|entry| {
+            entry
+                .as_object()
+                .and_then(|obj| obj.get("secret"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(jwt_secret_meets_minimum_strength)
+        }),
+        _ => false,
+    }
+}
+
+/// Why [`GatewayConfig::quarantine_invalid_jwt_credentials_against`]
+/// strips a Consumer's `jwt` credential.
+enum JwtQuarantineReason {
+    /// Another Consumer in the namespace holds one of its secrets.
+    Shared(String),
+    /// One of its secrets was shared in an earlier generation.
+    PreviouslyShared,
+    /// Malformed, or a secret below the strength floor.
+    Weak,
+}
+
+/// Upper bound on the shared-secret digests [`JwtSharedSecretHistory`] keeps
+/// per namespace. Past it the oldest digest is evicted (and the caller warns),
+/// so a config source that keeps presenting new shared secrets cannot grow the
+/// process without bound.
+pub const JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE: usize = 4096;
+
+/// Namespace-bound SHA-256 digest identifying a Consumer `jwt` secret without
+/// retaining it.
+fn jwt_shared_secret_digest(namespace: &str, secret: &str) -> [u8; 32] {
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update(b"ferrum-edge/jwt-shared-secret/v1\0");
+    hasher.update((namespace.len() as u64).to_be_bytes());
+    hasher.update(namespace.as_bytes());
+    hasher.update(secret.as_bytes());
+    hasher.finalize()
+}
+
+/// Consumer `jwt` secrets one quarantine pass saw configured on more than one
+/// Consumer of a namespace, as namespace-bound digests (never the secret).
+///
+/// The quarantine only *reports* these; the owner of a
+/// [`JwtSharedSecretHistory`] merges them once the candidate they came from
+/// is accepted, so a rejected candidate never records anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JwtSharedSecretRecords {
+    entries: Vec<(String, [u8; 32])>,
+}
+
+impl JwtSharedSecretRecords {
+    fn push(&mut self, namespace: &str, secret: &str) {
+        let digest = jwt_shared_secret_digest(namespace, secret);
+        if !self
+            .entries
+            .iter()
+            .any(|(ns, existing)| ns == namespace && *existing == digest)
+        {
+            self.entries.push((namespace.to_string(), digest));
+        }
+    }
+
+    /// Append `other`'s records, skipping duplicates.
+    pub fn extend(&mut self, other: JwtSharedSecretRecords) {
+        for (namespace, digest) in other.entries {
+            if !self
+                .entries
+                .iter()
+                .any(|(ns, existing)| *ns == namespace && *existing == digest)
+            {
+                self.entries.push((namespace, digest));
+            }
+        }
+    }
+
+    /// Number of distinct recorded shared secrets.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Result of [`GatewayConfig::quarantine_invalid_jwt_credentials_against`].
+#[derive(Debug, Default)]
+pub struct JwtQuarantineOutcome {
+    /// One human-readable message per quarantined credential (never the
+    /// secret); callers log these at `error!` severity.
+    pub messages: Vec<String>,
+    /// Secrets shared in this snapshot, for the caller to merge into its
+    /// history once the snapshot is accepted.
+    pub shared: JwtSharedSecretRecords,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NamespaceJwtSharedSecrets {
+    digests: HashSet<[u8; 32]>,
+    /// Insertion order, oldest first, for bounded eviction.
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+/// Process-local record of Consumer `jwt` secrets that were configured on
+/// more than one Consumer of a namespace.
+///
+/// A secret that was ever shared is known to another Consumer, so it must not
+/// be reactivated by a later incremental swap that no longer shows the other
+/// holder (the live snapshot it patches is already quarantined). Entries are
+/// SHA-256 digests bound to the namespace; the secret itself is never kept.
+/// Each namespace keeps at most
+/// [`JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE`] digests, evicting the
+/// oldest. The record is process-local: a restart starts empty and judges
+/// only the fresh authoritative snapshot, which is why a shared secret must be
+/// replaced on every Consumer that held it.
+#[derive(Debug, Clone, Default)]
+pub struct JwtSharedSecretHistory {
+    namespaces: HashMap<String, NamespaceJwtSharedSecrets>,
+}
+
+impl JwtSharedSecretHistory {
+    pub(crate) fn contains(&self, namespace: &str, secret: &str) -> bool {
+        self.namespaces.get(namespace).is_some_and(|recorded| {
+            recorded
+                .digests
+                .contains(&jwt_shared_secret_digest(namespace, secret))
+        })
+    }
+
+    /// Merge `records` with the default per-namespace bound. Returns how many
+    /// older digests were evicted to stay within it.
+    pub fn merge(&mut self, records: &JwtSharedSecretRecords) -> usize {
+        self.merge_with_limit(records, JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE)
+    }
+
+    /// [`Self::merge`] with an explicit per-namespace bound (at least 1).
+    pub fn merge_with_limit(&mut self, records: &JwtSharedSecretRecords, limit: usize) -> usize {
+        let limit = limit.max(1);
+        let mut evicted = 0;
+        for (namespace, digest) in &records.entries {
+            let recorded = self.namespaces.entry(namespace.clone()).or_default();
+            if recorded.digests.insert(*digest) {
+                recorded.order.push_back(*digest);
+                while recorded.order.len() > limit {
+                    if let Some(oldest) = recorded.order.pop_front() {
+                        recorded.digests.remove(&oldest);
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+        evicted
+    }
+
+    /// Number of recorded shared secrets across namespaces.
+    pub fn len(&self) -> usize {
+        self.namespaces
+            .values()
+            .map(|recorded| recorded.digests.len())
+            .sum()
+    }
+
+    /// Whether no shared secret has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.namespaces
+            .values()
+            .all(|recorded| recorded.digests.is_empty())
+    }
 }
 /// Minimum byte length for the server-side Basic-auth HMAC secret.
 pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
@@ -3623,6 +3827,16 @@ pub struct GatewayConfig {
     /// a rejected `POST /plugins`, prefixed with the plugin name and config id.
     #[serde(skip)]
     pub quarantined_plugin_configs: Vec<String>,
+    /// Consumer `jwt` secrets a full load found shared and stripped
+    /// (namespace-bound digests, never the secret).
+    ///
+    /// DERIVED, PROCESS-LOCAL ONLY: `#[serde(skip)]`, never persisted and
+    /// never on the ConfigSync wire. The SQL/Mongo full loaders fill it so the
+    /// serving `ProxyState` can seed its shared-secret history from a snapshot
+    /// that reaches it already stripped; `ProxyState` takes it on construction
+    /// and on every accepted swap.
+    #[serde(skip)]
+    pub quarantined_jwt_shared_secrets: JwtSharedSecretRecords,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
@@ -4259,8 +4473,9 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that every effective `mtls_auth` instance can receive a verified
-    /// client certificate on the proxy transport where it will execute.
+    /// Validate that every effective `mtls_auth` instance, and every
+    /// proxy/proxy-group-scoped `spiffe_identity` instance, can receive a
+    /// verified client certificate on the proxy transport where it will execute.
     pub fn validate_mtls_auth_compatibility(&self) -> Result<(), Vec<String>> {
         let errors = self.mtls_auth_compatibility_errors();
         if errors.is_empty() {
@@ -4274,14 +4489,6 @@ impl GatewayConfig {
     /// would install for each proxy. Any local proxy/proxy-group instance
     /// shadows all global instances of the same plugin type on that proxy.
     fn effective_mtls_auth_plugins_by_proxy(&self) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
-        // Association plugin_config_id values are namespace-local to the
-        // proxy. A bare-id index would bind a proxy to another tenant's
-        // same-id mtls_auth config.
-        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
-            .plugin_configs
-            .iter()
-            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
-            .collect();
         let global_mtls: Vec<&PluginConfig> = self
             .plugin_configs
             .iter()
@@ -4292,10 +4499,40 @@ impl GatewayConfig {
             })
             .collect();
 
+        self.local_plugins_by_proxy("mtls_auth")
+            .into_iter()
+            .map(|(proxy, local_mtls)| {
+                let effective = if local_mtls.is_empty() {
+                    // Globals are gateway-wide at runtime (`PluginCache` merges
+                    // the single global list into every proxy in every
+                    // namespace), so this must NOT be namespace-filtered —
+                    // only the association lookup in `local_plugins_by_proxy`
+                    // is namespace-local.
+                    global_mtls.clone()
+                } else {
+                    local_mtls
+                };
+                (proxy, effective)
+            })
+            .collect()
+    }
+
+    /// The enabled proxy/proxy-group-scoped `plugin_name` configurations each
+    /// proxy's associations attach to it. Globals are never included.
+    fn local_plugins_by_proxy(&self, plugin_name: &str) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
+        // Association plugin_config_id values are namespace-local to the
+        // proxy. A bare-id index would bind a proxy to another tenant's
+        // same-id config.
+        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
+            .plugin_configs
+            .iter()
+            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+            .collect();
+
         self.proxies
             .iter()
             .map(|proxy| {
-                let local_mtls: Vec<&PluginConfig> = proxy
+                let local: Vec<&PluginConfig> = proxy
                     .plugins
                     .iter()
                     .filter_map(|association| {
@@ -4313,22 +4550,23 @@ impl GatewayConfig {
                             }
                             PluginScope::Global => false,
                         };
-                        (plugin.enabled && plugin.plugin_name == "mtls_auth" && scope_applies)
+                        (plugin.enabled && plugin.plugin_name == plugin_name && scope_applies)
                             .then_some(plugin)
                     })
                     .collect();
-                let effective = if local_mtls.is_empty() {
-                    // Globals are gateway-wide at runtime (`PluginCache` merges
-                    // the single global list into every proxy in every
-                    // namespace), so this must NOT be namespace-filtered —
-                    // only the association lookup above is namespace-local.
-                    global_mtls.clone()
-                } else {
-                    local_mtls
-                };
-                (proxy, effective)
+                (proxy, local)
             })
             .collect()
+    }
+
+    /// Whether the named proxy has an enabled proxy/proxy-group-scoped
+    /// `spiffe_identity` instance attached. Globals are deliberately not
+    /// counted: a global instance legitimately no-ops on plaintext listeners
+    /// (the mesh-injected `__mesh_spiffe_identity` among them).
+    pub(crate) fn has_scoped_spiffe_identity_for_proxy(&self, proxy_id: &str) -> bool {
+        self.local_plugins_by_proxy("spiffe_identity")
+            .into_iter()
+            .any(|(proxy, plugins)| proxy.id == proxy_id && !plugins.is_empty())
     }
 
     /// Whether the named proxy has at least one enabled `mtls_auth` instance
@@ -4357,6 +4595,48 @@ impl GatewayConfig {
                         proxy.id, plugin.id
                     ));
                 }
+            }
+        }
+
+        errors.extend(self.scoped_spiffe_identity_stream_compatibility_errors());
+
+        errors
+    }
+
+    /// Validate that no proxy/proxy-group-scoped `spiffe_identity` instance is
+    /// attached to a stream proxy that terminates no TLS/DTLS.
+    ///
+    /// Already part of [`Self::validate_mtls_auth_compatibility`]; exposed on
+    /// its own for admission paths that judge a merged plugin-graph candidate
+    /// (API-spec create/replace, plugin-graph writes) without the namespace's
+    /// `mtls_auth` posture.
+    pub fn validate_scoped_spiffe_identity_stream_compatibility(&self) -> Result<(), Vec<String>> {
+        let errors = self.scoped_spiffe_identity_stream_compatibility_errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn scoped_spiffe_identity_stream_compatibility_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        // A deliberately attached `spiffe_identity` on a stream proxy that
+        // terminates no TLS/DTLS can never see a peer certificate, so it would
+        // accept the config and then silently publish no principal for every
+        // connection — leaving a principal-keyed `mesh_authz` DENY unmatched.
+        // Globals stay exempt: they legitimately no-op on plaintext listeners.
+        for (proxy, scoped_plugins) in self.local_plugins_by_proxy("spiffe_identity") {
+            if !proxy.effective_scheme().is_stream() || (proxy.frontend_tls && !proxy.passthrough) {
+                continue;
+            }
+            for plugin in scoped_plugins {
+                errors.push(format!(
+                    "Proxy {:?} cannot use `spiffe_identity` PluginConfig {:?}: stream SPIFFE \
+                     identity extraction requires `frontend_tls=true` with TLS/DTLS termination \
+                     (`passthrough=false`)",
+                    proxy.id, plugin.id
+                ));
             }
         }
 
@@ -5091,6 +5371,235 @@ impl GatewayConfig {
         messages
     }
 
+    /// Cross-Consumer `jwt` secret collisions within each namespace, as
+    /// `(consumer id, conflicting consumer id, namespace)` triples, each pair
+    /// reported once.
+    ///
+    /// `jwt_auth` selects the verifying Consumer from the token's unverified,
+    /// signer-chosen identity claim, so anyone who can sign with a secret two
+    /// Consumers share can sign as either of them. Reuse across namespaces and
+    /// within one Consumer (rotation entries sharing a secret) is allowed.
+    fn jwt_credential_collisions(&self) -> Vec<(&str, &str, &str)> {
+        let mut owners: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut collisions: Vec<(&str, &str, &str)> = Vec::new();
+
+        for consumer in &self.consumers {
+            let namespace = consumer.namespace.as_str();
+            let id = consumer.id.as_str();
+            let Some(value) = consumer.credentials.get("jwt") else {
+                continue;
+            };
+            for secret in jwt_credential_secret_values(value) {
+                match owners.entry((namespace, secret)) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(id);
+                    }
+                    std::collections::hash_map::Entry::Occupied(slot) => {
+                        let owner = *slot.get();
+                        let collision = (id, owner, namespace);
+                        if owner != id && !collisions.contains(&collision) {
+                            collisions.push(collision);
+                        }
+                    }
+                }
+            }
+        }
+
+        collisions
+    }
+
+    /// Error text for one cross-Consumer JWT secret collision. Names only
+    /// consumer ids and the namespace, never the secret.
+    fn jwt_collision_message(consumer_id: &str, other_id: &str, namespace: &str) -> String {
+        format!(
+            "Duplicate jwt secret in consumer {:?} (conflicts with consumer {:?} in namespace {:?}); \
+             each Consumer needs its own JWT signing secret",
+            consumer_id, other_id, namespace
+        )
+    }
+
+    fn jwt_credential_uniqueness_errors(&self) -> Vec<String> {
+        self.jwt_credential_collisions()
+            .into_iter()
+            .map(|(id, other, namespace)| Self::jwt_collision_message(id, other, namespace))
+            .collect()
+    }
+
+    /// Validate only the cross-Consumer `jwt` secret constraint.
+    pub fn validate_unique_jwt_credentials(&self) -> Result<(), Vec<String>> {
+        let duplicates = self.jwt_credential_uniqueness_errors();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Validate the cross-Consumer `jwt` secret constraint for collisions that
+    /// involve one of `consumer_ids`. Admin candidate checks use this narrower
+    /// surface so a pre-existing duplicate between two other Consumers (which
+    /// the full-load quarantine already strips) does not block an unrelated
+    /// write or the repair of one side.
+    pub fn validate_unique_jwt_credentials_for_consumers(
+        &self,
+        consumer_ids: &[&str],
+    ) -> Result<(), Vec<String>> {
+        let duplicates: Vec<String> = self
+            .jwt_credential_collisions()
+            .into_iter()
+            .filter(|collision| {
+                consumer_ids.contains(&collision.0) || consumer_ids.contains(&collision.1)
+            })
+            .map(|(id, other, namespace)| Self::jwt_collision_message(id, other, namespace))
+            .collect();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Fail-closed handling of Consumer `jwt` credential policy at full-load
+    /// time, for a snapshot judged on its own (no earlier generation).
+    ///
+    /// See [`Self::quarantine_invalid_jwt_credentials_against`]; this is
+    /// that function with an empty history, returning only the messages.
+    pub fn quarantine_invalid_jwt_credentials(&mut self) -> Vec<String> {
+        self.quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default())
+            .messages
+    }
+
+    /// Fail-closed handling of Consumer `jwt` credential policy at full-load
+    /// and runtime-swap time.
+    ///
+    /// Ownership is decided first, from the untouched snapshot: every secret
+    /// string a consumer stores counts, including one in an entry that is
+    /// itself malformed or weak, because removing a credential from
+    /// verification does not remove its holder's knowledge of the secret.
+    /// Then the `jwt` credential is stripped from every consumer that:
+    ///
+    /// - holds a secret that another consumer in the same namespace also
+    ///   holds. There is no first-loaded winner (unlike
+    ///   [`Self::quarantine_invalid_hmac_credentials`]): whoever holds a
+    ///   shared JWT secret can sign a token naming any Consumer that accepts
+    ///   it, so no holder is a trustworthy owner;
+    /// - holds a secret that `history` records as shared in an earlier
+    ///   generation. An incremental swap patches the already-quarantined live
+    ///   snapshot, which no longer shows the other holder, so the history is
+    ///   what keeps a still-shared (or once-shared, hence known to another
+    ///   Consumer) key from being reactivated by a later point delta;
+    /// - stores anything other than a non-empty array of objects each
+    ///   carrying a string `secret` with at least [`MIN_JWT_SECRET_LENGTH`]
+    ///   non-whitespace characters.
+    ///
+    /// Secrets shared in this snapshot are returned in
+    /// [`JwtQuarantineOutcome::shared`] (as namespace-bound digests, never the
+    /// secret); `history` itself is only read, so the caller decides whether
+    /// the candidate was accepted before recording them. The same secret may be
+    /// reused in a different namespace. Extra legacy fields beside `secret`
+    /// (for example a historical `algorithm: HS256` selector) are left to
+    /// admission-time validation; the verifier only ever reads `secret`.
+    ///
+    /// Admin write-time validation rejects NEW violations; this guard covers
+    /// pre-existing and out-of-band rows and snapshots from sources that
+    /// bypass the SQL/Mongo loaders. A stripped credential fails closed: the
+    /// `jwt_auth` plugin returns 401 for a consumer with no `jwt` entries.
+    /// Messages never contain the secret; callers log them at `error!`.
+    pub fn quarantine_invalid_jwt_credentials_against(
+        &mut self,
+        history: &JwtSharedSecretHistory,
+    ) -> JwtQuarantineOutcome {
+        let mut shared = JwtSharedSecretRecords::default();
+        let decisions: Vec<Option<JwtQuarantineReason>> = {
+            let mut holders: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+            for consumer in &self.consumers {
+                let Some(value) = consumer.credentials.get("jwt") else {
+                    continue;
+                };
+                for secret in jwt_credential_secret_values(value) {
+                    let ids = holders
+                        .entry((consumer.namespace.as_str(), secret))
+                        .or_default();
+                    if !ids.contains(&consumer.id.as_str()) {
+                        ids.push(consumer.id.as_str());
+                    }
+                }
+            }
+            for ((namespace, secret), ids) in &holders {
+                if ids.len() > 1 {
+                    shared.push(namespace, secret);
+                }
+            }
+
+            self.consumers
+                .iter()
+                .map(|consumer| {
+                    let value = consumer.credentials.get("jwt")?;
+                    let namespace = consumer.namespace.as_str();
+                    let secrets = jwt_credential_secret_values(value);
+                    let other_holder = secrets.iter().find_map(|secret| {
+                        holders
+                            .get(&(namespace, *secret))
+                            .and_then(|ids| ids.iter().find(|id| **id != consumer.id.as_str()))
+                            .map(|id| (*id).to_string())
+                    });
+                    if let Some(other_id) = other_holder {
+                        return Some(JwtQuarantineReason::Shared(other_id));
+                    }
+                    if !history.namespaces.is_empty()
+                        && secrets
+                            .iter()
+                            .any(|secret| history.contains(namespace, secret))
+                    {
+                        return Some(JwtQuarantineReason::PreviouslyShared);
+                    }
+                    if !jwt_credential_value_is_admissible(value) {
+                        return Some(JwtQuarantineReason::Weak);
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        let mut messages = Vec::new();
+        for (consumer, decision) in self.consumers.iter_mut().zip(decisions) {
+            let Some(reason) = decision else {
+                continue;
+            };
+            consumer.credentials.remove("jwt");
+            messages.push(match reason {
+                JwtQuarantineReason::Shared(other_id) => format!(
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets is also \
+                     configured on consumer {:?} in namespace {:?} — whoever holds a shared \
+                     secret can sign tokens as either Consumer, so the credential is excluded \
+                     on every Consumer that shares it. Give each of them a new, distinct \
+                     secret to restore it, before any restart: a restarted process no longer \
+                     knows which secrets were shared.",
+                    consumer.id, other_id, consumer.namespace
+                ),
+                JwtQuarantineReason::PreviouslyShared => format!(
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets was \
+                     shared with another Consumer in namespace {:?} in an earlier \
+                     configuration generation of this process, so another Consumer can still \
+                     sign tokens as this one. Give the Consumer a new, distinct secret to \
+                     restore it.",
+                    consumer.id, consumer.namespace
+                ),
+                JwtQuarantineReason::Weak => format!(
+                    "Quarantined jwt credential of consumer {:?}: a stored entry is \
+                     malformed or its secret has fewer than {} non-whitespace characters \
+                     — the credential is excluded from this config load so the weak \
+                     secret cannot authenticate. Repair the stored credential to restore it.",
+                    consumer.id, MIN_JWT_SECRET_LENGTH
+                ),
+            });
+        }
+
+        JwtQuarantineOutcome { messages, shared }
+    }
+
     /// Reject a runtime snapshot in which one keyauth key, basicauth username,
     /// or exact mTLS identity belongs to two Consumers of the same namespace
     /// (issue #6572).
@@ -5175,8 +5684,8 @@ impl GatewayConfig {
 
     /// Validate that consumer credentials are unique across all consumers.
     ///
-    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets, and
-    /// mTLS identities.
+    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets,
+    /// Consumer JWT secrets (per namespace), and mTLS identities.
     /// mTLS identities are exact by default and additionally ASCII-case-folded
     /// when an effective `san_dns` mTLS policy can consume the DNS lookup index.
     /// If two consumers share the same credential, the ConsumerIndex silently
@@ -5212,6 +5721,7 @@ impl GatewayConfig {
         }
 
         duplicates.extend(self.hmac_credential_uniqueness_errors());
+        duplicates.extend(self.jwt_credential_uniqueness_errors());
         duplicates.extend(self.mtls_credential_uniqueness_errors());
 
         if duplicates.is_empty() {
@@ -9290,15 +9800,17 @@ impl Consumer {
                         ));
                     }
                     match obj.get("secret") {
-                        Some(serde_json::Value::String(secret))
-                            if secret.chars().count() >= MIN_JWT_SECRET_LENGTH => {}
                         Some(serde_json::Value::String(secret)) => {
-                            errors.push(format!(
-                                "{}.secret must be at least {} characters (got {})",
-                                prefix,
-                                MIN_JWT_SECRET_LENGTH,
-                                secret.chars().count()
-                            ));
+                            // Whitespace does not count toward the floor, the
+                            // same rule as hmac_auth secrets: an HS256 key is
+                            // brute-forceable offline from one captured token.
+                            let strength = hmac_secret_strength(secret);
+                            if strength < MIN_JWT_SECRET_LENGTH {
+                                errors.push(format!(
+                                    "{}.secret must be at least {} non-whitespace characters (got {})",
+                                    prefix, MIN_JWT_SECRET_LENGTH, strength
+                                ));
+                            }
                         }
                         Some(_) => errors.push(format!("{}.secret must be a string", prefix)),
                         None => {}

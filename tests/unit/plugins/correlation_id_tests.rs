@@ -228,6 +228,78 @@ fn test_constructor_rejects_consumer_assertion_namespace_header_name() {
 }
 
 #[test]
+fn test_constructor_rejects_every_backend_gateway_assertion_header_name() {
+    // Outbound refresh (`refresh_backend_gateway_assertion_headers`) strips
+    // every gateway assertion name and restores only private gateway state, so
+    // a correlation ID written there would be echoed and logged but never
+    // reach the backend under its configured header.
+    for header_name in [
+        "x-geo-country",
+        "X-Geo-Country",
+        " x-GEO-country ",
+        "X_Geo_Country",
+        "x_geo-country",
+        "X-Authenticated-Identity",
+        "x_authenticated_identity",
+    ] {
+        let normalized = header_name.trim().to_ascii_lowercase();
+        assert!(
+            ferrum_edge::proxy::headers::is_gateway_assertion_header(&normalized),
+            "{header_name} must be in the stripped backend assertion set"
+        );
+        let err = CorrelationId::new(&json!({"header_name": header_name}))
+            .err()
+            .expect("a backend gateway assertion header must be rejected");
+        assert!(err.contains("gateway-owned"), "{header_name}: {err}");
+    }
+
+    let err = CorrelationId::new(&json!({"header_name": " X_Geo_Country "}))
+        .err()
+        .expect("underscore GeoIP spelling must be rejected");
+    assert!(
+        err.contains("gateway-owned backend assertion header"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_constructor_rejects_literal_x_real_ip_regardless_of_real_ip_setting() {
+    // Backend builders drop an untrusted peer's `X-Real-IP` whether or not
+    // `FERRUM_REAL_IP_HEADER` is configured, so the literal name is reserved
+    // independently of the deployment-specific real-IP header.
+    for header_name in ["x-real-ip", "X-Real-IP", " x-REAL-ip "] {
+        let err = CorrelationId::new(&json!({"header_name": header_name}))
+            .err()
+            .expect("x-real-ip must be rejected without FERRUM_REAL_IP_HEADER");
+        assert!(err.contains("protocol-managed"), "{header_name}: {err}");
+
+        let err = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
+            &json!({"header_name": header_name}),
+            Some("cf-connecting-ip"),
+        )
+        .err()
+        .expect("x-real-ip must be rejected when another real-IP header is configured");
+        assert!(err.contains("protocol-managed"), "{header_name}: {err}");
+    }
+}
+
+#[test]
+fn test_constructor_accepts_names_that_only_resemble_gateway_owned_fields() {
+    for (header_name, normalized) in [
+        ("X-Geo-Country-Code", "x-geo-country-code"),
+        ("x-real-ip-chain", "x-real-ip-chain"),
+        (
+            "x-authenticated-identity-trace",
+            "x-authenticated-identity-trace",
+        ),
+    ] {
+        let plugin = CorrelationId::new(&json!({"header_name": header_name}))
+            .unwrap_or_else(|error| panic!("{header_name} must remain valid: {error}"));
+        assert_eq!(plugin.correlation_id_header_name(), Some(normalized));
+    }
+}
+
+#[test]
 fn test_constructor_rejects_effective_real_ip_header_case_insensitively() {
     let error = ferrum_edge::_test_support::correlation_id_with_real_ip_header_for_test(
         &json!({"header_name": " CF-Connecting-IP "}),
@@ -278,6 +350,35 @@ fn test_constructor_accepts_null_fields_as_defaults() {
     }))
     .expect("null fields should fall back to defaults");
     assert_eq!(plugin.name(), "correlation_id");
+}
+
+#[test]
+fn test_constructor_accepts_each_inbound_policy_and_null() {
+    for inbound_policy in [json!("preserve"), json!("generate"), json!(null)] {
+        CorrelationId::new(&json!({"inbound_policy": inbound_policy.clone()}))
+            .unwrap_or_else(|error| panic!("{inbound_policy} must be accepted: {error}"));
+    }
+}
+
+#[test]
+fn test_constructor_rejects_unknown_or_non_string_inbound_policy() {
+    for inbound_policy in [
+        json!("Generate"),
+        json!("PRESERVE"),
+        json!("always"),
+        json!(""),
+        json!(true),
+        json!(1),
+        json!(["generate"]),
+    ] {
+        let err = CorrelationId::new(&json!({"inbound_policy": inbound_policy.clone()}))
+            .err()
+            .unwrap_or_else(|| panic!("{inbound_policy} must be rejected"));
+        assert!(
+            err.contains("`inbound_policy` must be `preserve` or `generate`"),
+            "{inbound_policy}: {err}"
+        );
+    }
 }
 
 // ── Plugin identity ─────────────────────────────────────────────────
@@ -1036,6 +1137,206 @@ async fn test_websocket_handshake_response_echoes_generated_and_preserved_ids() 
     }
 }
 
+// ── inbound_policy: generate ───────────────────────────────────────
+
+/// Drive every HTTP-side surface for one request carrying `inbound` on the
+/// default header and return the ID each surface observed.
+async fn generated_id_for_request_with_caller_id(plugin: &CorrelationId, inbound: &str) -> String {
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-request-id".to_string(), inbound.to_string());
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    let id = ctx
+        .headers
+        .get("x-request-id")
+        .expect("request header carries the resolved ID")
+        .clone();
+    assert_ne!(
+        id, inbound,
+        "generate must overwrite a well-formed caller ID"
+    );
+    assert!(uuid::Uuid::parse_str(&id).is_ok(), "got: {id}");
+    assert_eq!(ctx.metadata.get(REQUEST_ID_METADATA_KEY), Some(&id));
+    assert!(is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        &id
+    ));
+    assert!(!is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        inbound
+    ));
+
+    // A stale copy of the caller value in the outbound map is replaced.
+    let mut outbound = HashMap::new();
+    outbound.insert("x-request-id".to_string(), inbound.to_string());
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut outbound).await);
+    assert_eq!(outbound.get("x-request-id"), Some(&id));
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("x-request-id".to_string(), inbound.to_string());
+    plugin_utils::assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert_eq!(response_headers.get("x-request-id"), Some(&id));
+
+    let mut handshake_headers = HashMap::new();
+    plugin.apply_websocket_handshake_response_headers(&ctx, 101, &mut handshake_headers);
+    assert_eq!(handshake_headers.get("x-request-id"), Some(&id));
+
+    let logged = clone_log_metadata(&ctx);
+    assert_eq!(logged.get(REQUEST_ID_METADATA_KEY), Some(&id));
+    assert_eq!(
+        logged.get("correlation_id.instance.x-request-id"),
+        Some(&id)
+    );
+    id
+}
+
+#[tokio::test]
+async fn test_generate_policy_mints_distinct_ids_for_requests_sharing_a_caller_id() {
+    let plugin = CorrelationId::new(&json!({"inbound_policy": "generate"})).unwrap();
+    let first = generated_id_for_request_with_caller_id(&plugin, "shared-event").await;
+    let second = generated_id_for_request_with_caller_id(&plugin, "shared-event").await;
+    assert_ne!(
+        first, second,
+        "two requests with the same caller ID must receive distinct gateway IDs"
+    );
+}
+
+#[tokio::test]
+async fn test_explicit_preserve_policy_matches_default_preservation() {
+    let plugin = CorrelationId::new(&json!({"inbound_policy": "preserve"})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-request-id".to_string(), "shared-event".to_string());
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+    assert_eq!(
+        ctx.metadata
+            .get(REQUEST_ID_METADATA_KEY)
+            .map(String::as_str),
+        Some("shared-event")
+    );
+    assert!(!is_gateway_generated_correlation_header_for_test(
+        &ctx,
+        "x-request-id",
+        "shared-event"
+    ));
+}
+
+#[tokio::test]
+async fn test_generate_internal_instance_ignores_caller_supplied_internal_header() {
+    let internal = CorrelationId::new(&json!({
+        "header_name": "x-internal-request-id",
+        "inbound_policy": "generate"
+    }))
+    .unwrap();
+    let external = CorrelationId::new(&json!({
+        "header_name": "x-external-correlation-id"
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    // The caller supplies BOTH names, including the nominally internal one.
+    ctx.headers.insert(
+        "x-internal-request-id".to_string(),
+        "caller-chosen-internal".to_string(),
+    );
+    ctx.headers.insert(
+        "x-external-correlation-id".to_string(),
+        "caller-correlation".to_string(),
+    );
+    for plugin in [&internal, &external] {
+        plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+    }
+
+    let internal_id = ctx
+        .headers
+        .get("x-internal-request-id")
+        .expect("internal ID")
+        .clone();
+    assert_ne!(internal_id, "caller-chosen-internal");
+    assert!(uuid::Uuid::parse_str(&internal_id).is_ok());
+    assert_eq!(
+        ctx.metadata
+            .get(REQUEST_ID_METADATA_KEY)
+            .map(String::as_str),
+        Some(internal_id.as_str()),
+        "the generate instance owns the canonical request ID"
+    );
+
+    let mut outbound = HashMap::new();
+    let mut response_headers = HashMap::new();
+    for plugin in [&internal, &external] {
+        plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut outbound).await);
+        plugin_utils::assert_continue(
+            plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await,
+        );
+    }
+    for headers in [&outbound, &response_headers] {
+        assert_eq!(headers.get("x-internal-request-id"), Some(&internal_id));
+        assert_eq!(
+            headers.get("x-external-correlation-id").map(String::as_str),
+            Some("caller-correlation")
+        );
+    }
+}
+
+// ── Allocation-lean header writes ──────────────────────────────────
+
+#[tokio::test]
+async fn test_header_writes_reuse_an_existing_field_value_in_place() {
+    let plugin = CorrelationId::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+    let id = ctx
+        .headers
+        .get("x-request-id")
+        .expect("generated ID")
+        .clone();
+
+    // The outbound map is built from the request headers, so it already holds
+    // this field with the same value. Rewriting it must not allocate a new
+    // value buffer.
+    let mut outbound = ctx.headers.clone();
+    let outbound_ptr = outbound["x-request-id"].as_ptr();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut outbound).await);
+    assert_eq!(outbound.get("x-request-id"), Some(&id));
+    assert_eq!(
+        outbound["x-request-id"].as_ptr(),
+        outbound_ptr,
+        "an identical outbound field must be kept in place"
+    );
+
+    // A backend that echoes the identical ID is likewise left in place.
+    let mut response_headers = HashMap::new();
+    response_headers.insert("x-request-id".to_string(), id.clone());
+    let response_ptr = response_headers["x-request-id"].as_ptr();
+    plugin_utils::assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert_eq!(response_headers.get("x-request-id"), Some(&id));
+    assert_eq!(response_headers["x-request-id"].as_ptr(), response_ptr);
+
+    // A different value already present is overwritten, never kept.
+    let mut stale = HashMap::new();
+    stale.insert(
+        "x-request-id".to_string(),
+        "a-stale-backend-value-that-is-longer-than-a-uuid".to_string(),
+    );
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut stale).await);
+    assert_eq!(stale.get("x-request-id"), Some(&id));
+    assert_eq!(stale.len(), 1);
+}
+
 // ── Generated vs client-supplied provenance for response_caching (#3929) ─
 
 #[tokio::test]
@@ -1197,6 +1498,16 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             json!({"echo_downstream": token}),
             "`echo_downstream`",
             "must be a boolean",
+        ),
+        (
+            json!({"inbound_policy": token}),
+            "`inbound_policy`",
+            "must be `preserve` or `generate`",
+        ),
+        (
+            json!({"inbound_policy": true}),
+            "`inbound_policy`",
+            "must be `preserve` or `generate`",
         ),
     ] {
         let error = ferrum_edge::plugins::validate_plugin_config("correlation_id", &config)

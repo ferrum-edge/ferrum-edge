@@ -12,9 +12,10 @@ use std::sync::{Arc, LazyLock};
 use serde_json::{Map, Value};
 
 use crate::adaptive_concurrency::{
-    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimitExceeded,
-    AdaptiveConcurrencyLimiter,
+    AdaptiveConcurrencyAdmissionKind, AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy,
+    AdaptiveConcurrencyLimitExceeded, AdaptiveConcurrencyLimiter,
 };
+use crate::plugins::prometheus_metrics::{AdaptiveConcurrencyDecision, MetricsRegistry};
 use crate::plugins::{
     BackendAdmissionContext, BackendAdmissionDecision, HTTP_FAMILY_PROTOCOLS, Plugin,
     PluginHttpClient, ProxyProtocol, RequestContext,
@@ -32,6 +33,11 @@ pub struct AdaptiveConcurrency {
     config: Arc<AdaptiveConcurrencyConfig>,
     limiter: Arc<AdaptiveConcurrencyLimiter>,
     policy_generation: u64,
+    /// Process-global Prometheus registry, resolved once at construction so the
+    /// over-limit, shadow would-reject, and key-cap bypass decisions are counted
+    /// without a per-request registry lookup. Ordinary admissions record
+    /// nothing.
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl AdaptiveConcurrency {
@@ -43,6 +49,7 @@ impl AdaptiveConcurrency {
                 http_client.pool_shard_amount(),
             )),
             policy_generation: 1,
+            metrics: super::prometheus_metrics::global_registry(),
         })
     }
 
@@ -55,6 +62,7 @@ impl AdaptiveConcurrency {
             config,
             limiter,
             policy_generation,
+            metrics: super::prometheus_metrics::global_registry(),
         }
     }
 }
@@ -117,12 +125,33 @@ impl Plugin for AdaptiveConcurrency {
             self.policy_generation,
             ctx.lb_generation,
         ) {
-            Ok(permit) => BackendAdmissionDecision::Admit(permit),
+            Ok(permit) => {
+                match permit.admission_kind() {
+                    AdaptiveConcurrencyAdmissionKind::WithinLimit => {}
+                    AdaptiveConcurrencyAdmissionKind::ShadowWouldReject => {
+                        self.metrics.record_adaptive_concurrency_decision(
+                            &admission.proxy.id,
+                            AdaptiveConcurrencyDecision::WouldReject,
+                        );
+                    }
+                    AdaptiveConcurrencyAdmissionKind::UntrackedBypass => {
+                        self.metrics.record_adaptive_concurrency_decision(
+                            &admission.proxy.id,
+                            AdaptiveConcurrencyDecision::UntrackedBypass,
+                        );
+                    }
+                }
+                BackendAdmissionDecision::Admit(permit)
+            }
             Err(AdaptiveConcurrencyLimitExceeded::TargetLimit {
                 current_in_flight,
                 limit,
                 expose_headers,
             }) => {
+                self.metrics.record_adaptive_concurrency_decision(
+                    &admission.proxy.id,
+                    AdaptiveConcurrencyDecision::Rejected,
+                );
                 let mut headers = CONCURRENCY_LIMIT_HEADERS.clone();
                 if expose_headers {
                     headers.insert(
@@ -141,6 +170,10 @@ impl Plugin for AdaptiveConcurrency {
                 }
             }
             Err(AdaptiveConcurrencyLimitExceeded::GenerationHandoff) => {
+                self.metrics.record_adaptive_concurrency_decision(
+                    &admission.proxy.id,
+                    AdaptiveConcurrencyDecision::Rejected,
+                );
                 BackendAdmissionDecision::Reject {
                     status_code: 503,
                     body: br#"{"error":"Upstream concurrency limit reached"}"#.to_vec(),

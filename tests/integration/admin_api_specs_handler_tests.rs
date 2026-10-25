@@ -2812,6 +2812,146 @@ async fn direct_proxy_delete_rejects_foreign_upstream_then_allows_hand_owned_gra
     assert!(preserved_upstream.api_spec_id.is_none());
 }
 
+/// A plaintext TCP listener whose API-spec bundle attaches `spiffe_identity`
+/// (PR #6871 review SOL-2 / spiffe_identity-MUSE-2).
+fn plaintext_tcp_spec_with_spiffe_identity(
+    proxy_id: &str,
+    listen_port: u16,
+    plugin_id: Option<&str>,
+) -> Value {
+    let mut spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Plaintext TCP SPIFFE", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000,
+            "listen_port": listen_port
+        }
+    });
+    if let Some(plugin_id) = plugin_id {
+        spec["x-ferrum-plugins"] = json!([{
+            "id": plugin_id,
+            "plugin_name": "spiffe_identity",
+            "config": {}
+        }]);
+    }
+    spec
+}
+
+fn assert_spiffe_stream_refusal(status: reqwest::StatusCode, body: &Value) {
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "scoped spiffe_identity on a plaintext stream listener was admitted: {body}"
+    );
+    assert!(
+        body["failures"].as_array().is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure["resource_type"] == "plugin_composition"
+                    && failure["errors"]
+                        .to_string()
+                        .contains("cannot use `spiffe_identity` PluginConfig")
+            })
+        }),
+        "422 response omitted the stream SPIFFE compatibility failure: {body}"
+    );
+}
+
+#[tokio::test]
+async fn post_rejects_spiffe_identity_on_plaintext_stream_listener() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let listen_port = bound.local_addr().unwrap().port();
+    drop(bound);
+
+    let proxy_id = uid("spec-tcp-spiffe");
+    let plugin_id = uid("spec-tcp-spiffe-plugin");
+    let spec = plaintext_tcp_spec_with_spiffe_identity(&proxy_id, listen_port, Some(&plugin_id));
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+
+    assert_spiffe_stream_refusal(status, &body);
+    assert!(
+        store
+            .get_proxy("ferrum", &proxy_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused spec must persist no proxy"
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &plugin_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused spec must persist no plugin config"
+    );
+}
+
+#[tokio::test]
+async fn put_rejects_adding_spiffe_identity_to_plaintext_stream_listener() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+    let bound = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let listen_port = bound.local_addr().unwrap().port();
+    drop(bound);
+
+    let proxy_id = uid("spec-tcp-spiffe-put");
+    let (post_status, post_body) = client
+        .post_json(
+            "/api-specs",
+            &plaintext_tcp_spec_with_spiffe_identity(&proxy_id, listen_port, None),
+        )
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "plaintext TCP API-spec setup failed: {post_body}"
+    );
+    let spec_id = post_body["id"]
+        .as_str()
+        .expect("POST response must include spec id")
+        .to_string();
+
+    let plugin_id = uid("spec-tcp-spiffe-put-plugin");
+    let replacement =
+        plaintext_tcp_spec_with_spiffe_identity(&proxy_id, listen_port, Some(&plugin_id));
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &replacement)
+        .await;
+
+    assert_spiffe_stream_refusal(put_status, &put_body);
+    let proxy = store
+        .get_proxy("ferrum", &proxy_id)
+        .await
+        .unwrap()
+        .expect("the refused replacement must keep the stored proxy");
+    assert!(
+        proxy.plugins.is_empty(),
+        "the refused replacement must not attach the plugin: {:?}",
+        proxy.plugins
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", &plugin_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn post_rejects_hmac_request_body_transformer_composition() {
     let dir = TempDir::new().unwrap();

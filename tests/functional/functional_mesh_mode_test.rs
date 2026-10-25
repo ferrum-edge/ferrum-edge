@@ -20954,8 +20954,23 @@ async fn h3_mesh_plain_reload(
 
 /// Plain HTTP over same-cluster Sidecar mesh-mTLS through the H3 frontend.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+    // Same production-sized worker stack as
+    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
+    // request future is deliberately broad, and `#[tokio::test]` would run it
+    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
+    // gives every worker.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build 8 MiB-stack runtime matching src/main.rs")
+        .block_on(functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 plain mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21040,8 +21055,23 @@ async fn h3_mesh_plain_request(
 /// `503` whose `X-Gateway-Error` is the gateway's own `backend_error`, never the
 /// peer's spoofed value.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token() {
+#[test]
+fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token() {
+    // Same production-sized worker stack as
+    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
+    // request future is deliberately broad, and `#[tokio::test]` would run it
+    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
+    // gives every worker.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build 8 MiB-stack runtime matching src/main.rs")
+        .block_on(functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token_inner());
+}
+
+async fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token_inner() {
     let identities = TempDir::new().expect("h3 plain mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21268,8 +21298,23 @@ async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner() 
 /// candidate after a retryable connect failure and land on the secured mesh
 /// transport.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
+#[test]
+fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
+    // Same production-sized worker stack as
+    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
+    // request future is deliberately broad, and `#[tokio::test]` would run it
+    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
+    // gives every worker.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build 8 MiB-stack runtime matching src/main.rs")
+        .block_on(functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls_inner());
+}
+
+async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 plain mixed retry identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21427,8 +21472,23 @@ async fn functional_h3_plain_mesh_identity_failure_fails_closed() {
 
 /// Trusted projected reload re-points plain mesh tags / withdraws / corrupts.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
+#[test]
+fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
+    // Same production-sized worker stack as
+    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
+    // request future is deliberately broad, and `#[tokio::test]` would run it
+    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
+    // gives every worker.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build 8 MiB-stack runtime matching src/main.rs")
+        .block_on(functional_h3_plain_mesh_transport_follows_reload_and_withdrawal_inner());
+}
+
+async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal_inner() {
     let identities = TempDir::new().expect("h3 plain reload identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),

@@ -4989,6 +4989,57 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
     }
 }
 
+/// Whether an HTTP/1.1-speaking dispatcher (the direct HTTP/1.1 pool and the
+/// reqwest fallback) must attach the request body to this backend request.
+///
+/// [`request_may_have_body`] is only a method/header heuristic. It is right for
+/// HTTP/1.1, where a `GET`/`HEAD`/`OPTIONS` without `Content-Length` or
+/// `Transfer-Encoding` has no body, but an HTTP/2 client may leave the stream
+/// open after HEADERS and send DATA with no `Content-Length` on any method.
+/// Treating such a request as bodyless substituted an empty backend body: a
+/// permitted upload lost its payload, and an oversized one never passed through
+/// the size-limited adapter, so the route's request-body ceiling
+/// (`request_size_limiting`) never produced its `413`. The body representation
+/// itself is therefore consulted as well. A streaming body is skipped only when
+/// hyper has already proven end-of-stream (no HTTP/1.1 framing, or END_STREAM
+/// on the HTTP/2 HEADERS frame), and a buffered body only when it holds no
+/// bytes, so an empty `GET` keeps its zero-cost empty-body fast path.
+fn dispatch_request_body_may_be_present(
+    method: &str,
+    headers: &HashMap<String, String>,
+    client_request_body: &ClientRequestBody,
+) -> bool {
+    request_may_have_body(method, headers) || !client_request_body_proven_empty(client_request_body)
+}
+
+/// Whether an outbound HTTP/1.1 request must carry an explicit
+/// `Transfer-Encoding: chunked` for its body to be sent at all.
+///
+/// Hyper's HTTP/1.1 client encoder (`Client::set_length` in the vendored
+/// `proto/h1/role.rs`) frames an unknown-length body on a `GET`, `HEAD`, or
+/// `CONNECT` with no `Content-Length` / `Transfer-Encoding` as zero-length, and
+/// the dispatcher then drops the body without polling it. Other methods get
+/// `chunked` automatically. The proxy strips the client's framing fields from
+/// every outbound map and lets the body's size hint decide, so an HTTP/2
+/// `GET`/`HEAD` upload without `Content-Length` (or an HTTP/1.1 chunked `GET`)
+/// would reach the backend bodyless and never pass through the size-limited
+/// adapter, even with the body attached.
+///
+/// True only when the body is genuinely unknown-length and not already ended: a
+/// proven-empty body keeps the bodyless request with no `Transfer-Encoding`, and
+/// an exact-length body (a declared `Content-Length`, a buffered or retained
+/// body) keeps hyper's own `Content-Length`. Callers apply it only on a request
+/// already known to be sent as HTTP/1.1, never on HTTP/2 or HTTP/3, and never
+/// when the outbound map already carries framing.
+pub(crate) fn h1_request_requires_explicit_chunked_framing<B>(method: &str, body: &B) -> bool
+where
+    B: http_body::Body + ?Sized,
+{
+    matches!(method, "GET" | "HEAD")
+        && !http_body::Body::is_end_stream(body)
+        && http_body::Body::size_hint(body).exact().is_none()
+}
+
 /// Publish the transport's proof that a WebSocket HANDSHAKE carries no request
 /// body, so integrity-verifying authentication plugins can verify a signature
 /// over the empty body (issue #5000).
@@ -7658,6 +7709,15 @@ pub struct ProxyState {
     /// release) → SVID material (install, then release) → request epoch
     /// (commit). No helper called inside this boundary reacquires publication.
     pub gateway_trust_publication_lock: Arc<std::sync::Mutex<()>>,
+    /// Consumer `jwt` secrets this process has seen configured on more than
+    /// one Consumer of a namespace (namespace-bound digests only). Every
+    /// full and incremental swap quarantines against it, so a later point
+    /// delta cannot reactivate a key another Consumer is known to hold after
+    /// the live snapshot already stripped that other holder. Locked only on
+    /// the config-swap cold path, never on the request path. Only accepted
+    /// candidates record into it, and it is bounded per namespace.
+    pub jwt_shared_secret_history:
+        Arc<std::sync::Mutex<crate::config::types::JwtSharedSecretHistory>>,
     /// Whether this process cannot know its namespace's AUTHORITATIVE gateway
     /// trust state (issue #3727).
     ///
@@ -10579,6 +10639,13 @@ impl ProxyState {
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
         reserved_gateway_ports: HashSet<u16>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
+        // Seed the shared-secret history from the shared JWT secrets the
+        // full loader already stripped from this initial snapshot.
+        let mut initial_jwt_history = crate::config::types::JwtSharedSecretHistory::default();
+        let initial_jwt_shared = std::mem::take(&mut config.quarantined_jwt_shared_secrets);
+        if initial_jwt_history.merge(&initial_jwt_shared) > 0 {
+            warn_jwt_shared_secret_history_evicted();
+        }
         if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
             for msg in &errors {
                 error!("Initial config rejected: {}", msg);
@@ -11288,6 +11355,7 @@ impl ProxyState {
             gateway_trust_bundles,
             gateway_svid_update_lock: Arc::new(std::sync::Mutex::new(())),
             gateway_trust_publication_lock: Arc::new(std::sync::Mutex::new(())),
+            jwt_shared_secret_history: Arc::new(std::sync::Mutex::new(initial_jwt_history)),
             gateway_trust_authority_unresolved: Arc::new(AtomicBool::new(false)),
             mesh_trust_registry,
             mesh_inbound_tls,
@@ -14026,6 +14094,28 @@ impl ProxyState {
         trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
         explicit_trust: Option<GatewayTrustCommit>,
     ) -> ConfigApplyOutcome {
+        // Weak, malformed, or cross-Consumer shared JWT secrets (including
+        // ones shared in an earlier accepted generation) never reach the
+        // ConsumerIndex. Shared secrets this candidate reveals are recorded
+        // only if the candidate is accepted.
+        let jwt_shared = self.quarantine_jwt_credentials(&mut new_config, Some("Config reload"));
+        let outcome = self.update_config_with_mesh_ids_quarantined(
+            new_config,
+            trusted_mesh_ids,
+            explicit_trust,
+        );
+        if outcome.accepted() {
+            self.record_jwt_shared_secrets(&jwt_shared);
+        }
+        outcome
+    }
+
+    fn update_config_with_mesh_ids_quarantined(
+        &self,
+        mut new_config: GatewayConfig,
+        trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+        explicit_trust: Option<GatewayTrustCommit>,
+    ) -> ConfigApplyOutcome {
         use crate::config_delta::ConfigDelta;
 
         // Normalize hostnames (ASCII-lowercase) and pre-compute each
@@ -14720,6 +14810,34 @@ impl ProxyState {
             u64,
         )>,
     ) -> IncrementalApplyResult {
+        let mut jwt_shared = crate::config::types::JwtSharedSecretRecords::default();
+        let applied = self
+            .apply_incremental_staged(
+                result,
+                explicit_trust,
+                database_topology_fence,
+                &mut jwt_shared,
+            )
+            .await;
+        if matches!(&applied, IncrementalApplyResult::Outcome(outcome) if outcome.accepted()) {
+            self.record_jwt_shared_secrets(&jwt_shared);
+        }
+        applied
+    }
+
+    /// [`Self::apply_incremental_inner`] without the history commit: shared
+    /// JWT secrets the patched snapshot reveals are written to `jwt_shared`
+    /// and recorded by the caller only if the delta is accepted.
+    async fn apply_incremental_staged(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+        explicit_trust: Option<GatewayTrustCommit>,
+        database_topology_fence: Option<(
+            &Arc<dyn crate::config::db_backend::DatabaseBackend>,
+            u64,
+        )>,
+        jwt_shared: &mut crate::config::types::JwtSharedSecretRecords,
+    ) -> IncrementalApplyResult {
         if result.is_empty() {
             // An empty resource delta still has to commit an explicit trust
             // decision: a CP trust-only update carries no resources at all.
@@ -14886,6 +15004,13 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Incremental config: {}", message);
         }
+        // Consumer `jwt` secrets get the same fail-closed treatment on the
+        // patched snapshot, so a delta that introduces a shared secret strips
+        // it from every Consumer holding it, not only the delta's rows. The
+        // patched snapshot no longer shows holders an earlier generation
+        // already stripped, so the process-local shared-secret history is
+        // what keeps a later delta from reactivating such a key.
+        *jwt_shared = self.quarantine_jwt_credentials(&mut new_config, Some("Incremental config"));
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -15255,12 +15380,56 @@ impl ProxyState {
         self.config.load_full()
     }
 
+    /// Quarantine weak, malformed, and shared Consumer `jwt` credentials in
+    /// a candidate about to be swapped, against this process's shared-secret
+    /// history, logging each quarantine under `context` (`None` discards the
+    /// diagnostics, for read-only comparison). Returns the shared
+    /// secrets the candidate revealed, including those its full loader
+    /// already stripped, for [`Self::record_jwt_shared_secrets`] once the
+    /// candidate is accepted. Cold path only.
+    fn quarantine_jwt_credentials(
+        &self,
+        config: &mut GatewayConfig,
+        context: Option<&str>,
+    ) -> crate::config::types::JwtSharedSecretRecords {
+        let mut shared = std::mem::take(&mut config.quarantined_jwt_shared_secrets);
+        let outcome = {
+            let history = self
+                .jwt_shared_secret_history
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            config.quarantine_invalid_jwt_credentials_against(&history)
+        };
+        if let Some(context) = context {
+            for message in &outcome.messages {
+                error!("{}: {}", context, message);
+            }
+        }
+        shared.extend(outcome.shared);
+        shared
+    }
+
+    /// Merge shared JWT secrets from an accepted candidate into the history.
+    fn record_jwt_shared_secrets(&self, shared: &crate::config::types::JwtSharedSecretRecords) {
+        if shared.is_empty() {
+            return;
+        }
+        let evicted = self
+            .jwt_shared_secret_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .merge(shared);
+        if evicted > 0 {
+            warn_jwt_shared_secret_history_evicted();
+        }
+    }
+
     /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
     /// does before it swaps, so the result is content-comparable against
     /// [`Self::current_config`].
     ///
     /// `update_config` normalizes fields, resolves upstream TLS, quarantines
-    /// invalid HMAC credentials, and injects gateway workload-metrics identity
+    /// invalid HMAC and JWT credentials, and injects gateway workload-metrics identity
     /// **before** storing the snapshot. A raw CP-delivered candidate has not
     /// been through those node-local steps, so comparing it directly against
     /// the applied config reports a spurious mismatch on any node whose
@@ -15282,6 +15451,12 @@ impl ProxyState {
         candidate.normalize_fields();
         candidate.resolve_upstream_tls();
         let _ = candidate.quarantine_invalid_hmac_credentials();
+        // Quarantine against the live history without cloning it (diagnostics
+        // discarded like the HMAC ones above). Shared secrets a raw candidate
+        // reveals are kept: the source really assigns them to several
+        // Consumers, so recording them only fails closed.
+        let shared = self.quarantine_jwt_credentials(&mut candidate, None);
+        self.record_jwt_shared_secrets(&shared);
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
             &self.gateway_svid_bundle,
@@ -15289,6 +15464,16 @@ impl ProxyState {
         );
         candidate
     }
+}
+
+/// Warn that the bounded shared-secret history evicted older digests.
+fn warn_jwt_shared_secret_history_evicted() {
+    warn!(
+        "jwt_auth shared-secret history reached its per-namespace bound of {} digests; the \
+         oldest remembered shared secrets were forgotten. Replace shared Consumer JWT secrets \
+         on every former holder.",
+        crate::config::types::JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE
+    );
 }
 
 /// Drives the per-IP cleanup interval loop.
@@ -15832,10 +16017,32 @@ pub(crate) fn finalize_successful_websocket_response_headers(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
-    for plugin in plugins {
+    // The matched `mesh_route_dispatch` rule's response list governs the
+    // successful handshake too: apply it once, after the last eligible
+    // route-response consumer (in a WebSocket view, the cache-owned stand-in
+    // for the HTTP/gRPC-only `response_transformer`), exactly where the
+    // ordinary response path finalizes it. `None` when no list was published
+    // keeps the ordinary handshake free of the chain scan.
+    let route_response_finalizer = ctx
+        .route_override_response_transform
+        .as_ref()
+        .and_then(|_| {
+            plugins
+                .iter()
+                .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
+        });
+    for (index, plugin) in plugins.iter().enumerate() {
         plugin.apply_websocket_handshake_response_headers(ctx, response_status, response_headers);
         if plugin.is_initial_response_header_policy() {
             plugin.apply_initial_response_header_policy(response_headers);
+        }
+        if route_response_finalizer == Some(index)
+            && let Some(route_rules) = ctx.route_override_response_transform.as_deref()
+        {
+            crate::plugins::utils::route_header_transform::apply_route_header_transforms(
+                route_rules,
+                response_headers,
+            );
         }
     }
     strip_websocket_transport_managed_response_header_map(response_headers);
@@ -17182,6 +17389,18 @@ async fn handle_websocket_request_authenticated(
                     reason,
                     "Rejecting WebSocket upgrade: invalid backend permessage-deflate answer"
                 );
+                // The backend answered the upgrade with an extension response
+                // the gateway cannot honor: a backend protocol fault. Settle the
+                // admission permit as a failure before it drops, so the adaptive
+                // limiter backs off instead of silently releasing the slot.
+                if let Some(permits) = backend_admission_permits.as_ref() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error: false,
+                        error_class: Some(retry::ErrorClass::ProtocolError),
+                        backend_elapsed: backend_admission_start.elapsed(),
+                    });
+                }
                 log_rejected_request_with_path(
                     &plugins,
                     &ctx,
@@ -25096,6 +25315,54 @@ pub async fn log_rejected_request(
     .await;
 }
 
+/// Deliver the terminal summary of a request that matched no proxy (the
+/// route-miss `404`) to the generation's global access logs
+/// (`PluginCacheInner::unrouted_transaction_log_plugins`).
+///
+/// Callers reach this only when such a logger exists, so the no-logger route
+/// miss keeps its allocation-free fast path. No request hook ran, so the
+/// summary has no proxy, backend, consumer, or plugin time; it carries
+/// `metadata.rejection_phase = "route_not_found"`. The routing diagnostic was
+/// already recorded by `record_route_miss`, so this does not record another.
+///
+/// `namespace` is the gateway's serving namespace (`FERRUM_NAMESPACE`), the
+/// only namespace a request that matched no proxy can be attributed to; never
+/// the resource-deserialization default.
+pub async fn log_unrouted_request(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    namespace: &str,
+    status_code: u16,
+    start_time: Instant,
+) {
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let mut metadata = clone_log_metadata(ctx);
+    metadata.insert(
+        "rejection_phase".to_string(),
+        crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE.to_string(),
+    );
+    let summary = TransactionSummary {
+        namespace: namespace.to_owned(),
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        http_method: ctx.method.clone(),
+        request_path: ctx.path.clone(),
+        response_status_code: status_code,
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: total_ms,
+        latency_backend_ttfb_ms: -1.0,
+        latency_backend_total_ms: -1.0,
+        latency_gateway_overhead_ms: total_ms,
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        bytes_sent: ctx
+            .bytes_sent_observed
+            .load(std::sync::atomic::Ordering::Acquire),
+        metadata,
+        ..TransactionSummary::default()
+    };
+    crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
+}
+
 /// Run logging plugins for a rejection that occurred before backend contact.
 ///
 /// The summary retains matched-proxy attribution but deliberately omits
@@ -32838,6 +33105,32 @@ pub(crate) fn insert_reauthentication_challenge(
     );
 }
 
+/// Chain index after which proxy core applies the matched route request-header
+/// list (GHSA-3xxr-xhhj-9962).
+///
+/// The list is applied exactly once, after the LATER of the last eligible
+/// `request_transformer` (so a later static rule cannot undo route policy) and
+/// the last instance that may replace it — every `mesh_route_dispatch`
+/// instance, including one whose rules publish nothing, because a matching
+/// rule clears an earlier instance's list. A priority override can
+/// legitimately place the consumer before the dispatch block; finalizing at
+/// the consumer would take an empty slot (the list published afterwards would
+/// never apply), and finalizing inside the block would apply a list a later
+/// instance supersedes and let its predicates see route headers early. `None` when the chain has
+/// no eligible consumer: a disabled RTDS transformer neither consumes nor
+/// suppresses the list, and plugin-cache composition refuses a producer with
+/// no configured consumer at all. Neither participant defers its
+/// `before_proxy` hook, so the boundary always falls inside the initial pass.
+fn route_request_header_finalization_index(plugins: &[Arc<dyn Plugin>]) -> Option<usize> {
+    let last_consumer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_request_header_finalization())?;
+    let last_producer = plugins
+        .iter()
+        .rposition(|plugin| plugin.replaces_route_request_header_transforms());
+    Some(last_producer.map_or(last_consumer, |producer| producer.max(last_consumer)))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum BackendPathBeforeProxyPass {
     Initial,
@@ -32852,9 +33145,7 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     backend_path_is_policy_bound: bool,
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
-    let last_route_request_finalizer = plugins
-        .iter()
-        .rposition(|plugin| plugin.participates_in_route_request_header_finalization());
+    let last_route_request_finalizer = route_request_header_finalization_index(plugins);
     for (index, plugin) in plugins.iter().enumerate() {
         let deferred =
             backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();
@@ -35522,6 +35813,26 @@ async fn handle_proxy_request_inner(
                         response.status().as_u16(),
                     );
                     record_status(&state, response.status().as_u16());
+                    // Global access logs still record the miss (scanner and
+                    // stale-route traffic). Without one this stays the
+                    // allocation-free fast path: one pointer check. The
+                    // summary keeps the routing status (404) even when native
+                    // gRPC reshapes the head to trailers-only 200.
+                    if let Some(unrouted_log_plugins) =
+                        epoch.plugin_cache.unrouted_transaction_log_plugins()
+                    {
+                        ctx.materialize_headers();
+                        // Boxed: keep the logging future's state off the
+                        // request handler's (worker-stack) state machine.
+                        Box::pin(log_unrouted_request(
+                            &unrouted_log_plugins,
+                            &ctx,
+                            &state.env_config.namespace,
+                            StatusCode::NOT_FOUND.as_u16(),
+                            start_time,
+                        ))
+                        .await;
+                    }
                     return Ok(response);
                 }
             }
@@ -42892,6 +43203,12 @@ async fn handle_proxy_request_inner(
     // Assigned on every continuing dispatch path before first read; leave
     // uninitialized so an unused starter `None` cannot trip `-D warnings`.
     let passthrough_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>>;
+    // Direct-H2 withholds early backend response headers until the client
+    // upload reaches a terminal size/authorization decision. That wait belongs
+    // to the client, so it is carried out of the dispatcher together with the
+    // attempt start it was measured under and excluded from the adaptive
+    // sample below. Assigned on every continuing dispatch path, like the latch.
+    let direct_h2_client_upload_gate: (Instant, Duration);
     // Set when the retry loop breaks on a gateway-synthesized dispatch refusal
     // for a ROTATED candidate that was never dialed (mesh-transport / secured
     // transport screens). `final_upstream_target` deliberately points at that
@@ -43028,11 +43345,14 @@ async fn handle_proxy_request_inner(
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
                 passthrough_request_bytes,
+                client_upload_gate_wait,
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = mesh_read_timeout_ms;
                 passthrough_request_bytes_latch = passthrough_request_bytes;
+                direct_h2_client_upload_gate =
+                    (backend_admission_started_at, client_upload_gate_wait);
                 let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
@@ -43878,12 +44198,15 @@ async fn handle_proxy_request_inner(
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
                 passthrough_request_bytes,
+                client_upload_gate_wait,
                 ..
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = effective_streaming_h2_read_timeout_ms;
                 passthrough_request_bytes_latch = passthrough_request_bytes;
+                direct_h2_client_upload_gate =
+                    (backend_admission_started_at, client_upload_gate_wait);
                 let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
@@ -44395,7 +44718,19 @@ async fn handle_proxy_request_inner(
     let backend_admission_response_status = recorded_backend_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
-    let backend_admission_elapsed = final_backend_dispatch_elapsed;
+    // Only the attempt that measured the direct-H2 upload gate subtracts it: a
+    // retry resets `backend_admission_started_at`, so a stale gate never
+    // shortens another attempt's sample. Streamed responses therefore sample
+    // response-header arrival (TTFB) and buffered ones the backend round trip,
+    // never the client's upload time (`docs/plugins.md`).
+    let backend_admission_elapsed = {
+        let (gate_attempt_started_at, gate_wait) = direct_h2_client_upload_gate;
+        if gate_attempt_started_at == backend_admission_started_at {
+            final_backend_dispatch_elapsed.saturating_sub(gate_wait)
+        } else {
+            final_backend_dispatch_elapsed
+        }
+    };
     let mut is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
@@ -48670,6 +49005,11 @@ enum BackendDispatchResult {
         /// Join for unlimited direct-H2 passthrough byte publication. `None`
         /// on every other dispatch (reqwest, limited H2, mesh, H3).
         passthrough_request_bytes: Option<Arc<body::DirectH2BytesLatch>>,
+        /// Time the direct-H2 dispatcher held already-received backend response
+        /// headers while waiting for the client upload to finish. Client time,
+        /// excluded from the adaptive-concurrency latency sample. `ZERO` on
+        /// every other dispatch.
+        client_upload_gate_wait: Duration,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
@@ -48771,6 +49111,7 @@ fn backend_dispatch_response(
         request_body_exceeded: None,
         streaming_h2_read_timeout_ms: None,
         passthrough_request_bytes: None,
+        client_upload_gate_wait: Duration::ZERO,
     }
 }
 
@@ -50015,6 +50356,7 @@ async fn proxy_to_backend(
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
 
@@ -50093,6 +50435,7 @@ async fn proxy_to_backend(
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
 
@@ -50230,6 +50573,7 @@ async fn proxy_to_backend(
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
 
@@ -50608,6 +50952,7 @@ async fn proxy_to_backend(
                     }
                 };
                 let mut passthrough_request_bytes = None;
+                let mut client_upload_gate_wait = Duration::ZERO;
                 let (backend_resp, request_body_exceeded) = construct_proxy_future(|| {
                     proxy_to_backend_http2(
                         state,
@@ -50629,6 +50974,7 @@ async fn proxy_to_backend(
                         route_request_body_limit,
                         route_response_body_limit,
                         &mut passthrough_request_bytes,
+                        &mut client_upload_gate_wait,
                     )
                 })
                 .await;
@@ -50639,6 +50985,7 @@ async fn proxy_to_backend(
                     request_body_exceeded,
                     streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
                     passthrough_request_bytes,
+                    client_upload_gate_wait,
                 };
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
@@ -50733,7 +51080,11 @@ async fn proxy_to_backend(
     // `backend_url`, which names the real backend target the socket reaches.
     // Direct HTTP/1.1 pool (issue #5588): where reqwest would speak HTTP/1.1
     // anyway, dispatch on Ferrum's own exclusive-checkout hyper connections.
-    let direct_h1_has_body = request_may_have_body(method, headers);
+    // Consult the body itself, not only method/headers: an HTTP/2 GET/HEAD/
+    // OPTIONS can carry DATA without `Content-Length`, and that body must reach
+    // the size-limited adapter rather than being replaced by an empty one.
+    let direct_h1_has_body =
+        dispatch_request_body_may_be_present(method, headers, &client_request_body);
     if sni_reqwest_dial.is_none()
         && direct_h1_dispatch_eligible(
             state,
@@ -50990,7 +51341,10 @@ async fn proxy_to_backend(
         );
     }
 
-    let has_body = request_may_have_body(method, headers);
+    // Same body-presence decision as the direct HTTP/1.1 pool above, so turning
+    // that pool off cannot reopen the empty-body substitution for an HTTP/2
+    // GET/HEAD/OPTIONS upload without `Content-Length`.
+    let has_body = dispatch_request_body_may_be_present(method, headers, &client_request_body);
 
     // Shared flag for detecting size-limit exceeded during streaming.
     // Only allocated when we actually stream a request body.
@@ -51150,6 +51504,19 @@ async fn proxy_to_backend(
                 // EOF need not update `is_end_stream()`.
                 let require_end_stream = original_req.version() == hyper::Version::HTTP_2;
                 let incoming = (*original_req).into_body();
+                // Hyper would encode an unknown-length GET/HEAD body as
+                // zero-length and drop it unpolled, so the size-limited adapter
+                // below would never see it. Only when this reqwest dispatch is
+                // known to speak HTTP/1.1: HTTP/2 frames the body itself and
+                // must never carry `Transfer-Encoding`.
+                if reqwest_dispatch_is_http1_only(state, proxy, upstream_target)
+                    && h1_request_requires_explicit_chunked_framing(method, &incoming)
+                {
+                    req_builder = req_builder.header(
+                        reqwest::header::TRANSFER_ENCODING,
+                        reqwest::header::HeaderValue::from_static("chunked"),
+                    );
+                }
                 // Authorization lifetime for the UPLOAD direction (#3815). A
                 // client-streaming or bidirectional upload whose backend
                 // withholds response headers has no response body to bound, so
@@ -53069,6 +53436,28 @@ async fn proxy_to_backend_direct_h1(
     *backend_req.uri_mut() = origin_form_uri;
     *backend_req.version_mut() = hyper::Version::HTTP_11;
     *backend_req.headers_mut() = out_headers;
+    // This request is always HTTP/1.1, and its map carries no framing fields
+    // (they are stripped above). Without explicit `chunked`, hyper would send
+    // an unknown-length GET/HEAD body as zero-length and drop it unpolled, so
+    // the size-limited adapter would never see it. Set after the map is
+    // installed, so no hop-by-hop strip runs after it; an idle-race replay
+    // resends this same request head.
+    if !backend_req
+        .headers()
+        .contains_key(hyper::header::CONTENT_LENGTH)
+        && !backend_req
+            .headers()
+            .contains_key(hyper::header::TRANSFER_ENCODING)
+        && h1_request_requires_explicit_chunked_framing(
+            backend_req.method().as_str(),
+            backend_req.body(),
+        )
+    {
+        backend_req.headers_mut().insert(
+            hyper::header::TRANSFER_ENCODING,
+            hyper::header::HeaderValue::from_static("chunked"),
+        );
+    }
 
     // ── Send under the response-header, client and authorization bounds ──
     // `handoff_bound` (composed above, before the first checkout) carries all
@@ -53348,6 +53737,7 @@ async fn proxy_to_backend_direct_h1(
             request_body_exceeded: Some(body_size_exceeded),
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
     let collected = match collect_response_under_authorization(
@@ -55192,7 +55582,7 @@ fn build_request_body_too_large_response(
     }
     build_response(
         StatusCode::PAYLOAD_TOO_LARGE,
-        r#"{"error":"Request body exceeds maximum size"}"#,
+        crate::util::body_limit::REQUEST_BODY_TOO_LARGE_BODY,
     )
 }
 
@@ -56691,6 +57081,7 @@ fn route_deadline_dispatch_result(
         request_body_exceeded: None,
         streaming_h2_read_timeout_ms: None,
         passthrough_request_bytes: None,
+        client_upload_gate_wait: Duration::ZERO,
     }
 }
 
@@ -62977,6 +63368,10 @@ async fn proxy_to_backend_http2(
     // unlimited arm so transaction summaries can wait for forwarded bytes
     // after an early backend response without gating those headers here.
     passthrough_request_bytes: &mut Option<Arc<body::DirectH2BytesLatch>>,
+    // Out-parameter: how long already-received response headers were withheld
+    // waiting for the client upload's terminal decision. Set only when that
+    // gate forwards the response; left `ZERO` on every other return.
+    client_upload_gate_wait: &mut Duration,
 ) -> (
     retry::BackendResponse,
     Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -63611,6 +64006,9 @@ async fn proxy_to_backend_http2(
     // response headers withheld until its upload terminates — applies whenever a
     // request-size limit is set, and additionally for any authenticated request.
     if let Some(body_completion_rx) = body_completion_rx {
+        // Response headers are already here: from now until the gate forwards
+        // them, the request waits on the client upload, not the backend.
+        let upload_gate_started_at = Instant::now();
         // The header phase has already spent its own deadline, so the upload
         // phase reuses the operator whole-upload stall guard composed with any
         // client RPC deadline. Without it a backend that answers early and then
@@ -63780,7 +64178,9 @@ async fn proxy_to_backend_http2(
                     true
                 });
         match classify_direct_h2_upload_outcome(outcome, pump_outcome, authorization_expired) {
-            DirectH2UploadGate::Forward => {}
+            DirectH2UploadGate::Forward => {
+                *client_upload_gate_wait = upload_gate_started_at.elapsed();
+            }
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
             DirectH2UploadGate::AuthorizationExpired => {
                 return (
@@ -76073,6 +76473,7 @@ mod tests {
     fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
         GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies,
             consumers: vec![],

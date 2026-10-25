@@ -294,6 +294,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
                 orig_dst = %orig_dst,
                 app_port,
                 client_ip = %client_ip,
+                plugin = plugin.name(),
                 "Sidecar raw-TCP inbound connection rejected by stream policy; closing \
                  captured connection without relaying to loopback"
             );
@@ -310,8 +311,9 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             // counts the deny (it only records a failure when `error_class` is
             // present) instead of logging a zero-byte graceful close. The
             // `connection_error` text matches the generic path's
-            // `STREAM_ERR_REJECTED_BY_PLUGIN` prefix so log consumers see
-            // consistent wording across the two stream paths.
+            // `STREAM_ERR_REJECTED_BY_PLUGIN` prefix followed by the refusing
+            // plugin's name, so log consumers see consistent wording across the
+            // two stream paths and can attribute the refusal.
             //
             // Finalize the mesh TCP lifecycle under the metadata the rejecting
             // (and prior) hooks left, before the zero-byte disconnect summary,
@@ -329,7 +331,11 @@ pub(crate) async fn handle_mesh_tcp_inbound(
                 connected_at,
                 0,
                 0,
-                Some(tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN.to_string()),
+                Some(format!(
+                    "{} {}",
+                    tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN,
+                    plugin.name()
+                )),
                 Some(crate::retry::ErrorClass::RequestError),
                 Some(crate::plugins::Direction::ClientToBackend),
                 Some(DisconnectCause::RecvError),

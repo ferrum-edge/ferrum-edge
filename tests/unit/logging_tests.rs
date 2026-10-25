@@ -426,3 +426,148 @@ fn blocked_writer_produces_bounded_shutdown_and_incomplete_drain_count() {
     wake.notify_all();
     wait_until(|| sink.snapshot().queued_records == 0);
 }
+
+/// Thread-safe in-memory `MakeWriter` for the filter tests below.
+#[derive(Clone, Default)]
+struct FilterCapture(Arc<Mutex<Vec<u8>>>);
+
+impl FilterCapture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+impl Write for FilterCapture {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FilterCapture {
+    type Writer = FilterCapture;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Emit, through an output layer filtered by `directives` AND the gateway's
+/// credential-dumping filter (the same composition `init_logging` builds),
+/// the dependency records that render credentials plus sibling controls, and
+/// return what reached the output.
+fn render_under_gateway_filter(directives: &str) -> String {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let writer = FilterCapture::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .with_filter(tracing_subscriber::EnvFilter::new(directives))
+        .with_filter(ferrum_edge::logging::credential_dumping_log_filter());
+    let subscriber = tracing_subscriber::registry().with(layer);
+    crate::diagnostic_test_interest::ensure_interest_floor();
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("ws_connect");
+        let _entered = span.enter();
+        tracing::trace!(
+            target: "tungstenite::handshake::client",
+            "Request: GET /ingest?stream=handshake-path-canary HTTP/1.1 authorization: Bearer handshake-header-canary"
+        );
+        tracing::debug!(
+            target: "tungstenite::handshake::client",
+            "Client handshake done."
+        );
+        tracing::trace!(
+            target: "tungstenite::protocol",
+            "Received message {{\"token\":\"protocol-payload-canary\"}}"
+        );
+        tracing::trace!(
+            target: "tungstenite::protocol::frame",
+            "writing frame frame-payload-canary"
+        );
+        tracing::debug!(target: "tungstenite::protocol", "close-frame-debug-visible");
+        tracing::trace!(target: "tungstenite::handshake::server", "sibling-target-visible");
+        tracing::trace!(target: "tungstenite::protocolx", "lookalike-target-visible");
+    });
+    writer.contents()
+}
+
+#[test]
+fn credential_dumping_records_stay_off_under_every_directive_shape() {
+    for directives in [
+        "trace",
+        "tungstenite=trace",
+        "warn,tungstenite::handshake::client=trace",
+        // Field-scoped and span-scoped directives are more specific than any
+        // target directive; the AND-composed filter must still drop them.
+        "warn,tungstenite::handshake::client[{message}]=trace,tungstenite::protocol[{message}]=trace",
+        "warn,tungstenite::handshake::client[ws_connect]=trace,tungstenite::protocol[ws_connect]=trace",
+    ] {
+        let output = render_under_gateway_filter(directives);
+        for canary in [
+            "handshake-path-canary",
+            "handshake-header-canary",
+            "Client handshake done.",
+            "protocol-payload-canary",
+            "frame-payload-canary",
+        ] {
+            assert!(
+                !output.contains(canary),
+                "{directives}: {canary} leaked: {output}"
+            );
+        }
+    }
+
+    // Controls: the filter is target- and level-scoped, so other tungstenite
+    // records keep their configured verbosity...
+    let output = render_under_gateway_filter("trace");
+    assert!(output.contains("sibling-target-visible"), "{output}");
+    assert!(output.contains("close-frame-debug-visible"), "{output}");
+    assert!(output.contains("lookalike-target-visible"), "{output}");
+    // ...and the field-scoped directive shape really does enable records,
+    // so its suppression assertion above is not vacuous.
+    let output =
+        render_under_gateway_filter("warn,tungstenite::handshake::server[{message}]=trace");
+    assert!(output.contains("sibling-target-visible"), "{output}");
+}
+
+#[test]
+fn credential_dumping_filter_never_raises_verbosity() {
+    let output = render_under_gateway_filter("warn");
+    for record in [
+        "sibling-target-visible",
+        "close-frame-debug-visible",
+        "lookalike-target-visible",
+    ] {
+        assert!(!output.contains(record), "{record}: {output}");
+    }
+}
+
+/// Every output layer the binary installs must carry the credential filter
+/// outside its reloadable `EnvFilter`; a layer without it would let any
+/// directive or RTDS reload re-enable the records.
+#[test]
+fn every_gateway_output_layer_composes_the_credential_dumping_filter() {
+    let source = include_str!("../../src/gateway_entry.rs");
+    let output_layers = source.matches("tracing_subscriber::fmt::layer()").count();
+    let filtered = source
+        .matches(".with_filter(logging::credential_dumping_log_filter())")
+        .count();
+    assert!(output_layers >= 2, "expected both init_logging branches");
+    assert_eq!(
+        filtered, output_layers,
+        "every fmt output layer must compose credential_dumping_log_filter()"
+    );
+    assert!(
+        ferrum_edge::logging::CREDENTIAL_DUMPING_LOG_TARGETS
+            .iter()
+            .any(|(target, _)| *target == "tungstenite::handshake::client")
+    );
+}

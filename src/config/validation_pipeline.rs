@@ -1171,9 +1171,9 @@ mod tests {
             version: "1".to_string(),
             plugin_configs: vec![PluginConfig {
                 labels: Default::default(),
-                id: "bad-stdout".to_string(),
+                id: "bad-debugger".to_string(),
                 namespace: default_namespace(),
-                plugin_name: "stdout_logging".to_string(),
+                plugin_name: "transaction_debugger".to_string(),
                 config: json!("bad-config"),
                 scope: PluginScope::Global,
                 proxy_id: None,
@@ -1196,7 +1196,7 @@ mod tests {
             .expect("collect validation should return accumulated errors");
 
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("stdout_logging"), "{errors:?}");
-        assert!(errors[0].contains("bad-stdout"), "{errors:?}");
+        assert!(errors[0].contains("transaction_debugger"), "{errors:?}");
+        assert!(errors[0].contains("bad-debugger"), "{errors:?}");
     }
 }

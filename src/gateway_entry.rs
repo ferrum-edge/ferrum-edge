@@ -353,7 +353,10 @@ fn init_logging() -> Result<LoggingGuards, String> {
                 stdout: stdout_writer.clone(),
                 stderr: stderr_writer.clone(),
             })
-            .with_filter(fmt_reload_layer);
+            .with_filter(fmt_reload_layer)
+            // AND-ed with the reloadable filter: credential-dumping dependency
+            // records stay off whatever directive or RTDS reload is applied.
+            .with_filter(logging::credential_dumping_log_filter());
         let log_counter_filter = filter_fn(|metadata| {
             crate::runtime_metrics_tracing_layer::should_count_target(metadata.target())
         });
@@ -386,7 +389,10 @@ fn init_logging() -> Result<LoggingGuards, String> {
                 stdout: stdout_writer,
                 stderr: stderr_writer,
             })
-            .with_filter(reload_layer);
+            .with_filter(reload_layer)
+            // AND-ed with the reloadable filter: credential-dumping dependency
+            // records stay off whatever directive or RTDS reload is applied.
+            .with_filter(logging::credential_dumping_log_filter());
         if tracing_subscriber::registry()
             .with(fmt_layer)
             .try_init()

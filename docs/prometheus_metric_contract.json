@@ -334,6 +334,20 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "ferrum_adaptive_concurrency_decisions_total",
+    "type": "counter",
+    "help": "adaptive_concurrency admission decisions other than an ordinary within-limit admit, by proxy and decision.",
+    "labels": [
+      "proxy_id",
+      "decision",
+      "namespace"
+    ],
+    "subsystem": "adaptive_concurrency",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_admin_active_connections",
     "type": "gauge",
     "help": "Admin/management-plane connections currently in flight.",
@@ -5143,6 +5157,19 @@
       "namespace"
     ],
     "subsystem": "stream",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tcp_connection_throttle_rejections_total",
+    "type": "counter",
+    "help": "TCP connections refused by tcp_connection_throttle because the connection's Consumer or client-IP key was at max_connections_per_key.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "tcp_connection_throttle",
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"

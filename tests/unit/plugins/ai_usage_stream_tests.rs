@@ -1633,3 +1633,61 @@ fn untyped_cache_only_updates_reach_the_anthropic_fold() {
     extractor.finish();
     assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
 }
+
+// ─── Observer fields: provider family and bounded model ─────────────────
+
+/// `ai_token_metrics` publishes individual counters, the provider family, and
+/// the model from the shared accumulator; the model is retained only when it
+/// is publishable (1–256 bytes, no control characters).
+#[test]
+fn token_usage_carries_counters_provider_and_a_bounded_model() {
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&sse(&[
+        &json!({"object": "chat.completion.chunk", "model": "m".repeat(257), "choices": []})
+            .to_string(),
+        &json!({"object": "chat.completion.chunk", "model": "gpt-4o", "choices": []}).to_string(),
+        &json!({"object": "chat.completion.chunk", "model": "later", "choices": [],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}})
+        .to_string(),
+    ]));
+    extractor.finish();
+    let usage = extractor.usage().token_usage();
+    assert_eq!(usage.prompt_tokens, Some(3));
+    assert_eq!(usage.completion_tokens, Some(4));
+    assert_eq!(usage.total_tokens, Some(7));
+    assert_eq!(usage.provider, Some(AiProvider::OpenAi));
+    assert_eq!(usage.model.as_deref(), Some("gpt-4o"));
+
+    let mut anthropic = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    anthropic.push(&sse(&[
+        &json!({"type": "message_start", "message": {"model": "claude-test",
+            "usage": {"input_tokens": 10, "output_tokens": 1}}})
+        .to_string(),
+        &json!({"type": "message_delta", "usage": {"output_tokens": 5}}).to_string(),
+    ]));
+    anthropic.finish();
+    let usage = anthropic.usage().token_usage();
+    assert_eq!(usage.provider, Some(AiProvider::Anthropic));
+    assert_eq!(usage.model.as_deref(), Some("claude-test"));
+    assert_eq!(usage.completion_tokens, Some(5));
+
+    let mut responses = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    responses.push(&sse(&[&json!({"type": "response.completed", "response": {
+        "object": "response", "model": "gpt-resp",
+        "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}}})
+    .to_string()]));
+    responses.finish();
+    assert_eq!(
+        responses.usage().token_usage().model.as_deref(),
+        Some("gpt-resp")
+    );
+
+    // Control characters disqualify a model name.
+    let mut control = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    control.push(&sse(&[&json!({"model": "bad\nmodel",
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+    .to_string()]));
+    control.finish();
+    assert_eq!(control.usage().token_usage().model, None);
+    assert!(control.usage().observed());
+}

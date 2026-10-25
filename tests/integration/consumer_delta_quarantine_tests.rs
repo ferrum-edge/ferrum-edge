@@ -38,6 +38,12 @@ fn hmac(secret: &str) -> Value {
     json!({"hmac_auth": [{"secret": secret}]})
 }
 
+const JWT_SECRET: &str = "consumer-delta-jwt-secret-0123456789abcd";
+
+fn jwt(secret: &str) -> Value {
+    json!({"jwt": [{"secret": secret}]})
+}
+
 async fn expect_escalation(db: &dyn DatabaseBackend, namespace: &str, after: u64, why: &str) {
     match db.load_incremental_config(namespace, after).await {
         Ok(_) => panic!("{why}: consumer change must escalate to a full reload"),
@@ -139,6 +145,14 @@ pub(crate) async fn assert_consumer_delta_quarantine_contract<F, Fut>(
         .await
         .unwrap();
     expect_escalation(db, ns, after, "hmac_auth upsert").await;
+
+    // A jwt upsert escalates too (PR #6865): a shared JWT secret quarantines
+    // every holder, which only the full namespace snapshot can see.
+    let after = db.latest_change_sequence(ns).await.unwrap();
+    db.create_consumer(&consumer(ns, "c-j", jwt(JWT_SECRET)))
+        .await
+        .unwrap();
+    expect_escalation(db, ns, after, "jwt upsert").await;
 
     // A stored duplicate secret is quarantined at full load: the later id
     // loses its credential, and every consumer change now escalates.
@@ -281,4 +295,67 @@ async fn sqlite_full_load_refuses_shared_keyauth_key() {
         !message.contains("shared-key-0123456789"),
         "the rejection must not leak the key: {message}"
     );
+}
+
+/// PR #6865 review (SOL-1): a full load judges JWT secret ownership before it
+/// strips anything, so a holder whose own credential also carries a weak
+/// rotation entry still makes the other holder lose the shared secret.
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_full_load_quarantines_every_holder_of_a_shared_jwt_secret() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("consumer-jwt-shared.db");
+    let url = format!("sqlite:{}?mode=rwc", path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    let ns = "jwt-shared";
+    const SHARED: &str = "shared-jwt-secret-0123456789-abcdefghij";
+
+    store
+        .create_consumer(&consumer(ns, "c-a", jwt(SHARED)))
+        .await
+        .unwrap();
+    store
+        .create_consumer(&consumer(
+            ns,
+            "c-b",
+            jwt("other-jwt-secret-0123456789-abcdefghi"),
+        ))
+        .await
+        .unwrap();
+    store
+        .create_consumer(&consumer(
+            ns,
+            "c-c",
+            jwt("third-jwt-secret-0123456789-abcdefghi"),
+        ))
+        .await
+        .unwrap();
+
+    // Out of band: c-b now holds the shared secret beside a weak entry.
+    let credentials = json!({"jwt": [{"secret": SHARED}, {"secret": "short"}]}).to_string();
+    let result = sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind(credentials)
+        .bind(ns)
+        .bind("c-b")
+        .execute(&store.pool())
+        .await
+        .expect("out-of-band consumer update");
+    assert_eq!(result.rows_affected(), 1);
+
+    let full = store.load_full_config(ns).await.unwrap();
+    let jwt_of = |id: &str| {
+        full.consumers
+            .iter()
+            .find(|consumer| consumer.id == id)
+            .expect("consumer present")
+            .credentials
+            .contains_key("jwt")
+    };
+    assert!(
+        !jwt_of("c-a"),
+        "the other holder of the shared secret must lose it"
+    );
+    assert!(!jwt_of("c-b"));
+    assert!(jwt_of("c-c"), "an unrelated distinct secret stays usable");
 }

@@ -147,26 +147,45 @@ pub fn apply_file_config_candidate(
     candidate: Result<GatewayConfig, anyhow::Error>,
 ) {
     match candidate {
-        Ok(new_config) => match proxy_state.update_config(new_config) {
-            proxy::ConfigApplyOutcome::Applied => {
-                info!("Configuration reloaded successfully");
-                crate::modes::clear_config_rejected_after_accepted_full_reload(
-                    config_rejected,
-                    "file reload",
+        Ok(new_config) => {
+            // The file-mode sibling of the database stores' rename guard: a
+            // Consumer renamed while the reloaded file's `access_control`
+            // policy still names its previous username would silently detach
+            // that allow or deny entry (exact matching), so the reload is
+            // refused. Renaming the entry in the same file is accepted.
+            let rename_conflicts = crate::plugins::access_control::consumer_rename_conflicts(
+                &proxy_state.current_config(),
+                &new_config,
+            );
+            if !rename_conflicts.is_empty() {
+                error!(
+                    "Configuration reload rejected, keeping previous config: {}",
+                    rename_conflicts.join("; ")
                 );
-            }
-            proxy::ConfigApplyOutcome::Unchanged => {
-                info!("Configuration reload valid but unchanged");
-                crate::modes::clear_config_rejected_after_accepted_full_reload(
-                    config_rejected,
-                    "file reload",
-                );
-            }
-            proxy::ConfigApplyOutcome::Rejected { .. } => {
-                error!("Configuration reload rejected, keeping previous config");
                 config_rejected.store(true, Ordering::Relaxed);
+                return;
             }
-        },
+            match proxy_state.update_config(new_config) {
+                proxy::ConfigApplyOutcome::Applied => {
+                    info!("Configuration reloaded successfully");
+                    crate::modes::clear_config_rejected_after_accepted_full_reload(
+                        config_rejected,
+                        "file reload",
+                    );
+                }
+                proxy::ConfigApplyOutcome::Unchanged => {
+                    info!("Configuration reload valid but unchanged");
+                    crate::modes::clear_config_rejected_after_accepted_full_reload(
+                        config_rejected,
+                        "file reload",
+                    );
+                }
+                proxy::ConfigApplyOutcome::Rejected { .. } => {
+                    error!("Configuration reload rejected, keeping previous config");
+                    config_rejected.store(true, Ordering::Relaxed);
+                }
+            }
+        }
         Err(e) => {
             error!(
                 "Configuration reload failed, keeping previous config: {}",

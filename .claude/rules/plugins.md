@@ -126,8 +126,14 @@ paths:
   rows. Its Prometheus counters and top-level status totals are process-lifetime;
   instance diagnostics are generation-local. Pending per-event ownership spans
   retired workers, but a process crash cannot flush or account for lost memory.
+- Exception: `otel_tracing` admits at most one effective instance per proxy
+  after merge: the gateway SERVER span identity, sampling decision, and
+  attempt recorder are single request slots. When it and a trace-enabled
+  `workload_metrics` share a request, the first to establish the SERVER span
+  owns it (`RequestContext::gateway_trace_owner`, typed, never metadata) and
+  the other reuses it rather than re-deriving or importing wire `tracestate`.
 - Exception: `load_testing` admits at most one effective instance per proxy
-  after merge. It and both chargeback plugins are enforced by
+  after merge. It, `otel_tracing`, and both chargeback plugins are enforced by
   `exclusive_effective_instance_errors` in `src/plugin_cache.rs`, applied to the
   merged per-proxy chain in both the full-build and incremental-rebuild paths.
 - Stateful protections are owned by a **stable policy identity**
@@ -1028,7 +1034,7 @@ on a native-gRPC request.
 - Add unit tests for valid and invalid configs in `tests/unit/plugins/` and register the module.
 - Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
-- Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`stdout_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
+- Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`http_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
 - Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup.
 - A plugin config field that names a process environment variable (credential
   or URL) resolves it ONLY through `plugins::utils::plugin_secret_env`

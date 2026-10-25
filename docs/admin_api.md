@@ -1375,6 +1375,20 @@ policy. Remove or edit the username in those plugin configs, then retry. A
 consumer named only in `disallowed_consumers`, or not named in any
 `access_control` allow-list, can still be deleted.
 
+`PUT /consumers/{id}` that changes the consumer's `username` returns
+**409 Conflict** with
+`{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be renamed"}`
+while any `access_control` plugin config in the same namespace still names the
+**previous** username in `allowed_consumers` **or** `disallowed_consumers`.
+Matching is byte-for-byte, so the rename would otherwise silently detach the
+entry: an orphaned allow entry is inherited by any later consumer created under
+that username, and an orphaned deny entry un-revokes the renamed consumer. Edit
+those plugin configs first (for example, replace the old username with the new
+one), then rename. Updates that keep the username are unaffected. File mode
+applies the same rule on reload: a reloaded file that renames a consumer while
+its own `access_control` configs still name the previous username is rejected
+and the previous configuration is kept.
+
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
 2. Roll out the new key to all clients
@@ -1395,7 +1409,7 @@ per-type breakdown and the mitigations.
 
 The OpenAPI document models these wire differences with separate Consumer surface schemas: `ConsumerCreate` is the create/batch request shape (write-only credential inputs, including plaintext `basicauth` `password`, and no `[REDACTED]` values), `ConsumerUpdate` is the `PUT` request shape (identical to `ConsumerCreate` except that `keyauth`, `jwt`, and `hmac_auth` entries may also be the exact `[REDACTED]` placeholder, so the server's own redacted response validates as an update body), `Consumer` is the ordinary redacted response shape (`basicauth` absent; `keyauth.key`, `jwt.secret`, and `hmac_auth.secret` carry the exact `[REDACTED]` placeholder), and `ConsumerBackup`/`ConsumerRestore` are the unredacted backup/restore shapes documented in [docs/admin_backup_restore.md](admin_backup_restore.md). Every composed Consumer surface closes unknown top-level fields (`unevaluatedProperties: false`), matching runtime `Consumer` serde `deny_unknown_fields` on create, update, batch, restore, and file/CP-DP config deserialization (SQL/Mongo loaders construct Consumers from typed columns/documents rather than accepting free-form top-level JSON). Credential mutation request bodies use `ConsumerCredentialInput`, the union of the per-type input entry schemas. Dedicated credential `PUT`/`POST` path parameters advertise only `BuiltInCredentialType` (`basicauth`, `keyauth`, `jwt`, `hmac_auth`, `mtls_auth`), matching runtime `ALLOWED_CREDENTIAL_TYPES`; type-level `DELETE` keeps the broader path-safe `CredentialTypeName` so custom maps remain removable.
 
-Consumer credential string maxima use Unicode character counts, matching OpenAPI `maxLength`: `basicauth.password`, `keyauth.key`, `hmac_auth.secret`, `jwt.secret`, and `mtls_auth.identity` are limited to 4096 characters and reject disallowed ASCII control bytes. HMAC secrets additionally require at least 32 non-whitespace characters. Consumer `jwt` credential entries support one key form: exactly one `secret` string (32-4096 characters) used for HS256 verification. Fields such as `algorithm`, `public_key`, `jwks`, and `jwks_uri` are rejected rather than ignored. RSA/EC/JWKS verification is configured through the separate `jwks_auth` plugin; it may map verified claims to a Consumer identity but does not read Consumer `jwt` credentials.
+Consumer credential string maxima use Unicode character counts, matching OpenAPI `maxLength`: `basicauth.password`, `keyauth.key`, `hmac_auth.secret`, `jwt.secret`, and `mtls_auth.identity` are limited to 4096 characters and reject disallowed ASCII control bytes. HMAC and JWT secrets additionally require at least 32 non-whitespace characters. Consumer `jwt` credential entries support one key form: exactly one `secret` string (32-4096 characters, at least 32 non-whitespace) used for HMAC verification with the algorithm the `jwt_auth` instance pins (`HS256` by default). A `jwt` secret already configured on a different Consumer in the same namespace is refused on create, update, batch, restore, and the credential endpoints, the same as an `hmac_auth` secret: the token's signer chooses the identity claim, so a shared JWT secret would let either Consumer sign as the other. Rotation entries within one Consumer may repeat a secret, and separate namespaces may reuse one. Fields such as `algorithm`, `public_key`, `jwks`, and `jwks_uri` are rejected rather than ignored. RSA/EC/JWKS verification is configured through the separate `jwks_auth` plugin; it may map verified claims to a Consumer identity but does not read Consumer `jwt` credentials.
 
 ## Replace semantics for `PUT`
 
@@ -1703,7 +1717,7 @@ Fields covered by the schema include:
 | `serverless_function` | `function_url`, `aws_endpoint_url` | structural URL |
 | `serverless_function` | `azure_function_key` | `[REDACTED]` (sent verbatim as `x-functions-key`) |
 | `http_logging`, `loki_logging`, `ws_logging` | `endpoint_url` | structural URL |
-| `http_logging`, `loki_logging` | `custom_headers.*` | `[REDACTED]` |
+| `http_logging`, `loki_logging`, `ws_logging` | `custom_headers.*` | `[REDACTED]` |
 | `loki_logging` | `authorization_header` | `[REDACTED]` |
 | `otel_tracing` | `endpoint` | structural URL |
 | `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |
@@ -2514,6 +2528,7 @@ Returns (abridged; cached for 5 seconds):
   "caches": { ... },
   "consumer_index": { ... },
   "rate_limiting": { ... },
+  "adaptive_concurrency": { ... },
   "tcp_connection_throttle": { ... }
 }
 ```

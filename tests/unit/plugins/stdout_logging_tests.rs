@@ -1,8 +1,8 @@
 //! Tests for stdout_logging plugin
 
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, StreamTransactionSummary, stdout_logging::StdoutLogging,
-    validate_plugin_config,
+    Plugin, PluginResult, ProxyProtocol, StreamTransactionSummary, stdout_logging,
+    stdout_logging::StdoutLogging, validate_plugin_config,
 };
 use serde_json::json;
 
@@ -476,7 +476,7 @@ fn nested_expression_diagnostics_distinguish_missing_fields_and_integer_types() 
         (json!({"op": "status_code_min"}), "missing field `value`"),
         (
             json!({"op": "status_code_min", "value": true}),
-            "expected an unsigned integer between 0 and 65535",
+            "expected an unsigned integer between 0 and 999",
         ),
     ] {
         let error = StdoutLogging::new(&json!({"filter": {"expression": {
@@ -492,4 +492,362 @@ fn nested_expression_diagnostics_distinguish_missing_fields_and_integer_types() 
         }
         assert!(!rendered.contains("true"), "{rendered}");
     }
+}
+
+// ── WebSocket session-end projection field semantics ──────────────────────
+
+#[test]
+fn ws_session_end_row_marks_unobserved_latencies_and_records_the_end_time() {
+    let ctx = ws_disconnect_ctx("GET", "/client/ws", 101, "ws://backend.local:9000/ws");
+    let summary = StdoutLogging::project_ws_disconnect(&ctx);
+    let json = serde_json::to_value(&summary).expect("summary serializes");
+
+    assert_eq!(json["latency_total_ms"], 42.0, "session duration");
+    for field in [
+        "latency_gateway_processing_ms",
+        "latency_backend_ttfb_ms",
+        "latency_backend_total_ms",
+        "latency_plugin_execution_ms",
+        "latency_plugin_external_io_ms",
+        "latency_gateway_overhead_ms",
+    ] {
+        assert_eq!(
+            json[field],
+            ferrum_edge::plugins::LATENCY_UNKNOWN_MS,
+            "{field} is not observed for a session and must carry the sentinel"
+        );
+    }
+    assert_eq!(
+        json["timestamp_received"], "2026-01-01T00:00:00Z",
+        "timestamp_received stays the upgrade admission time"
+    );
+    assert_eq!(
+        json["metadata"][stdout_logging::WS_SESSION_END_TIMESTAMP_METADATA_KEY],
+        "2026-01-01T00:00:01Z",
+        "the session end is locatable in time and not redacted"
+    );
+    // The handshake identity fields are unchanged.
+    assert_eq!(json["http_method"], "GET");
+    assert_eq!(json["response_status_code"], 101);
+    assert_eq!(json["request_path"], "/client/ws");
+}
+
+// ── Sampling ──────────────────────────────────────────────────────────────
+
+fn clean_summary() -> ferrum_edge::plugins::TransactionSummary {
+    let mut summary = create_test_transaction_summary();
+    summary.body_completed = true;
+    summary
+}
+
+fn failed_summary() -> ferrum_edge::plugins::TransactionSummary {
+    let mut summary = clean_summary();
+    summary.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionReset);
+    summary
+}
+
+fn clean_stream_summary() -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        plugin_trigger_decisions: Default::default(),
+        namespace: "ferrum".to_string(),
+        proxy_id: "tcp-proxy-1".to_string(),
+        proxy_lifecycle_generation: None,
+        proxy_name: None,
+        client_ip: "127.0.0.1".to_string(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: "127.0.0.1:9000".to_string(),
+        backend_resolved_ip: None,
+        protocol: "tcp".to_string(),
+        listen_port: 8080,
+        duration_ms: 15.0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
+        timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
+        sni_hostname: None,
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
+    }
+}
+
+#[test]
+fn sampling_keeps_exactly_the_configured_fraction_evenly_spaced() {
+    let plugin = StdoutLogging::new(&json!({"sampling": {"rate": 0.25}})).unwrap();
+    let summary = clean_summary();
+    let admitted: Vec<bool> = (0..1000)
+        .map(|_| plugin.should_log_transaction(&summary))
+        .collect();
+    assert_eq!(admitted.iter().filter(|kept| **kept).count(), 250);
+    // Evenly spaced: never two kept records in a row at a quarter rate, and
+    // every window of four consecutive candidates keeps exactly one.
+    for window in admitted.windows(4) {
+        assert_eq!(window.iter().filter(|kept| **kept).count(), 1, "{window:?}");
+    }
+
+    let streams = StdoutLogging::new(&json!({"sampling": {"rate": 0.5}})).unwrap();
+    let stream = clean_stream_summary();
+    let kept = (0..1000)
+        .filter(|_| streams.should_log_stream_transaction(&stream))
+        .count();
+    assert_eq!(kept, 500, "stream records share the deterministic sampler");
+}
+
+#[test]
+fn sampling_rate_one_and_null_keep_every_record() {
+    for config in [
+        json!({"sampling": {"rate": 1}}),
+        json!({"sampling": {"rate": 1.0, "always_log_errors": true}}),
+        json!({"sampling": null}),
+    ] {
+        let plugin = StdoutLogging::new(&config).unwrap();
+        let summary = clean_summary();
+        assert!(
+            (0..100).all(|_| plugin.should_log_transaction(&summary)),
+            "{config} must keep every record"
+        );
+    }
+}
+
+#[test]
+fn sampling_always_log_errors_keeps_failures_without_consuming_samples() {
+    let plugin = StdoutLogging::new(&json!({
+        "sampling": {"rate": 0.001, "always_log_errors": true}
+    }))
+    .unwrap();
+    let failed = failed_summary();
+    assert!(
+        (0..1000).all(|_| plugin.should_log_transaction(&failed)),
+        "every terminal failure is kept"
+    );
+    // Failures did not advance the sequence: the first 999 clean records are
+    // all skipped and exactly the 1000th is kept.
+    let clean = clean_summary();
+    let kept: Vec<usize> = (0..1000)
+        .filter(|_| plugin.should_log_transaction(&clean))
+        .collect();
+    assert_eq!(kept, vec![999]);
+
+    let mut failed_stream = clean_stream_summary();
+    failed_stream.connection_error = Some("connection reset".to_string());
+    assert!((0..100).all(|_| plugin.should_log_stream_transaction(&failed_stream)));
+
+    let without = StdoutLogging::new(&json!({"sampling": {"rate": 0.001}})).unwrap();
+    let kept = (0..1000)
+        .filter(|_| without.should_log_transaction(&failed))
+        .count();
+    assert_eq!(
+        kept, 1,
+        "without always_log_errors failures are sampled too"
+    );
+}
+
+#[test]
+fn sampling_applies_only_to_records_the_filter_admits() {
+    let plugin = StdoutLogging::new(&json!({
+        "filter": {"status_code_min": 500},
+        "sampling": {"rate": 0.5}
+    }))
+    .unwrap();
+    let ok = clean_summary();
+    let mut server_error = clean_summary();
+    server_error.response_status_code = 503;
+    let mut kept = 0;
+    for _ in 0..100 {
+        assert!(!plugin.should_log_transaction(&ok), "filtered out first");
+        if plugin.should_log_transaction(&server_error) {
+            kept += 1;
+        }
+    }
+    assert_eq!(kept, 50, "filtered-out records never consume a sample");
+}
+
+#[test]
+fn sampling_config_is_validated_without_echoing_values() {
+    for (config, expected) in [
+        (json!({"sampling": "1%"}), "`sampling` must be an object"),
+        (json!({"sampling": {}}), "`sampling.rate` is required"),
+        (
+            json!({"sampling": {"rate": "0.5"}}),
+            "`sampling.rate` must be a number",
+        ),
+        (
+            json!({"sampling": {"rate": 0}}),
+            "`sampling.rate` must be greater than 0 and at most 1",
+        ),
+        (
+            json!({"sampling": {"rate": 1.5}}),
+            "`sampling.rate` must be greater than 0 and at most 1",
+        ),
+        (
+            json!({"sampling": {"rate": -0.25}}),
+            "`sampling.rate` must be greater than 0 and at most 1",
+        ),
+        (
+            json!({"sampling": {"rate": 0.0000001}}),
+            "`sampling.rate` must be at least 0.000001",
+        ),
+        (
+            json!({"sampling": {"rate": 0.5, "always_log_errors": "yes"}}),
+            "`sampling.always_log_errors` must be a boolean",
+        ),
+        (
+            json!({"sampling": {"rate": 0.5, "percent": 50}}),
+            "stdout_logging.sampling.percent",
+        ),
+    ] {
+        let error = StdoutLogging::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{config} must be rejected"));
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
+        let validated = validate_plugin_config("stdout_logging", &config)
+            .expect_err("shared validation reaches the same constructor");
+        assert!(validated.contains(expected), "{validated}");
+    }
+}
+
+// ── Unsatisfiable filters ─────────────────────────────────────────────────
+
+#[test]
+fn unreachable_and_contradictory_status_filters_are_rejected() {
+    for (config, expected) in [
+        (
+            json!({"filter": {"status_code_min": 5000}}),
+            "`filter.status_code_min` must be between 0 and 999",
+        ),
+        (
+            json!({"filter": {"status_code_max": 1000}}),
+            "`filter.status_code_max` must be between 0 and 999",
+        ),
+        (
+            json!({"filter": {"expression": {"op": "status_code_min", "value": 5000}}}),
+            "status-code bound must be between 0 and 999",
+        ),
+        (
+            json!({"filter": {"expression": {
+                "op": "and",
+                "left": {"op": "status_code_min", "value": 500},
+                "right": {"op": "status_code_max", "value": 400}
+            }}}),
+            "conjunction can never match",
+        ),
+        (
+            // Dead conjunction nested under `or`, with the status atoms split
+            // across a nested `and` chain.
+            json!({"filter": {"expression": {
+                "op": "or",
+                "left": {"op": "errors_only"},
+                "right": {
+                    "op": "and",
+                    "left": {"op": "status_code_min", "value": 500},
+                    "right": {
+                        "op": "and",
+                        "left": {"op": "min_latency_ms", "value": 10},
+                        "right": {"op": "status_code_max", "value": 499}
+                    }
+                }
+            }}}),
+            "conjunction can never match",
+        ),
+    ] {
+        let error = StdoutLogging::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{config} must be rejected"));
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
+    }
+
+    // Satisfiable shapes stay valid: an exact status (min == max), bounds that
+    // live in different `or` branches, and the edge values 0 and 999.
+    for config in [
+        json!({"filter": {"status_code_min": 0, "status_code_max": 999}}),
+        json!({"filter": {"expression": {
+            "op": "and",
+            "left": {"op": "status_code_min", "value": 503},
+            "right": {"op": "status_code_max", "value": 503}
+        }}}),
+        json!({"filter": {"expression": {
+            "op": "or",
+            "left": {"op": "status_code_min", "value": 500},
+            "right": {"op": "status_code_max", "value": 399}
+        }}}),
+        json!({"filter": {"expression": {
+            "op": "and",
+            "left": {"op": "status_code_min", "value": 500},
+            "right": {
+                "op": "or",
+                "left": {"op": "status_code_max", "value": 400},
+                "right": {"op": "errors_only"}
+            }
+        }}}),
+    ] {
+        if let Err(error) = StdoutLogging::new(&config) {
+            panic!("{config} must stay valid: {error}");
+        }
+    }
+}
+
+// ── Failure policy and loss attribution ───────────────────────────────────
+
+#[test]
+fn stdout_logging_is_keep_last_known_good() {
+    assert_eq!(
+        ferrum_edge::plugins::plugin_failure_policy("stdout_logging"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood),
+        "the access log must not be silently omitted on a bad config"
+    );
+}
+
+#[test]
+fn access_record_outcomes_are_attributed_to_the_stdout_logging_series() {
+    use ferrum_edge::logging::non_blocking::EnqueueResult;
+    use ferrum_edge::plugins::utils::sink_loss::{
+        SINK_PLUGINS, SinkLossReason, accepted_total, dropped_total, render_prometheus,
+    };
+
+    assert!(SINK_PLUGINS.contains(&"stdout_logging"));
+    let plugin = StdoutLogging::new(&json!({})).unwrap();
+    let accepted_before = accepted_total("stdout_logging");
+    let drops_before: Vec<u64> = [
+        SinkLossReason::QueueFull,
+        SinkLossReason::RecordTooLarge,
+        SinkLossReason::Shutdown,
+    ]
+    .iter()
+    .map(|reason| dropped_total("stdout_logging", *reason))
+    .collect();
+
+    plugin.record_enqueue_outcome(EnqueueResult::Queued);
+    plugin.record_enqueue_outcome(EnqueueResult::Saturated);
+    plugin.record_enqueue_outcome(EnqueueResult::RecordTooLarge);
+    plugin.record_enqueue_outcome(EnqueueResult::Closed);
+
+    // Counters are process-global, so assert growth rather than exact values.
+    assert!(accepted_total("stdout_logging") > accepted_before);
+    for (reason, before) in [
+        SinkLossReason::QueueFull,
+        SinkLossReason::RecordTooLarge,
+        SinkLossReason::Shutdown,
+    ]
+    .iter()
+    .zip(drops_before)
+    {
+        assert!(
+            dropped_total("stdout_logging", *reason) > before,
+            "{} must be attributed to stdout_logging",
+            reason.as_str()
+        );
+    }
+    let exposition = render_prometheus();
+    assert!(exposition.contains(
+        "ferrum_plugin_log_sink_records_dropped_total{plugin=\"stdout_logging\",reason=\"queue_full\"}"
+    ));
 }

@@ -555,6 +555,12 @@ fn validate_candidate_plugin_graph(
     crate::plugin_cache::validate_plugin_composition_candidate(candidate, http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
     crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
+        .map_err(AfterValidateError::BadRequest)?;
+    // Shared by direct plugin/proxy writes, API-spec create/replace, proxy
+    // deletes, and restore, so an API-spec bundle cannot attach a scoped
+    // `spiffe_identity` to a non-terminating stream listener either.
+    candidate
+        .validate_scoped_spiffe_identity_stream_compatibility()
         .map_err(AfterValidateError::BadRequest)
 }
 
@@ -1835,6 +1841,44 @@ pub(crate) async fn current_transaction_log_schema_graph_is_valid(
     }
 }
 
+/// Refuse a `spiffe_identity` write that would leave a proxy/proxy-group-scoped
+/// instance on a stream proxy terminating no TLS/DTLS, where it could never
+/// see a peer certificate.
+async fn validate_spiffe_identity_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin: &PluginConfig,
+) -> Result<(), AfterValidateError> {
+    let mut config = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    if let Some(existing) = config
+        .plugin_configs
+        .iter_mut()
+        .find(|item| item.id == plugin.id)
+    {
+        *existing = plugin.clone();
+    } else {
+        config.plugin_configs.push(plugin.clone());
+    }
+    // The Admin API appends a proxy-scoped write's association in the same
+    // transaction (issue #4611), so judge the graph that write produces.
+    for proxy in plugin_attach_proxy_candidates(db, namespace, plugin)
+        .await
+        .map_err(AfterValidateError::Db)?
+    {
+        if let Some(existing) = config.proxies.iter_mut().find(|item| item.id == proxy.id) {
+            *existing = proxy;
+        } else {
+            config.proxies.push(proxy);
+        }
+    }
+    config
+        .validate_mtls_auth_compatibility()
+        .map_err(AfterValidateError::BadRequest)
+}
+
 async fn validate_mtls_auth_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -1869,9 +1913,14 @@ async fn validate_mtls_auth_candidate(
             .plugin_configs
             .retain(|plugin| plugin.id != removed_plugin_id);
     }
-    if proxy
-        .is_some_and(|candidate| !config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()))
-    {
+    let checks_mtls_auth = proxy
+        .is_none_or(|candidate| config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()));
+    // A scoped `spiffe_identity` shares the stream TLS-termination requirement
+    // (but not the credential-uniqueness one) with `mtls_auth`.
+    let checks_spiffe_identity = proxy.is_some_and(|candidate| {
+        config.has_scoped_spiffe_identity_for_proxy(candidate.id.as_str())
+    });
+    if !checks_mtls_auth && !checks_spiffe_identity {
         return Ok(());
     }
     let compatibility_errors = config
@@ -1880,6 +1929,9 @@ async fn validate_mtls_auth_candidate(
         .unwrap_or_default();
     if !compatibility_errors.is_empty() {
         return Err(AfterValidateError::BadRequest(compatibility_errors));
+    }
+    if !checks_mtls_auth {
+        return Ok(());
     }
     config
         .validate_unique_mtls_credentials()
@@ -2565,6 +2617,25 @@ pub(crate) async fn hmac_consumer_candidate_errors(
     Ok(consumer_candidate_config(db, namespace, consumer)
         .await?
         .validate_unique_hmac_credentials()
+        .err()
+        .unwrap_or_default())
+}
+
+/// Reject an admin Consumer/credential write whose `jwt` secret is already
+/// configured on another consumer in the namespace. `jwt_auth` picks the
+/// verifying Consumer from the signer-chosen identity claim, so a shared JWT
+/// secret lets each holder sign as the other. Snapshot-based like the HMAC
+/// check; only collisions involving this consumer are reported, so a
+/// pre-existing duplicate between two other Consumers (quarantined on load)
+/// does not block an unrelated write.
+pub(crate) async fn jwt_consumer_candidate_errors(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> DbResult<Vec<String>> {
+    Ok(consumer_candidate_config(db, namespace, consumer)
+        .await?
+        .validate_unique_jwt_credentials_for_consumers(&[consumer.id.as_str()])
         .err()
         .unwrap_or_default())
 }
@@ -3579,6 +3650,22 @@ pub(crate) fn consumer_audit_body(consumer: &Consumer) -> Value {
     json!(super::redact_consumer_credentials_for_audit(consumer))
 }
 
+/// `409` body for a Consumer rename the store refused because an
+/// `access_control` plugin config still names the previous username in
+/// `allowed_consumers` or `disallowed_consumers`.
+const CONSUMER_RENAME_REFERENCED_BY_ACCESS_CONTROL: &str =
+    "Consumer is referenced by one or more access_control plugin_configs and cannot be renamed";
+
+/// The SQL and MongoDB stores refuse a username change while an
+/// `access_control` entry names the old username; their error text carries
+/// this marker (driver context may wrap it, so the whole chain is searched).
+fn is_access_control_rename_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("referenced by access_control") && message.contains("cannot be renamed")
+    })
+}
+
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
@@ -3586,8 +3673,9 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if is_mtls_dns_admission_unavailable(error) {
         return super::mtls_dns_admission_unavailable_response();
     }
-    let unique_conflict =
-        is_mtls_dns_identity_conflict(error) || super::chain_has_unique_constraint_violation(error);
+    let unique_conflict = is_access_control_rename_conflict(error)
+        || is_mtls_dns_identity_conflict(error)
+        || super::chain_has_unique_constraint_violation(error);
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
@@ -3606,6 +3694,8 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+    } else if is_access_control_rename_conflict(error) {
+        CONSUMER_RENAME_REFERENCED_BY_ACCESS_CONTROL.to_string()
     } else if let Some(conflict) = mtls_dns_identity_conflict(error) {
         // Render the typed conflict, not the chain's outermost message: the
         // identities it names are internally constructed and not secrets, but
@@ -4933,6 +5023,12 @@ impl AdminResource for PluginConfig {
             || existing.is_some_and(|plugin| plugin.plugin_name == "mtls_auth")
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
+        } else if resource.plugin_name == "spiffe_identity" && resource.scope != PluginScope::Global
+        {
+            // Stream TLS-termination compatibility only; a `spiffe_identity`
+            // write never changes mTLS credential uniqueness, and a global
+            // instance is exempt (it no-ops on plaintext listeners).
+            validate_spiffe_identity_candidate(db, namespace, resource).await?;
         }
         // Validate the graph the write will produce, including the proxy
         // association it attaches (issue #4611).
@@ -6017,6 +6113,13 @@ impl AdminResource for Consumer {
         if resource.has_credential("hmac_auth") {
             errors.extend(
                 hmac_consumer_candidate_errors(db, namespace, resource)
+                    .await
+                    .map_err(AfterValidateError::Db)?,
+            );
+        }
+        if resource.has_credential("jwt") {
+            errors.extend(
+                jwt_consumer_candidate_errors(db, namespace, resource)
                     .await
                     .map_err(AfterValidateError::Db)?,
             );

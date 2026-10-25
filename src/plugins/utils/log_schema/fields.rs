@@ -463,11 +463,27 @@ pub const WS_DISCONNECT_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
+        name: "http_method",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "request_path",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "handshake_status_code",
+        is_timestamp: false,
+    },
+    FieldMeta {
         name: "protocol",
         is_timestamp: false,
     },
     FieldMeta {
         name: "listen_port",
+        is_timestamp: false,
+    },
+    FieldMeta {
+        name: "connection_id",
         is_timestamp: false,
     },
     FieldMeta {
@@ -1251,6 +1267,6 @@ mod tests {
 
     #[test]
     fn websocket_disconnect_fields_match_expected_count() {
-        assert_eq!(WS_DISCONNECT_FIELDS.len(), 21);
+        assert_eq!(WS_DISCONNECT_FIELDS.len(), 25);
     }
 }

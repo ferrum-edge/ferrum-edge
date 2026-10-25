@@ -640,6 +640,9 @@ fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
     registry.configure(60, 3600, 0, 10_000, "contract-ns");
     registry.record(&make_summary("contract-proxy"));
+    for decision in ferrum_edge::plugins::prometheus_metrics::AdaptiveConcurrencyDecision::ALL {
+        registry.record_adaptive_concurrency_decision("contract-proxy", decision);
+    }
     let mut grpc_summary = make_summary("contract-grpc-proxy");
     grpc_summary
         .metadata
@@ -737,6 +740,7 @@ fn representative_exposition() -> String {
     // the family's HELP/TYPE/label keys.
     registry.record_unmatched_request(ferrum_edge::diagnostic_ref::ROUTE_NOT_FOUND_PHASE, 404);
     registry.record_rate_limit_exceeded();
+    registry.record_tcp_connection_throttle_rejection("contract-tcp-proxy");
     registry.record_rate_limit_local_fallback_decision();
     registry.record_rate_limit_enforcement_unavailable();
     registry.record_request_mirror_dispatched();
@@ -1131,6 +1135,7 @@ fn representative_metrics_exposition_matches_contract() {
         "ferrum_request_body_bytes_total",
         "ferrum_response_body_bytes_total",
         "ferrum_unmatched_requests_total",
+        "ferrum_tcp_connection_throttle_rejections_total",
         "ferrum_mesh_tcp_egress_connections_total",
         "ferrum_mesh_hbone_inner_pool_events_total",
         "ferrum_mesh_remote_discovery_poll_failures_total",

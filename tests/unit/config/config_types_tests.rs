@@ -1270,6 +1270,107 @@ fn scoped_mtls_auth_does_not_cross_namespaces() {
     );
 }
 
+fn spiffe_identity_plugin(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
+    let mut plugin = mtls_plugin(id, scope, proxy_id, serde_json::json!({}));
+    plugin.plugin_name = "spiffe_identity".to_string();
+    plugin
+}
+
+#[test]
+fn scoped_spiffe_identity_is_refused_on_non_terminating_stream_proxies() {
+    // A deliberately attached instance on a stream listener that terminates no
+    // TLS/DTLS can never see a peer certificate (spiffe_identity-MUSE-2).
+    let mut plaintext = stream_proxy("plain", BackendScheme::Tcp, false);
+    associate(&mut plaintext, &["spiffe-proxy"]);
+    let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, true);
+    passthrough.passthrough = true;
+    associate(&mut passthrough, &["spiffe-group"]);
+    let mut plaintext_udp = stream_proxy("udp", BackendScheme::Udp, false);
+    associate(&mut plaintext_udp, &["spiffe-group"]);
+    let config = GatewayConfig {
+        proxies: vec![plaintext, passthrough, plaintext_udp],
+        plugin_configs: vec![
+            spiffe_identity_plugin("spiffe-proxy", PluginScope::Proxy, Some("plain")),
+            spiffe_identity_plugin("spiffe-group", PluginScope::ProxyGroup, None),
+        ],
+        ..empty_config()
+    };
+
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    for proxy in ["plain", "passthrough", "udp"] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(&format!("Proxy {proxy:?}"))
+                    && error.contains("cannot use `spiffe_identity` PluginConfig")
+                    && error.contains("passthrough=false")),
+            "{proxy}: {errors:?}"
+        );
+    }
+    assert!(config.validate_plugin_references().is_err());
+    // The standalone validator the shared plugin-graph admission path (and
+    // therefore API-spec create/replace) uses reports the same refusals.
+    assert_eq!(
+        config
+            .validate_scoped_spiffe_identity_stream_compatibility()
+            .unwrap_err(),
+        errors
+    );
+}
+
+#[test]
+fn scoped_spiffe_identity_is_admitted_on_terminating_streams_and_http() {
+    let mut tcps = stream_proxy("tcps", BackendScheme::Tcp, true);
+    associate(&mut tcps, &["spiffe-group"]);
+    let mut dtls = stream_proxy("dtls", BackendScheme::Dtls, true);
+    associate(&mut dtls, &["spiffe-group"]);
+    let mut http = make_proxy("http", "/api");
+    associate(&mut http, &["spiffe-group"]);
+    let config = GatewayConfig {
+        proxies: vec![tcps, dtls, http],
+        plugin_configs: vec![spiffe_identity_plugin(
+            "spiffe-group",
+            PluginScope::ProxyGroup,
+            None,
+        )],
+        ..empty_config()
+    };
+
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
+    assert!(
+        config
+            .validate_scoped_spiffe_identity_stream_compatibility()
+            .is_ok()
+    );
+}
+
+#[test]
+fn global_spiffe_identity_stays_a_no_op_beside_plaintext_streams() {
+    // The mesh-injected `__mesh_spiffe_identity` (and any operator global)
+    // legitimately no-ops on plaintext listeners in mixed deployments.
+    let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, false);
+    passthrough.passthrough = true;
+    let mut disabled_scoped = spiffe_identity_plugin("spiffe-off", PluginScope::ProxyGroup, None);
+    disabled_scoped.enabled = false;
+    let mut plain = stream_proxy("plain", BackendScheme::Tcp, false);
+    associate(&mut plain, &["spiffe-off"]);
+    let config = GatewayConfig {
+        proxies: vec![
+            stream_proxy("tcp", BackendScheme::Tcp, false),
+            passthrough,
+            plain,
+        ],
+        plugin_configs: vec![
+            spiffe_identity_plugin("__mesh_spiffe_identity", PluginScope::Global, None),
+            disabled_scoped,
+        ],
+        ..empty_config()
+    };
+
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
+}
+
 #[test]
 fn omitted_consumers_deserializes_as_empty_vec() {
     let yaml = r#"
@@ -1861,6 +1962,514 @@ fn test_quarantine_hmac_duplicate_secret_first_loaded_consumer_wins() {
     assert!(!messages[0].contains(secret));
     assert!(config.consumers[0].has_credential("hmac_auth"));
     assert!(!config.consumers[1].has_credential("hmac_auth"));
+}
+
+// ---- Consumer JWT secret policy (jwt_auth-SOL-1 / SOL-2 / CLAUDE-2) ----
+
+fn jwt_consumer(id: &str, username: &str, secrets: &[&str]) -> Consumer {
+    let mut consumer = make_consumer(id, username);
+    let entries: Vec<serde_json::Value> = secrets
+        .iter()
+        .map(|secret| serde_json::json!({"secret": secret}))
+        .collect();
+    consumer
+        .credentials
+        .insert("jwt".into(), serde_json::Value::Array(entries));
+    consumer
+}
+
+#[test]
+fn test_unique_consumer_credentials_rejects_jwt_secret_shared_across_consumers() {
+    let secret = "shared-jwt-secret-at-least-32-characters";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[secret]),
+        jwt_consumer("eve", "eve", &[secret]),
+    ];
+
+    let errors = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("Duplicate jwt secret"));
+    assert!(errors[0].contains("\"eve\"") && errors[0].contains("\"alice\""));
+    assert!(
+        !errors[0].contains(secret),
+        "the secret must never be echoed"
+    );
+    assert!(config.validate_unique_jwt_credentials().is_err());
+}
+
+#[test]
+fn test_unique_jwt_credentials_rejects_collision_introduced_by_a_rotation_entry() {
+    let alice_secret = "alice-jwt-secret-at-least-32-characters";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[alice_secret]),
+        jwt_consumer(
+            "eve",
+            "eve",
+            &["eve-own-jwt-secret-at-least-32-characters", alice_secret],
+        ),
+    ];
+
+    assert!(config.validate_unique_jwt_credentials().is_err());
+    assert!(config.validate_unique_consumer_credentials().is_err());
+}
+
+#[test]
+fn test_unique_jwt_credentials_allow_same_consumer_rotation_and_other_namespaces() {
+    let secret = "reusable-jwt-secret-at-least-32-characters";
+    let mut tenant_a = jwt_consumer("alice", "alice", &[secret, secret]);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = jwt_consumer("bob", "bob", &[secret]);
+    tenant_b.namespace = "tenant-b".to_string();
+    let mut config = empty_config();
+    config.consumers = vec![tenant_a, tenant_b];
+
+    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("jwt"))
+    );
+}
+
+#[test]
+fn test_unique_jwt_credentials_for_consumers_reports_only_involved_collisions() {
+    let legacy = "legacy-shared-jwt-secret-at-least-32-chars";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[legacy]),
+        jwt_consumer("eve", "eve", &[legacy]),
+        jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+    ];
+
+    // A pre-existing duplicate between two other Consumers does not block a
+    // write to an unrelated Consumer...
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["bob"])
+            .is_ok()
+    );
+    // ...but a write to either side of the duplicate is refused.
+    let errors = config
+        .validate_unique_jwt_credentials_for_consumers(&["eve"])
+        .unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(!errors[0].contains(legacy));
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice"])
+            .is_err()
+    );
+}
+
+#[test]
+fn test_quarantine_jwt_strips_shared_secret_from_every_holder() {
+    let secret = "shared-jwt-secret-at-least-32-characters";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[secret]),
+        jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+        jwt_consumer(
+            "eve",
+            "eve",
+            &["eve-own-jwt-secret-at-least-32-characters", secret],
+        ),
+        jwt_consumer("mallory", "mallory", &[secret]),
+    ];
+
+    let messages = config.quarantine_invalid_jwt_credentials();
+    assert_eq!(messages.len(), 3, "{messages:?}");
+    assert!(messages.iter().all(|message| !message.contains(secret)));
+    let holders: Vec<(&str, bool)> = config
+        .consumers
+        .iter()
+        .map(|consumer| (consumer.id.as_str(), consumer.has_credential("jwt")))
+        .collect();
+    // No first-loaded winner: every holder of the shared secret loses it,
+    // and the Consumer with its own secret is untouched.
+    assert_eq!(
+        holders,
+        vec![
+            ("alice", false),
+            ("bob", true),
+            ("eve", false),
+            ("mallory", false)
+        ]
+    );
+    assert!(config.validate_unique_jwt_credentials().is_ok());
+}
+
+#[test]
+fn test_quarantine_jwt_strips_weak_or_malformed_credentials() {
+    let shapes = [
+        serde_json::json!([{"secret": "test-jwt-secret"}]),
+        serde_json::json!([{"secret": " ".repeat(32)}]),
+        serde_json::json!([{"secret": format!("a{}", " ".repeat(31))}]),
+        serde_json::json!([{"secret": format!("{}x", "\t".repeat(31))}]),
+        serde_json::json!([
+            {"secret": "strong-jwt-secret-at-least-32-characters"},
+            {"secret": "weak"}
+        ]),
+        serde_json::json!([{"secret": 12345}]),
+        serde_json::json!([{"no_secret": true}]),
+        serde_json::json!(["not-an-object"]),
+        serde_json::json!([]),
+        serde_json::json!({"secret": "not-an-array-secret-at-least-32-chars!"}),
+    ];
+    for shape in shapes {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer.credentials.insert("jwt".into(), shape.clone());
+        let mut config = empty_config();
+        config.consumers = vec![consumer];
+
+        let messages = config.quarantine_invalid_jwt_credentials();
+        assert_eq!(messages.len(), 1, "shape not quarantined: {shape}");
+        assert!(!messages[0].contains("test-jwt-secret"));
+        assert!(!config.consumers[0].credentials.contains_key("jwt"));
+    }
+}
+
+/// PR #6865 review (SOL-1): ownership is judged before any credential is
+/// stripped, so a holder whose own credential is malformed or weak still
+/// counts as a holder of the strong secret it shares.
+#[test]
+fn test_quarantine_jwt_counts_holders_whose_own_credential_is_malformed() {
+    let shared = "shared-jwt-secret-at-least-32-characters";
+    let eve_shapes = [
+        serde_json::json!([{"secret": shared}, {"secret": "short"}]),
+        serde_json::json!([{"secret": shared}, {"no_secret": true}]),
+        serde_json::json!([{"secret": shared}, {"secret": 12345}]),
+        serde_json::json!([{"secret": shared}, "not-an-object"]),
+        serde_json::json!([{"secret": shared, "extra": true}, {"secret": " ".repeat(40)}]),
+        // Legacy single-object shape: never verifiable, but Eve knows it.
+        serde_json::json!({"secret": shared}),
+    ];
+    for eve_shape in eve_shapes {
+        let mut eve = make_consumer("eve", "eve");
+        eve.credentials.insert("jwt".into(), eve_shape.clone());
+        let mut config = empty_config();
+        config.consumers = vec![
+            jwt_consumer("alice", "alice", &[shared]),
+            eve,
+            jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+        ];
+
+        let messages = config.quarantine_invalid_jwt_credentials();
+        assert_eq!(messages.len(), 2, "eve shape {eve_shape}: {messages:?}");
+        assert!(messages.iter().all(|message| !message.contains(shared)));
+        assert!(
+            !config.consumers[0].has_credential("jwt"),
+            "alice must lose the secret eve also holds (eve shape {eve_shape})"
+        );
+        assert!(!config.consumers[1].credentials.contains_key("jwt"));
+        assert!(config.consumers[2].has_credential("jwt"));
+    }
+}
+
+/// PR #6865 review (SOL-2): an incremental swap patches an already
+/// quarantined snapshot that no longer shows the other holder, so the
+/// shared-secret history must keep a once-shared key quarantined.
+#[test]
+fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
+    use ferrum_edge::config::types::JwtSharedSecretHistory;
+
+    let shared = "shared-jwt-secret-at-least-32-characters";
+    let mut history = JwtSharedSecretHistory::default();
+
+    // Generation 1: Alice and Eve share the secret; both lose it.
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[shared]),
+        jwt_consumer("eve", "eve", &[shared]),
+    ];
+    let outcome = config.quarantine_invalid_jwt_credentials_against(&history);
+    assert_eq!(outcome.messages.len(), 2);
+    assert_eq!(outcome.shared.len(), 1);
+    // The quarantine only reports; the caller records accepted candidates.
+    assert!(history.is_empty());
+    assert_eq!(history.merge(&outcome.shared), 0);
+    assert_eq!(history.len(), 1);
+
+    // Generation 2: a point delta re-delivers Alice with the same secret on
+    // top of the stripped snapshot (Eve's stripped credential is gone).
+    config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
+    assert!(config.validate_unique_jwt_credentials().is_ok());
+    let messages = config
+        .quarantine_invalid_jwt_credentials_against(&history)
+        .messages;
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("\"alice\""));
+    assert!(!messages[0].contains(shared));
+    assert!(!config.consumers[0].has_credential("jwt"));
+
+    // Without history (a fresh authoritative load) the same snapshot passes.
+    config.consumers[0] = jwt_consumer("alice", "alice", &[shared]);
+    let mut fresh = config.clone();
+    assert!(fresh.quarantine_invalid_jwt_credentials().is_empty());
+
+    // A new distinct secret restores Alice, and the history is namespace
+    // bound: another namespace may still use the once-shared value.
+    config.consumers[0] = jwt_consumer(
+        "alice",
+        "alice",
+        &["alice-new-jwt-secret-at-least-32-characters"],
+    );
+    let mut tenant = jwt_consumer("carol", "carol", &[shared]);
+    tenant.namespace = "tenant-b".to_string();
+    config.consumers.push(tenant);
+    assert!(
+        config
+            .quarantine_invalid_jwt_credentials_against(&history)
+            .messages
+            .is_empty()
+    );
+    assert!(config.consumers[0].has_credential("jwt"));
+    assert!(config.consumers[2].has_credential("jwt"));
+}
+
+/// PR #6865 review (SOL-5 / MUSE-4): the history is bounded per namespace;
+/// past the bound the oldest digests are evicted and the eviction is
+/// reported so the caller can warn.
+#[test]
+fn test_jwt_shared_secret_history_is_bounded_per_namespace() {
+    use ferrum_edge::config::types::JwtSharedSecretHistory;
+
+    fn shared_pair(namespace: &str, secret: &str) -> GatewayConfig {
+        let mut alice = jwt_consumer("alice", "alice", &[secret]);
+        alice.namespace = namespace.to_string();
+        let mut eve = jwt_consumer("eve", "eve", &[secret]);
+        eve.namespace = namespace.to_string();
+        let mut config = empty_config();
+        config.consumers = vec![alice, eve];
+        config
+    }
+
+    let mut history = JwtSharedSecretHistory::default();
+    let secrets: Vec<String> = (0..4)
+        .map(|generation| format!("generation-{generation}-shared-jwt-secret-0123456789"))
+        .collect();
+    let mut evicted = 0;
+    for secret in &secrets {
+        let outcome = shared_pair("ferrum", secret)
+            .quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default());
+        evicted += history.merge_with_limit(&outcome.shared, 3);
+    }
+    assert_eq!(evicted, 1, "the fourth distinct secret evicts the oldest");
+    assert_eq!(history.len(), 3);
+
+    // Re-merging an already remembered secret neither grows nor evicts.
+    let repeat = shared_pair("ferrum", &secrets[3])
+        .quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default());
+    assert_eq!(history.merge_with_limit(&repeat.shared, 3), 0);
+    assert_eq!(history.len(), 3);
+
+    // The oldest secret is forgotten; the newest is still enforced.
+    let mut oldest = empty_config();
+    oldest.consumers = vec![jwt_consumer("alice", "alice", &[secrets[0].as_str()])];
+    assert!(
+        oldest
+            .quarantine_invalid_jwt_credentials_against(&history)
+            .messages
+            .is_empty()
+    );
+    let mut newest = empty_config();
+    newest.consumers = vec![jwt_consumer("alice", "alice", &[secrets[3].as_str()])];
+    assert_eq!(
+        newest
+            .quarantine_invalid_jwt_credentials_against(&history)
+            .messages
+            .len(),
+        1
+    );
+
+    // The bound is per namespace: another namespace has its own budget.
+    let other = shared_pair("tenant-b", &secrets[0])
+        .quarantine_invalid_jwt_credentials_against(&JwtSharedSecretHistory::default());
+    assert_eq!(history.merge_with_limit(&other.shared, 3), 0);
+    assert_eq!(history.len(), 4);
+    assert_eq!(
+        ferrum_edge::config::types::JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE,
+        4096
+    );
+}
+
+/// PR #6865 review (SOL-4 / MUSE-2): a full loader that strips a shared JWT
+/// secret hands its digest to the serving process through the snapshot.
+#[test]
+fn test_jwt_loader_outcome_reports_stripped_shared_secrets() {
+    let shared = "loader-shared-jwt-secret-at-least-32-chars";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[shared]),
+        jwt_consumer("eve", "eve", &[shared]),
+        jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+    ];
+    let outcome = config.quarantine_invalid_jwt_credentials_against(
+        &ferrum_edge::config::types::JwtSharedSecretHistory::default(),
+    );
+    assert_eq!(outcome.messages.len(), 2);
+    assert_eq!(outcome.shared.len(), 1);
+    assert!(config.quarantined_jwt_shared_secrets.is_empty());
+
+    const SQL: &str = include_str!("../../../src/config/db_loader.rs");
+    const MONGO: &str = include_str!("../../../src/config/mongo_store.rs");
+    for (name, source) in [("SQL", SQL), ("Mongo", MONGO)] {
+        assert!(
+            source.contains("config.quarantined_jwt_shared_secrets = jwt_outcome.shared;"),
+            "{name} full load must hand stripped shared secrets to ProxyState"
+        );
+    }
+}
+
+/// PR #6865 review (MUSE-1): a point-loaded consumer carrying `jwt` escalates
+/// database/CP polling to a full reload, like `hmac_auth`, because only the
+/// full namespace snapshot sees every holder of a shared secret.
+#[test]
+fn test_jwt_consumer_change_requires_authoritative_reload() {
+    use ferrum_edge::config::db_backend::consumer_change_requires_authoritative_reload;
+
+    assert!(consumer_change_requires_authoritative_reload(
+        &jwt_consumer(
+            "alice",
+            "alice",
+            &["alice-jwt-secret-at-least-32-characters"]
+        )
+    ));
+    let mut keyauth_only = make_consumer("k", "k");
+    keyauth_only.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "keyauth-only-0123456789"}]),
+    );
+    assert!(!consumer_change_requires_authoritative_reload(
+        &keyauth_only
+    ));
+}
+
+/// PR #6865 review (MUSE-6): structural wiring of the JWT secret policy. The
+/// helper-level tests above call the quarantine and validators directly, so
+/// pin that every publication and admission boundary still invokes them.
+#[test]
+fn test_jwt_secret_policy_is_wired_into_every_boundary() {
+    const PROXY: &str = include_str!("../../../src/proxy/mod.rs");
+    const SQL: &str = include_str!("../../../src/config/db_loader.rs");
+    const MONGO: &str = include_str!("../../../src/config/mongo_store.rs");
+    const CRUD: &str = include_str!("../../../src/admin/crud.rs");
+    const ADMIN: &str = include_str!("../../../src/admin/mod.rs");
+
+    // Full and incremental swaps quarantine against the shared-secret
+    // history; the comparison helper uses a read-only copy of it.
+    assert_eq!(
+        PROXY
+            .matches("self.quarantine_jwt_credentials(&mut new_config, Some(")
+            .count(),
+        2,
+        "update_config and apply_incremental must both quarantine JWT credentials"
+    );
+    let canonicalize = PROXY
+        .split("pub fn canonicalize_snapshot_for_comparison(")
+        .nth(1)
+        .expect("canonicalize_snapshot_for_comparison");
+    let canonicalize = &canonicalize[..canonicalize.find("\n    }\n").expect("function end")];
+    assert!(canonicalize.contains("self.quarantine_jwt_credentials(&mut candidate, None)"));
+    // Only accepted candidates record into the history.
+    assert!(PROXY.contains(
+        "if outcome.accepted() {\n            self.record_jwt_shared_secrets(&jwt_shared);"
+    ));
+    assert!(PROXY.contains(
+        "if matches!(&applied, IncrementalApplyResult::Outcome(outcome) if outcome.accepted()) {"
+    ));
+
+    // Both full loaders judge JWT ownership before identity quarantine can
+    // remove a holder.
+    for (name, source) in [("SQL", SQL), ("Mongo", MONGO)] {
+        let jwt = source
+            .find("config.quarantine_invalid_jwt_credentials_against(")
+            .unwrap_or_else(|| panic!("{name} full load must quarantine JWT credentials"));
+        let identity = source
+            .find("config.quarantine_colliding_consumer_identities()")
+            .unwrap_or_else(|| panic!("{name} full load identity quarantine"));
+        assert!(
+            jwt < identity,
+            "{name}: JWT quarantine must run before identity quarantine"
+        );
+    }
+
+    // Admin create/update, the credential endpoints, and batch admission.
+    let after_validate = CRUD
+        .split("async fn after_validate(")
+        .find(|section| section.contains("hmac_consumer_candidate_errors(db, namespace, resource)"))
+        .expect("Consumer after_validate");
+    assert!(after_validate.contains("jwt_consumer_candidate_errors(db, namespace, resource)"));
+    let persist = ADMIN
+        .split("async fn persist_consumer_update(")
+        .nth(1)
+        .expect("persist_consumer_update");
+    let persist = &persist[..persist.find("\n}\n").expect("function end")];
+    assert!(persist.contains("ensure_jwt_consumer_candidate("));
+    assert!(
+        ADMIN.contains(".validate_unique_jwt_credentials_for_consumers(&jwt_batch_consumer_ids)")
+    );
+    let snapshot_gate = ADMIN
+        .split("fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("batch consumer snapshot gate");
+    assert!(snapshot_gate.contains("credential_entries(\"jwt\")"));
+}
+
+#[test]
+fn test_quarantine_jwt_keeps_strong_secrets_and_legacy_selector_fields() {
+    // The verifier only reads `secret`, so a historical `algorithm: HS256`
+    // selector on an otherwise strong stored entry is left to admission
+    // validation rather than stripped at load.
+    let mut legacy = make_consumer("legacy", "legacy");
+    legacy.credentials.insert(
+        "jwt".into(),
+        serde_json::json!([{
+            "secret": "legacy-jwt-secret-at-least-32-characters",
+            "algorithm": "HS256"
+        }]),
+    );
+    let strong_secret = format!("{}\t\n\r", "j".repeat(32));
+    let mut config = empty_config();
+    config.consumers = vec![
+        legacy,
+        jwt_consumer("strong", "strong", &[strong_secret.as_str()]),
+    ];
+
+    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("jwt"))
+    );
+}
+
+#[test]
+fn test_validate_fields_rejects_whitespace_padded_jwt_secrets() {
+    for secret in [
+        " ".repeat(32),
+        format!("a{}", " ".repeat(31)),
+        format!("{}x", "\t".repeat(31)),
+        format!("{}{}", "j".repeat(31), "\n".repeat(64)),
+    ] {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("jwt".into(), serde_json::json!([{"secret": secret}]));
+        let errors = consumer.validate_fields().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must be at least 32 non-whitespace characters")),
+            "{errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -2495,7 +3104,7 @@ fn test_validate_fields_rejects_short_jwt_secret() {
     let err = c.validate_fields().unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.contains("must be at least 32 characters"))
+            .any(|e| e.contains("must be at least 32 non-whitespace characters"))
     );
 }
 
@@ -2644,7 +3253,7 @@ fn test_validate_fields_rejects_short_jwt_secret_in_array() {
     let err = c.validate_fields().unwrap_err();
     assert_eq!(
         err.iter()
-            .filter(|e| e.contains("must be at least 32 characters"))
+            .filter(|e| e.contains("must be at least 32 non-whitespace characters"))
             .count(),
         2
     );

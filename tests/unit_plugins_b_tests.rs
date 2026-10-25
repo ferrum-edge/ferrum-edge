@@ -54,6 +54,7 @@ mod unit {
         mod openapi_validator_review_tests;
         mod openapi_validator_tests;
         mod otel_tracing_attempt_spans_tests;
+        mod otel_tracing_review_tests;
         mod otel_tracing_tests;
         mod plugin_cache_tests;
         mod plugin_doc_parity_tests;

@@ -113,7 +113,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### Authorization & Security Plugins
 
-- **Access Control** — consumer-based and group-based allow/deny lists (consumers declare `acl_groups` membership; plugins match via `allowed_groups` / `disallowed_groups`)
+- **Access Control** — consumer-based and group-based allow/deny lists (consumers declare `acl_groups` membership; plugins match via `allowed_groups` / `disallowed_groups`), plus exact external-principal allow/deny rules (`allowed_external_identities` / `disallowed_external_identities`) optionally scoped to the verifying authentication mechanism
 - **OPA** — Open Policy Agent authorization via the OPA Data API with fail-closed defaults, configurable decision pointers, request-header and credential redaction, verified external-identity realms, query and repeated-header ambiguity screening, opt-in decision obligations (upstream headers on allow, policy-shaped denials), a per-instance decision bulkhead, and `opa.decision` / `opa.reason` log metadata
 - **Mesh Outbound Registry** — HTTP-family Host allowlist used by mesh `REGISTRY_ONLY` outbound policy. It is normally auto-injected from mesh slices but can also be configured directly on non-mesh gateways as a generic Host allowlist.
 - **IP Restriction** — standalone IP/CIDR filtering

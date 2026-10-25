@@ -415,6 +415,7 @@ mod tests {
     ) -> GatewayConfig {
         GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies,
             consumers: vec![],

@@ -244,6 +244,7 @@ Pre-commit gateway rejections below are JSON with `Content-Type: application/jso
 | Total headers too large | `431 Request Header Fields Too Large` | `{"error":"Total request headers exceed maximum size"}` |
 | Request body too large (Content-Length) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
 | Request body too large (streaming) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
+| Request body too large (`request_size_limiting` route ceiling, any enforcement point) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` (the same body; the limit is recorded in request metadata, not the body) |
 | Admin API body too large | `413 Payload Too Large` | Request rejected by body size middleware |
 | Response body too large (declared `Content-Length` or buffered collection, pre-commit) | `502 Bad Gateway` (HTTP); trailers-only `RESOURCE_EXHAUSTED` (native gRPC buffered) | HTTP: `{"error":"Backend response body exceeds maximum size"}` |
 | Response body too large (unknown-length streaming, post-commit) | Committed backend status, then the body/stream terminates (`ResponseBodyTooLarge`); the gateway yields once before the error so the frontend can flush the head and the bytes accepted within the limit (deterministic on HTTP/1.1 once the socket accepts the write, best effort on HTTP/2 and HTTP/3, where the flush runs on the connection task) | No JSON `502` replacement after headers are committed |
@@ -329,7 +330,7 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `custom_id` | 255 chars | Optional custom identifier |
 | `credentials` (total JSON) | 64 KiB | Total serialized size of credentials object |
 | `credentials` (per value) | 4096 chars | Individual credential string values |
-| `credentials.jwt.secret` | min 32 chars | JWT secrets must be at least 32 characters |
+| `credentials.jwt.secret` | min 32 non-whitespace chars | JWT secrets must contain at least 32 non-whitespace characters |
 | Credential type key | 64 chars | Credential type name (e.g., `keyauth`, `basicauth`) |
 
 ### Upstream Fields

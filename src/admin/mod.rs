@@ -6555,6 +6555,24 @@ async fn ensure_hmac_consumer_candidate(
     }
 }
 
+async fn ensure_jwt_consumer_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer: &Consumer,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    match crud::jwt_consumer_candidate_errors(db, namespace, consumer).await {
+        Ok(errors) if errors.is_empty() => Ok(()),
+        Ok(errors) => Err(Box::new(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": errors.join("; ")}),
+        ))),
+        Err(error) => Err(Box::new(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&error),
+        ))),
+    }
+}
+
 async fn persist_consumer_update(
     db: Arc<dyn DatabaseBackend>,
     mut consumer: Consumer,
@@ -6571,6 +6589,14 @@ async fn persist_consumer_update(
     if !consumer.credential_entries("hmac_auth").is_empty()
         && let Err(response) =
             ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
+    {
+        return *response;
+    }
+    // Same for retained `jwt` secrets: a secret shared with another Consumer
+    // in the namespace lets either sign as the other.
+    if !consumer.credential_entries("jwt").is_empty()
+        && let Err(response) =
+            ensure_jwt_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
     {
         return *response;
     }
@@ -9135,7 +9161,9 @@ async fn batch_existing_resource_conflict(
 
 fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
     batch.consumers.iter().any(|consumer| {
-        consumer.has_credential("mtls_auth") || !consumer.credential_entries("hmac_auth").is_empty()
+        consumer.has_credential("mtls_auth")
+            || !consumer.credential_entries("hmac_auth").is_empty()
+            || !consumer.credential_entries("jwt").is_empty()
     }) || batch
         .plugin_configs
         .iter()
@@ -9143,10 +9171,17 @@ fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
 }
 
 fn batch_needs_mtls_plugin_compat(batch: &RestorePayload) -> bool {
+    // A scoped `spiffe_identity` row shares `mtls_auth`'s stream
+    // TLS-termination requirement, so it is screened against the persisted
+    // stream proxies it can attach to even when the batch carries none.
     batch
         .proxies
         .iter()
         .any(|proxy| proxy.dispatch_kind.is_stream())
+        || batch
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.plugin_name == "spiffe_identity")
 }
 
 fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {
@@ -9426,6 +9461,21 @@ async fn handle_batch_create(
                     .iter()
                     .any(|consumer| !consumer.credential_entries("hmac_auth").is_empty())
                     && let Err(errors) = candidate_config.validate_unique_hmac_credentials()
+                {
+                    validation_errors.extend(errors);
+                }
+                // Same for JWT secrets, limited to collisions that involve a
+                // submitted Consumer so pre-existing (load-quarantined)
+                // duplicates between other Consumers never block the batch.
+                let jwt_batch_consumer_ids: Vec<&str> = batch
+                    .consumers
+                    .iter()
+                    .filter(|consumer| !consumer.credential_entries("jwt").is_empty())
+                    .map(|consumer| consumer.id.as_str())
+                    .collect();
+                if !jwt_batch_consumer_ids.is_empty()
+                    && let Err(errors) = candidate_config
+                        .validate_unique_jwt_credentials_for_consumers(&jwt_batch_consumer_ids)
                 {
                     validation_errors.extend(errors);
                 }

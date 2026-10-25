@@ -998,7 +998,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     assert_component_validity(&spec, "Consumer", &custom_credential_input, false);
 
     // Consumer JWT credentials have exactly one supported algorithm/key form:
-    // an HS256 shared secret. The input, backup, and restore surfaces all
+    // an HMAC shared secret. The input, backup, and restore surfaces all
     // accept that canonical form, while the ordinary response accepts only
     // the runtime's exact redaction placeholder.
     let jwt_input = json!({"secret": jwt_secret});
@@ -1079,6 +1079,23 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
             false,
         );
     }
+    // Like HMAC secrets, a Consumer JWT secret needs 32 non-whitespace
+    // characters; padding does not count (jwt_auth-CLAUDE-2).
+    for padded in [
+        " ".repeat(32),
+        format!("a{}", " ".repeat(31)),
+        format!("{}{}", "j".repeat(31), " ".repeat(64)),
+    ] {
+        let padded_runtime_jwt: Consumer = serde_json::from_value(json!({
+            "username": "alice",
+            "credentials": {"jwt": [{"secret": padded}]}
+        }))
+        .expect("padded JWT Consumer deserializes");
+        assert!(padded_runtime_jwt.validate_fields().is_err());
+        for component in ["JwtCredential", "JwtCredentialBackup"] {
+            assert_component_validity(&spec, component, &json!({"secret": padded}), false);
+        }
+    }
     for component in ["HmacAuthCredential", "HmacAuthCredentialBackup"] {
         assert_component_validity(
             &spec,
@@ -1100,7 +1117,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     assert!(hmac_backup_description.contains("at least 32 non-whitespace characters"));
 
     // Algorithm selectors and asymmetric/JWKS key material are not Consumer
-    // JWT credential forms. jwt_auth always verifies HS256 with `secret`;
+    // JWT credential forms. jwt_auth verifies `secret` with its pinned HMAC algorithm;
     // RSA/EC/JWKS verification belongs to the separate jwks_auth plugin.
     for unsupported in [
         json!({}),
@@ -2741,6 +2758,16 @@ fn access_control_schema_matches_runtime_validation() {
             "disallowed_consumers": ["é".repeat(4096)],
             "allow_authenticated_identity": true
         }),
+        json!({"allowed_external_identities": [{"identity": "alice"}]}),
+        json!({
+            "allowed_external_identities": [{"identity": "alice", "mechanism": "jwks_auth"}],
+            "allowed_groups": ["engineering"]
+        }),
+        json!({
+            "disallowed_external_identities": [{"identity": "é".repeat(4096), "mechanism": "ldap_auth"}],
+            "allow_authenticated_identity": true
+        }),
+        json!({"disallowed_external_identities": [{"identity": "\u{feff}"}]}),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -2781,6 +2808,20 @@ fn access_control_schema_matches_runtime_validation() {
             "disallowed_consumers": ["a".repeat(4097)],
             "allow_authenticated_identity": true
         }),
+        json!({"allowed_external_identities": []}),
+        json!({"allowed_external_identities": [], "allow_authenticated_identity": true}),
+        json!({
+            "allowed_external_identities": [{"identity": "alice"}],
+            "allow_authenticated_identity": true
+        }),
+        json!({"allowed_external_identities": ["alice"]}),
+        json!({"allowed_external_identities": [{"mechanism": "jwks_auth"}]}),
+        json!({"allowed_external_identities": [{"identity": "   "}]}),
+        json!({"allowed_external_identities": [{"identity": "\u{0085}"}]}),
+        json!({"allowed_external_identities": [{"identity": "a".repeat(4097)}]}),
+        json!({"disallowed_external_identities": [{"identity": "alice", "mechanism": "jwks"}]}),
+        json!({"disallowed_external_identities": [{"identity": "alice", "realm": "x"}]}),
+        json!({"disallowed_external_identities": []}),
     ] {
         assert!(
             validator.validate(&config).is_err(),
@@ -8177,6 +8218,71 @@ fn assert_component_validity(
     );
 }
 
+/// `SpiffeIdentityConfig` admits exactly what `SpiffeIdentity::new` admits for
+/// every shape the schema can express — including the documented `null`
+/// config (spiffe_identity-SOL-2).
+#[test]
+fn spiffe_identity_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentity;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let cases = [
+        (serde_json::Value::Null, true),
+        (json!({}), true),
+        (json!({"require_identity": true}), true),
+        (json!({"allowed_trust_domains": ["prod.example.com"]}), true),
+        (json!({"forward_identity": true}), true),
+        (
+            json!({
+                "require_identity": true,
+                "allowed_trust_domains": ["prod.example.com", "staging.example.com"],
+                "forward_identity": true
+            }),
+            true,
+        ),
+        (json!([]), false),
+        (json!("spiffe"), false),
+        (json!(1), false),
+        (json!(true), false),
+        (json!({"unexpected": true}), false),
+        (json!({"require_identity": "yes"}), false),
+        (json!({"allowed_trust_domains": []}), false),
+        (json!({"allowed_trust_domains": [1]}), false),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com", "prod.example.com"]}),
+            false,
+        ),
+        // Lexical trust-domain grammar the constructor enforces
+        // (PR #6871 review SOL-4).
+        (json!({"allowed_trust_domains": ["PROD.example"]}), false),
+        (
+            json!({"allowed_trust_domains": ["spiffe://prod.example.com"]}),
+            false,
+        ),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com:8443"]}),
+            false,
+        ),
+        (json!({"allowed_trust_domains": [""]}), false),
+        (json!({"allowed_trust_domains": ["a".repeat(256)]}), false),
+        (json!({"allowed_trust_domains": ["a".repeat(255)]}), true),
+        (json!({"allowed_trust_domains": ["_audit.example-1"]}), true),
+        (json!({"forward_identity": "x-spiffe-id"}), false),
+        (json!({"forward_identity": 7}), false),
+        (json!({"forward_header": "x-spiffe-id"}), false),
+    ];
+    for (instance, expected_valid) in cases {
+        assert_component_validity(&spec, "SpiffeIdentityConfig", &instance, expected_valid);
+        assert_eq!(
+            SpiffeIdentity::new(&instance).is_ok(),
+            expected_valid,
+            "constructor/schema admission mismatch for {instance}"
+        );
+    }
+}
+
 #[test]
 fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
     let spec: serde_json::Value =
@@ -8574,6 +8680,12 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x-consumers-id"}),
         json!({"header_name": "a".repeat(65_535)}),
         json!({"header_name": null, "echo_downstream": null}),
+        json!({"inbound_policy": "preserve"}),
+        json!({"inbound_policy": "generate", "header_name": "x-edge-request-id"}),
+        json!({"inbound_policy": null}),
+        json!({"header_name": "X-Geo-Country-Code"}),
+        json!({"header_name": "x-real-ip-chain"}),
+        json!({"header_name": "x-authenticated-identity-trace"}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
         CorrelationId::new(&valid)
@@ -8643,6 +8755,16 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x_consumer-trace"}),
         json!({"header_name": "X-Ferrum-Hops"}),
         json!({"header_name": " x_ferrum_hops "}),
+        json!({"header_name": "X-Geo-Country"}),
+        json!({"header_name": " x_geo_country "}),
+        json!({"header_name": "x-GEO_country"}),
+        json!({"header_name": "X-Authenticated-Identity"}),
+        json!({"header_name": "x_authenticated-identity"}),
+        json!({"header_name": "X-Real-IP"}),
+        json!({"header_name": " x-real-ip "}),
+        json!({"inbound_policy": "Generate"}),
+        json!({"inbound_policy": "always"}),
+        json!({"inbound_policy": true}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
         assert!(
@@ -8673,6 +8795,38 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
                 "correlation exclusion {exclusion_pointer} missed {reserved}"
             );
         }
+    }
+
+    // Backend gateway assertions that outbound refresh strips and regenerates,
+    // plus the literal X-Real-IP that backend builders drop from untrusted
+    // peers, have their own exclusion so the runtime predicate stays in sync.
+    let assertion_exclusion = header_name_schema
+        .pointer("/allOf/3/not")
+        .expect("gateway assertion exclusion exists");
+    let validator = jsonschema::draft202012::options()
+        .build(assertion_exclusion)
+        .unwrap_or_else(|error| panic!("gateway assertion exclusion compiles: {error}"));
+    for (name, excluded) in [
+        ("x-geo-country", true),
+        (" X_Geo_Country ", true),
+        ("x-authenticated-identity", true),
+        ("X_AUTHENTICATED_IDENTITY", true),
+        ("X-Real-IP", true),
+        ("x-geo-country-code", false),
+        ("x-real-ip-chain", false),
+    ] {
+        assert_eq!(
+            validator.validate(&json!(name)).is_ok(),
+            excluded,
+            "gateway assertion exclusion mismatch for {name:?}"
+        );
+        assert_eq!(
+            ferrum_edge::proxy::headers::is_gateway_assertion_header(
+                &name.trim().to_ascii_lowercase()
+            ) || name.trim().eq_ignore_ascii_case("x-real-ip"),
+            excluded,
+            "runtime reservation mismatch for {name:?}"
+        );
     }
 }
 
@@ -8948,12 +9102,53 @@ async fn ws_logging_schema_matches_strict_runtime_config_contract() {
         json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "schema_ref": ""}),
         json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "batch_size": 0}),
         json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "flush_interval_ms": 99}),
+        json!({"endpoint_url": "ws://127.0.0.1:0/ingest"}),
+        json!({"endpoint_url": "ws://127.0.0.1:00/ingest"}),
+        json!({"endpoint_url": "ws://127.0.0.1:65536/ingest"}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest#fragment"}),
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest", "custom_headers": "x"}),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "custom_headers": {"X-Tenant": 7}
+        }),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "inbound_message_policy": "drop"
+        }),
     ];
     for config in runtime_and_schema_invalid {
         assert_component_validity(&spec, "WsLoggingConfig", &config, false);
         assert!(
             WsLogging::new(&config, PluginHttpClient::default()).is_err(),
             "runtime accepted OpenAPI-invalid ws_logging config: {config}"
+        );
+    }
+
+    let valid_new_fields = json!({
+        "endpoint_url": "ws://127.0.0.1:65535/ingest?stream=edge",
+        "custom_headers": {"X-Collector-Tenant": "acme", "Authorization": "Bearer literal"},
+        "inbound_message_policy": "ignore"
+    });
+    assert_component_validity(&spec, "WsLoggingConfig", &valid_new_fields, true);
+    assert!(WsLogging::new(&valid_new_fields, PluginHttpClient::default()).is_ok());
+
+    // Credential-shaped query names, handshake-owned header names, and
+    // plugin-secret reference shapes are runtime-only screens.
+    for runtime_only in [
+        json!({"endpoint_url": "ws://127.0.0.1:39999/ingest?token=abc"}),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "custom_headers": {"Host": "other.example"}
+        }),
+        json!({
+            "endpoint_url": "ws://127.0.0.1:39999/ingest",
+            "custom_headers": {"Authorization": "${FERRUM_ADMIN_JWT_SECRET}"}
+        }),
+    ] {
+        assert_component_validity(&spec, "WsLoggingConfig", &runtime_only, true);
+        assert!(
+            WsLogging::new(&runtime_only, PluginHttpClient::default()).is_err(),
+            "runtime must refuse {runtime_only}"
         );
     }
 
@@ -12539,6 +12734,7 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
         json!({"buffer_streaming_responses": true}),
         json!({"cost_per_prompt_token": 0.000003}),
         json!({"cost_per_prompt_token": 18_446_744_073_709.55}),
+        json!({"model_pricing": [{"model": "gpt-4o*", "cost_per_prompt_token": 0.0000025}]}),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -12560,6 +12756,8 @@ fn ai_token_metrics_runtime_and_openapi_contracts_match() {
         json!({"metadata_prefix": "x".repeat(65)}),
         json!({"cost_per_prompt_token": -1}),
         json!({"cost_per_prompt_token": 18_446_744_073_710.0}),
+        json!({"model_pricing": [{"model": "gpt-4o*"}]}),
+        json!({"model_pricing": [{"model": "a..b", "cost_per_prompt_token": 1}]}),
     ] {
         assert!(
             validator.validate(&config).is_err(),
@@ -14031,6 +14229,93 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             parity_rule(json!({"attempt_timeout_ms": 0})),
             false,
         ),
+        // Plugin-review hardening: operand grammar, rule labels, and the
+        // Istio match fields (withoutHeaders, queryParams StringMatch, port).
+        (
+            "rule_name_label",
+            parity_rule(json!({"name": "ns/vs:route-1"})),
+            true,
+        ),
+        (
+            "rule_name_whitespace",
+            parity_rule(json!({"name": "has space"})),
+            false,
+        ),
+        (
+            "redirect_uri_relative",
+            parity_rule(json!({"redirect": {"uri": "new"}})),
+            false,
+        ),
+        (
+            "redirect_uri_fragment",
+            parity_rule(json!({"redirect": {"uri": "/new#frag"}})),
+            false,
+        ),
+        (
+            "redirect_uri_with_query",
+            parity_rule(json!({"redirect": {"uri": "/new?x=1"}})),
+            true,
+        ),
+        (
+            "redirect_uri_query_nul",
+            parity_rule(json!({"redirect": {"uri": "/new?x=\u{0}"}})),
+            false,
+        ),
+        (
+            "redirect_uri_query_del",
+            parity_rule(json!({"redirect": {"uri": "/new?x=\u{7f}"}})),
+            false,
+        ),
+        (
+            "redirect_uri_encoded_query",
+            parity_rule(json!({"redirect": {"uri": "/new?x=%00"}})),
+            true,
+        ),
+        (
+            "redirect_authority_with_path",
+            parity_rule(json!({"redirect": {"authority": "a/b"}})),
+            false,
+        ),
+        (
+            "rewrite_authority_userinfo",
+            parity_rule(json!({"rewrite": {"authority": "user@backend"}})),
+            false,
+        ),
+        (
+            "rewrite_authority_bracketed_ipv6_port",
+            parity_rule(json!({"rewrite": {"authority": "[2001:db8::10]:8080"}})),
+            true,
+        ),
+        (
+            "match_without_headers_regex",
+            parity_rule(json!({"match": {"without_headers": {"x-legacy": {"regex": ".*"}}}})),
+            true,
+        ),
+        (
+            "match_without_headers_invalid_name",
+            parity_rule(json!({"match": {"without_headers": {"x bad": "1"}}})),
+            false,
+        ),
+        (
+            "match_query_params_prefix",
+            parity_rule(json!({"match": {"query_params": {"tier": {"prefix": "gold"}}}})),
+            true,
+        ),
+        (
+            "match_query_params_empty_regex",
+            parity_rule(json!({"match": {"query_params": {"tier": {"regex": ""}}}})),
+            false,
+        ),
+        (
+            "match_port",
+            parity_rule(json!({"match": {"port": 8080}})),
+            true,
+        ),
+        (
+            "match_port_zero",
+            parity_rule(json!({"match": {"port": 0}})),
+            false,
+        ),
     ] {
         assert_component_validity(&spec, "MeshRouteDispatchConfig", &config, accepted);
         assert_eq!(
@@ -14189,6 +14474,20 @@ fn admin_referential_delete_conflicts_have_openapi_parity() {
             "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"
         ),
         "DELETE /consumers/{{id}} 409 must name the access_control error string: {consumer_desc}"
+    );
+
+    let consumer_rename_409 = spec
+        .pointer("/paths/~1consumers~1{id}/put/responses/409")
+        .expect("PUT /consumers/{id} must document 409");
+    let consumer_rename_desc = consumer_rename_409["description"]
+        .as_str()
+        .expect("PUT /consumers/{id} 409 description");
+    assert!(
+        consumer_rename_desc.contains(
+            "Consumer is referenced by one or more access_control plugin_configs and cannot be renamed"
+        ),
+        "PUT /consumers/{{id}} 409 must name the access_control rename error string: \
+         {consumer_rename_desc}"
     );
 
     let upstream_409 = spec
@@ -15666,6 +15965,69 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         status_schema["properties"]["replica_limit_behavior"]["enum"][0],
         "configured_limit_per_replica"
     );
+    assert!(
+        status_schema["required"]
+            .as_array()
+            .expect("required list")
+            .contains(&json!("active_connections")),
+        "admin metrics must always report live throttle occupancy"
+    );
+    assert_eq!(
+        status_schema["properties"]["active_connections"]["type"],
+        "integer"
+    );
+    assert!(metrics_source.contains("pub active_connections: u64"));
+
+    // IPv6 grouping is an explicit, validated contract shared by the schema,
+    // the runtime parser, and the docs. It matches `rate_limiting`'s
+    // `ipv6_prefix` (default /64, range 1..=128).
+    let rate_limit_prefix = spec
+        .pointer("/components/schemas/RateLimitingConfig/properties/ipv6_prefix")
+        .expect("RateLimitingConfig.ipv6_prefix exists");
+    let prefix = &schema["properties"]["ipv6_prefix"];
+    assert_eq!(prefix["type"], "integer");
+    assert_eq!(prefix["default"], json!(64));
+    assert_eq!(prefix["minimum"], json!(1));
+    assert_eq!(prefix["maximum"], json!(128));
+    for bound in ["type", "minimum", "maximum", "default"] {
+        assert_eq!(
+            prefix[bound], rate_limit_prefix[bound],
+            "ipv6_prefix `{bound}` must match rate_limiting"
+        );
+    }
+    for (value, expected_valid) in [
+        (json!(1), true),
+        (json!(64), true),
+        (json!(128), true),
+        (json!(0), false),
+        (json!(129), false),
+        (json!("64"), false),
+    ] {
+        let config = json!({"max_connections_per_key": 1, "ipv6_prefix": value});
+        assert_component_validity(
+            &spec,
+            "TcpConnectionThrottleConfig",
+            &config,
+            expected_valid,
+        );
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &config)
+                .is_ok(),
+            expected_valid,
+            "runtime and schema must agree on {config}"
+        );
+    }
+    for text in [schema_text.as_str(), plugin_docs] {
+        assert!(text.contains("ipv6_prefix"), "missing IPv6 grouping");
+        assert!(
+            text.contains("FERRUM_TCP_MAX_CONNECTIONS_PER_IP"),
+            "missing the accept-time per-IP bound interaction"
+        );
+        assert!(
+            text.contains("ferrum_tcp_connection_throttle_rejections_total"),
+            "missing the refusal counter"
+        );
+    }
 }
 
 #[test]
@@ -18410,6 +18772,10 @@ fn jwt_auth_schema_matches_runtime_admission() {
         json!({"audiences": ["payments-api"]}),
         json!({"leeway_secs": 300}),
         json!({"require_exp": false, "require_nbf": true}),
+        json!({"algorithm": "HS256"}),
+        json!({"algorithm": "HS384"}),
+        json!({"algorithm": "HS512", "hide_credentials": true}),
+        json!({"token_lookup": "query:token", "hide_credentials": false}),
     ];
     for config in &accepted {
         assert_component_validity(&spec, "JwtAuthConfig", config, true);
@@ -18434,6 +18800,11 @@ fn jwt_auth_schema_matches_runtime_admission() {
         json!({"leeway_secs": -1}),
         json!({"leeway_secs": 301}),
         json!({"audience": ["payments-api"]}),
+        json!({"algorithm": "RS256"}),
+        json!({"algorithm": "hs256"}),
+        json!({"algorithm": "none"}),
+        json!({"algorithm": ["HS256"]}),
+        json!({"hide_credentials": "yes"}),
     ];
     for config in &rejected {
         assert_component_validity(&spec, "JwtAuthConfig", config, false);

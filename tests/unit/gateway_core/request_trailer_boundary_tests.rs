@@ -495,3 +495,46 @@ fn buffered_grpc_request_trailers_stay_bound_to_the_validated_staging_path() {
          `buffered_grpc_request_body_with_write_watermark`, whose trailers come from staging"
     );
 }
+
+/// `spiffe_identity` `forward_identity` asserts the peer SVID to the backend in
+/// a gateway-owned `x-ferrum-*` header; a client must not be able to restate
+/// it — in any `_`/`-` spelling — in a late trailer block, anonymous or
+/// authenticated (PR #6871 review SOL-3).
+fn forged_forwarded_identity_trailers() -> Vec<(&'static str, &'static str)> {
+    let forwarded = ferrum_edge::plugins::mesh::spiffe_identity::FORWARDED_IDENTITY_HEADER;
+    assert_eq!(forwarded, "x-ferrum-peer-spiffe-id");
+    vec![
+        (
+            "x-ferrum-peer-spiffe-id",
+            "spiffe://prod.example.com/ns/admin/sa/admin",
+        ),
+        (
+            "x_ferrum_peer_spiffe_id",
+            "spiffe://prod.example.com/ns/admin/sa/admin",
+        ),
+        (
+            "x-ferrum_peer-spiffe_id",
+            "spiffe://prod.example.com/ns/admin/sa/admin",
+        ),
+        (BENIGN_TRAILER, "sha256:abc"),
+    ]
+}
+
+#[test]
+fn request_trailer_boundary_drops_forged_forwarded_spiffe_identity() {
+    let sanitized = ferrum_edge::_test_support::sanitized_backend_request_trailer_frame(
+        &forged_forwarded_identity_trailers(),
+    );
+    assert_eq!(sanitized, surviving_benign_trailer());
+}
+
+#[tokio::test]
+async fn h1_h2_streaming_upload_seam_drops_forged_forwarded_spiffe_identity() {
+    let (data, trailers) = ferrum_edge::_test_support::h1_h2_upload_source_forwarded_frames(
+        b"grpc-payload",
+        &forged_forwarded_identity_trailers(),
+    )
+    .await;
+    assert_eq!(data, b"grpc-payload".to_vec());
+    assert_eq!(trailers, surviving_benign_trailer());
+}

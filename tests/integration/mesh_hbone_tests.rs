@@ -154,6 +154,7 @@ fn create_mesh_proxy_state_with_env(
 ) -> ProxyState {
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies: vec![proxy],
         consumers,
@@ -1276,6 +1277,7 @@ fn create_inbound_relay_gateway_state(mesh: Option<MeshConfig>) -> ProxyState {
     let spiffe_plugin = spiffe_identity_global_plugin_config();
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         // One unrelated HTTP route keeps the config shaped like a real gateway.
         // It can never serve these CONNECTs: a `udp`-marked CONNECT is forced to
@@ -2077,6 +2079,7 @@ fn materialize_source_side_external_udp(
     };
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies: vec![],
         consumers: vec![],
@@ -5338,6 +5341,7 @@ fn create_post_plugin_third_workload_state(
     let spiffe_plugin = spiffe_identity_global_plugin_config();
     let config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         // Unrelated HTTP route: CONNECT to 127.0.0.1:b_port misses it, so
         // synthesis builds `__mesh-inbound-hbone-relay` and the global plugin

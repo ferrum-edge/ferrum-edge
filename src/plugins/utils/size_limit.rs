@@ -21,36 +21,62 @@ pub trait SizeLimiter {
     }
 }
 
+/// Read a required positive integer field, naming the actual fault class.
+///
+/// Missing, wrong-type, negative, fractional, and zero values are all refused,
+/// each with its own reason, so an operator who wrote `"1048576"` or
+/// `1048576.0` is told the value has the wrong type rather than that it must be
+/// greater than zero. Messages name the field and the JSON type but never echo
+/// the supplied value.
 pub fn required_positive_u64(
     config: &Value,
     field: &'static str,
     plugin_name: &'static str,
 ) -> Result<u64, String> {
-    let value = config[field].as_u64().unwrap_or(0);
-
-    if value == 0 {
-        Err(format!(
-            "{plugin_name}: `{field}` is required and must be greater than zero"
-        ))
-    } else {
-        Ok(value)
+    match config.get(field) {
+        None | Some(Value::Null) => Err(format!("{plugin_name}: `{field}` is required")),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(0) => Err(format!(
+                "{plugin_name}: `{field}` must be greater than zero"
+            )),
+            Some(value) => Ok(value),
+            None if number.is_i64() => {
+                Err(format!("{plugin_name}: `{field}` must not be negative"))
+            }
+            None => Err(format!(
+                "{plugin_name}: `{field}` must be written as an integer, not a fractional or exponent number"
+            )),
+        },
+        Some(other) => Err(format!(
+            "{plugin_name}: `{field}` must be an integer, not {}",
+            json_kind(other)
+        )),
     }
 }
 
+/// Value-free name of a non-numeric JSON value's type, for diagnostics.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// [`required_positive_u64`] narrowed to `usize`; a value the platform cannot
+/// represent is refused rather than truncated.
 pub fn required_positive_usize(
     config: &Value,
     field: &'static str,
     plugin_name: &'static str,
 ) -> Result<usize, String> {
-    let value = config[field].as_u64().unwrap_or(0) as usize;
-
-    if value == 0 {
-        Err(format!(
-            "{plugin_name}: `{field}` is required and must be greater than zero"
-        ))
-    } else {
-        Ok(value)
-    }
+    let value = required_positive_u64(config, field, plugin_name)?;
+    usize::try_from(value).map_err(|_| {
+        format!("{plugin_name}: `{field}` exceeds the largest size this platform supports")
+    })
 }
 
 /// Why a `Content-Length` fast path refuses a message.
