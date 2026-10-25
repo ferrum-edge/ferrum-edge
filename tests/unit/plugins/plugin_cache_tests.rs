@@ -12129,6 +12129,33 @@ fn test_modifies_request_headers_flag_computed() {
 }
 
 #[test]
+fn request_transformer_joins_the_websocket_handshake_view() {
+    // request_transformer-SOL-3: header/query rules (and route-header
+    // finalization) must run on WebSocket handshakes too.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "request_transformer",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let websocket = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
+    assert!(
+        websocket
+            .iter()
+            .any(|plugin| plugin.name() == "request_transformer"),
+        "the WebSocket view must carry request_transformer"
+    );
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::WebSocket);
+    assert!(caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS));
+}
+
+#[test]
 fn test_hmac_auth_rejects_request_body_transformer_composition() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],
@@ -12699,6 +12726,31 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
         caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT),
         "WAF plugin must set NEEDS_FINAL_REQUEST_BODY_CONTEXT so the proxy \
          passes a mutable RequestContext into on_final_request_body hooks"
+    );
+}
+
+#[test]
+fn request_transformer_body_rules_select_the_context_aware_body_hook() {
+    // PR #6858 review SOL-2: a chain whose only body plugin is a
+    // request_transformer must still route H1/H2 through the context-aware
+    // transform so `request_transformer.body_skipped` is published.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "request_transformer",
+            json!({"rules": [{"operation": "remove", "target": "body", "key": "internal.secret"}]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    assert!(caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT));
+    assert!(caps.has(PluginCapabilities::MODIFIES_REQUEST_BODY));
+    assert!(
+        !caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
+        "body rules alone must not force the per-request header-map copy"
     );
 }
 

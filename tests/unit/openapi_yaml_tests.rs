@@ -7348,6 +7348,31 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "new_key": "user.new"
             }]
         }),
+        // Bounded request-variable templates compile at load time.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Tenant-Echo",
+                "value": "tenant=$(header.x-tenant); user=$(consumer.username)"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "rid",
+                "value": "$(request_id)-$$(literal)"
+            }]
+        }),
+        // An escaped trailing dot is one non-empty segment.
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "trailing\\."
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, true);
         assert!(
@@ -7511,6 +7536,21 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "target": "body",
                 "key": "first",
                 "new_key": "items.0"
+            }]
+        }),
+        // Empty dot-segments in a body path.
+        json!({"rules": [{"operation": "remove", "target": "body", "key": ""}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "user."}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": ".user"}]}),
+        json!({
+            "rules": [{"operation": "update", "target": "body", "key": "a..b", "value": 1}]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "user.old",
+                "new_key": "user..new"
             }]
         }),
     ] {
@@ -7799,6 +7839,9 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
                 "new_key": "first"
             }]
         }),
+        // Empty dot-segments in a body path (shared body-rule parser).
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "a..b"}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "trailing."}]}),
     ] {
         assert_component_validity(&spec, "ResponseTransformerConfig", &config, false);
         assert!(

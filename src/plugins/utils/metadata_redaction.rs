@@ -482,6 +482,10 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "request_id",
     "request_path",
     "request_protocol",
+    // Fixed, value-free reason literals (`template_unresolved`,
+    // `non_json_content_type`, …); never request content.
+    "request_transformer.body_skipped",
+    "request_transformer.rule_skipped",
     "response_status_code",
     "route_request_timeout",
     "server_address",

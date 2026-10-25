@@ -27136,8 +27136,9 @@ components:
                   auto-emitted empty-rules instance act as that eligible
                   consumer. Validated at config load — CRLF in values,
                   unknown operations, and `add`/`update` destinations in the
-                  gateway-owned `x-consumer-*` consumer assertion namespace are
-                  rejected.
+                  gateway-owned `x-consumer-*` consumer assertion namespace or
+                  the router's `x-path-param-*` route-capture namespace
+                  (case-insensitive, `_` or `-`) are rejected.
                 items:
                   type: object
                   additionalProperties: false
@@ -30227,14 +30228,18 @@ components:
             HTTP header name; must be a complete HTTP field-name token (the
             same grammar `HeaderName` accepts). Add/update destinations and
             rename destinations
-            reject gateway-owned names (case-insensitive): host, content-length,
+            reject gateway-owned names (case-insensitive, with `_` treated as
+            `-`, so `X_Forwarded_For` and `content_length` are refused too):
+            host, content-length,
             connection, transfer-encoding, keep-alive, proxy-authorization,
             proxy-connection, te, trailer, upgrade, expect, x-forwarded-for,
             x-forwarded-proto, x-forwarded-host,
             x-ferrum-original-content-encoding, and x-grpc-web-mode. They also
             reject every name in the gateway-owned `x-consumer-*` consumer
             assertion namespace (including x-consumer-username and
-            x-consumer-custom-id); the error names the rule.
+            x-consumer-custom-id) and in the router's `x-path-param-*`
+            route-capture namespace (either spelling); the error names the
+            rule.
             Removal and rename sources remain allowed, except for the
             gateway-owned x-ferrum-hops proxy hop count (either spelling):
             every rule that names it, as key or new_key, is rejected.
@@ -30249,6 +30254,20 @@ components:
             Must be a valid HTTP HeaderValue (HTAB, visible ASCII, and
             obs-text are accepted; CR, LF, DEL, and other C0 controls are
             rejected).
+            May reference up to 8 request variables, compiled at load time:
+            `$(consumer.username)`, `$(client_ip)`, `$(request_id)`,
+            `$(header.<name>)` and `$(query.<name>)` (both read from the
+            ORIGINAL client request, so a rename cannot relabel a
+            credential). `$$(` writes a literal `$(`; an unknown variable, an
+            unterminated `$(`, or a credential-bearing source name (the
+            built-in credential headers in any `_` / `-` spelling, or any
+            name the shared sensitive-name classifier flags: `*token*`,
+            `*secret*`, `password`, `api_key`, …) is rejected. When a
+            variable is unavailable for a request — or names a credential
+            location an auth plugin marked — or the resolved text is not a
+            valid HeaderValue, the rule is skipped for that request and
+            `request_transformer.rule_skipped` transaction metadata records
+            `template_unresolved` / `template_invalid_header_value`.
         new_key:
           type: string
           minLength: 1
@@ -30304,7 +30323,9 @@ components:
           description: |
             Required for add/update; must not be set for remove/rename.
             Must not contain CR or LF. Authored onto the outbound query with
-            RFC 3986 percent-encoding (`%20` for spaces, never `+`).
+            RFC 3986 percent-encoding (`%20` for spaces, never `+`). Accepts
+            the same `$(...)` request variables as a header `value`; the
+            resolved text is percent-encoded like any authored value.
         new_key:
           type: string
           not:
@@ -30347,12 +30368,20 @@ components:
           const: body
         key:
           type: string
+          minLength: 1
+          not:
+            # An empty dot-segment: a leading `.`, or an unescaped `.` (one
+            # preceded by an even run of backslashes) followed by `.` or the
+            # end of the path.
+            pattern: '^\.|(^|[^\\])(\\\\)*\.(\.|$)'
           description: |
             Dot-notation body path. Supports nested objects
             ('user.address.city'), array indexing via numeric segments
             ('items.0.name'), and backslash-escaped literal dots
-            ('meta.weird\\.key'). `rename` additionally rejects unescaped
-            numeric segments here and in `new_key`.
+            ('meta.weird\\.key'). Empty segments (an empty path, or a
+            leading, trailing, or doubled unescaped `.`) are rejected.
+            `rename` additionally rejects unescaped numeric segments here
+            and in `new_key`.
         value:
           description: |
             Required for add/update; must not be set for remove/rename.
@@ -30363,9 +30392,13 @@ components:
             as a JSON string.
         new_key:
           type: string
+          minLength: 1
+          not:
+            pattern: '^\.|(^|[^\\])(\\\\)*\.(\.|$)'
           description: |
             Required for rename; must not be set for add/update/remove.
-            Array indices are rejected in a rename `key` / `new_key`.
+            Array indices and empty dot-segments are rejected in a rename
+            `key` / `new_key`.
 
     ResponseTransformerConfig:
       type: object
@@ -30587,11 +30620,16 @@ components:
           const: body
         key:
           type: string
+          minLength: 1
+          not:
+            # An empty dot-segment (see RequestTransformerBodyRule.key).
+            pattern: '^\.|(^|[^\\])(\\\\)*\.(\.|$)'
           description: |
             Dot-notation body path. Supports nested objects, array indexing
-            ('items.0'), and backslash-escaped literal dots. `rename`
-            additionally rejects unescaped numeric segments here and in
-            `new_key`.
+            ('items.0'), and backslash-escaped literal dots. Empty segments
+            (an empty path, or a leading, trailing, or doubled unescaped `.`)
+            are rejected. `rename` additionally rejects unescaped numeric
+            segments here and in `new_key`.
         value:
           description: |
             Required for add/update; must not be set for remove/rename.
@@ -30601,9 +30639,13 @@ components:
             type at runtime; otherwise kept as a JSON string.
         new_key:
           type: string
+          minLength: 1
+          not:
+            pattern: '^\.|(^|[^\\])(\\\\)*\.(\.|$)'
           description: |
             Required for rename; must not be set for add/update/remove.
-            Array indices are rejected in a rename `key` / `new_key`.
+            Array indices and empty dot-segments are rejected in a rename
+            `key` / `new_key`.
 
     SecurityHeadersConfig:
       type: object

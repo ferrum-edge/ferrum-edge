@@ -1728,7 +1728,7 @@ Given all built-in plugins enabled, the execution order is:
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, transform_response_body, after_proxy, on_final_response_body |
 | 46 | `a2a_gateway` | 2993 | before_proxy, on_final_request_body, after_proxy, normalize_response_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
-| 48 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 48 | `request_transformer` | 3000 | before_proxy, transform_request_body_with_context |
 | 49 | `request_deduplication` | 3010 | before_proxy, on_final_response_body, on_response_stream_terminated, on_response_committed |
 | 50 | `serverless_function` | 3025 | finalized request egress |
 | 51 | `response_mock` | 3030 | before_proxy |
@@ -2205,7 +2205,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `mcp_gateway` | ✓ | | | | | HTTP-only MCP JSON-RPC parsing, metadata, and namespaced tool/resource/prompt routing |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP and gRPC Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
-| `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
+| `request_transformer` | ✓ | ✓ | ✓ | | | Modifies HTTP headers/query/body; WebSocket handshake headers/query only |
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC |
 | `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported by design — only the validated serverless_function terminate contract carries provenance-authorized framed unary Reject semantics |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
