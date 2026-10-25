@@ -157,28 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`proxy_alerts` incident lifecycle hardening.** Trigger/Resolve delivery
-  state is now tracked per `(rule, proxy, channel)`: a rule fanning out to
-  several channels no longer commits the incident when only one channel
-  delivered, so a channel whose Resolve failed (or whose dispatch was dropped
-  for backpressure) keeps owing it and retries independently. A reminder
-  Trigger for an Active incident now reserves a `PendingReminder` seat that
-  holds recovery until it settles, so a slow reminder can no longer reach the
-  receiver after the Resolve and reopen a recovered incident. A background
-  re-evaluation (every 5s) advances Active/Recovering incidents against their
-  windows without traffic, so an incident on a proxy that stopped receiving
-  requests resolves on schedule; a window that re-breaches as samples age out
-  returns a Recovering incident to Active so recovery restarts. WebSocket policy closes
-  (`credential_expired`, `trust_withdrawn`, `max_lifetime`) now match
-  `gateway_policy` instead of `graceful_shutdown`. `${sample_count}` /
-  "Samples" now report the documented window total for count rules (it was
-  the matched count). Webhook/email templates gain `${incident_key}`, a stable
-  per-plugin-config/namespace/proxy/rule key, and the PagerDuty examples send it as
-  `dedup_key` so Resolve closes the Trigger's incident. Established window,
-  cooldown, and recovery lookups are served from a lock-free `ArcSwap`
-  snapshot instead of a per-sample mutex, and each rule walks its window
-  store once per sample. The docs now state that evaluation is per gateway
-  node.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
