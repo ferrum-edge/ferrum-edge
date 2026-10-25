@@ -25686,11 +25686,15 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: hmac_auth — Ferrum-specific versioned HMAC authorization with
-        mandatory request-body integrity protection. RFC 9530 defines
-        Content-Digest; this is not RFC 9421 HTTP Message Signatures. Requests
-        must include exactly one of Digest or Content-Digest matching the
-        original body. Sending both headers is refused as ambiguous;
+        Plugin: hmac_auth — versioned HMAC request authentication with
+        mandatory request-body integrity protection. The Ferrum profiles
+        (`ferrum-hmac-v2`, `ferrum-hmac-v1`) use `Authorization: hmac` and a
+        Ferrum signing base; the `rfc9421` profile verifies RFC 9421 HTTP
+        Message Signatures (`Signature-Input` / `Signature`, `hmac-sha256`,
+        key looked up by `keyid` among the Consumers' `hmac_auth` secrets).
+        RFC 9530 defines Content-Digest. Requests must include exactly one of
+        Digest or Content-Digest matching the original body (`rfc9421`
+        requires Content-Digest and must cover it). Sending both headers is refused as ambiguous;
         unsupported algorithms and malformed members fail closed. The signing
         base's FIRST field is the profile version, so a signature produced
         under one profile can never verify under another.
@@ -25702,7 +25706,8 @@ components:
         retry is therefore a replay and is rejected; safe retries send a fresh
         nonce with a recomputed signature. HBONE CONNECT and
         request-body-transformer compositions fail closed. The
-        pre-authentication body path has a 10 MiB hard ceiling. A WebSocket
+        pre-authentication body path is bounded by max_body_bytes (default
+        10 MiB). A WebSocket
         handshake (HTTP/1.1 Upgrade, HTTP/2 and HTTP/3 Extended CONNECT) is
         signed over the EMPTY body: tunnel DATA is never drained as a request
         body, so the transport proves the handshake's empty representation from
@@ -25723,12 +25728,25 @@ components:
             captured valid request stays replayable.
         signing_profile:
           type: string
-          enum: [ferrum-hmac-v2, ferrum-hmac-v1]
+          enum: [ferrum-hmac-v2, rfc9421, ferrum-hmac-v1]
           default: ferrum-hmac-v2
           description: >-
             Versioned signing profile. 'ferrum-hmac-v2' requires a client nonce
             in the Authorization parameters, binds it into the signature, and
-            makes each signed request single-use. 'ferrum-hmac-v1' is
+            makes each signed request single-use. 'rfc9421' verifies (never
+            signs) exactly one RFC 9421 HTTP Message Signature with alg
+            'hmac-sha256' (an absent alg means hmac-sha256; any other is
+            refused). Covered components must include @method, @authority,
+            @path, @query, content-digest, every signed_headers entry, and
+            every required_components entry; 'created', 'keyid', and 'nonce'
+            are required, 'expires' is enforced when sent, 'created' must be
+            within clock_skew_seconds, and the nonce is claimed single-use like
+            v2 (in its own replay domain). Unknown algorithms, components,
+            component parameters, and signature parameters are refused.
+            Supported derived components are @method (the wire method:
+            CONNECT for an HTTP/2 or HTTP/3 WebSocket Extended CONNECT),
+            @authority, @path, @query, and @request-target (the target as
+            sent, including HTTP/1.1 absolute form and an empty query). 'ferrum-hmac-v1' is
             freshness-only — a captured valid request can be replayed verbatim
             for the whole clock_skew_seconds window — and additionally requires
             allow_unsafe_replayable_v1 true. v1 rejects a nonce parameter
@@ -25747,8 +25765,8 @@ components:
           type: string
           enum: [process, shared]
           description: >-
-            Required for ferrum-hmac-v2 and rejected for ferrum-hmac-v1; there is
-            no default. Use 'shared' together with sync_mode 'redis' for any
+            Required for ferrum-hmac-v2 and rfc9421 and rejected for
+            ferrum-hmac-v1; there is no default. Use 'shared' together with sync_mode 'redis' for any
             deployment running more than one gateway replica: every replica then
             claims each nonce through one atomic Redis SET NX EX. Use 'process'
             to declare a single-process deployment whose replay protection is
@@ -25760,15 +25778,62 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 10000000
           default: 100000
           description: >-
             Capacity this process-scoped authority enforces against the shared
-            replay lane. At capacity only expired markers are reclaimed; if none
-            can be, the request is refused (503) rather than a live marker
-            evicted. Repeated full-live refusals are O(1) until an expiry is
-            actually due. An equivalent reload applies the new cap without
-            forgetting live markers. Ignored for 'shared'.
+            replay lane (at most 10,000,000; use replay_scope 'shared' for more).
+            At capacity only expired markers are reclaimed; if none can be, the
+            request is refused (503) rather than a live marker evicted.
+            Repeated full-live refusals are O(1) until an expiry is actually
+            due, and a due reclamation pops only markers whose expiry has
+            passed from an ordered expiry index, never rescanning live markers. An equivalent reload applies the
+            new cap without forgetting live markers. Ignored for 'shared';
+            rejected with ferrum-hmac-v1, which has no replay state.
+        signed_headers:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: "^[a-z0-9!#$%&'*+.^_`|~-]+$"
+            not:
+              enum: [authorization, signature, signature-input, host, connection, keep-alive, proxy-connection, te, trailer, transfer-encoding, upgrade]
+          description: >-
+            Lowercase request header names every accepted signature must cover,
+            for all profiles. Under the Ferrum profiles each is appended to the
+            signing base, in this order, as one '\n{name}:{value}' line after
+            the nonce (v2) or digest (v1), where value is the RFC 9421 section
+            2.1 canonical value (each field line trimmed, joined by ', '). Under
+            rfc9421 each must appear in the covered components. A configured
+            header missing from the request is refused (401). Signature
+            carriers and connection-specific fields cannot be named. Omitted or
+            empty leaves the signing base unchanged.
+        required_components:
+          type: array
+          maxItems: 5
+          uniqueItems: true
+          items:
+            type: string
+            enum: ['@method', '@authority', '@path', '@query', '@request-target']
+          description: >-
+            rfc9421 only (rejected with the Ferrum profiles): additional derived
+            components every signature must cover beyond the mandatory
+            @method, @authority, @path, @query, and content-digest. Require
+            header fields with signed_headers.
+        max_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 268435456
+          default: 10485760
+          description: >-
+            Pre-authentication request-body ceiling in bytes (at most 256 MiB).
+            Only a request whose signature already verified is buffered, and
+            the stricter of this, the route, and the global request-body limits
+            applies; a larger signed body is refused (413).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -25838,14 +25903,24 @@ components:
               sync_mode:
                 const: local
             not:
-              required: [replay_scope]
+              anyOf:
+                - required: [replay_scope]
+                - required: [replay_max_entries]
           else:
-            # ferrum-hmac-v2 (the default) has no default replay scope, and the
-            # unsafe acknowledgement is only meaningful with v1.
+            # ferrum-hmac-v2 (the default) and rfc9421 have no default replay
+            # scope, and the unsafe acknowledgement is only meaningful with v1.
             required: [replay_scope]
             properties:
               allow_unsafe_replayable_v1:
                 const: false
+        # `required_components` is an RFC 9421 policy.
+        - if:
+            required: [required_components]
+          then:
+            required: [signing_profile]
+            properties:
+              signing_profile:
+                const: rfc9421
         - if:
             required: [replay_scope]
             properties:
@@ -31357,17 +31432,18 @@ components:
                 pattern: "^[rR][eE][dD][iI][sS]$"
           then:
             required: [redis_url]
-      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. Residual admission rules this schema cannot express, enforced by the plugin constructor alone: one consumer identity may not appear in two different `scope: consumers` rules (JSON Schema can only reject a duplicate inside one rule), and `redis_url` details noted on that field."
+      description: "Plugin: rate_limiting — Per-IP, per-consumer, per-SPIFFE-identity, or per-policy aggregate (`limit_by: service`) request rate limiting. Quota 429 responses carry a Retry-After header. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. Residual admission rules this schema cannot express, enforced by the plugin constructor alone: one consumer identity may not appear in two different `scope: consumers` rules (JSON Schema can only reject a duplicate inside one rule), and `redis_url` details noted on that field."
       properties:
         limit_by:
           type: [string, "null"]
-          pattern: "^([iI][pP]|[cC][oO][nN][sS][uU][mM][eE][rR]|[sS][pP][iI][fF][fF][eE](_[iI][dD][eE][nN][tT][iI][tT][yY])?)$"
+          pattern: "^([iI][pP]|[cC][oO][nN][sS][uU][mM][eE][rR]|[sS][pP][iI][fF][fF][eE](_[iI][dD][eE][nN][tT][iI][tT][yY])?|[sS][eE][rR][vV][iI][cC][eE])$"
           default: ip
           description: |
             Rate limit key. Parsed case-insensitively; `null` is the same as omitting the field:
             - `ip` (default) — client IP.
             - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
             - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
+            - `service` — one aggregate budget per policy shared by every caller (a total route/service rate), charged after authentication (authorize phase) on HTTP and once per connection/session on TCP/UDP. With `sync_mode: redis` the budget is shared by every gateway serving the policy. Compose it beside a per-caller instance to enforce both a per-caller and a total limit.
         ipv6_prefix:
           type: integer
           minimum: 1
@@ -31377,7 +31453,18 @@ components:
         expose_headers:
           type: boolean
           default: false
-          description: "Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting. The header names are one public set, so when several rate_limiting instances run on a route exactly one verdict is published: the limiter that refused the request, or — when all of them admitted — the tightest remaining budget. A refusing limiter with expose_headers=false, and any fail-closed 503, publish no rate-limit headers at all."
+          description: "Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including successful WebSocket handshake responses and gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting. The header names are one public set, so when several rate_limiting instances run on a route exactly one verdict is published: the limiter that refused the request, or — when all of them admitted — the tightest remaining budget. A refusing limiter with expose_headers=false, and any fail-closed 503, publish no rate-limit headers at all."
+        max_state_entries:
+          type: integer
+          minimum: 1
+          maximum: 10000000
+          default: 100000
+          description: >-
+            Hard cap on distinct keys this policy keeps in local (and
+            Redis-fallback) state. At the cap, keys already tracked keep their
+            budgets and a previously unseen key is refused with 429 until idle
+            keys are pruned. Read per admission and not part of the local-state
+            compatibility fingerprint, so changing it never resets live budgets.
         limits:
           type: array
           minItems: 1
@@ -31406,7 +31493,11 @@ components:
             with the media types mcp_gateway admits (application/json,
             application/json-rpc, +json, or no Content-Type); a body with
             duplicate member names, or a batch past 32 members / 1 MiB / 256 KiB
-            per member, is refused with JSON-RPC -32600. These recognizer bounds
+            per member, is refused with JSON-RPC -32600. So is an in-scope
+            request whose Content-Type declares a charset other than UTF-8, and
+            a body strict UTF-8 JSON cannot read (UTF-16/32, a byte-order mark,
+            NaN, comments, invalid UTF-8) that could still carry a tools/call
+            for a lenient upstream parser. These recognizer bounds
             are fixed at 32 members / 1 MiB / 256 KiB per member; setting
             mcp_gateway validation.max_batch_* above these values makes the
             limiter refuse the larger request with -32600. An in-scope request
@@ -31466,7 +31557,7 @@ components:
         redis_tls:
           type: boolean
           default: false
-          description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+          description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://; the URL scheme is matched case-insensitively and stored lowercase). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
           minLength: 1
@@ -35223,7 +35314,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching. Cache keys are opaque SHA-256 digests over typed, length-framed fields: the effective post-routing destination (proxy, listen path, upstream or direct host/port/scheme, authority, rewritten path), the original authority, method, path, backend-effective outbound query, a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and digests of every credential header presented — taken over both the pristine inbound wire header view and the live backend-visible one, so an earlier ai_stream_router credential rewrite cannot erase the original caller distinction; every caller also binds its canonical peer address, and only an anonymous caller's binding is relaxable per anonymous_caller_scope), and a digest of the complete configured/origin-selected Vary tuple including every name, presence flag, and value. Authorization, Proxy-Authorization, and Cookie are mandatory dimensions on every retained response, including anonymous responses, and are emitted in Vary so downstream shared caches cannot cross Ferrum's private caller partition. That Vary list is published on the MISS response itself as well as on later hits, so the first publicly cacheable response a downstream cache stores already carries the same selection; an origin Vary: * is left untouched. No raw delimiter concatenation is used anywhere in key construction, so an attacker-supplied header or query value cannot forge a field boundary and collide two distinct requests onto one key. Keys are never logged. GET/HEAD lookup requires a private transport-owned proof that the complete H1/H2/H3 upload is empty; non-empty or unproven bodies bypass, and admission rejects deferred request-body transforms that could synthesize bytes after lookup. Honors Cache-Control freshness, upstream Age/Date (a comma-folded repeated Age uses its first member rather than resetting to zero), current Age generation on hits, ETag/Last-Modified revalidation (304, tolerating a bounded number of empty entity-tag list members), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to requests carrying Authorization in either the pristine inbound or live backend-visible view are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Gateway-generated transport failures are refused from typed backend-dispatch provenance on every HTTP version, so listing 502/504 in cacheable_status_codes retains genuine origin error pages without pinning a local connect/read failure over a recovered origin. Includes a bounded FIFO cacheability predictor (amortized O(1) admission, no full-map sort at capacity) that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, is confined to the same normalized/transformed Host/authority partition as lookup, and treats a slash-terminated mutated path (including the root) as its own descendant boundary so its children are invalidated too. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching. Cache keys are opaque SHA-256 digests over typed, length-framed fields: the effective post-routing destination (proxy, listen path, upstream or direct host/port/scheme, authority, rewritten path), the matched proxy's backend_path, strip_listen_path, and preserve_host_header (so a proxy-only reload that changes the assembled origin path or outbound Host cannot keep replaying the previous route through a retained global instance), the effective frontend scheme from private connection provenance (the proxy regenerates X-Forwarded-Proto from it, so an HTTPS representation is never replayed to plaintext or vice versa), the original authority, method, path, backend-effective outbound query, a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and digests of every credential header presented — taken over both the pristine inbound wire header view and the live backend-visible one, so an earlier ai_stream_router credential rewrite cannot erase the original caller distinction; every caller also binds its canonical peer address, and only an anonymous caller's binding is relaxable per anonymous_caller_scope), and a digest of the complete configured/origin-selected Vary tuple including every name, presence flag, and value. Authorization, Proxy-Authorization, and Cookie are mandatory dimensions on every retained response, including anonymous responses, and are emitted in Vary so downstream shared caches cannot cross Ferrum's private caller partition. That Vary list is published on the MISS response itself, and on an honored request Cache-Control: no-cache refresh (X-Cache-Status: BYPASS, which stores its replacement under the same partition), as well as on later hits, so every freshly fetched publicly cacheable response a downstream cache stores already carries the same selection; an origin Vary: * is left untouched. No raw delimiter concatenation is used anywhere in key construction, so an attacker-supplied header or query value cannot forge a field boundary and collide two distinct requests onto one key. Keys are never logged. GET/HEAD lookup requires a private transport-owned proof that the complete H1/H2/H3 upload is empty; non-empty or unproven bodies bypass, and admission rejects deferred request-body transforms that could synthesize bytes after lookup. Honors Cache-Control freshness, upstream Age/Date (a comma-folded repeated Age uses its first member rather than resetting to zero), current Age generation on hits, ETag/Last-Modified revalidation (304, tolerating a bounded number of empty entity-tag list members), Vary, and never caches responses with Set-Cookie (matched case-insensitively, as is Content-Range). Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade), every field the origin qualified with private=\"…\" or no-cache=\"…\", and every field the shared replay-sanitation policy also applied by ai_semantic_cache and request_deduplication classifies as per-response state (Set-Cookie/Set-Cookie2, WWW-Authenticate, response credentials, per-request trace and correlation identifiers such as traceparent, b3, x-b3-*, X-Request-Id, X-Correlation-Id, Retry-After, and every RateLimit/X-RateLimit/X-AI-RateLimit/Anthropic-RateLimit field) are dropped before storage, so no replay can emit them; the response that produced the miss is delivered untouched. Responses to requests carrying Authorization in either the pristine inbound or live backend-visible view are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Gateway-generated transport failures are refused from typed backend-dispatch provenance on every HTTP version, so listing 502/504 in cacheable_status_codes retains genuine origin error pages without pinning a local connect/read failure over a recovered origin. Includes a bounded FIFO cacheability predictor (amortized O(1) admission, no full-map sort at capacity) that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, is confined to the same normalized/transformed Host/authority partition as lookup, and treats a slash-terminated mutated path (including the root) as its own descendant boundary so its children are invalidated too. Store-side staging (header delta, reduced snapshot, timing, lookup path, keys) is written only once a request is known to reach the origin (MISS or no-cache refresh), never on a HIT, REVALIDATED, PREDICTED-BYPASS, or request no-store. Lookup outcomes are exported as the bounded ferrum_response_cache_lookups_total{status} counter (hit, miss, bypass, revalidated, predicted_bypass; never a key, path, host, or caller label). Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -35271,17 +35362,17 @@ components:
             minimum: 200
             maximum: 599
             not:
-              enum: [206, 304]
+              enum: [206, 304, 401, 407]
           default: [200, 301, 404]
-          description: "Response status codes eligible for caching. Must contain at least one entry, and every entry must be a final status between 200 and 599 whose caching semantics the plugin implements. 1xx (interim), 206 (partial content — requires Range/Content-Range, strong-validator, completeness, and request-applicability tracking), and 304 (validator metadata that freshens an existing stored representation rather than a representation of its own) are rejected at admission and refused again at store time, so a caller cannot poison the shared cache with a truncated or validator-only entry. A 2xx response carrying Content-Range is likewise never stored."
+          description: "Response status codes eligible for caching. Must contain at least one entry, and every entry must be a final status between 200 and 599 whose caching semantics the plugin implements. 1xx (interim), 206 (partial content — requires Range/Content-Range, strong-validator, completeness, and request-applicability tracking), 304 (validator metadata that freshens an existing stored representation rather than a representation of its own), and 401/407 (only valid with an authentication challenge that a shared cache cannot retain: WWW-Authenticate is per-response state under the shared replay-sanitation policy and Proxy-Authenticate is hop-scoped, so a stored copy would replay a challenge-less 401/407) are rejected at admission and refused again at store time, so a caller cannot poison the shared cache with a truncated, validator-only, or challenge-less entry. A 2xx response carrying Content-Range is likewise never stored."
         respect_cache_control:
           type: [boolean, "null"]
           default: true
-          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public) and explicit Expires freshness. Setting false explicitly overrides origin Cache-Control and Expires with ttl_seconds; age accounting still applies. Parsing is grammar-aware: the qualified field-name forms private=\"x-account\" and no-cache=\"x-secret\" are understood, and the named fields are removed from the retained entry so they are never replayed from the shared cache. A qualified argument that is not a well-formed quoted field-name list (unquoted, unterminated, empty, or not a valid field name) fails closed to the bare directive and the whole response is refused. Duplicate max-age/s-maxage keep the most restrictive value; malformed lifetime directives contribute zero."
+          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public) and explicit Expires freshness. Setting false ignores the origin's Cache-Control entirely, not only its lifetimes: freshness comes from ttl_seconds instead of Cache-Control and Expires (age accounting still applies), and the origin's storage prohibitions are ignored too — a response marked no-store, private, or no-cache is stored, and fields it qualified with private=\"…\" or no-cache=\"…\" are retained (still only within the mandatory caller partition). Conversely, because public, must-revalidate, and s-maxage are also ignored, a response to an Authorization-bearing request can never satisfy the shared-cache opt-in and is never stored. Parsing is grammar-aware: the qualified field-name forms private=\"x-account\" and no-cache=\"x-secret\" are understood, and the named fields are removed from the retained entry so they are never replayed from the shared cache. A qualified argument that is not a well-formed quoted field-name list (unquoted, unterminated, empty, or not a valid field name) fails closed to the bare directive and the whole response is refused. Duplicate max-age/s-maxage keep the most restrictive value; malformed lifetime directives contribute zero."
         respect_no_cache:
           type: [boolean, "null"]
           default: true
-          description: "Bypass cache lookup when the client request sends Cache-Control: no-cache or no-store"
+          description: "Honor client request Cache-Control. no-cache bypasses lookup and refreshes the entry (the replacement is stored under the same partition and carries the downstream Vary contract); no-store bypasses lookup and stores nothing. A request max-age is enforced against the stored entry's current age, and a request min-fresh against its remaining freshness (RFC 9111 §5.2.1), so an entry the client would not accept is refetched rather than served — a request max-age=0 always refetches. When false, the whole request Cache-Control value is a bound key dimension and none of these directives is acted on."
         vary_by_headers:
           type: array
           items:
@@ -35289,6 +35380,13 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
           description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header, with the dimensions already published for the base key, and with the mandatory authorization/cookie/proxy-authorization names; the merged list is emitted on the MISS response as well as on later hits. Every entry must be a valid RFC 9110 HTTP field-name token."
+        ignore_request_headers:
+          type: array
+          items:
+            type: string
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          default: []
+          description: "Operator attestation that these request headers never select the origin's response (for example a per-request X-Request-Id stamped by an upstream CDN or load balancer), so they must not fragment the cache. Each named header is removed from the request in before_proxy, before the cache key is derived, and is therefore never sent to the origin either — the key still binds every header the origin actually receives, so this relaxes hit rate without opening an unbound dimension. Matching is case-insensitive and applies to every request this instance handles. Names are rejected at admission when they are not valid RFC 9110 field-name tokens, when they are also listed in vary_by_headers, when they name a credential or session header (Authorization, Proxy-Authorization, Cookie, the built-in credential headers, or anything the log-redaction rules classify as sensitive), a gateway-owned header the proxy re-asserts on the backend request after lookup (X-Ferrum-Hops and the rest of the X-Ferrum-* namespace, X-Consumer-*, X-Authenticated-Identity, X-Geo-Country, X-Path-Param-*), Host or a hop-by-hop field, Cache-Control, Pragma, Range, Max-Forwards, any If-* precondition, any Content-* field, Expect, Accept, Accept-Encoding, or proxy-owned forwarding identity (any X-Forwarded-* field, Forwarded, X-Real-IP, Via). Family refusals are prefix matches, and these admission refusals are ASCII case-insensitive with _ treated as -. Stripping a named header and the vary_by_headers overlap check use exact field-name matching (ASCII case-insensitive only), so x_cdn_hop does not remove X-Cdn-Hop. A non-empty list makes this instance a request-header mutator at its priority, so it cannot share a proxy with request_deduplication, which refuses any later header mutator. The operator must also ensure no later plugin derives the response from an ignored header."
         cache_key_include_query:
           type: [boolean, "null"]
           default: true
@@ -35305,7 +35403,7 @@ components:
         add_cache_status_header:
           type: [boolean, "null"]
           default: true
-          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header. Publication of the downstream Vary contract on a MISS is independent of this flag."
+          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses. Cache hits also emit a current Age header. Publication of the downstream Vary contract on a MISS or no-cache refresh is independent of this flag."
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
@@ -36088,7 +36186,7 @@ components:
           type: [string, "null"]
           enum: [metadata_only, redacted_body, full_body, hash_only, null]
           default: redacted_body
-          description: "Null keeps the default, as for every other fixed scalar here. metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; everything under an Azure 'On Your Data' parameters object inside a data_sources / dataSources / data-sources container is additionally replaced wholesale, and recognizing that container name never short-circuits the ordinary visitor — a value under it that is not the provider's conventional array (object, string, number, boolean, null) is still traversed with the same member-name and pattern rules; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Only a provider-declared unsigned index correlates fragments across deltas; array position is intra-delta identity only (exported as 'position:<n>' choice keys and a tool-call 'position' field, never as a fabricated index). Malformed optional fields do not abort reassembly (that would drop back to per-frame redaction, which cannot see a secret split across fragments): ignorable ones (finish_reason, delta, delta.content, tool_calls, id, type, function, function.name, function.arguments) are skipped, while a malformed identity-bearing index (choices[].index, tool_calls[].index) takes a collision-free per-occurrence bucket ('unattributed:<n>' choice key, index_unattributed:true plus occurrence:<n> on a tool call) rather than collapsing onto index 0, sharing one unattributed bucket, or being dropped. Where identity is a guess, payload is withheld instead of joined or split: ambiguous completion text becomes '[REDACTED:ambiguous_choice]' with choice_identity_ambiguous:true and completion_text_withheld:true, and ambiguous tool arguments become '[REDACTED:ambiguous_tool_call]' with arguments_withheld:true. Skipped or re-routed fields are listed in a sorted malformed_fields array of compiled-in field paths (never provider values); the key is omitted for well-formed streams. Other or non-parseable SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
+          description: "Null keeps the default, as for every other fixed scalar here. metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; everything under an Azure 'On Your Data' parameters object inside a data_sources / dataSources / data-sources container is additionally replaced wholesale, and recognizing that container name never short-circuits the ordinary visitor — a value under it that is not the provider's conventional array (object, string, number, boolean, null) is still traversed with the same member-name and pattern rules; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Only a provider-declared unsigned index correlates fragments across deltas; array position is intra-delta identity only (exported as 'position:<n>' choice keys and a tool-call 'position' field, never as a fabricated index). Malformed optional fields do not abort reassembly (that would drop back to per-frame redaction, which cannot see a secret split across fragments): ignorable ones (finish_reason, delta, delta.content, tool_calls, id, type, function, function.name, function.arguments) are skipped, while a malformed identity-bearing index (choices[].index, tool_calls[].index) takes a collision-free per-occurrence bucket ('unattributed:<n>' choice key, index_unattributed:true plus occurrence:<n> on a tool call) rather than collapsing onto index 0, sharing one unattributed bucket, or being dropped. Where identity is a guess, payload is withheld instead of joined or split: ambiguous completion text becomes '[REDACTED:ambiguous_choice]' with choice_identity_ambiguous:true and completion_text_withheld:true, and ambiguous tool arguments become '[REDACTED:ambiguous_tool_call]' with arguments_withheld:true. Skipped or re-routed fields are listed in a sorted malformed_fields array of compiled-in field paths (never provider values); the key is omitted for well-formed streams. Other or non-parseable SSE stays per-event: each event's data lines are joined with a newline as a client reads them and redacted as one document, and a JSON-shaped event payload the parser refuses is replaced, continuation lines included, by one data: [UNPARSEABLE] line. A leading UTF-8 BOM is stripped before any structural parse; a request candidate or JSON-typed response that no structural parse can read (UTF-16/UTF-32, NaN, comments, a batch past the nesting limit) is never pattern-redacted, because sensitive member names need the parse: its excerpt is withheld with request_body_omitted_reason / response_body_omitted_reason unparseable_document. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
         allow_full_body:
           type: [boolean, "null"]
           default: false
@@ -36158,7 +36256,7 @@ components:
             always_capture_on_guardrail:
               type: [boolean, "null"]
               default: true
-              description: "Override a losing sampling roll for a fired guardrail. A non-empty ai_tool_governor.decision other than allow (deny, dry_run, require_approval, or redact_args) fires this override on request, buffered-response, and terminal-stream paths; ordinary allow does not. Exported guardrails include bounded ai_tool_governor.enabled, mode, decision, tool_names, risk, policy_ids, approval_id, arguments_hashes, and redacted_tools fields."
+              description: "Override a losing sampling roll for a fired guardrail. A non-empty ai_tool_governor.decision other than allow (deny, dry_run, require_approval, or redact_args) fires this override on request, buffered-response, and terminal-stream paths; ordinary allow does not. Exported guardrails include bounded ai_tool_governor.enabled, mode, decision, tool_names, risk, policy_ids, approval_id, and redacted_tools fields. The governor's ai_tool_governor.arguments_hashes (an unkeyed SHA-256 of each call's arguments, an offline guessing oracle) is never exported; mcp.calls[].arguments_hash is the keyed equivalent."
             always_capture_on_error:
               type: [boolean, "null"]
               default: true
@@ -36400,12 +36498,12 @@ components:
               type: [string, "null"]
               enum: [drop, reject, null]
               default: drop
-              description: "drop: silently drop when the queue or per-instance 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Shared candidate markers from co-located peers do not bypass this bound. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue or per-instance 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Either reject policy also claims the finalized request representation of candidate-shaped POSTs, so a Content-Encoding is decoded by the shared request representation gate before classification (an undecodable one is refused with 400), and any candidate body no parser can read (comments, UTF-16/UTF-32, NaN, trailing commas — independent of capture.mcp_tool_calls) is conservatively audited rather than forwarded unaudited. Shared candidate markers from co-located peers do not bypass this bound. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: [string, "null"]
               enum: [warn, reject, null]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Sink health is published from the COMPLETE delivery outcome, never from response headers alone: the acknowledgement body is drained and validated under sink.ack_max_bytes / sink.ack_timeout_ms first, and a 2xx whose acknowledgement stalls, overruns its bound, fails transport, or fails ack_policy validation is an ambiguous delivery that marks the sink unhealthy AND returns the batch for retry. Any non-2xx collector response also marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Hysteresis: health drops on the first failed or ambiguous delivery with no damping, and is restored only by a 2xx whose acknowledgement fully drained and validated; each retry attempt re-publishes, so recovery happens on the attempt that actually succeeded. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Like on_buffer_full: reject, it claims the finalized representation of candidate-shaped POSTs (content codings decoded before classification, unreadable candidate bodies conservatively audited). Streaming admission honors sampling plus configured error/guardrail overrides. Sink health is published from the COMPLETE delivery outcome, never from response headers alone: the acknowledgement body is drained and validated under sink.ack_max_bytes / sink.ack_timeout_ms first, and a 2xx whose acknowledgement stalls, overruns its bound, fails transport, or fails ack_policy validation is an ambiguous delivery that marks the sink unhealthy AND returns the batch for retry. Any non-2xx collector response also marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Hysteresis: health drops on the first failed or ambiguous delivery with no damping, and is restored only by a 2xx whose acknowledgement fully drained and validated; each retry attempt re-publishes, so recovery happens on the attempt that actually succeeded. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe."
             ack_policy:
               type: [string, "null"]
               enum: [drain, json, null]
@@ -36473,7 +36571,10 @@ components:
             listen-path stripping, so configuring this block fully buffers the
             request body of EVERY native gRPC request on the proxy — enrolled
             or not — and the final request-body hook makes the authoritative
-            enrollment decision. A client-streaming or bidirectional-streaming
+            enrollment decision. An enrolled instance joins the backend-path
+            boundary itself, so that decision uses the backend-effective path
+            the proxy binds and does not require grpc_method_router (whose
+            grpc_full_method, when present, still takes precedence). A call enrolled only by its backend-effective method is staged at that boundary, so a deferred before_proxy short circuit after it still leaves a record. A client-streaming or bidirectional-streaming
             method on such a proxy therefore gets fully buffered request
             semantics; max_messages caps how much is captured, not how much is
             buffered.
@@ -40769,9 +40870,15 @@ components:
         OpenAPI encodes material cross-field invariants that JSON Schema can
         represent accurately: `clickhouse` (with runtime-mandatory `url`) is
         required; snapshot mode forbids `spool.enabled=false`; nonempty
-        `clickhouse.password_ref` requires `https://` and forbids disabled TLS
-        certificate/hostname verification; `clickhouse.url` must be http(s)
-        without user-info; `clickhouse.tls.client_cert_file` and
+        `clickhouse.password_ref` requires `https://`, forbids disabled TLS
+        certificate/hostname verification, and requires a non-blank
+        `clickhouse.username` (the password is sent as that user's HTTP Basic
+        password); `clickhouse.url` must be http(s) without user-info;
+        `clickhouse.database` is a single identifier and `clickhouse.table` is
+        `table` or `database.table`, each part not starting with a digit;
+        `insert_query_params` may not name the reserved `database` / `query`
+        parameters; an enabled spool's `max_bytes` is at least 1048576;
+        `clickhouse.tls.client_cert_file` and
         `client_key_file` must be set together; `pricing_tiers[].status_codes`
         entries are unique within a tier; and batch/spool/snapshot numeric,
         length, and character bounds match the constructor. Settings the
@@ -40894,7 +41001,7 @@ components:
                       pattern: '[\x00]'
                   max_bytes:
                     type: integer
-                    minimum: 1
+                    minimum: 1048576
                   replay_interval_secs:
                     type: integer
                     minimum: 1
@@ -40902,6 +41009,21 @@ components:
                     type: integer
                     minimum: 1
                     maximum: 1000000
+        - not:
+            required: [clickhouse]
+            properties:
+              clickhouse:
+                type: object
+                required: [password_ref]
+                properties:
+                  password_ref:
+                    type: string
+                    pattern: '\S'
+                not:
+                  required: [username]
+                  properties:
+                    username:
+                      type: string
         - not:
             allOf:
               - required: [clickhouse]
@@ -41064,18 +41186,25 @@ components:
             database:
               type: string
               minLength: 1
-              pattern: '^[A-Za-z0-9_.]+$'
+              pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
               default: ferrum
-              description: ClickHouse database identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
+              description: ClickHouse database identifier sent as the INSERT `database` parameter. A single identifier of ASCII letters, digits, and underscore that does not start with a digit; dots are rejected.
             table:
               type: string
               minLength: 1
-              pattern: '^[A-Za-z0-9_.]+$'
+              pattern: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$'
               default: charges_raw
-              description: ClickHouse table identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
+              description: ClickHouse table identifier interpolated into INSERT, as `table` or `database.table` (at most one dot). Each part uses ASCII letters, digits, and underscore and must not start with a digit, so names such as `123charges`, `.`, `ferrum.`, `a..b`, or `a.b.c` that ClickHouse cannot parse as an unquoted INSERT target are rejected at admission.
             username:
               type: [string, "null"]
-              description: Optional ClickHouse HTTP Basic username. `null` is accepted and means unset.
+              minLength: 1
+              pattern: '\S'
+              description: >-
+                Optional ClickHouse HTTP Basic username. `null` is accepted and
+                means unset; an empty or whitespace-only string is rejected.
+                Required whenever `password_ref` is nonempty, because the
+                resolved password is only ever sent as this user's HTTP Basic
+                password.
             password_ref:
               type: [string, "null"]
               maxLength: 256
@@ -41131,6 +41260,8 @@ components:
                       pattern: '[Aa][Pp][Ii][Kk][Ee][Yy]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]'
                   - not:
                       pattern: '^[Uu][Ss][Ee][Rr]$|^[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]$|^[Ss][Ee][Ss][Ss][Ii][Oo][Nn]_[Ii][Dd]$'
+                  - not:
+                      pattern: '^[Dd][Aa][Tt][Aa][Bb][Aa][Ss][Ee]$|^[Qq][Uu][Ee][Rr][Yy]$'
               additionalProperties:
                 type: string
                 maxLength: 512
@@ -41154,7 +41285,12 @@ components:
                 name containing `apikey`, `api_key`, `credential`, `passwd`,
                 `secret`, or `token`. Authenticate with `username` and
                 `password_ref`, which are sent as an HTTP Basic header rather
-                than appended to the INSERT URL. Parameter values stay arbitrary
+                than appended to the INSERT URL. The names `database` and
+                `query` (case-insensitive) are reserved: the sink sets them from
+                `clickhouse.database` and its fixed
+                `INSERT INTO <table> FORMAT JSONEachRow` statement, and a second
+                occurrence would leave the executed statement to ClickHouse's
+                duplicate-parameter handling. Parameter values stay arbitrary
                 bounded strings, so the sink never renders the INSERT query
                 string in any diagnostic; failures report a structurally
                 redacted `scheme://host:port/redacted` endpoint. Admin audit
@@ -41274,7 +41410,11 @@ components:
                 Hard ceiling on total encoded on-disk bytes owned by this sink under
                 its managed namespace
                 (<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/) after
-                compression. The owner digest binds the plugin config id, Ferrum
+                compression. While spooling is enabled it must be at least
+                1048576 bytes. This is a policy floor: a quota that small or
+                smaller refuses ordinary failed batches and snapshot chunks so
+                often that spooling (and snapshot finalization) cannot be relied
+                on, even though an individual small artifact may fit. The owner digest binds the plugin config id, Ferrum
                 namespace/ledger, sanitized ClickHouse endpoint, database, table, and
                 node id; it contains no credentials. Counts active spool files
                 (*.ndjson / *.ndjson.zst), atomic-write temps

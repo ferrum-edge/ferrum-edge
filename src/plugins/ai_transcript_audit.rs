@@ -98,6 +98,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
+use super::request_representation;
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::byte_budget::{ByteBudget, ByteLease};
@@ -435,6 +436,13 @@ const OMIT_REASON_RETAINED_BYTE_BUDGET: &str = "retained_byte_budget";
 /// The aggregate `limits.max_request_bytes` budget for MCP argument excerpts
 /// was already spent by earlier calls of the same request.
 const OMIT_REASON_MCP_ARGUMENTS_BUDGET: &str = "mcp_arguments_budget";
+/// A redacted excerpt of a JSON document (a request candidate, a JSON
+/// response, or an object/array-shaped payload) was withheld because no
+/// structural parse could read it — a non-UTF-8 encoding, `NaN`, comments, or a
+/// batch past the whole-document nesting limit — so the sensitive-member-name
+/// policy could not be applied. Pattern-only redaction of such a document would
+/// export generic credentials (`password`, `token`, …) verbatim.
+const OMIT_REASON_UNPARSEABLE_DOCUMENT: &str = "unparseable_document";
 /// Enrolled gRPC method whose descriptor dependency is unavailable on this node.
 const OMIT_REASON_GRPC_DESCRIPTOR_UNAVAILABLE: &str = "grpc_descriptor_unavailable";
 /// Framed gRPC body was malformed, truncated, or used an unsupported encoding.
@@ -3052,13 +3060,47 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn shape_body(&self, raw: &[u8], max_bytes: usize) -> ShapedBody {
+    /// Whether either fail-closed sink policy is configured, so audited
+    /// traffic must stop rather than flow unaudited.
+    fn fails_closed(&self) -> bool {
+        self.on_buffer_full == BufferFullPolicy::Reject
+            || self.on_sink_error == SinkErrorPolicy::Reject
+    }
+
+    /// Whether a candidate-typed body that no structural parse could read must
+    /// still be audited as a possible AI request.
+    ///
+    /// Callers reach this only for a body on the candidate surface
+    /// (a POST whose media type is JSON-ish, or a Content-Type-less body the
+    /// MCP prefilter flagged). Any such body strict parsing refuses can still
+    /// be executed by a lenient upstream — UTF-16 / UTF-32, a leading `//` or
+    /// `/* */` comment, a non-ASCII whitespace prefix, `NaN`, trailing commas —
+    /// and no byte heuristic enumerates every dialect. So under a fail-closed
+    /// policy every unreadable candidate body is conservatively in scope,
+    /// exactly like a body past the redaction scan ceiling and independent of
+    /// `capture.mcp_tool_calls`: it is staged, admitted, and recorded (its
+    /// excerpt withheld as `unparseable_document`), never silently forwarded
+    /// unaudited. Fail-open policies keep the heuristic classification.
+    fn unreadable_document_in_scope(&self, body: &[u8], parsed: Option<&Value>) -> bool {
+        // An empty body carries no request at all, so it is never "unreadable".
+        !body.is_empty() && parsed.is_none() && self.fails_closed()
+    }
+
+    fn shape_body(
+        &self,
+        raw: &[u8],
+        max_bytes: usize,
+        representation: PayloadRepresentation,
+        pre_parsed: PreParsed,
+    ) -> ShapedBody {
         shape_bytes(
             self.mode,
             &self.redactor,
             raw,
             max_bytes,
             self.limits.max_redaction_scan_bytes,
+            representation,
+            pre_parsed,
         )
     }
 
@@ -3066,8 +3108,14 @@ impl AiTranscriptAudit {
     /// backend-effective one.
     ///
     /// Prefers the finalized `grpc_full_method` published by
-    /// `grpc_method_router` (which reflects a method rewrite) and falls back
-    /// to the request path.
+    /// `grpc_method_router` (which reflects a method rewrite), then the
+    /// backend-effective path the proxy bound at the backend-path boundary
+    /// (`RequestContext::authorized_backend_path`, bound for every request on a
+    /// `grpc`-enrolled instance because it opts into
+    /// `requires_backend_path_resolution`), and only then the request path.
+    /// Without the bound path an audit-only proxy with `strip_listen_path` or a
+    /// `backend_path` would decide enrollment on the client path, which the
+    /// backend never receives.
     ///
     /// `grpc_method_router` publishes this key twice: provisionally from the
     /// CLIENT path in `on_request_received`, then authoritatively from the
@@ -3087,7 +3135,8 @@ impl AiTranscriptAudit {
     /// normalization would make the metadata value unable to match any enrolled
     /// key while still suppressing the `ctx.path` fallback — every enrolled gRPC
     /// call would silently escape capture whenever `grpc_method_router` is also
-    /// configured. Empty metadata still falls back to the request path.
+    /// configured. Empty metadata still falls back to the bound backend path,
+    /// then the request path.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
         match ctx.metadata.get("grpc_full_method") {
             Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
@@ -3097,7 +3146,7 @@ impl AiTranscriptAudit {
                 path.push_str(method);
                 Cow::Owned(path)
             }
-            _ => Cow::Borrowed(ctx.path.as_str()),
+            _ => Cow::Borrowed(ctx.authorized_backend_path().unwrap_or(ctx.path.as_str())),
         }
     }
 
@@ -3666,9 +3715,17 @@ impl AiTranscriptAudit {
     /// ([`AuditStaging::captured`]) — so the common no-transform path performs a
     /// single keyed HMAC pass instead of hashing once at staging and again to
     /// discover the final body was unchanged.
+    ///
+    /// `document` is the caller's own parse of these exact bytes (`None` when
+    /// it was refused or skipped by the scan ceiling). It is consumed here:
+    /// model/tool metadata is read from it first (only when
+    /// `extract_metadata`; an MCP candidate's final body names neither), and
+    /// the same tree is then redacted in place for the excerpt, so one hook
+    /// never parses the same document twice.
     fn capture_request(
         &self,
-        parsed: Option<&Value>,
+        document: Option<Value>,
+        extract_metadata: bool,
         body: &[u8],
         sample_hit: bool,
         excerpt_budget: usize,
@@ -3694,6 +3751,7 @@ impl AiTranscriptAudit {
         // `hash_only` exports no model/provider/tool metadata at all
         // (`build_record` discards it), so do not extract or redact it.
         let harvests = self.mode.harvests_metadata();
+        let parsed = document.as_ref().filter(|_| extract_metadata);
         let model = if harvests {
             parsed
                 .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
@@ -3709,7 +3767,18 @@ impl AiTranscriptAudit {
             BoundedToolNames::default()
         };
         let shaped = if self.capture.request {
-            self.shape_body(body, excerpt_budget)
+            // Every request capture is a classified JSON / MCP candidate, and
+            // the caller already parsed (or failed to parse) these bytes.
+            let pre_parsed = match document {
+                Some(document) => PreParsed::Document(document),
+                None => PreParsed::Unparseable,
+            };
+            self.shape_body(
+                body,
+                excerpt_budget,
+                PayloadRepresentation::JsonDocument,
+                pre_parsed,
+            )
         } else {
             ShapedBody::default()
         };
@@ -3778,9 +3847,16 @@ impl AiTranscriptAudit {
         let parsed: Option<Value> = if scan_limited {
             None
         } else {
-            serde_json::from_slice(body).ok()
+            parse_json_document(body)
         };
-        let is_ai = scan_limited || parsed.as_ref().is_some_and(json_looks_like_ai_request);
+        // A candidate body no structural parse can read is, under a
+        // fail-closed policy, conservatively a possible AI request — like a
+        // scan-limited one — so it cannot bypass fail-closed admission.
+        let unreadable_document =
+            !scan_limited && self.unreadable_document_in_scope(body, parsed.as_ref());
+        let is_ai = scan_limited
+            || unreadable_document
+            || parsed.as_ref().is_some_and(json_looks_like_ai_request);
         // Whenever no `Value` is available — the redaction scan ceiling, or a
         // body the whole-document parse refuses — read the bytes with the
         // bounded recognizer. `mcp_gateway` admits batch members one at a time,
@@ -3791,8 +3867,9 @@ impl AiTranscriptAudit {
         let raw_scan = scan_limited || parsed.is_none();
         let bounded_mcp_scan = (raw_scan && self.capture.mcp_tool_calls)
             .then(|| mcp_jsonrpc::scan_request_bytes(body));
-        // A body the whole-document parse refused may still be accepted by a
-        // lenient upstream decoder (a BOM, UTF-16 / UTF-32 or other non-UTF-8
+        // A body the whole-document parse refused (a leading UTF-8 BOM is
+        // already stripped) may still be accepted by a lenient upstream
+        // decoder (a UTF-16 / UTF-32 BOM, UTF-16 / UTF-32 or other non-UTF-8
         // bytes, `NaN`, comments, trailing commas) that the strict recognizer
         // cannot read. Like `ai_prompt_shield`, err toward auditing: a body
         // `mcp_jsonrpc::may_carry_tool_call` flags stays an MCP candidate (with
@@ -3840,6 +3917,7 @@ impl AiTranscriptAudit {
         // succeeds so a refused retained-byte lease cannot leave
         // `MD_STREAM_REQUEST` without an owning staging entry.
         let stream_requested = scan_limited
+            || unreadable_document
             || parsed
                 .as_ref()
                 .and_then(|json| json.get("stream"))
@@ -3890,7 +3968,8 @@ impl AiTranscriptAudit {
             // from it, and its excerpt shares the request budget with the
             // argument excerpts.
             BodyPhase::Final => self.capture_request(
-                parsed.as_ref().filter(|_| mcp_section.is_none()),
+                parsed,
+                mcp_section.is_none(),
                 body,
                 sample_hit,
                 max_request_bytes.saturating_sub(mcp_arguments_bytes),
@@ -4025,8 +4104,12 @@ impl AiTranscriptAudit {
         let parsed: Option<Value> = if scan_limited {
             None
         } else {
-            serde_json::from_slice(body).ok()
+            parse_json_document(body)
         };
+        // Mirror `stage_candidate`'s conservative fail-closed scope for a
+        // candidate body no structural parse can read.
+        let unreadable_document =
+            !scan_limited && self.unreadable_document_in_scope(body, parsed.as_ref());
         // An MCP candidate was classified from the client's JSON-RPC body when
         // it was staged. Its backend-visible body is the gateway's
         // upstream-named envelope or an OpenAPI bridge's REST request, which
@@ -4037,6 +4120,7 @@ impl AiTranscriptAudit {
             .get(&record_id)
             .and_then(|staging| staging.mcp_charges());
         if !scan_limited
+            && !unreadable_document
             && staged_mcp.is_none()
             && !parsed.as_ref().is_some_and(json_looks_like_ai_request)
         {
@@ -4052,6 +4136,7 @@ impl AiTranscriptAudit {
         // directions. This is cheap and runs even when capture is skipped,
         // because stream-vs-buffer correctness is not a capture concern.
         if scan_limited
+            || unreadable_document
             || parsed
                 .as_ref()
                 .and_then(|json| json.get("stream"))
@@ -4080,12 +4165,13 @@ impl AiTranscriptAudit {
         let max_request_bytes = self.limits.max_request_bytes;
         let mut capture = match staged_mcp {
             Some((mcp_arguments_bytes, _)) => self.capture_request(
-                None,
+                parsed,
+                false,
                 body,
                 sample_hit,
                 max_request_bytes.saturating_sub(mcp_arguments_bytes),
             ),
-            None => self.capture_request(parsed.as_ref(), body, sample_hit, max_request_bytes),
+            None => self.capture_request(parsed, true, body, sample_hit, max_request_bytes),
         };
         self.publish_request_capture(ctx, &capture);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
@@ -4324,7 +4410,7 @@ impl AiTranscriptAudit {
         // does not flip with HashMap iteration order.
         let mut federation_provider: Option<String> = None;
         for (key, value) in metadata {
-            if key.starts_with("ai_transcript_audit.") {
+            if key.starts_with("ai_transcript_audit.") || is_argument_digest_key(key) {
                 continue;
             }
             // Audit records bypass the transaction-log redaction layer, so apply
@@ -4640,7 +4726,12 @@ impl AiTranscriptAudit {
             entry.arguments_omitted_reason = Some(OMIT_REASON_MCP_ARGUMENTS_BUDGET);
             return;
         }
-        let shaped = self.shape_body(serialized.as_bytes(), budget);
+        let shaped = self.shape_body(
+            serialized.as_bytes(),
+            budget,
+            PayloadRepresentation::JsonDocument,
+            PreParsed::NotAttempted,
+        );
         let excerpt_bytes = shaped.excerpt.as_deref().map_or(0, str::len);
         *arguments_bytes = arguments_bytes.saturating_add(excerpt_bytes);
         entry.arguments = shaped.excerpt;
@@ -4861,6 +4952,113 @@ impl Plugin for AiTranscriptAudit {
         true
     }
 
+    /// Claim the finalized backend-visible representation of a candidate-shaped
+    /// HTTP request when a fail-closed sink policy is configured, so the shared
+    /// request representation gate decodes a `Content-Encoding` into the staged
+    /// plaintext view before the final hook classifies it — or refuses the
+    /// request when it cannot (`GHSA-3973-47g5-4mcx`). Without the claim a
+    /// gzip/deflate/br AI request would be classified on its coded octets,
+    /// never staged, and so never reach the `on_buffer_full: reject` /
+    /// `on_sink_error: reject` admission gates.
+    ///
+    /// Fail-open policies never claim: they cannot refuse anything, so a body
+    /// they merely fail to observe must not become a `400`. They still read
+    /// the decoded view whenever another enforcing plugin claimed the request.
+    /// Native gRPC is framed per message (`grpc-encoding`) and is never claimed.
+    /// Decided from configuration and request state only, never by decoding.
+    fn enforces_final_request_body_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> bool {
+        if !self.active || !self.fails_closed() || ctx.is_native_grpc_request() {
+            return false;
+        }
+        ctx.method.eq_ignore_ascii_case("POST")
+            && self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str))
+    }
+
+    /// Enrolled native-gRPC instances subscribe to the backend-path boundary,
+    /// so the proxy binds the backend-effective path (after route override,
+    /// listen-path stripping, and upstream target path assembly) on the
+    /// request. That bound path is this instance's own enrollment witness when
+    /// no `grpc_full_method` was published, so an audit-only proxy does not
+    /// depend on `grpc_method_router` to decide enrollment on the method the
+    /// backend actually receives.
+    fn requires_backend_path_resolution(&self) -> bool {
+        self.active && self.grpc.is_some()
+    }
+
+    /// Stage a native-gRPC call whose BACKEND-EFFECTIVE method is enrolled
+    /// although its client-path method was not, at the moment that method
+    /// becomes authoritative.
+    ///
+    /// The selected path is pinned here and this hook runs before any deferred
+    /// `before_proxy` hook (`fault_injection`, `response_mock`, …) can
+    /// short-circuit. Staging only in the final request-body hook would lose
+    /// the call whenever such a deferred hook answers first: no final hook
+    /// runs, and the reject-path and log fallbacks capture only a candidate
+    /// that is already staged. A call `before_proxy` already staged for its
+    /// enrolled client path is left alone; the final hook (or the reject-path
+    /// refresh) re-decides it against the bound path.
+    ///
+    /// Enrollment is decided from `backend_path` itself, the authoritative
+    /// value at this boundary. `grpc_full_method` is NOT consulted here: it may
+    /// still hold `grpc_method_router`'s provisional client-path value, because
+    /// priorities are configurable and the router's own boundary callback can
+    /// run after this one.
+    ///
+    /// No header map is available at this boundary, so the framing witness is
+    /// the `grpc-encoding` this instance recorded from the live `before_proxy`
+    /// header map (never `RequestContext::headers`, which may be the original
+    /// inbound map). Without one the witness is `Unsupported`, so a
+    /// short-circuit capture withholds the excerpt rather than misreading the
+    /// frames. Ordinary dispatch still captures from the final hook's own
+    /// backend-visible header map.
+    async fn on_backend_path_resolved(
+        &self,
+        ctx: &mut RequestContext,
+        backend_path: &str,
+    ) -> PluginResult {
+        if !self.active || !ctx.is_native_grpc_request() {
+            return PluginResult::Continue;
+        }
+        let Some(grpc) = self.grpc.as_ref() else {
+            return PluginResult::Continue;
+        };
+        if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
+            return PluginResult::Continue;
+        }
+        if !grpc.enrolls(backend_path) {
+            return PluginResult::Continue;
+        }
+        let encoding = ctx
+            .plugin_state()
+            .and_then(|state| state.ai_transcript_audit_grpc_request_encoding)
+            .unwrap_or(GrpcMessageEncoding::Unsupported);
+        let stage_result = if let Some(body) = ctx.metadata.remove("request_body") {
+            let staged =
+                self.stage_grpc_candidate(ctx, body.as_bytes(), encoding, BodyPhase::Provisional);
+            ctx.metadata.insert("request_body".to_string(), body);
+            staged
+        } else if let Some(body) = ctx.request_body_bytes.clone() {
+            // `Bytes::clone` shares the already-bounded buffer.
+            self.stage_grpc_candidate(ctx, &body, encoding, BodyPhase::Provisional)
+        } else {
+            return PluginResult::Continue;
+        };
+        // Fail-closed commit admission is deliberately NOT taken here: the
+        // proxy binds the backend path only after this boundary accepts, and
+        // every later admission point — the final request-body hook on
+        // ordinary dispatch, `after_proxy` on a deferred short circuit — runs
+        // with that bound path, so it captures the call under the enrolled
+        // method. A refusal here would be finalized before the bind and the
+        // reject-path refresh would see only the unenrolled client method.
+        // `stage_result` still carries a staging-saturation refusal.
+        stage_result
+    }
+
     fn start_background_tasks(&self) -> Result<(), String> {
         // Materialize every custom header (resolving `${secret:NAME}` references
         // against `FERRUM_TRANSCRIPT_SINK_SECRET_*`) BEFORE the batching worker
@@ -5011,6 +5209,15 @@ impl Plugin for AiTranscriptAudit {
         // method view does not select must not fall through to the JSON
         // candidate path below — `application/grpc+json` would otherwise
         // satisfy its content-type test.
+        if self.grpc_enrollment_owns_request(ctx) {
+            // Record the framing witness from this LIVE header map even when
+            // the provisional method is not enrolled: the backend-effective
+            // method can still enroll the call at the backend-path boundary,
+            // where no header map is available, and a deferred short circuit
+            // after that boundary never reaches the final request-body hook.
+            ctx.plugin_state_mut()
+                .ai_transcript_audit_grpc_request_encoding = Some(grpc_message_encoding(headers));
+        }
         if self.request_capture_route(ctx) == RequestCaptureRoute::GrpcNotEnrolled {
             return PluginResult::Continue;
         }
@@ -5093,9 +5300,10 @@ impl Plugin for AiTranscriptAudit {
     /// The AUTHORITATIVE gRPC enrollment decision for ordinary backend-dispatched
     /// traffic.
     ///
-    /// This hook runs after `on_backend_path_resolved`, so `grpc_full_method` now
-    /// names the backend-effective method. Both transitions are decided here and
-    /// only here:
+    /// This hook runs after `on_backend_path_resolved`, so `grpc_full_method`
+    /// (when `grpc_method_router` publishes it) or the backend path the proxy
+    /// bound for this instance now names the backend-effective method. Both
+    /// transitions are decided here and only here:
     ///
     /// - provisional unenrolled/invalid -> final enrolled: nothing staged in
     ///   `before_proxy`, so the candidate is staged and captured now from these
@@ -5127,6 +5335,19 @@ impl Plugin for AiTranscriptAudit {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
+        // HTTP bodies are classified and captured on the plaintext the shared
+        // request representation gate staged when a content coding is present
+        // and an enforcing plugin (this one under a fail-closed policy) claimed
+        // it. Reading the coded octets would classify a gzip AI request as
+        // non-AI and let it bypass fail-closed admission. `Bytes` is an `O(1)`
+        // share of the gate's charged allocation, never a copy. Native gRPC is
+        // framed per message and keeps the raw body.
+        let decoded_view = if route == RequestCaptureRoute::Http {
+            ctx.inspectable_final_request_body_owned()
+        } else {
+            None
+        };
+        let http_body: &[u8] = decoded_view.as_deref().unwrap_or(body);
         // Staged (cheaply) in `before_proxy`: these are the backend-visible
         // bytes, so this is where the transaction's single capture pass runs.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
@@ -5140,7 +5361,7 @@ impl Plugin for AiTranscriptAudit {
                     GrpcRequestFraming::Header(grpc_message_encoding(headers)),
                 );
             } else {
-                self.capture_staged_request(ctx, body);
+                self.capture_staged_request(ctx, http_body);
             }
             // Capture may flip `MD_STREAM_REQUEST`. Re-evaluate whether a later
             // response/stream gate will reserve, or whether request-time
@@ -5166,6 +5387,20 @@ impl Plugin for AiTranscriptAudit {
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
+        if decoded_view.is_none()
+            && headers
+                .get("content-encoding")
+                .is_some_and(|encoding| request_representation::requires_decode_judgment(encoding))
+        {
+            // Still content-coded and nothing decoded it. A fail-closed
+            // instance claims every candidate-shaped POST, so the gate has
+            // already decoded or refused such a request before this hook;
+            // reaching here means a fail-open instance or an unclaimed shape.
+            // The coded octets are not a JSON document, so there is nothing to
+            // classify from them.
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        }
         let is_json =
             self.candidate_content_type(ctx, headers.get("content-type").map(String::as_str));
         if !is_json {
@@ -5175,12 +5410,12 @@ impl Plugin for AiTranscriptAudit {
         if skip_content_type_less_non_mcp(
             headers.get("content-type").map(String::as_str),
             self.capture.mcp_tool_calls,
-            body,
+            http_body,
         ) {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
-        let stage_result = self.stage_candidate(ctx, body, BodyPhase::Final);
+        let stage_result = self.stage_candidate(ctx, http_body, BodyPhase::Final);
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
@@ -5533,7 +5768,22 @@ impl Plugin for AiTranscriptAudit {
                     GrpcBodyDirection::Response,
                 )
             } else {
-                self.shape_body(body, self.limits.max_response_bytes)
+                // A JSON-typed buffered response is one document; an event
+                // stream keeps its frame-by-frame redaction.
+                let representation = if response_headers
+                    .get("content-type")
+                    .is_some_and(|content_type| is_json_content_type(content_type))
+                {
+                    PayloadRepresentation::JsonDocument
+                } else {
+                    PayloadRepresentation::MaybeEventStream
+                };
+                self.shape_body(
+                    body,
+                    self.limits.max_response_bytes,
+                    representation,
+                    PreParsed::NotAttempted,
+                )
             }
         } else {
             ShapedBody::default()
@@ -6165,6 +6415,8 @@ impl ResponseStreamInspector for AuditStreamInspector {
                         &work.accumulated,
                         self.max_bytes,
                         self.max_scan_bytes,
+                        PayloadRepresentation::MaybeEventStream,
+                        PreParsed::NotAttempted,
                     )
                 };
                 *capture = StreamCaptureLifecycle::Complete(Some(StreamCaptured {
@@ -6715,12 +6967,19 @@ impl ShapedBody {
 ///
 /// (`full_body` is the deliberate raw-capture opt-in, so it caps first — on a
 /// UTF-8 boundary — and never scans beyond the cap at all.)
+///
+/// `representation` tells the redactor what the caller already knows the
+/// payload is. A [`PayloadRepresentation::JsonDocument`] that no structural
+/// parse can read is withheld rather than pattern-redacted: see
+/// [`redact_body_decoded_json_strings`].
 fn shape_bytes(
     mode: AuditMode,
     redactor: &PiiRedactor,
     raw: &[u8],
     max_bytes: usize,
     max_scan_bytes: usize,
+    representation: PayloadRepresentation,
+    pre_parsed: PreParsed,
 ) -> ShapedBody {
     if !mode.captures_body() {
         return ShapedBody::default();
@@ -6730,7 +6989,10 @@ fn shape_bytes(
         if raw.len() > max_scan_bytes {
             return ShapedBody::omitted(OMIT_REASON_REDACTION_SCAN_LIMIT);
         }
-        redact_body_decoded_json_strings(redactor, raw)
+        match redact_body_decoded_json_strings(redactor, raw, representation, pre_parsed) {
+            Some(redacted) => redacted,
+            None => return ShapedBody::omitted(OMIT_REASON_UNPARSEABLE_DOCUMENT),
+        }
     } else {
         // Cut the raw bytes on a UTF-8 boundary so the capped excerpt stays
         // valid text instead of ending in a replacement character.
@@ -6773,25 +7035,118 @@ fn utf8_prefix(raw: &[u8], max_bytes: usize) -> &[u8] {
     }
 }
 
-fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> String {
-    if let Ok(mut json) = serde_json::from_slice::<Value>(raw) {
+/// What a captured payload is known to be, which decides how a payload that
+/// no structural parse can read is treated in `redacted_body` mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PayloadRepresentation {
+    /// A single JSON document: a classified request candidate (JSON media
+    /// type, or a Content-Type-less MCP call), a JSON-typed buffered response,
+    /// or serialized MCP arguments. Unreadable means withheld.
+    JsonDocument,
+    /// A payload that may legitimately be an event stream or other text (a
+    /// streamed response). SSE events are redacted event by event; anything
+    /// that still looks like a JSON document is withheld; only genuinely
+    /// non-JSON text falls back to pattern redaction.
+    MaybeEventStream,
+}
+
+/// Whether the caller already parsed a payload's exact bytes with
+/// [`parse_json_document`], so redaction can reuse that result instead of
+/// parsing the same document again.
+enum PreParsed {
+    /// No parse of these bytes is available; redaction parses them itself.
+    NotAttempted,
+    /// The caller's parse of these exact bytes, handed over to be redacted in
+    /// place.
+    Document(Value),
+    /// The caller's parse of these exact bytes failed.
+    Unparseable,
+}
+
+/// Strip one leading UTF-8 byte-order mark. Strict JSON refuses it, while
+/// lenient readers (and the upstream that will execute the request) skip it,
+/// so structural parsing must see the document behind it.
+fn strip_utf8_bom(raw: &[u8]) -> &[u8] {
+    raw.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(raw)
+}
+
+/// Parse a whole JSON document after stripping a leading UTF-8 BOM. Request
+/// classification and extraction, and every excerpt redaction, go through this
+/// one helper so they all read the same document.
+fn parse_json_document(raw: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Value>(strip_utf8_bom(raw)).ok()
+}
+
+/// Whether `raw` is shaped like a JSON object/array document that some reader
+/// could accept even though strict parsing refused it: a UTF-16 / UTF-32 BOM,
+/// or (after a UTF-8 BOM, ASCII whitespace, and the NUL bytes of a UTF-16 /
+/// UTF-32 encoding) a `{` or `[` first character. Byte checks only; nothing is
+/// parsed or allocated.
+fn looks_like_json_document(raw: &[u8]) -> bool {
+    const WIDE_BYTE_ORDER_MARKS: [&[u8]; 3] = [b"\xFE\xFF", b"\xFF\xFE", b"\x00\x00\xFE\xFF"];
+    if WIDE_BYTE_ORDER_MARKS.iter().any(|bom| raw.starts_with(bom)) {
+        return true;
+    }
+    let lead = strip_utf8_bom(raw)
+        .iter()
+        .copied()
+        .find(|byte| !matches!(byte, 0 | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C));
+    matches!(lead, Some(b'{' | b'['))
+}
+
+/// Redact a captured payload for a `redacted_body` excerpt, or `None` when it
+/// must be withheld.
+///
+/// Sensitive-member-name redaction (`password`, `token`, …) exists only in the
+/// structural JSON visitor; the regex table cannot recognize an arbitrary
+/// value beside such a key. A payload that is a JSON document but that no
+/// structural parse can read — a UTF-16 body, `NaN`, comments, a batch past
+/// serde_json's nesting limit — is therefore withheld instead of being
+/// pattern-redacted, because pattern-only redaction would export those
+/// credentials verbatim. A leading UTF-8 BOM is stripped before parsing, so a
+/// BOM-prefixed document is redacted structurally.
+fn redact_body_decoded_json_strings(
+    redactor: &PiiRedactor,
+    raw: &[u8],
+    representation: PayloadRepresentation,
+    pre_parsed: PreParsed,
+) -> Option<String> {
+    // An empty payload (a bridged GET, an empty response) carries nothing to
+    // redact or withhold.
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    let document = match pre_parsed {
+        PreParsed::NotAttempted => parse_json_document(raw),
+        PreParsed::Document(document) => Some(document),
+        PreParsed::Unparseable => None,
+    };
+    if let Some(mut json) = document {
         redact_json_value_strings(redactor, &mut json);
-        serde_json::to_string(&json)
-            .map(|serialized| redactor.redact(&serialized))
-            .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
-    } else if let Some(mut reassembled) = reassemble_openai_sse_deltas(raw) {
+        // Serializing a `Value` does not fail in practice; if it ever did, the
+        // only fallback would be the raw bytes, so withhold instead.
+        return serde_json::to_string(&json)
+            .ok()
+            .map(|serialized| redactor.redact(&serialized));
+    }
+    if representation == PayloadRepresentation::JsonDocument {
+        return None;
+    }
+    if let Some(mut reassembled) = reassemble_openai_sse_deltas(raw) {
         // OpenAI-chunk SSE capture: per-frame redaction would miss PII split
         // across `delta.content` fragments (each frame carries an unmatched
         // piece), so the exported excerpt is the redaction of the REASSEMBLED
         // per-choice completion text, not the raw frames.
         redact_json_value_strings(redactor, &mut reassembled);
         serde_json::to_string(&reassembled)
+            .ok()
             .map(|serialized| redactor.redact(&serialized))
-            .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
     } else if let Some(redacted_sse) = redact_sse_json_frames(redactor, raw) {
-        redacted_sse
+        Some(redacted_sse)
+    } else if looks_like_json_document(raw) {
+        None
     } else {
-        redactor.redact(&String::from_utf8_lossy(raw))
+        Some(redactor.redact(&String::from_utf8_lossy(raw)))
     }
 }
 
@@ -7492,30 +7847,98 @@ fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> 
     // Leading BOMs are copied through unchanged; only the lines after them are
     // rewritten, each keeping its original terminator.
     out.push_str(&text[..text.len() - body.len()]);
+    // The lines (terminators included) of the event being accumulated. An
+    // event ends at a blank line; its payload is all of its `data:` lines
+    // joined with `\n`, exactly as `utils::sse` (and every client) reads it.
+    let mut event: Vec<&str> = Vec::new();
     for line in sse_lines_inclusive(body) {
-        let (line_no_newline, newline) = split_sse_line_terminator(line);
-        if let Some(rest) = line_no_newline
-            .strip_prefix("data: ")
-            .or_else(|| line_no_newline.strip_prefix("data:"))
-        {
-            let trimmed = rest.trim();
-            if !trimmed.is_empty()
-                && trimmed != "[DONE]"
-                && let Ok(mut json) = serde_json::from_str::<Value>(trimmed)
-            {
-                redact_json_value_strings(redactor, &mut json);
-                if let Ok(serialized) = serde_json::to_string(&json) {
-                    out.push_str("data: ");
-                    out.push_str(&redactor.redact(&serialized));
-                    out.push_str(newline);
-                    changed = true;
-                    continue;
-                }
-            }
+        if split_sse_line_terminator(line).0.is_empty() {
+            changed |= redact_sse_event(redactor, &event, &mut out);
+            event.clear();
+            out.push_str(line);
+        } else {
+            event.push(line);
         }
-        out.push_str(line);
     }
+    changed |= redact_sse_event(redactor, &event, &mut out);
     changed.then(|| redactor.redact(&out))
+}
+
+/// The value of an SSE `data` field line, or `None` for any other line. Per
+/// the event-stream grammar the value follows the first `:` minus one optional
+/// leading space, and a bare `data` line is a data field with an empty value.
+fn sse_data_value(line: &str) -> Option<&str> {
+    if line == "data" {
+        return Some("");
+    }
+    let value = line.strip_prefix("data:")?;
+    Some(value.strip_prefix(' ').unwrap_or(value))
+}
+
+/// Append one SSE event (its non-blank lines, terminators included) to `out`,
+/// redacting its payload as a whole. Returns whether the payload was replaced.
+///
+/// The payload is every `data:` line of the event joined with `\n`, so a JSON
+/// document a provider spreads over several `data:` lines is parsed — and
+/// redacted by member name — as the one document a client reads, never line
+/// by line. A JSON payload is re-emitted as one redacted `data:` line at the
+/// position of the event's first data line; a JSON-shaped payload the parser
+/// refuses is replaced by one `data: [UNPARSEABLE]` line, withholding every
+/// continuation line with it. Non-data fields (`event:`, `id:`, comments) stay
+/// in place. A payload that is not JSON at all (plain text) is copied through
+/// for the caller's pattern pass, as before.
+fn redact_sse_event(redactor: &PiiRedactor, lines: &[&str], out: &mut String) -> bool {
+    let mut data = String::new();
+    let mut data_lines = 0usize;
+    for line in lines {
+        if let Some(value) = sse_data_value(split_sse_line_terminator(line).0) {
+            if data_lines > 0 {
+                data.push('\n');
+            }
+            data.push_str(value);
+            data_lines += 1;
+        }
+    }
+    let trimmed = data.trim();
+    let replacement = if data_lines == 0 || trimmed.is_empty() || trimmed == "[DONE]" {
+        None
+    } else {
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(mut json) => {
+                redact_json_value_strings(redactor, &mut json);
+                // Serializing a `Value` does not fail in practice; if it ever
+                // did, the payload is withheld rather than copied raw.
+                Some(
+                    serde_json::to_string(&json)
+                        .map(|serialized| redactor.redact(&serialized))
+                        .unwrap_or_else(|_| "[UNPARSEABLE]".to_string()),
+                )
+            }
+            Err(_) if looks_like_json_document(trimmed.as_bytes()) => {
+                Some("[UNPARSEABLE]".to_string())
+            }
+            Err(_) => None,
+        }
+    };
+    let Some(replacement) = replacement else {
+        for line in lines {
+            out.push_str(line);
+        }
+        return false;
+    };
+    let mut emitted = false;
+    for line in lines {
+        let (content, newline) = split_sse_line_terminator(line);
+        if sse_data_value(content).is_none() {
+            out.push_str(line);
+        } else if !emitted {
+            out.push_str("data: ");
+            out.push_str(&replacement);
+            out.push_str(newline);
+            emitted = true;
+        }
+    }
+    true
 }
 
 fn response_body_capture_allowed(
@@ -7837,6 +8260,21 @@ fn cache_similarity_value_admitted(value: &str) -> bool {
         b'1' => &bytes[2..] == b"000000",
         _ => false,
     }
+}
+
+/// Producer metadata keys whose values are UNKEYED digests of tool-call
+/// arguments. `ai_tool_governor.arguments_hashes` is a plain SHA-256 of each
+/// call's raw arguments: exported into a record it is an offline guessing
+/// oracle for small argument spaces (a PIN, an account number) that neither
+/// `redaction.hash_secret` nor disabling `capture.mcp_arguments` would close,
+/// so it is never harvested. The audit's own `mcp.calls[].arguments_hash` is
+/// the keyed replacement. The metadata-redaction allowlist marks the key safe
+/// for transaction logs only by name; that says nothing about the digest's
+/// strength, so the exclusion is by key here.
+const ARGUMENT_DIGEST_METADATA_KEYS: &[&str] = &["ai_tool_governor.arguments_hashes"];
+
+fn is_argument_digest_key(key: &str) -> bool {
+    ARGUMENT_DIGEST_METADATA_KEYS.contains(&key)
 }
 
 fn is_guardrail_key(key: &str) -> bool {
@@ -8666,8 +9104,8 @@ struct GrpcFrame<'a> {
 }
 
 /// Message encoding negotiated for this body, from `grpc-encoding`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrpcMessageEncoding {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrpcMessageEncoding {
     Identity,
     Gzip,
     /// An encoding this plugin cannot decode. Only reachable when a frame

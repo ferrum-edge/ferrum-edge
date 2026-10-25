@@ -2386,6 +2386,16 @@ pub struct RequestContext {
     /// wrapper. Its wire signature binds the literal bytes the client signed.
     /// Never route, authorize, or log this value.
     raw_path: Option<hmac_auth::HmacWirePath>,
+    /// The client's wire method, retained only when a frontend rewrote
+    /// [`Self::method`] (HTTP/2 and HTTP/3 WebSocket Extended CONNECT become
+    /// `GET`). Private to `hmac_auth`'s RFC 9421 `@method` derivation; route,
+    /// policy, and backend semantics keep reading [`Self::method`].
+    hmac_wire_method: Option<String>,
+    /// The client's request-target, retained only when it cannot be
+    /// reconstructed from the path and query (an HTTP/1.1 absolute-form
+    /// target, or a present-but-empty query). Private to `hmac_auth`'s RFC 9421
+    /// `@request-target` derivation through the debug-redacted wrapper.
+    hmac_wire_request_target: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are
     /// ASCII-lowercased with a trailing DNS dot removed; an explicit
@@ -4047,6 +4057,17 @@ pub(crate) struct PluginRequestState {
     /// only the dispatcher's own rewrite) and never touches a `Host` another
     /// plugin set before the dispatch block.
     pub(crate) mesh_route_dispatch_host_before_rewrite: Option<Option<String>>,
+    /// `grpc-encoding` framing witness `ai_transcript_audit` records from the
+    /// LIVE `before_proxy` header map for a native-gRPC request on a
+    /// `grpc`-enrolled instance, before the backend-effective method is known.
+    /// A call enrolled only at the backend-path boundary has no other
+    /// authoritative framing source when a deferred `before_proxy` hook
+    /// short-circuits it (no final request-body hook runs), and
+    /// `RequestContext::headers` may be the original inbound map rather than the
+    /// backend-visible one. Kept out of public metadata so no other plugin can
+    /// rewrite it and it never reaches a transaction log.
+    pub(crate) ai_transcript_audit_grpc_request_encoding:
+        Option<ai_transcript_audit::GrpcMessageEncoding>,
     /// Per-`transaction_debugger`-instance record that a body-capture record
     /// was already emitted for each direction, so the header-phase and
     /// final-body hooks emit exactly one record between them. Content-free
@@ -4485,6 +4506,8 @@ impl RequestContext {
             method,
             path,
             raw_path: None,
+            hmac_wire_method: None,
+            hmac_wire_request_target: None,
             request_authority: None,
             request_is_secure: false,
             outbound_proxy_hops: None,
@@ -6015,6 +6038,8 @@ impl RequestContext {
             method: self.method.clone(),
             path: self.path.clone(),
             raw_path: self.raw_path.clone(),
+            hmac_wire_method: self.hmac_wire_method.clone(),
+            hmac_wire_request_target: self.hmac_wire_request_target.clone(),
             request_authority: self.request_authority.clone(),
             outbound_proxy_hops: self.outbound_proxy_hops,
             request_is_secure: self.request_is_secure,
@@ -7336,6 +7361,32 @@ impl RequestContext {
     #[inline]
     pub(crate) fn set_raw_path_for_hmac(&mut self, raw_path: String) {
         self.raw_path = Some(hmac_auth::HmacWirePath::new(raw_path));
+    }
+
+    /// Record the client's wire method when a frontend rewrites
+    /// [`Self::method`] (WebSocket Extended CONNECT → `GET`), so RFC 9421
+    /// `@method` covers the method the client actually signed.
+    #[inline]
+    pub(crate) fn set_wire_method_for_hmac(&mut self, wire_method: String) {
+        self.hmac_wire_method = Some(wire_method);
+    }
+
+    /// Record the frontend request line for RFC 9421 derivation: the wire
+    /// method when it differs from [`Self::method`], and the request-target
+    /// when [`hmac_auth::unreconstructible_request_target`] says the path and
+    /// query cannot reproduce it. Allocates nothing for an ordinary request.
+    pub(crate) fn record_wire_request_line_for_hmac(
+        &mut self,
+        wire_method: &str,
+        version: http::Version,
+        uri: &http::Uri,
+    ) {
+        if wire_method != self.method {
+            self.hmac_wire_method = Some(wire_method.to_owned());
+        }
+        if let Some(target) = hmac_auth::unreconstructible_request_target(version, uri) {
+            self.hmac_wire_request_target = Some(hmac_auth::HmacWirePath::new(target));
+        }
     }
 
     /// Parse the raw query string into `self.query_params`. Keys and values are

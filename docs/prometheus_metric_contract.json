@@ -4790,6 +4790,19 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_response_cache_lookups_total",
+    "type": "counter",
+    "help": "response_caching lookup outcomes by X-Cache-Status class, across every plugin instance in this process.",
+    "labels": [
+      "status",
+      "namespace"
+    ],
+    "subsystem": "response_caching",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_service_discovery_body_budget_rejected_total",
     "type": "counter",
     "help": "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",

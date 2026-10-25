@@ -2933,6 +2933,19 @@ fn rate_limiting_schema_and_runtime_admission_agree() {
             "limit_by": "spiffe",
             "limits": [{"scope": "default", "requests_per_minute": 100}]
         }),
+        // The aggregate dimension and a sized key cap.
+        json!({
+            "limit_by": "SERVICE",
+            "max_state_entries": 250000,
+            "limits": [{"scope": "default", "requests_per_second": 1000}]
+        }),
+        // A mixed-case Redis scheme is a valid URL (the constructor lowercases it).
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "REDIS://redis-host:6379/0",
+            "redis_tls": true,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
         // Consumer-scoped rules alongside the required default rule.
         json!({
             "limit_by": "consumer",
@@ -3021,6 +3034,23 @@ fn rate_limiting_schema_and_runtime_admission_agree() {
                     "requests_per_minute": 10
                 }
             ]
+        }),
+        // Consumer rules are a `limit_by: consumer` feature, not an aggregate one.
+        json!({
+            "limit_by": "service",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // The key cap is bounded on both sides.
+        json!({
+            "max_state_entries": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "max_state_entries": 10000001,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
         }),
         // Centralized mode without an endpoint.
         json!({
@@ -5604,6 +5634,26 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
         schema["properties"]["replay_max_entries"]["default"],
         json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_REPLAY_MAX_ENTRIES)
     );
+    assert_eq!(
+        schema["properties"]["replay_max_entries"]["maximum"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_REPLAY_MAX_ENTRIES)
+    );
+    assert_eq!(
+        schema["properties"]["max_body_bytes"]["default"],
+        json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_MAX_BODY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_body_bytes"]["maximum"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_MAX_BODY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["signed_headers"]["maxItems"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_SIGNED_HEADERS)
+    );
+    assert_eq!(
+        schema["properties"]["required_components"]["items"]["enum"],
+        json!(ferrum_edge::plugins::hmac_auth::RFC9421_SUPPORTED_DERIVED_COMPONENTS)
+    );
 }
 
 /// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
@@ -5644,6 +5694,24 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
             "replay_scope": "shared",
             "sync_mode": "redis",
             "redis_url": redis_url
+        }),
+        // Production-launch review hardening: bounded capacity, signed
+        // headers, a configurable body ceiling, and the RFC 9421 profile.
+        json!({"replay_scope": "process", "replay_max_entries": 10_000_000}),
+        json!({"replay_scope": "process", "signed_headers": ["x-tenant-id", "content-type"]}),
+        json!({"replay_scope": "process", "signed_headers": []}),
+        json!({"replay_scope": "process", "max_body_bytes": 268_435_456}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "signed_headers": ["idempotency-key"]
+        }),
+        json!({"signing_profile": "rfc9421", "replay_scope": "process"}),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "signed_headers": ["x-tenant-id"],
+            "required_components": ["@request-target"]
         }),
     ];
     for config in &accepted {
@@ -5695,6 +5763,28 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": true}),
         json!({"replay_scope": "process", "replay_scop": "shared"}),
         json!({"replay_scope": "process", "require_digest": true}),
+        // Replay capacity is bounded and meaningless without replay state.
+        json!({"replay_scope": "process", "replay_max_entries": 10_000_001}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_max_entries": 1000
+        }),
+        // Signed headers, body ceiling, and RFC 9421 policy bounds.
+        json!({"replay_scope": "process", "signed_headers": ["X-Tenant-Id"]}),
+        json!({"replay_scope": "process", "signed_headers": ["authorization"]}),
+        json!({"replay_scope": "process", "signed_headers": ["host"]}),
+        json!({"replay_scope": "process", "signed_headers": ["a", "a"]}),
+        json!({"replay_scope": "process", "max_body_bytes": 0}),
+        json!({"replay_scope": "process", "max_body_bytes": 268_435_457}),
+        json!({"signing_profile": "rfc9421"}),
+        json!({"replay_scope": "process", "required_components": ["@method"]}),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "required_components": ["@scheme"]
+        }),
+        json!({"signing_profile": "RFC9421", "replay_scope": "process"}),
     ];
     for config in &rejected {
         assert!(
@@ -16311,10 +16401,14 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     // constructor does.
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["items"]["not"]["enum"],
-        json!([206, 304])
+        json!([206, 304, 401, 407])
     );
     assert_eq!(
         schema["properties"]["vary_by_headers"]["items"]["pattern"],
+        json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+    );
+    assert_eq!(
+        schema["properties"]["ignore_request_headers"]["items"]["pattern"],
         json!("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
     );
 
@@ -16363,6 +16457,9 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": [200, 599]}),
         // An explicitly empty Vary list is accepted (no extra key dimensions).
         json!({"vary_by_headers": []}),
+        // Operator-attested ignored request headers.
+        json!({"ignore_request_headers": []}),
+        json!({"ignore_request_headers": ["x-request-id", "X-Cdn-Hop"]}),
         json!({
             "ttl_seconds": 60,
             "max_entries": 100,
@@ -16424,8 +16521,14 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": [206]}),
         json!({"cacheable_status_codes": [304]}),
         json!({"cacheable_status_codes": [200, 206]}),
+        // PR #6830: challenge-dependent statuses cannot be retained.
+        json!({"cacheable_status_codes": [401]}),
+        json!({"cacheable_status_codes": [200, 407]}),
         json!({"vary_by_headers": [""]}),
         json!({"vary_by_headers": ["bad header"]}),
+        json!({"ignore_request_headers": [""]}),
+        json!({"ignore_request_headers": ["bad header"]}),
+        json!({"ignore_request_header": ["x-request-id"]}),
         // Issue #5144: body-bearing and non-retrieval methods are refused by
         // the constructor and must fail the schema too.
         json!({"cacheable_methods": ["POST"]}),
@@ -16503,6 +16606,7 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         "cacheable_methods",
         "cacheable_status_codes",
         "vary_by_headers",
+        "ignore_request_headers",
     ] {
         let mut config = json!({});
         config

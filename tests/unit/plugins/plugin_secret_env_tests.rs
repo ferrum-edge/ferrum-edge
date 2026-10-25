@@ -140,6 +140,7 @@ fn api_chargeback_sink_password_ref(name: &str) -> Value {
     json!({
         "clickhouse": {
             "url": "https://clickhouse.example:8443",
+            "username": "ferrum_ingest",
             "password_ref": name
         },
         "spool": { "enabled": false },

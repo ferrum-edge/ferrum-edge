@@ -662,7 +662,38 @@ const BACKEND_REFUTES_PATH: &str = "/test.Greeter/SayHello";
 /// enrollment and one sink, which is what lets a record captured on either
 /// proxy be observed on the same collector queue.
 fn build_transition_config_yaml(backend_port: u16, collector_port: u16) -> String {
+    build_transition_config_yaml_with(backend_port, collector_port, true)
+}
+
+/// The same transition proxies with `ai_transcript_audit` as the ONLY plugin:
+/// no `grpc_method_router` publishes `grpc_full_method`, so enrollment must
+/// come from the backend-effective path the proxy binds because a
+/// `grpc`-enrolled audit instance joins the backend-path boundary itself
+/// (`ai_transcript_audit-SOL-2`).
+fn build_transition_config_yaml_without_router(backend_port: u16, collector_port: u16) -> String {
+    build_transition_config_yaml_with(backend_port, collector_port, false)
+}
+
+fn build_transition_config_yaml_with(
+    backend_port: u16,
+    collector_port: u16,
+    with_method_router: bool,
+) -> String {
     let descriptor = descriptor_path();
+    let method_router = if with_method_router {
+        r#"
+  - id: "grpc-method-policy"
+    plugin_name: "grpc_method_router"
+    scope: global
+    enabled: true
+    config:
+      allow_methods:
+        - "test.Greeter/SayHello"
+        - "test.Greeter/Refuted"
+"#
+    } else {
+        ""
+    };
     format!(
         r#"
 version: "1"
@@ -711,16 +742,7 @@ plugin_configs:
           "/test.Greeter/SayHello":
             request_type: "test.HelloRequest"
             response_type: "test.HelloResponse"
-
-  - id: "grpc-method-policy"
-    plugin_name: "grpc_method_router"
-    scope: global
-    enabled: true
-    config:
-      allow_methods:
-        - "test.Greeter/SayHello"
-        - "test.Greeter/Refuted"
-"#
+{method_router}"#
     )
 }
 
@@ -1130,6 +1152,70 @@ async fn grpc_audit_discards_a_candidate_the_backend_effective_method_refutes() 
         assert!(
             !serialized.contains("Refuted"),
             "the refuted backend-effective method leaked into an exported record: {serialized}"
+        );
+    }
+    harness.shutdown();
+}
+
+/// Backend-effective enrollment without `grpc_method_router`
+/// (`ai_transcript_audit-SOL-2`). The audit instance itself joins the
+/// backend-path boundary, so the proxy binds `/test.Greeter/SayHello` for the
+/// client path `/audit/SayHello` and `/test.Greeter/Refuted` for the enrolled
+/// client path `/test.Greeter/SayHello`. The refuted call is driven first and
+/// the enrolled one is its FIFO barrier, exactly as in the router-backed test
+/// above: the first and only record must be the enrolled call's.
+#[tokio::test]
+#[ignore]
+async fn grpc_audit_backend_effective_enrollment_does_not_need_a_method_router() {
+    let harness = Harness::start_with(build_transition_config_yaml_without_router).await;
+
+    let refuted_body = grpc_frame(&encode_hello_request("refuted-subject", 0));
+    let refuted = send_grpc_request(&harness.addr, BACKEND_REFUTES_PATH, &refuted_body, &[])
+        .await
+        .expect("gRPC call");
+    assert_eq!(refuted.status, 200);
+    assert_eq!(
+        refuted.grpc_status(),
+        "0",
+        "a refuted enrollment must not change what the client sees: \
+         headers={:?} trailers={:?}",
+        refuted.headers,
+        refuted.trailers
+    );
+
+    let body = grpc_frame(&encode_hello_request("routerless-subject", 0));
+    let call = send_grpc_request(&harness.addr, BACKEND_ENROLLS_PATH, &body, &[])
+        .await
+        .expect("gRPC call");
+    assert_eq!(call.status, 200);
+    assert_eq!(
+        call.grpc_status(),
+        "0",
+        "the enrolled call must succeed end to end: headers={:?} trailers={:?}",
+        call.headers,
+        call.trailers
+    );
+
+    let records = harness.records.wait_for(1).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "exactly the backend-effective enrolled call must be exported: {records:?}"
+    );
+    let excerpt = request_excerpt(&records[0]);
+    assert!(
+        excerpt.contains(&format!("\"grpc_method\":\"{ENROLLED_METHOD}\"")),
+        "the record must be filed under the backend-effective method: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("routerless-subject"),
+        "the excerpt must carry the enrolled call's payload: {excerpt}"
+    );
+    for record in &records {
+        let serialized = record.to_string();
+        assert!(
+            !serialized.contains("refuted-subject"),
+            "a refuted candidate leaked into an exported record: {serialized}"
         );
     }
     harness.shutdown();
