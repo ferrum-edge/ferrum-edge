@@ -437,16 +437,21 @@ pub trait RateLimitAlgorithm: Send + Sync + 'static {
     /// fails closed if the two ever disagree.
     const REQUIRES_SERVER_CLOCK: bool;
 
-    /// Whether [`Self::check_local_shared`] can decide an existing key's
-    /// admission through a shared map reference. When `false` (the default)
-    /// [`LocalLimiter`] never takes the shared-reference lookup, so the
-    /// other algorithms keep their single exclusive-guard lookup unchanged.
-    const SHARED_STATE_CHECK: bool = false;
-
     fn new_state(&self) -> Self::State;
 
     fn check_local(&self, state: &mut Self::State, op: &Self::Op, now: Instant)
     -> RateLimitOutcome;
+
+    /// Whether [`Self::check_local_shared`] can decide an existing key's
+    /// admission through a shared map reference for THIS policy. When `false`
+    /// (the default) [`LocalLimiter`] never takes the shared-reference lookup,
+    /// so the other algorithms keep their single exclusive-guard lookup
+    /// unchanged. Return `true` only when one atomic read-modify-write decides
+    /// the operation, so concurrent shared decisions still have a valid
+    /// serial order.
+    fn admits_shared_state_check(&self) -> bool {
+        false
+    }
 
     /// Decide an existing key's admission while holding only a SHARED map
     /// reference, so concurrent checks of one key — and of unrelated keys on
@@ -455,7 +460,8 @@ pub trait RateLimitAlgorithm: Send + Sync + 'static {
     /// Return `None` whenever the decision needs exclusive access (for
     /// example a window rollover that resets several counters together); the
     /// caller then retries through [`Self::check_local`] under the exclusive
-    /// entry guard. Only consulted when [`Self::SHARED_STATE_CHECK`] is true.
+    /// entry guard. Only consulted when [`Self::admits_shared_state_check`]
+    /// is true.
     fn check_local_shared(
         &self,
         state: &Self::State,
@@ -492,8 +498,8 @@ where
     #[cfg(debug_assertions)]
     all_shard_len_calls: AtomicUsize,
     /// Counts exclusive `DashMap::entry` acquisitions. Tests assert that steady
-    /// occupied-key admission for a [`RateLimitAlgorithm::SHARED_STATE_CHECK`]
-    /// algorithm leaves it flat.
+    /// occupied-key admission for a policy whose
+    /// [`RateLimitAlgorithm::admits_shared_state_check`] is true leaves it flat.
     #[cfg(debug_assertions)]
     exclusive_entry_calls: AtomicUsize,
     #[cfg(test)]
@@ -552,7 +558,7 @@ where
         // falls through to the exclusive path below, which re-checks from
         // scratch. Exclusive writers cannot run while this reference is held,
         // so the shared decision never interleaves with a reset.
-        if A::SHARED_STATE_CHECK
+        if self.algorithm.admits_shared_state_check()
             && let Some(existing) = self.state.get(&key)
             && let Some(outcome) = self.algorithm.check_local_shared(existing.value(), op, now)
         {
@@ -3857,10 +3863,6 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
     /// A plain fixed window with no previous-window term and no sub-buckets.
     const REQUIRES_SERVER_CLOCK: bool = false;
 
-    /// Every field of [`UdpWindowState`] is atomic, so steady in-window
-    /// admission needs no exclusive shard guard.
-    const SHARED_STATE_CHECK: bool = true;
-
     fn new_state(&self) -> Self::State {
         UdpWindowState::new(0, 0)
     }
@@ -3875,12 +3877,28 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
         self.charge_window(state, op, now_secs, current_epoch)
     }
 
+    /// Every field of [`UdpWindowState`] is atomic, but a datagram charges the
+    /// count and the byte total with two separate atomic additions. With ONE
+    /// axis bounded, the decision rests on a single read-modify-write, so
+    /// concurrent shared decisions serialize in that counter's order. With
+    /// BOTH bounded, two datagrams could each take an earlier position on a
+    /// different counter and both be refused where every serial order admits
+    /// one of them, so a two-axis policy keeps the exclusive entry guard.
+    fn admits_shared_state_check(&self) -> bool {
+        self.datagrams_per_window.is_none() || self.bytes_per_window.is_none()
+    }
+
     fn check_local_shared(
         &self,
         state: &Self::State,
         op: &Self::Op,
         now: Instant,
     ) -> Option<RateLimitOutcome> {
+        // Defensive: a caller that skipped `admits_shared_state_check` still
+        // cannot take an incoherent two-axis decision here.
+        if !self.admits_shared_state_check() {
+            return None;
+        }
         let (now_secs, current_epoch) = self.window_position(now);
         // A due rollover resets several counters together; leave it to the
         // exclusive path. Under this shared reference no exclusive holder can

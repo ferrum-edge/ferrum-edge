@@ -1442,3 +1442,131 @@ async fn fail_closed_outage_drop_is_counted_as_enforcement_unavailable() {
         "the outage drop must be counted"
     );
 }
+
+// ── PR #6868 fix round 1 ───────────────────────────────────────────────
+
+/// PR6868-SOL-1: the count and byte totals are separate atomics, so a policy
+/// that bounds both axes must not decide from a shared reference; a
+/// single-axis policy may.
+#[test]
+fn shared_state_check_is_offered_only_for_single_axis_policies() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        RateLimitAlgorithm, UdpRateLimitAlgorithm, UdpRateLimitOp,
+    };
+    use std::time::{Duration, Instant};
+
+    let epoch = Instant::now();
+    let now = epoch + Duration::from_millis(100);
+    let op = UdpRateLimitOp { datagram_size: 20 };
+
+    let two_axis = UdpRateLimitAlgorithm::new(Some(2), Some(120), 1, epoch);
+    assert!(!two_axis.admits_shared_state_check());
+    let state = two_axis.new_state();
+    assert!(
+        two_axis.check_local_shared(&state, &op, now).is_none(),
+        "a two-axis decision must go through the exclusive entry guard"
+    );
+
+    for single_axis in [
+        UdpRateLimitAlgorithm::new(Some(2), None, 1, epoch),
+        UdpRateLimitAlgorithm::new(None, Some(120), 1, epoch),
+    ] {
+        assert!(single_axis.admits_shared_state_check());
+        let state = single_axis.new_state();
+        assert!(
+            single_axis.check_local_shared(&state, &op, now).is_some(),
+            "an in-window single-axis decision may be taken shared"
+        );
+    }
+}
+
+/// PR6868-SOL-1: steady admission under a two-axis policy keeps the exclusive
+/// entry guard (the counter is compiled only with `debug_assertions`).
+#[tokio::test]
+async fn two_axis_policy_admission_keeps_the_exclusive_entry_guard() {
+    use ferrum_edge::_test_support::udp_rate_limiting_exclusive_entry_calls_for_test;
+
+    let plugin = make_plugin(json!({
+        "datagrams_per_second": 1_000,
+        "bytes_per_second": 1_000_000,
+        "window_seconds": 3_600
+    }));
+    let ctx = make_ctx("10.0.0.1", 64);
+    assert_eq!(
+        plugin.on_udp_datagram(&ctx).await,
+        UdpDatagramVerdict::Forward
+    );
+    let after_insert = udp_rate_limiting_exclusive_entry_calls_for_test(&plugin);
+    for _ in 0..100 {
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+    if cfg!(debug_assertions) {
+        assert_eq!(
+            udp_rate_limiting_exclusive_entry_calls_for_test(&plugin),
+            after_insert + 100,
+            "every two-axis datagram must be decided under the exclusive guard"
+        );
+    }
+}
+
+/// PR6868-SOL-1, the reviewer's scenario: count limit 2, byte limit 120, an
+/// occupied entry at (1 datagram, 20 bytes), then A = 20 bytes and B = 100
+/// bytes race. Every serial order admits exactly one of them (A first sees
+/// (2, 40); B first sees (2, 120)); both being refused is the incoherent
+/// interleaving the shared path allowed.
+#[test]
+fn concurrent_two_axis_datagrams_keep_a_serial_outcome() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        LocalLimiter, UdpRateLimitAlgorithm, UdpRateLimitOp,
+    };
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    let epoch = Instant::now();
+    let now = epoch + Duration::from_millis(100);
+    for round in 0..500 {
+        let limiter = Arc::new(LocalLimiter::new(
+            UdpRateLimitAlgorithm::new(Some(2), Some(120), 1, epoch),
+            4,
+        ));
+        assert!(
+            limiter
+                .check_at(
+                    "10.0.0.1".to_string(),
+                    &UdpRateLimitOp { datagram_size: 20 },
+                    now
+                )
+                .allowed
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [20u64, 100]
+            .into_iter()
+            .map(|datagram_size| {
+                let limiter = Arc::clone(&limiter);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    limiter
+                        .check_at(
+                            "10.0.0.1".to_string(),
+                            &UdpRateLimitOp { datagram_size },
+                            now,
+                        )
+                        .allowed
+                })
+            })
+            .collect();
+        let admitted = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker joins"))
+            .filter(|allowed| *allowed)
+            .count();
+        assert_eq!(
+            admitted, 1,
+            "round {round}: exactly one of A/B fits every serial order"
+        );
+    }
+}
