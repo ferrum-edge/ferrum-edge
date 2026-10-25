@@ -28,33 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `kafka_logging` producer and SASL admission is stricter (#6850)
+### `cors` method and header lists are bounded (#6844)
 
-A `kafka_logging` config that previously started a sink which could never
-deliver is now refused at admission. File mode fails startup, admin writes
-return `400`, and a data plane keeps its previous generation. Before you
-upgrade, check every `kafka_logging` row:
-
-- Move `producer_config` `acks` / `request.required.acks` to top-level `acks`,
-  `message.timeout.ms` / `delivery.timeout.ms` to `message_timeout_ms`, and
-  `compression.type` / `compression.codec` to `compression`. Every spelling of
-  these properties, including `topic.`-prefixed and re-cased forms, is refused
-  in `producer_config`.
-- Keep one spelling per librdkafka property. For example, use `linger.ms` or
-  `queue.buffering.max.ms`, not both.
-- If you set `producer_config.message.max.bytes`, make it at least
-  `max_entry_bytes` + 128, or remove it and let the default fit.
-- `enable.idempotence: "true"` requires `acks: all` (or omit `acks`).
-- On `sasl_plaintext` / `sasl_ssl`, set `sasl_mechanism` to the exact
-  uppercase name (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`).
-  PLAIN and SCRAM need `sasl_username` and `sasl_password`; remove them for
-  `OAUTHBEARER`. `GSSAPI` is accepted only on Windows builds.
-
-To keep the gateway's backend egress policy on while you use `kafka_logging`,
-list the cluster's brokers in `FERRUM_KAFKA_ALLOWED_BROKERS` on every node that
-admits or runs the plugin. Include every broker the cluster advertises, or
-their subnet. See
-[`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies).
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 

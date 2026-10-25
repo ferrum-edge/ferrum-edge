@@ -28600,9 +28600,11 @@ components:
             the plain string `"*.example.com"` matches every subdomain.
         allowed_methods:
           type: array
+          maxItems: 128
           items:
             type: string
             minLength: 1
+            maxLength: 256
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
             Preflight-only allowed methods returned in
@@ -28616,9 +28618,11 @@ components:
             Istio's empty list.
         allowed_headers:
           type: array
+          maxItems: 128
           items:
             type: string
             minLength: 1
+            maxLength: 256
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
             Preflight-only allowed request headers returned in
@@ -28635,12 +28639,23 @@ components:
             preserves Istio's empty list.
         exposed_headers:
           type: array
+          maxItems: 128
           items:
             type: string
             minLength: 1
+            maxLength: 256
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
-          description: Response headers exposed to browser JavaScript
+          description: >-
+            Response headers exposed to browser JavaScript, returned in
+            Access-Control-Expose-Headers. Header names are case-insensitive.
+            With credentials disabled, `*` exposes every response header; with
+            credentials enabled, it is a literal token. Multiple policies
+            intersect exposure: an uncredentialed `*` intersected with an
+            explicit list keeps that list, and a credentialed policy's literal
+            `*` is omitted rather than widened when the aggregate disables
+            credentials. Bounded at 128 entries of at most 256 bytes each, like
+            allowed_methods and allowed_headers.
         allow_credentials:
           type: boolean
           default: false
@@ -28664,6 +28679,18 @@ components:
             when the suffix is a single label, a public suffix, or has a
             Public Suffix List rule beneath it (`*.com`, `*.co.uk`,
             `*.github.io`, `*.run.app`, `*.amazonaws.com`).
+        allow_private_network:
+          type: boolean
+          default: false
+          description: >-
+            Private Network Access opt-in. When true, a preflight from an
+            allowed origin that carries
+            `Access-Control-Request-Private-Network: true` is answered with
+            `Access-Control-Allow-Private-Network: true` (locally or, with
+            preflight_continue, on the forwarded response). The field is never
+            sent on actual responses or on preflights that did not ask, and a
+            backend's own value is always stripped. With multiple policies,
+            every matching policy must opt in.
         max_age:
           type: integer
           format: uint64
