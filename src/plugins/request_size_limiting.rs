@@ -24,13 +24,14 @@
 //! depend on which enforcement point fired. The limit, the observed size, and
 //! the rejecting instance go to request metadata (and from there to the
 //! transaction log) instead of the response body. That metadata is always
-//! recorded by the `Content-Length` and buffered-body refusals. The final-body
-//! refusal records it only when its hook is handed a request context: always on
-//! native HTTP/3, but on H1/H2 only when another plugin on the route asks for
-//! the final-body context (`needs_final_request_body_context`). This plugin
-//! does not ask, so it never adds a per-request context clone; without that
-//! context the H1/H2 final-body `413` carries no `request_size_limiting.*`
-//! metadata.
+//! recorded by the `Content-Length` and buffered-body refusals. On every
+//! protocol, the final-body refusal records it only when its hook is handed a
+//! request context. The native-H3 preparation paths and the H3 cross-protocol
+//! bridge always pass one. The H1/H2 ladders and the native-H3 buffered ladder
+//! pass one only when another plugin on the route asks for the final-body
+//! context (`needs_final_request_body_context`). This plugin does not ask, so it
+//! never adds a per-request context clone; a final-body `413` decided without a
+//! context carries no `request_size_limiting.*` metadata.
 
 use async_trait::async_trait;
 use serde_json::Value;
