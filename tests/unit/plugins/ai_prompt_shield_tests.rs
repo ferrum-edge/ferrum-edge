@@ -5887,3 +5887,127 @@ async fn put_and_patch_prompts_are_inspected_like_post() {
     ctx.method = "PUT".to_string();
     assert!(!mcp.should_buffer_request_body(&ctx));
 }
+
+// ─── Fix round 2 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn deferred_requests_relabelled_to_a_sniffed_charset_are_refused() {
+    // `before_proxy` deferred an encoded declared-JSON body; a later header
+    // rewrite labels it `text/plain; charset=utf-7`. The decoded plaintext is
+    // ASCII JSON whose UTF-7 reading carries `alice@example.com`, so the final
+    // hook must apply the charset rule even though the deferral already made
+    // the request a JSON candidate.
+    let plaintext = br#"{"prompt":"+AGE-lice+AEA-example.com"}"#;
+    for (action, expect_reject) in [("reject", true), ("redact", true), ("warn", false)] {
+        let plugin = AiPromptShield::new(&json!({
+            "action": action,
+            "patterns": ["email"]
+        }))
+        .unwrap();
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        let mut early_headers = make_post_headers();
+        early_headers.insert("content-encoding".to_string(), "gzip".to_string());
+        ctx.headers = early_headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut early_headers).await);
+
+        let final_headers = optional_content_type_headers(Some("text/plain; charset=utf-7"));
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &final_headers, plaintext)
+            .await;
+        if expect_reject {
+            assert_reject(result, Some(400));
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_rejected"),
+                Some("unsupported_charset"),
+                "{action}"
+            );
+        } else {
+            assert_continue(result);
+            assert_eq!(
+                shield_metadata(&ctx, "ai_shield_warnings"),
+                Some("unsupported_charset")
+            );
+        }
+    }
+}
+
+/// Encode an ASCII document as BOM-less UTF-16LE / UTF-16BE / UTF-32LE.
+fn bomless_wide_encodings(ascii: &str) -> Vec<(&'static str, String)> {
+    let mut utf16le = Vec::new();
+    let mut utf16be = Vec::new();
+    let mut utf32le = Vec::new();
+    for byte in ascii.bytes() {
+        utf16le.extend_from_slice(&[byte, 0]);
+        utf16be.extend_from_slice(&[0, byte]);
+        utf32le.extend_from_slice(&[byte, 0, 0, 0]);
+    }
+    vec![
+        ("utf-16le", String::from_utf8(utf16le).unwrap()),
+        ("utf-16be", String::from_utf8(utf16be).unwrap()),
+        ("utf-32le", String::from_utf8(utf32le).unwrap()),
+    ]
+}
+
+#[tokio::test]
+async fn bomless_wide_encoded_numeric_roots_are_json_candidates() {
+    // The UTF-8 JSON number `4111111111111111` is inspected in all mode; its
+    // BOM-less wide encodings (valid UTF-8, interleaved with NULs) must not be
+    // classified as unrelated uploads that skip the scan ceiling and the
+    // strict-parse refusal.
+    for content_type in [None, Some("text/plain")] {
+        for (label, wide) in bomless_wide_encodings("4111111111111111") {
+            for action in ["reject", "redact"] {
+                for (max_scan_bytes, expected) in [(16, 413), (1_048_576, 400)] {
+                    let plugin = AiPromptShield::new(&json!({
+                        "action": action,
+                        "scan_fields": "all",
+                        "patterns": ["credit_card"],
+                        "max_scan_bytes": max_scan_bytes
+                    }))
+                    .unwrap();
+                    let mut ctx = make_post_ctx_with_raw_body(&wide);
+                    let mut headers = optional_content_type_headers(content_type);
+                    ctx.headers = headers.clone();
+                    assert_reject(
+                        plugin.before_proxy(&mut ctx, &mut headers).await,
+                        Some(expected),
+                    );
+                    let mut final_ctx = create_test_context();
+                    final_ctx.method = "POST".to_string();
+                    assert_reject(
+                        plugin
+                            .on_final_request_body_with_context(
+                                &mut final_ctx,
+                                &headers,
+                                wide.as_bytes(),
+                            )
+                            .await,
+                        Some(expected),
+                    );
+                    if expected == 400 {
+                        assert_eq!(
+                            shield_metadata(&final_ctx, "ai_shield_rejected"),
+                            Some("malformed_json"),
+                            "{label} {action} {content_type:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Wide-encoded prose that merely starts with a digit is still an
+    // unrelated upload.
+    let plugin = AiPromptShield::new(&json!({
+        "scan_fields": "all",
+        "patterns": ["credit_card"],
+        "max_scan_bytes": 16
+    }))
+    .unwrap();
+    for (_, wide) in bomless_wide_encodings("2024 annual report") {
+        let mut ctx = make_post_ctx_with_raw_body(&wide);
+        let mut headers = optional_content_type_headers(Some("text/plain"));
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}

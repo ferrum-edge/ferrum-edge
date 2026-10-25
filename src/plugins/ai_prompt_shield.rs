@@ -720,6 +720,10 @@ fn may_be_json_document(body: &[u8]) -> bool {
         if matches!(lead, Some(b'{' | b'[' | b'"' | b'/' | b'#')) {
             return true;
         }
+        // A BOM-less wide-encoded root number or literal (`4\0 1\0 …`).
+        if is_wide_encoded_scalar(body) {
+            return true;
+        }
     }
     let rest = trim_trailing_lenient_whitespace(skip_leading_lenient_whitespace(body));
     match rest.first().copied() {
@@ -728,6 +732,44 @@ fn may_be_json_document(body: &[u8]) -> bool {
         Some(b'"') => rest.len() > 1 && rest.ends_with(b"\""),
         Some(_) => is_json_like_scalar(rest),
     }
+}
+
+/// Whether `body`, read with every NUL byte dropped, is one root JSON number or
+/// literal surrounded only by whitespace — the shape of a BOM-less UTF-16 /
+/// UTF-32 scalar document. Single pass, no allocation: the token is retained in
+/// a fixed buffer only as long as a literal can be.
+fn is_wide_encoded_scalar(body: &[u8]) -> bool {
+    const LONGEST_LITERAL: usize = 9;
+    let mut token = [0u8; LONGEST_LITERAL];
+    let mut token_len = 0usize;
+    let mut numeric = true;
+    let mut has_digit = false;
+    // 0: leading whitespace, 1: inside the token, 2: trailing whitespace.
+    let mut state = 0u8;
+    for byte in body.iter().copied().filter(|byte| *byte != 0) {
+        let whitespace = matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C);
+        match (state, whitespace) {
+            (0 | 2, true) => {}
+            (0 | 1, false) => {
+                state = 1;
+                has_digit |= byte.is_ascii_digit();
+                numeric &= matches!(byte, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E');
+                if let Some(slot) = token.get_mut(token_len) {
+                    *slot = byte;
+                }
+                token_len = token_len.saturating_add(1);
+                if !numeric && token_len > LONGEST_LITERAL {
+                    return false;
+                }
+            }
+            (1, true) => state = 2,
+            _ => return false,
+        }
+    }
+    if token_len == 0 {
+        return false;
+    }
+    (numeric && has_digit) || token.get(..token_len).is_some_and(is_json_like_scalar)
 }
 
 /// A root JSON scalar other than a string, under strict or lenient spelling.
@@ -2817,8 +2859,11 @@ impl Plugin for AiPromptShield {
         // it may be a JSON document at all — its `charset`, its size, UTF-8,
         // and a strict-parse failure — and left alone otherwise (a text or
         // binary upload), mirroring `before_proxy`.
-        if scope == BodyScope::Sniffed && !deferred {
-            if !may_be_json_document(body) {
+        // A request already selected by the compressed-body deferral is a JSON
+        // candidate by that selection, so it skips the sniff — but never the
+        // charset rule its final headers now impose.
+        if scope == BodyScope::Sniffed {
+            if !deferred && !may_be_json_document(body) {
                 return PluginResult::Continue;
             }
             if self.has_unsupported_charset(BodyScope::Declared, headers) {
