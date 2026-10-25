@@ -38,8 +38,11 @@ create are now reserved, plus equal headroom for a pricing reload. That covers
 one row per priced status, one shared status-`0` row when bandwidth is priced,
 and one row per stream proxy. Admission refuses a `max_retained_bytes` smaller
 than twice that matrix: a validation error names both numbers, so raise the
-budget if it appears. The reserved bytes are no longer available to
-per-identity rows. In the overflow row, bandwidth recorded at a status no tier
+budget if it appears. A reload is also refused when its new overflow rows do
+not fit beside the billing state the live registry already retains, for
+example a repricing while the registry is saturated. Raise
+`max_retained_bytes`, or let retained rows be collected and evicted, then
+retry. The reserved bytes are no longer available to per-identity rows. In the overflow row, bandwidth recorded at a status no tier
 prices is filed under status `0`.
 
 An instance with nonzero `bandwidth_pricing` now forces its proxy's WebSocket

@@ -38417,7 +38417,9 @@ components:
         `schema_ref` must name a definition a `transaction_log_schema` plugin
         registered; a status code must not appear in more than one tier across
         the whole `pricing_tiers` array; `max_retained_bytes` must hold twice
-        the configured overflow-row matrix; and `stale_entry_ttl_seconds` /
+        the configured overflow-row matrix, and a reload whose not-yet-created
+        overflow rows do not fit beside the billing state the live registry
+        retains is refused; and `stale_entry_ttl_seconds` /
         `cleanup_interval_seconds` interact with the collection contract
         described in docs/plugins.md.
       allOf:

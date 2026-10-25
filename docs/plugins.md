@@ -2152,7 +2152,17 @@ of reserved rows that do not exist yet, nor an equal amount of headroom kept
 for a pricing reload's next generation while the retired one drains.
 Admission therefore refuses a `max_retained_bytes` smaller than twice the
 matrix, and a flood of distinct identities can never take the bytes the
-overflow fallback needs. That
+overflow fallback needs. Reserving cannot free bytes that retained history
+already occupies: retained rows may hold uncollected charges, and an active
+series keeps its retired pricing generations. So a reload is also refused, and
+the live generation stays in place, when the new configuration's overflow rows
+that do not exist yet need more than the registry's free space. Typically that
+is a repricing against a saturated registry. Raise `max_retained_bytes`, or let
+retained rows be collected and evicted first. Rows admitted between that check
+and the reload's publication are not counted. Creating an overflow row never
+waits for an eviction pass. Concurrent first creations of the same overflow row
+serialize, so they cannot each reserve its bytes and drop charges one row would
+hold. That
 sentinel lives in the digest-form
 billing-identity class (`~sha256:` marker, non-hex suffix), so
 `bounded_billing_identity` can never return it for a real authenticated claim
@@ -2199,7 +2209,11 @@ the body is the last signal the HTTP stack offers. HTTP/2 takes it before
 flow-control capacity is granted and HTTP/1 before the write is flushed, so one
 delivered document may still never reach the collector. A single failed
 delivery can never authorize deletion. A retry served from the render cache
-counts as a delivery of the walk that produced the cached document. The
+counts as a hand-off of the walk that produced the cached document. These are
+hand-offs, not proof of receipt. Two hand-offs on one connection can fail
+together (for example two HTTP/2 streams behind a zero receive window that is
+then reset), so a collector that systematically fails after the gateway hands
+over the body can still lose idle rows. The
 gateway cannot observe whether the collector then ingested the document, so set
 `stale_entry_ttl_seconds` to span several collection intervals. Both eviction entrypoints share that rule: the periodic
 `cleanup_interval_seconds` task and the eviction pass each export runs before

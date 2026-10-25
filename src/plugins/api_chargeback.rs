@@ -976,7 +976,8 @@ pub fn validate_composition(
         // The overflow fallback must always fit: refused identities fold into
         // reserved aggregate rows, and a pricing reload's next generation needs
         // its own rows while the retired generation drains.
-        let matrix_bytes: usize = overflow_reservation_matrix(config).values().sum();
+        let matrix = overflow_reservation_matrix(config);
+        let matrix_bytes: usize = matrix.values().sum();
         let required_bytes = matrix_bytes.saturating_mul(2);
         if required_bytes > reference_tunables.max_retained_bytes {
             errors.push(format!(
@@ -986,6 +987,14 @@ pub fn validate_composition(
                  Raise `max_retained_bytes`",
                 reference_tunables.max_retained_bytes
             ));
+        }
+        // The matrix must also fit beside what the live registry already
+        // retains; reserving cannot free occupied bytes (PR #6842).
+        if let Some(registry) = try_global_registry()
+            && let Err(error) = registry
+                .check_overflow_reservation_fits(&matrix, reference_tunables.max_retained_bytes)
+        {
+            errors.push(error);
         }
     }
 
@@ -1148,11 +1157,10 @@ pub struct ChargebackRegistry {
     /// this much headroom free so the next pricing generation's overflow rows
     /// still fit while retired-generation rows drain.
     overflow_reserve_headroom: AtomicUsize,
-    /// Excludes `/charges` walks, overflow-reservation publication, and
-    /// reserved overflow-row creation while an eviction pass retires series
-    /// groups, so no export observes a partially retired group and no
-    /// reservation flag races its row's removal. Never taken on the ordinary
-    /// recording path.
+    /// Excludes `/charges` walks and overflow-reservation publication while an
+    /// eviction pass retires series groups, so no export observes a partially
+    /// retired group. Never waited on by the recording path: aggregate-row
+    /// creation only TRIES it (see `record_new_aggregate_row`).
     retirement_lock: std::sync::RwLock<()>,
     /// Registry walks performed by `/charges` renders (diagnostics and tests).
     render_walks: AtomicUsize,
@@ -1273,8 +1281,12 @@ impl ChargebackRegistry {
     /// in `retained_bytes`); the rest form the outstanding reserve that
     /// ordinary rows may not consume, and the whole matrix is additionally
     /// kept as headroom for the next pricing generation. Runs on the reload
-    /// cold path under the retirement lock so it cannot race an eviction pass
-    /// or a reserved row's creation.
+    /// cold path under the retirement lock so it cannot race an eviction pass.
+    /// A reserved row created concurrently (aggregate-row creation never waits
+    /// for the lock) may stay counted as outstanding — protecting more than
+    /// needed — until the next eviction pass reconciles every flag.
+    /// [`validate_composition`] has already refused a matrix that does not fit
+    /// beside the retained rows ([`Self::check_overflow_reservation_fits`]).
     #[doc(hidden)]
     pub fn publish_overflow_reservations(&self, config: &crate::config::types::GatewayConfig) {
         let matrix = overflow_reservation_matrix(config);
@@ -1306,6 +1318,44 @@ impl ChargebackRegistry {
             .store(outstanding, Ordering::Release);
         self.overflow_reserve_headroom
             .store(total, Ordering::Release);
+    }
+
+    /// Refuse a candidate overflow matrix this live registry cannot reserve
+    /// beside the billing state it already retains.
+    ///
+    /// Reserving only records which bytes ordinary rows must leave free; it
+    /// cannot free bytes retained history already occupies. Retained rows are
+    /// never deleted to make room (they may hold uncollected charges, and an
+    /// active series keeps its retired pricing generations), so a candidate
+    /// whose overflow rows that do not exist yet need more than the free
+    /// space would leave its own current-generation charges to be dropped.
+    /// [`validate_composition`] refuses such a candidate and the live
+    /// generation stays in place. Rows admitted between this check and the
+    /// candidate's publication are not counted.
+    #[doc(hidden)]
+    pub fn check_overflow_reservation_fits(
+        &self,
+        matrix: &HashMap<String, usize>,
+        max_retained_bytes: usize,
+    ) -> Result<(), String> {
+        let missing_bytes: usize = matrix
+            .iter()
+            .filter(|(key, _)| !self.entries.contains_key(key.as_str()))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        let retained_bytes = self.retained_bytes.load(Ordering::Acquire);
+        let required_bytes = retained_bytes.saturating_add(missing_bytes);
+        if required_bytes > max_retained_bytes {
+            return Err(format!(
+                "api_chargeback `max_retained_bytes` ({max_retained_bytes}) cannot reserve the \
+                 aggregate overflow rows this configuration needs beside the billing state the \
+                 live `/charges` registry already retains: {retained_bytes} bytes retained plus \
+                 {missing_bytes} bytes of overflow rows not yet created. Raise \
+                 `max_retained_bytes`, or let retained rows be collected and evicted before \
+                 changing pricing"
+            ));
+        }
+        Ok(())
     }
 
     /// Bytes currently reserved for reserved overflow rows that do not exist.
@@ -1808,52 +1858,61 @@ impl ChargebackRegistry {
                 namespace_label.len(),
                 scope,
             );
-            // An aggregate row may be one the accepted configuration reserved
-            // bytes for. Creating it holds the retirement lock shared, so an
-            // eviction pass or a reservation publication cannot race its
-            // reservation flag. Ordinary rows never take the lock.
-            let _reservation_guard = (!identity_admission).then(|| {
-                self.retirement_lock
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            });
-            let reservations =
-                (!identity_admission).then(|| self.overflow_reservations.load_full());
-            let reserved_slot = reservations
-                .as_ref()
-                .and_then(|reservations| reservations.get(owned_key.as_str()));
-            let own_reserved_bytes = reserved_slot
-                .filter(|slot| !slot.present.load(Ordering::Acquire))
-                .map_or(0, |slot| slot.bytes);
-            if !self.try_reserve(entry_bytes, identity_admission, own_reserved_bytes) {
-                // Budget exhausted. Fold the charge into the fixed-cardinality
-                // aggregate row rather than losing billable state. If even that
-                // row cannot be admitted, the loss is counted and surfaced.
+            let make_entry = || {
+                ChargebackEntry::new(
+                    self.epoch,
+                    Arc::from(consumer),
+                    Arc::from(proxy_id),
+                    Arc::from(proxy_namespace),
+                    Arc::from(proxy_name),
+                    status_code,
+                    protocol_family,
+                    if count_call { call_price } else { 0.0 },
+                    bw_price_sent,
+                    bw_price_received,
+                    Arc::clone(&scope.currency),
+                    Arc::from(namespace_label.as_str()),
+                    entry_bytes,
+                    identity_admission,
+                )
+            };
+
+            if !identity_admission {
+                self.record_new_aggregate_row(
+                    owned_key,
+                    entry_bytes,
+                    make_entry,
+                    bytes_sent,
+                    bytes_received,
+                    count_call,
+                );
                 self.maybe_invalidate_caches();
-                if identity_admission {
-                    self.identity_overflow_total.fetch_add(1, Ordering::Relaxed);
-                    self.warn_on_admission("entry budget exhausted");
-                    self.record_admitted(
-                        scope,
-                        proxy_namespace,
-                        OVERFLOW_CONSUMER_SENTINEL,
-                        proxy_id,
-                        proxy_name,
-                        overflow_status_code,
-                        overflow_status_code,
-                        protocol_family,
-                        call_price,
-                        bytes_sent,
-                        bytes_received,
-                        bw_price_sent,
-                        bw_price_received,
-                        count_call,
-                        false,
-                    );
-                } else {
-                    self.dropped_charges_total.fetch_add(1, Ordering::Relaxed);
-                    self.warn_on_admission("retained-byte budget exhausted");
-                }
+                return;
+            }
+
+            if !self.try_reserve(entry_bytes, true, 0) {
+                // Budget exhausted. Fold the charge into the fixed-cardinality
+                // aggregate row rather than losing billable state.
+                self.maybe_invalidate_caches();
+                self.identity_overflow_total.fetch_add(1, Ordering::Relaxed);
+                self.warn_on_admission("entry budget exhausted");
+                self.record_admitted(
+                    scope,
+                    proxy_namespace,
+                    OVERFLOW_CONSUMER_SENTINEL,
+                    proxy_id,
+                    proxy_name,
+                    overflow_status_code,
+                    overflow_status_code,
+                    protocol_family,
+                    call_price,
+                    bytes_sent,
+                    bytes_received,
+                    bw_price_sent,
+                    bw_price_received,
+                    count_call,
+                    false,
+                );
                 return;
             }
 
@@ -1861,22 +1920,7 @@ impl ChargebackRegistry {
             {
                 let entry = self.entries.entry(owned_key).or_insert_with(|| {
                     created = true;
-                    ChargebackEntry::new(
-                        self.epoch,
-                        Arc::from(consumer),
-                        Arc::from(proxy_id),
-                        Arc::from(proxy_namespace),
-                        Arc::from(proxy_name),
-                        status_code,
-                        protocol_family,
-                        if count_call { call_price } else { 0.0 },
-                        bw_price_sent,
-                        bw_price_received,
-                        Arc::clone(&scope.currency),
-                        Arc::from(namespace_label),
-                        entry_bytes,
-                        identity_admission,
-                    )
+                    make_entry()
                 });
                 entry.record(bytes_sent, bytes_received, count_call, self.epoch);
             }
@@ -1884,20 +1928,102 @@ impl ChargebackRegistry {
                 // Lost the publish race: the winner owns the single reservation
                 // for this key. Release ours exactly once so the budget stays
                 // exact.
-                self.release_reservation(entry_bytes, identity_admission);
-            } else if let Some(slot) = reserved_slot
-                && slot
-                    .present
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                // The reserved row now exists: its bytes moved from the
-                // outstanding reserve into `retained_bytes`.
-                saturating_fetch_sub(&self.outstanding_overflow_reserve, slot.bytes);
+                self.release_reservation(entry_bytes, true);
             }
         }
 
         self.maybe_invalidate_caches();
+    }
+
+    /// Cold path for an aggregate overflow row that the fast path did not
+    /// find.
+    ///
+    /// **Never waits.** A running eviction pass or reservation publication
+    /// holds the retirement lock exclusively for a whole-registry walk, and
+    /// the request path must not block behind it. The lock is only TRIED: with
+    /// it, a newly created reserved row also moves its bytes out of the
+    /// outstanding reserve; without it, the row is still created against its
+    /// own reservation, and its bytes simply stay counted as outstanding
+    /// (conservatively, protecting more than needed) until the pass that holds
+    /// the lock re-derives every reservation flag from the rows that exist.
+    ///
+    /// The byte reservation is taken under the row's shard lock, so
+    /// concurrent first creations of the same aggregate row serialize: the
+    /// later ones find the row and record into it instead of each reserving
+    /// its bytes speculatively and dropping charges one row would hold.
+    fn record_new_aggregate_row(
+        &self,
+        owned_key: String,
+        entry_bytes: usize,
+        make_entry: impl FnOnce() -> ChargebackEntry,
+        bytes_sent: u64,
+        bytes_received: u64,
+        count_call: bool,
+    ) {
+        let reservation_guard = match self.retirement_lock.try_read() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        let reservations = self.overflow_reservations.load_full();
+        let reserved_slot = reservations.get(owned_key.as_str());
+        let own_reserved_bytes = reserved_slot
+            .filter(|slot| !slot.present.load(Ordering::Acquire))
+            .map_or(0, |slot| slot.bytes);
+        let created = match self.entries.entry(owned_key) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                occupied
+                    .get()
+                    .record(bytes_sent, bytes_received, count_call, self.epoch);
+                false
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                if !self.try_reserve(entry_bytes, false, own_reserved_bytes) {
+                    drop(vacant);
+                    self.dropped_charges_total.fetch_add(1, Ordering::Relaxed);
+                    self.warn_on_admission("retained-byte budget exhausted");
+                    return;
+                }
+                vacant.insert(make_entry()).record(
+                    bytes_sent,
+                    bytes_received,
+                    count_call,
+                    self.epoch,
+                );
+                true
+            }
+        };
+        if created
+            && reservation_guard.is_some()
+            && let Some(slot) = reserved_slot
+            && slot
+                .present
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            // The reserved row now exists: its bytes moved from the
+            // outstanding reserve into `retained_bytes`.
+            saturating_fetch_sub(&self.outstanding_overflow_reserve, slot.bytes);
+        }
+        drop(reservation_guard);
+    }
+
+    /// Re-derive every reservation flag and the outstanding reserve from the
+    /// rows that exist. Runs under the exclusive retirement lock at the end of
+    /// each eviction pass, which also heals the conservative over-count left
+    /// by aggregate rows created while the lock was held elsewhere.
+    fn reconcile_overflow_reservations(&self) {
+        let reservations = self.overflow_reservations.load_full();
+        let mut outstanding = 0usize;
+        for (key, slot) in reservations.iter() {
+            let present = self.entries.contains_key(key.as_str());
+            slot.present.store(present, Ordering::Release);
+            if !present {
+                outstanding = outstanding.saturating_add(slot.bytes);
+            }
+        }
+        self.outstanding_overflow_reserve
+            .store(outstanding, Ordering::Release);
     }
 
     /// Reserve one entry's retained bytes, and a retained-row slot when the
@@ -2197,9 +2323,9 @@ impl ChargebackRegistry {
 
     /// [`Self::evict_stale`] with callbacks run after candidate selection and
     /// after candidate removal, so tests can interleave a record with a pass
-    /// deterministically. A callback may record onto an existing row or create
-    /// an ordinary row; it must not create an aggregate overflow row (that
-    /// path takes the retirement lock this pass holds).
+    /// deterministically. A callback may record onto existing rows or create
+    /// new ones, including aggregate overflow rows: their creation only tries
+    /// the retirement lock this pass holds, so it proceeds without waiting.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn evict_stale_interleaved_for_tests(
@@ -2249,6 +2375,7 @@ impl ChargebackRegistry {
             .store(uncollected, Ordering::Relaxed);
         candidates.retain(|(group, _)| !retained_groups.contains(group));
         if candidates.is_empty() {
+            self.reconcile_overflow_reservations();
             return 0;
         }
         after_selection();
@@ -2279,7 +2406,6 @@ impl ChargebackRegistry {
             }
         }
 
-        let reservations = self.overflow_reservations.load_full();
         let mut evicted = 0;
         for (group, key, entry) in removed {
             if revived.contains(&group) {
@@ -2288,19 +2414,12 @@ impl ChargebackRegistry {
             }
             evicted += 1;
             // Release the retired entry's reservation so capacity recovers
-            // exactly, and return a reserved overflow row's bytes to the
-            // outstanding reserve.
+            // exactly.
             self.release_reservation(entry.retained_bytes, entry.counts_against_identity_budget);
-            if let Some(slot) = reservations.get(key.as_str())
-                && slot
-                    .present
-                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                self.outstanding_overflow_reserve
-                    .fetch_add(slot.bytes, Ordering::AcqRel);
-            }
         }
+        // A retired reserved overflow row returns its bytes to the outstanding
+        // reserve; rows created during the pass are counted as present.
+        self.reconcile_overflow_reservations();
         if evicted > 0 {
             self.prometheus_cache.store(Arc::new(None));
             self.json_cache.store(Arc::new(None));
