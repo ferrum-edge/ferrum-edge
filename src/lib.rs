@@ -188,6 +188,21 @@ pub mod _test_support {
             .await
     }
 
+    /// Bytes of backend-provided semantic text (task id, context id, task
+    /// state) an `a2a_gateway` SSE inspector retains after ingesting `chunks`,
+    /// before the stream ends.
+    pub fn a2a_sse_retained_semantic_bytes_for_test(
+        binding: &'static str,
+        metadata_limit: usize,
+        chunks: &[&[u8]],
+    ) -> usize {
+        crate::plugins::a2a_gateway::sse_inspector_retained_semantic_bytes(
+            binding,
+            metadata_limit,
+            chunks,
+        )
+    }
+
     /// `body_validator`'s omitted-field gRPC decompression default resolved
     /// from a raw `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` value (clamped to the
     /// hard ceiling).
