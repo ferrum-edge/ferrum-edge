@@ -32786,7 +32786,9 @@ components:
                 maxLength: 262144
                 description: >-
                   Response body string (default empty), at most 262144 UTF-8
-                  bytes. Omitted or null selects empty. On the wire, HEAD responses omit content bytes
+                  bytes (runtime counts bytes, so a multibyte body can be
+                  refused below this schema's character maxLength). Omitted or
+                  null selects empty. On the wire, HEAD responses omit content bytes
                   while keeping representation Content-Length. Statuses 204, 205,
                   and 304 omit both the body and Content-Length even when this
                   field is non-empty. Shared synthetic-response finalization

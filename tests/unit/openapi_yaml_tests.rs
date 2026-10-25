@@ -15685,7 +15685,8 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         .as_str()
         .expect("status_code description");
     assert!(
-        status_desc.contains("informational") && status_desc.contains("rejected"),
+        status_desc.contains("Informational statuses (100–199, including 101)")
+            && status_desc.contains("rejected"),
         "status_code must document informational rejection: {status_desc}"
     );
     assert!(
@@ -15829,12 +15830,12 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("Host-only"));
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
-    assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Unknown top-level, per-rule, and `match` keys are rejected"));
     assert!(guide.contains("Omitted or explicit `null`"));
     assert!(guide.contains("0`–`60000"));
     assert!(guide.contains("FERRUM_MAX_CONCURRENT_FAULT_DELAYS"));
     assert!(guide.contains("Status / body wire semantics"));
-    assert!(guide.contains("informational statuses"));
+    assert!(guide.contains("Informational statuses (`100`–`199`, including `101`) are rejected"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
 

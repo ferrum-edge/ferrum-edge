@@ -8,25 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `response_mock` delays, statuses, and config sizes are bounded**
-  (issue/PR #6869). `delay_ms` now runs under the shared fault-delay bounds
-  (the process-wide `FERRUM_MAX_CONCURRENT_FAULT_DELAYS` budget shared with
-  `fault_injection`, shutdown-drain cancellation, HTTP/3 peer-gone
-  cancellation) instead of a bare timer, and its maximum drops from 3600000 to
-  60000 ms. An exhausted budget or a shutdown serves the mock at once; a
-  departed client gets `499`. `status_code: 101` is rejected at construction,
-  and a `2xx` rule that matches a WebSocket handshake now answers `500` on
-  H1, H2, and H3 instead of a success the mock cannot honor (an HTTP/2
-  Extended CONNECT `2xx` with a body was reset). Configs are bounded to 1024
-  rules, 262144-byte bodies, 64 response headers per rule, and 8192-byte
-  header values; a config over a bound is rejected at load/reload.
-- **`response_mock` request conditions, indexed matching, and shared bodies**
-  (#6869). Rules accept an optional `match` with exact `headers` (client-sent
-  field lines) and `query_params` conditions (1–16 each); a rule whose
-  conditions fail falls through to the next rule, and condition values are
-  redacted in non-admin config reads. Exact rule paths are served from a
-  construction-time index with a combined regex prefilter (first-match order
-  unchanged), and mock bodies are shared `Bytes` instead of a per-hit copy.
 - **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
   `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
   most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,

@@ -28,28 +28,6 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `response_mock` delays, statuses, and config sizes are bounded (#6869)
-
-`response_mock` `delay_ms` now accepts at most `60000` (one minute, the same
-ceiling as `fault_injection`); a rule above it fails startup/reload and admin
-API writes. Lower any larger delay before upgrading. Delays also count against
-`FERRUM_MAX_CONCURRENT_FAULT_DELAYS` (default 256, shared with
-`fault_injection`): when that budget is exhausted, or the gateway is shutting
-down, the mock is served without its delay, so raise the budget if a latency
-test parks more concurrent requests than that.
-
-`status_code: 101` is no longer accepted. Previously it produced a synthetic
-handshake that no client could use (and that HTTP/2 / HTTP/3 cannot carry).
-A `2xx` rule that matches a WebSocket handshake now answers `500` on every
-frontend; mock a refused handshake with a non-`2xx` status (for example `401`,
-`403`, `418`, or `503`) instead, or set `passthrough_on_no_match: true` and
-let the real backend answer.
-
-Configs are bounded to 1024 rules, a 262144-byte `body` per rule, 64 response
-`headers` per rule, and 8192-byte header values. Split oversized rule sets
-across proxies or trim fixture bodies. Configs within these bounds need no
-change.
-
 ### `cors` method and header lists are bounded (#6844)
 
 `cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept

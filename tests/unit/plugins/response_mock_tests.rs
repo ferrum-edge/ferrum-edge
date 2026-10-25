@@ -1153,7 +1153,8 @@ fn test_supported_protocols() {
 //
 // Runtime classifies upgrades as ProxyProtocol::WebSocket and still selects
 // this plugin for HTTP + WebSocket. Matching only Rejects the handshake
-// HTTP response; it never establishes a frame stream — including status 101.
+// HTTP response; it never establishes a frame stream, so success-shaped (2xx)
+// rules fail closed at a real handshake boundary and 101 is never accepted.
 
 #[tokio::test]
 async fn test_websocket_upgrade_matching_rule_short_circuits_handshake() {
