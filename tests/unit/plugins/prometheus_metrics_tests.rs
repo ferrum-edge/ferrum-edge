@@ -3838,7 +3838,7 @@ fn unmatched_requests_are_counted_by_closed_reason_and_status() {
     registry.record_unmatched_request(ROUTE_NOT_FOUND_PHASE, 404);
     registry.record_unmatched_request(ROUTE_NOT_FOUND_PHASE, 404);
     registry.record_unmatched_request(MESH_REGISTRY_ONLY_PHASE, 502);
-    registry.record_unmatched_request("not-a-routing-phase", 70_000);
+    registry.record_unmatched_request("not-a-routing-phase", 700);
 
     assert_eq!(registry.unmatched_request_counter.len(), 3);
     assert!(
