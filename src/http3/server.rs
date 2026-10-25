@@ -4124,7 +4124,7 @@ async fn handle_h3_request(
                 ),
             );
             record_h3_flavor_aware_reject(&state, http_flavor, 404);
-            send_h3_error_flavor_aware(
+            let sent = send_h3_error_flavor_aware(
                 &mut stream,
                 http_flavor,
                 grpc_web_response_content_type,
@@ -4133,9 +4133,11 @@ async fn handle_h3_request(
                 crate::proxy::grpc_proxy::grpc_status::NOT_FOUND,
                 "Not Found",
             )
-            .await?;
+            .await;
             // Same contract as the H1/H2 route miss: global access logs record
-            // it, and without one this is a single pointer check.
+            // it, and without one this is a single pointer check. Delivered
+            // before the write result propagates, so a peer that resets or
+            // closes during the 404 still leaves its access record.
             if let Some(unrouted_log_plugins) =
                 epoch.plugin_cache.unrouted_transaction_log_plugins()
             {
@@ -4143,11 +4145,13 @@ async fn handle_h3_request(
                 crate::proxy::log_unrouted_request(
                     &unrouted_log_plugins,
                     &ctx,
+                    &state.env_config.namespace,
                     StatusCode::NOT_FOUND.as_u16(),
                     start_time,
                 )
                 .await;
             }
+            sent?;
             return Ok(());
         }
     };

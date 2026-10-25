@@ -24816,9 +24816,14 @@ pub async fn log_rejected_request(
 /// summary has no proxy, backend, consumer, or plugin time; it carries
 /// `metadata.rejection_phase = "route_not_found"`. The routing diagnostic was
 /// already recorded by `record_route_miss`, so this does not record another.
-pub(crate) async fn log_unrouted_request(
+///
+/// `namespace` is the gateway's serving namespace (`FERRUM_NAMESPACE`), the
+/// only namespace a request that matched no proxy can be attributed to; never
+/// the resource-deserialization default.
+pub async fn log_unrouted_request(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
+    namespace: &str,
     status_code: u16,
     start_time: Instant,
 ) {
@@ -24829,7 +24834,7 @@ pub(crate) async fn log_unrouted_request(
         crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE.to_string(),
     );
     let summary = TransactionSummary {
-        namespace: crate::config::types::default_namespace(),
+        namespace: namespace.to_owned(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         http_method: ctx.method.clone(),
@@ -35266,6 +35271,7 @@ async fn handle_proxy_request_inner(
                         log_unrouted_request(
                             &unrouted_log_plugins,
                             &ctx,
+                            &state.env_config.namespace,
                             StatusCode::NOT_FOUND.as_u16(),
                             start_time,
                         )
