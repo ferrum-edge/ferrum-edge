@@ -83,6 +83,11 @@ struct JsonReadings {
     hit: Vec<bool>,
     /// JSON-path rules not yet hit on this body.
     pending: usize,
+    /// A COMPLETE message of a framed RPC stream could not be read (it was
+    /// refused, compressed, or lies past a framing defect). That message is
+    /// a whole document whatever `max_scan_bytes` did to a later one, so its
+    /// refusal is judged even when the body as a whole is only a prefix.
+    complete_message_refused: bool,
 }
 
 /// How one reading's refusal is weighed.
@@ -112,6 +117,7 @@ impl JsonReadings {
             budget: json_doc::WorkBudget::for_body(length),
             hit: Vec::new(),
             pending: rules,
+            complete_message_refused: false,
         }
     }
 
@@ -125,7 +131,10 @@ impl JsonReadings {
         };
         let opening = match kind {
             ReadingKind::Alternative | ReadingKind::SniffedCharset => opening,
-            ReadingKind::FramedMessage => json_doc::JsonOpening::Yes,
+            ReadingKind::FramedMessage => {
+                self.complete_message_refused = true;
+                json_doc::JsonOpening::Yes
+            }
         };
         self.refused = true;
         self.refused_opening = self.refused_opening.max(opening);
@@ -136,6 +145,18 @@ impl JsonReadings {
     fn record_unreadable(&mut self) {
         self.refused = true;
         self.refused_opening = json_doc::JsonOpening::Yes;
+        self.complete_message_refused = true;
+    }
+
+    /// The extent a refusal is judged under. A prefix scan cuts only the
+    /// document the window ends in; a complete framed message that could not
+    /// be read is judged as the complete document it is.
+    fn judged_extent(&self, body: BodyExtent) -> BodyExtent {
+        if self.complete_message_refused {
+            BodyExtent::Complete
+        } else {
+            body
+        }
     }
 
     fn is_hit(&self, position: usize) -> bool {
@@ -792,7 +813,7 @@ impl Waf {
             );
         }
         if readings.fail_closed(content_type) {
-            self.push_unparsed_json_hits(outcome, subject, extent);
+            self.push_unparsed_json_hits(outcome, subject, readings.judged_extent(extent));
         }
     }
 

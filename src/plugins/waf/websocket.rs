@@ -484,6 +484,31 @@ impl WafWsSession {
     }
 }
 
+impl Waf {
+    /// Bind this instance to the upgrade `ctx` exactly as the relay does and
+    /// decide a CLEAN message in `direction` whose scan missed its deadline;
+    /// `true` when the session closes. Not a production API: external tests
+    /// use it to pin the WebSocket `on_scan_timeout` disposition without
+    /// depending on how long a real scan takes.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests
+    pub fn ws_clean_timed_out_message_closes_for_test(
+        self: Arc<Self>,
+        ctx: &RequestContext,
+        direction: WebSocketFrameDirection,
+    ) -> bool {
+        let policy = WsSessionPolicy::from_upgrade(&self, ctx);
+        let session = WafWsSession { waf: self, policy };
+        let outcome = ScanOutcome {
+            timed_out: true,
+            ..ScanOutcome::default()
+        };
+        session
+            .finish("test-proxy", 0, direction, &outcome)
+            .is_some()
+    }
+}
+
 #[async_trait]
 impl Plugin for WafWsSession {
     fn name(&self) -> &str {

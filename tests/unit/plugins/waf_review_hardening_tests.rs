@@ -423,6 +423,53 @@ async fn the_scan_window_edge_is_not_a_framing_defect() {
     assert_eq!(meta(&request, "waf.body_uninspected"), None);
 }
 
+#[tokio::test]
+async fn a_complete_unreadable_message_is_judged_even_when_a_later_one_is_cut() {
+    // Message 1 is complete inside the 128-byte window but holds a number
+    // `serde_json` refuses (#6807); message 2 runs past the window. Only the
+    // cut message is exempt from judgement, not the complete one before it.
+    let mut config = json_path_bio_rule();
+    config["max_scan_bytes"] = json!(128);
+    config["on_body_too_large"] = json!("scan_truncated");
+    let plugin = waf(config).unwrap();
+    let refused = br#"{"user":{"bio":"forbidden-canary"},"n":1e400}"#;
+    let padding = format!(r#"{{"pad":"{}"}}"#, "p".repeat(300));
+    let mut frames = grpc_frame(0, refused);
+    frames.extend(grpc_frame(0, padding.as_bytes()));
+    let text = base64::engine::general_purpose::STANDARD.encode(&frames);
+
+    for (content_type, body) in [
+        ("application/grpc+json", frames.clone()),
+        ("application/grpc-web-text+json", text.into_bytes()),
+    ] {
+        let (result, request) =
+            final_request_body(&plugin, "POST", &[("content-type", content_type)], &body).await;
+        assert!(is_reject(&result), "{content_type}");
+        assert_eq!(
+            meta(&request, "waf.rule_hits"),
+            Some("BIO"),
+            "{content_type}"
+        );
+        assert_eq!(
+            meta(&request, "waf.scan_truncated"),
+            Some("true"),
+            "{content_type}"
+        );
+    }
+
+    // Control: a parseable complete message before the cut still passes.
+    let mut clean = grpc_frame(0, br#"{"user":{"bio":"hello"}}"#);
+    clean.extend(grpc_frame(0, padding.as_bytes()));
+    let (result, _) = final_request_body(
+        &plugin,
+        "POST",
+        &[("content-type", "application/grpc+json")],
+        &clean,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
 // ── waf-SOL-2: bounded bodies relabeled as SSE ─────────────────────────────
 
 fn gzip(data: &[u8]) -> Vec<u8> {
@@ -933,38 +980,25 @@ async fn header_present_suppresses_the_strict_unlisted_response_block() {
     }
 }
 
-#[tokio::test]
-async fn header_present_suppresses_the_scan_timeout_block() {
-    // One scan of a 1 MB body cannot finish inside a 1 ms budget (the same
-    // premise the WebSocket timeout tests use); the body itself is clean.
+#[test]
+fn header_present_suppresses_the_scan_timeout_block() {
+    // The timeout outcome is forced, so the verdict depends on the
+    // disposition alone and never on how fast a real scan ran.
     let mut config = with_bypass_secret(enforcing_body_text_rule("enforce"));
-    config["scan_budget_ms"] = json!(1);
-    config["max_scan_bytes"] = json!(2_000_000);
     config["on_scan_timeout"] = json!("block");
     let plugin = waf(config).unwrap();
-    let body = "a".repeat(1_000_000);
 
     let mut trusted = exempt(ctx("POST", "/upload"));
-    trusted
-        .headers
-        .insert("content-type".into(), "text/plain".into());
-    let headers = trusted.headers.clone();
-    let result = plugin
-        .on_final_request_body_with_context(&mut trusted, &headers, body.as_bytes())
-        .await;
+    let result = plugin.finish_clean_timed_out_body_scan_for_test(&mut trusted, true);
     assert!(
         matches!(result, PluginResult::Continue),
         "a trusted hop's clean but late scan is not refused"
     );
+    assert_eq!(meta(&trusted, "waf.scan_timed_out"), Some("true"));
+    assert_eq!(meta(&trusted, "waf.block_reason"), None);
 
     let mut untrusted = ctx("POST", "/upload");
-    untrusted
-        .headers
-        .insert("content-type".into(), "text/plain".into());
-    let headers = untrusted.headers.clone();
-    let result = plugin
-        .on_final_request_body_with_context(&mut untrusted, &headers, body.as_bytes())
-        .await;
+    let result = plugin.finish_clean_timed_out_body_scan_for_test(&mut untrusted, true);
     assert!(is_reject(&result));
     assert_eq!(meta(&untrusted, "waf.block_reason"), Some("scan_timeout"));
 }

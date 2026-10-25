@@ -603,29 +603,35 @@ fn over_budget_clean_message() -> Message {
 
 /// `on_scan_timeout: block` closes every over-budget session except one whose
 /// upgrade carried a `global_exemptions.header_present` secret, mirroring the
-/// HTTP `finish_timeout`.
-#[tokio::test]
-async fn scan_timeout_block_spares_a_header_present_exempt_session() {
+/// HTTP `finish_timeout`. The timed-out outcome is forced through the
+/// session-bound decision, so the verdict never depends on scan speed.
+#[test]
+fn scan_timeout_block_spares_a_header_present_exempt_session() {
     let mut config = enforcing_request_rule();
-    config["scan_budget_ms"] = json!(1);
     config["on_scan_timeout"] = json!("block");
     config["global_exemptions"] = json!({
         "header_present": { "x-skip-waf": "trusted-hop-shared-secret" }
     });
-    let plugins = vec![waf(config)];
-    let original = over_budget_clean_message();
+    let plugin = Arc::new(Waf::new(&config).expect("valid waf config"));
 
     let mut exempt_ctx = upgrade_ctx("/ws");
     exempt_ctx.headers.insert(
         "x-skip-waf".to_string(),
         "trusted-hop-shared-secret".to_string(),
     );
-    let exempt = relay_to_backend(&plugins, &exempt_ctx, original.clone()).await;
-    assert_eq!(exempt, original);
+    assert!(
+        !Arc::clone(&plugin).ws_clean_timed_out_message_closes_for_test(
+            &exempt_ctx,
+            WebSocketFrameDirection::ClientToBackend
+        ),
+        "a header-exempt session is not closed on a clean but late message"
+    );
 
     let governed_ctx = upgrade_ctx("/ws");
-    let governed = relay_to_backend(&plugins, &governed_ctx, original).await;
-    assert_policy_close(&governed);
+    assert!(plugin.ws_clean_timed_out_message_closes_for_test(
+        &governed_ctx,
+        WebSocketFrameDirection::ClientToBackend
+    ));
 }
 
 /// A message the WAF scanned end to end and found clean is forwarded on the

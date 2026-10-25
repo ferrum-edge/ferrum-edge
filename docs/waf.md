@@ -585,7 +585,10 @@ ordinary body.
 
 A body scanned only up to `max_scan_bytes` (`on_body_too_large:
 scan_truncated`, or a prefix scan in a configuration that cannot block) is cut
-short by construction and is not judged. WebSocket messages carry no
+short by construction and is not judged — except a complete gRPC / gRPC-Web
+message inside the window, which is a whole document of its own and fails
+closed when it cannot be read, whatever the window did to a later message.
+WebSocket messages carry no
 `Content-Type`, so only the opening rules apply to them.
 
 What remains outside `body_json_path` inspection is a part of a body that is

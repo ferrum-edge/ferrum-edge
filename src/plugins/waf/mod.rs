@@ -1130,6 +1130,24 @@ impl Waf {
         PluginResult::Continue
     }
 
+    /// Decide a CLEAN request-body scan that missed its deadline, exactly as
+    /// the final request-body hook does, without depending on how long a real
+    /// scan takes. Not a production API: external tests use it to pin the
+    /// `on_scan_timeout` disposition deterministically.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests
+    pub fn finish_clean_timed_out_body_scan_for_test(
+        &self,
+        ctx: &mut RequestContext,
+        timeout_enforces: bool,
+    ) -> PluginResult {
+        let outcome = ScanOutcome {
+            timed_out: true,
+            ..ScanOutcome::default()
+        };
+        self.finish_scan(ctx, outcome, WafScorePhase::Accumulating, timeout_enforces)
+    }
+
     /// Build the configured rejection response (status, content-type, body).
     /// On TCP/UDP stream paths the proxy ignores the status/body and simply
     /// drops the connection or datagram; the `Reject` variant is what triggers
