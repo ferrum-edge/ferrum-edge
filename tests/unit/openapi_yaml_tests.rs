@@ -3475,6 +3475,16 @@ fn ai_rate_limiter_schema_matches_constructor_admission() {
             "redis_url": "redis://cache.internal:6379/0",
             "redis_failure_policy": "fail_closed"
         }),
+        // Budget overrides and the per-media estimate (ai_rate_limiter-MUSE-6/7).
+        json!({
+            "token_limit": 100,
+            "consumer_limits": {"alice": 5000, "bob": 1},
+            "model_limits": {"o1": 2000},
+            "media_token_estimate": 765
+        }),
+        json!({"token_limit": 100, "limit_by": "ip", "model_limits": {"gpt-4o": 10}}),
+        json!({"token_limit": 100, "limit_by": "ip", "consumer_limits": {}}),
+        json!({"token_limit": 100, "media_token_estimate": 0}),
     ];
     for config in &accepted {
         assert_schema_and_constructor(
@@ -3502,6 +3512,14 @@ fn ai_rate_limiter_schema_matches_constructor_admission() {
         json!({"token_limit": 100, "redis_health_check_interval_seconds": -1}),
         json!({"token_limit": 100, "count_mode": "completion_token"}),
         json!({"token_limit": 100, "toke_limit": 100}),
+        json!({"token_limit": 100, "limit_by": "ip", "consumer_limits": {"alice": 5}}),
+        json!({"token_limit": 100, "consumer_limits": {"alice": 0}}),
+        json!({"token_limit": 100, "consumer_limits": {"": 5}}),
+        json!({"token_limit": 100, "consumer_limits": ["alice"]}),
+        json!({"token_limit": 100, "model_limits": {"o1": -1}}),
+        json!({"token_limit": 100, "model_limits": {"o1": "10"}}),
+        json!({"token_limit": 100, "media_token_estimate": 1000001}),
+        json!({"token_limit": 100, "media_token_estimate": -1}),
     ];
     for config in &rejected {
         assert_schema_and_constructor(
