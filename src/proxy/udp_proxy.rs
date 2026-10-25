@@ -67,6 +67,14 @@ pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
     crate::util::client_identity::canonical_ip_arc(client_addr.ip())
 }
 
+/// Typed form of [`udp_session_client_ip`]: the same canonical identity
+/// (IPv4-mapped IPv6 folded to IPv4), computed once per session for
+/// [`UdpDatagramContext::client_ip_addr`].
+#[inline]
+pub fn udp_session_client_addr(client_addr: SocketAddr) -> IpAddr {
+    crate::util::client_identity::canonical_ip(client_addr.ip())
+}
+
 /// Canonical client endpoint for diagnostics. Transport paths retain the raw
 /// socket address for reply routing and DTLS demux, but log fields must not
 /// split one IPv4 client across native and mapped-IPv6 representations.
@@ -338,7 +346,12 @@ struct UdpSession {
     /// Plugins and proxy metadata resolved from the RequestEpoch used to create this session.
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     datagram_plugins: Arc<[Arc<dyn Plugin>]>,
+    /// Ends this session when its proxy's datagram-hook policy changes after
+    /// admission. `None` only for directly constructed test sessions.
+    datagram_policy_fence: Option<UdpDatagramPolicyFence>,
     datagram_client_ip: Arc<str>,
+    /// Typed form of `datagram_client_ip`, computed once at admission.
+    datagram_client_addr: IpAddr,
     /// Authenticated forwarded client this session was admitted with, when the
     /// listener runs the datagram client-address gate. Later datagrams from the
     /// same socket peer must carry the same value; a different one is dropped
@@ -570,11 +583,118 @@ impl NodeWaypointUdpSessionSource {
     }
 }
 
+/// Datagram-hook policy fence for one established UDP/DTLS session.
+///
+/// A session binds its datagram-hook list ONCE, at first-datagram admission,
+/// from one plugin-cache generation (issue #3734 trigger decisions belong to
+/// that generation too). Without a fence, a reload that adds, removes, or
+/// reconfigures a datagram hook on the session's proxy — for example
+/// tightening `udp_rate_limiting` during a flood — never reached a flow that
+/// keeps sending, because every admitted datagram refreshes its idle timer.
+///
+/// The fence compares the published configuration generation with the last
+/// one it verified: two atomic loads (the session's verified generation and the
+/// store's published mirror) while nothing changed, so the
+/// per-datagram path stays allocation-, lock-, and hash-free. When the
+/// generation moves it reads, through an `ArcSwap` guard, the proxy's CURRENT
+/// datagram-hook policy digest — precomputed when the plugin cache built the
+/// entry from the plugin configs' ids, triggers, priorities, and config
+/// documents (`plugin_cache::udp_datagram_policy_digest`) — and compares it
+/// with the admission digest. A reload that leaves the proxy's datagram-hook
+/// configs unchanged (an unrelated delta, or a full rebuild that reconstructs
+/// identical instances) re-verifies and the session continues; a real policy
+/// change ends the session so the client's next datagram is admitted —
+/// stream-connect chain, trigger decisions, and hook list — under the current
+/// generation.
+pub(crate) struct UdpDatagramPolicyFence {
+    store: Arc<RequestEpochStore>,
+    namespace: String,
+    proxy_id: String,
+    /// Digest of the proxy's datagram-hook policy in the admission generation.
+    admitted_digest: crate::plugin_cache::UdpDatagramPolicyDigest,
+    /// Pins the admission generation's instances: an instance that contributes
+    /// `Arc` identity (not built through the cache funnel) to the digest must
+    /// not be freed and its address reused while the session compares against it.
+    _admitted_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    verified_generation: AtomicU64,
+}
+
+impl UdpDatagramPolicyFence {
+    pub(crate) fn new(
+        store: Arc<RequestEpochStore>,
+        admission_epoch: &RequestEpoch,
+        namespace: &str,
+        proxy_id: &str,
+        admitted_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    ) -> Self {
+        Self {
+            store,
+            namespace: namespace.to_owned(),
+            proxy_id: proxy_id.to_owned(),
+            admitted_digest: admission_epoch
+                .plugin_cache
+                .udp_datagram_policy_digest(namespace, proxy_id),
+            _admitted_plugins: admitted_plugins,
+            verified_generation: AtomicU64::new(admission_epoch.config_generation()),
+        }
+    }
+
+    /// Whether the session's admitted datagram hooks are still the proxy's
+    /// current ones.
+    #[inline]
+    pub(crate) fn is_current(&self) -> bool {
+        let verified = self.verified_generation.load(Ordering::Acquire);
+        if self.store.published_config_generation() == verified {
+            return true;
+        }
+        self.reverify(verified)
+    }
+
+    #[cold]
+    fn reverify(&self, verified: u64) -> bool {
+        self.store.with_current(|epoch| {
+            let generation = epoch.config_generation();
+            if generation == verified {
+                return true;
+            }
+            let current = epoch
+                .plugin_cache
+                .udp_datagram_policy_digest(&self.namespace, &self.proxy_id);
+            if current != self.admitted_digest {
+                return false;
+            }
+            self.verified_generation
+                .fetch_max(generation, Ordering::AcqRel);
+            true
+        })
+    }
+}
+
+/// Error recorded when a session ends because its proxy's datagram-hook policy
+/// changed after admission.
+pub(crate) fn udp_datagram_policy_changed_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "UDP datagram plugin policy for this proxy changed after session admission; \
+         closing the session so the next datagram is admitted under the current policy"
+    )
+}
+
 impl UdpSession {
-    /// Revalidate destination ownership and retire this session fail-closed on
-    /// removal or reownership. The reply task remains the identity-aware map
-    /// remover and accounting owner; flag + wake prevents any further send.
+    /// Revalidate the session's admission-time capabilities before a side
+    /// effect, retiring the session fail-closed when one no longer holds:
+    /// NodeWaypoint destination ownership (removal or reownership) and the
+    /// datagram-hook policy generation ([`UdpDatagramPolicyFence`]). The reply
+    /// task remains the identity-aware map remover and accounting owner; flag
+    /// + wake prevents any further send.
     fn revalidate_destination(&self) -> Result<(), anyhow::Error> {
+        if let Some(fence) = self.datagram_policy_fence.as_ref()
+            && !fence.is_current()
+        {
+            self.expired.store(true, Ordering::Release);
+            signal_udp_reply_task_stop(&self.stop_reply_task, self.stop_notify.as_ref());
+            self.close_hook_ingress();
+            return Err(udp_datagram_policy_changed_error());
+        }
         let Some(destination) = self.node_waypoint_destination.as_ref() else {
             return Ok(());
         };
@@ -1205,6 +1325,7 @@ fn spawn_session_hook_ingress_worker(
                 allowed = udp_datagram_allowed(
                 &session.datagram_plugins,
                 Arc::clone(&session.datagram_client_ip),
+                session.datagram_client_addr,
                 Arc::clone(&session.datagram_proxy_id),
                 session.datagram_proxy_name.clone(),
                 session.listen_port,
@@ -2172,6 +2293,7 @@ fn resolve_udp_session_epoch_view(
 async fn udp_datagram_allowed(
     datagram_plugins: &[Arc<dyn Plugin>],
     client_ip: Arc<str>,
+    client_ip_addr: IpAddr,
     proxy_id: Arc<str>,
     proxy_name: Option<Arc<str>>,
     listen_port: u16,
@@ -2187,6 +2309,7 @@ async fn udp_datagram_allowed(
 
     let ctx = UdpDatagramContext {
         client_ip,
+        client_ip_addr,
         proxy_id,
         proxy_name,
         listen_port,
@@ -4897,7 +5020,7 @@ async fn process_new_session_datagram(
     identity: DatagramClientIdentity,
     proxy_id: &str,
     proxy_namespace: &str,
-    request_epoch: &RequestEpochStore,
+    request_epoch: &Arc<RequestEpochStore>,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
     frontend_socket: &Arc<FrontendUdpSocket>,
@@ -5098,6 +5221,7 @@ async fn process_new_session_datagram(
             udp_datagram_allowed(
                 &admitted_datagram_plugins,
                 udp_session_client_ip(identity.resolved()),
+                udp_session_client_addr(identity.resolved()),
                 Arc::from(view.proxy.id.as_str()),
                 view.proxy.name.as_deref().map(Arc::from),
                 listen_port,
@@ -5165,6 +5289,7 @@ async fn process_new_session_datagram(
     let per_ip_guard = reservation.take_per_ip_guard();
 
     let session = create_session(
+        request_epoch,
         &epoch,
         view,
         dns_cache,
@@ -5293,6 +5418,7 @@ async fn process_new_session_datagram(
             if !udp_datagram_allowed(
                 &session.datagram_plugins,
                 Arc::clone(&session.datagram_client_ip),
+                session.datagram_client_addr,
                 Arc::clone(&session.datagram_proxy_id),
                 session.datagram_proxy_name.clone(),
                 session.listen_port,
@@ -6019,6 +6145,15 @@ async fn start_dtls_frontend_listener(
                         .filter(|p| p.requires_udp_datagram_hooks())
                         .cloned()
                         .collect();
+                    // Ends this DTLS session if the proxy's datagram-hook
+                    // policy changes after admission (see the fence).
+                    let datagram_policy_fence = Arc::new(UdpDatagramPolicyFence::new(
+                        Arc::clone(&handler_request_epoch),
+                        &epoch,
+                        &proxy_namespace,
+                        &resolved_proxy_id,
+                        Arc::clone(&plugins),
+                    ));
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
                     // `client_ip` (remote.ip) follows the authenticated
@@ -6263,6 +6398,7 @@ async fn start_dtls_frontend_listener(
                         handler_ca_bundle.as_deref(),
                         &handler_cb_cache,
                         &datagram_plugins,
+                        datagram_policy_fence,
                         proxy_name.as_deref(),
                         port,
                         &handler_crls,
@@ -6434,6 +6570,7 @@ async fn handle_dtls_client(
     tls_ca_bundle_path: Option<&str>,
     circuit_breaker_cache: &CircuitBreakerCache,
     datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
+    datagram_policy_fence: Arc<UdpDatagramPolicyFence>,
     proxy_name: Option<&str>,
     listen_port: u16,
     crls: &crate::tls::CrlList,
@@ -6475,6 +6612,7 @@ async fn handle_dtls_client(
         Arc::clone(&response_budget_remaining),
         Arc::clone(&datagram_metadata),
         datagram_plugins,
+        datagram_policy_fence,
         proxy_name,
         listen_port,
         crls,
@@ -7566,6 +7704,7 @@ async fn handle_dtls_client_inner(
     response_budget_remaining: Arc<AtomicU64>,
     datagram_metadata: Arc<std::sync::Mutex<crate::plugins::MetadataMap>>,
     datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
+    datagram_policy_fence: Arc<UdpDatagramPolicyFence>,
     proxy_name: Option<&str>,
     listen_port: u16,
     crls: &crate::tls::CrlList,
@@ -7903,6 +8042,7 @@ async fn handle_dtls_client_inner(
     // Pre-compute context strings as Arc<str> — per-datagram "clone" is a pointer
     // bump (~5ns) instead of heap allocation + memcpy.
     let dgram_client_ip = udp_session_client_ip(identity.resolved());
+    let dgram_client_addr = udp_session_client_addr(identity.resolved());
     let dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let dgram_proxy_name: Option<Arc<str>> = proxy_name.map(Arc::from);
     let dgram_listen_port = listen_port;
@@ -7917,6 +8057,8 @@ async fn handle_dtls_client_inner(
     let dgram_metadata_rev = Arc::clone(&datagram_metadata);
     let node_waypoint_source_fwd = node_waypoint_source.clone();
     let node_waypoint_source_rev = node_waypoint_source;
+    let policy_fence_fwd = Arc::clone(&datagram_policy_fence);
+    let policy_fence_rev = datagram_policy_fence;
     let shared_activity_ms = Arc::new(AtomicU64::new(coarse_epoch_millis()));
 
     // Client → Backend
@@ -7972,6 +8114,11 @@ async fn handle_dtls_client_inner(
                     refusal.as_str()
                 ));
             }
+            // Datagram-hook policy changed since admission: end the session
+            // rather than keep applying the admission generation's hooks.
+            if !policy_fence_fwd.is_current() {
+                return Err(udp_datagram_policy_changed_error());
+            }
             let len = data.len();
             let admission_datagram = first_application_datagram;
             first_application_datagram = false;
@@ -7987,6 +8134,7 @@ async fn handle_dtls_client_inner(
             if !dgram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: Arc::clone(&dgram_client_ip),
+                    client_ip_addr: dgram_client_addr,
                     proxy_id: Arc::clone(&dgram_proxy_id),
                     proxy_name: dgram_proxy_name.clone(),
                     listen_port: dgram_listen_port,
@@ -8045,6 +8193,11 @@ async fn handle_dtls_client_inner(
                      ({})",
                     refusal.as_str()
                 ));
+            }
+            // A reload may have changed the datagram-hook policy while a hook
+            // awaited: do not forward under the admission generation's verdict.
+            if !policy_fence_fwd.is_current() {
+                return Err(udp_datagram_policy_changed_error());
             }
 
             // Publish before sending so a fast backend reply cannot observe a
@@ -8161,6 +8314,9 @@ async fn handle_dtls_client_inner(
                     refusal.as_str()
                 ));
             }
+            if !policy_fence_rev.is_current() {
+                return Err(udp_datagram_policy_changed_error());
+            }
             let len = data.len();
 
             metrics_rev.datagrams_in.fetch_add(1, Ordering::Relaxed);
@@ -8186,6 +8342,7 @@ async fn handle_dtls_client_inner(
             if !dgram_plugins_rev.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: dgram_client_ip_rev.clone(),
+                    client_ip_addr: dgram_client_addr,
                     proxy_id: dgram_proxy_id_rev.clone(),
                     proxy_name: dgram_proxy_name_rev.clone(),
                     listen_port,
@@ -8239,6 +8396,9 @@ async fn handle_dtls_client_inner(
                      ({})",
                     refusal.as_str()
                 ));
+            }
+            if !policy_fence_rev.is_current() {
+                return Err(udp_datagram_policy_changed_error());
             }
 
             let sent = within_dtls_trust_fence(
@@ -8527,6 +8687,7 @@ async fn admit_plain_udp_stream(
 /// Create a new UDP session after stream admission and first-datagram policy.
 #[allow(clippy::too_many_arguments)]
 async fn create_session(
+    request_epoch: &Arc<RequestEpochStore>,
     epoch: &RequestEpoch,
     view: UdpSessionEpochView,
     dns_cache: &DnsCache,
@@ -8899,7 +9060,15 @@ async fn create_session(
         node_waypoint_source,
         plugins: Arc::clone(&plugins),
         datagram_plugins: Arc::clone(&datagram_plugins),
+        datagram_policy_fence: Some(UdpDatagramPolicyFence::new(
+            Arc::clone(request_epoch),
+            epoch,
+            &proxy_namespace,
+            proxy_id,
+            Arc::clone(&plugins),
+        )),
         datagram_client_ip: Arc::clone(&datagram_client_ip),
+        datagram_client_addr: udp_session_client_addr(identity.resolved()),
         forwarded_client: identity.forwarded,
         datagram_proxy_id: Arc::clone(&datagram_proxy_id),
         datagram_proxy_name: datagram_proxy_name.clone(),
@@ -9239,6 +9408,7 @@ async fn create_session(
             if !reply_datagram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
                     client_ip: reply_dgram_client_ip.clone(),
+                    client_ip_addr: reply_session.datagram_client_addr,
                     proxy_id: reply_dgram_proxy_id.clone(),
                     proxy_name: reply_dgram_proxy_name.clone(),
                     listen_port: reply_listen_port,
@@ -9492,6 +9662,7 @@ async fn create_session(
                             if !reply_datagram_plugins.is_empty() {
                                 let ctx = UdpDatagramContext {
                                     client_ip: reply_dgram_client_ip.clone(),
+                                    client_ip_addr: reply_session.datagram_client_addr,
                                     proxy_id: reply_dgram_proxy_id.clone(),
                                     proxy_name: reply_dgram_proxy_name.clone(),
                                     listen_port: reply_listen_port,
@@ -10341,7 +10512,9 @@ impl UdpAuthorizationSessionProbe {
             node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_policy_fence: None,
             datagram_client_ip: Arc::from("127.0.0.1"),
+            datagram_client_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             forwarded_client: None,
             datagram_proxy_id: Arc::from("udp-proxy"),
             datagram_proxy_name: Some(Arc::from("UDP Proxy")),
@@ -10765,7 +10938,9 @@ impl UdpEgressWriterProbe {
             node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_policy_fence: None,
             datagram_client_ip: Arc::from("127.0.0.1"),
+            datagram_client_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             forwarded_client: None,
             datagram_proxy_id: Arc::from("udp-proxy"),
             datagram_proxy_name: Some(Arc::from("UDP Proxy")),
@@ -11035,7 +11210,9 @@ mod tests {
             node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_policy_fence: None,
             datagram_client_ip: Arc::from("127.0.0.1"),
+            datagram_client_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             forwarded_client: None,
             datagram_proxy_id: Arc::from("udp-proxy"),
             datagram_proxy_name: Some(Arc::from("UDP Proxy")),
@@ -12370,7 +12547,9 @@ backend_tls_verify_server_cert: false
             node_waypoint_source: None,
             plugins: Arc::new(Vec::new()),
             datagram_plugins: Arc::from([]),
+            datagram_policy_fence: None,
             datagram_client_ip: Arc::from("127.0.0.1"),
+            datagram_client_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             forwarded_client: None,
             datagram_proxy_id: Arc::from("udp-proxy"),
             datagram_proxy_name: Some(Arc::from("UDP Proxy")),
