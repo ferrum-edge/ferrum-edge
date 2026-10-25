@@ -15333,7 +15333,7 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     // constructor does.
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["items"]["not"]["enum"],
-        json!([206, 304])
+        json!([206, 304, 401, 407])
     );
     assert_eq!(
         schema["properties"]["vary_by_headers"]["items"]["pattern"],
@@ -15453,6 +15453,9 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": [206]}),
         json!({"cacheable_status_codes": [304]}),
         json!({"cacheable_status_codes": [200, 206]}),
+        // PR #6830: challenge-dependent statuses cannot be retained.
+        json!({"cacheable_status_codes": [401]}),
+        json!({"cacheable_status_codes": [200, 407]}),
         json!({"vary_by_headers": [""]}),
         json!({"vary_by_headers": ["bad header"]}),
         json!({"ignore_request_headers": [""]}),

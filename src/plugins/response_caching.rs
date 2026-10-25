@@ -331,12 +331,20 @@ const NEVER_CACHED_RESPONSE_HEADERS: [&str; 9] = [
 /// * `304 Not Modified` is validator metadata used to freshen an existing
 ///   stored representation (RFC 9111 §4.3.4), never a representation of its
 ///   own; storing one hands later callers an empty body under a `304` status.
+/// * `401 Unauthorized` / `407 Proxy Authentication Required` are only valid
+///   with their authentication challenge (RFC 9110 §15.5.2 / §15.5.8), and a
+///   shared cache cannot retain that challenge safely: `WWW-Authenticate` is
+///   per-response state under the shared replay-sanitation policy (a Digest
+///   challenge carries a per-response nonce) and `Proxy-Authenticate` is
+///   hop-scoped. A stored copy would therefore replay a challenge-less `401` /
+///   `407` that clients cannot act on, and the gateway deliberately never
+///   invents a challenge for an origin-authored replay.
 /// * `1xx` are interim responses and never final.
 ///
 /// These are rejected at configuration admission *and* refused again at store
-/// time, so neither an operator config nor a backend can turn a validator-only
-/// or partial payload into a reusable entry.
-const UNSUPPORTED_CACHEABLE_STATUS_CODES: [u16; 2] = [206, 304];
+/// time, so neither an operator config nor a backend can turn a validator-only,
+/// partial, or challenge-dependent payload into a reusable entry.
+const UNSUPPORTED_CACHEABLE_STATUS_CODES: [u16; 4] = [206, 304, 401, 407];
 
 fn is_supported_cacheable_status(status: u16) -> bool {
     status >= 200 && !UNSUPPORTED_CACHEABLE_STATUS_CODES.contains(&status)
@@ -1175,8 +1183,10 @@ fn parse_status_code_list(config: &Value, field: &'static str) -> Result<Option<
             return Err(format!(
                 "response_caching: `{field}[{index}]` (\"{code}\") has caching semantics this plugin \
                  does not implement and cannot be marked cacheable — 1xx responses are interim, \
-                 206 requires range/validator/completeness tracking, and 304 is validator \
-                 metadata for an existing stored representation rather than a representation"
+                 206 requires range/validator/completeness tracking, 304 is validator \
+                 metadata for an existing stored representation rather than a representation, \
+                 and 401/407 are only valid with an authentication challenge a shared cache \
+                 cannot retain"
             ));
         }
         status_codes.push(code);
@@ -1225,45 +1235,93 @@ fn parse_header_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
 /// * forwarding identity the proxy regenerates for the origin.
 ///
 /// Host and hop-by-hop framing fields are refused separately through
-/// [`replay_partition::is_non_backend_visible_request_header`], and every
-/// credential / session header through [`ignored_request_header_refusal`].
+/// [`replay_partition::is_non_backend_visible_request_header`], the families in
+/// [`NON_IGNORABLE_REQUEST_HEADER_PREFIXES`] by prefix, gateway-owned
+/// assertions that proxy core re-asserts after lookup through
+/// [`ignored_request_header_refusal`], and every credential / session header
+/// there too. Every comparison folds `_` to `-` as CGI-style backends do.
 const NON_IGNORABLE_REQUEST_HEADERS: &[&str] = &[
     "accept",
     "accept-encoding",
     "cache-control",
-    "content-encoding",
-    "content-length",
-    "content-type",
     "expect",
     "forwarded",
-    "if-match",
-    "if-modified-since",
-    "if-none-match",
-    "if-range",
-    "if-unmodified-since",
+    "max-forwards",
     "pragma",
     "range",
     "via",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-port",
-    "x-forwarded-proto",
     "x-real-ip",
 ];
+
+/// Header-name families `ignore_request_headers` may never name, matched as
+/// case-insensitive prefixes (`_` folded to `-`):
+///
+/// * `content-` — request representation metadata and framing;
+/// * `if-` — every conditional precondition;
+/// * `x-forwarded-` — the proxy-owned forwarding identity family, including
+///   members the gateway does not itself regenerate (`X-Forwarded-Prefix`);
+/// * `x-ferrum-` — the gateway's own namespace (the hop count it re-asserts
+///   after every `before_proxy` hook, mesh protocol and internal markers);
+/// * `x-consumer-` / `x-path-param-` — gateway assertions; proxy core scrubs
+///   and re-writes the authoritative values after lookup, so stripping them
+///   here would leave an origin-visible dimension the key never bound.
+const NON_IGNORABLE_REQUEST_HEADER_PREFIXES: &[&str] = &[
+    "content-",
+    "if-",
+    "x-consumer-",
+    "x-ferrum-",
+    "x-forwarded-",
+    "x-path-param-",
+];
+
+/// ASCII case-insensitive prefix test with `_` treated as `-`, the folding
+/// CGI-style backends apply. Allocation-free.
+fn has_backend_folded_prefix(name: &str, prefix: &str) -> bool {
+    let Some(head) = name.as_bytes().get(..prefix.len()) else {
+        return false;
+    };
+    head.iter()
+        .zip(prefix.as_bytes())
+        .all(|(&byte, &expected)| {
+            let folded = if byte == b'_' {
+                b'-'
+            } else {
+                byte.to_ascii_lowercase()
+            };
+            folded == expected
+        })
+}
 
 /// Why `header` cannot be listed in `ignore_request_headers`, or `None` when it
 /// may be. The reason is static text and never echoes the configured name.
 fn ignored_request_header_refusal(header: &str) -> Option<&'static str> {
+    // Gateway-owned names proxy core re-asserts on the outbound map after every
+    // `before_proxy` hook: the forwarded hop count and the authenticated /
+    // GeoIP / path-param assertions. Stripping one here would remove it from
+    // the key while dispatch puts it back, leaving an origin-visible dimension
+    // the key never bound.
+    if crate::proxy::hop_limit::is_proxy_hops_header(header)
+        || RequestContext::is_reserved_gateway_assertion_header(header)
+    {
+        return Some(
+            "names a gateway-owned header that the proxy re-asserts on the backend request \
+             after cache lookup (the forwarded hop count or a gateway identity, GeoIP, or \
+             path-parameter assertion), so it cannot be ignored",
+        );
+    }
     if replay_partition::is_non_backend_visible_request_header(header)
-        || NON_IGNORABLE_REQUEST_HEADERS
+        || NON_IGNORABLE_REQUEST_HEADERS.iter().any(|refused| {
+            crate::proxy::headers::field_names_equivalent_for_backends(header, refused)
+        })
+        || NON_IGNORABLE_REQUEST_HEADER_PREFIXES
             .iter()
-            .any(|refused| header.eq_ignore_ascii_case(refused))
+            .any(|prefix| has_backend_folded_prefix(header, prefix))
     {
         return Some(
             "names a request header the cache or the proxy interprets (Host, hop-by-hop \
-             framing, Cache-Control/Pragma, conditional/range preconditions, Content-*, \
-             Expect, Accept/Accept-Encoding, or proxy-owned forwarding identity), so it \
-             cannot be ignored",
+             framing, Cache-Control/Pragma, If-*, Range, Content-*, Expect, Max-Forwards, \
+             Accept/Accept-Encoding, X-Ferrum-*, or proxy-owned forwarding identity such as \
+             X-Forwarded-*), so it cannot be ignored",
         );
     }
     if is_auto_sensitive_vary_header(header)

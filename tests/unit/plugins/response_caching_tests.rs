@@ -5475,14 +5475,16 @@ async fn test_rate_limit_fields_are_not_retained() {
 /// implement cannot be configured as cacheable.
 #[test]
 fn test_unsupported_cacheable_status_codes_rejected() {
-    for status in [100, 101, 199, 206, 304] {
+    // 401 / 407 (PR #6830): only valid with an authentication challenge the
+    // shared cache cannot retain, so a stored copy would be challenge-less.
+    for status in [100, 101, 199, 206, 304, 401, 407] {
         let err = ResponseCaching::new(&json!({ "cacheable_status_codes": [200, status] }))
             .err()
             .unwrap_or_else(|| panic!("status {status} must not be configurable as cacheable"));
         assert!(err.contains("cacheable_status_codes[1]"), "got: {err}");
     }
 
-    for status in [200, 203, 204, 300, 301, 308, 404, 410, 500] {
+    for status in [200, 203, 204, 300, 301, 308, 403, 404, 410, 500] {
         ResponseCaching::new(&json!({ "cacheable_status_codes": [status] }))
             .unwrap_or_else(|error| panic!("status {status} must stay configurable: {error}"));
     }
@@ -9873,6 +9875,24 @@ fn ignore_request_headers_refuses_names_the_cache_cannot_safely_ignore() {
         "accept-encoding",
         "x-forwarded-for",
         "forwarded",
+        // PR6830-SOL-1: gateway-owned headers proxy core re-asserts after
+        // lookup, including the backend-folded `_` spellings.
+        "x-ferrum-hops",
+        "X_Ferrum_Hops",
+        "x-ferrum-internal",
+        "x-consumer-custom-id",
+        "x-consumer-username",
+        "x-authenticated-identity",
+        "x-geo-country",
+        "x_geo_country",
+        "x-path-param-id",
+        "max-forwards",
+        // PR6830-SOL-3: documented families are prefix refusals.
+        "content-language",
+        "content-md5",
+        "x-forwarded-prefix",
+        "X_Forwarded_For",
+        "if-schedule-tag-match",
     ] {
         let config = json!({ "ignore_request_headers": ["x-request-id", header] });
         let error = ResponseCaching::new(&config)
@@ -9909,4 +9929,35 @@ fn ignore_request_headers_refuses_names_the_cache_cannot_safely_ignore() {
             "{invalid} must be rejected"
         );
     }
+}
+
+// PR6830-SOL-1: an accepted ignored name is gone from the outbound map even
+// after proxy core re-asserts its gateway-owned headers, while the re-asserted
+// hop count (which admission refuses to ignore) is still present.
+#[tokio::test]
+async fn accepted_ignored_header_stays_absent_after_gateway_reassertion() {
+    let plugin = plugin_with_config(json!({ "ignore_request_headers": ["x-request-id"] }));
+    let mut ctx = make_ctx("GET", "/reasserted");
+    ctx.outbound_proxy_hops = Some(1);
+    ctx.headers
+        .insert("x-request-id".to_string(), "cdn-0001".to_string());
+    let mut outbound = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut outbound).await,
+        PluginResult::Continue
+    ));
+    ferrum_edge::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut outbound);
+    assert!(
+        !outbound
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-request-id")),
+        "an accepted ignored header must never reappear on the backend request"
+    );
+    assert!(
+        outbound
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-ferrum-hops")),
+        "the gateway re-asserts its hop count after lookup, which is why it is not ignorable"
+    );
+    assert!(ResponseCaching::new(&json!({ "ignore_request_headers": ["x-ferrum-hops"] })).is_err());
 }

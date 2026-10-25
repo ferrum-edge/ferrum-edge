@@ -28,6 +28,18 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `response_caching` no longer admits `401` / `407` as cacheable statuses (#6830)
+
+`cacheable_status_codes` now refuses `401` and `407` at admission, alongside
+`1xx`, `206`, and `304`. A cached `401` / `407` could only be replayed without
+its authentication challenge (`WWW-Authenticate` is stripped from retained
+entries as per-response state, and `Proxy-Authenticate` is hop-scoped), which
+clients cannot act on. Remove `401` and `407` from every `response_caching`
+`cacheable_status_codes` list before upgrading; a config that still lists
+either fails validation and, under `KeepLastKnownGood`, is not applied on
+reload. No other migration is needed — these responses are simply forwarded
+uncached.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

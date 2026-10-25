@@ -8,15 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `response_caching` refuses `401` and `407` in
+  `cacheable_status_codes`** (issue #6830). Both are only valid with their
+  authentication challenge, which the cache cannot retain (`WWW-Authenticate`
+  is stripped from retained entries by the shared replay-sanitation policy and
+  `Proxy-Authenticate` is hop-scoped), so a stored copy would replay a
+  challenge-less `401` / `407`. A config listing either status now fails
+  admission; remove it from the list. Such responses are also refused at store
+  time.
 - **`response_caching` gains `ignore_request_headers` and a lookup counter.**
   `ignore_request_headers` is an operator attestation that named request
   headers (for example a per-request `X-Request-Id` stamped by a CDN) never
   select the response: each is removed from the request before the key is
   derived, so the origin never receives it and the key still binds every
-  header the origin sees. Credential/session, `Host`, hop-by-hop,
-  `Cache-Control`/`Pragma`, precondition/range, `Content-*`, `Expect`,
-  `Accept`/`Accept-Encoding`, and forwarding headers are refused, as is a name
-  also in `vary_by_headers`; a non-empty list makes the instance a request
+  header the origin sees. Credential/session, gateway-owned re-asserted
+  (`X-Ferrum-*`, `X-Consumer-*`, `X-Authenticated-Identity`, `X-Geo-Country`,
+  `X-Path-Param-*`), `Host`, hop-by-hop, `Cache-Control`/`Pragma`, `If-*`,
+  `Range`, `Max-Forwards`, `Content-*`, `Expect`, `Accept`/`Accept-Encoding`,
+  and `X-Forwarded-*`/forwarding headers are refused (families by prefix), as
+  is a name also in `vary_by_headers`; a non-empty list makes the instance a request
   header mutator, so it cannot share a proxy with `request_deduplication`.
   Lookup outcomes are exported as the bounded
   `ferrum_response_cache_lookups_total{status}` counter (`hit`, `miss`,
