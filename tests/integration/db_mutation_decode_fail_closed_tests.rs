@@ -495,7 +495,9 @@ async fn full_reload_candidate_with_unconstructible_fail_closed_plugin_keeps_pri
     )
     .await;
     insert_association(&store, "proxy-1", "plugin-1").await;
-    insert_named_plugin(&store, "stdout-ok", "stdout_logging", r#"{}"#, &ts).await;
+    // `transaction_debugger` is `OptionalFailOpen`; `stdout_logging` is
+    // `KeepLastKnownGood` and would reject the optional candidate below.
+    insert_named_plugin(&store, "optional-ok", "transaction_debugger", r#"{}"#, &ts).await;
 
     let good = store
         .load_full_config("ferrum")
@@ -551,7 +553,7 @@ async fn full_reload_candidate_with_unconstructible_fail_closed_plugin_keeps_pri
     // succeeds, and the fail-closed plugin is untouched.
     let mut optional_candidate = good.clone();
     for plugin_config in &mut optional_candidate.plugin_configs {
-        if plugin_config.id == "stdout-ok" {
+        if plugin_config.id == "optional-ok" {
             plugin_config.config = serde_json::json!({"filtr": {}});
             plugin_config.updated_at = later;
         }
