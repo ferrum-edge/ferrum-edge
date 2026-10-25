@@ -1375,6 +1375,20 @@ policy. Remove or edit the username in those plugin configs, then retry. A
 consumer named only in `disallowed_consumers`, or not named in any
 `access_control` allow-list, can still be deleted.
 
+`PUT /consumers/{id}` that changes the consumer's `username` returns
+**409 Conflict** with
+`{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be renamed"}`
+while any `access_control` plugin config in the same namespace still names the
+**previous** username in `allowed_consumers` **or** `disallowed_consumers`.
+Matching is byte-for-byte, so the rename would otherwise silently detach the
+entry: an orphaned allow entry is inherited by any later consumer created under
+that username, and an orphaned deny entry un-revokes the renamed consumer. Edit
+those plugin configs first (for example, replace the old username with the new
+one), then rename. Updates that keep the username are unaffected. File mode
+applies the same rule on reload: a reloaded file that renames a consumer while
+its own `access_control` configs still name the previous username is rejected
+and the previous configuration is kept.
+
 Credential rotation workflow:
 1. `POST .../credentials/keyauth` with the new key — both old and new are now active
 2. Roll out the new key to all clients

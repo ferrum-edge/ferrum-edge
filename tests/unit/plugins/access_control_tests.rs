@@ -1019,3 +1019,396 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+// ---- External-identity rules (realm-aware allow / deny) ----
+
+/// A request whose external identity was committed through the shared
+/// authentication boundary, so it carries `mechanism` as its verified realm.
+fn external_identity_context(
+    identity: &str,
+    mechanism: &'static str,
+) -> ferrum_edge::plugins::RequestContext {
+    use ferrum_edge::plugins::utils::auth_attempt::AuthenticationAttempt;
+    use ferrum_edge::plugins::utils::auth_flow::{VerifyOutcome, commit_authentication_attempt};
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    let committed = commit_authentication_attempt(
+        &mut ctx,
+        AuthenticationAttempt::new(),
+        VerifyOutcome::success(None, Some(identity.to_string()), None),
+        mechanism,
+        true,
+    )
+    .expect("external identity commits");
+    assert!(committed, "the external identity must be committed");
+    assert_eq!(
+        ctx.authenticated_identity_realm()
+            .map(|realm| realm.mechanism()),
+        Some(mechanism)
+    );
+    ctx
+}
+
+#[tokio::test]
+async fn test_access_control_external_allow_list_admits_only_listed_identities() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "alice"}]
+    }))
+    .unwrap();
+
+    let mut listed = external_identity_context("alice", "jwks_auth");
+    assert_continue(plugin.authorize(&mut listed).await);
+
+    let mut unlisted = external_identity_context("bob", "jwks_auth");
+    assert_reject(plugin.authorize(&mut unlisted).await, Some(403));
+
+    // An identity set without the commit boundary has no realm; an unscoped
+    // entry still matches it.
+    let mut unscoped = create_test_context();
+    unscoped.identified_consumer = None;
+    unscoped.authenticated_identity = Some("alice".to_string());
+    assert_continue(plugin.authorize(&mut unscoped).await);
+
+    let mut nobody = create_test_context();
+    nobody.identified_consumer = None;
+    assert_reject(plugin.authorize(&mut nobody).await, Some(401));
+}
+
+#[tokio::test]
+async fn test_access_control_external_allow_entry_is_scoped_to_its_mechanism() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "alice", "mechanism": "jwks_auth"}]
+    }))
+    .unwrap();
+
+    let mut jwks = external_identity_context("alice", "jwks_auth");
+    assert_continue(plugin.authorize(&mut jwks).await);
+
+    // The same subject string asserted by a different authority is a different
+    // principal.
+    let mut ldap = external_identity_context("alice", "ldap_auth");
+    assert_reject(plugin.authorize(&mut ldap).await, Some(403));
+
+    // No verified realm: a scoped allow entry cannot establish admission.
+    let mut unknown_realm = create_test_context();
+    unknown_realm.identified_consumer = None;
+    unknown_realm.authenticated_identity = Some("alice".to_string());
+    assert_reject(plugin.authorize(&mut unknown_realm).await, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_external_deny_entry_is_scoped_to_its_mechanism() {
+    let plugin = AccessControl::new(&json!({
+        "allow_authenticated_identity": true,
+        "disallowed_external_identities": [{"identity": "alice", "mechanism": "ldap_auth"}]
+    }))
+    .unwrap();
+
+    let mut ldap = external_identity_context("alice", "ldap_auth");
+    assert_reject(plugin.authorize(&mut ldap).await, Some(403));
+
+    let mut jwks = external_identity_context("alice", "jwks_auth");
+    assert_continue(plugin.authorize(&mut jwks).await);
+
+    // No verified realm: a scoped deny entry fails closed.
+    let mut unknown_realm = create_test_context();
+    unknown_realm.identified_consumer = None;
+    unknown_realm.authenticated_identity = Some("alice".to_string());
+    assert_reject(plugin.authorize(&mut unknown_realm).await, Some(403));
+
+    let mut other = external_identity_context("bob", "ldap_auth");
+    assert_continue(plugin.authorize(&mut other).await);
+}
+
+#[tokio::test]
+async fn test_access_control_external_deny_overrides_external_allow() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "alice"}],
+        "disallowed_external_identities": [{"identity": "alice", "mechanism": "ldap_auth"}],
+        "disallowed_consumers": ["mallory"]
+    }))
+    .unwrap();
+
+    let mut ldap = external_identity_context("alice", "ldap_auth");
+    assert_reject(plugin.authorize(&mut ldap).await, Some(403));
+
+    let mut jwks = external_identity_context("alice", "jwks_auth");
+    assert_continue(plugin.authorize(&mut jwks).await);
+
+    // `disallowed_consumers` stays a realm-blind external deny.
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "mallory"}],
+        "disallowed_consumers": ["mallory"]
+    }))
+    .unwrap();
+    let mut mallory = external_identity_context("mallory", "jwks_auth");
+    assert_reject(plugin.authorize(&mut mallory).await, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_external_only_allow_list_denies_mapped_consumers() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "alice"}]
+    }))
+    .unwrap();
+
+    // An allow-list means "only these principals": a mapped Consumer matches
+    // none of the (empty) consumer allow-lists.
+    let mut consumer = create_test_context();
+    consumer.identified_consumer = Some(Arc::new(make_consumer_with_groups("alice", vec![])));
+    assert_reject(plugin.authorize(&mut consumer).await, Some(403));
+
+    // Combined with a group allow-list, the matching Consumer passes.
+    let plugin = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "alice"}],
+        "allowed_groups": ["engineering"]
+    }))
+    .unwrap();
+    let mut engineer = create_test_context();
+    engineer.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "carol",
+        vec!["engineering"],
+    )));
+    assert_continue(plugin.authorize(&mut engineer).await);
+    let mut external = external_identity_context("alice", "oidc_relying_party");
+    assert_continue(plugin.authorize(&mut external).await);
+}
+
+#[tokio::test]
+async fn test_access_control_stream_identity_never_matches_a_scoped_allow_entry() {
+    let scoped = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "svc", "mechanism": "jwks_auth"}]
+    }))
+    .unwrap();
+    let mut ctx = create_stream_context(None);
+    ctx.authenticated_identity = Some("svc".to_string());
+    assert_reject(scoped.on_stream_connect(&mut ctx).await, Some(403));
+
+    let unscoped = AccessControl::new(&json!({
+        "allowed_external_identities": [{"identity": "svc"}]
+    }))
+    .unwrap();
+    let mut ctx = create_stream_context(None);
+    ctx.authenticated_identity = Some("svc".to_string());
+    assert_continue(unscoped.on_stream_connect(&mut ctx).await);
+}
+
+#[test]
+fn test_access_control_external_identity_rule_validation() {
+    for config in [
+        json!({"allowed_external_identities": [{"identity": "alice"}]}),
+        json!({"disallowed_external_identities": [{"identity": "alice", "mechanism": "jwks_auth"}]}),
+        json!({"disallowed_external_identities": [], "allow_authenticated_identity": true}),
+        json!({
+            "allowed_external_identities": [
+                {"identity": "alice", "mechanism": "jwks_auth"},
+                {"identity": "alice", "mechanism": "ldap_auth"}
+            ],
+            "allowed_consumers": ["bob"]
+        }),
+    ] {
+        assert!(
+            AccessControl::new(&config).is_ok(),
+            "config should be accepted: {config}"
+        );
+    }
+
+    for (config, fragment) in [
+        (
+            json!({"allowed_external_identities": []}),
+            "must not be an empty array",
+        ),
+        (
+            json!({
+                "allowed_external_identities": [{"identity": "alice"}],
+                "allow_authenticated_identity": true
+            }),
+            "allow_authenticated_identity",
+        ),
+        (
+            json!({"allowed_external_identities": ["alice"]}),
+            "must be objects",
+        ),
+        (
+            json!({"allowed_external_identities": {"identity": "alice"}}),
+            "must be an array of objects",
+        ),
+        (
+            json!({"allowed_external_identities": [{"mechanism": "jwks_auth"}]}),
+            "`identity` string",
+        ),
+        (
+            json!({"allowed_external_identities": [{"identity": "   "}]}),
+            "non-whitespace",
+        ),
+        (
+            json!({"allowed_external_identities": [{"identity": "a".repeat(4097)}]}),
+            "must not exceed 4096",
+        ),
+        (
+            json!({"disallowed_external_identities": [{"identity": "alice", "mechanism": "jwks"}]}),
+            "`mechanism` must be one of",
+        ),
+        (
+            json!({"disallowed_external_identities": [{"identity": "alice", "mechanism": 7}]}),
+            "`mechanism` must be one of",
+        ),
+        (
+            json!({"disallowed_external_identities": [{"identity": "alice", "realm": "x"}]}),
+            "accept only `identity` and `mechanism`",
+        ),
+    ] {
+        let err = match AccessControl::new(&config) {
+            Ok(_) => panic!("config should be rejected: {config}"),
+            Err(err) => err,
+        };
+        assert!(err.contains(fragment), "got: {err} for {config}");
+    }
+}
+
+// ---- Consumer rename referential integrity ----
+
+fn access_control_plugin_config(
+    id: &str,
+    namespace: &str,
+    config: serde_json::Value,
+) -> ferrum_edge::config::types::PluginConfig {
+    ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
+        id: id.to_string(),
+        plugin_name: "access_control".to_string(),
+        namespace: namespace.to_string(),
+        config,
+        scope: ferrum_edge::config::types::PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn gateway_config_with(
+    consumers: Vec<Consumer>,
+    plugin_configs: Vec<ferrum_edge::config::types::PluginConfig>,
+) -> ferrum_edge::config::types::GatewayConfig {
+    ferrum_edge::config::types::GatewayConfig {
+        consumers,
+        plugin_configs,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_access_control_config_names_consumer_username_checks_both_lists() {
+    use ferrum_edge::plugins::access_control::config_names_consumer_username;
+
+    let config = json!({
+        "allowed_consumers": ["alice"],
+        "disallowed_consumers": ["mallory"],
+        "allowed_groups": ["bob"]
+    });
+    assert!(config_names_consumer_username(&config, "alice"));
+    assert!(config_names_consumer_username(&config, "mallory"));
+    assert!(
+        !config_names_consumer_username(&config, "bob"),
+        "group names are not usernames"
+    );
+    assert!(
+        !config_names_consumer_username(&config, " alice"),
+        "matching is byte-for-byte"
+    );
+}
+
+#[test]
+fn test_access_control_file_reload_refuses_rename_of_referenced_consumer() {
+    use ferrum_edge::plugins::access_control::consumer_rename_conflicts;
+
+    let namespace = ferrum_edge::config::types::default_namespace();
+    let mallory = make_consumer_with_groups("mallory", vec![]);
+    let mut renamed = mallory.clone();
+    renamed.username = "m.reyes".to_string();
+    let deny = access_control_plugin_config(
+        "acl-deny",
+        &namespace,
+        json!({"disallowed_consumers": ["mallory"]}),
+    );
+    let previous = gateway_config_with(vec![mallory.clone()], vec![deny.clone()]);
+
+    // Deny side: the rename would un-revoke the principal.
+    let conflicts = consumer_rename_conflicts(
+        &previous,
+        &gateway_config_with(vec![renamed.clone()], vec![deny.clone()]),
+    );
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert!(conflicts[0].contains("acl-deny"), "{conflicts:?}");
+    assert!(
+        !conflicts[0].contains("mallory") && !conflicts[0].contains("m.reyes"),
+        "diagnostics name resource ids, not usernames: {conflicts:?}"
+    );
+
+    // Allow side: the rename would orphan the allow entry.
+    let allow = access_control_plugin_config(
+        "acl-allow",
+        &namespace,
+        json!({"allowed_consumers": ["mallory"]}),
+    );
+    let conflicts = consumer_rename_conflicts(
+        &gateway_config_with(vec![mallory.clone()], vec![allow.clone()]),
+        &gateway_config_with(vec![renamed.clone()], vec![allow]),
+    );
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+
+    // Renaming the rule in the same reload is accepted.
+    let updated_deny = access_control_plugin_config(
+        "acl-deny",
+        &namespace,
+        json!({"disallowed_consumers": ["m.reyes"]}),
+    );
+    assert!(
+        consumer_rename_conflicts(
+            &previous,
+            &gateway_config_with(vec![renamed.clone()], vec![updated_deny])
+        )
+        .is_empty()
+    );
+
+    // An update that keeps the username, and a rename of an unreferenced
+    // consumer, are unaffected.
+    let mut regrouped = mallory.clone();
+    regrouped.acl_groups = vec!["engineering".to_string()];
+    assert!(
+        consumer_rename_conflicts(
+            &previous,
+            &gateway_config_with(vec![regrouped], vec![deny.clone()])
+        )
+        .is_empty()
+    );
+    let other = make_consumer_with_groups("carol", vec![]);
+    let mut other_renamed = other.clone();
+    other_renamed.username = "carol2".to_string();
+    assert!(
+        consumer_rename_conflicts(
+            &gateway_config_with(vec![mallory.clone(), other], vec![deny.clone()]),
+            &gateway_config_with(vec![mallory.clone(), other_renamed], vec![deny.clone()])
+        )
+        .is_empty()
+    );
+
+    // A rule in another namespace does not pin this namespace's consumer.
+    let foreign = access_control_plugin_config(
+        "acl-foreign",
+        "other-namespace",
+        json!({"disallowed_consumers": ["mallory"]}),
+    );
+    assert!(
+        consumer_rename_conflicts(
+            &gateway_config_with(vec![mallory], vec![foreign.clone()]),
+            &gateway_config_with(vec![renamed], vec![foreign])
+        )
+        .is_empty()
+    );
+}

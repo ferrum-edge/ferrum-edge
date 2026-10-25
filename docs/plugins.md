@@ -4006,25 +4006,59 @@ UDP+DTLS streams via certificate-based consumer mapping.
 | `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. An external principal above the 512-byte authenticated-principal limit is rejected during authentication, so entries longer than that can never match. |
 | `allowed_groups` | String[] | (omitted) | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Omit it for no group allow check; an explicitly empty array is rejected. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
+| `allowed_external_identities` | Object[] | (omitted) | Exact unmapped external principals that are allowed: each entry is `{identity, mechanism?}`. `identity` matches the external identity string byte-for-byte (non-whitespace, at most 4096 characters); `mechanism`, when set, restricts the entry to identities committed by that built-in mechanism (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`, or `soap_ws_security`). The narrow alternative to `allow_authenticated_identity`, and cannot be combined with it. Omit it for no external allow-list; an explicitly empty array is rejected. |
+| `disallowed_external_identities` | Object[] | `[]` | Exact unmapped external principals that are denied, same entry shape. A `mechanism`-scoped entry revokes the principal only as verified by that mechanism, so an equal subject string from another mechanism is unaffected. Takes precedence over every allow rule. |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy.
-An allow-list that is present must name at least one entry: `allowed_consumers: []` or
-`allowed_groups: []` is rejected at config validation. An empty allow-list has nothing to
+An allow-list that is present must name at least one entry: `allowed_consumers: []`,
+`allowed_groups: []`, or `allowed_external_identities: []` is rejected at config validation. An empty allow-list has nothing to
 match, so it can mean neither "allow nobody" nor "no restriction" safely; omit the key
 when no allow restriction is intended. Empty deny-lists remain accepted and deny nothing.
 Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
 semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
-(`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer
-usernames and `acl_groups`, which never apply to an unmapped external identity,
-so the combination would silently bypass the allow-list for every
-externally-authenticated-but-unmapped caller. The combination is rejected at
-config validation. The `disallowed_consumers` deny-list is still applied to the
-external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal. External identities longer than the 4096-character
-exact-rule bound fail closed instead of bypassing the deny-list.
+(`allowed_consumers`, `allowed_groups`, or `allowed_external_identities`): the
+consumer allow-lists match mapped Consumer usernames and `acl_groups`, which never
+apply to an unmapped external identity, and the bypass would admit every external
+identity an external allow-list omits, so the combination would silently bypass
+the allow-list. The combination is rejected at config validation. The
+`disallowed_consumers` deny-list is still applied to the external identity string
+(from every mechanism), so it may be combined with `allow_authenticated_identity`
+or `allowed_external_identities` to revoke a compromised principal. External
+identities longer than the 4096-character exact-rule bound fail closed instead of
+bypassing the deny-list.
+
+**External identity realms.** An external subject names a user only within the
+authority that verified it, so `allowed_external_identities` and
+`disallowed_external_identities` entries can be scoped with `mechanism` to the
+authentication plugin that committed the identity. Scoping is by mechanism only:
+two providers of the same plugin (two `jwks_auth` issuers, say) share one
+mechanism, so an entry cannot tell them apart. An identity with no verified realm
+— every TCP/UDP stream identity, or one a custom plugin set without the
+authentication commit boundary — never matches a `mechanism`-scoped allow entry
+and always matches a `mechanism`-scoped deny entry, so scoping can only narrow
+admission. Entries without `mechanism` match the identity from every mechanism.
+
+**An allow-list means "only these principals".** Once any allow-list is configured,
+a principal that matches none of them is denied. In particular, a policy whose only
+allow-list is `allowed_external_identities` denies every mapped Consumer (`403`);
+add `allowed_consumers` / `allowed_groups` for the Consumers that should pass.
+
+**Consumer renames.** Rules match usernames byte-for-byte, so renaming a Consumer
+that a rule names would silently detach the rule. `PUT /consumers/{id}` that
+changes the username is refused with `409` while any `access_control` config in
+the namespace names the previous username in `allowed_consumers` or
+`disallowed_consumers`, and a file-mode reload that renames such a Consumer
+without also updating the rule is rejected (the previous configuration is kept).
+Update the rule first, then rename.
+
+**Live HBONE tunnels.** The mesh HBONE admission fence re-runs this plugin for live
+tunnels on every published generation, and re-reads the mapped Consumer's record
+from that generation first, so removing a Consumer from an allowed group (or
+deleting the Consumer) revokes its live tunnels rather than only refusing its next
+CONNECT.
 
 An authenticated external identity that is not enabled by this policy is an
 authorization denial: HTTP requests receive 403 and native gRPC requests receive
@@ -4032,6 +4066,7 @@ trailers-only `PERMISSION_DENIED` (status 7). Requests with no meaningful mapped
 or external identity receive HTTP 401 / gRPC `UNAUTHENTICATED` (status 16).
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
+For an unmapped external identity: deny (`disallowed_consumers` → `disallowed_external_identities`) → allow (`allowed_external_identities`, or the `allow_authenticated_identity` bypass).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
 Deny always takes precedence — a consumer whose username is in `allowed_consumers` is still
 rejected if any of their groups appear in `disallowed_groups`.
@@ -4055,6 +4090,17 @@ config:
 plugin_name: access_control
 config:
   allow_authenticated_identity: true
+
+# Allow only named external principals; revoke one subject only as LDAP asserts it
+plugin_name: access_control
+config:
+  allowed_external_identities:
+    - identity: "billing-admin@example.com"
+      mechanism: jwks_auth
+    - identity: "svc-reporting"
+  disallowed_external_identities:
+    - identity: "svc-reporting"
+      mechanism: ldap_auth
 ```
 
 ### `opa`

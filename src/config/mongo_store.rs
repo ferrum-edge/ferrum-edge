@@ -350,12 +350,8 @@ mod inner {
     /// (byte-for-byte). A delete must refuse while any plugin config in the
     /// namespace still authorizes that username; the operator's policy is not
     /// rewritten.
-    fn access_control_plugin_allows_consumer(plugin: &PluginConfig, username: &str) -> bool {
-        if plugin.plugin_name != "access_control" {
-            return false;
-        }
-        plugin
-            .config
+    fn access_control_plugin_allows_consumer(config: &serde_json::Value, username: &str) -> bool {
+        config
             .get("allowed_consumers")
             .and_then(|value| value.as_array())
             .is_some_and(|consumers| {
@@ -4961,11 +4957,14 @@ mod inner {
             Ok(None)
         }
 
+        /// First `access_control` plugin config in `namespace` whose config
+        /// `references` reports as naming `username`.
         async fn find_access_control_consumer_ref_opt_session(
             &self,
             session: Option<&mut ClientSession>,
             namespace: &str,
             username: &str,
+            references: fn(&serde_json::Value, &str) -> bool,
         ) -> Result<Option<PluginConfig>, anyhow::Error> {
             if let Some(s) = session {
                 let plugin_configs = self.plugin_configs();
@@ -4978,7 +4977,9 @@ mod inner {
                     .await?;
                 while cursor.advance(&mut *s).await? {
                     let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
-                    if access_control_plugin_allows_consumer(&plugin, username) {
+                    if plugin.plugin_name == "access_control"
+                        && references(&plugin.config, username)
+                    {
                         return Ok(Some(plugin));
                     }
                 }
@@ -4992,7 +4993,9 @@ mod inner {
                     .await?;
                 while cursor.advance().await? {
                     let plugin = doc_to_plugin_config(cursor.deserialize_current()?)?;
-                    if access_control_plugin_allows_consumer(&plugin, username) {
+                    if plugin.plugin_name == "access_control"
+                        && references(&plugin.config, username)
+                    {
                         return Ok(Some(plugin));
                     }
                 }
@@ -11895,6 +11898,7 @@ mod inner {
                                         doc,
                                         consumer.namespace.clone(),
                                         consumer.id.clone(),
+                                        consumer.username.clone(),
                                         composite_id,
                                         new_identity_values,
                                     ),
@@ -11904,6 +11908,7 @@ mod inner {
                                         doc,
                                         namespace,
                                         id,
+                                        username,
                                         composite_id,
                                         new_identity_values,
                                     )| {
@@ -11925,6 +11930,31 @@ mod inner {
                                                 .map_err(|e| {
                                                     mongodb::error::Error::custom(e.to_string())
                                                 })?;
+                                            // A rename detaches every byte-for-byte
+                                            // `access_control` entry naming the old
+                                            // username; refuse it while one does.
+                                            if previous_consumer.username != *username
+                                                && let Some(plugin) = this
+                                                    .find_access_control_consumer_ref_opt_session(
+                                                        Some(&mut *s),
+                                                        namespace.as_str(),
+                                                        &previous_consumer.username,
+                                                        crate::plugins::access_control::config_names_consumer_username,
+                                                    )
+                                                    .await
+                                                    .map_err(|error| {
+                                                        mongodb::error::Error::custom(
+                                                            error.to_string(),
+                                                        )
+                                                    })?
+                                            {
+                                                return Err(mongodb::error::Error::custom(format!(
+                                                    "Consumer {:?} is referenced by \
+                                                     access_control plugin_config {:?} and \
+                                                     cannot be renamed",
+                                                    id, plugin.id
+                                                )));
+                                            }
                                             let old_values =
                                                 consumer_identity_values(&previous_consumer);
                                             let replace_result = this
@@ -11993,6 +12023,25 @@ mod inner {
                             return Ok(false);
                         };
                         let previous_consumer = doc_to_consumer(previous_doc.clone())?;
+                        // A rename detaches every byte-for-byte `access_control`
+                        // entry naming the old username; refuse it while one does.
+                        if previous_consumer.username != consumer.username
+                            && let Some(plugin) = self
+                                .find_access_control_consumer_ref_opt_session(
+                                    None,
+                                    &consumer.namespace,
+                                    &previous_consumer.username,
+                                    crate::plugins::access_control::config_names_consumer_username,
+                                )
+                                .await?
+                        {
+                            anyhow::bail!(
+                                "Consumer {:?} is referenced by access_control plugin_config {:?} \
+                                 and cannot be renamed",
+                                consumer.id,
+                                plugin.id
+                            );
+                        }
                         let old_values = consumer_identity_values(&previous_consumer);
                         let added: Vec<String> = new_identity_values
                             .iter()
@@ -12136,6 +12185,7 @@ mod inner {
                                                 Some(&mut *s),
                                                 namespace.as_str(),
                                                 &username,
+                                                access_control_plugin_allows_consumer,
                                             )
                                             .await
                                             .map_err(|error| {
@@ -12196,7 +12246,12 @@ mod inner {
                             anyhow::anyhow!("consumer {:?} is missing username: {}", id, error)
                         })?;
                         if let Some(plugin) = self
-                            .find_access_control_consumer_ref_opt_session(None, namespace, username)
+                            .find_access_control_consumer_ref_opt_session(
+                                None,
+                                namespace,
+                                username,
+                                access_control_plugin_allows_consumer,
+                            )
                             .await?
                         {
                             anyhow::bail!(

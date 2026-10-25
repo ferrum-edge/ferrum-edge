@@ -6212,6 +6212,11 @@ paths:
         only in also accepting the exact `[REDACTED]` placeholder entries the
         ordinary `Consumer` response returns, so a read-modify-write round trip
         of that response validates against this schema.
+
+
+        Changing `username` is refused with `409` while any `access_control`
+        plugin config in the namespace still names the previous username in
+        `allowed_consumers` or `disallowed_consumers`; edit those configs first.
       tags: [Consumers]
       requestBody:
         required: true
@@ -6249,7 +6254,20 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            Conflict — an identity or credential uniqueness conflict, an mTLS
+            DNS identity conflict, or a `username` change while an
+            `access_control` plugin_config in the same namespace still names
+            the previous username in `allowed_consumers` or
+            `disallowed_consumers` (matching is byte-for-byte, so the rename
+            would silently detach that allow or deny entry). Body for the
+            rename case:
+            `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be renamed"}`.
+            The consumer and plugin configs are left unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "500":
@@ -28927,17 +28945,27 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: access_control — consumer-based and group-based allow/deny for
-        HTTP-family and TCP/UDP stream proxies. Evaluation order: deny
-        (consumer username → group) then allow (consumer username → group).
-        Deny always overrides allow. At least one of `allowed_consumers`,
-        `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or
-        `allow_authenticated_identity=true` must be configured, and an allow-list
-        (`allowed_consumers`/`allowed_groups`) that is present must be non-empty:
-        omit it for no allow restriction. Unknown config keys are rejected.
-        `allow_authenticated_identity=true` cannot be combined
-        with an allow-list (`allowed_consumers`/`allowed_groups`) because the
-        allow-list is not applied to unmapped external identities. Use
+        Plugin: access_control — consumer-based, group-based, and exact
+        external-principal allow/deny for HTTP-family and TCP/UDP stream
+        proxies. Evaluation order: deny (consumer username → group) then allow
+        (consumer username → group); unmapped external identities are judged by
+        `disallowed_consumers`, `disallowed_external_identities`, then
+        `allowed_external_identities` or the `allow_authenticated_identity`
+        bypass. Deny always overrides allow. Once any allow-list is configured,
+        a principal matching none of them is denied — a mapped Consumer on a
+        policy whose only allow-list is `allowed_external_identities` included.
+        At least one of `allowed_consumers`, `disallowed_consumers`,
+        `allowed_groups`, `disallowed_groups`, `allowed_external_identities`,
+        `disallowed_external_identities`, or `allow_authenticated_identity=true`
+        must be configured, and an allow-list
+        (`allowed_consumers`/`allowed_groups`/`allowed_external_identities`)
+        that is present must be non-empty: omit it for no allow restriction.
+        Unknown config keys are rejected. `allow_authenticated_identity=true`
+        cannot be combined with an allow-list
+        (`allowed_consumers`/`allowed_groups`/`allowed_external_identities`):
+        the consumer allow-lists are not applied to unmapped external
+        identities, and the bypass would admit every external identity an
+        external allow-list omits. Use
         ip_restriction for IP/CIDR rules. Rule entries match principal values
         byte-for-byte (no trimming) and must contain at least one
         non-whitespace character. Whitespace admission follows Rust
@@ -28960,6 +28988,14 @@ components:
               properties:
                 disallowed_groups:
                   minItems: 1
+            - required: [allowed_external_identities]
+              properties:
+                allowed_external_identities:
+                  minItems: 1
+            - required: [disallowed_external_identities]
+              properties:
+                disallowed_external_identities:
+                  minItems: 1
             - required: [allow_authenticated_identity]
               properties:
                 allow_authenticated_identity:
@@ -28978,6 +29014,10 @@ components:
                   - required: [allowed_groups]
                     properties:
                       allowed_groups:
+                        minItems: 1
+                  - required: [allowed_external_identities]
+                    properties:
+                      allowed_external_identities:
                         minItems: 1
       properties:
         allowed_consumers:
@@ -29042,8 +29082,90 @@ components:
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
             was mapped. Empty or whitespace-only identities are unauthenticated.
             Cannot be combined with an allow-list
-            (`allowed_consumers`/`allowed_groups`); the deny-list
-            `disallowed_consumers` is still applied to the external identity.
+            (`allowed_consumers`/`allowed_groups`/`allowed_external_identities`);
+            the deny-lists `disallowed_consumers` and
+            `disallowed_external_identities` are still applied to the external
+            identity.
+        allowed_external_identities:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [identity]
+            description: >-
+              One exact external-principal rule for `access_control`.
+            properties:
+              identity:
+                type: string
+                minLength: 1
+                maxLength: 4096
+                pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                description: >-
+                  The external identity string, matched byte-for-byte (no trimming).
+                  Must contain a non-whitespace character; at most 4096 characters.
+              mechanism:
+                type: string
+                enum:
+                  - jwks_auth
+                  - ldap_auth
+                  - oauth2_introspection
+                  - oidc_relying_party
+                  - soap_ws_security
+                description: >-
+                  Restrict the rule to identities committed by this built-in
+                  authentication mechanism. Omit to match the identity from every
+                  mechanism.
+          description: >-
+            Exact unmapped external principals (for example a `jwks_auth` `sub`)
+            that are allowed when no gateway Consumer was mapped — the narrow
+            alternative to `allow_authenticated_identity`. An entry with
+            `mechanism` matches only an identity committed by that
+            authentication mechanism; an identity with no verified realm (stream
+            proxies, or an identity a custom plugin set directly) never matches a
+            mechanism-scoped allow entry. Omit the key for no external allow
+            list; an explicitly empty array is rejected. Mapped Consumers are not
+            judged by this list, but configuring it makes the policy an
+            allow-list, so a mapped Consumer must then match
+            `allowed_consumers`/`allowed_groups` to pass.
+        disallowed_external_identities:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [identity]
+            description: >-
+              One exact external-principal rule for `access_control`.
+            properties:
+              identity:
+                type: string
+                minLength: 1
+                maxLength: 4096
+                pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                description: >-
+                  The external identity string, matched byte-for-byte (no trimming).
+                  Must contain a non-whitespace character; at most 4096 characters.
+              mechanism:
+                type: string
+                enum:
+                  - jwks_auth
+                  - ldap_auth
+                  - oauth2_introspection
+                  - oidc_relying_party
+                  - soap_ws_security
+                description: >-
+                  Restrict the rule to identities committed by this built-in
+                  authentication mechanism. Omit to match the identity from every
+                  mechanism.
+          default: []
+          description: >-
+            Exact unmapped external principals that are denied, optionally
+            scoped to the authentication mechanism that verified them, so one
+            principal can be revoked without revoking an equal subject string
+            from a different mechanism. A mechanism-scoped entry also matches an
+            identity with no verified realm (it fails closed). Takes precedence
+            over every allow rule. `disallowed_consumers` remains a
+            realm-blind deny for external identities.
 
     TcpConnectionThrottleConfig:
       type: object
