@@ -10327,3 +10327,138 @@ fn max_body_bytes_has_a_hard_admission_ceiling() {
         assert!(error.contains("max_body_bytes"), "{error}");
     }
 }
+
+// ──────── PR6848-MUSE-1: gateway `zstd` (RFC 9659) is validated, not rejected ────────
+
+fn zstd_bytes(body: &[u8]) -> Vec<u8> {
+    zstd::stream::encode_all(body, 3).expect("zstd encode")
+}
+
+/// `compression` can now emit `zstd` responses and accept `zstd` uploads for an
+/// instance that opts in. The validator must decode them (through the charged
+/// strict decoder) and validate the decoded document in `block` mode — and
+/// still reject a schema violation, proving validation ran over decoded bytes.
+#[tokio::test]
+async fn zstd_bodies_are_decoded_and_validated_in_block_mode() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+
+    for (body, accepted) in [
+        (zstd_bytes(br#"{"name":"book"}"#), true),
+        (zstd_bytes(br#"{"name":42}"#), false),
+    ] {
+        let headers = encoding_headers("zstd");
+        let mut ctx = post_ctx("/items");
+        ctx.headers = headers.clone();
+        let client_phase = plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, &body)
+            .await;
+        let mut ctx = post_ctx("/items");
+        let final_phase = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await;
+        if accepted {
+            assert_continue(client_phase);
+            assert_continue(final_phase);
+        } else {
+            assert_reject(client_phase, Some(400));
+            assert_reject(final_phase, Some(400));
+        }
+    }
+
+    for (body, accepted) in [
+        (zstd_bytes(br#"{"ok":true}"#), true),
+        (zstd_bytes(br#"{"ok":"not-a-boolean"}"#), false),
+    ] {
+        let mut ctx = post_ctx("/items");
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &encoding_headers("zstd"), &body)
+            .await;
+        if accepted {
+            assert_continue(result);
+        } else {
+            assert_reject(result, Some(502));
+        }
+    }
+
+    // Stacked with gzip, decoded in reverse application order.
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &encoding_headers("zstd, gzip"),
+                &gzip_bytes(&zstd_bytes(br#"{"ok":true}"#)),
+            )
+            .await,
+    );
+
+    // Not a zstd frame: still the fixed, payload-free decode refusal.
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &encoding_headers("zstd"),
+                br#"{"name":"book"}"#,
+            )
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded")
+    );
+}
+
+/// PR6848-MUSE-1 composition: the bytes and headers `compression` actually
+/// produces for an opted-in `zstd` client reach the validator's final response
+/// hook (which runs after transport encoding) and are accepted.
+#[tokio::test]
+async fn gateway_zstd_compression_output_passes_response_validation() {
+    use ferrum_edge::plugins::compression::CompressionPlugin;
+
+    let compression = CompressionPlugin::new(&json!({
+        "algorithms": ["zstd", "gzip"],
+        "min_content_length": 1
+    }))
+    .unwrap();
+    let validator = OpenapiValidator::new(&validator_config("block")).unwrap();
+
+    let mut ctx = post_ctx("/items");
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
+    ctx.headers
+        .insert("accept-encoding".to_string(), "zstd".to_string());
+    let mut request_headers = ctx.headers.clone();
+    compression
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await;
+
+    let plaintext = br#"{"ok":true}"#;
+    let mut response_headers = json_headers();
+    response_headers.insert("content-length".to_string(), plaintext.len().to_string());
+    assert_continue(
+        compression
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+    );
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("zstd")
+    );
+    let encoded = compression
+        .transform_response_body_with_context(
+            &mut ctx,
+            plaintext,
+            Some("application/json"),
+            &response_headers,
+        )
+        .await
+        .expect("committed zstd is produced");
+
+    assert_continue(
+        validator
+            .on_final_response_body(&mut ctx, 200, &response_headers, &encoded)
+            .await,
+    );
+}
