@@ -7378,6 +7378,31 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "new_key": "user.new"
             }]
         }),
+        // Bounded request-variable templates compile at load time.
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Tenant-Echo",
+                "value": "tenant=$(header.x-tenant); user=$(consumer.username)"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "rid",
+                "value": "$(request_id)-$$(literal)"
+            }]
+        }),
+        // An escaped trailing dot is one non-empty segment.
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "body",
+                "key": "trailing\\."
+            }]
+        }),
     ] {
         assert_component_validity(&spec, "RequestTransformerConfig", &config, true);
         assert!(
@@ -7541,6 +7566,21 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
                 "target": "body",
                 "key": "first",
                 "new_key": "items.0"
+            }]
+        }),
+        // Empty dot-segments in a body path.
+        json!({"rules": [{"operation": "remove", "target": "body", "key": ""}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "user."}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": ".user"}]}),
+        json!({
+            "rules": [{"operation": "update", "target": "body", "key": "a..b", "value": 1}]
+        }),
+        json!({
+            "rules": [{
+                "operation": "rename",
+                "target": "body",
+                "key": "user.old",
+                "new_key": "user..new"
             }]
         }),
     ] {
@@ -7829,6 +7869,9 @@ fn response_transformer_schema_matches_runtime_target_and_value_contract() {
                 "new_key": "first"
             }]
         }),
+        // Empty dot-segments in a body path (shared body-rule parser).
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "a..b"}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "trailing."}]}),
     ] {
         assert_component_validity(&spec, "ResponseTransformerConfig", &config, false);
         assert!(
@@ -9979,6 +10022,14 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": ["::/0", "2001:db8::1/128"]}),
         json!({"allow": ["::ffff:127.0.0.1/96", "::ffff:127.0.0.1/128"]}),
         json!({"allow": [" [::1] ", " fe80::1%eth0/64 "]}),
+        // Compressed IPv6 with an embedded dotted IPv4 tail after a hextet.
+        json!({"allow": ["2001:db8::1:192.0.2.1", "[2001:db8::1:192.0.2.1]/64"]}),
+        json!({"allow": ["::1:192.0.2.1", "1:2:3:4:5::192.0.2.1"]}),
+        // Alternative spellings of IPv4-mapped IPv6 at /96 and /128.
+        json!({"allow": ["0::ffff:c000:201/96", "0::ffff:c000:201/128"]}),
+        json!({"allow": ["[0::ffff:c000:201]/96", "0:0:0:0:0:ffff::/96"]}),
+        json!({"allow": ["0::ffff:192.0.2.1/128", "::0:ffff:192.0.2.1/96"]}),
+        json!({"allow": ["[fe80::1%eth0]/64", "fe80::1%25"]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, true);
         assert!(
@@ -10007,6 +10058,26 @@ fn ip_restriction_schema_matches_the_strict_runtime_shape() {
         json!({"allow": ["::ffff:127.0.0.1/95"]}),
         json!({"allow": ["010.1.2.3"]}),
         json!({"allow": ["+10.1.2.3"]}),
+        // Mapped IPv6 below /96 in spellings other than `::ffff:`.
+        json!({"deny": ["0::ffff:c000:201/64"]}),
+        json!({"deny": ["[0::ffff:c000:201]/95"]}),
+        json!({"deny": ["0:0:0:0:0:ffff::/64"]}),
+        json!({"deny": ["0:0::ffff:c000:201/0"]}),
+        json!({"deny": ["::0:ffff:192.0.2.1/95"]}),
+        // No room for a dotted tail after six hextets and `::`.
+        json!({"allow": ["1:2:3:4:5:6::192.0.2.1"]}),
+        // Non-canonical CIDR prefixes.
+        json!({"allow": ["10.0.0.0/08"]}),
+        json!({"allow": ["10.0.0.0/+8"]}),
+        json!({"allow": ["0.0.0.0/00"]}),
+        json!({"allow": ["::ffff:192.0.2.0/096"]}),
+        json!({"allow": ["2001:db8::/032"]}),
+        // Empty or malformed IPv6 zones.
+        json!({"allow": ["fe80::1%"]}),
+        json!({"allow": ["[fe80::1%]"]}),
+        json!({"allow": ["fe80::1%/64"]}),
+        json!({"allow": ["fe80::1%a b"]}),
+        json!({"allow": ["fe80::1%a]"]}),
     ] {
         assert_component_validity(&spec, "IpRestrictionConfig", &config, false);
         assert!(
@@ -11148,8 +11219,35 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
             "cache_invalidation_min_age_ms",
             "mesh_series_budget_per_family",
             "render_cache_ttl_seconds",
+            "request_duration_buckets_ms",
+            "session_duration_buckets_ms",
             "stale_entry_ttl_seconds",
         ])
+    );
+    for field in ["request_duration_buckets_ms", "session_duration_buckets_ms"] {
+        assert_eq!(schema["properties"][field]["type"], json!("array"));
+        assert_eq!(schema["properties"][field]["minItems"], json!(1));
+        assert_eq!(schema["properties"][field]["maxItems"], json!(64));
+        assert_eq!(
+            schema["properties"][field]["items"]["exclusiveMinimum"],
+            json!(0)
+        );
+    }
+    let schema_default = |field: &str| -> Vec<f64> {
+        schema["properties"][field]["default"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} default is an array"))
+            .iter()
+            .map(|bound| bound.as_f64().expect("numeric bucket bound"))
+            .collect()
+    };
+    assert_eq!(
+        schema_default("request_duration_buckets_ms"),
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_REQUEST_DURATION_BUCKETS_MS.to_vec()
+    );
+    assert_eq!(
+        schema_default("session_duration_buckets_ms"),
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_SESSION_DURATION_BUCKETS_MS.to_vec()
     );
     assert!(
         !schema_fields.contains("schema") && !schema_fields.contains("schema_ref"),
@@ -11184,6 +11282,8 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
         json!({"cache_invalidation_min_age_ms": u64::MAX}),
         json!({"mesh_series_budget_per_family": 1}),
         json!({"mesh_series_budget_per_family": 1_000_000}),
+        json!({"request_duration_buckets_ms": [0.5, 100, 300000]}),
+        json!({"session_duration_buckets_ms": [1000, 3600000]}),
     ] {
         assert_component_validity(&spec, "PrometheusMetricsConfig", &config, true);
         PrometheusMetrics::new(&config, "ferrum")
@@ -11199,6 +11299,11 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
         json!({"cache_invalidation_min_age_ms": -1}),
         json!({"mesh_series_budget_per_family": 0}),
         json!({"mesh_series_budget_per_family": 1_000_001}),
+        json!({"request_duration_buckets_ms": []}),
+        json!({"request_duration_buckets_ms": [0]}),
+        json!({"request_duration_buckets_ms": "100"}),
+        json!({"session_duration_buckets_ms": [-1]}),
+        json!({"session_duration_buckets_ms": ["60000"]}),
     ] {
         assert_component_validity(&spec, "PrometheusMetricsConfig", &config, false);
         assert!(
@@ -11215,6 +11320,19 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
         .expect("object")
         .insert("render_cache_ttl_seconds".to_string(), over);
     assert_component_validity(&spec, "PrometheusMetricsConfig", &over_range, false);
+
+    // Strict ordering is not expressible in JSON Schema; the constructor is
+    // the authoritative gate for it.
+    for config in [
+        json!({"request_duration_buckets_ms": [100, 100]}),
+        json!({"session_duration_buckets_ms": [1000, 10]}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, true);
+        assert!(
+            PrometheusMetrics::new(&config, "ferrum").is_err(),
+            "constructor must reject non-increasing bucket bounds {config}"
+        );
+    }
 }
 
 #[test]
@@ -12114,15 +12232,33 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         "max_scan_bytes",
         "preserve_tag",
         "request_family",
+        "target_max_tokens",
+        "mode",
+        "sample_rate",
     ]
     .into_iter()
     .map(str::to_string)
     .collect();
     assert_eq!(schema_fields, runtime_fields);
 
+    let max_roles: Vec<String> = (0..32).map(|index| format!("role{index}")).collect();
+    let too_many_roles: Vec<String> = (0..33).map(|index| format!("role{index}")).collect();
     for config in [
         json!({}),
         json!({"compress_roles": ["user", "system"]}),
+        json!({"compress_roles": max_roles}),
+        json!({"compress_roles": ["r".repeat(64)]}),
+        json!({"min_content_tokens": 200.0}),
+        json!({"max_scan_bytes": 1024.0}),
+        json!({"target_max_tokens": 1}),
+        json!({"target_max_tokens": 8000.0}),
+        json!({"target_max_tokens": 131072}),
+        json!({"mode": "enforce"}),
+        json!({"mode": "observe"}),
+        json!({"sample_rate": 1}),
+        json!({"sample_rate": 0.25}),
+        json!({"request_family": "responses"}),
+        json!({"request_family": "anthropic_messages"}),
         json!({"target_ratio": 0.25}),
         json!({"min_content_tokens": 131072}),
         json!({"max_scan_bytes": 1048576}),
@@ -12152,6 +12288,20 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         json!({"preserve_tag": "x".repeat(65)}),
         json!({"request_family": "images"}),
         json!({"request_family": "text_completions", "compress_roles": ["system"]}),
+        json!({"compress_roles": too_many_roles}),
+        json!({"compress_roles": ["r".repeat(65)]}),
+        json!({"min_content_tokens": 200.5}),
+        json!({"min_content_tokens": -1.0}),
+        json!({"target_max_tokens": 0}),
+        json!({"target_max_tokens": 131073}),
+        json!({"target_max_tokens": 10.5}),
+        json!({"target_max_tokens": null}),
+        json!({"mode": "shadow"}),
+        json!({"mode": null}),
+        json!({"sample_rate": 0}),
+        json!({"sample_rate": 1.5}),
+        json!({"sample_rate": "half"}),
+        json!({"sample_rate": null}),
     ] {
         assert!(
             validator.validate(&config).is_err(),
@@ -18862,6 +19012,56 @@ fn opa_schema_and_constructor_admit_the_same_configs() {
             base(json!({"decision_pointr": ["result"]})),
             false,
         ),
+        (
+            "delegated header ambiguity",
+            base(json!({"header_ambiguity_policy": "delegate"})),
+            true,
+        ),
+        (
+            "unknown header ambiguity policy",
+            base(json!({"header_ambiguity_policy": "allow"})),
+            false,
+        ),
+        (
+            "bounded decision concurrency",
+            base(json!({"max_concurrent_decisions": 64})),
+            true,
+        ),
+        (
+            "zero decision concurrency",
+            base(json!({"max_concurrent_decisions": 0})),
+            false,
+        ),
+        (
+            "decision concurrency above the cap",
+            base(json!({"max_concurrent_decisions": 1_000_001})),
+            false,
+        ),
+        (
+            "ordinary obligation destination",
+            base(json!({"decision_request_headers": ["x-tenant"]})),
+            true,
+        ),
+        (
+            "invalid obligation destination name",
+            base(json!({"decision_request_headers": ["Bad Header"]})),
+            false,
+        ),
+        (
+            "non-array obligation destinations",
+            base(json!({"decision_request_headers": "x-tenant"})),
+            false,
+        ),
+        (
+            "deny obligations enabled",
+            base(json!({"decision_deny_response": true})),
+            true,
+        ),
+        (
+            "non-boolean deny obligations",
+            base(json!({"decision_deny_response": "yes"})),
+            false,
+        ),
     ];
 
     for (label, config, expected_valid) in cases {
@@ -19368,6 +19568,8 @@ fn api_chargeback_schema_admits_only_constructible_configs() {
         json!({"schema": {"rename": {"total_calls": "calls"}}}),
     ));
     accept(with(supported_derived));
+    // The cleanup interval is admitted at its bound.
+    accept(with(json!({"cleanup_interval_seconds": 31_536_000})));
 
     let unrepresentable_derived = json!({
         "schema": {"derived_fields": [{"name": "host", "kind": "backend_host"}]}
@@ -19393,6 +19595,9 @@ fn api_chargeback_schema_admits_only_constructible_configs() {
     reject(with(json!({"cleanup_interval_seconds": -1})));
     reject(with(json!({"max_entries": 0})));
     reject(with(json!({"max_retained_bytes": 0})));
+    // A cleanup interval whose sleep deadline could overflow is refused.
+    reject(with(json!({"cleanup_interval_seconds": 31_536_001})));
+    reject(with(json!({"cleanup_interval_seconds": u64::MAX})));
     // Projection surface: mutually exclusive, and narrowed to the billing row.
     reject(with(json!({"schema": {}, "schema_ref": "missing"})));
     reject(with(json!({"schema": {"order": ["proxy_id"]}})));

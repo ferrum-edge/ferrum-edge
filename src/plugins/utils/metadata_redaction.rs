@@ -178,6 +178,10 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "ai_model",
     "ai_prompt_compressor.compressed_tokens",
     "ai_prompt_compressor.fields_compressed",
+    "ai_prompt_compressor.observed_compressed_tokens",
+    "ai_prompt_compressor.observed_fields_compressed",
+    "ai_prompt_compressor.observed_original_tokens",
+    "ai_prompt_compressor.observed_tokens_saved",
     "ai_prompt_compressor.original_tokens",
     "ai_prompt_compressor.tokens_saved",
     "ai_prompt_tokens",
@@ -333,6 +337,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "hbone_datagram",
     "http_method",
     "io_side",
+    "ip_restriction.reason",
     "mcp.admission_violation",
     "mcp.arguments",
     "mcp.arguments_hash",
@@ -457,6 +462,8 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "mesh_request_auth.permissive_missing_token",
     "mirror_error",
     "namespace",
+    "opa.decision",
+    "opa.reason",
     "openapi_validator.action",
     "openapi_validator.matched_operation",
     "openapi_validator.mode",
@@ -480,6 +487,10 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "request_id",
     "request_path",
     "request_protocol",
+    // Fixed, value-free reason literals (`template_unresolved`,
+    // `non_json_content_type`, …); never request content.
+    "request_transformer.body_skipped",
+    "request_transformer.rule_skipped",
     "response_status_code",
     "route_request_timeout",
     "server_address",
@@ -606,7 +617,15 @@ fn is_builtin_metadata_key_family(key: &str) -> bool {
             is_decimal_instance_id(id)
                 && matches!(
                     suffix,
-                    "original_tokens" | "compressed_tokens" | "tokens_saved" | "fields_compressed"
+                    "original_tokens"
+                        | "compressed_tokens"
+                        | "tokens_saved"
+                        | "fields_compressed"
+                        | "observed_original_tokens"
+                        | "observed_compressed_tokens"
+                        | "observed_tokens_saved"
+                        | "observed_fields_compressed"
+                        | "skipped"
                 )
         });
     }

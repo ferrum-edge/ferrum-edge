@@ -18113,10 +18113,65 @@ pub fn refresh_backend_gateway_assertion_headers(
     }
 }
 
+/// Retire request content-integrity fields (`Content-Digest`, `Repr-Digest`,
+/// `Digest`, `Content-MD5`) that `request_transformer` body rules may
+/// invalidate, judged over the FINAL outbound headers — after every
+/// `before_proxy` hook and the route-header finalizer, before any backend
+/// header builder consumes the map. Several dispatch ladders install headers
+/// before the body transform runs, so a digest cannot be recomputed for the
+/// rewritten bytes.
+///
+/// Enrolled by every enabled body-rule `request_transformer`, independent of
+/// whether its own `before_proxy` saw a digest — a later header rule, rename,
+/// or the route-header finalizer can introduce one. Allocation-free when the
+/// final map carries no such field: the check is one scan of the header
+/// names, and the outbound map is copied (clone-on-write) only when a field
+/// must be removed. `ctx.headers` keeps the original inbound view.
+pub(crate) fn retire_stale_request_integrity_headers(
+    ctx: &RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if !ctx.request_body_integrity_retirement {
+        return;
+    }
+    let effective = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    if !request_integrity_retirement_applies(ctx, effective) {
+        return;
+    }
+    let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+    crate::plugins::request_transformer::strip_body_bound_integrity_headers(headers);
+}
+
+/// Owned-map variant of [`retire_stale_request_integrity_headers`] for the
+/// native HTTP/3 deferred passes, whose outbound map is already a copy.
+pub(crate) fn retire_stale_request_integrity_headers_in_map(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    if ctx.request_body_integrity_retirement && request_integrity_retirement_applies(ctx, headers) {
+        crate::plugins::request_transformer::strip_body_bound_integrity_headers(headers);
+    }
+}
+
+fn request_integrity_retirement_applies(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> bool {
+    use crate::plugins::request_transformer::{
+        is_body_bound_request_integrity_header, request_body_rules_may_rewrite,
+    };
+    headers
+        .keys()
+        .any(|name| is_body_bound_request_integrity_header(name))
+        && request_body_rules_may_rewrite(&ctx.method, headers)
+}
+
 fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
+    // A deferred pass or egress overlay can change `Content-Type` again.
+    retire_stale_request_integrity_headers(ctx, owned_proxy_headers);
     if let Some(headers) = owned_proxy_headers.as_mut() {
         refresh_backend_gateway_assertion_headers(ctx, headers);
     } else {
@@ -36274,18 +36329,42 @@ async fn handle_proxy_request_inner(
                 .await
                 {
                     Ok(buffered) => {
-                        if let ClientRequestBody::Buffered(buffered) = &buffered {
-                            store_request_body_metadata(
-                                &mut ctx,
-                                &buffered.body,
-                                authorize_body_requirements.needs_text,
-                                authorize_body_requirements.needs_bytes,
-                                authorize_body_requirements.needs_digests,
-                            );
-                            ctx.bytes_sent_observed.fetch_max(
-                                buffered.body.len() as u64,
-                                std::sync::atomic::Ordering::Release,
-                            );
+                        match &buffered {
+                            ClientRequestBody::Buffered(buffered) => {
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    &buffered.body,
+                                    authorize_body_requirements.needs_text,
+                                    authorize_body_requirements.needs_bytes,
+                                    authorize_body_requirements.needs_digests,
+                                );
+                                ctx.bytes_sent_observed.fetch_max(
+                                    buffered.body.len() as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                            }
+                            // The no-collection fast path hands the request
+                            // back unread only once the transport has proven
+                            // the body empty (no CL/TE and END_STREAM).
+                            // Publish the same empty views a `Content-Length:
+                            // 0` collect and the native H3 drain publish, so
+                            // authorize-phase body policy (`opa`
+                            // `include_body`) sees one representation of an
+                            // empty upload on every frontend protocol. An
+                            // unread stream that may still carry DATA never
+                            // reaches this arm.
+                            ClientRequestBody::Streaming(request)
+                                if hyper::body::Body::is_end_stream(request.body()) =>
+                            {
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    &[],
+                                    authorize_body_requirements.needs_text,
+                                    authorize_body_requirements.needs_bytes,
+                                    authorize_body_requirements.needs_digests,
+                                );
+                            }
+                            ClientRequestBody::Streaming(_) => {}
                         }
                         buffered
                     }
@@ -37040,6 +37119,10 @@ async fn handle_proxy_request_inner(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // Stale request digests: decided over the final outbound headers, after
+    // every `before_proxy` hook and the route-header finalizer. The native
+    // HTTP/3 frontend does the same at the same point — keep both in sync.
+    retire_stale_request_integrity_headers(&ctx, &mut owned_proxy_headers);
     // Proxy hop limit (issue #6109): re-assert the forwarded `X-Ferrum-Hops`
     // count on the authoritative outbound map now that every request-phase
     // plugin has run, so no plugin can reset the count the next gateway hop
@@ -41174,9 +41257,7 @@ async fn handle_proxy_request_inner(
                 // counts decoded message frames. Attached independently of
                 // whether a deferred logger is present so message metrics are
                 // not silently zero when plugins are absent.
-                if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(
-                    &ctx.metadata,
-                ) {
+                if crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages(&ctx) {
                     body = body.with_grpc_message_counter(Arc::clone(
                         &ctx.grpc_response_messages_observed,
                     ));
@@ -45999,7 +46080,7 @@ async fn handle_proxy_request_inner(
     // buffered one, which carries no backend gRPC messages. Genuinely buffered
     // backend bodies were already counted from `backend_resp.body` above.
     if body_will_stream
-        && crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata)
+        && crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages(&ctx)
     {
         body = body.with_grpc_message_counter(Arc::clone(&ctx.grpc_response_messages_observed));
     }

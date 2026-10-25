@@ -114,6 +114,16 @@ pub mod _test_support {
         ctx.authorization_connection_closer = Some(closer);
     }
 
+    /// Install a route's credential-header redaction set on a request
+    /// context, as the H1/H2/H3 handlers do from the plugin cache view
+    /// (`opa` obligation-destination conflict tests).
+    pub fn set_request_headers_to_redact_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_headers_to_redact(std::sync::Arc::new(headers));
+    }
+
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =
@@ -186,6 +196,21 @@ pub mod _test_support {
     ) -> Result<(), anyhow::Error> {
         crate::modes::file::await_fallible_listener_handles(handles, move || shutdown.shutdown())
             .await
+    }
+
+    /// Bytes of backend-provided semantic text (task id, context id, task
+    /// state) an `a2a_gateway` SSE inspector retains after ingesting `chunks`,
+    /// before the stream ends.
+    pub fn a2a_sse_retained_semantic_bytes_for_test(
+        binding: &'static str,
+        metadata_limit: usize,
+        chunks: &[&[u8]],
+    ) -> usize {
+        crate::plugins::a2a_gateway::sse_inspector_retained_semantic_bytes(
+            binding,
+            metadata_limit,
+            chunks,
+        )
     }
 
     /// `body_validator`'s omitted-field gRPC decompression default resolved
@@ -2548,6 +2573,22 @@ pub mod _test_support {
     pub fn admin_builder_failure_response_for_test()
     -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
         crate::admin::admin_builder_failure_response()
+    }
+
+    /// Collect an admin response through the connection body wrapper exactly
+    /// as the admin listener does (`/charges` delivery acknowledgement tests).
+    pub async fn collect_guarded_admin_response_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) -> bytes::Bytes {
+        crate::admin::collect_guarded_admin_response_for_test(response).await
+    }
+
+    /// Wrap an admin response as the admin listener does, then drop it
+    /// without writing its body (`/charges` delivery acknowledgement tests).
+    pub fn drop_guarded_admin_response_unpolled_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) {
+        crate::admin::drop_guarded_admin_response_unpolled_for_test(response)
     }
 
     pub fn x_gateway_error_for_backend_failure_for_test(
@@ -5068,6 +5109,38 @@ pub mod _test_support {
             };
             self.0.emit_setup_failure_if_owner(failure).await
         }
+    }
+
+    /// Drive the production frontend-DTLS plugin-rejection summary path: the
+    /// same attribution snapshot and emission the DTLS accept handler runs
+    /// when its `on_stream_connect` chain rejects. Returns whether a summary
+    /// was emitted.
+    pub async fn emit_dtls_plugin_rejection_summary_for_test(
+        plugins: Vec<Arc<dyn Plugin>>,
+        proxy: &crate::config::types::Proxy,
+        ctx: &crate::plugins::StreamConnectionContext,
+        client_ip: &str,
+        listen_port: u16,
+    ) -> bool {
+        let progress = crate::proxy::udp_proxy::dtls_plugin_rejection_progress(
+            Arc::new(plugins),
+            proxy.name.as_deref(),
+            proxy.effective_scheme(),
+            format!("{}:{}", proxy.backend_host, proxy.backend_port),
+            ctx,
+        );
+        crate::proxy::udp_proxy::emit_dtls_plugin_rejection_summary(
+            progress,
+            crate::proxy::udp_proxy::DtlsPluginRejection {
+                namespace: &proxy.namespace,
+                proxy_id: &proxy.id,
+                client_ip,
+                listen_port,
+                connected_wall_at: chrono::Utc::now(),
+                duration_ms: 0.0,
+            },
+        )
+        .await
     }
 
     /// The production wrapper that decides whether a stream-setup DNS resolve
@@ -10090,6 +10163,15 @@ pub mod _test_support {
 
     pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
         crate::proxy::request_may_have_body(method, headers)
+    }
+
+    /// Proxy core's stale request-digest retirement over the final outbound
+    /// headers (clone-on-write into `owned_proxy_headers`).
+    pub fn retire_stale_request_integrity_headers(
+        ctx: &crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<HashMap<String, String>>,
+    ) {
+        crate::proxy::retire_stale_request_integrity_headers(ctx, owned_proxy_headers)
     }
 
     pub async fn apply_request_body_plugins(
