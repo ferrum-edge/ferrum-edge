@@ -7845,6 +7845,11 @@ async fn handle_dtls_client_inner(
     let c2b_trust = client_trust.clone();
     let b2c_trust = client_trust.clone();
     let client_to_backend = tokio::spawn(async move {
+        // The accept-time `on_stream_connect` chain already admitted this
+        // session; its first application datagram is the event that chain's
+        // per-session decisions (for example a fault-injection abort roll)
+        // stand for, so datagram hooks must not decide them a second time.
+        let mut first_application_datagram = true;
         'c2b: loop {
             let data = match dtls_c2b_under_bounds(
                 c2b_auth_plan,
@@ -7875,6 +7880,8 @@ async fn handle_dtls_client_inner(
                 ));
             }
             let len = data.len();
+            let admission_datagram = first_application_datagram;
+            first_application_datagram = false;
 
             metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_fwd
@@ -7896,7 +7903,7 @@ async fn handle_dtls_client_inner(
                     payload: &data,
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_fwd.as_ref())),
-                    admission_datagram: false,
+                    admission_datagram,
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {

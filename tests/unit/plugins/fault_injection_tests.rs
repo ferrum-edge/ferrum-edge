@@ -1779,10 +1779,12 @@ mod udp_datagram_faults {
         assert!(!map.contains_key("fault_abort_status"));
     }
 
-    /// Replays the plain-UDP setup sequence (stream connect, then the
-    /// first-datagram hook on the same packet) for many fresh sources. The
-    /// share of refused first contacts must track the configured 50%, not the
-    /// compounded `1-(1-p)^2` = 75% two independent abort rolls produce.
+    /// Replays the first-contact sequence for many fresh clients: stream
+    /// connect, then the datagram hook on the session's first client→backend
+    /// datagram (the plain-UDP opening packet, or the first DTLS application
+    /// datagram after the admitted handshake). The share of refused first
+    /// contacts must track the configured 50%, not the compounded
+    /// `1-(1-p)^2` = 75% two independent abort rolls produce.
     #[tokio::test]
     async fn first_udp_datagram_abort_rate_matches_configured_percentage() {
         use ferrum_edge::config::types::BackendScheme;
@@ -1790,46 +1792,48 @@ mod udp_datagram_faults {
         use ferrum_edge::plugins::StreamConnectionContext;
 
         const SOURCES: usize = 4_000;
-        let plugin = FaultInjectionPlugin::new(&json!({
-            "abort": { "status_code": 503, "percentage": 50.0 }
-        }))
-        .unwrap();
         let consumers = Arc::new(ConsumerIndex::new(&[]));
 
-        let mut refused = 0usize;
-        for _ in 0..SOURCES {
-            let mut stream_ctx = StreamConnectionContext::new(
-                "127.0.0.1".to_string(),
-                "127.0.0.1".to_string(),
-                "udp-proxy".to_string(),
-                None,
-                9000,
-                BackendScheme::Udp,
-                Arc::clone(&consumers),
-            );
-            if matches!(
-                plugin.on_stream_connect(&mut stream_ctx).await,
-                PluginResult::Reject { .. }
-            ) {
-                refused += 1;
-                continue;
+        for scheme in [BackendScheme::Udp, BackendScheme::Dtls] {
+            let plugin = FaultInjectionPlugin::new(&json!({
+                "abort": { "status_code": 503, "percentage": 50.0 }
+            }))
+            .unwrap();
+            let mut refused = 0usize;
+            for _ in 0..SOURCES {
+                let mut stream_ctx = StreamConnectionContext::new(
+                    "127.0.0.1".to_string(),
+                    "127.0.0.1".to_string(),
+                    "udp-proxy".to_string(),
+                    None,
+                    9000,
+                    scheme,
+                    Arc::clone(&consumers),
+                );
+                if matches!(
+                    plugin.on_stream_connect(&mut stream_ctx).await,
+                    PluginResult::Reject { .. }
+                ) {
+                    refused += 1;
+                    continue;
+                }
+                let ctx = datagram_ctx_with_admission(
+                    UdpDatagramDirection::ClientToBackend,
+                    b"first",
+                    None,
+                    true,
+                );
+                if plugin.on_udp_datagram(&ctx).await == UdpDatagramVerdict::Drop {
+                    refused += 1;
+                }
             }
-            let ctx = datagram_ctx_with_admission(
-                UdpDatagramDirection::ClientToBackend,
-                b"first",
-                None,
-                true,
-            );
-            if plugin.on_udp_datagram(&ctx).await == UdpDatagramVerdict::Drop {
-                refused += 1;
-            }
-        }
 
-        let rate = refused as f64 / SOURCES as f64;
-        assert!(
-            (0.45..=0.55).contains(&rate),
-            "first-contact refusal rate must match the configured 50%, got {rate}"
-        );
+            let rate = refused as f64 / SOURCES as f64;
+            assert!(
+                (0.45..=0.55).contains(&rate),
+                "{scheme:?} first-contact refusal rate must match the configured 50%, got {rate}"
+            );
+        }
     }
 }
 

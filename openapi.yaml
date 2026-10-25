@@ -31388,7 +31388,7 @@ components:
     FaultInjectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; TCP/UDP/DTLS session admission faults run on stream connect; UDP/DTLS also apply per-datagram faults on on_udp_datagram (client→backend) in isolated session workers without blocking the shared recv loop. Each fault side is decided once per packet: the plain-UDP datagram that opens a session has its abort decided only by stream connect and its delay only by the datagram hook. Optional `match.headers` targets HTTP-family requests and `expires_at` ends the experiment."
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; TCP/UDP/DTLS session admission faults run on stream connect; UDP/DTLS also apply per-datagram faults on on_udp_datagram (client→backend) in isolated session workers without blocking the shared recv loop. Each fault side is decided once per first contact: a session's first client→backend datagram (the plain-UDP opening packet, or the first DTLS application datagram after an admitted handshake) has its abort decided only by stream connect and its delay only by the datagram hook. Optional `match.headers` targets HTTP-family requests and `expires_at` ends the experiment."
       properties:
         abort:
           type: [object, "null"]

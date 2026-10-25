@@ -19,11 +19,11 @@
 //! aborts run in `on_udp_datagram` on the established-session hook-ingress
 //! worker (and the first-datagram setup path), never inside the shared listener
 //! recv loop, so a delay for peer A cannot stall peer B. Each fault side is
-//! decided exactly once per packet: UDP/DTLS stream connect decides only the
-//! abort side, and the plain-UDP datagram that opens a session (which stream
-//! connect already evaluated) decides only the delay side, so neither a second
-//! abort roll nor a second wait applies to that first packet. DTLS admission is
-//! the handshake, a separate event from any application datagram. TCP keeps
+//! decided exactly once per first contact: UDP/DTLS stream connect decides only
+//! the abort side, and the session's first client→backend datagram (the
+//! plain-UDP packet that opened the session, or the first DTLS application
+//! datagram after the admitted handshake) decides only the delay side, so
+//! neither a second abort roll nor a second wait applies to it. TCP keeps
 //! delay+abort on connect. Within one session the worker preserves
 //! client→backend ordering: a delayed datagram parks that session's worker under
 //! the shared delayed-work budget while later datagrams remain in the bounded
@@ -683,9 +683,10 @@ impl Plugin for FaultInjectionPlugin {
         // UDP/DTLS application latency is owned by `on_udp_datagram`: the
         // plain-UDP first-datagram setup path runs stream connect and then the
         // datagram hook on the same packet, so deciding delay here too would
-        // stack two waits. Session abort is decided only here (the datagram
-        // hook skips its abort roll for that opening packet), refusing
-        // admission like a TCP stream reject. TCP keeps delay+abort on connect.
+        // stack two waits. First-contact abort is decided only here (the
+        // datagram hook skips its abort roll for the session's first datagram,
+        // plain UDP or DTLS), refusing admission like a TCP stream reject. TCP
+        // keeps delay+abort on connect.
         let udp_family = matches!(
             ctx.backend_scheme,
             crate::config::types::BackendScheme::Udp | crate::config::types::BackendScheme::Dtls
@@ -743,9 +744,10 @@ impl Plugin for FaultInjectionPlugin {
             return UdpDatagramVerdict::Forward;
         }
 
-        // The packet that opened a plain-UDP session already had its abort
-        // decided by `on_stream_connect`; rolling abort again here would make
-        // the effective first-contact failure rate `1-(1-p)^2` instead of `p`.
+        // The session's first datagram (plain-UDP opening packet, or first DTLS
+        // application datagram) already had its abort decided by
+        // `on_stream_connect`; rolling abort again here would make the
+        // effective first-contact failure rate `1-(1-p)^2` instead of `p`.
         let (delay_triggered, abort_triggered) =
             self.decide_fault_sides(true, !ctx.admission_datagram);
         if !delay_triggered && !abort_triggered {

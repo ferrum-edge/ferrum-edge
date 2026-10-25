@@ -151,15 +151,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`fault_injection` no longer rolls the UDP abort twice for a new source's
-  first datagram.** Plain-UDP session setup runs `on_stream_connect` and then
-  the datagram hook on the same opening packet, and both rolled
-  `abort.percentage`, so the effective first-contact failure rate was
-  `1-(1-p)^2` (75% at a configured 50%). Stream connect now owns the abort
-  decision for that packet and the first-datagram hook decides only the delay;
-  the proxy marks it with the new `UdpDatagramContext::admission_datagram`
-  field (`false` for established-session, backend→client, and DTLS
-  datagrams).
+- **`fault_injection` no longer rolls the UDP/DTLS abort twice for a new
+  client's first datagram.** Plain-UDP session setup runs `on_stream_connect`
+  and then the datagram hook on the same opening packet, and a terminating-DTLS
+  session rolls admission at handshake accept and again on its first
+  application datagram; both rolled `abort.percentage`, so the effective
+  first-contact failure rate was `1-(1-p)^2` (75% at a configured 50%). Stream
+  connect now owns the abort decision for that first datagram and the datagram
+  hook decides only its delay; the proxy marks it with the new
+  `UdpDatagramContext::admission_datagram` field (`false` for every later and
+  every backend→client datagram).
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

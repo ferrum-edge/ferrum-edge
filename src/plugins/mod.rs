@@ -1379,14 +1379,15 @@ pub struct UdpDatagramContext<'a> {
     /// that `build_udp_stream_summary` / `build_dtls_stream_summary` read at
     /// disconnect. `None` when there is no session map to attach to (or in tests).
     pub metadata_sink: Option<UdpMetadataSink<'a>>,
-    /// `true` only for the client→backend datagram whose arrival opened a
-    /// plain-UDP session. The proxy runs this hook on that packet during
-    /// session setup, after the `on_stream_connect` admission chain has already
-    /// evaluated the same packet, so a plugin that makes one per-event decision
-    /// in both hooks (for example a fault-injection abort roll) must not decide
-    /// it a second time here. `false` for every established-session datagram,
-    /// for backend→client datagrams, and for DTLS, whose admission is the
-    /// handshake — an event distinct from any application datagram.
+    /// `true` only for the first client→backend datagram of a session whose
+    /// `on_stream_connect` admission chain already ran for it: the packet that
+    /// opened a plain-UDP session (the proxy runs this hook on it during
+    /// session setup, after admission evaluated the same packet), and the first
+    /// decrypted application datagram of a terminating-DTLS session (admitted
+    /// at handshake accept). A plugin that makes one first-contact decision in
+    /// both hooks (for example a fault-injection abort roll) must not decide it
+    /// a second time here. `false` for every later datagram and for every
+    /// backend→client datagram.
     pub admission_datagram: bool,
 }
 
