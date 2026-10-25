@@ -3462,7 +3462,13 @@ pub struct RequestContext {
     /// re-resolves this from the upstream snapshot automatically. Plugins that
     /// override a direct backend host/port can set this field explicitly when
     /// the destination uses different mTLS materials.
-    pub route_override_resolved_tls: Option<BackendTlsConfig>,
+    ///
+    /// Shared (`Arc`) so a producer that precomputed its TLS policy at config
+    /// load (`mesh_route_dispatch` per-rule `backend_tls`) publishes it with a
+    /// refcount bump instead of deep-cloning the SAN allow-list and paths on
+    /// every matched request. Equality is by value, so claim witnesses that
+    /// compare it keep their exact-configuration semantics.
+    pub route_override_resolved_tls: Option<Arc<BackendTlsConfig>>,
     /// Plugin-set override for the proxy's backend response/read timeout.
     /// Used by mesh L7 route dispatch so route-local policy follows the
     /// matched predicate even when the hot router selected a later fallback
@@ -3509,8 +3515,9 @@ pub struct RequestContext {
     pub route_override_backend_connect_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's retry policy. Outer `None` means
     /// no override; `Some(None)` intentionally clears the selected proxy's
-    /// retry policy for this route.
-    pub route_override_retry: Option<Option<RetryConfig>>,
+    /// retry policy for this route. Shared (`Arc`) so a route-local policy
+    /// compiled at config load is published without a per-request deep clone.
+    pub route_override_retry: Option<Option<Arc<RetryConfig>>>,
     /// Per-rule request header transforms published by `mesh_route_dispatch`
     /// when a matching rule carries `request_transform` rules (Istio
     /// `VirtualService.http[].headers.request.{set,add,remove}`). Enabled
@@ -4047,6 +4054,14 @@ pub(crate) struct PluginRequestState {
     /// isolation. Bounded by the number of attached WAF instances (operator
     /// configuration), never by request content.
     pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
+    /// Forwarded `Host` value that was live immediately before the first
+    /// `mesh_route_dispatch` authority rewrite on this request. `Some` exactly
+    /// while a dispatcher-owned `Host` rewrite is in the shared header map;
+    /// the inner `None` records that no `Host` was present. A later matching
+    /// instance without an authority rewrite restores this value (undoing
+    /// only the dispatcher's own rewrite) and never touches a `Host` another
+    /// plugin set before the dispatch block.
+    pub(crate) mesh_route_dispatch_host_before_rewrite: Option<Option<String>>,
     /// `grpc-encoding` framing witness `ai_transcript_audit` records from the
     /// LIVE `before_proxy` header map for a native-gRPC request on a
     /// `grpc`-enrolled instance, before the backend-effective method is known.
@@ -6869,7 +6884,8 @@ impl RequestContext {
             };
         let resolved_tls_override = self
             .route_override_resolved_tls
-            .clone()
+            .as_deref()
+            .cloned()
             .or(upstream_tls_override)
             .or(direct_backend_tls_override);
         let resolved_tls_changed = resolved_tls_override
@@ -6948,7 +6964,7 @@ impl RequestContext {
         let retry_changed = self
             .route_override_retry
             .as_ref()
-            .is_some_and(|retry| proxy.retry != *retry);
+            .is_some_and(|retry| proxy.retry.as_ref() != retry.as_deref());
         // An Istio `rewrite.authority` rebases the `Host`/`:authority` forwarded
         // to the backend. The plugin already wrote the new authority into the
         // request `host` header; flipping `preserve_host_header` on the
@@ -7023,7 +7039,7 @@ impl RequestContext {
             overridden.backend_connect_timeout_ms = timeout;
         }
         if let Some(retry) = &self.route_override_retry {
-            overridden.retry = retry.clone();
+            overridden.retry = retry.as_deref().cloned();
         }
         if preserve_host_changed {
             overridden.preserve_host_header = true;
@@ -12023,6 +12039,43 @@ pub trait Plugin: Any + Send + Sync {
     /// for `response_transformer` and
     /// [`RequestContext::route_override_response_transform`].
     fn participates_in_route_response_header_finalization(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this instance may publish
+    /// [`RequestContext::route_override_request_transform`] from
+    /// `before_proxy` (a `mesh_route_dispatch` instance whose rules carry
+    /// `request_transform`).
+    ///
+    /// Plugin cache composition refuses such a producer with no configured
+    /// `request_transformer` on the same effective chain. Where the list is
+    /// applied is decided by [`Self::replaces_route_request_header_transforms`].
+    fn publishes_route_request_header_transforms(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this instance's `before_proxy` may replace (publish
+    /// OR clear) [`RequestContext::route_override_request_transform`] — every
+    /// `mesh_route_dispatch` instance, because a matching rule replaces the
+    /// whole route decision, including the staged request header list, even
+    /// when its own rules carry no `request_transform`.
+    ///
+    /// Proxy core applies the staged list after the LATER of the last
+    /// eligible consumer and the last such instance. A consumer that a
+    /// priority override placed before the dispatch block therefore neither
+    /// finalizes an empty slot (dropping a list published afterwards) nor
+    /// applies a list a later dispatch instance would have superseded — and
+    /// no later dispatch predicate observes route headers early.
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        false
+    }
+
+    /// Response-side counterpart to
+    /// [`Self::publishes_route_request_header_transforms`] for
+    /// [`RequestContext::route_override_response_transform`]. Plugin cache
+    /// composition refuses a producer with no configured
+    /// `response_transformer` on the same effective chain.
+    fn publishes_route_response_header_transforms(&self) -> bool {
         false
     }
 

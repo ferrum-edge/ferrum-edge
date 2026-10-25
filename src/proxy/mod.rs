@@ -15966,10 +15966,32 @@ pub(crate) fn finalize_successful_websocket_response_headers(
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
 ) {
-    for plugin in plugins {
+    // The matched `mesh_route_dispatch` rule's response list governs the
+    // successful handshake too: apply it once, after the last eligible
+    // route-response consumer (in a WebSocket view, the cache-owned stand-in
+    // for the HTTP/gRPC-only `response_transformer`), exactly where the
+    // ordinary response path finalizes it. `None` when no list was published
+    // keeps the ordinary handshake free of the chain scan.
+    let route_response_finalizer = ctx
+        .route_override_response_transform
+        .as_ref()
+        .and_then(|_| {
+            plugins
+                .iter()
+                .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
+        });
+    for (index, plugin) in plugins.iter().enumerate() {
         plugin.apply_websocket_handshake_response_headers(ctx, response_status, response_headers);
         if plugin.is_initial_response_header_policy() {
             plugin.apply_initial_response_header_policy(response_headers);
+        }
+        if route_response_finalizer == Some(index)
+            && let Some(route_rules) = ctx.route_override_response_transform.as_deref()
+        {
+            crate::plugins::utils::route_header_transform::apply_route_header_transforms(
+                route_rules,
+                response_headers,
+            );
         }
     }
     strip_websocket_transport_managed_response_header_map(response_headers);
@@ -32978,6 +33000,32 @@ pub(crate) fn insert_reauthentication_challenge(
     );
 }
 
+/// Chain index after which proxy core applies the matched route request-header
+/// list (GHSA-3xxr-xhhj-9962).
+///
+/// The list is applied exactly once, after the LATER of the last eligible
+/// `request_transformer` (so a later static rule cannot undo route policy) and
+/// the last instance that may replace it — every `mesh_route_dispatch`
+/// instance, including one whose rules publish nothing, because a matching
+/// rule clears an earlier instance's list. A priority override can
+/// legitimately place the consumer before the dispatch block; finalizing at
+/// the consumer would take an empty slot (the list published afterwards would
+/// never apply), and finalizing inside the block would apply a list a later
+/// instance supersedes and let its predicates see route headers early. `None` when the chain has
+/// no eligible consumer: a disabled RTDS transformer neither consumes nor
+/// suppresses the list, and plugin-cache composition refuses a producer with
+/// no configured consumer at all. Neither participant defers its
+/// `before_proxy` hook, so the boundary always falls inside the initial pass.
+fn route_request_header_finalization_index(plugins: &[Arc<dyn Plugin>]) -> Option<usize> {
+    let last_consumer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_request_header_finalization())?;
+    let last_producer = plugins
+        .iter()
+        .rposition(|plugin| plugin.replaces_route_request_header_transforms());
+    Some(last_producer.map_or(last_consumer, |producer| producer.max(last_consumer)))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum BackendPathBeforeProxyPass {
     Initial,
@@ -32992,9 +33040,7 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     backend_path_is_policy_bound: bool,
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
-    let last_route_request_finalizer = plugins
-        .iter()
-        .rposition(|plugin| plugin.participates_in_route_request_header_finalization());
+    let last_route_request_finalizer = route_request_header_finalization_index(plugins);
     for (index, plugin) in plugins.iter().enumerate() {
         let deferred =
             backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();

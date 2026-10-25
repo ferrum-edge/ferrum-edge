@@ -382,6 +382,7 @@ pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwne
         return Some(CacheOwnedPlugin::Wraps(wrapper.inner.as_ref()));
     }
     let builtin = plugin.is::<MeshRouteDispatchFinalizer>()
+        || plugin.is::<RouteHeaderConsumerStandIn>()
         || plugin.is::<CompositionShapePlugin>()
         || plugin.is::<ServerlessSecurityCompositionPlugin>()
         || plugin.is::<FinalizedRequestPolicyCompositionPlugin>();
@@ -389,7 +390,10 @@ pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwne
 }
 
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
+const REQUEST_TRANSFORMER_NAME: &str = "request_transformer";
+const RESPONSE_TRANSFORMER_NAME: &str = "response_transformer";
 const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+const ROUTE_HEADER_CONSUMER_STAND_IN_NAME: &str = "__route_header_transform_consumer";
 const CORS_NAME: &str = "cors";
 
 /// Warn when a proxy expresses a strict HTTP/gRPC CORS origin policy but leaves
@@ -508,6 +512,182 @@ pub(crate) fn install_mesh_route_dispatch_finalizer(
         last_index + 1,
         Arc::new(MeshRouteDispatchFinalizer { priority }),
     );
+    Ok(())
+}
+
+/// Cache-internal stand-in for an eligible route-header consumer in a protocol
+/// view that consumer does not run on.
+///
+/// `response_transformer` runs on HTTP and gRPC only, while
+/// `mesh_route_dispatch` also routes WebSocket handshakes. Without a stand-in
+/// the WebSocket view has no eligible response consumer, so proxy core would
+/// leave a matched rule's route response list unused. `request_transformer`
+/// runs on WebSocket handshakes itself, so it stays the request list's sole
+/// consumer there and no request stand-in is synthesized (the slot logic only
+/// fills a direction the view has no eligible participant for, which keeps the
+/// request list applied exactly once). The stand-in carries only the
+/// route-header finalization participation of the consumer it replaces —
+/// never that transformer's static header, query, or body rules — and sits at
+/// that consumer's chain position.
+struct RouteHeaderConsumerStandIn {
+    priority: u16,
+    request: bool,
+    response: bool,
+}
+
+#[async_trait]
+impl Plugin for RouteHeaderConsumerStandIn {
+    fn name(&self) -> &str {
+        ROUTE_HEADER_CONSUMER_STAND_IN_NAME
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [crate::plugins::ProxyProtocol] {
+        crate::plugins::HTTP_FAMILY_PROTOCOLS
+    }
+
+    /// Cache-internal sentinel: never replaces a response body. Declared
+    /// explicitly for the same reason as the dispatch finalizer sentinel.
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        crate::plugins::ResponseBodyProduction::Never
+    }
+
+    /// Cache-internal sentinel: its only request-input effect is the declared
+    /// header map the route finalization phase writes.
+    fn declares_request_input_mutations(&self) -> bool {
+        true
+    }
+
+    /// Route request writes must reach the backend request, so the dispatcher
+    /// takes the cloned-header path exactly as for the replaced transformer.
+    fn modifies_request_headers(&self) -> bool {
+        self.request
+    }
+
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        self.request
+    }
+
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        self.response
+    }
+
+    /// The replaced `response_transformer` opts into reject hooks, so the
+    /// stand-in must too: the rejection loop finalizes the route response
+    /// list at this chain position, before later decorators such as
+    /// `security_headers`, instead of in the end-of-chain fallback after
+    /// them (which would let an earlier route write override a later scrub).
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.response
+    }
+}
+
+/// Where `filter_for_protocol` inserts route-header consumer stand-ins: the
+/// full-chain index of the last eligible consumer for each direction that the
+/// protocol view would otherwise lose, when a dispatcher in that view publishes
+/// route lists for the direction.
+#[derive(Default)]
+struct RouteHeaderConsumerStandInSlots {
+    request: Option<usize>,
+    response: Option<usize>,
+}
+
+impl RouteHeaderConsumerStandInSlots {
+    fn for_view(plugins: &[Arc<dyn Plugin>], protocol: ProxyProtocol) -> Self {
+        Self {
+            request: route_header_consumer_stand_in_slot(
+                plugins,
+                protocol,
+                |plugin| plugin.publishes_route_request_header_transforms(),
+                |plugin| plugin.participates_in_route_request_header_finalization(),
+            ),
+            response: route_header_consumer_stand_in_slot(
+                plugins,
+                protocol,
+                |plugin| plugin.publishes_route_response_header_transforms(),
+                |plugin| plugin.participates_in_route_response_header_finalization(),
+            ),
+        }
+    }
+}
+
+/// The full-chain index of the last eligible consumer (`participates`) when a
+/// dispatcher in `protocol`'s view publishes route lists (`publishes`) but the
+/// view keeps no eligible consumer for them. `None` otherwise: an RTDS-disabled
+/// consumer stays ineligible and its stand-in is never synthesized.
+fn route_header_consumer_stand_in_slot(
+    plugins: &[Arc<dyn Plugin>],
+    protocol: ProxyProtocol,
+    publishes: impl Fn(&Arc<dyn Plugin>) -> bool,
+    participates: impl Fn(&Arc<dyn Plugin>) -> bool,
+) -> Option<usize> {
+    let in_view = |plugin: &Arc<dyn Plugin>| plugin.supported_protocols().contains(&protocol);
+    let view_publishes = plugins.iter().any(|plugin| {
+        in_view(plugin) && is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME) && publishes(plugin)
+    });
+    if !view_publishes
+        || plugins
+            .iter()
+            .any(|plugin| in_view(plugin) && participates(plugin))
+    {
+        return None;
+    }
+    plugins.iter().rposition(participates)
+}
+
+/// Refuse an effective chain whose `mesh_route_dispatch` rules publish
+/// route-level header transforms that no configured transformer on the same
+/// chain can apply.
+///
+/// Proxy core applies a matched rule's `request_transform` /
+/// `response_transform` only when the chain carries an eligible
+/// `request_transformer` / `response_transformer`; without one the published
+/// list is silently dropped, so a rule that strips a sensitive request header
+/// would forward it untouched. The translators auto-emit an empty
+/// `apply_route_overrides: true` consumer; a hand-authored chain must attach
+/// one too. Presence is judged by the configured built-in instance, not by its
+/// RTDS gate: a transformer an RTDS overlay disables is still the operator's
+/// configured consumer (its kill switch must not wedge every reload), and it
+/// keeps the documented "not eligible, route list unused" behavior at runtime.
+/// `request_transformer` runs in every view the dispatcher runs in; the
+/// WebSocket view, which drops the HTTP/gRPC-only `response_transformer`, keeps
+/// an eligible response consumer through [`RouteHeaderConsumerStandIn`], so
+/// presence on the effective chain is sufficient for every view.
+pub(crate) fn validate_mesh_route_transform_consumers(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    let dispatchers = || {
+        plugins
+            .iter()
+            .filter(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
+    };
+    let publishes_request =
+        dispatchers().any(|plugin| plugin.publishes_route_request_header_transforms());
+    let publishes_response =
+        dispatchers().any(|plugin| plugin.publishes_route_response_header_transforms());
+    if publishes_request
+        && !plugins
+            .iter()
+            .any(|plugin| is_builtin_named(plugin, REQUEST_TRANSFORMER_NAME))
+    {
+        return Err(
+            "mesh_route_dispatch rules carry request_transform, but the effective plugin chain has no request_transformer to apply them, so the route-level request header policy would be silently dropped; attach a request_transformer to this proxy (`{\"rules\": [], \"apply_route_overrides\": true}` is enough) or remove the rules' request_transform"
+                .to_string(),
+        );
+    }
+    if publishes_response
+        && !plugins
+            .iter()
+            .any(|plugin| is_builtin_named(plugin, RESPONSE_TRANSFORMER_NAME))
+    {
+        return Err(
+            "mesh_route_dispatch rules carry response_transform, but the effective plugin chain has no response_transformer to apply them, so the route-level response header policy would be silently dropped; attach a response_transformer to this proxy (`{\"rules\": [], \"apply_route_overrides\": true}` is enough) or remove the rules' response_transform"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1400,6 +1580,15 @@ impl Plugin for PluginInstanceWrapper {
     fn participates_in_route_response_header_finalization(&self) -> bool {
         self.inner
             .participates_in_route_response_header_finalization()
+    }
+    fn publishes_route_request_header_transforms(&self) -> bool {
+        self.inner.publishes_route_request_header_transforms()
+    }
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        self.inner.replaces_route_request_header_transforms()
+    }
+    fn publishes_route_response_header_transforms(&self) -> bool {
+        self.inner.publishes_route_response_header_transforms()
     }
     fn modifies_request_query(&self) -> bool {
         self.inner.modifies_request_query()
@@ -4975,6 +5164,7 @@ fn prepare_plugin_chain(
     for result in [
         install_cors_finalizer(plugins),
         install_mesh_route_dispatch_finalizer(plugins),
+        validate_mesh_route_transform_consumers(plugins),
         validate_plugin_security_composition(plugins),
         validate_correlation_id_composition(plugins, real_ip_header),
     ] {
@@ -5759,13 +5949,29 @@ fn filter_for_protocol(
     plugins: &[Arc<dyn Plugin>],
     protocol: ProxyProtocol,
 ) -> Arc<Vec<Arc<dyn Plugin>>> {
-    Arc::new(
-        plugins
-            .iter()
-            .filter(|p| p.supported_protocols().contains(&protocol))
-            .cloned()
-            .collect(),
-    )
+    // A WebSocket view drops the HTTP/gRPC-only `response_transformer` but
+    // keeps `mesh_route_dispatch`; stand in for a route-header consumer the
+    // view lost so the matched rule's route lists still apply to the
+    // handshake. A direction the view already has an eligible consumer for
+    // (the request side, via `request_transformer`) gets no stand-in, so each
+    // list is still applied exactly once.
+    let slots = RouteHeaderConsumerStandInSlots::for_view(plugins, protocol);
+    let mut filtered = Vec::with_capacity(plugins.len());
+    for (index, plugin) in plugins.iter().enumerate() {
+        if plugin.supported_protocols().contains(&protocol) {
+            filtered.push(Arc::clone(plugin));
+        }
+        let request = slots.request == Some(index);
+        let response = slots.response == Some(index);
+        if request || response {
+            filtered.push(Arc::new(RouteHeaderConsumerStandIn {
+                priority: plugin.priority(),
+                request,
+                response,
+            }) as Arc<dyn Plugin>);
+        }
+    }
+    Arc::new(filtered)
 }
 
 /// Config-side state of global `mesh_authz` rows for one generation.
