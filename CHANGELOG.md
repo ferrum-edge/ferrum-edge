@@ -8,22 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **Log schemas gain bounded value `transforms` and admission bounds.** A
-  `schema:` / named `transaction_log_schema` definition can now shape selected
-  string fields at the point of emission: `truncate` (`max_bytes`),
-  `ip_prefix` (`ipv4_bits` / `ipv6_bits`, default /24 and /48), and `hash`
-  (lowercase-hex HMAC-SHA-256 keyed by a `${FERRUM_PLUGIN_SECRET_<NAME>}`
-  reference; literal keys are refused). Transforms compile once and cost no
-  allocation per record; the chargeback families and `transaction_debugger`
-  reject them. The compiler now also bounds named schemas (256, names ≤ 128
-  bytes), `omit` / `order` / `rename` (256 entries), output keys (128 bytes),
-  `static_fields` (64 entries, 16384 serialized bytes, nesting depth 8),
-  `derived_fields` (32), and `metadata.prefix` (64 bytes). `omit: [metadata]`
-  and `rename: {metadata: …}` are rejected under `metadata.mode: flatten`, and
-  `rename: {metadata: …}` under `metadata.mode: omit`, instead of being
-  silently ignored. `metadata.on_collision: overwrite` now replaces the
-  colliding field's value in place rather than emitting a duplicate JSON key.
-  See `docs/log_schema.md`.
 - **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
   `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
   most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
@@ -173,17 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **Named log-schema changes reach `proxy_group` loggers on incremental
-  reloads.** A proxy-group logging plugin with `schema_ref` was retained
-  across a DB-poll or CP→DP delta whenever its own config row was unchanged,
-  so it kept emitting the schema compiled at construction after the referenced
-  `transaction_log_schema` definition changed (for example, an added privacy
-  `omit` never reached that sink). Group instances now record the definition
-  they resolved and are rebuilt, once and shared by every associated proxy,
-  when it changes; an unchanged definition keeps the instance. The named-schema
-  reload bracket is also released by an RAII guard if plugin construction
-  unwinds, so a panic during a reload can no longer leave the registry
-  serializer held and every later reload refused.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
