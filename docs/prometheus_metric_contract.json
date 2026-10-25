@@ -3686,7 +3686,7 @@
   {
     "name": "ferrum_mesh_tracing_spans_dropped_total",
     "type": "counter",
-    "help": "Finished mesh telemetry spans a workload_metrics exporter refused before delivery, by provider and reason.",
+    "help": "Finished mesh telemetry spans a workload_metrics exporter dropped, refused at enqueue or discarded at delivery, by provider and reason.",
     "labels": [
       "provider",
       "reason",

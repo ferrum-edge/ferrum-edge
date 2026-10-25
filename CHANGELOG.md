@@ -155,8 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the request used the single-header form) beside W3C; stale incoming B3 is
     replaced.
   - New `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` counts
-    spans an exporter refused (`queue_full`, `byte_budget`,
-    `process_ceiling`, `shutting_down`, `unavailable`).
+    spans an exporter refused at enqueue (`queue_full`, `byte_budget`,
+    `process_ceiling`, `shutting_down`, `unavailable`) or discarded at
+    delivery (`export_failed`).
   - HBONE baggage attribution reads the same input as `mesh_authz` (wire
     field-lines plus the folded map); a `baggage` header added by a request
     transform after authorization is no longer honored.

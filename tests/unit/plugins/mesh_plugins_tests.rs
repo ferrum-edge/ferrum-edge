@@ -861,6 +861,59 @@ async fn workload_metrics_attributes_wire_hbone_baggage_like_mesh_authz() {
     );
 }
 
+/// PR6817-SOL-1: the ASCII-only raw accessor skips a field-line carrying
+/// obs-text (here valid UTF-8 `é`), but materialization keeps it in the folded
+/// map `mesh_authz` evaluates. The backend restamp must resolve from that same
+/// evidence: the later `client` assertion authorization honored, not the
+/// earlier `victim` line the raw accessor alone would leave.
+#[tokio::test]
+async fn workload_metrics_backend_restamp_keeps_obs_text_baggage_authz_evaluated() {
+    let metrics = WorkloadMetrics::new(&json!({})).expect("metrics config");
+    let authz = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("authz config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut wire = http::HeaderMap::new();
+    wire.append(
+        "baggage",
+        "source.principal=spiffe://cluster.local/ns/default/sa/victim"
+            .parse()
+            .expect("header value"),
+    );
+    wire.append(
+        "baggage",
+        http::HeaderValue::from_bytes(
+            "source.principal=spiffe://cluster.local/ns/default/sa/client,note=é".as_bytes(),
+        )
+        .expect("obs-text header value"),
+    );
+    ctx.set_raw_headers(wire);
+    ctx.materialize_headers();
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        stamped_source_principal(&ctx),
+        Some("spiffe://cluster.local/ns/default/sa/client")
+    );
+    // Authorization allows only `client`, so Continue proves it resolved the
+    // obs-text field-line's assertion too.
+    let result = authz.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut headers = ctx.headers.clone();
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        stamped_source_principal(&ctx),
+        Some("spiffe://cluster.local/ns/default/sa/client"),
+        "final attribution must match the identity authorization evaluated"
+    );
+}
+
 /// workload_metrics-MUSE-1: a `baggage` header added to the backend request
 /// after authorization (for example by `request_transformer`) was never
 /// evaluated by `mesh_authz`, so telemetry must not newly honor it.

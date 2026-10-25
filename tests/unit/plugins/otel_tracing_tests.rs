@@ -2895,3 +2895,55 @@ async fn workload_metrics_counts_refused_spans_by_provider_and_reason() {
         .expect("zipkin queue_full series");
     assert!(!series.contains("127.0.0.1"), "{series}");
 }
+
+/// PR6817-SOL-2: an enqueued span the exporter discards at delivery (here a
+/// non-retryable collector `400` with no retries) is counted once per lost
+/// span as `reason="export_failed"`, though no queue refusal ever happened.
+#[tokio::test]
+async fn workload_metrics_counts_spans_discarded_after_collector_failure() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/api/v2/spans"))
+        .respond_with(wiremock::ResponseTemplate::new(400))
+        .mount(&mock_server)
+        .await;
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "max_retries": 0,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {"url": format!("{}/api/v2/spans", mock_server.uri())}
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+    let count = || {
+        prometheus_helpers::mesh_tracing_spans_dropped_count(
+            MeshTracingProvider::Zipkin,
+            MeshTracingSpanDropReason::ExportFailed,
+        )
+    };
+    let before = count();
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    // Completion barrier: the collector saw the batch, then the counter moves.
+    let _ = received_json(&mock_server).await;
+    let mut after = count();
+    for _ in 0..100 {
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        after = count();
+    }
+    assert!(
+        after > before,
+        "a span discarded on a terminal collector failure must be counted ({before} -> {after})"
+    );
+}

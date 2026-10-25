@@ -1110,15 +1110,19 @@ pub enum MeshTracingSpanDropReason {
     /// The exporter could not accept spans at all (no flush worker, for
     /// example outside a Tokio runtime).
     Unavailable,
+    /// An enqueued batch was discarded at delivery: a non-retryable
+    /// collector response, exhausted retries, or no HTTP client.
+    ExportFailed,
 }
 
 impl MeshTracingSpanDropReason {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::QueueFull,
         Self::ByteBudget,
         Self::ProcessCeiling,
         Self::ShuttingDown,
         Self::Unavailable,
+        Self::ExportFailed,
     ];
 
     pub const fn as_metric_label(self) -> &'static str {
@@ -1128,6 +1132,7 @@ impl MeshTracingSpanDropReason {
             Self::ProcessCeiling => "process_ceiling",
             Self::ShuttingDown => "shutting_down",
             Self::Unavailable => "unavailable",
+            Self::ExportFailed => "export_failed",
         }
     }
 
@@ -1138,6 +1143,7 @@ impl MeshTracingSpanDropReason {
             Self::ProcessCeiling => 2,
             Self::ShuttingDown => 3,
             Self::Unavailable => 4,
+            Self::ExportFailed => 5,
         }
     }
 }
@@ -1157,8 +1163,17 @@ pub fn increment_mesh_tracing_span_dropped(
     provider: MeshTracingProvider,
     reason: MeshTracingSpanDropReason,
 ) {
+    add_mesh_tracing_spans_dropped(provider, reason, 1);
+}
+
+/// Count `spans` dropped at once (a whole discarded export batch).
+pub fn add_mesh_tracing_spans_dropped(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+    spans: u64,
+) {
     if let Some(slot) = mesh_tracing_span_drop_slot(provider, reason) {
-        slot.fetch_add(1, Ordering::Relaxed);
+        slot.fetch_add(spans, Ordering::Relaxed);
     }
 }
 
@@ -1682,7 +1697,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         .any(|slot| slot.load(Ordering::Relaxed) > 0)
     {
         output.push_str(
-            "# HELP ferrum_mesh_tracing_spans_dropped_total Finished mesh telemetry spans a workload_metrics exporter refused before delivery, by provider and reason.\n",
+            "# HELP ferrum_mesh_tracing_spans_dropped_total Finished mesh telemetry spans a workload_metrics exporter dropped, refused at enqueue or discarded at delivery, by provider and reason.\n",
         );
         output.push_str("# TYPE ferrum_mesh_tracing_spans_dropped_total counter\n");
         for provider in MeshTracingProvider::ALL {

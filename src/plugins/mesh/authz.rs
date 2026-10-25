@@ -4379,6 +4379,30 @@ pub(crate) fn hbone_baggage_identity(ctx: &RequestContext, folded: Option<&str>)
     HboneIdentity::from_baggage_values(ctx.raw_header_values(BAGGAGE_HEADER).chain(folded))
 }
 
+/// The folded `baggage` value request-header materialization derives from the
+/// pristine wire block: every field-line that is valid UTF-8 (obs-text
+/// included), joined with `, ` exactly as
+/// [`RequestContext::materialize_headers`] joins them. This is the folded
+/// value `mesh_authz` evaluates for a materialized request, rebuilt for a hook
+/// that runs after request transforms may have rewritten the header map.
+/// `None` when no wire `baggage` field-line decodes.
+pub(crate) fn hbone_wire_folded_baggage(ctx: &RequestContext) -> Option<String> {
+    let mut folded: Option<String> = None;
+    for value in ctx.raw_header_value_bytes(BAGGAGE_HEADER) {
+        let Ok(value) = std::str::from_utf8(value) else {
+            continue;
+        };
+        match folded.as_mut() {
+            Some(existing) => {
+                existing.push_str(", ");
+                existing.push_str(value);
+            }
+            None => folded = Some(value.to_owned()),
+        }
+    }
+    folded
+}
+
 /// Disposition of a baggage assertion against the trusted-assertor relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssertionVerdict {

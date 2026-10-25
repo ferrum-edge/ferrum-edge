@@ -1156,6 +1156,11 @@ pub(crate) struct TraceExporterOptions {
     allow_plaintext: bool,
     /// Retained-byte ceiling every exporter built from these options charges.
     ceiling: &'static RetainedByteCeiling,
+    /// Count spans this exporter discards after enqueue (terminal collector
+    /// failure, exhausted retries, no HTTP client) on the mesh span-drop
+    /// counter. Set only for `workload_metrics` mesh exporters, so
+    /// standalone `otel_tracing` losses never reach a mesh-named series.
+    mesh_span_drop_accounting: bool,
 }
 
 impl TraceExporterOptions {
@@ -1221,6 +1226,7 @@ impl TraceExporterOptions {
             deployment_environment: optional_string_config(config, "deployment_environment")?,
             allow_plaintext: bool_config(config, "allow_plaintext", false)?,
             ceiling: process_ceiling(),
+            mesh_span_drop_accounting: false,
         })
     }
 }
@@ -1251,6 +1257,8 @@ struct TraceHttpExporterConfig {
     /// Ceiling the queued spans *and* every batch representation built from them
     /// are charged to. Always the process ceiling in production.
     ceiling: &'static RetainedByteCeiling,
+    /// See [`TraceExporterOptions::mesh_span_drop_accounting`].
+    mesh_span_drop_accounting: bool,
 }
 
 struct QueuedSpan {
@@ -1653,6 +1661,7 @@ impl TraceHttpExporterConfig {
             payload_kind,
             allow_plaintext: options.allow_plaintext,
             ceiling: options.ceiling,
+            mesh_span_drop_accounting: options.mesh_span_drop_accounting,
         })
     }
 }
@@ -1670,7 +1679,10 @@ pub(crate) fn trace_exporters_from_providers(
         return Ok(Vec::new());
     }
     let service_name = string_config(config, "service_name", default_service_name)?;
-    let options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+    let mut options = TraceExporterOptions::from_config(config, service_name.clone(), http_client)?;
+    // Only `workload_metrics` builds exporters here: their post-enqueue
+    // losses belong on the mesh span-drop counter.
+    options.mesh_span_drop_accounting = true;
     providers
         .iter()
         .enumerate()
@@ -1774,6 +1786,7 @@ pub(crate) fn probe_trace_batch_materialization_for_test(
         payload_kind: TracePayloadKind::Otlp,
         allow_plaintext: false,
         ceiling,
+        mesh_span_drop_accounting: false,
     };
 
     let mut spans = Vec::with_capacity(span_count);
@@ -2310,6 +2323,7 @@ async fn deliver_trace_payload(
                 cfg.provider_name,
                 entry_count,
             );
+            record_mesh_trace_batch_discard(cfg, entry_count);
             return;
         };
         let request = match cfg.payload_kind {
@@ -2358,6 +2372,7 @@ async fn deliver_trace_payload(
                         status,
                         entry_count,
                     );
+                    record_mesh_trace_batch_discard(cfg, entry_count);
                     return;
                 }
                 throttle = retry_after_from_headers(response.headers());
@@ -2384,6 +2399,24 @@ async fn deliver_trace_payload(
         cfg.provider_name,
         total_attempts,
         entry_count,
+    );
+    record_mesh_trace_batch_discard(cfg, entry_count);
+}
+
+/// Count a batch [`deliver_trace_payload`] permanently discarded on the mesh
+/// span-drop counter (`reason="export_failed"`), once per lost span, for
+/// `workload_metrics` exporters only.
+fn record_mesh_trace_batch_discard(cfg: &TraceHttpExporterConfig, entry_count: usize) {
+    if !cfg.mesh_span_drop_accounting {
+        return;
+    }
+    use crate::plugins::mesh::prometheus_helpers::{
+        MeshTracingProvider, MeshTracingSpanDropReason, add_mesh_tracing_spans_dropped,
+    };
+    add_mesh_tracing_spans_dropped(
+        MeshTracingProvider::from_exporter_name(cfg.provider_name),
+        MeshTracingSpanDropReason::ExportFailed,
+        u64::try_from(entry_count).unwrap_or(u64::MAX),
     );
 }
 
@@ -3968,6 +4001,7 @@ mod tests {
             payload_kind: TracePayloadKind::Otlp,
             allow_plaintext: true,
             ceiling: process_ceiling(),
+            mesh_span_drop_accounting: false,
         }
     }
 

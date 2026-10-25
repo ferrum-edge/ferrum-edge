@@ -24,9 +24,9 @@ use crate::modes::mesh::metric_tag_cel::{
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
     HboneBaggageHonor, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertorIndex,
-    hbone_baggage_honor, hbone_baggage_identity, merge_hbone_baggage_honor,
-    mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
-    parse_trusted_hbone_assertors,
+    hbone_baggage_honor, hbone_baggage_identity, hbone_wire_folded_baggage,
+    merge_hbone_baggage_honor, mesh_authz_destination_port, mesh_stream_authz_destination_port,
+    parse_trust_domain_aliases, parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
@@ -696,16 +696,22 @@ impl WorkloadMetrics {
     /// have already run, after authorization, so its `baggage` is NOT what
     /// `mesh_authz` evaluated: a transformer-added assertion must not be
     /// honored, and one a transformer stripped before forwarding must not be
-    /// lost. While the pristine wire block is held it alone supplies the HBONE
-    /// baggage identity; without one the map's value is the only evidence.
+    /// lost. While the pristine wire block is held, the folded value is
+    /// rebuilt from it with materialization's own UTF-8 rule
+    /// ([`hbone_wire_folded_baggage`]), so an obs-text field-line the ASCII
+    /// raw accessor skips still counts exactly as it did for authorization;
+    /// without a wire block the map's value is the only evidence.
     fn annotate_backend_http_context(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
     ) {
         let probe = TraceHeaderProbe::scan(headers);
+        let wire_folded = (ctx.has_raw_headers() && is_hbone_request(ctx))
+            .then(|| hbone_wire_folded_baggage(ctx))
+            .flatten();
         let folded_baggage = if ctx.has_raw_headers() {
-            None
+            wire_folded.as_deref()
         } else {
             headers.get(BAGGAGE_HEADER).map(String::as_str)
         };
@@ -2809,15 +2815,13 @@ fn remote_source_facts(
 /// The HBONE baggage identity of an HBONE request, read exactly as
 /// `mesh_authz` reads it: every pristine wire field-line plus `folded`.
 fn hbone_identity_for_request(ctx: &RequestContext, folded: Option<&str>) -> Option<HboneIdentity> {
-    if ctx
-        .metadata
-        .get("request_protocol")
-        .is_none_or(|value| value != "hbone")
-    {
-        return None;
-    }
+    is_hbone_request(ctx).then(|| hbone_baggage_identity(ctx, folded))
+}
 
-    Some(hbone_baggage_identity(ctx, folded))
+fn is_hbone_request(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .get("request_protocol")
+        .is_some_and(|value| value == "hbone")
 }
 
 /// Which B3 spellings the backend request carries.

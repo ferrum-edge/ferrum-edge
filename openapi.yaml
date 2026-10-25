@@ -27270,7 +27270,8 @@ components:
             `traceparent`; B3 is likewise refreshed from the active span
             whenever the backend request still carries B3 headers, and the
             single-header `b3` form is written when the request used it.
-            Spans an exporter refuses are counted on
+            Spans an exporter refuses at enqueue or discards at delivery
+            (`reason="export_failed"`) are counted on
             `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` with
             fixed labels only.
         tracing_provider:
