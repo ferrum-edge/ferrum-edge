@@ -8426,6 +8426,12 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x-consumers-id"}),
         json!({"header_name": "a".repeat(65_535)}),
         json!({"header_name": null, "echo_downstream": null}),
+        json!({"inbound_policy": "preserve"}),
+        json!({"inbound_policy": "generate", "header_name": "x-edge-request-id"}),
+        json!({"inbound_policy": null}),
+        json!({"header_name": "X-Geo-Country-Code"}),
+        json!({"header_name": "x-real-ip-chain"}),
+        json!({"header_name": "x-authenticated-identity-trace"}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &valid, true);
         CorrelationId::new(&valid)
@@ -8495,6 +8501,16 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
         json!({"header_name": "x_consumer-trace"}),
         json!({"header_name": "X-Ferrum-Hops"}),
         json!({"header_name": " x_ferrum_hops "}),
+        json!({"header_name": "X-Geo-Country"}),
+        json!({"header_name": " x_geo_country "}),
+        json!({"header_name": "x-GEO_country"}),
+        json!({"header_name": "X-Authenticated-Identity"}),
+        json!({"header_name": "x_authenticated-identity"}),
+        json!({"header_name": "X-Real-IP"}),
+        json!({"header_name": " x-real-ip "}),
+        json!({"inbound_policy": "Generate"}),
+        json!({"inbound_policy": "always"}),
+        json!({"inbound_policy": true}),
     ] {
         assert_component_validity(&spec, "CorrelationIdConfig", &invalid, false);
         assert!(
@@ -8525,6 +8541,38 @@ fn correlation_id_runtime_and_openapi_contracts_match() {
                 "correlation exclusion {exclusion_pointer} missed {reserved}"
             );
         }
+    }
+
+    // Backend gateway assertions that outbound refresh strips and regenerates,
+    // plus the literal X-Real-IP that backend builders drop from untrusted
+    // peers, have their own exclusion so the runtime predicate stays in sync.
+    let assertion_exclusion = header_name_schema
+        .pointer("/allOf/3/not")
+        .expect("gateway assertion exclusion exists");
+    let validator = jsonschema::draft202012::options()
+        .build(assertion_exclusion)
+        .unwrap_or_else(|error| panic!("gateway assertion exclusion compiles: {error}"));
+    for (name, excluded) in [
+        ("x-geo-country", true),
+        (" X_Geo_Country ", true),
+        ("x-authenticated-identity", true),
+        ("X_AUTHENTICATED_IDENTITY", true),
+        ("X-Real-IP", true),
+        ("x-geo-country-code", false),
+        ("x-real-ip-chain", false),
+    ] {
+        assert_eq!(
+            validator.validate(&json!(name)).is_ok(),
+            excluded,
+            "gateway assertion exclusion mismatch for {name:?}"
+        );
+        assert_eq!(
+            ferrum_edge::proxy::headers::is_gateway_assertion_header(
+                &name.trim().to_ascii_lowercase()
+            ) || name.trim().eq_ignore_ascii_case("x-real-ip"),
+            excluded,
+            "runtime reservation mismatch for {name:?}"
+        );
     }
 }
 
