@@ -10979,41 +10979,117 @@ async fn embedding_batches_fit_realistic_vector_dimensions() {
     );
 }
 
+/// Raw embedding endpoint for the concurrency regression. Every received call
+/// is reported on `received` (`"index"` for the rule-index build, `"segment"`
+/// otherwise), and segment calls are held until the test adds a permit to
+/// `release`, so admission is observed through explicit events rather than
+/// wall-clock ordering.
+struct GatedEmbeddingServer {
+    endpoint: String,
+    received: tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    release: Arc<tokio::sync::Semaphore>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn gated_embedding_server() -> GatedEmbeddingServer {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/embeddings", listener.local_addr().unwrap());
+    let (sender, received) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = Arc::clone(&release);
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let sender = sender.clone();
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let (header_end, content_length) = loop {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(position) =
+                        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let head =
+                            String::from_utf8_lossy(&buffer[..position]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (position + 4, length);
+                    }
+                };
+                while buffer.len() < header_end + content_length {
+                    let read = socket.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+                let body: Value =
+                    serde_json::from_slice(&buffer[header_end..header_end + content_length])
+                        .unwrap_or(Value::Null);
+                let inputs = body["input"].as_array().cloned().unwrap_or_default();
+                let is_rule = |input: &Value| {
+                    input
+                        .as_str()
+                        .is_some_and(|text| text.contains("rule gate"))
+                };
+                let index_build = inputs.iter().any(is_rule);
+                let _ = sender.send(if index_build { "index" } else { "segment" });
+                if !index_build {
+                    match gate.acquire().await {
+                        Ok(permit) => permit.forget(),
+                        Err(_) => return,
+                    }
+                }
+                let data: Vec<Value> = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| {
+                        let embedding = if is_rule(input) {
+                            vec![1.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0]
+                        };
+                        json!({"index": index, "embedding": embedding})
+                    })
+                    .collect();
+                let payload = json!({"data": data}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    GatedEmbeddingServer {
+        endpoint,
+        received,
+        release,
+        task,
+    }
+}
+
 #[tokio::test]
 async fn provider_concurrency_bounds_in_flight_embedding_calls() {
     // CLAUDE-5: inbound concurrency fanned out 1:1 into provider calls.
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/embeddings"))
-        .respond_with(|request: &Request| {
-            let body: Value = serde_json::from_slice(&request.body).unwrap();
-            let inputs = body["input"].as_array().unwrap();
-            let index_build = inputs.iter().any(|input| {
-                input
-                    .as_str()
-                    .is_some_and(|text| text.contains("rule gate"))
-            });
-            let data: Vec<Value> = inputs
-                .iter()
-                .enumerate()
-                .map(|(index, _)| json!({"index": index, "embedding": [1.0, 0.0]}))
-                .collect();
-            let response = ResponseTemplate::new(200).set_body_json(json!({"data": data}));
-            if index_build {
-                response
-            } else {
-                response.set_delay(Duration::from_secs(20))
-            }
-        })
-        .mount(&server)
-        .await;
+    let mut server = gated_embedding_server().await;
     let firewall = plugin(&json!({
         "inspect": {"request": true, "response": false},
         "on_error": "reject",
         "provider": {
             "type": "openai_compatible_embeddings",
-            "endpoint": format!("{}/v1/embeddings", server.uri()),
-            "request_timeout_ms": 1500,
+            "endpoint": server.endpoint,
+            "request_timeout_ms": 30000,
             "max_concurrent_requests": 1
         },
         "builtins": disabled_builtins(),
@@ -11029,26 +11105,41 @@ async fn provider_concurrency_bounds_in_flight_embedding_calls() {
     let mut second_ctx = make_post_ctx(&body);
     let mut first_headers = json_headers();
     let mut second_headers = json_headers();
+    let second_may_start = tokio::sync::Notify::new();
 
     let first = firewall.before_proxy(&mut first_ctx, &mut first_headers);
     let second = async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        second_may_start.notified().await;
         firewall
             .before_proxy(&mut second_ctx, &mut second_headers)
             .await
     };
-    let observed = async {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
-        server.received_requests().await.unwrap_or_default().len()
+    let controller = async {
+        assert_eq!(server.received.recv().await, Some("index"));
+        // The first request's segment call now holds the only permit and is
+        // parked inside the provider until released.
+        assert_eq!(server.received.recv().await, Some("segment"));
+        second_may_start.notify_one();
+        // While that permit is held the second request's call must not reach
+        // the provider. With the semaphore it never does, so this bounded wait
+        // cannot fail a correct build; without it the call arrives at once.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), server.received.recv())
+                .await
+                .is_err(),
+            "a second outbound embedding call was admitted while the only permit was held"
+        );
+        server.release.add_permits(1);
+        // Releasing the first call frees the permit; only now may the second
+        // request's call be sent.
+        assert_eq!(server.received.recv().await, Some("segment"));
+        server.release.add_permits(1);
     };
-    let (first, second, observed) = tokio::join!(first, second, observed);
+    let (first, second, ()) = tokio::join!(first, second, controller);
 
-    assert_eq!(
-        observed, 2,
-        "the rule index call plus ONE segment call may be in flight; the second request waits"
-    );
-    assert_reject(first, Some(503));
-    assert_reject(second, Some(503));
+    assert_continue(first);
+    assert_continue(second);
+    server.task.abort();
 }
 
 #[test]
@@ -11202,72 +11293,73 @@ fn rule_and_streaming_admission_maxima() {
     }
 }
 
-#[tokio::test]
-async fn provider_auth_header_and_scheme_support_azure_api_key() {
-    // CLAUDE-8: only `Authorization: Bearer` could be sent.
+#[test]
+fn provider_auth_header_and_scheme_support_azure_api_key() {
+    // CLAUDE-8: only `Authorization: Bearer` could be sent. The credential is
+    // installed through the shared environment guard for the whole test, so a
+    // parallel test clearing `FERRUM_*` cannot race the lazy secret lookup.
     const ENV_NAME: &str = "FERRUM_PLUGIN_SECRET_TEST_SEMANTIC_FIREWALL_AZURE_KEY_6810";
-    unsafe { std::env::set_var(ENV_NAME, "azure-secret") };
+    crate::unit::env_lock::with_env_vars_async(&[(ENV_NAME, "azure-secret")], || async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("api-key", "azure-secret"))
+            .respond_with(|request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let inputs = body["input"].as_array().unwrap();
+                let data: Vec<Value> = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| {
+                        let embedding = if input
+                            .as_str()
+                            .is_some_and(|text| text.contains("approved topic"))
+                        {
+                            json!([1.0, 0.0])
+                        } else {
+                            json!([0.0, 1.0])
+                        };
+                        json!({"index": index, "embedding": embedding})
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({"data": data}))
+            })
+            .mount(&server)
+            .await;
 
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/embeddings"))
-        .and(header("api-key", "azure-secret"))
-        .respond_with(|request: &Request| {
-            let body: Value = serde_json::from_slice(&request.body).unwrap();
-            let inputs = body["input"].as_array().unwrap();
-            let data: Vec<Value> = inputs
-                .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    let embedding = if input
-                        .as_str()
-                        .is_some_and(|text| text.contains("approved topic"))
-                    {
-                        json!([1.0, 0.0])
-                    } else {
-                        json!([0.0, 1.0])
-                    };
-                    json!({"index": index, "embedding": embedding})
-                })
-                .collect();
-            ResponseTemplate::new(200).set_body_json(json!({"data": data}))
-        })
-        .mount(&server)
-        .await;
+        let firewall = plugin(&json!({
+            "inspect": {"request": true, "response": false},
+            "on_error": "reject",
+            "provider": {
+                "type": "openai_compatible_embeddings",
+                "endpoint": format!("{}/v1/embeddings", server.uri()),
+                "api_key_env": ENV_NAME,
+                "auth_header": "api-key",
+                "auth_scheme": ""
+            },
+            "builtins": disabled_builtins(),
+            "custom_rules": [{
+                "id": "semantic-only",
+                "direction": "request",
+                "examples": ["approved topic"],
+                "threshold": 0.99
+            }]
+        }));
+        let mut ctx = make_post_ctx(&json!({
+            "messages": [{"role": "user", "content": "ordinary unrelated request"}]
+        }));
+        let result = firewall.before_proxy(&mut ctx, &mut json_headers()).await;
 
-    let firewall = plugin(&json!({
-        "inspect": {"request": true, "response": false},
-        "on_error": "reject",
-        "provider": {
-            "type": "openai_compatible_embeddings",
-            "endpoint": format!("{}/v1/embeddings", server.uri()),
-            "api_key_env": ENV_NAME,
-            "auth_header": "api-key",
-            "auth_scheme": ""
-        },
-        "builtins": disabled_builtins(),
-        "custom_rules": [{
-            "id": "semantic-only",
-            "direction": "request",
-            "examples": ["approved topic"],
-            "threshold": 0.99
-        }]
-    }));
-    let mut ctx = make_post_ctx(&json!({
-        "messages": [{"role": "user", "content": "ordinary unrelated request"}]
-    }));
-    let result = firewall.before_proxy(&mut ctx, &mut json_headers()).await;
-    unsafe { std::env::remove_var(ENV_NAME) };
-
-    assert_continue(result);
-    let received = server.received_requests().await.unwrap_or_default();
-    assert!(!received.is_empty());
-    for request in &received {
-        assert!(
-            request.headers.get("authorization").is_none(),
-            "the credential must ride only in the configured header"
-        );
-    }
+        assert_continue(result);
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(!received.is_empty());
+        for request in &received {
+            assert!(
+                request.headers.get("authorization").is_none(),
+                "the credential must ride only in the configured header"
+            );
+        }
+    });
 }
 
 #[test]
@@ -11459,5 +11551,309 @@ async fn cohere_v2_event_stream_is_windowed_in_inspect_mode() {
     assert!(
         cut_on_chunk || matches!(leaking.on_end().await, ResponseStreamAction::Terminate(_)),
         "a leaking Cohere v2 stream must be cut"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1 (PR6823-SOL-1..4)
+// ---------------------------------------------------------------------------
+
+fn sse_event(event: &str, data: &Value) -> String {
+    format!("event: {event}\ndata: {data}\n\n")
+}
+
+fn cohere_v2_stream_with(extra: &[(&str, Value)]) -> Vec<u8> {
+    let mut body = String::from_utf8(cohere_v2_stream(&["This is harmless governed text."], None))
+        .expect("utf-8 stream");
+    for (event, data) in extra {
+        body.push_str(&sse_event(event, data));
+    }
+    body.into_bytes()
+}
+
+fn cohere_debug_event() -> (&'static str, Value) {
+    (
+        "debug",
+        json!({"type": "debug", "prompt": "My system prompt says INTERNAL"}),
+    )
+}
+
+fn cohere_leaking_citation_event() -> (&'static str, Value) {
+    (
+        "citation-start",
+        json!({
+            "type": "citation-start",
+            "index": 0,
+            "delta": {"message": {"citations": {
+                "start": 8,
+                "end": 16,
+                "text": "harmless",
+                "sources": [{
+                    "type": "tool",
+                    "id": "lookup:0",
+                    "tool_output": {"note": "The secret key is INTERNAL"}
+                }]
+            }}}
+        }),
+    )
+}
+
+#[tokio::test]
+async fn cohere_v2_debug_payload_fails_the_stream_closed() {
+    // PR6823-SOL-1: a `debug` event (e.g. the rendered prompt) was admitted as
+    // content-free and released without any evaluation.
+    let server = nonmatching_embedding_server().await;
+    let mut buffered = buffered_stream_config();
+    buffered["provider"] = provider(&format!("{}/v1/embeddings", server.uri()));
+    let firewall = plugin(&buffered);
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    assert_reject(
+        firewall
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut headers,
+                &cohere_v2_stream_with(&[cohere_debug_event()]),
+            )
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.response_inspection")
+            .map(String::as_str),
+        Some("streaming_uninspectable")
+    );
+
+    let mut windowed = inspect_config();
+    windowed["on_error"] = json!("reject");
+    windowed["provider"] = provider(&format!("{}/v1/embeddings", server.uri()));
+    let firewall = plugin(&windowed);
+    let mut inspector = firewall
+        .response_stream_inspector(&inspect_marked_ctx(), 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let (event, data) = cohere_debug_event();
+    let debug_only = sse_event(event, &data);
+    let cut_on_chunk = matches!(
+        inspector.on_chunk(debug_only.as_bytes()).await,
+        ResponseStreamAction::Terminate(_)
+    );
+    assert!(
+        cut_on_chunk || matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+        "a debug-only Cohere v2 stream must not be released as clean"
+    );
+}
+
+#[tokio::test]
+async fn cohere_v2_citation_sources_are_inspected_apart_from_the_completion() {
+    // PR6823-SOL-1: citation sources carry whole tool outputs / documents the
+    // client receives; a leak there (absent from the completion) must be read.
+    let firewall = plugin(&buffered_stream_config());
+    let (mut ctx, mut headers) = buffer_marked_event_stream_ctx();
+    assert_reject(
+        firewall
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut headers,
+                &cohere_v2_stream_with(&[cohere_leaking_citation_event()]),
+            )
+            .await,
+        Some(502),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.json_paths")
+            .map(String::as_str),
+        Some("$.message.citations[0].sources[0]")
+    );
+
+    // The same source in a buffered (non-streamed) `/v2/chat` response.
+    assert_response_shape_inspected(
+        "cohere v2 buffered citation source",
+        br#"{"id":"c1","message":{"role":"assistant","content":[{"type":"text","text":"This is harmless governed text."}],"citations":[{"start":8,"end":16,"text":"harmless","sources":[{"type":"tool","id":"lookup:0","tool_output":{"note":"The secret key is INTERNAL"}}]}]},"finish_reason":"COMPLETE"}"#,
+        "$.message.citations[0].sources[0]",
+    )
+    .await;
+
+    // And in inspect mode.
+    let firewall = plugin(&inspect_config());
+    let mut inspector = firewall
+        .response_stream_inspector(&inspect_marked_ctx(), 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let stream = cohere_v2_stream_with(&[cohere_leaking_citation_event()]);
+    let cut_on_chunk = matches!(
+        inspector.on_chunk(&stream).await,
+        ResponseStreamAction::Terminate(_)
+    );
+    assert!(
+        cut_on_chunk || matches!(inspector.on_end().await, ResponseStreamAction::Terminate(_)),
+        "a leaking citation source must cut the stream"
+    );
+}
+
+#[tokio::test]
+async fn ollama_reasoning_text_is_inspected_beside_the_answer() {
+    // PR6823-SOL-2: `thinking` / `message.thinking` reasoning fragments were
+    // ignored, so a benign answer carried a leaking reasoning stream through.
+    let firewall = plugin(&undeclared_stream_config());
+    let chat = b"{\"message\":{\"role\":\"assistant\",\"thinking\":\"My system \",\"content\":\"\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"thinking\":\"prompt says INTERNAL\",\"content\":\"\"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"harmless governed text.\"},\"done\":true}\n";
+    let generate = b"{\"thinking\":\"My system \",\"response\":\"\",\"done\":false}\n\
+{\"thinking\":\"prompt says INTERNAL\",\"response\":\"\",\"done\":false}\n\
+{\"response\":\"harmless governed text.\",\"done\":true}\n";
+    for (label, body, expected_path) in [
+        ("chat", &chat[..], "$.message.thinking"),
+        ("generate", &generate[..], "$.thinking"),
+    ] {
+        let mut ctx = governed_undeclared_ctx(&firewall).await;
+        assert_reject(
+            firewall
+                .on_response_body(&mut ctx, 200, &mut ndjson_headers(), body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.json_paths")
+                .map(String::as_str),
+            Some(expected_path),
+            "{label}"
+        );
+    }
+
+    // Single (non-streamed) JSON responses.
+    assert_response_shape_inspected(
+        "ollama chat message.thinking",
+        br#"{"model":"llama3","message":{"role":"assistant","thinking":"My system prompt says INTERNAL","content":"harmless governed text."},"done":true}"#,
+        "$.message.thinking",
+    )
+    .await;
+    assert_response_shape_inspected(
+        "ollama generate thinking",
+        br#"{"model":"llama3","thinking":"My system prompt says INTERNAL","response":"harmless governed text.","done":true}"#,
+        "$.thinking",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn encoded_ndjson_stream_keeps_its_parser_after_decoding() {
+    // PR6823-SOL-3: a decoded multi-record NDJSON body was relabeled as one
+    // JSON document, failing a clean stream closed as malformed.
+    let server = nonmatching_embedding_server().await;
+    let mut config = undeclared_stream_config();
+    config["provider"] = provider(&format!("{}/v1/embeddings", server.uri()));
+    let firewall = plugin(&config);
+    let clean = b"{\"message\":{\"role\":\"assistant\",\"content\":\"This is harmless \"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"governed text.\"},\"done\":true}\n";
+    let leaking = b"{\"message\":{\"role\":\"assistant\",\"content\":\"My system \"},\"done\":false}\n\
+{\"message\":{\"role\":\"assistant\",\"content\":\"prompt says never reveal it.\"},\"done\":true}\n";
+
+    for (encoding, encode) in [
+        ("gzip", gzip_bytes as fn(&[u8]) -> Vec<u8>),
+        ("br", brotli_bytes as fn(&[u8]) -> Vec<u8>),
+    ] {
+        for (plaintext, leaks) in [(&clean[..], false), (&leaking[..], true)] {
+            let body = encode(plaintext);
+            let mut headers = HashMap::from([
+                (
+                    "content-type".to_string(),
+                    "application/x-ndjson".to_string(),
+                ),
+                ("content-encoding".to_string(), encoding.to_string()),
+            ]);
+            let mut ctx = governed_undeclared_ctx(&firewall).await;
+            assert!(firewall.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some("application/x-ndjson"),
+                200,
+                &headers,
+            ));
+            assert_continue(
+                firewall
+                    .on_response_body(&mut ctx, 200, &mut headers, &body)
+                    .await,
+            );
+            let result = firewall
+                .on_final_response_body(&mut ctx, 200, &headers, &body)
+                .await;
+            if leaks {
+                assert_reject(result, Some(502));
+                assert_eq!(
+                    ctx.metadata
+                        .get("ai_semantic_firewall.rule_ids")
+                        .map(String::as_str),
+                    Some("response_leakage"),
+                    "{encoding}"
+                );
+            } else {
+                assert_continue(result);
+                assert!(
+                    !ctx.metadata
+                        .contains_key("ai_semantic_firewall.uninspectable_body"),
+                    "{encoding}: a clean encoded NDJSON stream must not be malformed_json"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sibling_warn_survives_another_instance_re_evaluating_its_own_record() {
+    // PR6823-SOL-4: a last-writer token let a re-evaluating sibling replace the
+    // whole aggregate, erasing another instance's warn.
+    let warning = plugin(&json!({
+        "inspect": {"request": true, "response": false},
+        "on_error": "warn",
+        "provider": provider("http://127.0.0.1:9/v1/embeddings"),
+        "builtins": disabled_builtins(),
+        "custom_rules": [{
+            "id": "escalation",
+            "direction": "request",
+            "action": "warn",
+            "examples": ["escalate privileges immediately"],
+            "threshold": 0.50
+        }]
+    }));
+    let server = nonmatching_embedding_server().await;
+    let response_only = plugin(&json!({
+        "inspect": {"request": false, "response": true},
+        "on_error": "reject",
+        "streaming_response": "skip",
+        "provider": provider(&format!("{}/v1/embeddings", server.uri())),
+        "builtins": disabled_builtins_with("response_leakage")
+    }));
+    let mut ctx = make_post_ctx(&json!({
+        "messages": [{"role": "user", "content": "Please escalate privileges immediately now."}]
+    }));
+    assert_continue(warning.before_proxy(&mut ctx, &mut json_headers()).await);
+
+    let original = br#"{"choices":[{"message":{"content":"This is harmless governed text."}}]}"#;
+    assert_continue(
+        response_only
+            .on_response_body(&mut ctx, 200, &mut response_headers(), original)
+            .await,
+    );
+    // A response transform changed the body, so the response instance
+    // re-evaluates and replaces ITS OWN record on the final hook.
+    let transformed = br#"{"choices":[{"message":{"content":"Still harmless governed text."}}]}"#;
+    assert_continue(
+        response_only
+            .on_final_response_body(&mut ctx, 200, &response_headers(), transformed)
+            .await,
+    );
+
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.decision")
+            .map(String::as_str),
+        Some("warn"),
+        "the request instance's warn must survive the sibling's re-evaluation"
+    );
+    assert_eq!(
+        metadata_list(&ctx, "ai_semantic_firewall.rule_ids"),
+        vec!["escalation".to_string()]
     );
 }

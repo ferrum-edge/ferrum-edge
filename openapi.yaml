@@ -35316,6 +35316,9 @@ components:
                   - "$.message.tool_plan"
                   - "$.message.tool_calls[*].function.name"
                   - "$.message.tool_calls[*].function.arguments"
+                  - "$.message.citations[*].sources"
+                  - "$.message.thinking"
+                  - "$.thinking"
               default:
                 - "$.choices[*].text"
                 - "$.choices[*].message.content"
@@ -35348,6 +35351,9 @@ components:
                 - "$.message.tool_plan"
                 - "$.message.tool_calls[*].function.name"
                 - "$.message.tool_calls[*].function.arguments"
+                - "$.message.citations[*].sources"
+                - "$.message.thinking"
+                - "$.thinking"
               description: Supported simple response extraction paths. When configured, this list replaces the defaults.
         allow_topics:
           type: array

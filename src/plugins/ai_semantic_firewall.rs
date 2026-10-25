@@ -154,6 +154,13 @@ pub(crate) const DEFAULT_RESPONSE_JSON_PATHS: &[&str] = &[
     "$.message.tool_plan",
     "$.message.tool_calls[*].function.name",
     "$.message.tool_calls[*].function.arguments",
+    // Cohere v2 citation sources: whole tool outputs / documents returned
+    // beside the completion (buffered, and each streamed `citation-start`).
+    "$.message.citations[*].sources",
+    // Ollama reasoning text (`think: true`): `/api/chat` `message.thinking` and
+    // `/api/generate` `thinking`, returned to the caller beside the answer.
+    "$.message.thinking",
+    "$.thinking",
 ];
 
 /// Hard bound on one embedding-provider response body, applied before generic
@@ -480,39 +487,102 @@ impl Severity {
             Self::Critical => 4,
         }
     }
+}
 
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            "critical" => Some(Self::Critical),
-            _ => None,
-        }
+/// Metadata list suffixes, in [`FirewallDecisionRecord::lists`] order.
+const DECISION_LIST_SUFFIXES: [&str; 9] = [
+    "rule_ids",
+    "rule_packs",
+    "rule_descriptions",
+    "match_directions",
+    "segment_kinds",
+    "roles",
+    "json_paths",
+    "matcher_type",
+    "snippet_hashes",
+];
+
+/// One firewall instance's latest decision for one metadata scope, kept in
+/// typed request state so the published metadata can be derived from every
+/// instance's live record (see `write_decision_metadata`).
+#[derive(Debug, Clone)]
+pub(crate) struct FirewallDecisionRecord {
+    action: Action,
+    dry_run: bool,
+    /// Comma-joined lists, in [`DECISION_LIST_SUFFIXES`] order.
+    lists: [String; 9],
+    max_score: f32,
+    max_severity: Option<Severity>,
+    provider_error: Option<String>,
+}
+
+/// The published view of every live record in one scope.
+struct AggregatedDecision {
+    decision_label: &'static str,
+    client_action: &'static str,
+    would_action: Option<&'static str>,
+    lists: [String; 9],
+    max_score: f32,
+    max_severity: Option<Severity>,
+    provider_error: Option<String>,
+}
+
+fn action_rank(action: Action) -> u8 {
+    match action {
+        Action::Reject => 3,
+        Action::Warn => 2,
+        Action::Allow => 1,
     }
 }
 
-/// Severity order of a recorded `decision` label, for merging sibling
-/// instances' records: reject > warn > allow, dry-run labels ranked by the
-/// action they would have taken.
-fn decision_label_rank(label: &str) -> u8 {
-    match label {
-        "reject" | "would_reject" => 3,
-        "warn" | "would_warn" => 2,
-        "allow" | "would_allow" => 1,
-        _ => 0,
-    }
-}
-
-/// Union of a recorded comma-joined metadata list with a new one, keeping
-/// first-seen order and dropping empties and duplicates.
-fn merge_metadata_list(existing: Option<&String>, new: String) -> String {
-    match existing {
-        Some(existing) if !existing.is_empty() => {
-            join_unique(existing.split(',').chain(new.split(',')).collect())
+/// Fold the live records of one scope, in instance order: the most severe
+/// decision wins (the latest of equally severe ones), lists are unioned in
+/// first-seen order, score and severity keep the maximum, and the first
+/// provider error is kept. `None` when there is no record.
+fn aggregate_decision_records<'a>(
+    records: impl Iterator<Item = &'a FirewallDecisionRecord> + Clone,
+) -> Option<AggregatedDecision> {
+    let chosen = records
+        .clone()
+        .max_by_key(|record| action_rank(record.action))?;
+    let decision_label = if chosen.dry_run {
+        match chosen.action {
+            Action::Reject => "would_reject",
+            Action::Warn => "would_warn",
+            Action::Allow => "would_allow",
         }
-        _ => new,
-    }
+    } else {
+        chosen.action.as_str()
+    };
+    let lists = std::array::from_fn(|index| {
+        join_unique(
+            records
+                .clone()
+                .flat_map(|record| record.lists[index].split(','))
+                .collect(),
+        )
+    });
+    Some(AggregatedDecision {
+        decision_label,
+        client_action: if chosen.dry_run {
+            "allow"
+        } else {
+            chosen.action.as_str()
+        },
+        would_action: chosen.dry_run.then_some(chosen.action.as_str()),
+        lists,
+        max_score: records
+            .clone()
+            .map(|record| record.max_score)
+            .fold(0.0_f32, f32::max),
+        max_severity: records
+            .clone()
+            .filter_map(|record| record.max_severity)
+            .max_by_key(|severity| severity.rank()),
+        provider_error: records
+            .clone()
+            .find_map(|record| record.provider_error.clone()),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2221,22 +2291,111 @@ impl FirewallEngine {
             }
         };
 
+        let lists = [
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.rule_id.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.rule_pack.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.rule_description.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.direction.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.segment_kind.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.role.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.json_path.as_deref())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .map(|m| m.matcher_type.as_str())
+                    .collect(),
+            ),
+            join_unique(
+                decision
+                    .matches
+                    .iter()
+                    .filter_map(|m| m.snippet_hash.as_deref())
+                    .collect(),
+            ),
+        ];
+        let record = FirewallDecisionRecord {
+            action: decision.action,
+            dry_run: decision.dry_run,
+            lists,
+            max_score: decision
+                .matches
+                .iter()
+                .map(|m| m.score)
+                .fold(0.0_f32, f32::max),
+            max_severity: decision
+                .matches
+                .iter()
+                .map(|m| m.severity)
+                .max_by_key(|severity| severity.rank()),
+            provider_error: provider_error.map(sanitize_provider_error),
+        };
+
         // Several instances may write the same keys in one transaction (a
-        // global and a proxy-scoped firewall). A SIBLING instance's record is
-        // merged rather than overwritten — the most severe decision wins, and
-        // rule/match lists, scores, severities, and provider errors are
-        // unioned — so a later clean instance cannot erase an earlier warn.
-        // This instance's own earlier record (an early pass re-decided on the
-        // final body) is still replaced. The writer ledger is typed request
-        // state, never metadata.
+        // global and a proxy-scoped firewall). Each instance keeps its OWN
+        // private record per scope — replaced when that instance re-decides
+        // (an early pass re-evaluated on the final body) — and the published
+        // keys are derived from every live record: the most severe decision
+        // wins, lists are unioned, score/severity keep the maximum, and the
+        // first provider error is kept. A later clean instance, or a sibling's
+        // re-evaluation, can therefore never erase another instance's warn.
+        // The records are typed request state, never metadata.
         let scope: &'static str = if scoped { direction.as_str() } else { "" };
-        let merge = ctx
-            .plugin_state()
-            .and_then(|state| state.ai_semantic_firewall_decision_writers.get(scope))
-            .is_some_and(|writer| *writer != self.instance_id);
-        ctx.plugin_state_mut()
-            .ai_semantic_firewall_decision_writers
-            .insert(scope, self.instance_id);
+        let aggregate = {
+            let records = &mut ctx.plugin_state_mut().ai_semantic_firewall_decision_records;
+            records.insert((scope, self.instance_id), record);
+            aggregate_decision_records(
+                records
+                    .iter()
+                    .filter(|((record_scope, _), _)| *record_scope == scope)
+                    .map(|(_, record)| record),
+            )
+        };
+        let Some(aggregate) = aggregate else {
+            return;
+        };
 
         ctx.metadata.insert(
             "ai_semantic_firewall.enabled".to_string(),
@@ -2248,165 +2407,34 @@ impl FirewallEngine {
         );
         ctx.metadata
             .insert(key("direction"), direction.as_str().to_string());
-
-        let decision_label = if decision.dry_run {
-            match decision.action {
-                Action::Reject => "would_reject",
-                Action::Warn => "would_warn",
-                Action::Allow => "would_allow",
-            }
-        } else {
-            decision.action.as_str()
-        };
-        let existing_rank = ctx
-            .metadata
-            .get(&key("decision"))
-            .map_or(0, |label| decision_label_rank(label.as_str()));
-        if !merge || decision_label_rank(decision_label) >= existing_rank {
-            ctx.metadata
-                .insert(key("decision"), decision_label.to_string());
-            ctx.metadata.insert(
-                key("action"),
-                if decision.dry_run {
-                    "allow".to_string()
-                } else {
-                    decision.action.as_str().to_string()
-                },
-            );
-            if decision.dry_run {
+        ctx.metadata
+            .insert(key("decision"), aggregate.decision_label.to_string());
+        ctx.metadata
+            .insert(key("action"), aggregate.client_action.to_string());
+        match aggregate.would_action {
+            Some(would_action) => {
                 ctx.metadata
-                    .insert(key("would_action"), decision.action.as_str().to_string());
-            } else if merge {
+                    .insert(key("would_action"), would_action.to_string());
+            }
+            None => {
                 ctx.metadata.remove(&key("would_action"));
             }
         }
-
-        let rule_ids = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.rule_id.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let rule_packs = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.rule_pack.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let rule_descriptions = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.rule_description.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let match_directions = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.direction.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let segment_kinds = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.segment_kind.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let roles = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.role.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let json_paths = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.json_path.as_deref())
-                .collect::<Vec<_>>(),
-        );
-        let matcher_types = join_unique(
-            decision
-                .matches
-                .iter()
-                .map(|m| m.matcher_type.as_str())
-                .collect::<Vec<_>>(),
-        );
-        let snippet_hashes = join_unique(
-            decision
-                .matches
-                .iter()
-                .filter_map(|m| m.snippet_hash.as_deref())
-                .collect::<Vec<_>>(),
-        );
-
-        for (suffix, value) in [
-            ("rule_ids", rule_ids),
-            ("rule_packs", rule_packs),
-            ("rule_descriptions", rule_descriptions),
-            ("match_directions", match_directions),
-            ("segment_kinds", segment_kinds),
-            ("roles", roles),
-            ("json_paths", json_paths),
-            ("matcher_type", matcher_types),
-            ("snippet_hashes", snippet_hashes),
-        ] {
-            let metadata_key = key(suffix);
-            let value = if merge {
-                merge_metadata_list(ctx.metadata.get(&metadata_key), value)
-            } else {
-                value
-            };
-            ctx.metadata.insert(metadata_key, value);
-        }
-
-        let mut max_score = decision
-            .matches
-            .iter()
-            .map(|m| m.score)
-            .fold(0.0_f32, f32::max);
-        if merge
-            && let Some(existing) = ctx
-                .metadata
-                .get(&key("max_score"))
-                .and_then(|value| value.parse::<f32>().ok())
-                .filter(|value| value.is_finite())
-        {
-            max_score = max_score.max(existing);
+        for (suffix, value) in DECISION_LIST_SUFFIXES.iter().zip(aggregate.lists) {
+            ctx.metadata.insert(key(suffix), value);
         }
         ctx.metadata
-            .insert(key("max_score"), format!("{max_score:.6}"));
-
-        let mut max_severity = decision
-            .matches
-            .iter()
-            .map(|m| m.severity)
-            .max_by_key(|severity| severity.rank())
-            .map(Severity::as_str)
-            .unwrap_or("");
-        if merge
-            && let Some(existing) = ctx
-                .metadata
-                .get(&key("max_severity"))
-                .and_then(|value| Severity::parse(value.as_str()))
-            && existing.rank() > Severity::parse(max_severity).map_or(0, Severity::rank)
-        {
-            max_severity = existing.as_str();
-        }
-        ctx.metadata
-            .insert(key("max_severity"), max_severity.to_string());
-
-        if let Some(provider_error) = provider_error {
-            let provider_error_key = key("provider_error");
-            if !merge || !ctx.metadata.contains_key(&provider_error_key) {
-                ctx.metadata
-                    .insert(provider_error_key, sanitize_provider_error(provider_error));
-            }
+            .insert(key("max_score"), format!("{:.6}", aggregate.max_score));
+        ctx.metadata.insert(
+            key("max_severity"),
+            aggregate
+                .max_severity
+                .map(Severity::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+        if let Some(provider_error) = aggregate.provider_error {
+            ctx.metadata.insert(key("provider_error"), provider_error);
         }
     }
 
@@ -3178,9 +3206,13 @@ impl Plugin for AiSemanticFirewall {
             // JSON extraction. Do not rely on its first byte alone, though:
             // valid SSE may begin with an ignored JSON-looking field before
             // later `data:` frames. Preserve the SSE parser unless the entire
-            // decoded representation is one JSON document.
+            // decoded representation is one JSON document. NDJSON is a stream
+            // representation too: a multi-record body also begins with `{`,
+            // so it keeps its own parser unless it is one document.
+            let stream_representation = is_event_stream_content_type(content_type)
+                || is_non_sse_ai_stream_content_type(content_type);
             let decoded_is_json_document = decoded_looks_like_json
-                && (!is_event_stream_content_type(content_type)
+                && (!stream_representation
                     || serde_json::from_slice::<serde::de::IgnoredAny>(strip_json_bom(&decoded))
                         .is_ok());
             let decoded_content_type = if decoded_is_json_document {
@@ -4144,8 +4176,14 @@ fn reassemble_json_frame_array_segments(
 
 /// Incremental fields of an Ollama NDJSON stream: every line carries one
 /// fragment of the completion in `response` (`/api/generate`) or
-/// `message.content` (`/api/chat`).
-const NDJSON_INCREMENTAL_RESPONSE_PATHS: &[&str] = &["$.response", "$.message.content"];
+/// `message.content` (`/api/chat`), and with `think: true` one fragment of the
+/// reasoning in `thinking` / `message.thinking`.
+const NDJSON_INCREMENTAL_RESPONSE_PATHS: &[&str] = &[
+    "$.response",
+    "$.message.content",
+    "$.thinking",
+    "$.message.thinking",
+];
 
 /// Reassemble a buffered newline-delimited JSON stream (Ollama
 /// `application/x-ndjson`) into response segments.
@@ -4167,6 +4205,8 @@ fn reassemble_ndjson_response_segments(
     let mut fully_parsed = true;
     let mut response_text = String::new();
     let mut message_text = String::new();
+    let mut thinking_text = String::new();
+    let mut message_thinking_text = String::new();
     let per_line_extraction = ExtractionConfig {
         request_json_paths: Vec::new(),
         response_json_paths: extraction
@@ -4186,16 +4226,26 @@ fn reassemble_ndjson_response_segments(
             fully_parsed = false;
             continue;
         };
-        match frame.get("response") {
-            None | Some(Value::Null) => {}
-            Some(Value::String(fragment)) => response_text.push_str(fragment),
-            Some(_) => fully_parsed = false,
+        for (field, accumulator) in [
+            ("response", &mut response_text),
+            ("thinking", &mut thinking_text),
+        ] {
+            match frame.get(field) {
+                None | Some(Value::Null) => {}
+                Some(Value::String(fragment)) => accumulator.push_str(fragment),
+                Some(_) => fully_parsed = false,
+            }
         }
         if let Some(message) = frame.get("message").and_then(Value::as_object) {
-            match message.get("content") {
-                None | Some(Value::Null) => {}
-                Some(Value::String(fragment)) => message_text.push_str(fragment),
-                Some(_) => fully_parsed = false,
+            for (field, accumulator) in [
+                ("content", &mut message_text),
+                ("thinking", &mut message_thinking_text),
+            ] {
+                match message.get(field) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(fragment)) => accumulator.push_str(fragment),
+                    Some(_) => fully_parsed = false,
+                }
             }
         }
         if !per_line_extraction.response_json_paths.is_empty() {
@@ -4207,9 +4257,13 @@ fn reassemble_ndjson_response_segments(
             );
         }
     }
+    // Answer and reasoning stay separate segments: each is model text the
+    // caller receives, and neither may hide a phrase inside the other.
     for (path, reassembled) in [
         ("$.response", &response_text),
         ("$.message.content", &message_text),
+        ("$.thinking", &thinking_text),
+        ("$.message.thinking", &message_thinking_text),
     ] {
         if extraction
             .response_json_paths
@@ -6786,6 +6840,10 @@ fn sse_text_to_segment(text: SseText, extraction: &ExtractionConfig) -> Option<T
             &["$.message.tool_calls[*].function.arguments"],
             SegmentKind::ToolArguments,
         ),
+        SseTextKind::CohereCitationSource => (
+            &["$.message.citations[*].sources"],
+            SegmentKind::GenericText,
+        ),
     };
 
     let enabled = path_patterns.iter().any(|pattern| {
@@ -7147,6 +7205,30 @@ fn extract_known_path(
                     segments,
                 );
             }
+        }
+        "$.message.thinking" => {
+            if let Some(message) = json.get("message").filter(|message| message.is_object()) {
+                extract_prose_value(
+                    message.get("thinking"),
+                    direction,
+                    SegmentKind::AssistantMessage,
+                    Some("assistant".to_string()),
+                    Some(prefixed_json_path(prefix, "$.message.thinking".to_string())),
+                    segments,
+                );
+            }
+        }
+        // Ollama `/api/generate` reasoning. Marker-less, like `$.response`.
+        "$.thinking" => extract_prose_value(
+            json.get("thinking"),
+            direction,
+            SegmentKind::AssistantMessage,
+            Some("assistant".to_string()),
+            Some(prefixed_json_path(prefix, "$.thinking".to_string())),
+            segments,
+        ),
+        "$.message.citations[*].sources" => {
+            extract_message_citation_sources(json, direction, prefix, segments)
         }
         "$.message.tool_calls[*].function.name" => extract_message_object_tool_calls(
             json,
@@ -7827,6 +7909,61 @@ fn extract_choice_function_call(
             )),
             segments,
         );
+    }
+}
+
+/// Cohere v2 `message.citations[].sources[]`: each source's `tool_output` or
+/// `document` (else the whole source) as its own segment, serialized compactly
+/// when it is not a string. Kept apart from the completion text.
+fn extract_message_citation_sources(
+    json: &Value,
+    direction: Direction,
+    prefix: Option<&str>,
+    segments: &mut Vec<TextSegment>,
+) {
+    let Some(citations) = json
+        .get("message")
+        .filter(|message| message.is_object())
+        .and_then(|message| message.get("citations"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for (citation_index, citation) in citations.iter().enumerate() {
+        let Some(sources) = citation.get("sources").and_then(Value::as_array) else {
+            continue;
+        };
+        for (source_index, source) in sources.iter().enumerate() {
+            let payload = source
+                .get("tool_output")
+                .or_else(|| source.get("document"))
+                .unwrap_or(source);
+            let path = prefixed_json_path(
+                prefix,
+                format!("$.message.citations[{citation_index}].sources[{source_index}]"),
+            );
+            if payload.is_array() {
+                // An array payload is one source: serialize it whole rather
+                // than reading only elements that happen to carry `text`.
+                push_segment(
+                    direction,
+                    SegmentKind::GenericText,
+                    None,
+                    Some(path),
+                    &payload.to_string(),
+                    segments,
+                );
+            } else {
+                extract_text_value(
+                    Some(payload),
+                    direction,
+                    SegmentKind::GenericText,
+                    None,
+                    Some(path),
+                    segments,
+                );
+            }
+        }
     }
 }
 

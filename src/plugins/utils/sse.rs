@@ -654,6 +654,12 @@ pub enum SseTextKind {
     /// Cohere v2 streamed tool-call arguments
     /// (`$.message.tool_calls[*].function.arguments`). Extended shapes only.
     CohereToolArguments,
+    /// One Cohere v2 citation source (`citation-start`
+    /// `delta.message.citations.sources[]`): a tool output or document the
+    /// client receives beside the completion, serialized compactly and kept
+    /// separate from it (`$.message.citations[*].sources`). Extended shapes
+    /// only.
+    CohereCitationSource,
 }
 
 /// Cohere v2 `/v2/chat` streaming event types this reassembler models. Every
@@ -927,6 +933,10 @@ pub struct SseReassembler {
     /// Set once a Cohere v2 event has been folded, so a later frame carrying
     /// an unmodelled hyphenated event type is recognized as out-of-protocol.
     cohere_stream: bool,
+    /// Cohere v2 citation sources keyed by `(citation index, source position)`.
+    cohere_citation_sources: Vec<((usize, usize), String)>,
+    /// Lookup table for `cohere_citation_sources`.
+    cohere_citation_source_positions: HashMap<(usize, usize), usize>,
 }
 
 impl SseReassembler {
@@ -940,9 +950,10 @@ impl SseReassembler {
     /// * legacy Chat Completions `choices[].delta.function_call.{name,
     ///   arguments}` fragments, per choice index; and
     /// * Cohere v2 `/v2/chat` streaming events (`content-start` /
-    ///   `content-delta` text per content index, `tool-plan-delta` prose, and
+    ///   `content-delta` text per content index, `tool-plan-delta` prose,
     ///   `tool-call-start` / `tool-call-delta` name and arguments per tool
-    ///   index). An unmodelled hyphenated event, a modelled event carrying a
+    ///   index, and each `citation-start` source as its own fragment; a
+    ///   `debug` event with a payload marks the stream uninspectable). An unmodelled hyphenated event, a modelled event carrying a
     ///   non-string text/name/arguments, or a non-text content part inside an
     ///   identified Cohere v2 stream marks it uninspectable.
     ///
@@ -1094,6 +1105,11 @@ impl SseReassembler {
             .iter()
             .map(|(_, call)| call.name.len().saturating_add(call.arguments.len()))
             .sum::<usize>();
+        let cohere_citation_sources = self
+            .cohere_citation_sources
+            .iter()
+            .map(|(_, source)| source.len())
+            .sum::<usize>();
         completion_text
             .saturating_add(content)
             .saturating_add(tool_calls)
@@ -1107,6 +1123,7 @@ impl SseReassembler {
             .saturating_add(cohere_text)
             .saturating_add(self.cohere_tool_plan.len())
             .saturating_add(cohere_tool_calls)
+            .saturating_add(cohere_citation_sources)
     }
 
     /// Number of live keyed accumulators across every family.
@@ -1122,6 +1139,7 @@ impl SseReassembler {
             .saturating_add(self.function_calls.len())
             .saturating_add(self.cohere_text.len())
             .saturating_add(self.cohere_tool_calls.len())
+            .saturating_add(self.cohere_citation_sources.len())
     }
 
     /// `true` when a stream identified as a provider protocol this reassembler
@@ -1310,6 +1328,13 @@ impl SseReassembler {
                 &accum.arguments,
             );
         }
+        for ((citation, source), text) in &self.cohere_citation_sources {
+            push(
+                SseTextKind::CohereCitationSource,
+                format!("$.message.citations[{citation}].sources[{source}]"),
+                text,
+            );
+        }
         out
     }
 
@@ -1385,7 +1410,11 @@ impl SseReassembler {
             || self
                 .cohere_tool_calls
                 .iter()
-                .any(|(_index, accum)| !accum.arguments.is_empty());
+                .any(|(_index, accum)| !accum.arguments.is_empty())
+            || self
+                .cohere_citation_sources
+                .iter()
+                .any(|(_key, source)| !source.is_empty());
         let argument_budget = if has_names && has_arguments {
             keep_total.div_ceil(2)
         } else if has_arguments {
@@ -1416,6 +1445,9 @@ impl SseReassembler {
         }
         for (_index, accum) in self.cohere_tool_calls.iter_mut().rev() {
             retain_tail_within_budget(&mut accum.arguments, &mut argument_remaining);
+        }
+        for (_key, source) in self.cohere_citation_sources.iter_mut().rev() {
+            retain_tail_within_budget(source, &mut argument_remaining);
         }
         let mut name_remaining = name_budget;
         for (_key, accum) in self.tool_calls.iter_mut().rev() {
@@ -1451,6 +1483,12 @@ impl SseReassembler {
         self.cohere_tool_call_positions.clear();
         for (position, (index, _accum)) in self.cohere_tool_calls.iter().enumerate() {
             self.cohere_tool_call_positions.insert(*index, position);
+        }
+        self.cohere_citation_sources
+            .retain(|(_key, source)| !source.is_empty());
+        self.cohere_citation_source_positions.clear();
+        for (position, (key, _source)) in self.cohere_citation_sources.iter().enumerate() {
+            self.cohere_citation_source_positions.insert(*key, position);
         }
         self.responses_args
             .retain(|(_output, text)| !text.is_empty());
@@ -1634,10 +1672,11 @@ impl SseReassembler {
     /// (`delta.message.tool_calls.function.{name, arguments}` per `index`), a
     /// `message-start` envelope (an empty one carries nothing; a populated
     /// `tool_plan` is folded, populated `content` / `tool_calls` arrays are
-    /// out of the modelled protocol), and the no-content `content-end`,
-    /// `tool-call-end`, `citation-start`, `citation-end`, `message-end`, and
-    /// `debug` events. A citation's `text` is a span of content already
-    /// reassembled from `content-delta`, so it is not read twice.
+    /// out of the modelled protocol), `citation-start` sources (each a
+    /// separate fragment; the cited `text` span is already in the content),
+    /// a `debug` event (any payload fails the stream closed), and the
+    /// no-content `content-end`, `tool-call-end`, `citation-end`, and
+    /// `message-end` events.
     ///
     /// Once a Cohere v2 event has been seen, a later unmodelled hyphenated
     /// event, a non-text content part, or a non-string text/name/arguments
@@ -1746,11 +1785,74 @@ impl SseReassembler {
                     }
                 }
             }
-            // `content-end`, `tool-call-end`, `citation-start`,
-            // `citation-end`, `message-end`, `debug`: no model text that is
-            // not already reassembled from the delta events.
+            // A citation's `text` is a span of content already reassembled
+            // from `content-delta`, but its `sources[]` carry whole tool
+            // outputs / documents the client receives too: each source is
+            // kept as its own fragment, never folded into the completion.
+            "citation-start" => {
+                let Some(citations) = message.and_then(|message| message.get("citations")) else {
+                    return;
+                };
+                let Some(citation) = citations.as_object() else {
+                    self.provider_uninspectable = true;
+                    return;
+                };
+                let citation_index = index_field(frame, "index").unwrap_or(0);
+                match citation.get("sources") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Array(sources)) => {
+                        for (position, source) in sources.iter().enumerate() {
+                            let payload = source
+                                .get("tool_output")
+                                .or_else(|| source.get("document"))
+                                .unwrap_or(source);
+                            let rendered = match payload {
+                                Value::String(text) => text.clone(),
+                                Value::Null => continue,
+                                other => match serde_json::to_string(other) {
+                                    Ok(rendered) => rendered,
+                                    Err(_) => {
+                                        self.provider_uninspectable = true;
+                                        continue;
+                                    }
+                                },
+                            };
+                            self.cohere_citation_source_mut(citation_index, position)
+                                .push_str(&rendered);
+                        }
+                    }
+                    Some(_) => self.provider_uninspectable = true,
+                }
+            }
+            // A `debug` event echoes provider-side state such as the rendered
+            // `prompt` (system prompt included). No response path models it,
+            // so a debug event carrying anything beyond its discriminator is
+            // outside the inspected document and fails the stream closed.
+            "debug" => {
+                let carries_payload = frame.as_object().is_some_and(|object| {
+                    object
+                        .iter()
+                        .any(|(field, value)| field != "type" && !value.is_null())
+                });
+                if carries_payload {
+                    self.provider_uninspectable = true;
+                }
+            }
+            // `content-end`, `tool-call-end`, `citation-end`, `message-end`:
+            // no model text that is not already reassembled from the delta
+            // events.
             _ => {}
         }
+    }
+
+    fn cohere_citation_source_mut(&mut self, citation: usize, source: usize) -> &mut String {
+        bounded_slot(
+            &mut self.cohere_citation_sources,
+            &mut self.cohere_citation_source_positions,
+            (citation, source),
+            (usize::MAX, usize::MAX),
+            &mut self.provider_uninspectable,
+        )
     }
 
     fn function_call_mut(&mut self, choice: usize) -> &mut ToolCallAccumulator {
@@ -1972,6 +2074,15 @@ impl SseReassembler {
                     kind: SseTextKind::CohereToolArguments,
                     json_path: format!("$.message.tool_calls[{index}].function.arguments"),
                     text: accum.arguments,
+                });
+            }
+        }
+        for ((citation, source), text) in self.cohere_citation_sources {
+            if !text.is_empty() {
+                out.push(SseText {
+                    kind: SseTextKind::CohereCitationSource,
+                    json_path: format!("$.message.citations[{citation}].sources[{source}]"),
+                    text,
                 });
             }
         }

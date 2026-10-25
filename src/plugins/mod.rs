@@ -3866,12 +3866,17 @@ pub(crate) struct PluginRequestState {
     /// re-evaluate transformed client-visible representations. Also private for
     /// the same prompt/response confidentiality reason.
     pub(crate) ai_semantic_firewall_response_hashes: HashMap<u64, String>,
-    /// Which `ai_semantic_firewall` instance last wrote each decision-metadata
-    /// scope (`""` unscoped, `"request"`, `"response"`). A sibling instance
-    /// merges into that record instead of overwriting it, so a later clean
-    /// instance cannot erase an earlier instance's warn/reject audit. Bounded
-    /// by the three fixed scopes.
-    pub(crate) ai_semantic_firewall_decision_writers: HashMap<&'static str, u64>,
+    /// Each `ai_semantic_firewall` instance's latest decision per metadata
+    /// scope (`""` unscoped, `"request"`, `"response"`), keyed by
+    /// `(scope, instance id)`. An instance replaces only its own record; the
+    /// published decision metadata is derived from every live record, so one
+    /// instance's later or re-evaluated clean decision cannot erase another
+    /// instance's warn/reject audit. Ordered so the derived lists are
+    /// deterministic; bounded by three scopes times the attached instances.
+    pub(crate) ai_semantic_firewall_decision_records: std::collections::BTreeMap<
+        (&'static str, u64),
+        ai_semantic_firewall::FirewallDecisionRecord,
+    >,
     /// Per-`request_deduplication`-instance completion state acquired during
     /// `before_proxy`. Keeping this out of public metadata prevents internal
     /// cache keys and lock tokens from entering transaction logs. The map is

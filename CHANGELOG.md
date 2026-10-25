@@ -150,7 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Chat Completions `function_call` paths (buffered and streamed, reassembled
   per choice), Cohere v2 `/v2/chat` SSE reassembly (`content-delta`,
   `tool-plan-delta`, `tool-call-*`) plus the `$.message.content` /
-  `.tool_plan` / `.tool_calls[*].function.*` paths (also Ollama `/api/chat`).
+  `.tool_plan` / `.tool_calls[*].function.*` paths (also Ollama `/api/chat`),
+  Cohere v2 citation sources (`$.message.citations[*].sources`, each its own
+  segment; a `debug` event with a payload fails the stream closed), and Ollama
+  reasoning text (`$.message.thinking`, `$.thinking`).
   Streams the request did not declare with `stream: true` are governed too:
   Gemini `:streamGenerateContent` and Bedrock `converse-stream` /
   `invoke-with-response-stream` request targets count as declared streams, an
@@ -168,8 +171,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per instance by the new `provider.max_concurrent_requests` (default 32,
   admission wait bounded by `provider.request_timeout_ms`, now at most 60000).
   New `provider.auth_header` / `provider.auth_scheme` support Azure OpenAI
-  `api-key` style credentials. Sibling instances merge decision metadata
-  (most severe decision, unioned rule lists) instead of overwriting it.
+  `api-key` style credentials. Each instance keeps a private decision record
+  and the published decision metadata is derived from all of them (most
+  severe decision, unioned rule lists), so a sibling's later or re-evaluated
+  clean decision cannot erase another instance's warn. Gzip/Brotli NDJSON
+  keeps its stream parser after the bounded decode.
   Admission now caps rules (64 per list), examples (64 per rule, 2048
   characters each, 512 total), `streaming.max_window_bytes` (1 MiB), and
   `streaming.max_inspections` (10000, no longer saturated).
