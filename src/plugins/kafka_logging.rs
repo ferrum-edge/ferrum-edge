@@ -618,11 +618,19 @@ fn canonical_producer_property(normalized: &str) -> &str {
     let name = normalized.strip_prefix("topic.").unwrap_or(normalized);
     for (alias, canonical) in PRODUCER_PROPERTY_ALIASES {
         if *alias == name {
-            return *canonical;
+            return canonical;
         }
     }
     name
 }
+
+/// `producer_config` budgets Ferrum re-derives, caps at its hard maxima, and
+/// writes under their exact name after the escape-hatch properties.
+const BOUNDED_PRODUCER_BUDGET_KEYS: &[&str] = &[
+    "queue.buffering.max.messages",
+    "queue.buffering.max.kbytes",
+    "message.max.bytes",
+];
 
 /// librdkafka's boolean parser (`rd_kafka_anyconf_set_prop` `_RK_C_BOOL`):
 /// `true`/`t` case-insensitively, or `1`.
@@ -3194,6 +3202,15 @@ fn admit_producer_config(
         }
         if canonical == "enable.idempotence" {
             admitted.idempotence = librdkafka_bool_is_true(prop);
+        }
+        if normalized != canonical && BOUNDED_PRODUCER_BUDGET_KEYS.contains(&canonical) {
+            // Ferrum re-derives these budgets, caps them, and writes them under
+            // their exact name. A `topic.`-prefixed spelling would skip that
+            // bound and race Ferrum's own value in the config map.
+            return Err(format!(
+                "kafka_logging: `producer_config` key {key:?} is not allowed; set \
+                 `producer_config.{canonical}` instead"
+            ));
         }
         if normalized == "ssl.crl.location" {
             admit_producer_crl_location(

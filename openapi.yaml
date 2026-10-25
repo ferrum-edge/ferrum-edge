@@ -21649,6 +21649,13 @@ components:
                     - compression.type
                     - topic.compression.codec
                     - topic.compression.type
+              # Ferrum-bounded budgets accept only their exact name; a topic.
+              # spelling would skip the cap and race Ferrum's value.
+              - not:
+                  enum:
+                    - topic.queue.buffering.max.messages
+                    - topic.queue.buffering.max.kbytes
+                    - topic.message.max.bytes
           # Two spellings of one librdkafka property would be applied in hash
           # order. The constructor also catches re-cased and topic.-prefixed
           # duplicates.

@@ -2589,6 +2589,32 @@ async fn kafka_message_max_bytes_must_fit_the_largest_admitted_entry() {
         .unwrap_or_else(|error| panic!("exactly the framing floor must be admitted: {error}"));
     assert!(KafkaLogging::new(&config(4096, Some(floor - 1)), &client).is_err());
 
+    // A `topic.`-prefixed spelling cannot skip the bound or race Ferrum's own
+    // value (PR6850-MUSE-2).
+    for key in [
+        "topic.message.max.bytes",
+        "Topic.Message.Max.Bytes",
+        "topic.queue.buffering.max.messages",
+        "topic.queue.buffering.max.kbytes",
+    ] {
+        let config = json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "producer_config": { key: "1024" }
+        });
+        let error = KafkaLogging::new(&config, &client)
+            .err()
+            .unwrap_or_else(|| panic!("producer_config.{key} must be refused"));
+        assert!(
+            error.contains(&format!("{key:?}")) && error.contains("is not allowed"),
+            "{key}: {error}"
+        );
+        assert_eq!(
+            kafka_logging_validate_producer_admission_for_test(&config, &client),
+            Err(error)
+        );
+    }
+
     // Without an explicit ceiling the default grows to fit the largest entry.
     KafkaLogging::new(&config(HARD_MAX_ENTRY_BYTES, None), &client).unwrap_or_else(|error| {
         panic!("the default message ceiling must fit a hard-maximum entry: {error}")

@@ -7961,6 +7961,7 @@ fn kafka_logging_schema_matches_runtime_admission() {
         base(json!({"producer_config": {"delivery.timeout.ms": "1000"}})),
         base(json!({"producer_config": {"compression.type": "gzip"}})),
         base(json!({"producer_config": {"topic.acks": "0"}})),
+        base(json!({"producer_config": {"topic.message.max.bytes": "1024"}})),
         base(json!({"producer_config": {"linger.ms": "5", "queue.buffering.max.ms": "50"}})),
         // Idempotence requires acks all (kafka_logging-CLAUDE-2).
         base(json!({"acks": "1", "producer_config": {"enable.idempotence": "true"}})),
