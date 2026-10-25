@@ -184,6 +184,10 @@ impl CorrelationId {
 /// names, so a correlation ID written there would never reach the backend.
 pub(crate) fn is_reserved_header_name(name: &str) -> bool {
     RESERVED_HEADER_NAMES.contains(&name)
+        // The `x-consumer-*` namespace is decided by the shared predicate every
+        // consumer-assertion boundary uses; the wider gateway-assertion set adds
+        // the remaining names outbound refresh strips (`x-geo-country`).
+        || crate::proxy::headers::is_consumer_assertion_header(name)
         || crate::proxy::headers::is_gateway_assertion_header(name)
         || crate::proxy::hop_limit::is_proxy_hops_header(name)
 }
