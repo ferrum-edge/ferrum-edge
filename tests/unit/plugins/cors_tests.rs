@@ -126,6 +126,7 @@ fn test_constructor_rejects_noop_non_object_unknown_and_null_configs() {
         "allowed_headers",
         "exposed_headers",
         "allow_credentials",
+        "allow_private_network",
         "max_age",
         "preflight_continue",
         "unmatched_preflights",
@@ -2870,8 +2871,16 @@ async fn composed_preflight(
     method: &str,
     requested_headers: Option<&str>,
 ) -> (u16, HashMap<String, String>) {
-    use ferrum_edge::plugins::ProxyProtocol;
+    let extra: Vec<(&str, &str)> = requested_headers
+        .map(|requested| ("access-control-request-headers", requested))
+        .into_iter()
+        .collect();
+    composed_preflight_with(policies, method, &extra).await
+}
 
+/// Build the gateway plugin cache for `policies` attached to one proxy, so
+/// every test runs the real deferred CORS chain plus its finalizer.
+fn composed_cors_cache(policies: &[Value]) -> PluginCache {
     let mut config = gateway_with_cors_proxy(json!(["https://app.example"]), vec![]);
     config.plugin_configs = policies
         .iter()
@@ -2894,16 +2903,24 @@ async fn composed_preflight(
             plugin_config_id: plugin.id.clone(),
         })
         .collect();
-    let cache = PluginCache::new(&config).expect("CORS policies compose");
+    PluginCache::new(&config).expect("CORS policies compose")
+}
+
+async fn composed_preflight_with(
+    policies: &[Value],
+    method: &str,
+    extra_headers: &[(&str, &str)],
+) -> (u16, HashMap<String, String>) {
+    use ferrum_edge::plugins::ProxyProtocol;
+
+    let cache = composed_cors_cache(policies);
     let mut response = None;
     for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
         let plugins = cache.get_plugins_for_protocol("ferrum", "ws-api", protocol);
         let mut ctx = make_preflight_ctx("https://app.example", method);
-        if let Some(requested) = requested_headers {
-            ctx.headers.insert(
-                "access-control-request-headers".to_string(),
-                requested.to_string(),
-            );
+        for (name, value) in extra_headers {
+            ctx.headers
+                .insert((*name).to_string(), (*value).to_string());
         }
         let mut status = 200;
         let mut headers = HashMap::new();
@@ -3126,6 +3143,293 @@ async fn mixed_credentials_do_not_promote_literal_star_in_response_lists() {
     }
 }
 
+/// Run an allowed actual (non-preflight) request through the composed HTTP and
+/// gRPC chains and return the final response headers. The backend response
+/// carries its own permissive CORS fields plus a `Content-Disposition`.
+async fn composed_actual_response(policies: &[Value]) -> HashMap<String, String> {
+    use ferrum_edge::plugins::ProxyProtocol;
+
+    let cache = composed_cors_cache(policies);
+    let mut response = None;
+    for protocol in [ProxyProtocol::Http, ProxyProtocol::Grpc] {
+        let plugins = cache.get_plugins_for_protocol("ferrum", "ws-api", protocol);
+        let mut ctx = make_cors_ctx("GET", "https://app.example");
+        for plugin in plugins.iter() {
+            assert!(matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ));
+        }
+        let mut headers = permissive_backend_cors_headers();
+        headers.insert(
+            "content-disposition".to_string(),
+            "attachment; filename=\"report.csv\"".to_string(),
+        );
+        for plugin in plugins.iter() {
+            assert!(matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+                PluginResult::Continue
+            ));
+        }
+        if let Some(previous) = &response {
+            assert_eq!(&headers, previous, "HTTP and gRPC CORS parity");
+        }
+        response = Some(headers);
+    }
+    response.expect("both protocol chains ran")
+}
+
+fn exposure_policy(exposed: Value, allow_credentials: bool) -> Value {
+    json!({
+        "allowed_origins": ["https://app.example"],
+        "exposed_headers": exposed,
+        "allow_credentials": allow_credentials
+    })
+}
+
+#[tokio::test]
+async fn exposed_header_wildcards_intersect_with_explicit_names_in_both_orders() {
+    // A single policy keeps its own list verbatim.
+    let headers = composed_actual_response(&[exposure_policy(json!(["*"]), false)]).await;
+    assert_eq!(headers["access-control-expose-headers"], "*");
+    let headers = composed_actual_response(&[exposure_policy(json!(["*"]), true)]).await;
+    assert_eq!(headers["access-control-expose-headers"], "*");
+
+    for (left, right, expected) in [
+        // An uncredentialed wildcard keeps the sibling's explicit names.
+        (
+            exposure_policy(json!(["*"]), false),
+            exposure_policy(json!(["Content-Disposition"]), false),
+            Some("Content-Disposition"),
+        ),
+        (
+            exposure_policy(json!(["*"]), false),
+            exposure_policy(json!(["*"]), false),
+            Some("*"),
+        ),
+        (
+            exposure_policy(json!(["X-A", "Content-Disposition"]), false),
+            exposure_policy(json!(["content-disposition"]), false),
+            Some("Content-Disposition"),
+        ),
+        // A credentialed literal `*` is never promoted to a wildcard when the
+        // aggregate drops credentials.
+        (
+            exposure_policy(json!(["*", "X-A"]), true),
+            exposure_policy(json!(["*"]), false),
+            Some("X-A"),
+        ),
+        (
+            exposure_policy(json!(["*"]), true),
+            exposure_policy(json!(["*"]), false),
+            None,
+        ),
+        (
+            exposure_policy(json!(["*"]), true),
+            exposure_policy(json!(["Content-Disposition"]), true),
+            None,
+        ),
+    ] {
+        let mut policies = vec![left, right];
+        for _ in 0..2 {
+            let headers = composed_actual_response(&policies).await;
+            assert_eq!(
+                headers["access-control-allow-origin"], "https://app.example",
+                "{policies:?}"
+            );
+            assert_eq!(
+                headers["content-disposition"],
+                "attachment; filename=\"report.csv\""
+            );
+            match expected {
+                Some(expected) => assert!(
+                    headers["access-control-expose-headers"].eq_ignore_ascii_case(expected),
+                    "{policies:?}: {headers:?}"
+                ),
+                None => assert!(
+                    !headers.contains_key("access-control-expose-headers"),
+                    "{policies:?}: {headers:?}"
+                ),
+            }
+            policies.reverse();
+        }
+    }
+}
+
+#[tokio::test]
+async fn unlisted_requested_header_is_left_to_browser_enforcement_of_the_emitted_list() {
+    // Neither a single native policy nor identical composed policies refuse a
+    // requested header that no policy lists: the preflight succeeds with the
+    // configured list and the browser blocks the follow-up request.
+    let policy = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["PUT"],
+        "allowed_headers": ["X-Allowed"]
+    });
+    for policies in [vec![policy.clone()], vec![policy.clone(), policy.clone()]] {
+        let (status, headers) = composed_preflight(&policies, "PUT", Some("x-denied")).await;
+        assert_eq!(status, 204, "{policies:?}");
+        assert_eq!(headers["access-control-allow-headers"], "X-Allowed");
+    }
+
+    // The gateway 403 is reserved for a composed conflict: one policy allows
+    // the header but the intersection does not.
+    let wider = json!({
+        "allowed_origins": ["https://app.example"],
+        "allowed_methods": ["PUT"],
+        "allowed_headers": ["X-Allowed", "X-Extra"]
+    });
+    let mut policies = vec![wider, policy];
+    for _ in 0..2 {
+        assert_eq!(
+            composed_preflight(&policies, "PUT", Some("x-extra"))
+                .await
+                .0,
+            403
+        );
+        policies.reverse();
+    }
+}
+
+const PRIVATE_NETWORK_REQUEST: (&str, &str) = ("access-control-request-private-network", "true");
+
+#[test]
+fn allow_private_network_must_be_a_boolean() {
+    for value in [json!("true"), json!(1), json!([])] {
+        assert!(
+            CorsPlugin::new(&json!({
+                "allowed_origins": ["https://app.example"],
+                "allow_private_network": value
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn private_network_access_opt_in_answers_only_requesting_preflights() {
+    let enabled = json!({
+        "allowed_origins": ["https://app.example"],
+        "allow_private_network": true
+    });
+    let disabled = json!({"allowed_origins": ["https://app.example"]});
+
+    for policies in [
+        vec![enabled.clone()],
+        vec![enabled.clone(), enabled.clone()],
+    ] {
+        let (status, headers) =
+            composed_preflight_with(&policies, "GET", &[PRIVATE_NETWORK_REQUEST]).await;
+        assert_eq!(status, 204);
+        assert_eq!(headers["access-control-allow-private-network"], "true");
+    }
+
+    for (policies, extra) in [
+        (vec![disabled.clone()], vec![PRIVATE_NETWORK_REQUEST]),
+        (vec![enabled.clone()], vec![]),
+        (
+            vec![enabled.clone()],
+            vec![("access-control-request-private-network", "false")],
+        ),
+        // Every matching policy must opt in.
+        (
+            vec![enabled.clone(), disabled.clone()],
+            vec![PRIVATE_NETWORK_REQUEST],
+        ),
+        (
+            vec![disabled, enabled.clone()],
+            vec![PRIVATE_NETWORK_REQUEST],
+        ),
+    ] {
+        let (status, headers) = composed_preflight_with(&policies, "GET", &extra).await;
+        assert_eq!(status, 204, "{policies:?} {extra:?}");
+        assert!(
+            !headers.contains_key("access-control-allow-private-network"),
+            "{policies:?} {extra:?}: {headers:?}"
+        );
+    }
+
+    let plugin = CorsPlugin::new(&enabled).unwrap();
+
+    // A disallowed origin never receives the opt-in.
+    let mut ctx = make_preflight_ctx("https://other.example", "GET");
+    ctx.headers.insert(
+        PRIVATE_NETWORK_REQUEST.0.to_string(),
+        PRIVATE_NETWORK_REQUEST.1.to_string(),
+    );
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = plugin.on_request_received(&mut ctx).await
+    else {
+        panic!("disallowed origin preflight must be rejected");
+    };
+    assert_eq!(status_code, 403);
+    assert!(!headers.contains_key("access-control-allow-private-network"));
+
+    // Actual responses never carry it, and the backend's value is stripped.
+    let mut ctx = make_cors_ctx("GET", "https://app.example");
+    ctx.headers.insert(
+        PRIVATE_NETWORK_REQUEST.0.to_string(),
+        PRIVATE_NETWORK_REQUEST.1.to_string(),
+    );
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = permissive_backend_cors_headers();
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(
+        response_headers
+            .keys()
+            .all(|name| !name.eq_ignore_ascii_case("access-control-allow-private-network")),
+        "{response_headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn forwarded_preflight_carries_the_gateway_private_network_decision() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://app.example"],
+        "allow_private_network": true,
+        "preflight_continue": true
+    }))
+    .unwrap();
+
+    for requested in [true, false] {
+        let mut ctx = make_preflight_ctx("https://app.example", "GET");
+        if requested {
+            ctx.headers.insert(
+                PRIVATE_NETWORK_REQUEST.0.to_string(),
+                PRIVATE_NETWORK_REQUEST.1.to_string(),
+            );
+        }
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        // The decision is captured when the CORS chain runs; a later request
+        // mutation cannot change it.
+        ctx.headers.remove(PRIVATE_NETWORK_REQUEST.0);
+
+        let mut response_headers = permissive_backend_cors_headers();
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        assert!(!response_headers.contains_key("Access-Control-Allow-Private-Network"));
+        assert_eq!(
+            response_headers
+                .get("access-control-allow-private-network")
+                .map(String::as_str),
+            requested.then_some("true"),
+            "requested={requested}: {response_headers:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn wildcard_suffixes_normalize_idna_without_changing_literal_matchers() {
     for suffix in [
@@ -3317,4 +3621,73 @@ fn documented_per_proxy_cors_example_passes_file_admission() {
     .expect("the complete documented example passes file-mode validation");
     assert_eq!(config.proxies.len(), 2);
     assert_eq!(config.plugin_configs.len(), 2);
+}
+
+#[test]
+fn method_and_header_lists_are_bounded_in_schema_and_runtime() {
+    let spec: Value = serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/CorsConfig",
+        "components": spec["components"]
+    });
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    let at_limit: Vec<String> = (0..128).map(|i| format!("X-H{i}")).collect();
+    let over_limit: Vec<String> = (0..129).map(|i| format!("X-H{i}")).collect();
+    for field in ["allowed_methods", "allowed_headers", "exposed_headers"] {
+        for (values, valid) in [
+            (json!(at_limit), true),
+            (json!(over_limit), false),
+            (json!(["X".repeat(256)]), true),
+            (json!(["X".repeat(257)]), false),
+        ] {
+            let mut config = json!({"allowed_origins": ["https://app.example"]});
+            config[field] = values;
+            assert_eq!(
+                validator.is_valid(&config),
+                valid,
+                "schema: {field} {valid}"
+            );
+            match CorsPlugin::new(&config) {
+                Ok(_) => assert!(valid, "runtime accepted an over-budget {field}"),
+                Err(error) => {
+                    assert!(!valid, "runtime rejected a valid {field}: {error}");
+                    assert!(error.contains(field), "{error}");
+                    assert!(error.contains("at most"), "{error}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn psl_ancestor_index_is_generated_from_the_locked_psl_version() {
+    // The generated ancestor index feeds the credentialed-wildcard interlock.
+    // A `psl` bump that changes the bundled list without regenerating the
+    // index must fail here rather than silently weaken the classification.
+    let index = include_str!("../../../src/plugins/cors_psl_ancestors.rs");
+    let lock = include_str!("../../../Cargo.lock");
+    let index_version = index
+        .lines()
+        .next()
+        .and_then(|line| line.split_once("`psl` "))
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("index header names the psl version it was generated from");
+    let locked_versions: Vec<&str> = lock
+        .split("[[package]]")
+        .filter(|package| package.lines().any(|line| line.trim() == "name = \"psl\""))
+        .filter_map(|package| {
+            package
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("version = \""))
+                .and_then(|rest| rest.strip_suffix('"'))
+        })
+        .collect();
+    assert_eq!(
+        locked_versions,
+        [index_version],
+        "Cargo.lock resolves psl {locked_versions:?} but src/plugins/cors_psl_ancestors.rs \
+         was generated from psl {index_version}; regenerate the index from the new \
+         bundled list and update its header"
+    );
 }

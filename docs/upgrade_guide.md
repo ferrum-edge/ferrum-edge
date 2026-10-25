@@ -51,6 +51,18 @@ across namespaces are still allowed. `jwt_auth` also gains `algorithm` (`HS256` 
 `hide_credentials` (default `false`); existing configurations keep their
 behavior. See [plugins.md](plugins.md#jwt_auth).
 
+### `cors` method and header lists are bounded (#6844)
+
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now
