@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`oauth2_introspection` concurrency limits are configurable.** The fixed
+  32-per-provider / 128-per-process caps on uncached introspection calls are
+  replaced by `providers[].max_concurrent_introspections` (default `32`) and a
+  plugin-level `max_concurrent_introspections` (default `128`, shared by one
+  instance's providers), both `1..=1024`, under a fixed process-wide ceiling
+  of 1024. Limits stay non-queuing: an exhausted limit fails fast with `503`.
+  Several instances no longer share one 128-call process budget.
+- **`oauth2_introspection` refreshes OIDC discovery.** A `discovery_url`
+  provider now re-fetches its discovery document every
+  `providers[].discovery_refresh_interval_secs` (default `900`, `1..=86400`)
+  after the first resolution, so a moved introspection endpoint is picked up
+  without a reload. A failed refresh keeps serving the last known endpoint and
+  retries with the existing capped backoff.
+- **`oauth2_introspection` can admit RFC 8705 certificate-bound tokens.** With
+  `providers[].accept_mtls_bound_tokens: true`, an active response whose `cnf`
+  is exactly one `x5t#S256` member is admitted only when the frontend client
+  certificate has that SHA-256 thumbprint, re-verified on every request
+  (cache hits included) before any scope or role verdict. DPoP-bound and other
+  confirmations still fail closed; the default is unchanged.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +158,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`oauth2_introspection` reads a null `cnf` or `token_type` as omitted.**
+  An authorization server that serializes unset optional members as `null`
+  previously had every token rejected (`401` for `cnf: null`, `503` for
+  `token_type: null`), like the null temporal members fixed in #6611.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
@@ -361,6 +384,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`oauth2_introspection` binds the response issuer into an unpinned
+  provider's identity realm.** A provider without `issuer` committed one realm
+  for every accepted token, so the same `sub` asserted for two issuers behind
+  one introspection service became one principal to realm-aware consumers such
+  as `mcp_gateway` session ownership. Each active response's string `iss` now
+  joins the realm, on cache misses and hits alike; a pinned `issuer` is
+  unchanged.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

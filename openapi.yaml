@@ -24048,6 +24048,8 @@ components:
             oneOf:
               - required: [introspection_endpoint]
               - required: [discovery_url]
+            dependentRequired:
+              discovery_refresh_interval_secs: [discovery_url]
             properties:
               introspection_endpoint:
                 type: string
@@ -24080,8 +24082,11 @@ components:
                 pattern: '\S'
                 description: >-
                   Expected iss claim in active introspection responses. Trimmed;
-                  a blank value is rejected. Also used as the audience of a
-                  private_key_jwt client assertion.
+                  a blank value is rejected. Independent of the private_key_jwt
+                  assertion audience (see client_auth.client_assertion_audience).
+                  When omitted, each active response's string iss joins the
+                  external identity realm, so equal subjects asserted for
+                  different issuers are different principals.
               audiences:
                 type: array
                 items:
@@ -24162,6 +24167,17 @@ components:
                     default: RS256
                   private_key_jwt_kid:
                     type: string
+                  client_assertion_audience:
+                    type: string
+                    pattern: '\S'
+                    description: >-
+                      aud of private_key_jwt client assertions. Trimmed; a
+                      blank value is rejected. Defaults to the resolved
+                      introspection endpoint URL (the configured
+                      introspection_endpoint, or the endpoint discovery
+                      resolved). Independent of issuer: set it when the
+                      authorization server requires another audience, such as
+                      its issuer identifier.
               from_headers:
                 type: array
                 items:
@@ -24213,6 +24229,41 @@ components:
                 minimum: 100
                 maximum: 30000
                 description: Per-introspection-request timeout, in milliseconds.
+              max_concurrent_introspections:
+                type: integer
+                format: uint64
+                default: 32
+                minimum: 1
+                maximum: 1024
+                description: >-
+                  Uncached introspection calls this provider may have in
+                  flight. Non-queuing: a lookup that finds the limit exhausted
+                  fails fast with 503. Also bounded by the plugin-level
+                  max_concurrent_introspections and a fixed process-wide
+                  ceiling of 1024.
+              discovery_refresh_interval_secs:
+                type: integer
+                format: uint64
+                default: 900
+                minimum: 1
+                maximum: 86400
+                description: >-
+                  Seconds between discovery document re-fetches after a
+                  successful resolution. A failed refresh keeps serving the
+                  last known endpoint and retries with capped exponential
+                  backoff. Only valid with discovery_url.
+              accept_mtls_bound_tokens:
+                type: boolean
+                default: false
+                description: >-
+                  Admit RFC 8705 certificate-bound tokens whose cnf is exactly
+                  one non-empty x5t#S256 member, only when the request's
+                  frontend client certificate has that base64url SHA-256
+                  thumbprint; a missing or different certificate is a bearer
+                  401. Re-verified on every request, including cache hits.
+                  Any other cnf (DPoP jkt, jwk, extra members) and any
+                  non-Bearer token_type still fail closed. A null cnf or
+                  token_type is treated as absent.
               max_cache_entries:
                 type: integer
                 format: uint64
@@ -24322,6 +24373,17 @@ components:
                   that is not a valid header value (for example one containing CR or LF)
                   or that renders to more than 8192 bytes, including a joined array,
                   leaves the destination absent.
+        max_concurrent_introspections:
+          type: integer
+          format: uint64
+          default: 128
+          minimum: 1
+          maximum: 1024
+          description: >-
+            Uncached introspection calls this plugin instance may have in
+            flight across all of its providers. Non-queuing: a lookup that
+            finds the limit exhausted fails fast with 503. A fixed
+            process-wide ceiling of 1024 applies across every instance.
         allow_provider_fanout:
           type: boolean
           default: false
