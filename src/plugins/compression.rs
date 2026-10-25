@@ -2709,9 +2709,8 @@ impl Plugin for CompressionPlugin {
                     // form of the origin validator (eligibility above already
                     // proved every `ETag` field has one). The body transform
                     // retires content-bound validators once the bytes change, so
-                    // the origin value is recorded for
-                    // `on_response_body_transformed` to re-attach the weak form,
-                    // and for abort recovery to put the origin value back.
+                    // the origin value is recorded for abort recovery; the value
+                    // re-attached after encoding is captured at encode time.
                     if self.config.weaken_strong_etag {
                         weaken_response_etag(ctx, response_headers);
                     }

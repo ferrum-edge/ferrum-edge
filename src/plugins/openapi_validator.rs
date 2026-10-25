@@ -2559,8 +2559,12 @@ fn decode_body<'a>(
     // body nor transaction metadata can reproduce it (`GHSA-5p2h-fq6q-gwh9`).
     // Response conversion already has a coarser outer collapse; request must
     // be safe here too. The shared utility stays detailed for other plugins.
+    let content_encoding = header_value(headers, "content-encoding");
+    if let Some(decoded) = decode_zstd_chain(content_encoding, body, max_body_bytes) {
+        return decoded.map(Cow::Owned);
+    }
     decode_content_encoding(
-        header_value(headers, "content-encoding"),
+        content_encoding,
         body,
         DecodeLimits {
             max_decoded_bytes: max_body_bytes,
@@ -2570,6 +2574,45 @@ fn decode_body<'a>(
         },
     )
     .map_err(|_| "Content-Encoding could not be decoded".to_string())
+}
+
+/// Decode a coding chain that names `zstd`, or `None` when it does not.
+///
+/// `compression` can emit `zstd` (and accept `zstd` uploads) for an instance
+/// that opts in, but the shared inspection decoder only knows gzip/br, so a
+/// valid zstd representation would otherwise be reported as undecodable and
+/// rejected in `block` mode. Chains naming `zstd` go through the charged,
+/// memory-budgeted strict decoder instead (one frame per layer, 8 MB window
+/// cap), with the same per-layer ceiling and the same payload-free error.
+fn decode_zstd_chain(
+    content_encoding: Option<&str>,
+    body: &[u8],
+    max_body_bytes: usize,
+) -> Option<Result<Vec<u8>, String>> {
+    let codings =
+        super::utils::content_encoding::parse_content_codings_including_zstd(content_encoding?)
+            .ok()?;
+    if !codings.iter().any(|coding| coding == "zstd") {
+        return None;
+    }
+    let undecodable = || "Content-Encoding could not be decoded".to_string();
+    if codings.len() > MAX_CONTENT_CODINGS || codings.iter().any(|coding| coding == "identity") {
+        return Some(Err(undecodable()));
+    }
+    Some(
+        super::charged_decode::decode_charged_content_coding_chain(
+            &codings,
+            body,
+            DecodeLimits {
+                max_decoded_bytes: max_body_bytes,
+                max_cumulative_bytes: max_body_bytes.saturating_mul(MAX_CONTENT_CODINGS),
+                max_codings: MAX_CONTENT_CODINGS,
+                max_amplification_ratio: 0,
+            },
+            crate::proxy::response_buffer_budget::BudgetRef::global(),
+        )
+        .map_err(|_| undecodable()),
+    )
 }
 
 enum SchemaInstance {
