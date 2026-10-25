@@ -1340,8 +1340,8 @@ fn test_invalid_config_shapes_rejected() {
 // ─── ScanMode::All — structural keys are protected from redaction ─────
 
 fn ipv4_redact_plugin() -> AiResponseGuard {
-    // ip_address pattern is broad and will match strings that look like
-    // dotted quads — including timestamps in the form "2024.01.15.10".
+    // ip_address pattern matches any in-range dotted quad, including
+    // identifier-like values such as "10.20.30.40".
     AiResponseGuard::new(&json!({
         "pii_patterns": ["ip_address"],
         "scan_fields": "all",
@@ -3015,30 +3015,57 @@ async fn test_sse_scan_all_duplicate_structural_members_fail_closed() {
 }
 
 #[tokio::test]
-async fn test_sse_scan_all_masks_only_last_duplicate_structural_scalar() {
+async fn test_sse_scan_all_duplicate_members_are_uninspectable_even_when_preserved() {
+    // The only match is the semantic last `id`, expressed with an equivalent
+    // escaped key, which the structural carve-out would preserve. The frame
+    // still carries duplicate members, and which of them a client keeps is
+    // its parser's choice, so an enforcing guard refuses it rather than
+    // deciding on serde's last-wins view (ai_response_guard-SOL-1).
+    let body = b": preserve this comment\r\nevent: completion\r\ndata: { \"id\" : \"chunk_0\", \"\\u0069d\" : \"10.0.0.1\", \"unrelated\" : \"first\", \"unrelated\" : \"second\" }\r\n\r\n";
     let plugin = make_plugin(json!({
         "pii_patterns": ["ip_address"],
         "scan_fields": "all",
         "action": "redact"
     }));
-    // The only match is the semantic last `id`, expressed with an equivalent
-    // escaped key. It is preserved structurally, so the caller must retain the
-    // original CRLF framing, comment, whitespace, and unrelated duplicates.
-    let body = b": preserve this comment\r\nevent: completion\r\ndata: { \"id\" : \"chunk_0\", \"\\u0069d\" : \"10.0.0.1\", \"unrelated\" : \"first\", \"unrelated\" : \"second\" }\r\n\r\n";
 
     let mut ctx = ctx_with_content_type("POST", "text/event-stream");
     assert!(matches!(
         plugin
             .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
             .await,
-        PluginResult::Continue
+        PluginResult::Reject { .. }
     ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_rejected")
+            .map(String::as_str),
+        Some("ambiguous_json_document")
+    );
     assert!(
         plugin
             .transform_response_body(body, Some("text/event-stream"), &sse_headers())
             .await
             .is_none(),
         "a preserved last structural scalar must leave the exact SSE bytes untouched"
+    );
+
+    let warner = make_plugin(json!({
+        "pii_patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "warn"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        warner
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_warning")
+            .map(String::as_str),
+        Some("ambiguous_json_document")
     );
 }
 
@@ -7969,5 +7996,1083 @@ async fn sse_index_families_past_the_ceiling_fail_closed() {
             matches!(result, PluginResult::Reject { .. }),
             "{label}: folded index families must fail closed: {result:?}"
         );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  Production-launch review fixes
+// ══════════════════════════════════════════════════════════════════════
+
+fn json_headers() -> HashMap<String, String> {
+    HashMap::from([("content-type".to_string(), "application/json".to_string())])
+}
+
+fn rejected_metadata(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("ai_response_guard_rejected")
+        .map(String::as_str)
+}
+
+// ─── ai_response_guard-SOL-1 / MUSE-4: duplicate JSON members ─────────
+
+#[tokio::test]
+async fn duplicate_member_with_escaped_pii_is_refused_by_enforcing_actions() {
+    // serde keeps the last `x`; the first carries an escaped email that the
+    // raw pass cannot see (`\u0040`, not `@`) and the decoded pass never sees.
+    let body = br#"{"x":"user\u0040example.com","x":"safe"}"#;
+    for action in ["reject", "redact"] {
+        let plugin = make_plugin(json!({
+            "pii_patterns": ["email"], "scan_fields": "all", "action": action
+        }));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut json_headers(), body)
+                    .await,
+                PluginResult::Reject {
+                    status_code: 502,
+                    ..
+                }
+            ),
+            "{action}: an ambiguous duplicate-member body must fail closed"
+        );
+        assert_eq!(rejected_metadata(&ctx), Some("ambiguous_json_document"));
+        // The context-free transform is representation-safe on its own.
+        assert!(
+            plugin
+                .transform_response_body(body, Some("application/json"), &json_headers())
+                .await
+                .is_none()
+        );
+    }
+
+    let warner = make_plugin(json!({
+        "pii_patterns": ["email"], "scan_fields": "all", "action": "warn"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        warner
+            .on_response_body(&mut ctx, 200, &mut json_headers(), body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_warning")
+            .map(String::as_str),
+        Some("ambiguous_json_document")
+    );
+}
+
+#[tokio::test]
+async fn content_mode_duplicate_governed_field_is_refused() {
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    for body in [
+        // A literal duplicate governed field.
+        br#"{"choices":[{"message":{"content":"SSN 123-45-6789","content":"clean"}}]}"#.as_slice(),
+        // Escaped-equivalent member names are the same member.
+        br#"{"choices":[{"message":{"content":"SSN 123-45-6789","cont\u0065nt":"clean"}}]}"#
+            .as_slice(),
+    ] {
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut json_headers(), body)
+                    .await,
+                PluginResult::Reject { .. }
+            ),
+            "duplicate governed field passed: {}",
+            String::from_utf8_lossy(body)
+        );
+        assert_eq!(rejected_metadata(&ctx), Some("ambiguous_json_document"));
+    }
+
+    // Control: the same document without the duplicate is inspected normally.
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut json_headers(),
+                br#"{"choices":[{"message":{"content":"clean"}}]}"#,
+            )
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn duplicate_member_tool_arguments_are_refused() {
+    let arguments = r#"{"x":"user\u0040example.com","x":"safe"}"#;
+    let body = serde_json::to_vec(&json!({
+        "choices": [{"message": {"tool_calls": [{
+            "function": {"name": "lookup", "arguments": arguments}
+        }]}}]
+    }))
+    .unwrap();
+    for scan_fields in ["content", "all"] {
+        let plugin = make_plugin(json!({
+            "pii_patterns": ["email"], "scan_fields": scan_fields, "action": "reject"
+        }));
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                    .await,
+                PluginResult::Reject { .. }
+            ),
+            "{scan_fields}: a duplicate-member argument document passed"
+        );
+        assert_eq!(rejected_metadata(&ctx), Some("ambiguous_json_document"));
+    }
+}
+
+#[tokio::test]
+async fn duplicate_member_sse_payloads_and_reassembled_arguments_are_refused() {
+    let plugin = make_plugin(json!({"pii_patterns": ["email"], "action": "reject"}));
+    // One frame with a duplicate governed member.
+    let frame = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":",
+        "{\"content\":\"user\\u0040example.com\",\"content\":\"safe\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), frame.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(rejected_metadata(&ctx), Some("ambiguous_json_document"));
+
+    // Tool arguments whose duplicate member only exists once the deltas are
+    // reassembled across frames.
+    let split = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",",
+        "\"arguments\":\"{\\\"x\\\":\\\"user\\\\u0040example.com\\\",\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\"\\\"x\\\":\\\"safe\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), split.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(rejected_metadata(&ctx), Some("uninspectable_sse"));
+}
+
+#[tokio::test]
+async fn require_json_alone_accepts_duplicate_members() {
+    // Duplicates do not change whether the bytes parse, and no rule here
+    // decides on member values.
+    let plugin = make_plugin(json!({"require_json": true}));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), br#"{"a":1,"a":2}"#)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+// ─── ai_response_guard-SOL-2: router-free gRPC enrollment ─────────────
+
+#[test]
+fn grpc_enrolled_guard_joins_the_backend_path_boundary() {
+    assert!(grpc_guard("reject").requires_backend_path_resolution());
+    assert!(!make_plugin(json!({"pii_patterns": ["email"]})).requires_backend_path_resolution());
+}
+
+#[tokio::test]
+async fn grpc_bound_backend_path_decides_enrollment_without_method_router() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+
+    // `/api` was stripped: the backend serves the enrolled method.
+    let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "precondition: the client path alone is not enrolled"
+    );
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    // The reverse transition: an enrolled client path routed to another
+    // backend method keeps streaming and is not inspected.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/Other",
+    );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // A published `grpc_full_method` still wins over the bound path.
+    let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/Other",
+    );
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+// ─── ai_response_guard-SOL-3: empty synthetic successes ──────────────
+
+#[tokio::test]
+async fn empty_synthetic_success_runs_structural_rules() {
+    for config in [
+        json!({"require_json": true}),
+        json!({"required_fields": ["choices"]}),
+    ] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(config.clone()))];
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let mut status = 200;
+        let mut headers = json_headers();
+        let mut body = bytes::Bytes::new();
+        ferrum_edge::_test_support::finalize_synthetic_response_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await;
+        assert_eq!(
+            status, 502,
+            "{config}: an empty synthetic 200 bypassed the guard"
+        );
+        assert_eq!(rejected_metadata(&ctx), Some("empty_response_body"));
+    }
+
+    // Content-only rules and no-content statuses keep the empty answer.
+    for (config, start_status) in [
+        (json!({"pii_patterns": ["email"]}), 200),
+        (json!({"require_json": true}), 204),
+    ] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(config.clone()))];
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let mut status = start_status;
+        let mut headers = json_headers();
+        let mut body = bytes::Bytes::new();
+        ferrum_edge::_test_support::finalize_synthetic_response_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await;
+        assert_eq!(status, start_status, "{config}");
+    }
+
+    let plugin = make_plugin(json!({"require_json": true}));
+    let ctx = ctx_with_content_type("POST", "application/json");
+    assert!(plugin.should_process_empty_synthetic_response_body(&ctx, 200));
+    assert!(!plugin.should_process_empty_synthetic_response_body(&ctx, 204));
+    assert!(!plugin.should_process_empty_synthetic_response_body(&ctx, 500));
+    let head = ctx_with_content_type("HEAD", "application/json");
+    assert!(!plugin.should_process_empty_synthetic_response_body(&head, 200));
+}
+
+// ─── ai_response_guard-SOL-4: gRPC placeholders are not residual ──────
+
+fn grpc_self_matching_redactor() -> AiResponseGuard {
+    make_plugin(json!({
+        "action": "redact",
+        "blocked_patterns": [{"name": "draft", "regex": "draft"}],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }))
+}
+
+#[tokio::test]
+async fn grpc_redaction_accepts_its_own_self_matching_placeholder() {
+    for gzip in [false, true] {
+        let plugin = grpc_self_matching_redactor();
+        let payload = hello_response_bytes("draft");
+        let body = if gzip {
+            gzip_grpc_frame(&payload)
+        } else {
+            grpc_frame(&payload)
+        };
+        let mut headers = grpc_headers();
+        if gzip {
+            headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+        }
+        let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut headers, &body)
+                    .await,
+                PluginResult::Continue
+            ),
+            "gzip={gzip}: a fully redactable message must not be rejected"
+        );
+        let redacted = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &headers,
+            )
+            .await
+            .expect("the verified redaction must be installed");
+        if !gzip {
+            assert_eq!(
+                hello_response_text(&grpc_frame_payloads(&redacted)[0]),
+                "[REDACTED:draft]"
+            );
+        }
+        assert!(
+            matches!(
+                plugin
+                    .finalize_client_visible_response_body(&mut ctx, 200, &headers, &redacted)
+                    .await,
+                PluginResult::Continue
+            ),
+            "gzip={gzip}: the exact verified output must pass the final phase"
+        );
+    }
+
+    // A later change to the output loses the exemption and is re-detected.
+    let plugin = grpc_self_matching_redactor();
+    let body = grpc_frame(&hello_response_bytes("draft"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let headers = grpc_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    plugin
+        .transform_response_body_with_context(&mut ctx, &body, Some("application/grpc"), &headers)
+        .await
+        .expect("redaction installed");
+    let mutated = grpc_frame(&hello_response_bytes("[REDACTED:draft] draft"));
+    assert!(matches!(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, &mutated)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+// ─── ai_response_guard-MUSE-1: reasoning and tool fields ──────────────
+
+fn reasoning_and_tool_bodies() -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        (
+            "anthropic thinking",
+            json!({"content": [
+                {"type": "thinking", "thinking": "The SSN is 123-45-6789", "signature": "sig"},
+                {"type": "text", "text": "Done."}
+            ]}),
+        ),
+        (
+            "converse toolUse",
+            json!({"output": {"message": {"content": [{"toolUse": {
+                "toolUseId": "t1", "name": "lookup", "input": {"ssn": "123-45-6789"}
+            }}]}}}),
+        ),
+        (
+            "converse reasoningContent",
+            json!({"output": {"message": {"content": [
+                {"reasoningContent": {"reasoningText": {"text": "ssn 123-45-6789"}}},
+                {"text": "ok"}
+            ]}}}),
+        ),
+        (
+            "responses reasoning summary",
+            json!({"output": [{"type": "reasoning", "summary": [
+                {"type": "summary_text", "text": "ssn 123-45-6789"}
+            ]}]}),
+        ),
+        (
+            "chat reasoning_content",
+            json!({"choices": [{"message": {"content": "ok", "reasoning_content": "ssn 123-45-6789"}}]}),
+        ),
+        (
+            "chat reasoning",
+            json!({"choices": [{"message": {"content": "ok", "reasoning": "ssn 123-45-6789"}}]}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn content_mode_inspects_reasoning_and_tool_fields() {
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    for (label, value) in reasoning_and_tool_bodies() {
+        let body = serde_json::to_vec(&value).unwrap();
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+                    .await,
+                PluginResult::Reject { .. }
+            ),
+            "{label}: PII in a client-visible field passed content mode"
+        );
+    }
+}
+
+#[tokio::test]
+async fn content_mode_redacts_reasoning_and_tool_fields() {
+    for (label, value) in reasoning_and_tool_bodies() {
+        let (status, _, body) = publish_guarded_response(
+            json!({"pii_patterns": ["ssn"], "action": "redact"}),
+            "application/json",
+            None,
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .await;
+        assert_eq!(status, 200, "{label}");
+        let delivered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!delivered.contains("123-45-6789"), "{label}: {delivered}");
+        assert!(
+            delivered.contains("[REDACTED:pii:ssn]"),
+            "{label}: {delivered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn streamed_reasoning_deltas_are_reassembled() {
+    let plugin = make_plugin(json!({"pii_patterns": ["ssn"], "action": "reject"}));
+    for key in ["reasoning_content", "reasoning"] {
+        let mut body = String::new();
+        for fragment in ["ssn 123-", "45-6789"] {
+            let frame = json!({"choices": [{"index": 0, "delta": {key: fragment}}]});
+            body.push_str(&format!("data: {frame}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+                    .await,
+                PluginResult::Reject { .. }
+            ),
+            "{key}: a match split across reasoning deltas passed"
+        );
+        assert_eq!(rejected_metadata(&ctx), Some("pii:ssn"), "{key}");
+    }
+
+    let mut body = String::new();
+    for fragment in ["ssn 123-", "45-6789"] {
+        let frame = json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0, "delta": fragment
+        });
+        body.push_str(&format!("data: {frame}\n\n"));
+    }
+    let mut ctx = ctx_with_content_type("POST", "text/event-stream");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers(), body.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+// ─── ai_response_guard-MUSE-3: final phase reuses a complete decision ─
+
+#[tokio::test]
+async fn final_phase_reuses_an_unchanged_inspection_and_rescans_changes() {
+    let plugin = make_plugin(json!({"pii_patterns": ["email"], "action": "warn"}));
+    let headers = json_headers();
+    let body = br#"{"choices":[{"message":{"content":"mail ops@example.com"}}]}"#;
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), body)
+            .await,
+        PluginResult::Continue
+    ));
+    // Observable proof of reuse: the final phase does not re-run detection,
+    // so it does not re-publish the finding cleared here.
+    ctx.metadata.remove("ai_response_guard_detected");
+    assert!(matches!(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("ai_response_guard_detected"));
+
+    // A different status, media type, or body is inspected afresh.
+    for (status, content_type) in [(201, "application/json"), (200, "application/vnd.x+json")] {
+        let changed_headers =
+            HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        assert!(matches!(
+            plugin
+                .finalize_client_visible_response_body(&mut ctx, status, &changed_headers, body)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(
+            ctx.metadata.contains_key("ai_response_guard_detected"),
+            "{status} {content_type}: a changed representation was not re-inspected"
+        );
+        ctx.metadata.remove("ai_response_guard_detected");
+    }
+
+    // An enforcing instance still rejects content a later transform moved in.
+    let rejecter = make_plugin(json!({"pii_patterns": ["email"], "action": "reject"}));
+    let clean = br#"{"choices":[{"message":{"content":"hello"}}]}"#;
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        rejecter
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), clean)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        rejecter
+            .finalize_client_visible_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+// ─── ai_response_guard-MUSE-5: metadata is a union across instances ───
+
+#[tokio::test]
+async fn guard_metadata_keeps_every_instance_finding() {
+    let email = make_plugin(json!({"pii_patterns": ["email"], "action": "warn"}));
+    let ssn = make_plugin(json!({"pii_patterns": ["ssn"], "action": "warn"}));
+    let body = br#"{"choices":[{"message":{"content":"ops@example.com 123-45-6789"}}]}"#;
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    for plugin in [&email, &ssn, &email] {
+        assert!(matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut json_headers(), body)
+                .await,
+            PluginResult::Continue
+        ));
+    }
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_detected")
+            .map(String::as_str),
+        Some("pii:email,pii:ssn"),
+        "a later instance must not erase an earlier finding, and a re-run must not repeat it"
+    );
+}
+
+// ─── ai_response_guard-MUSE-9: allowlist and Luhn confirmation ────────
+
+#[tokio::test]
+async fn allowlisted_values_are_not_findings_in_any_action() {
+    let allowlist = json!({"values": ["support@example.com"]});
+    let allowed = br#"{"choices":[{"message":{"content":"write to support@example.com"}}]}"#;
+    let mixed =
+        br#"{"choices":[{"message":{"content":"support@example.com or ops@example.com"}}]}"#;
+
+    let rejecter = make_plugin(json!({
+        "pii_patterns": ["email"], "action": "reject", "allowlist": allowlist
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        rejecter
+            .on_response_body(&mut ctx, 200, &mut json_headers(), allowed)
+            .await,
+        PluginResult::Continue
+    ));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        rejecter
+            .on_response_body(&mut ctx, 200, &mut json_headers(), mixed)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let warner = make_plugin(json!({
+        "pii_patterns": ["email"], "action": "warn", "allowlist": allowlist
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        warner
+            .on_response_body(&mut ctx, 200, &mut json_headers(), allowed)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("ai_response_guard_detected"));
+
+    for scan_fields in ["content", "all"] {
+        let (status, _, body) = publish_guarded_response(
+            json!({
+                "pii_patterns": ["email"], "action": "redact",
+                "scan_fields": scan_fields, "allowlist": allowlist
+            }),
+            "application/json",
+            None,
+            mixed.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 200, "{scan_fields}");
+        let delivered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            delivered["choices"][0]["message"]["content"],
+            "support@example.com or [REDACTED:pii:email]",
+            "{scan_fields}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn allowlist_patterns_match_whole_values_and_never_excuse_blocked_content() {
+    let plugin = make_plugin(json!({
+        "custom_pii_patterns": [{"name": "order", "regex": "ORD-\\d+"}],
+        "blocked_phrases": ["classified"],
+        "action": "reject",
+        "allowlist": {"patterns": ["ORD-1\\d*"], "values": ["classified"]}
+    }));
+    let cases = [
+        ("order ORD-123", true),
+        ("order ORD-923", false),
+        ("this is classified", false),
+    ];
+    for (text, passes) in cases {
+        let body =
+            serde_json::to_vec(&json!({"choices": [{"message": {"content": text}}]})).unwrap();
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await;
+        assert_eq!(
+            matches!(result, PluginResult::Continue),
+            passes,
+            "{text}: {result:?}"
+        );
+    }
+
+    // `ORD` does not match the whole `ORD-123` match, so it excuses nothing.
+    let partial = make_plugin(json!({
+        "custom_pii_patterns": [{"name": "order", "regex": "ORD-\\d+"}],
+        "allowlist": {"patterns": ["ORD"]}
+    }));
+    let body =
+        serde_json::to_vec(&json!({"choices": [{"message": {"content": "ORD-123"}}]})).unwrap();
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        partial
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[test]
+fn allowlist_admission_matches_component_schema() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).unwrap();
+    let schema = json!({
+        "$ref": "#/components/schemas/AiResponseGuardConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    for (allowlist, valid) in [
+        (json!({}), true),
+        (json!({"values": [], "patterns": []}), true),
+        (
+            json!({"values": ["support@example.com"], "patterns": ["ORD-\\d+"]}),
+            true,
+        ),
+        (json!({"values": [""]}), false),
+        (json!({"patterns": [""]}), false),
+        (json!({"values": "support@example.com"}), false),
+        (json!({"value": ["support@example.com"]}), false),
+        (json!(["support@example.com"]), false),
+    ] {
+        let config = json!({"pii_patterns": ["email"], "allowlist": allowlist});
+        assert_eq!(
+            AiResponseGuard::validate_config(&config).is_ok(),
+            valid,
+            "runtime admission: {config}"
+        );
+        assert_eq!(
+            validator.is_valid(&config),
+            valid,
+            "schema admission: {config}"
+        );
+    }
+    // Runtime-only: every pattern must compile on its own, so it cannot close
+    // the anchoring group, and the byte bound is measured in UTF-8 bytes.
+    for allowlist in [
+        json!({"patterns": ["("]}),
+        json!({"patterns": ["a)|(b"]}),
+        json!({"values": ["é".repeat(600)]}),
+    ] {
+        let config = json!({"pii_patterns": ["email"], "allowlist": allowlist});
+        assert!(
+            AiResponseGuard::validate_config(&config).is_err(),
+            "{config}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn credit_card_findings_are_luhn_confirmed() {
+    let plugin = make_plugin(json!({"pii_patterns": ["credit_card"], "action": "reject"}));
+    for (text, valid) in [
+        ("card 4111 1111 1111 1111", true),
+        ("card 2223 0031 2200 3222", true),
+        ("card 3782 822463 10005", true),
+        ("order 4111 1111 1111 1112", false),
+        ("order 2223 0031 2200 3223", false),
+    ] {
+        let body =
+            serde_json::to_vec(&json!({"choices": [{"message": {"content": text}}]})).unwrap();
+        let mut ctx = ctx_with_content_type("POST", "application/json");
+        let result = plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await;
+        assert_eq!(
+            matches!(result, PluginResult::Reject { .. }),
+            valid,
+            "{text}: {result:?}"
+        );
+    }
+
+    let (status, _, body) = publish_guarded_response(
+        json!({"pii_patterns": ["credit_card"], "action": "redact"}),
+        "application/json",
+        None,
+        serde_json::to_vec(&json!({"choices": [{"message": {
+            "content": "pay 4111-1111-1111-1111, ref 4111-1111-1111-1112"
+        }}]}))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let delivered: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        delivered["choices"][0]["message"]["content"],
+        "pay [REDACTED:pii:credit_card], ref 4111-1111-1111-1112"
+    );
+}
+
+// ─── ai_response_guard-MUSE-2 / ai_prompt_shield-SOL-4/5: shared catalog ─
+
+fn builtin_regex(name: &str) -> regex::Regex {
+    regex::Regex::new(ferrum_edge::plugins::utils::ai_pii::builtin_pii_pattern(name).unwrap())
+        .unwrap()
+}
+
+/// Whether `text` holds a finding of the built-in `name`, applying its
+/// validator the way confirming consumers do.
+fn builtin_finds(name: &str, text: &str) -> bool {
+    let validator = ferrum_edge::plugins::utils::ai_pii::builtin_pii_validator(name);
+    builtin_regex(name)
+        .find_iter(text)
+        .any(|matched| validator.is_none_or(|valid| valid(matched.as_str())))
+}
+
+#[test]
+fn shared_catalog_covers_modern_card_key_ip_and_iban_spellings() {
+    let anthropic_key = format!("sk-ant-api03-{}", "A".repeat(40));
+    let project_key = format!("sk-proj-{}-x_Y9{}", "Ab3".repeat(12), "Q".repeat(8));
+    let github_token = format!("ghp_{}", "a".repeat(36));
+    let google_key = format!("AIza{}", "B".repeat(35));
+    let cases: Vec<(&str, String, bool)> = vec![
+        // credit_card
+        ("credit_card", "4111-1111-1111-1111".into(), true),
+        ("credit_card", "2223003122003222".into(), true),
+        ("credit_card", "5555 5555 5555 4444".into(), true),
+        ("credit_card", "3782 822463 10005".into(), true),
+        ("credit_card", "378282246310005".into(), true),
+        ("credit_card", "3782 8224 6310 005".into(), true),
+        ("credit_card", "3566 0020 2036 0505".into(), true),
+        ("credit_card", "6200000000000005".into(), true),
+        ("credit_card", "3056 930902 5904".into(), true),
+        ("credit_card", "6011 1111 1111 1117".into(), true),
+        ("credit_card", "4111 1111 1111 1112".into(), false),
+        ("credit_card", "order 1234 5678 9012 3456".into(), false),
+        ("credit_card", "2024 0315 1200 0000".into(), false),
+        // api_key
+        ("api_key", anthropic_key.clone(), true),
+        ("api_key", project_key.clone(), true),
+        ("api_key", "sk_liveabcdefghijklmnopqrstuvwxyz".into(), true),
+        ("api_key", github_token, true),
+        ("api_key", google_key, true),
+        ("api_key", "xoxb-1234567890-abcdefABCDEF".into(), true),
+        (
+            "api_key",
+            "token-based-authentication-is-great".into(),
+            false,
+        ),
+        ("api_key", "the secret of the universe".into(), false),
+        // ip_address
+        ("ip_address", "client 192.168.1.1".into(), true),
+        ("ip_address", "2001:db8:85a3:0:0:8a2e:370:7334".into(), true),
+        ("ip_address", "2001:db8::1".into(), true),
+        ("ip_address", "fe80::1:2".into(), true),
+        ("ip_address", "999.999.999.999".into(), false),
+        ("ip_address", "256.1.1.1".into(), false),
+        ("ip_address", "use std::fmt::Display".into(), false),
+        ("ip_address", "a::b::c".into(), false),
+        ("ip_address", "12:30:45".into(), false),
+        ("ip_address", "00:1A:2B:3C:4D:5E".into(), false),
+        // iban
+        ("iban", "GB29 NWBK 6016 1331 9268 19".into(), true),
+        ("iban", "GB29NWBK60161331926819".into(), true),
+        ("iban", "FR1420041010050500013M02606".into(), true),
+        ("iban", "NO9386011117947".into(), true),
+        ("iban", "XX12ABCD1234567890".into(), false),
+    ];
+    for (name, text, expected) in cases {
+        assert_eq!(builtin_finds(name, &text), expected, "{name}: {text}");
+    }
+
+    // A multi-segment key is matched IN FULL, so redaction leaves no suffix.
+    for key in [&anthropic_key, &project_key] {
+        let text = format!("key {key} end");
+        assert_eq!(
+            builtin_regex("api_key").replace_all(&text, "[R]"),
+            "key [R] end",
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn luhn_validator_ignores_separators_and_refuses_other_characters() {
+    use ferrum_edge::plugins::utils::ai_pii::luhn_valid_card_number;
+
+    assert!(luhn_valid_card_number("4111111111111111"));
+    assert!(luhn_valid_card_number("4111-1111.1111 1111"));
+    assert!(luhn_valid_card_number("4111\u{a0}1111\u{a0}1111\u{a0}1111"));
+    assert!(!luhn_valid_card_number("4111111111111112"));
+    assert!(!luhn_valid_card_number("411111111111"), "12 digits");
+    assert!(!luhn_valid_card_number("41111111111111111111"), "20 digits");
+    assert!(!luhn_valid_card_number("4111x111111111111"));
+}
+
+#[test]
+fn transcript_redactor_confirms_cards_and_redacts_whole_keys() {
+    use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
+
+    let redactor = PiiRedactor::from_config(
+        &["credit_card".to_string(), "api_key".to_string()],
+        &[],
+        "[REDACTED:{type}]",
+        false,
+        None,
+        "test",
+    )
+    .unwrap();
+    let key = format!("sk-ant-api03-{}-Zz_9{}", "A".repeat(30), "B".repeat(6));
+    assert_eq!(
+        redactor.redact(&format!(
+            "card 4111111111111111 ref 4111111111111112 key {key}"
+        )),
+        "card [REDACTED:credit_card] ref 4111111111111112 key [REDACTED:api_key]"
+    );
+}
+
+#[tokio::test]
+async fn prompt_shield_detects_new_card_and_key_formats() {
+    use ferrum_edge::plugins::ai_prompt_shield::AiPromptShield;
+
+    let shield = AiPromptShield::new(&json!({"patterns": ["api_key", "credit_card"]})).unwrap();
+    for text in [
+        format!("use sk-ant-api03-{}", "A".repeat(40)),
+        format!("use sk-proj-{}", "Ab3".repeat(10)),
+        "card 2223003122003222".to_string(),
+        "card 3782 822463 10005".to_string(),
+    ] {
+        let mut ctx = super::plugin_utils::create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            json!({"model": "m", "messages": [{"role": "user", "content": text}]}).to_string(),
+        );
+        let mut headers = json_headers();
+        assert!(
+            matches!(
+                shield.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Reject { .. }
+            ),
+            "{text}"
+        );
+    }
+}
+
+// ─── PR #6839 fix round 1 ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn card_followed_by_a_short_numeric_token_is_still_confirmed() {
+    // PR6839-SOL-1: the greedy 17–19-digit tail absorbs ` 123`; the 16-digit
+    // card before it must still be a finding.
+    let card_and_code = "card 4111 1111 1111 1111 123";
+    assert!(builtin_finds("credit_card", card_and_code));
+    assert!(
+        builtin_finds("credit_card", "6205500000000000004"),
+        "a true 19-digit card"
+    );
+    assert!(!builtin_finds("credit_card", "ref 4111 1111 1111 1112 123"));
+
+    let plugin = make_plugin(json!({"pii_patterns": ["credit_card"], "action": "reject"}));
+    let body =
+        serde_json::to_vec(&json!({"choices": [{"message": {"content": card_and_code}}]})).unwrap();
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let (status, _, delivered) = publish_guarded_response(
+        json!({"pii_patterns": ["credit_card"], "action": "redact"}),
+        "application/json",
+        None,
+        body,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let delivered: serde_json::Value = serde_json::from_slice(&delivered).unwrap();
+    assert_eq!(
+        delivered["choices"][0]["message"]["content"],
+        "card [REDACTED:pii:credit_card]"
+    );
+
+    let redactor = ferrum_edge::plugins::utils::ai_pii::PiiRedactor::from_config(
+        &["credit_card".to_string()],
+        &[],
+        "[REDACTED:{type}]",
+        false,
+        None,
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        redactor.redact(card_and_code),
+        "card [REDACTED:credit_card]"
+    );
+    assert_eq!(
+        redactor.redact("ref 4111 1111 1111 1112 123"),
+        "ref 4111 1111 1111 1112 123"
+    );
+}
+
+#[test]
+fn api_keys_ending_in_token_punctuation_are_matched_in_full() {
+    // PR6839-SOL-2: a 39-character Google key may end in `-` (no word boundary
+    // follows it), and provider keys may carry `--` or end in `_`.
+    let google_dash = format!("AIza{}-", "A".repeat(34));
+    let google_underscore = format!("AIza{}_", "A".repeat(34));
+    let doubled = format!("sk-ant-api03-{}--x_y_", "A".repeat(30));
+    let trailing_underscore = format!("sk-{}_", "A".repeat(25));
+    let regex = builtin_regex("api_key");
+    for key in [
+        &google_dash,
+        &google_underscore,
+        &doubled,
+        &trailing_underscore,
+    ] {
+        for (before, after) in [("", ""), ("key ", " end"), ("{\"k\":\"", "\"}")] {
+            let text = format!("{before}{key}{after}");
+            assert_eq!(
+                regex.replace_all(&text, "[R]"),
+                format!("{before}[R]{after}"),
+                "{text}"
+            );
+        }
+    }
+    let redactor = ferrum_edge::plugins::utils::ai_pii::PiiRedactor::from_config(
+        &["api_key".to_string()],
+        &[],
+        "[REDACTED:{type}]",
+        false,
+        None,
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        redactor.redact(&format!("key {google_dash}")),
+        "key [REDACTED:api_key]"
+    );
+}
+
+#[tokio::test]
+async fn guard_redacts_a_google_key_ending_in_a_hyphen() {
+    let key = format!("AIza{}-", "A".repeat(34));
+    let (status, _, delivered) = publish_guarded_response(
+        json!({"pii_patterns": ["api_key"], "action": "redact"}),
+        "application/json",
+        None,
+        serde_json::to_vec(&json!({"choices": [{"message": {"content": key}}]})).unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let delivered: serde_json::Value = serde_json::from_slice(&delivered).unwrap();
+    assert_eq!(
+        delivered["choices"][0]["message"]["content"],
+        "[REDACTED:pii:api_key]"
+    );
+}
+
+#[test]
+fn trailing_zero_compressed_ipv6_is_matched() {
+    // PR6839-SOL-3: three to seven explicit groups followed by `::`.
+    let regex = builtin_regex("ip_address");
+    for address in [
+        "2001:db8:1234::",
+        "2001:db8:1234:5::",
+        "2001:db8:1:2:3::",
+        "2001:db8:1:2:3:4::",
+        "1:2:3:4:5:6:7::",
+    ] {
+        for (before, after) in [("", ""), ("host ", " up"), ("{\"ip\":\"", "\"}")] {
+            let text = format!("{before}{address}{after}");
+            assert_eq!(
+                regex.replace_all(&text, "[R]"),
+                format!("{before}[R]{after}"),
+                "{text}"
+            );
+        }
+    }
+    // A following group is still matched as part of the address, and the
+    // excluded two-group and code-like forms stay unmatched.
+    assert_eq!(regex.replace_all("2001:db8:1::5", "[R]"), "[R]");
+    for text in ["fe80:1::", "use std::fmt::Display", "a::b::c"] {
+        assert!(!regex.is_match(text), "{text}");
     }
 }

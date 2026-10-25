@@ -3,6 +3,9 @@
 //! Adds gRPC method-aware proxying capabilities:
 //! - Parses the gRPC path (`/package.Service/Method`) to extract service and method names
 //! - Enforces access control and rate limits against the backend-effective method
+//! - Matches exact `package.Service/Method` rules and service-level
+//!   `package.Service/*` rules; rate limits fall back to an optional
+//!   `default_rate_limit` (exact beats service, service beats default)
 //! - Populates `grpc_service`, `grpc_method`, and `grpc_full_method` metadata
 //!   from that finalized method for downstream response phases
 
@@ -24,7 +27,8 @@ use super::utils::rate_limit::{
     validate_max_requests, validate_window_seconds,
 };
 use super::{
-    GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
+    GRPC_ONLY_PROTOCOLS, MetadataMap, Plugin, PluginHttpClient, PluginResult, ProxyProtocol,
+    RequestContext,
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -37,12 +41,18 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str = r#"{"error":"Rate limit state capacity exceeded"}"#;
+/// Method segment that turns a configured rule into a service-level rule.
+const SERVICE_WILDCARD_METHOD: &str = "*";
+/// Rate-key rule component of `default_rate_limit`. Never collides with an
+/// exact (`svc/Method`) or service-level (`svc/*`) rule, which both carry `/`.
+const DEFAULT_RATE_RULE: &str = "*";
 
 /// `grpc_method_router`-specific top-level config keys (excludes Redis fields).
 const GRPC_METHOD_ROUTER_POLICY_CONFIG_KEYS: &[&str] = &[
     "allow_methods",
     "deny_methods",
     "method_rate_limits",
+    "default_rate_limit",
     "limit_by",
 ];
 
@@ -57,6 +67,7 @@ pub const GRPC_METHOD_ROUTER_CONFIG_KEYS: &[&str] = &[
     "allow_methods",
     "deny_methods",
     "method_rate_limits",
+    "default_rate_limit",
     "limit_by",
     // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
@@ -71,7 +82,7 @@ pub const GRPC_METHOD_ROUTER_CONFIG_KEYS: &[&str] = &[
     "redis_failure_policy",
 ];
 
-/// Closed key set for one `method_rate_limits` entry.
+/// Closed key set for one `method_rate_limits` entry and `default_rate_limit`.
 const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
 
 /// A rate window spec parsed from config.
@@ -79,12 +90,65 @@ const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
 struct RateSpec {
     max_requests: u64,
     op: DynamicRateLimitOp,
+    /// Rule component of the rate key: the exact `svc/Method` for an exact
+    /// rule, `svc/*` for a service-level rule, `*` for `default_rate_limit`.
+    /// Service-level and default budgets are therefore pooled per caller
+    /// across every method they cover, and request-chosen method names can
+    /// never mint new counter keys.
+    rule: String,
+}
+
+impl RateSpec {
+    fn new(max_requests: u64, window: Duration, rule: String) -> Self {
+        Self {
+            max_requests,
+            op: DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+                limit: max_requests,
+                duration: window,
+            }]),
+            rule,
+        }
+    }
+}
+
+/// One configured allow or deny list: exact methods plus service-level
+/// (`package.Service/*`) rules.
+#[derive(Debug, Default)]
+struct MethodSet {
+    /// Exact `package.Service/Method` entries, without the leading slash.
+    methods: HashSet<String>,
+    /// Bare service names from `package.Service/*` entries.
+    services: HashSet<String>,
+}
+
+impl MethodSet {
+    fn is_empty(&self) -> bool {
+        self.methods.is_empty() && self.services.is_empty()
+    }
+
+    fn matches(&self, full_method: &str, service: &str) -> bool {
+        self.methods.contains(full_method)
+            || (!self.services.is_empty() && self.services.contains(service))
+    }
+}
+
+/// One normalized configured method rule.
+enum MethodPattern {
+    /// `package.Service/Method`, stored without the leading slash.
+    Exact(String),
+    /// `package.Service/*`, stored as the bare service name.
+    Service(String),
 }
 
 pub struct GrpcMethodRouter {
-    allow_methods: Option<HashSet<String>>,
-    deny_methods: HashSet<String>,
+    allow_methods: Option<MethodSet>,
+    deny_methods: MethodSet,
+    /// Exact-method rate rules keyed by `package.Service/Method`.
     method_rate_limits: HashMap<String, RateSpec>,
+    /// Service-level rate rules keyed by bare service name.
+    service_rate_limits: HashMap<String, RateSpec>,
+    /// Rate rule for methods no exact or service-level rule covers.
+    default_rate_limit: Option<RateSpec>,
     limit_by: String,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
     request_counter: AtomicU64,
@@ -175,6 +239,7 @@ impl GrpcMethodRouter {
         };
 
         let mut method_rate_limits = HashMap::new();
+        let mut service_rate_limits = HashMap::new();
         if let Some(value) = config.get("method_rate_limits")
             && !value.is_null()
         {
@@ -185,56 +250,27 @@ impl GrpcMethodRouter {
                 )
             })?;
             for (method, spec) in obj {
-                let spec_obj = spec.as_object().ok_or_else(|| {
-                    format!("grpc_method_router: `method_rate_limits` entry {method:?} must be an object")
-                })?;
-                let label = format!("grpc_method_router: `method_rate_limits` entry {method:?}");
-                reject_unknown_keys(
-                    spec_obj,
+                // Bounds are validated before the key is normalized, so a
+                // hostile key still reaches the shared validators.
+                let (max_requests, window) = parse_rate_window(
+                    spec,
+                    &format!("`method_rate_limits` entry {method:?}"),
+                    "`method_rate_limits`",
                     &format!("config.method_rate_limits[{method}]"),
-                    RATE_SPEC_KEYS,
-                    "grpc_method_router: ",
-                )
-                .map_err(|error| format!("`method_rate_limits`: {error}"))?;
-                let max_requests = spec_obj
-                    .get("max_requests")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        format!(
-                            "grpc_method_router: `method_rate_limits` entry {method:?}: `max_requests` is required and must be a positive integer"
-                        )
-                    })?;
-                let window_seconds = spec_obj
-                    .get("window_seconds")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        format!(
-                            "grpc_method_router: `method_rate_limits` entry {method:?}: `window_seconds` is required and must be a positive integer"
-                        )
-                    })?;
-                let max_requests = validate_max_requests(&label, "max_requests", max_requests)
-                    .map_err(|error| {
-                        format!("grpc_method_router: `method_rate_limits`: {error}")
-                    })?;
-                let window_seconds =
-                    validate_window_seconds(&label, "window_seconds", window_seconds).map_err(
-                        |error| format!("grpc_method_router: `method_rate_limits`: {error}"),
-                    )?;
-                let normalized = normalize_config_method_path(method, "method_rate_limits")?;
-                let window = Duration::from_secs(window_seconds);
-                if method_rate_limits
-                    .insert(
-                        normalized,
-                        RateSpec {
-                            max_requests,
-                            op: DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
-                                limit: max_requests,
-                                duration: window,
-                            }]),
-                        },
-                    )
-                    .is_some()
+                )?;
+                let duplicate = match normalize_config_method_pattern(method, "method_rate_limits")?
                 {
+                    MethodPattern::Exact(full_method) => {
+                        let rate = RateSpec::new(max_requests, window, full_method.clone());
+                        method_rate_limits.insert(full_method, rate).is_some()
+                    }
+                    MethodPattern::Service(service) => {
+                        let rate =
+                            RateSpec::new(max_requests, window, service_rule_label(&service));
+                        service_rate_limits.insert(service, rate).is_some()
+                    }
+                };
+                if duplicate {
                     return Err(format!(
                         "grpc_method_router: duplicate `method_rate_limits` entry after normalization: {method:?}"
                     ));
@@ -242,35 +278,65 @@ impl GrpcMethodRouter {
             }
         }
 
-        let has_any_config =
-            allow_methods.is_some() || !deny_methods.is_empty() || !method_rate_limits.is_empty();
+        let default_rate_limit = match config.get("default_rate_limit") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let (max_requests, window) = parse_rate_window(
+                    value,
+                    "`default_rate_limit`",
+                    "`default_rate_limit`",
+                    "config.default_rate_limit",
+                )?;
+                Some(RateSpec::new(
+                    max_requests,
+                    window,
+                    DEFAULT_RATE_RULE.to_string(),
+                ))
+            }
+        };
+
+        let has_any_config = allow_methods.is_some()
+            || !deny_methods.is_empty()
+            || !method_rate_limits.is_empty()
+            || !service_rate_limits.is_empty()
+            || default_rate_limit.is_some();
 
         if !has_any_config {
             return Err(
                 "grpc_method_router: no rules configured — set `allow_methods`, `deny_methods`, \
-                 or `method_rate_limits`"
+                 `method_rate_limits`, or `default_rate_limit`"
                     .to_string(),
             );
         }
 
         // Effective enforcement semantics, not raw syntax: the lower-cased limit
         // dimension and the path-normalized per-method budgets, so a spelling
-        // the parser normalizes keeps one budget. `allow_methods` /
-        // `deny_methods` are stateless admission lists that never consult a
-        // counter; the shared Redis posture is added by the backend.
+        // the parser normalizes keeps one budget. Exact and service-level
+        // rules share one map keyed by their rule label (`svc/Method` vs
+        // `svc/*`, never equal). `default_rate_limit` is recorded only when
+        // set, so omitting it (or `null`) keeps the pre-existing fingerprint.
+        // `allow_methods` / `deny_methods` are stateless admission lists that
+        // never consult a counter; the shared Redis posture is added by the
+        // backend.
         let mut semantics = LocalStateSemantics::new();
         semantics.text("limit_by", &limit_by);
         semantics.window_map(
             "method_rate_limits",
             method_rate_limits
-                .iter()
-                .map(|(method, spec)| (method.as_str(), spec.op.specs())),
+                .values()
+                .chain(service_rate_limits.values())
+                .map(|spec| (spec.rule.as_str(), spec.op.specs())),
         );
+        if let Some(spec) = &default_rate_limit {
+            semantics.windows("default_rate_limit", spec.op.specs());
+        }
 
         Ok(Self {
             allow_methods,
             deny_methods,
             method_rate_limits,
+            service_rate_limits,
+            default_rate_limit,
             limit_by,
             limiter: RateLimitBackend::from_plugin_config_with_policy_identity(
                 "grpc_method_router",
@@ -456,6 +522,20 @@ impl GrpcMethodRouter {
             .await
     }
 
+    /// The most specific rate rule covering a method: exact, then
+    /// service-level, then `default_rate_limit`. At most one rule is charged.
+    fn rate_spec_for(&self, full_method: &str, service: &str) -> Option<&RateSpec> {
+        if let Some(spec) = self.method_rate_limits.get(full_method) {
+            return Some(spec);
+        }
+        if !self.service_rate_limits.is_empty()
+            && let Some(spec) = self.service_rate_limits.get(service)
+        {
+            return Some(spec);
+        }
+        self.default_rate_limit.as_ref()
+    }
+
     /// Build the rate limit key based on `limit_by` config.
     ///
     /// When `limit_by: "consumer"`, uses the identified consumer's username,
@@ -465,7 +545,10 @@ impl GrpcMethodRouter {
     /// The identity is tagged `consumer:` or `ip:` (as in `rate_limiting`) so an
     /// identity string that equals an IP never shares a budget with the
     /// unauthenticated caller at that IP.
-    fn rate_key(&self, ctx: &RequestContext, method_path: &str) -> String {
+    ///
+    /// `rule` is the matched rule's [`RateSpec::rule`], so an exact rule keeps
+    /// its per-method key and service/default rules pool per caller.
+    fn rate_key(&self, ctx: &RequestContext, rule: &str) -> String {
         let (kind, identity) = match (self.limit_by == "consumer")
             .then(|| ctx.effective_identity())
             .flatten()
@@ -479,19 +562,18 @@ impl GrpcMethodRouter {
                 ),
             ),
         };
-        let mut key = String::with_capacity(
-            "grpc_method::".len() + kind.len() + identity.len() + method_path.len(),
-        );
+        let mut key =
+            String::with_capacity("grpc_method::".len() + kind.len() + identity.len() + rule.len());
         key.push_str("grpc_method:");
         key.push_str(kind);
         key.push_str(&identity);
         key.push(':');
-        key.push_str(method_path);
+        key.push_str(rule);
         key
     }
 }
 
-fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<HashSet<String>>, String> {
+fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<MethodSet>, String> {
     let Some(value) = config.get(key) else {
         return Ok(None);
     };
@@ -505,7 +587,7 @@ fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<HashSet
             value = value.to_string()
         )
     })?;
-    let mut methods = HashSet::with_capacity(entries.len());
+    let mut set = MethodSet::default();
     for (idx, entry) in entries.iter().enumerate() {
         let method = entry.as_str().ok_or_else(|| {
             format!(
@@ -513,17 +595,83 @@ fn parse_optional_method_set(config: &Value, key: &str) -> Result<Option<HashSet
                 entry = entry.to_string()
             )
         })?;
-        let normalized = normalize_config_method_path(method, key)?;
-        if !methods.insert(normalized.clone()) {
+        let duplicate = match normalize_config_method_pattern(method, key)? {
+            MethodPattern::Exact(full_method) => {
+                if set.methods.contains(&full_method) {
+                    Some(full_method)
+                } else {
+                    set.methods.insert(full_method);
+                    None
+                }
+            }
+            MethodPattern::Service(service) => {
+                if set.services.contains(&service) {
+                    Some(service_rule_label(&service))
+                } else {
+                    set.services.insert(service);
+                    None
+                }
+            }
+        };
+        if let Some(normalized) = duplicate {
             return Err(format!(
                 "grpc_method_router: duplicate method in `{key}` after normalization: {normalized:?}"
             ));
         }
     }
-    Ok(Some(methods))
+    Ok(Some(set))
 }
 
-fn normalize_config_method_path(method: &str, field: &str) -> Result<String, String> {
+/// Parse one closed `{max_requests, window_seconds}` spec.
+///
+/// `subject` names the entry in diagnostics (Debug-escaped by the shared
+/// validators), `field` is the schema-authored config key, and `path` is the
+/// unknown-key location.
+fn parse_rate_window(
+    spec: &Value,
+    subject: &str,
+    field: &str,
+    path: &str,
+) -> Result<(u64, Duration), String> {
+    let spec_obj = spec
+        .as_object()
+        .ok_or_else(|| format!("grpc_method_router: {subject} must be an object"))?;
+    let label = format!("grpc_method_router: {subject}");
+    reject_unknown_keys(spec_obj, path, RATE_SPEC_KEYS, "grpc_method_router: ")
+        .map_err(|error| format!("{field}: {error}"))?;
+    let max_requests = spec_obj
+        .get("max_requests")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "grpc_method_router: {subject}: `max_requests` is required and must be a positive integer"
+            )
+        })?;
+    let window_seconds = spec_obj
+        .get("window_seconds")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "grpc_method_router: {subject}: `window_seconds` is required and must be a positive integer"
+            )
+        })?;
+    let max_requests = validate_max_requests(&label, "max_requests", max_requests)
+        .map_err(|error| format!("grpc_method_router: {field}: {error}"))?;
+    let window_seconds = validate_window_seconds(&label, "window_seconds", window_seconds)
+        .map_err(|error| format!("grpc_method_router: {field}: {error}"))?;
+    Ok((max_requests, Duration::from_secs(window_seconds)))
+}
+
+/// `package.Service/*`, the configured spelling of a service-level rule.
+fn service_rule_label(service: &str) -> String {
+    let mut rule = String::with_capacity(service.len() + 1 + SERVICE_WILDCARD_METHOD.len());
+    rule.push_str(service);
+    rule.push('/');
+    rule.push_str(SERVICE_WILDCARD_METHOD);
+    rule
+}
+
+fn normalize_config_method_pattern(method: &str, field: &str) -> Result<MethodPattern, String> {
     let trimmed = method.trim();
     if trimmed.is_empty() {
         return Err(format!(
@@ -533,7 +681,7 @@ fn normalize_config_method_path(method: &str, field: &str) -> Result<String, Str
     let normalized = trimmed.strip_prefix('/').unwrap_or(trimmed);
     let Some((service, method_name)) = normalized.split_once('/') else {
         return Err(format!(
-            "grpc_method_router: `{field}` entry must use `package.Service/Method`: {method:?}"
+            "grpc_method_router: `{field}` entry must use `package.Service/Method` or `package.Service/*`: {method:?}"
         ));
     };
     if service.is_empty() || method_name.is_empty() || method_name.contains('/') {
@@ -541,12 +689,23 @@ fn normalize_config_method_path(method: &str, field: &str) -> Result<String, Str
             "grpc_method_router: invalid gRPC method path in `{field}`: {method:?}"
         ));
     }
-    if !is_valid_grpc_service(service) || !is_valid_grpc_identifier(method_name) {
+    if !is_valid_grpc_service(service) {
         return Err(format!(
             "grpc_method_router: invalid gRPC method path in `{field}`: {method:?}"
         ));
     }
-    Ok(normalized.to_string())
+    // A service-level rule is exactly `*` in the method segment. The service
+    // segment never takes a wildcard, and there is no pattern grammar beyond
+    // this one literal form.
+    if method_name == SERVICE_WILDCARD_METHOD {
+        return Ok(MethodPattern::Service(service.to_string()));
+    }
+    if !is_valid_grpc_identifier(method_name) {
+        return Err(format!(
+            "grpc_method_router: invalid gRPC method path in `{field}`: {method:?}"
+        ));
+    }
+    Ok(MethodPattern::Exact(normalized.to_string()))
 }
 
 fn is_valid_grpc_service(service: &str) -> bool {
@@ -579,34 +738,54 @@ fn parse_grpc_path(path: &str) -> Option<(&str, &str)> {
     Some((service, method))
 }
 
-fn grpc_method_metadata(path: &str) -> Option<(String, String, String)> {
-    let (service, method) = parse_grpc_path(path)?;
-    let mut full_method = String::with_capacity(service.len() + 1 + method.len());
-    full_method.push_str(service);
-    full_method.push('/');
-    full_method.push_str(method);
-    Some((service.to_string(), method.to_string(), full_method))
+/// Publish (or clear) the gRPC method metadata as one request-local operation.
+///
+/// `RequestContext` is exclusively borrowed by the caller, so downstream
+/// phases observe either the method parsed here or no gRPC method fields when
+/// the path is invalid; stale client-path values cannot survive a rewrite.
+/// A value that already matches is left in place and a changed value reuses
+/// its existing buffer, so the common no-rewrite request does not
+/// re-materialize the three strings on the backend-path refresh.
+fn publish_grpc_method_metadata(metadata: &mut MetadataMap, parsed: Option<(&str, &str)>) {
+    let Some((service, method)) = parsed else {
+        metadata.remove("grpc_service");
+        metadata.remove("grpc_method");
+        metadata.remove("grpc_full_method");
+        return;
+    };
+    set_metadata_parts(metadata, "grpc_service", &[service]);
+    set_metadata_parts(metadata, "grpc_method", &[method]);
+    set_metadata_parts(metadata, "grpc_full_method", &[service, "/", method]);
 }
 
-/// Replace the provisional/client-path gRPC metadata as one request-local
-/// operation. `RequestContext` is exclusively borrowed here, so downstream
-/// phases observe either the refreshed method or no gRPC method fields when
-/// the backend-effective path is invalid; stale client-path values cannot
-/// survive a rewrite.
-fn refresh_grpc_method_metadata(
-    ctx: &mut RequestContext,
-    metadata: Option<(String, String, String)>,
-) {
-    ctx.metadata.remove("grpc_service");
-    ctx.metadata.remove("grpc_method");
-    ctx.metadata.remove("grpc_full_method");
-
-    if let Some((service, method, full_method)) = metadata {
-        ctx.metadata.insert("grpc_service".to_string(), service);
-        ctx.metadata.insert("grpc_method".to_string(), method);
-        ctx.metadata
-            .insert("grpc_full_method".to_string(), full_method);
+/// Set `key` to the concatenation of `parts`, without allocating when the
+/// published value already matches.
+fn set_metadata_parts(metadata: &mut MetadataMap, key: &str, parts: &[&str]) {
+    if let Some(existing) = metadata.get_mut(key) {
+        if !equals_concatenation(existing, parts) {
+            existing.clear();
+            for part in parts {
+                existing.push_str(part);
+            }
+        }
+        return;
     }
+    let mut value = String::with_capacity(parts.iter().map(|part| part.len()).sum());
+    for part in parts {
+        value.push_str(part);
+    }
+    metadata.insert(key.to_string(), value);
+}
+
+fn equals_concatenation(value: &str, parts: &[&str]) -> bool {
+    let mut rest = value;
+    for part in parts {
+        match rest.strip_prefix(*part) {
+            Some(remaining) => rest = remaining,
+            None => return false,
+        }
+    }
+    rest.is_empty()
 }
 
 /// Returns a header map with `content-type: application/grpc`.
@@ -654,9 +833,9 @@ impl Plugin for GrpcMethodRouter {
         // Populate provisional metadata for early downstream consumers. The
         // authoritative method is refreshed and enforced only after routing,
         // rewrites, prefix stripping, and target selection are complete.
-        let metadata = grpc_method_metadata(&ctx.path);
-        let method_is_valid = metadata.is_some();
-        refresh_grpc_method_metadata(ctx, metadata);
+        let parsed = parse_grpc_path(&ctx.path);
+        let method_is_valid = parsed.is_some();
+        publish_grpc_method_metadata(&mut ctx.metadata, parsed);
         if !method_is_valid {
             debug!(
                 path = %ctx.path,
@@ -676,11 +855,11 @@ impl Plugin for GrpcMethodRouter {
         ctx: &mut RequestContext,
         backend_path: &str,
     ) -> PluginResult {
-        let metadata = grpc_method_metadata(backend_path);
-        refresh_grpc_method_metadata(ctx, metadata);
-        let full_method = match ctx.metadata.get("grpc_full_method") {
-            Some(method) => method.as_str(),
-            None => {
+        let parsed = parse_grpc_path(backend_path);
+        publish_grpc_method_metadata(&mut ctx.metadata, parsed);
+        let (full_method, service) = match (ctx.metadata.get("grpc_full_method"), parsed) {
+            (Some(method), Some((service, _))) => (method.as_str(), service),
+            _ => {
                 debug!(
                     path = %backend_path,
                     plugin = "grpc_method_router",
@@ -695,8 +874,9 @@ impl Plugin for GrpcMethodRouter {
                 };
             }
         };
-        // Check deny list first (deny wins over allow)
-        if self.deny_methods.contains(full_method) {
+        // Check deny list first (deny wins over allow, including an exact
+        // allow entry under a denied service).
+        if self.deny_methods.matches(full_method, service) {
             debug!(
                 method = %full_method,
                 plugin = "grpc_method_router",
@@ -711,7 +891,7 @@ impl Plugin for GrpcMethodRouter {
 
         // Check allow list (if configured, only listed methods pass)
         if let Some(ref allow_methods) = self.allow_methods
-            && !allow_methods.contains(full_method)
+            && !allow_methods.matches(full_method, service)
         {
             debug!(
                 method = %full_method,
@@ -725,9 +905,9 @@ impl Plugin for GrpcMethodRouter {
             };
         }
 
-        // Check per-method rate limits on the pinned selected method.
-        if let Some(spec) = self.method_rate_limits.get(full_method) {
-            let key = self.rate_key(ctx, full_method);
+        // Check the most specific rate rule on the pinned selected method.
+        if let Some(spec) = self.rate_spec_for(full_method, service) {
+            let key = self.rate_key(ctx, &spec.rule);
             match self.check_rate(&key, spec).await {
                 None => {
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
@@ -751,15 +931,12 @@ impl Plugin for GrpcMethodRouter {
                             headers: grpc_content_type_header(),
                         };
                     }
+                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     warn_sampled!(
                         method = %full_method,
                         plugin = "grpc_method_router",
                         "gRPC method rate limit exceeded"
                     );
-                    // The quota refusal is the operational signal the shared
-                    // exceeded counter exists for; the capacity arm above
-                    // already records it.
-                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     let remaining = outcome.remaining.unwrap_or(0);
                     let mut headers = grpc_content_type_header();
                     headers.insert(

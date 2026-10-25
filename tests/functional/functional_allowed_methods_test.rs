@@ -95,7 +95,7 @@ plugin_configs:
       set:
         X-Synthetic-Policy: "enforced"
         Allow: "DELETE"
-      remove: ["Content-Type"]
+      remove: []
 "#
     )
 }
@@ -203,10 +203,14 @@ async fn functional_allowed_methods_http1_and_h2_enforced_before_backend() {
     let h1_blocked = h1.post(&url).send().await.expect("h1 blocked POST");
     assert_eq!(h1_blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(h1_blocked.headers(), &["GET", "HEAD"]);
-    assert!(
-        !h1_blocked
+    // `security_headers` refuses representation metadata, so the gateway's
+    // own JSON content type survives the decorated 405.
+    assert_eq!(
+        h1_blocked
             .headers()
-            .contains_key(http::header::CONTENT_TYPE)
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
     );
     assert_eq!(
         h1_blocked
@@ -237,10 +241,14 @@ async fn functional_allowed_methods_http1_and_h2_enforced_before_backend() {
     assert_eq!(h2_blocked.version(), reqwest::Version::HTTP_2);
     assert_eq!(h2_blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(h2_blocked.headers(), &["GET", "HEAD"]);
-    assert!(
-        !h2_blocked
+    // `security_headers` refuses representation metadata, so the gateway's
+    // own JSON content type survives the decorated 405.
+    assert_eq!(
+        h2_blocked
             .headers()
-            .contains_key(http::header::CONTENT_TYPE)
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
     );
     assert_eq!(
         h2_blocked
@@ -293,7 +301,13 @@ async fn functional_allowed_methods_http3_rejects_before_backend() {
 
     assert_eq!(response.status, http::StatusCode::METHOD_NOT_ALLOWED);
     assert_allow_header(&response.headers, &["GET", "HEAD"]);
-    assert!(!response.headers.contains_key(http::header::CONTENT_TYPE));
+    assert_eq!(
+        response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
     assert_eq!(
         response
             .headers

@@ -3499,6 +3499,12 @@ async fn handle_h3_request(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // The `h3` request stream exposes no end-of-stream signal before the first
+    // body read (a client's FIN is only observable by polling for DATA), so an
+    // HTTP/3 request may always carry DATA after its head. Body policies must
+    // not treat an omitted `Content-Length` / `Content-Type` as proof of an
+    // empty body here.
+    ctx.inbound_request_body_may_follow = Some(true);
     // The task-scoped diagnostic-reference slot (issue #5767), so the terminal
     // transaction log can record the detail this request's reference names.
     ctx.set_diagnostic_slot(crate::diagnostic_ref::current_h3_slot());

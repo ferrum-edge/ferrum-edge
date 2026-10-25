@@ -3025,6 +3025,22 @@ pub const fn max_token_window_entries_for_test() -> usize {
     MAX_TOKEN_WINDOW_ENTRIES
 }
 
+/// Process-wide source of local token-window reservation ids.
+///
+/// Ids must stay unique across the WHOLE lifetime of an identity, not just one
+/// `TokenUsageWindow` value. Idle cleanup deletes a window whose last activity
+/// is older than the window length even while a request it admitted is still
+/// in flight; the next request for that identity then constructs a fresh
+/// window. A per-window counter restarted at `1` there, so the late request's
+/// correction carried an id that now named the NEW request's live
+/// reservation and released it — letting the identity reserve the budget a
+/// second time while the first call was still running. Drawing every id from
+/// one monotonic counter means a stale id can never match a reservation it did
+/// not create; it takes the documented "reservation already gone" path.
+///
+/// `0` is the "no reservation" sentinel and is never handed out.
+static NEXT_TOKEN_RESERVATION_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug)]
 pub struct TokenUsageWindow {
     entries: VecDeque<TokenEntry>,
@@ -3035,9 +3051,6 @@ pub struct TokenUsageWindow {
     /// forward so reverse-ordered `now` samples (captured before the per-key
     /// write guard) cannot make still-live newer usage look stale.
     last_activity: Option<Instant>,
-    /// Monotonic per-window source of reservation ids. `0` is reserved as the
-    /// "no reservation" sentinel, so ids handed out start at `1`.
-    next_reservation_id: u64,
 }
 
 impl TokenUsageWindow {
@@ -3048,7 +3061,6 @@ impl TokenUsageWindow {
             limit,
             total: 0,
             last_activity: None,
-            next_reservation_id: 1,
         }
     }
 
@@ -3130,32 +3142,38 @@ impl TokenUsageWindow {
     }
 
     fn allocate_id(&mut self) -> u64 {
-        let id = self.next_reservation_id;
-        // Wrap past u64::MAX back to 1 (never 0, the sentinel). Collisions
-        // after 2^64 reservations in a single window are not a practical
-        // concern, and a stale collision only degrades to the back-pop
-        // fallback, never an over-count.
-        self.next_reservation_id = self.next_reservation_id.checked_add(1).unwrap_or(1);
-        id
+        // One shared monotonic counter (see `NEXT_TOKEN_RESERVATION_ID`), so an
+        // id outlives the window value that issued it. Skip the `0` sentinel
+        // if the counter ever wraps past `u64::MAX`; a collision after 2^64
+        // process-wide reservations is not a practical concern.
+        loop {
+            let id = NEXT_TOKEN_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
     }
 
-    fn reserve(&mut self, now: Instant, tokens: u64) -> RateLimitOutcome {
+    /// Reserve `tokens` against `limit`, the effective ceiling for this
+    /// identity (the configured `token_limit`, or a per-consumer / per-model
+    /// override the caller resolved).
+    fn reserve(&mut self, now: Instant, tokens: u64, limit: u64) -> RateLimitOutcome {
         let usage = self.current_usage(now);
         let reserved_usage = usage.saturating_add(tokens);
-        if reserved_usage > self.limit {
+        if reserved_usage > limit {
             return RateLimitOutcome::deny()
-                .with_limit(self.limit)
+                .with_limit(limit)
                 .with_window(self.window_duration.as_secs())
                 .with_usage(usage)
-                .with_remaining(self.limit.saturating_sub(usage));
+                .with_remaining(limit.saturating_sub(usage));
         }
 
         let reservation_id = self.record_usage(now, tokens);
         RateLimitOutcome::allow()
-            .with_limit(self.limit)
+            .with_limit(limit)
             .with_window(self.window_duration.as_secs())
             .with_usage(reserved_usage)
-            .with_remaining(self.limit.saturating_sub(reserved_usage))
+            .with_remaining(limit.saturating_sub(reserved_usage))
             .with_reservation_id(reservation_id)
     }
 
@@ -3172,28 +3190,38 @@ impl TokenUsageWindow {
     /// When a non-zero `reservation_id` is supplied but no matching entry
     /// remains (the reservation already aged out of the window, or a non-2xx
     /// release already removed it and a later final-body rejection re-runs
-    /// reconciliation), the outcome depends on the delta sign:
+    /// reconciliation), nothing is ever released and the outcome depends on
+    /// `actual_tokens`:
     ///
-    /// - **Negative delta → no-op.** The reservation this correction targets is
-    ///   already gone, so there is nothing of *this request's* to release.
-    ///   Falling through to the back-of-queue release here would pop tokens from
-    ///   an unrelated, still-live reservation for the same key and under-count
-    ///   the budget (the bug a stale/duplicate reconciliation would otherwise
-    ///   cause). The expired reservation's own usage was already dropped by the
-    ///   window/TTL or the earlier release, so dropping the delta is correct.
-    /// - **Positive delta → append a fresh entry.** Actual usage exceeded the
-    ///   (now-expired) reservation; recording the extra consumption never
-    ///   under-counts, so it is safe to add it back as new usage.
+    /// - **No actual usage (a release) → no-op.** The reservation this
+    ///   correction targets is already gone, so there is nothing of *this
+    ///   request's* to release. Falling through to the back-of-queue release
+    ///   here would pop tokens from an unrelated, still-live reservation for
+    ///   the same key and under-count the budget (the bug a stale/duplicate
+    ///   reconciliation would otherwise cause). The expired reservation's own
+    ///   usage was already dropped by the window/TTL or the earlier release.
+    /// - **Actual usage → charged in full as fresh usage.** A request that
+    ///   outlived its window still consumed `actual_tokens`, and the expired
+    ///   reservation no longer counts anywhere, so the whole actual usage (not
+    ///   just `actual - reserved`) is recorded at `now`. Recording only the
+    ///   positive excess dropped the reserved portion entirely, and a request
+    ///   whose actual usage was at or below its expired estimate was charged
+    ///   nothing at all (`ai_rate_limiter-MUSE-1`). When the entry was instead
+    ///   absorbed by history coalescing (more than `MAX_TOKEN_WINDOW_ENTRIES`
+    ///   unreconciled requests for one identity), its reserved tokens are still
+    ///   retained, so this over-counts by at most that reservation — the
+    ///   conservative direction.
     ///
     /// When `reservation_id` is `None` (the legacy / anonymous path with no
     /// per-entry identity), positive deltas append a fresh entry and negative
     /// deltas release from the back of the queue, floored at zero.
-    fn adjust_usage(&mut self, now: Instant, reservation_id: Option<u64>, delta: i64) {
-        if delta == 0 {
-            self.current_usage(now);
-            return;
-        }
-
+    fn adjust_usage(
+        &mut self,
+        now: Instant,
+        reservation_id: Option<u64>,
+        delta: i64,
+        actual_tokens: u64,
+    ) {
         self.current_usage(now);
 
         if let Some(id) = reservation_id.filter(|id| *id != 0) {
@@ -3207,6 +3235,9 @@ impl TokenUsageWindow {
             // and off the request-admission hot path. Documented in
             // docs/plugins.md (Local-mode performance).
             if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+                if delta == 0 {
+                    return;
+                }
                 let new_tokens = if delta >= 0 {
                     entry.tokens.saturating_add(delta as u64)
                 } else {
@@ -3227,13 +3258,16 @@ impl TokenUsageWindow {
 
             // A reservation id was supplied but the entry is gone. Do NOT fall
             // through to the anonymous back-of-queue release: that would steal a
-            // different in-flight reservation's tokens. Only a positive delta
-            // (extra usage above an expired reservation) is recorded; a negative
-            // delta is a no-op because the reservation it targeted is already
-            // released/expired.
-            if delta > 0 {
-                self.record_usage(now, delta as u64);
+            // different in-flight reservation's tokens. The expired reservation
+            // no longer counts, so the request's whole actual usage is charged
+            // as fresh usage; a release (`actual_tokens == 0`) is a no-op.
+            if actual_tokens > 0 {
+                self.record_usage(now, actual_tokens);
             }
+            return;
+        }
+
+        if delta == 0 {
             return;
         }
 
@@ -3320,6 +3354,19 @@ pub enum AiRateLimitOp {
     Reserve {
         tokens: u64,
     },
+    /// [`Self::CheckBudget`] against an explicit ceiling instead of the
+    /// algorithm's configured `token_limit` — a per-consumer or per-model
+    /// budget override resolved by the caller. The identity's key already
+    /// selects its own window, so only the comparison changes.
+    CheckBudgetWithLimit {
+        limit: u64,
+    },
+    /// [`Self::Reserve`] against an explicit ceiling (see
+    /// [`Self::CheckBudgetWithLimit`]).
+    ReserveWithLimit {
+        tokens: u64,
+        limit: u64,
+    },
     AdjustUsage {
         /// Id returned by the `Reserve` outcome, so the local window can release
         /// the exact reservation this reconciliation belongs to. `None` (or `0`)
@@ -3370,6 +3417,18 @@ impl AiTokenRateAlgorithm {
             window_seconds: window_seconds.max(1),
         }
     }
+
+    /// The ceiling an admission op is evaluated against: an explicit
+    /// per-request override, or the configured `token_limit`.
+    fn admission_limit(&self, op: &AiRateLimitOp) -> u64 {
+        match *op {
+            AiRateLimitOp::CheckBudgetWithLimit { limit }
+            | AiRateLimitOp::ReserveWithLimit { limit, .. } => limit,
+            AiRateLimitOp::CheckBudget
+            | AiRateLimitOp::Reserve { .. }
+            | AiRateLimitOp::AdjustUsage { .. } => self.token_limit,
+        }
+    }
 }
 
 #[async_trait]
@@ -3394,22 +3453,25 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
         op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
+        let limit = self.admission_limit(op);
         match *op {
-            AiRateLimitOp::CheckBudget => {
+            AiRateLimitOp::CheckBudget | AiRateLimitOp::CheckBudgetWithLimit { .. } => {
                 let usage = state.current_usage(now);
-                let remaining = state.remaining(now);
-                let outcome = if usage >= self.token_limit {
+                let remaining = limit.saturating_sub(usage);
+                let outcome = if usage >= limit {
                     RateLimitOutcome::deny()
                 } else {
                     RateLimitOutcome::allow()
                 };
                 outcome
-                    .with_limit(self.token_limit)
+                    .with_limit(limit)
                     .with_window(self.window_seconds)
                     .with_usage(usage)
                     .with_remaining(remaining)
             }
-            AiRateLimitOp::Reserve { tokens } => state.reserve(now, tokens),
+            AiRateLimitOp::Reserve { tokens } | AiRateLimitOp::ReserveWithLimit { tokens, .. } => {
+                state.reserve(now, tokens, limit)
+            }
             AiRateLimitOp::AdjustUsage {
                 reservation_id,
                 // The local window pins the correction to the right window via
@@ -3440,7 +3502,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         state.current_usage(now);
                     }
                 } else {
-                    state.adjust_usage(now, reservation_id, delta);
+                    state.adjust_usage(now, reservation_id, delta, actual_tokens);
                 }
                 // Surface post-reconcile bucket state so `expose_headers` can
                 // refresh `x-ai-ratelimit-usage` / `remaining` after admission.
@@ -3461,8 +3523,9 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
+        let limit = self.admission_limit(op);
         match *op {
-            AiRateLimitOp::CheckBudget => {
+            AiRateLimitOp::CheckBudget | AiRateLimitOp::CheckBudgetWithLimit { .. } => {
                 let progress = RedisRateLimitClient::window_progress(self.window_seconds);
                 let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
@@ -3472,19 +3535,19 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let (prev_count, curr_count) = redis.get_two_counters(&prev_key, &curr_key).await?;
                 let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
                 let usage = weighted as u64;
-                let remaining = self.token_limit.saturating_sub(usage);
-                let outcome = if usage >= self.token_limit {
+                let remaining = limit.saturating_sub(usage);
+                let outcome = if usage >= limit {
                     RateLimitOutcome::deny()
                 } else {
                     RateLimitOutcome::allow()
                 };
                 Ok(outcome
-                    .with_limit(self.token_limit)
+                    .with_limit(limit)
                     .with_window(self.window_seconds)
                     .with_usage(usage)
                     .with_remaining(remaining))
             }
-            AiRateLimitOp::Reserve { tokens } => {
+            AiRateLimitOp::Reserve { tokens } | AiRateLimitOp::ReserveWithLimit { tokens, .. } => {
                 let progress = RedisRateLimitClient::window_progress(self.window_seconds);
                 let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
@@ -3497,8 +3560,8 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let (prev_count, _) = redis.get_two_counters(&prev_key, &curr_key).await?;
                 let weighted = weighted_window_count(prev_count, new_curr_count, elapsed_fraction);
                 let usage = weighted.max(0.0) as u64;
-                let remaining = self.token_limit.saturating_sub(usage);
-                if weighted > self.token_limit as f64 {
+                let remaining = limit.saturating_sub(usage);
+                if weighted > limit as f64 {
                     // Roll back the speculative reservation we just added. Use
                     // the floor-at-zero variant (not a raw negative INCRBY): a
                     // concurrent reconciliation racing this rollback on the same
@@ -3520,16 +3583,13 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         );
                     }
                     return Ok(RateLimitOutcome::deny()
-                        .with_limit(self.token_limit)
+                        .with_limit(limit)
                         .with_window(self.window_seconds)
                         .with_usage(usage.saturating_sub(tokens))
-                        .with_remaining(
-                            self.token_limit
-                                .saturating_sub(usage.saturating_sub(tokens)),
-                        ));
+                        .with_remaining(limit.saturating_sub(usage.saturating_sub(tokens))));
                 }
                 Ok(RateLimitOutcome::allow()
-                    .with_limit(self.token_limit)
+                    .with_limit(limit)
                     .with_window(self.window_seconds)
                     .with_usage(usage)
                     .with_remaining(remaining)
@@ -3585,6 +3645,21 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // `actual_tokens == 0` (full release of a local reservation)
                     // is a no-op against Redis — there is nothing on this backend
                     // to release, and the local reservation expires on its own.
+                } else if reserved_window_index.is_some_and(|reserved| reserved < prev_idx) {
+                    // The reservation's window is older than the previous
+                    // window: no admission reads it any more and its key is past
+                    // (or about to pass) its TTL, so the reservation no longer
+                    // counts anywhere. A request that outlived two windows — a
+                    // long reasoning stream is routine — must not write its
+                    // correction into that dead key, or its whole positive
+                    // correction is invisible to enforcement
+                    // (`ai_rate_limiter-MUSE-1`). Treat it like a backend switch:
+                    // charge the FULL actual usage to the current window. A
+                    // release (`actual_tokens == 0`) has nothing live to debit.
+                    if actual_tokens > 0 {
+                        let increment = u64_to_i64_saturating(actual_tokens);
+                        curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
+                    }
                 } else if delta != 0 {
                     // Debit the window the reservation actually credited (carried
                     // back from the `Reserve` outcome) so a request that

@@ -644,9 +644,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ws_frame_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9050,
-        active_phases: "on_ws_frame, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
+        active_phases: "on_ws_policy_close, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
         matrix_protocols: WS_ONLY_PROTOCOLS,
-        protocol_rationale: "`on_ws_frame` records policy decisions such as Close; delivery observations are emitted after successful destination sends",
+        protocol_rationale: "`on_ws_policy_close` records final policy Close decisions; delivery observations are emitted after successful destination sends",
     },
     BuiltinPluginParityMeta {
         name: "statsd_logging",
