@@ -1077,8 +1077,9 @@ fn test_registry_stale_eviction() {
         0.0,
     );
 
-    // A completed export collects the entry's counters (issue #5276); only then
-    // does idle age make it evictable.
+    // Two delivered exports confirm the entry's counters were collected
+    // (issue #5276); only then does idle age make it evictable.
+    registry.render_prometheus().unwrap();
     registry.render_prometheus().unwrap();
 
     // Evict with zero TTL should remove everything
@@ -4097,8 +4098,9 @@ fn test_eviction_releases_budget_capacity() {
     let saturated_bytes = registry.retained_bytes_for_tests();
     assert!(saturated_bytes > 0);
 
-    // Acknowledge collection first: idle age alone no longer deletes billing
-    // rows (issue #5276).
+    // Confirm collection first (two delivered exports): idle age alone no
+    // longer deletes billing rows (issue #5276).
+    registry.render_prometheus().unwrap();
     registry.render_prometheus().unwrap();
 
     // Evict everything (ttl of 0 nanos makes every entry stale).
@@ -5110,7 +5112,10 @@ fn test_uncollected_idle_entry_is_retained_by_eviction() {
     let row = &rendered["consumers"]["user-a"]["proxies"]["proxy-a"];
     assert_eq!(row["total_calls"], 1, "the retained row stays billable");
 
-    // The export above collected it, so the next pass may reclaim it.
+    // One delivery does not confirm collection; a second one (here a cached
+    // re-serve of the same document) does, so the next pass may reclaim it.
+    assert_eq!(registry.evict_stale(0), 0);
+    registry.render_json().unwrap();
     assert_eq!(registry.evict_stale(0), 1);
     assert!(registry.entries.is_empty());
     assert_eq!(registry.reserved_entries_for_tests(), 0);
@@ -5136,7 +5141,8 @@ fn test_charges_recorded_after_the_last_export_survive_eviction() {
         .map(|entry| entry.call_count.load(Ordering::Relaxed));
     assert_eq!(calls, Some(2), "the second billed call is retained");
 
-    // Collect again, and the row becomes reclaimable.
+    // Collect again (twice, to confirm), and the row becomes reclaimable.
+    registry.render_json().unwrap();
     registry.render_json().unwrap();
     assert_eq!(registry.evict_stale(0), 1);
 }
@@ -5189,10 +5195,12 @@ fn test_either_export_format_acknowledges_collection() {
         let registry = ChargebackRegistry::new();
         registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
         record_identity(&registry, "user-a");
-        if json_collector {
-            registry.render_json().unwrap();
-        } else {
-            registry.render_prometheus().unwrap();
+        for _ in 0..2 {
+            if json_collector {
+                registry.render_json().unwrap();
+            } else {
+                registry.render_prometheus().unwrap();
+            }
         }
         let evicted = registry.evict_stale(0);
         assert_eq!(
@@ -5266,83 +5274,157 @@ fn test_uncollected_retained_entries_is_exported_without_identities() {
 
 // --- Production-launch review fixes ---
 
-/// The value of the first `family` sample labelled with `consumer`.
-fn prometheus_sample(document: &str, family: &str, consumer: &str) -> Option<f64> {
-    let prefix = format!("{family}{{");
-    let label = format!("consumer=\"{consumer}\"");
-    document
-        .lines()
-        .filter(|line| line.starts_with(&prefix))
-        .find(|line| line.contains(&label))
-        .and_then(|line| line.rsplit(' ').next())
-        .and_then(|value| value.parse().ok())
+/// A one-proxy gateway configuration whose `api_chargeback` uses `pricing`.
+fn reservation_config(
+    proxy_id: &str,
+    proxy_name: &str,
+    pricing: serde_json::Value,
+) -> GatewayConfig {
+    let mut proxy = chargeback_chain_proxy(proxy_id, "/billing", "cb-reserve");
+    proxy.name = Some(proxy_name.to_string());
+    GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![chargeback_chain_plugin(
+            "cb-reserve",
+            proxy_id,
+            "USD",
+            pricing,
+        )],
+        ..GatewayConfig::default()
+    }
 }
 
-/// api_chargeback-SOL-1: ordinary rows can never consume the bytes the
-/// overflow fallback needs, so a byte-saturated registry still preserves every
-/// charge instead of counting it as dropped.
+fn total_registry_calls(registry: &ChargebackRegistry) -> u64 {
+    registry
+        .entries
+        .iter()
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// api_chargeback-SOL-1 / PR6842-SOL-1: the configured overflow matrix is
+/// reserved before ordinary rows can consume it, so every refused tuple —
+/// including ones first seen after saturation — folds into an overflow row
+/// instead of being dropped.
 #[test]
-fn test_byte_saturation_folds_into_reserved_overflow_without_dropping() {
-    let budget = ferrum_edge::plugins::api_chargeback::MIN_MAX_RETAINED_BYTES;
+fn test_reserved_overflow_matrix_absorbs_every_refused_tuple() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let config = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({"pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00001}]}),
+    );
+    let matrix = overflow_reservation_matrix(&config);
+    assert_eq!(matrix.len(), 3, "one overflow row per priced status");
+    let matrix_bytes: usize = matrix.values().sum();
+    let budget = 4096;
+    assert!(
+        2 * matrix_bytes <= budget,
+        "the scenario budget admits the protected matrix ({matrix_bytes} bytes)"
+    );
+
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
+    registry.publish_overflow_reservations(&config);
+    assert_eq!(
+        registry.outstanding_overflow_reserve_for_tests(),
+        matrix_bytes
+    );
 
     for index in 0..500 {
         record_identity(&registry, &format!("user-{index}"));
     }
+    // Tuples first seen after the ordinary share is exhausted.
+    for status in [201, 202] {
+        registry.record_http(
+            &scope(),
+            &format!("late-{status}"),
+            "proxy-a",
+            "My API",
+            status,
+            0.00001,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
 
-    assert!(
-        registry.retained_bytes_for_tests() <= budget,
-        "retained bytes {} exceeded the configured ceiling",
-        registry.retained_bytes_for_tests()
+    assert!(registry.retained_bytes_for_tests() <= budget);
+    assert_eq!(
+        total_registry_calls(&registry),
+        502,
+        "no billable call is lost"
     );
-    assert!(
-        registry.reserved_entries_for_tests() > 0,
-        "ordinary rows are still admitted up to their share"
-    );
-    let total_calls: u64 = registry
-        .entries
-        .iter()
-        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
-        .sum();
-    assert_eq!(total_calls, 500, "every billable call must be retained");
-    assert!(
-        by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL) > 0,
-        "refused identities fold into the overflow row"
+    assert_eq!(
+        registry.outstanding_overflow_reserve_for_tests(),
+        0,
+        "every reserved overflow row now exists"
     );
     let rendered: serde_json::Value =
         serde_json::from_str(&registry.render_json().unwrap()).unwrap();
     assert_eq!(rendered["registry"]["dropped_charges_total"], 0);
 }
 
-/// The reserved share is exactly what ordinary rows may not use.
+/// The overflow matrix covers bandwidth-only statuses with one shared row and
+/// a stream proxy with its single stream row.
 #[test]
-fn test_ordinary_row_byte_ceiling_reserves_a_quarter_for_overflow() {
-    use ferrum_edge::plugins::api_chargeback::ordinary_row_byte_ceiling;
-    assert_eq!(ordinary_row_byte_ceiling(4096), 3072);
-    assert_eq!(
-        ordinary_row_byte_ceiling(DEFAULT_MAX_RETAINED_BYTES),
-        DEFAULT_MAX_RETAINED_BYTES / 4 * 3
+fn test_overflow_matrix_is_bounded_by_configuration() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let http = reservation_config(
+        "proxy-bw",
+        "Bandwidth API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 204], "price_per_call": 0.001}],
+            "bandwidth_pricing": {"price_per_byte_received": 0.000001}
+        }),
     );
+    assert_eq!(
+        overflow_reservation_matrix(&http).len(),
+        3,
+        "two priced statuses plus the shared status-0 bandwidth row"
+    );
+
+    let stream = GatewayConfig {
+        proxies: vec![chargeback_chain_stream_proxy("proxy-tcp", "cb-stream")],
+        plugin_configs: vec![chargeback_chain_plugin(
+            "cb-stream",
+            "proxy-tcp",
+            "USD",
+            json!({
+                "stream_connection_pricing": {"price_per_connection": 0.5},
+                "bandwidth_pricing": {"price_per_byte_sent": 0.000001}
+            }),
+        )],
+        ..GatewayConfig::default()
+    };
+    assert_eq!(overflow_reservation_matrix(&stream).len(), 1);
 }
 
-/// A budget too small for its overflow reserve to hold an overflow row is
-/// refused at construction.
+/// A `max_retained_bytes` that cannot hold twice the overflow matrix (the live
+/// generation plus a pricing reload's next one) is refused at admission.
 #[test]
-fn test_max_retained_bytes_below_floor_is_rejected() {
-    let floor = ferrum_edge::plugins::api_chargeback::MIN_MAX_RETAINED_BYTES;
-    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]});
+fn test_budget_below_twice_the_overflow_matrix_is_refused() {
+    use ferrum_edge::plugins::api_chargeback::validate_composition;
 
-    let mut too_small = base.clone();
-    too_small["max_retained_bytes"] = json!(floor - 1);
-    let error = ApiChargeback::new(&too_small, "ferrum")
-        .err()
-        .expect("a budget below the floor must be refused");
-    assert!(error.contains("`max_retained_bytes`"), "{error}");
-
-    let mut at_floor = base;
-    at_floor["max_retained_bytes"] = json!(floor);
-    assert!(ApiChargeback::new(&at_floor, "ferrum").is_ok());
+    let pricing = |budget: u64| {
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00001}],
+            "max_retained_bytes": budget
+        })
+    };
+    let errors = validate_composition(&reservation_config("proxy-a", "My API", pricing(2048)))
+        .expect_err("a budget below twice the matrix must be refused");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("`max_retained_bytes`") && error.contains("overflow")),
+        "{errors:?}"
+    );
+    validate_composition(&reservation_config("proxy-a", "My API", pricing(4096)))
+        .unwrap_or_else(|errors| panic!("a budget holding the matrix is admitted: {errors:?}"));
 }
 
 /// api_chargeback-SOL-2: an idle, collected status row whose bandwidth series
@@ -5369,7 +5451,8 @@ fn test_idle_row_of_a_live_series_is_not_evicted_alone() {
     record(500, 100_000);
     record(200, 1_000_000);
     registry.render_prometheus().unwrap();
-    // Only the 200 row sees traffic after the export.
+    registry.render_prometheus().unwrap();
+    // Only the 200 row sees traffic after the exports.
     record(200, 1);
 
     assert_eq!(
@@ -5389,7 +5472,9 @@ fn test_idle_row_of_a_live_series_is_not_evicted_alone() {
         "the cumulative counter must not decrease:\n{document}"
     );
 
-    // Once every member is idle and collected, the group retires together.
+    // Once every member is idle and confirmed collected, the group retires
+    // together.
+    registry.render_prometheus().unwrap();
     assert_eq!(registry.evict_stale(0), 2);
     assert!(registry.entries.is_empty());
     assert_eq!(registry.reserved_entries_for_tests(), 0);
@@ -5418,6 +5503,7 @@ fn test_retired_pricing_generation_of_a_live_series_is_not_evicted_alone() {
     record(0.01);
     record(0.01);
     registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
     // A pricing reload: new traffic lands on a new pricing-generation row.
     record(0.02);
 
@@ -5432,7 +5518,111 @@ fn test_retired_pricing_generation_of_a_live_series_is_not_evicted_alone() {
         Some(3.0),
         "{document}"
     );
+    registry.render_prometheus().unwrap();
     assert_eq!(registry.evict_stale(0), 2);
+}
+
+/// Two idle, confirmed-collected rows of one bandwidth series, ready to retire.
+fn collected_live_series(registry: &ChargebackRegistry, consumer: &str) {
+    for (status, bytes) in [(500, 100_000), (200, 1_000_000)] {
+        registry.record_http(
+            &scope(),
+            consumer,
+            "proxy-race",
+            "API",
+            status,
+            0.0,
+            0,
+            bytes,
+            0.0,
+            0.001,
+        );
+    }
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+}
+
+fn record_race_bytes(registry: &ChargebackRegistry, consumer: &str, status: u16, bytes: u64) {
+    registry.record_http(
+        &scope(),
+        consumer,
+        "proxy-race",
+        "API",
+        status,
+        0.0,
+        0,
+        bytes,
+        0.0,
+        0.001,
+    );
+}
+
+/// PR6842-SOL-2: a member refreshed after candidate selection but before
+/// removal revives its whole group; no sibling is removed.
+#[test]
+fn test_member_refreshed_during_eviction_revives_its_whole_group() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    collected_live_series(&registry, "carol-refresh");
+
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || record_race_bytes(&registry, "carol-refresh", 200, 1),
+        || {},
+    );
+    assert_eq!(evicted, 0, "a refreshed member keeps its whole group");
+    assert_eq!(registry.entries.len(), 2);
+    let document = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prometheus_sample(
+            &document,
+            "ferrum_api_bytes_received_total",
+            "carol-refresh"
+        ),
+        Some(1_100_001.0),
+        "{document}"
+    );
+}
+
+/// PR6842-SOL-2: a group that gains a row while its members are being removed
+/// is restored in full; a fresh row for a removed key is merged, not lost.
+#[test]
+fn test_group_revived_during_removal_is_restored_in_full() {
+    for (consumer, revive_status) in [("dave-new-member", 404), ("dave-same-key", 200)] {
+        let registry = ChargebackRegistry::new();
+        registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+        collected_live_series(&registry, consumer);
+
+        let evicted = registry.evict_stale_interleaved_for_tests(
+            0,
+            || {},
+            || record_race_bytes(&registry, consumer, revive_status, 7),
+        );
+        assert_eq!(evicted, 0, "{consumer}: a revived group keeps every member");
+        let document = registry.render_prometheus().unwrap();
+        assert_eq!(
+            prometheus_sample(&document, "ferrum_api_bytes_received_total", consumer),
+            Some(1_100_007.0),
+            "{consumer}: {document}"
+        );
+        assert_eq!(
+            registry.reserved_entries_for_tests(),
+            registry.entries.len(),
+            "{consumer}: one reservation per retained row"
+        );
+    }
+}
+
+/// The value of the first `family` sample labelled with `consumer`.
+fn prometheus_sample(document: &str, family: &str, consumer: &str) -> Option<f64> {
+    let prefix = format!("{family}{{");
+    let label = format!("consumer=\"{consumer}\"");
+    document
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .find(|line| line.contains(&label))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
 }
 
 /// api_chargeback-CLAUDE-1: bandwidth pricing keeps WebSocket sessions on the
@@ -5536,7 +5726,14 @@ fn test_pending_render_acknowledges_only_when_its_receipt_is_returned() {
         assert_eq!(cached, document, "the retry is served from the cache");
         assert_eq!(cached_receipt, receipt);
 
+        // PR6842-SOL-3: one delivery never confirms collection on its own.
         registry.acknowledge_collection(receipt);
+        assert_eq!(
+            registry.evict_stale(0),
+            0,
+            "a single delivery does not confirm collection (json={json_format})"
+        );
+        registry.acknowledge_collection(cached_receipt);
         assert_eq!(registry.evict_stale(0), 1, "json={json_format}");
     }
 }
@@ -5572,55 +5769,54 @@ async fn test_charges_delivery_ack_fires_only_once_the_body_is_taken() {
         ferrum_edge::_test_support::collect_guarded_admin_response_for_test(response_with_ack())
             .await;
     assert_eq!(body.as_ref(), document.as_bytes());
+    // PR6842-SOL-3: taking the body is not proof the peer received it, so one
+    // delivery does not authorize eviction; a second delivery confirms it.
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "one delivered document does not confirm collection"
+    );
+    let _ =
+        ferrum_edge::_test_support::collect_guarded_admin_response_for_test(response_with_ack())
+            .await;
     assert_eq!(
         registry.evict_stale(0),
         1,
-        "a delivered document acknowledges its walk"
+        "two delivered documents confirm collection"
     );
 }
 
-/// api_chargeback-CLAUDE-4: a reload that keeps advancing the proxy-metadata
-/// generation cannot keep one `/charges` render walking forever.
+/// api_chargeback-CLAUDE-4: a reload that invalidates every walk cannot keep
+/// one `/charges` render walking forever — each format stops after exactly
+/// `MAX_RENDER_ATTEMPTS` walks and returns its last document uncached.
 #[test]
-fn test_render_terminates_under_continuous_generation_churn() {
-    let registry = Arc::new(ChargebackRegistry::new());
-    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
-    // Enough rows that every walk overlaps several generation advances.
-    for index in 0..20_000 {
-        record_identity(&registry, &format!("churn-{index}"));
+fn test_render_returns_after_bounded_walks_when_every_walk_is_invalidated() {
+    use ferrum_edge::plugins::api_chargeback::MAX_RENDER_ATTEMPTS;
+
+    let registry = ChargebackRegistry::new();
+    registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-bounded");
+    registry.invalidate_every_render_walk_for_tests(true);
+    for json_format in [true, false] {
+        let before = registry.render_walks_for_tests();
+        let (document, _receipt) = if json_format {
+            registry.render_json_pending().unwrap()
+        } else {
+            registry.render_prometheus_pending().unwrap()
+        };
+        assert!(document.contains("user-bounded"), "{document}");
+        assert_eq!(
+            registry.render_walks_for_tests() - before,
+            MAX_RENDER_ATTEMPTS,
+            "json={json_format}"
+        );
     }
 
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flapper = {
-        let registry = Arc::clone(&registry);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let mut flip = false;
-            while !stop.load(Ordering::Relaxed) {
-                flip = !flip;
-                let name = if flip { "Churn A" } else { "Churn B" };
-                registry.set_active_proxy_names(active_proxy_names("ferrum", "proxy-a", name));
-            }
-        })
-    };
-
-    let (sender, receiver) = std::sync::mpsc::channel();
-    {
-        let registry = Arc::clone(&registry);
-        std::thread::spawn(move || {
-            let json = registry.render_json_pending().is_ok();
-            let prometheus = registry.render_prometheus_pending().is_ok();
-            let _ = sender.send(json && prometheus);
-        });
-    }
-    let finished = receiver.recv_timeout(std::time::Duration::from_secs(60));
-    stop.store(true, Ordering::Relaxed);
-    let _ = flapper.join();
-    assert_eq!(
-        finished,
-        Ok(true),
-        "each render must return within MAX_RENDER_ATTEMPTS walks"
-    );
+    // Nothing was cached, and without the churn one walk suffices.
+    registry.invalidate_every_render_walk_for_tests(false);
+    let before = registry.render_walks_for_tests();
+    registry.render_json_pending().unwrap();
+    assert_eq!(registry.render_walks_for_tests() - before, 1);
 }
 
 /// api_chargeback-CLAUDE-5: an interval whose sleep deadline could overflow is

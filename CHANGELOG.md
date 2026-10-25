@@ -9,12 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **BREAKING — `api_chargeback` admission bounds and WebSocket billing basis**
-  (issue #6842). `max_retained_bytes` below `4096` and
-  `cleanup_interval_seconds` above `31536000` (one year, whose sleep deadline
-  could overflow and kill the cleanup task) are now refused. Ordinary billing
-  rows may use only three quarters of `max_retained_bytes`; the remaining
-  quarter is reserved for the aggregate overflow rows, so a flood of distinct
-  identities folds into overflow instead of dropping charges. A
+  (issue #6842). `cleanup_interval_seconds` above `31536000` (one year, whose
+  sleep deadline could overflow and kill the cleanup task) is now refused.
+  The aggregate overflow rows the configured proxies and pricing tiers can
+  create are reserved up front, plus equal headroom for a pricing reload.
+  That covers one row per priced status, one shared status-`0` row that
+  takes bandwidth-only statuses, and one row per stream proxy. Ordinary rows
+  can no longer take those bytes, a refused identity always folds into
+  overflow instead of dropping the charge, and a `max_retained_bytes` smaller
+  than twice that matrix is refused at admission. A
   bandwidth-priced instance now keeps its proxy's WebSocket sessions on the
   parsed relay. WebSocket bandwidth is billed on payload bytes even with
   `FERRUM_WEBSOCKET_TUNNEL_MODE=true`, and policy-stopped sessions now report
@@ -157,11 +160,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consistent** (#6842). Idle eviction retires a row only together with every
   row sharing its consumer, proxy, and currency, so a live cumulative
   Prometheus counter never shrinks, which `increase()` / `rate()` would misread
-  as a reset. `GET /charges` acknowledges collection only once the admin
-  connection has taken the complete document, not at render time, so a scrape
-  cancelled mid-render cannot authorize eviction of rows no collector
-  received. Renders run on the blocking pool and give up re-walking after three
-  generation-invalidated attempts instead of looping on an admin worker.
+  as a reset. Each member is removed only if still evictable under its lock,
+  and a group refreshed or extended during the pass is restored in full while
+  renders wait. `GET /charges` counts a delivery only once the admin
+  connection has taken the complete document, not at render time, and a row
+  becomes evictable only after two deliveries, so a scrape cancelled
+  mid-render or a single failed write cannot authorize eviction of rows no
+  collector received. Renders run on the blocking pool and give up re-walking
+  after three generation-invalidated attempts instead of looping on an admin
+  worker.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

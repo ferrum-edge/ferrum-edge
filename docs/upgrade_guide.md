@@ -30,13 +30,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ### `api_chargeback` budget bounds and WebSocket billing basis (PR #6842)
 
-`api_chargeback` now refuses `max_retained_bytes` below `4096` and
-`cleanup_interval_seconds` above `31536000` (one year). Raise or lower such
-values before upgrading. To disable periodic cleanup, use `0`, not a huge
-interval. Ordinary billing rows may now use only three quarters of
-`max_retained_bytes`, with the rest reserved for the aggregate overflow rows.
-A deployment sized to fill the whole budget with per-identity rows should raise
-`max_retained_bytes` by a third to keep the same per-identity capacity.
+`api_chargeback` now refuses `cleanup_interval_seconds` above `31536000`
+(one year). To disable periodic cleanup, use `0`, not a huge interval.
+
+The aggregate overflow rows the configured proxies and pricing tiers can
+create are now reserved, plus equal headroom for a pricing reload. That covers
+one row per priced status, one shared status-`0` row when bandwidth is priced,
+and one row per stream proxy. Admission refuses a `max_retained_bytes` smaller
+than twice that matrix: a validation error names both numbers, so raise the
+budget if it appears. The reserved bytes are no longer available to
+per-identity rows. In the overflow row, bandwidth recorded at a status no tier
+prices is filed under status `0`.
 
 An instance with nonzero `bandwidth_pricing` now forces its proxy's WebSocket
 sessions onto the parsed relay. `FERRUM_WEBSOCKET_TUNNEL_MODE` raw copy no
@@ -51,8 +55,9 @@ trailer frame) are now billed at the `500` tier by both `api_chargeback` and
 `api_chargeback_sink`.
 
 Idle rows are now evicted only together with every row sharing their consumer,
-proxy, and currency. Collection is acknowledged only once a `/charges` response
-body has been handed to the admin connection. Neither change needs action.
+proxy, and currency. They become evictable only after two delivered `/charges`
+responses have included their current counters, so expect idle rows to linger
+one collection interval longer. Neither change needs action.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 

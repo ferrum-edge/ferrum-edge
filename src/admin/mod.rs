@@ -1436,10 +1436,12 @@ impl Drop for AdminActivityGuard {
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
     inner: Full<Bytes>,
-    /// `GET /charges` collection acknowledgement, fired once hyper has taken
+    /// `GET /charges` delivery acknowledgement, fired once hyper has taken
     /// the complete document from this body (issue #5276). A response dropped
     /// before then — a scrape cancelled while the registry was rendering, or a
-    /// stream reset before the body was written — acknowledges nothing.
+    /// stream reset before the body was polled — acknowledges nothing. Taking
+    /// the body is not proof the peer received it, so the registry confirms
+    /// collection only after two such deliveries.
     delivery_ack: Option<plugins::api_chargeback::ChargesDeliveryAck>,
     _guard: AdminActivityGuard,
 }
