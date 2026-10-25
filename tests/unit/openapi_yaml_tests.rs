@@ -17756,6 +17756,9 @@ fn oauth2_introspection_schema_and_constructor_admit_the_same_configs() {
         "role_claim",
         "consumer_identity_claim",
         "consumer_header_claim",
+        "max_concurrent_introspections",
+        "discovery_refresh_interval_secs",
+        "accept_mtls_bound_tokens",
     ] {
         assert!(
             provider_properties.contains_key(field),
@@ -17939,6 +17942,94 @@ fn oauth2_introspection_schema_and_constructor_admit_the_same_configs() {
         (
             "unknown provider key",
             provider(json!({"introspection_endpoiint": loopback})),
+            false,
+        ),
+        (
+            "provider concurrency limit zero",
+            provider(json!({"max_concurrent_introspections": 0})),
+            false,
+        ),
+        (
+            "provider concurrency limit at maximum",
+            provider(json!({"max_concurrent_introspections": 1024})),
+            true,
+        ),
+        (
+            "provider concurrency limit above range",
+            provider(json!({"max_concurrent_introspections": 1025})),
+            false,
+        ),
+        (
+            "plugin concurrency limit in range",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "max_concurrent_introspections": 64}),
+            true,
+        ),
+        (
+            "plugin concurrency limit zero",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "max_concurrent_introspections": 0}),
+            false,
+        ),
+        (
+            "plugin concurrency limit above range",
+            json!({"providers": [{
+                "introspection_endpoint": loopback,
+                "client_auth": {"method": "none"}
+            }], "max_concurrent_introspections": 1025}),
+            false,
+        ),
+        (
+            "discovery refresh interval with discovery",
+            json!({"providers": [{
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "discovery_refresh_interval_secs": 60,
+                "client_auth": {"method": "none"}
+            }]}),
+            true,
+        ),
+        (
+            "discovery refresh interval zero",
+            json!({"providers": [{
+                "discovery_url": "http://127.0.0.1:32123/.well-known/openid-configuration",
+                "discovery_refresh_interval_secs": 0,
+                "client_auth": {"method": "none"}
+            }]}),
+            false,
+        ),
+        (
+            "discovery refresh interval without discovery",
+            provider(json!({"discovery_refresh_interval_secs": 60})),
+            false,
+        ),
+        (
+            "certificate-bound tokens accepted",
+            provider(json!({"accept_mtls_bound_tokens": true})),
+            true,
+        ),
+        (
+            "certificate-bound flag of the wrong type",
+            provider(json!({"accept_mtls_bound_tokens": "yes"})),
+            false,
+        ),
+        (
+            "client assertion audience",
+            provider(json!({"client_auth": {
+                "method": "none",
+                "client_assertion_audience": "https://idp.example.com/"
+            }})),
+            true,
+        ),
+        (
+            "blank client assertion audience",
+            provider(json!({"client_auth": {
+                "method": "none",
+                "client_assertion_audience": "   "
+            }})),
             false,
         ),
         (
