@@ -2424,8 +2424,9 @@ pub struct RequestContext {
     hmac_wire_method: Option<String>,
     /// The client's request-target, retained only when it cannot be
     /// reconstructed from the path and query (an HTTP/1.1 absolute-form
-    /// target, or a present-but-empty query). Private to `hmac_auth`'s RFC 9421
-    /// `@request-target` derivation through the debug-redacted wrapper.
+    /// target, an authority-form CONNECT, or a present-but-empty query).
+    /// Private to `hmac_auth`'s RFC 9421 `@request-target` derivation through
+    /// the debug-redacted wrapper.
     hmac_wire_request_target: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are

@@ -65,7 +65,9 @@
 //! ordered set, and the pass pops only markers whose expiry has passed, so
 //! staggered or clustered expirations under sustained traffic near capacity
 //! cost the due markers (plus one peek per stripe), never a rescan of live
-//! ones. Index insert, refresh move, and removal are O(log n).
+//! ones. Due digests are drained in fixed-size stack batches, never collected
+//! into a heap buffer proportional to the expired population. Index insert,
+//! refresh move, and removal are O(log n).
 //! Ordinary admission publishes that bound
 //! only earlier (`fetch_min`) under a lock-free active-writer count plus a
 //! completed-revision counter; prune may store a later bound only after a scan
@@ -159,6 +161,9 @@ const SHARED_KEY_COMPONENT: &str = "replay";
 /// taken from the marker digest, which is uniformly distributed, so
 /// concurrent admissions spread across stripes instead of contending on one.
 const EXPIRY_INDEX_STRIPES: usize = 16;
+
+/// Maximum due digests held on the stack between index pops and map removals.
+const EXPIRY_PRUNE_BATCH_SIZE: usize = 64;
 
 /// One stripe of the expiry index, ordered by expiry then digest.
 type ExpiryStripe = Mutex<BTreeSet<(u64, [u8; 32])>>;
@@ -855,55 +860,62 @@ impl ProcessReplayLane {
         // revision change. Load order is owned by [`Self::writer_epoch`].
         let epoch = self.writer_epoch();
 
-        // Pop exactly the markers whose indexed expiry has passed, one stripe
-        // at a time; a stripe's first remaining element is its earliest live
-        // expiry. Nothing live is taken out of the index, so a later pass never
-        // revisits it. No stripe is held past its own loop iteration.
-        let mut due: Vec<[u8; 32]> = Vec::new();
+        // Drain due markers in fixed-size stack batches, even if the whole
+        // lane expires together. Release the stripe before taking an entry
+        // guard to preserve the entries -> stripe lock order. Nothing live is
+        // taken out of the index, so a later pass never revisits it.
+        let mut due = [[0u8; 32]; EXPIRY_PRUNE_BATCH_SIZE];
         let mut live_min = u64::MAX;
+        let mut reclaimed = 0usize;
+        let mut examined = 0u64;
         for stripe in &self.expiry_index {
-            let mut stripe = stripe
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             loop {
-                match stripe.first() {
-                    Some(&(expires_at, _)) if expires_at <= now_millis => {
-                        if let Some((_, digest)) = stripe.pop_first() {
-                            due.push(digest);
+                let mut due_len = 0;
+                {
+                    let mut stripe = stripe
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while due_len < due.len() {
+                        match stripe.first() {
+                            Some(&(expires_at, _)) if expires_at <= now_millis => {
+                                if let Some((_, digest)) = stripe.pop_first() {
+                                    due[due_len] = digest;
+                                    due_len += 1;
+                                }
+                            }
+                            Some(&(expires_at, _)) => {
+                                live_min = live_min.min(expires_at);
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    Some(&(expires_at, _)) => {
-                        live_min = live_min.min(expires_at);
-                        break;
-                    }
-                    None => break,
                 }
-            }
-        }
-
-        let mut reclaimed = 0usize;
-        let examined = u64::try_from(due.len()).unwrap_or(u64::MAX);
-        for key in due {
-            // Re-check the expiry under the shard guard: a concurrent request
-            // may have refreshed this marker (re-indexing it at its new
-            // expiry), and removing it then would drop a live claim.
-            match self
-                .entries
-                .remove_if(&key, |_, entry| entry.expires_at_millis <= now_millis)
-            {
-                Some((_, entry)) => {
-                    self.entry_count.fetch_sub(1, Ordering::AcqRel);
-                    self.release_principal(&entry.principal_digest);
-                    reclaimed += 1;
-                }
-                None => {
-                    // Refreshed concurrently: its refresh re-indexed it under
-                    // the new expiry, which bounds it for publication too.
-                    if let Some(expires_at) =
-                        self.entries.get(&key).map(|entry| entry.expires_at_millis)
+                for key in &due[..due_len] {
+                    examined = examined.saturating_add(1);
+                    // Re-check under the shard guard: a concurrent refresh
+                    // re-indexes this marker at its new expiry, and must keep
+                    // its live claim and principal charge.
+                    match self
+                        .entries
+                        .remove_if(key, |_, entry| entry.expires_at_millis <= now_millis)
                     {
-                        live_min = live_min.min(expires_at);
+                        Some((_, entry)) => {
+                            self.entry_count.fetch_sub(1, Ordering::AcqRel);
+                            self.release_principal(&entry.principal_digest);
+                            reclaimed += 1;
+                        }
+                        None => {
+                            if let Some(expires_at) =
+                                self.entries.get(key).map(|entry| entry.expires_at_millis)
+                            {
+                                live_min = live_min.min(expires_at);
+                            }
+                        }
                     }
+                }
+                if due_len < due.len() {
+                    break;
                 }
             }
         }

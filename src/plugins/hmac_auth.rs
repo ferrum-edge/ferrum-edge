@@ -700,7 +700,8 @@ fn rfc9421_component_value(ctx: &RequestContext, name: &str) -> Result<String, &
             Ok(value)
         }
         // §2.2.5: the request-target as sent. The frontend retains it when the
-        // path and query cannot reproduce it (absolute-form, empty query).
+        // path and query cannot reproduce it (absolute-form, authority-form,
+        // empty query).
         "@request-target" if ctx.hmac_wire_request_target.is_some() => Ok(ctx
             .hmac_wire_request_target
             .as_ref()
@@ -725,10 +726,11 @@ fn rfc9421_component_value(ctx: &RequestContext, name: &str) -> Result<String, &
 
 /// The request-target a frontend must retain for RFC 9421 `@request-target`
 /// because the path and query alone cannot reproduce it: an HTTP/1.x
-/// absolute-form target (`GET https://host/p?q HTTP/1.1`), or a
+/// absolute-form target (`GET https://host/p?q HTTP/1.1`), an authority-form
+/// CONNECT target (`host:port`, including CONNECT without `:path` on H2/H3), or a
 /// present-but-empty query (`/p?`), which the query accessor collapses to
 /// absence. `None` for every ordinary origin-form request, so the common path
-/// allocates nothing. HTTP/2 and HTTP/3 always carry origin-form `:path`.
+/// allocates nothing. An HTTP/2 or HTTP/3 request with `:path` uses that target.
 pub fn unreconstructible_request_target(version: http::Version, uri: &http::Uri) -> Option<String> {
     let http1 = matches!(
         version,
@@ -736,6 +738,11 @@ pub fn unreconstructible_request_target(version: http::Version, uri: &http::Uri)
     );
     if http1 && uri.scheme().is_some() {
         return Some(uri.to_string());
+    }
+    if uri.path_and_query().is_none() {
+        return uri
+            .authority()
+            .map(|authority| authority.as_str().to_owned());
     }
     if uri.query() == Some("") {
         return uri
