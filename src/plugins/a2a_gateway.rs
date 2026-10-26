@@ -32,7 +32,9 @@ use crate::util::unknown_keys::reject_unknown_keys;
 /// representation retained under `v1` may be an encoded card carrying the
 /// backend's internal URLs, which a finalized replay would serve without
 /// re-running the rewrite, so it must no longer match.
-const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.a2a_gateway.static.v2";
+/// `v3`: multipart partial HTTP cards are refused independently of media type,
+/// retiring representations retained before that refusal was enforced.
+const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.a2a_gateway.static.v3";
 
 /// Process-unique instance identity for the per-request claim
 /// ([`A2aGatewayClaim`]). Two `a2a_gateway` instances on one proxy have
@@ -1651,7 +1653,7 @@ impl Plugin for A2aGateway {
         self.enabled && (self.discovery.rewrite_agent_card_urls || self.observability.emit_metadata)
     }
 
-    /// Claim an HTTP JSON Agent Card response the shared representation gate
+    /// Claim an HTTP Agent Card response the shared representation gate
     /// must make inspectable before this plugin's rewrite can be trusted.
     ///
     /// The card rewrite is a body policy in the gate's sense: the operator
@@ -1667,15 +1669,17 @@ impl Plugin for A2aGateway {
     ///   transform phase rewrites, or fails it closed;
     /// * a range slice or delta (`206` / `226`; the pristine
     ///   `crate::proxy::ORIGIN_FRAGMENT_RESPONSE_METADATA_KEY` stamp). The
-    ///   gate rejects it rather than letting a client reassemble an un-rewritten
-    ///   card from slices.
+    ///   gate rejects it independently of media type, including multipart byte
+    ///   ranges whose individual parts carry JSON, rather than letting a client
+    ///   reassemble an un-rewritten card from slices.
     ///
     /// A complete identity body is NOT claimed: it is already the plaintext the
     /// rewrite parses, and a non-JSON body there carries no card a client could
     /// parse either, so claiming it would only turn ordinary error pages into
     /// gateway errors. Scoped to this instance's own claim, to card requests
-    /// with rewriting enabled, and to JSON (or untyped) media; native gRPC
-    /// cards keep their own frame-level refusal path.
+    /// with rewriting enabled. Only content-coded complete responses retain the
+    /// JSON (or untyped) media restriction; native gRPC cards keep their own
+    /// frame-level refusal path.
     fn enforces_response_body_policy(
         &self,
         ctx: &RequestContext,
@@ -1683,10 +1687,12 @@ impl Plugin for A2aGateway {
         _response_body: &[u8],
     ) -> bool {
         self.may_enforce_response_body_policy(ctx)
-            && response_content_type.is_none_or(content_type_value_is_json)
-            && !response_content_type
-                .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
-            && (origin_response_is_still_encoded(ctx) || origin_response_is_fragment(ctx))
+            && (origin_response_is_fragment(ctx)
+                || (origin_response_is_still_encoded(ctx)
+                    && response_content_type.is_none_or(content_type_value_is_json)
+                    && !response_content_type.is_some_and(
+                        crate::plugins::utils::body_transform::is_framed_grpc_content_type,
+                    )))
     }
 
     /// Over-approximation used before the response headers are known: every

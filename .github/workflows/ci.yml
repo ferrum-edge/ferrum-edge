@@ -2081,6 +2081,7 @@ jobs:
               functional_secrets_test
               functional_ai_plugins_test
               functional_a2a_gateway_grpc_card_test
+              functional_a2a_gateway_http_card_test
               functional_ai_response_guard_grpc_test
               functional_ai_stream_router_test
               functional_ai_transcript_audit_grpc_test
