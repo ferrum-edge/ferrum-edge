@@ -50884,10 +50884,14 @@ async fn proxy_to_backend(
     // A `Cow` so the direct-H2 block below can hand over the target-effective
     // proxy it ALREADY owns instead of cloning a second one per request.
     let mut sni_reqwest_dial: Option<(std::borrow::Cow<'_, Proxy>, String)> = None;
+    // Keep this request's ALPN result even when the registry has no entry to
+    // downgrade yet. The reqwest fallback still needs explicit H1 framing.
+    let mut reqwest_negotiated_http1 = false;
 
     // Use the direct HTTP/2 pool only when the capability registry has already
-    // classified this concrete backend target as H2-capable and the request
-    // body path is compatible with the hyper sender.
+    // classified this concrete backend target as H2-capable, or when policy /
+    // an unknown-length GET/HEAD upload requires classification before sending.
+    // The request body path must be compatible with the hyper sender.
     if proxy.dispatch_kind == DispatchKind::HttpsPool {
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
         // Mirror the warmup path: the direct H2 pool must key and dial on the
@@ -50927,13 +50931,31 @@ async fn proxy_to_backend(
         // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
         // HBONE/mesh-mTLS transports never reach here. See
         // `should_dispatch_direct_h2` for the exact policy interaction.
-        let direct_h2_dispatch = should_dispatch_direct_h2(
-            direct_h2_can_dispatch,
-            direct_h2_supports,
-            direct_h2_known_unsupported,
-            requires_direct_h2_for_sni,
-            direct_h2_proxy.h2_upgrade_policy,
-        );
+        // Reqwest may ALPN-negotiate H1 on an unclassified HTTPS target. Its
+        // encoder would drop an unknown-length GET/HEAD body without polling
+        // the size limiter unless chunked framing were set. Classify these
+        // streaming uploads with the existing H2 handshake first: H2 keeps its
+        // sender, and an H1 result falls through before any request is sent.
+        // Buffered/replayed bodies have an exact length; proven-empty bodies
+        // keep the ordinary fast path. Respect an explicit H1-only policy.
+        let classify_upload_protocol = direct_h2_can_dispatch
+            && !direct_h2_supports
+            && !direct_h2_known_unsupported
+            && !direct_h2_proxy.forces_backend_http1_only()
+            && stream_request_body
+            && matches!(
+                &client_request_body,
+                ClientRequestBody::Streaming(request)
+                    if h1_request_requires_explicit_chunked_framing(method, request.body())
+            );
+        let direct_h2_dispatch = classify_upload_protocol
+            || should_dispatch_direct_h2(
+                direct_h2_can_dispatch,
+                direct_h2_supports,
+                direct_h2_known_unsupported,
+                requires_direct_h2_for_sni,
+                direct_h2_proxy.h2_upgrade_policy,
+            );
         if requires_direct_h2_for_sni && direct_h2_known_unsupported {
             // A backend proven to speak only HTTP/1.1 over TLS is the ordinary
             // BackendTLSPolicy case, not an error: honor the overridden TLS
@@ -51025,6 +51047,7 @@ async fn proxy_to_backend(
                 Ok(Ok(sender)) => Some(sender),
                 Ok(Err(e)) => {
                     if should_fallback_to_reqwest_after_http2_pool_error(&e) {
+                        reqwest_negotiated_http1 = true;
                         // The per-pool-key ALPN learning cache was removed
                         // when the capability registry took over classification,
                         // so without this the next request would repeat the
@@ -51703,7 +51726,8 @@ async fn proxy_to_backend(
                 // below would never see it. Only when this reqwest dispatch is
                 // known to speak HTTP/1.1: HTTP/2 frames the body itself and
                 // must never carry `Transfer-Encoding`.
-                if reqwest_dispatch_is_http1_only(state, proxy, upstream_target)
+                if (reqwest_negotiated_http1
+                    || reqwest_dispatch_is_http1_only(state, proxy, upstream_target))
                     && h1_request_requires_explicit_chunked_framing(method, &incoming)
                 {
                     req_builder = req_builder.header(
