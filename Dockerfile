@@ -18,8 +18,8 @@
 # Build the eBPF targets with `FEATURES=cloud-secrets,ebpf`; hosted CI exercises
 # all three contracts.
 ARG FEATURES=cloud-secrets
-# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+# Digest resolved 2026-10-26; the tag is kept for readability, the digest is authoritative.
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 ARG IPROUTE2_BASE=debian:13-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 ARG IPROUTE2_VERSION=6.15.0-1
 ARG BPF_LINKER_VERSION=0.11.0
