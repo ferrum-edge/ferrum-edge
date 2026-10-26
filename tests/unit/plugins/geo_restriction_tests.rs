@@ -635,7 +635,11 @@ async fn registered_country_only_record_drives_http_and_stream_policy() {
             admitted
         );
         assert_eq!(
-            stream.metadata.get("geo.country").map(String::as_str),
+            stream
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("geo.country"))
+                .map(String::as_str),
             Some("DE")
         );
     }
