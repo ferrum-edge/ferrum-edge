@@ -225,8 +225,8 @@ async fn a_failure_before_admission_notifies_no_plugins_and_claims_no_generation
 /// Frontend DTLS plugin reject (PR #6872 review): the accepted-DTLS handler
 /// used to close and return before building any summary, so metadata the
 /// rejecting chain wrote — `ip_restriction.reason` — never reached a log sink.
-/// The handler now emits one zero-byte, client-side summary through the same
-/// setup-failure path as a plain-UDP plugin reject.
+/// Exercise the production summary helper's zero-byte, client-side attribution;
+/// the structural test below separately pins its listener call site.
 #[tokio::test]
 async fn a_frontend_dtls_plugin_rejection_emits_one_summary_with_the_rejection_reason() {
     use ferrum_edge::plugins::ip_restriction::{IpRestriction, REJECTION_REASON_METADATA_KEY};
@@ -294,4 +294,59 @@ async fn a_frontend_dtls_plugin_rejection_emits_one_summary_with_the_rejection_r
             "a plugin reject is client-side and backend-health neutral"
         );
     }
+}
+
+/// The helper test above cannot catch the listener dropping summary emission
+/// (issue #6906). Scope this guard to the listener's rejection arm so the helper
+/// definition or a call in another branch cannot satisfy it.
+#[test]
+fn frontend_dtls_listener_awaits_plugin_rejection_summary_before_returning() {
+    let source = include_str!("../../../src/proxy/udp_proxy.rs");
+    let listener = source
+        .split_once("async fn start_dtls_frontend_listener(")
+        .expect("frontend DTLS listener")
+        .1
+        .split_once("\n}\n")
+        .expect("end of frontend DTLS listener")
+        .0;
+    let rejected = listener
+        .split_once("DtlsStreamConnectOutcome::Rejected => {")
+        .expect("listener plugin-rejection arm")
+        .1
+        .split_once("\n                        }\n")
+        .expect("end of listener plugin-rejection arm")
+        .0;
+    let before_return = rejected
+        .split_once("return;")
+        .expect("plugin rejection returns before backend setup")
+        .0;
+    let snapshot = before_return
+        .find("let progress = dtls_plugin_rejection_progress(")
+        .expect("plugin rejection snapshots the admitting context before returning");
+    let emit = before_return
+        .find("emit_dtls_plugin_rejection_summary(")
+        .expect("listener must emit the plugin-rejection summary before returning");
+    assert!(snapshot < emit, "snapshot attribution before emitting");
+    assert_eq!(
+        rejected
+            .matches("emit_dtls_plugin_rejection_summary(")
+            .count(),
+        1,
+        "the listener must emit exactly one plugin-rejection summary"
+    );
+
+    // Ignore rustfmt whitespace, but require the real awaited call with the
+    // rejection's attribution, rather than merely finding the helper's name.
+    let call: String = before_return[emit..].split_whitespace().collect();
+    assert!(
+        call.starts_with(concat!(
+            "emit_dtls_plugin_rejection_summary(progress,DtlsPluginRejection{",
+            "namespace:&proxy_namespace,proxy_id:&resolved_proxy_id,",
+            "client_ip:client_ip.as_ref(),listen_port:port,",
+            "connected_wall_at:connected_at,",
+            "duration_ms:connected_mono.elapsed().as_secs_f64()*1000.0,",
+            "},).await;"
+        )),
+        "the listener must await summary emission with the rejected connection's attribution"
+    );
 }
