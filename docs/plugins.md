@@ -3288,12 +3288,18 @@ owner, and each quarantine is logged at `error`. Ownership counts every
 secret a Consumer stores, including one in an entry that is itself malformed
 or weak. A running gateway also remembers (as namespace-bound digests, at most
 4096 per namespace with the oldest forgotten first and a warning logged) every
-secret it has seen shared in an accepted configuration, including ones a
-database full load already stripped, so a later incremental change cannot
-reactivate it on one holder while the other holder is no longer visible. The
-memory is process-local: a restart, a control plane, and a data plane fed
-already-stripped snapshots judge only the current source, so give every
-Consumer that held a shared secret a new, distinct one. A changed Consumer carrying
+secret removed from a credential quarantined for sharing in an accepted
+configuration, including every other key in its rotation array and ones a
+database full load already stripped. Startup seeds this history from the
+initial snapshot. Publication and recording share one cold-path lock boundary;
+a candidate whose remaining keys became tainted during staging is rejected
+for retry against the current history. Read-only comparison and rejected or
+stale-fenced candidates record nothing. Thus a later incremental change cannot
+reactivate an omitted key while its former holder is no longer visible. The
+memory is best-effort and process-local: a restart, a control-plane full reload,
+and a data plane fed already-stripped snapshots judge only the current source;
+capacity eviction also forgets older keys. Give every Consumer whose credential
+was quarantined an entirely new, distinct set of secrets. A changed Consumer carrying
 `jwt` makes database-mode and control-plane polling take a full reload. The verifier additionally
 never checks a signature against a stored secret below the 32 non-whitespace
 character floor. A token naming an unknown identity (or a Consumer with no

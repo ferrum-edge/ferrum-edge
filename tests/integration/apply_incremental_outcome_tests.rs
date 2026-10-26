@@ -3404,3 +3404,187 @@ async fn rejected_candidate_does_not_record_shared_jwt_secrets() {
         .await;
     assert!(live_has_jwt(&state, "alice"));
 }
+
+/// Issue #6902: both raw and loader-quarantined startup snapshots seed the
+/// history before constructing the request-facing ConsumerIndex.
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_snapshot_seeds_all_quarantined_jwt_rotation_keys() {
+    const SHARED: &str = "startup-shared-jwt-secret-0123456789abcdef";
+    const OTHER: &str = "startup-other-jwt-secret-0123456789abcdefg";
+    const NEW: &str = "startup-fresh-jwt-secret-0123456789abcdefg";
+    for loader_stripped in [false, true] {
+        let mut alice = jwt_test_consumer("alice", SHARED);
+        alice.credentials.insert(
+            "jwt".to_string(),
+            serde_json::json!([{ "secret": SHARED }, { "secret": OTHER }]),
+        );
+        let mut initial = GatewayConfig {
+            consumers: vec![alice, jwt_test_consumer("eve", SHARED)],
+            ..GatewayConfig::default()
+        };
+        if loader_stripped {
+            let outcome = initial.quarantine_invalid_jwt_credentials_against(&Default::default());
+            initial.quarantined_jwt_shared_secrets = outcome.shared;
+        }
+        let state = proxy_state_with_config(initial);
+        assert!(!live_has_jwt(&state, "alice"));
+        assert!(!live_has_jwt(&state, "eve"));
+        assert!(
+            !state
+                .consumer_index
+                .find_by_identity("alice")
+                .expect("Alice remains indexed")
+                .credentials
+                .contains_key("jwt")
+        );
+        assert_eq!(state.jwt_shared_secret_history.lock().unwrap().len(), 2);
+
+        // The other key was unique before its array disappeared. A point
+        // update assigning it to Eve must still fail closed.
+        assert!(
+            state
+                .apply_incremental(delta_with_consumers(vec![jwt_test_consumer("eve", OTHER)]))
+                .await
+                .accepted()
+        );
+        assert!(!live_has_jwt(&state, "eve"));
+        assert!(
+            state
+                .apply_incremental(delta_with_consumers(vec![jwt_test_consumer("eve", NEW)]))
+                .await
+                .accepted()
+        );
+        assert!(live_has_jwt(&state, "eve"));
+    }
+}
+
+/// Exercise the real comparison/freshness seam without a network or timers.
+/// Neither a stale fence nor a later apply rejection accepts these records.
+#[tokio::test(flavor = "multi_thread")]
+async fn comparing_stale_or_rejected_snapshots_does_not_record_jwt_history() {
+    use ferrum_edge::grpc::configsync_lifecycle::{
+        AppliedSnapshotAuthority, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
+        full_snapshot_stream_disposition, gateway_config_content_matches,
+        snapshot_requires_older_payload_exception,
+    };
+
+    const SHARED: &str = "compared-shared-jwt-secret-0123456789abcde";
+    for loader_stripped in [false, true] {
+        let state = empty_proxy_state();
+        let authority = AppliedSnapshotAuthority {
+            version: Some(state.current_config().loaded_at),
+            source_cp_url: "http://cp-primary:50051".to_string(),
+            gateway_trust: GatewayTrustEquivalenceState::Absent,
+        };
+        let mut candidate = GatewayConfig {
+            proxies: vec![test_proxy("p1", "/dup"), test_proxy("p2", "/dup")],
+            consumers: vec![
+                jwt_test_consumer("alice", SHARED),
+                jwt_test_consumer("eve", SHARED),
+            ],
+            loaded_at: state.current_config().loaded_at - Duration::hours(1),
+            ..GatewayConfig::default()
+        };
+        if loader_stripped {
+            let outcome = candidate.quarantine_invalid_jwt_credentials_against(&Default::default());
+            candidate.quarantined_jwt_shared_secrets = outcome.shared;
+        }
+        let fallback = "http://cp-fallback:50051";
+        assert!(snapshot_requires_older_payload_exception(
+            Some(&authority),
+            candidate.loaded_at,
+            fallback,
+        ));
+        let comparable = state.canonicalize_snapshot_for_comparison(&candidate);
+        assert!(
+            comparable
+                .consumers
+                .iter()
+                .all(|c| !c.has_credential("jwt"))
+        );
+        let equivalent = gateway_config_content_matches(&state.current_config(), &comparable);
+        assert!(!equivalent);
+        assert!(matches!(
+            full_snapshot_stream_disposition(
+                Some(&authority),
+                candidate.loaded_at,
+                fallback,
+                equivalent,
+            ),
+            FullSnapshotStreamDisposition::RefuseAndTerminate(_)
+        ));
+        assert!(state.jwt_shared_secret_history.lock().unwrap().is_empty());
+
+        // The same comparison may precede an apply that fails validation.
+        assert!(matches!(
+            state.update_config(candidate),
+            ConfigApplyOutcome::Rejected { .. }
+        ));
+        assert!(state.jwt_shared_secret_history.lock().unwrap().is_empty());
+        assert!(state.current_config().consumers.is_empty());
+        assert!(
+            state
+                .apply_incremental(delta_with_consumers(vec![jwt_test_consumer(
+                    "alice", SHARED
+                )]))
+                .await
+                .accepted()
+        );
+        assert!(live_has_jwt(&state, "alice"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_delta_does_not_record_jwt_history() {
+    const SHARED: &str = "delta-rejected-jwt-secret-0123456789abcdef";
+    let state = empty_proxy_state();
+    let mut delta = delta_with_consumers(vec![
+        jwt_test_consumer("alice", SHARED),
+        jwt_test_consumer("eve", SHARED),
+    ]);
+    delta.added_or_modified_proxies = vec![test_proxy("p1", "/dup"), test_proxy("p2", "/dup")];
+    assert!(matches!(
+        state.apply_incremental(delta).await,
+        ConfigApplyOutcome::Rejected { .. }
+    ));
+    assert!(state.jwt_shared_secret_history.lock().unwrap().is_empty());
+    assert!(state.current_config().consumers.is_empty());
+    assert!(
+        state
+            .apply_incremental(delta_with_consumers(vec![jwt_test_consumer(
+                "alice", SHARED
+            )]))
+            .await
+            .accepted()
+    );
+    assert!(live_has_jwt(&state, "alice"));
+}
+
+/// An accepted records-only snapshot must seed history even when no resources
+/// need publishing. These local records never travel on the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_empty_full_snapshot_records_loader_stripped_jwt_secrets() {
+    const SHARED: &str = "empty-loader-jwt-secret-0123456789abcdefgh";
+    let mut loaded = GatewayConfig {
+        consumers: vec![
+            jwt_test_consumer("alice", SHARED),
+            jwt_test_consumer("eve", SHARED),
+        ],
+        ..GatewayConfig::default()
+    };
+    let outcome = loaded.quarantine_invalid_jwt_credentials_against(&Default::default());
+    loaded.quarantined_jwt_shared_secrets = outcome.shared;
+    loaded.consumers.clear();
+    let state = empty_proxy_state();
+    assert_eq!(state.update_config(loaded), ConfigApplyOutcome::Unchanged);
+    assert_eq!(state.jwt_shared_secret_history.lock().unwrap().len(), 1);
+    assert!(
+        state
+            .apply_incremental(delta_with_consumers(vec![jwt_test_consumer(
+                "alice", SHARED
+            )]))
+            .await
+            .accepted()
+    );
+    assert!(!live_has_jwt(&state, "alice"));
+}
