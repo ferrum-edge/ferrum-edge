@@ -1859,16 +1859,20 @@ fn inject_provider_default_max_tokens(
             // Keep the client's ProtoJSON spelling: injecting the other spelling
             // beside an existing container or `null` cap would make the body
             // carry one proto field twice.
-            let container = if is_present_value(obj.get("generation_config"))
-                && !is_present_value(obj.get("generationConfig"))
-            {
-                "generation_config"
-            } else {
-                "generationConfig"
-            };
+            let container =
+                if obj.contains_key("generation_config") && !obj.contains_key("generationConfig") {
+                    "generation_config"
+                } else {
+                    "generationConfig"
+                };
             let entry = obj
                 .entry(container.to_string())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            // A lone null container is unset too; replace it in place so the
+            // default neither disappears nor creates a second proto spelling.
+            if entry.is_null() {
+                *entry = Value::Object(serde_json::Map::new());
+            }
             if let Some(gen_config) = entry.as_object_mut() {
                 let field = if gen_config.contains_key("max_output_tokens")
                     && !gen_config.contains_key("maxOutputTokens")

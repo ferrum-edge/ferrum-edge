@@ -5673,6 +5673,55 @@ async fn single_null_cap_spelling_is_replaced_in_place_by_the_default() {
     );
 }
 
+/// Issue #6896: a lone null generation container receives the default under
+/// its original spelling and remains valid through the final-body pass.
+#[tokio::test]
+async fn single_null_generation_container_is_replaced_in_place_by_the_default() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 128})).unwrap();
+    for container in ["generationConfig", "generation_config"] {
+        let mut body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        });
+        body[container] = serde_json::Value::Null;
+        let mut expected = body.clone();
+        expected[container] = json!({"maxOutputTokens": 128});
+
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(request_body_json(&ctx), expected, "{container}");
+        assert_eq!(
+            decision(&ctx),
+            (Some("modify"), Some("default_max_tokens_injected")),
+            "{container}"
+        );
+
+        // The wire transform receives the original body, independently of the
+        // eager metadata rewrite used by downstream before_proxy hooks.
+        let original = serde_json::to_vec(&body).unwrap();
+        let transformed = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &original,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .expect("a null generation container is replaced by the default");
+        let transformed_json: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+        assert_eq!(transformed_json, expected, "{container}");
+        assert!(
+            ctx.metadata
+                .contains_key(plugin.final_inspection_marker_key())
+        );
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
+                .await,
+        );
+    }
+}
+
 /// PR6849-SOL-2: `max_choices: 0` refuses every request, including one that
 /// relies on the provider's implicit single completion.
 #[tokio::test]
