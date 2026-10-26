@@ -41,8 +41,8 @@ use serde_json::json;
 #[test]
 fn request_transformer_header_outcomes_share_every_dispatch_boundary() {
     // Behavioral tests cover both helper shapes; this inventory pins their
-    // placement after header hooks on H1/H2 and H3, including deferred passes
-    // and externally supplied finalized-egress overlays.
+    // placement after initial/deferred header hooks on H1/H2 and H3. Post-body
+    // finalized-egress overlays retire digests without relabeling body outcomes.
     let proxy = source("src/proxy/mod.rs");
     let h3 = source("src/http3/server.rs");
     for (text, signature) in [
@@ -55,44 +55,51 @@ fn request_transformer_header_outcomes_share_every_dispatch_boundary() {
             .find("BackendPathBeforeProxyPass::Initial")
             .unwrap();
         let boundary = dispatcher
-            .find("retire_stale_request_integrity_headers(&mut ctx, &mut owned_proxy_headers)")
+            .find("finalize_request_transformer_headers(&mut ctx, &mut owned_proxy_headers)")
             .unwrap();
         assert!(wire < hooks && hooks < boundary, "{signature}");
     }
-    let refresh = item_body(
-        &proxy,
-        "fn refresh_effective_backend_gateway_assertion_headers(",
-        "\n}",
-    );
-    assert!(refresh.contains("retire_stale_request_integrity_headers(ctx, owned_proxy_headers)"));
     let h1_dispatcher = item_body(&proxy, "async fn handle_proxy_request_inner(", "\n}");
-    assert!(
+    assert_eq!(
         h1_dispatcher
-            .matches("refresh_effective_backend_gateway_assertion_headers(&mut ctx,")
-            .count()
-            >= 2
+            .matches("finalize_request_transformer_headers(&mut ctx,")
+            .count(),
+        3
     );
     let h3_dispatcher = item_body(&h3, "async fn handle_h3_request(", "\n}");
-    assert!(
+    assert_eq!(
         h3_dispatcher
-            .matches("retire_stale_request_integrity_headers_in_map(")
-            .count()
-            >= 2
+            .matches("finalize_request_transformer_headers_in_map(")
+            .count(),
+        2
     );
     for (signature, required) in [
         (
             "pub(crate) fn apply_finalized_request_egress_header_overlay(",
-            "refresh_effective_backend_gateway_assertion_headers(ctx, owned_proxy_headers)",
+            "retire_stale_request_integrity_headers(ctx, owned_proxy_headers)",
         ),
         (
             "pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(",
             "retire_stale_request_integrity_headers_in_map(ctx, headers)",
         ),
     ] {
+        let overlay = item_body(&proxy, signature, "\n}");
+        assert!(overlay.contains(required), "{signature}");
         assert!(
-            item_body(&proxy, signature, "\n}").contains(required),
+            !overlay.contains("finalize_request_transformer_headers"),
             "{signature}"
         );
+    }
+    for signature in [
+        "pub(crate) fn retire_stale_request_integrity_headers(",
+        "pub(crate) fn retire_stale_request_integrity_headers_in_map(",
+    ] {
+        let retirement = item_body(&proxy, signature, "\n}");
+        assert!(
+            !retirement.contains("record_body_rule_header_skip"),
+            "{signature}"
+        );
+        assert!(!retirement.contains("&mut RequestContext"), "{signature}");
     }
 }
 

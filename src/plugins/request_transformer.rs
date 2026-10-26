@@ -1094,9 +1094,10 @@ pub(crate) fn request_body_rules_may_rewrite(
             })
 }
 
-/// Publish the media-type skip at the final-header boundary, including when
-/// streaming skips the body hook. Reconsider only this provisional reason on
-/// later passes; a body hook's parse/no-rule outcome remains authoritative.
+/// Publish the media-type skip at a pre-body final-header boundary, including
+/// when streaming skips the body hook. Reconsider only this provisional reason
+/// on deferred header passes; a body hook's parse/no-rule outcome remains
+/// authoritative. Post-body egress overlays must not call this function.
 pub(crate) fn record_body_rule_header_skip(
     method: &str,
     headers: &HashMap<String, String>,
@@ -1108,7 +1109,7 @@ pub(crate) fn record_body_rule_header_skip(
             .is_some_and(|content_type| !body_transform::is_json_content_type(content_type));
     let previous = metadata.get(BODY_SKIPPED_METADATA_KEY).map(String::as_str);
     if skipped {
-        if previous != Some(BODY_SKIPPED_NON_JSON_CONTENT_TYPE) {
+        if previous.is_none() {
             metadata.insert(
                 BODY_SKIPPED_METADATA_KEY.to_string(),
                 BODY_SKIPPED_NON_JSON_CONTENT_TYPE.to_string(),

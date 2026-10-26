@@ -2836,7 +2836,7 @@ async fn run_chain_then_retire(
     }
     ctx.headers = inbound;
     let mut owned = (outbound != ctx.headers).then_some(outbound);
-    ferrum_edge::_test_support::retire_stale_request_integrity_headers(ctx, &mut owned);
+    ferrum_edge::_test_support::finalize_request_transformer_headers(ctx, &mut owned);
     owned
 }
 
@@ -2848,10 +2848,10 @@ fn finalize_body_rule_headers_on_surface(
     in_map: bool,
 ) {
     if in_map {
-        ferrum_edge::_test_support::retire_stale_request_integrity_headers_in_map(ctx, outbound);
+        ferrum_edge::_test_support::finalize_request_transformer_headers_in_map(ctx, outbound);
     } else {
         let mut owned = Some(std::mem::take(outbound));
-        ferrum_edge::_test_support::retire_stale_request_integrity_headers(ctx, &mut owned);
+        ferrum_edge::_test_support::finalize_request_transformer_headers(ctx, &mut owned);
         *outbound = owned.expect("an owned outbound map stays owned");
     }
 }
@@ -2940,15 +2940,117 @@ async fn body_skip_is_reconsidered_after_deferred_header_relabels() {
                 .await
                 .is_none()
             );
+            for content_type in ["text/plain", "application/json"] {
+                outbound.insert("content-type".to_string(), content_type.to_string());
+                finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+                assert_eq!(
+                    ctx.metadata
+                        .get(BODY_SKIPPED_METADATA_KEY)
+                        .map(String::as_str),
+                    Some(reason),
+                    "in_map={in_map}, content_type={content_type}"
+                );
+            }
+        }
+    }
+}
+
+async fn assert_egress_overlay_preserves_body_outcome(bytes: &[u8], expected_skip: Option<&str>) {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    for in_map in [false, true] {
+        for overlay_type in ["text/plain", "application/json"] {
+            let mut ctx = post_ctx();
+            let mut outbound =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            retain_client_wire_headers(&mut ctx, &outbound);
+            ctx.headers = outbound.clone();
+            body.before_proxy(&mut ctx, &mut outbound).await;
             finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            let replacement = body
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    bytes,
+                    Some("application/json"),
+                    &outbound,
+                )
+                .await;
+            if expected_skip.is_none() {
+                let replacement = replacement.expect("the body rule must replace the body");
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&replacement).unwrap(),
+                    json!({"keep": true})
+                );
+            } else {
+                assert!(replacement.is_none());
+            }
             assert_eq!(
                 ctx.metadata
                     .get(BODY_SKIPPED_METADATA_KEY)
                     .map(String::as_str),
-                Some(reason)
+                expected_skip
             );
+
+            // Exercise the actual post-body overlay boundaries, including the
+            // H1/H2 path that first materializes an owned outbound map here.
+            // JSON overlays must still retire newly introduced digests.
+            let overlay = integrity_headers(Some(overlay_type));
+            if in_map {
+                ferrum_edge::_test_support::apply_finalized_request_egress_header_overlay_in_map(
+                    &[],
+                    &ctx,
+                    &mut outbound,
+                    overlay,
+                    &[],
+                );
+            } else {
+                let mut owned = None;
+                ferrum_edge::_test_support::apply_finalized_request_egress_header_overlay(
+                    &[],
+                    &mut ctx,
+                    &mut owned,
+                    overlay,
+                    &[],
+                );
+                outbound = owned.expect("the overlay must materialize an outbound map");
+            }
+            assert_eq!(
+                outbound.get("content-type").map(String::as_str),
+                Some(overlay_type)
+            );
+            assert_eq!(
+                ctx.metadata
+                    .get(BODY_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                expected_skip,
+                "in_map={in_map}, overlay_type={overlay_type}"
+            );
+            if overlay_type == "application/json" {
+                for name in ["content-digest", "Repr-Digest", "digest", "content-md5"] {
+                    assert!(!outbound.contains_key(name), "{name}, in_map={in_map}");
+                }
+            }
         }
     }
+}
+
+#[tokio::test]
+async fn egress_header_relabel_preserves_body_parse_error() {
+    assert_egress_overlay_preserves_body_outcome(b"not json", Some("parse_error")).await;
+}
+
+#[tokio::test]
+async fn egress_header_relabel_preserves_body_no_rule_outcome() {
+    assert_egress_overlay_preserves_body_outcome(b"{}", Some("no_rule_applied")).await;
+}
+
+#[tokio::test]
+async fn egress_header_relabel_does_not_resurrect_skip_after_body_replacement() {
+    assert_egress_overlay_preserves_body_outcome(br#"{"debug":true,"keep":true}"#, None).await;
 }
 
 #[tokio::test]

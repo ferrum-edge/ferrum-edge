@@ -5884,7 +5884,7 @@ config:
 
 Neither key ever carries header, query, or body content, so both are reviewed safe metadata: default transaction logs show the reason value (an operator `FERRUM_LOG_REDACT_METADATA_KEYS` entry still redacts it). With several instances on one chain the last reason written wins.
 
-The `non_json_content_type` reason is decided over the final outbound headers after the complete `before_proxy` chain and route-header finalizer, and reconsidered after deferred passes and finalized-egress header overlays. A later header-only relabel to non-JSON therefore publishes the reason even when streaming skips the body hook; a relabel back to JSON clears that provisional reason. Buffered body hooks publish the actual parse/no-rule outcome or clear the marker when they rewrite the body.
+The `non_json_content_type` reason is decided over the final outbound headers after the complete `before_proxy` chain and route-header finalizer, and reconsidered after deferred header passes before the body hooks run. A later header-only relabel to non-JSON therefore publishes the reason even when streaming skips the body hook; a relabel back to JSON clears that provisional reason. Buffered body hooks publish the actual parse/no-rule outcome or clear the marker when they rewrite the body. Finalized-egress header overlays preserve that body outcome, including the absence of a skip marker after a rewrite; they still reapply digest retirement.
 
 **Body rules:** use dot-notation paths for nested JSON. Features:
 - **Nested objects** — `user.address.city`.
