@@ -5843,3 +5843,187 @@ fn test_member_of_mode_configuration() {
         .is_ok()
     );
 }
+
+// Each inner script is one group search, followed by one reply per candidate.
+#[derive(Clone, Copy)]
+enum BudgetProofReply {
+    Absent,
+    Listed,
+    Unavailable,
+    PausedListed,
+}
+
+struct MemberOfBudgetDirectory {
+    port: u16,
+    proofs: AtomicUsize,
+    group_searches: AtomicUsize,
+    paused: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+async fn spawn_member_of_budget_directory(
+    checks: Vec<Vec<BudgetProofReply>>,
+) -> Arc<MemberOfBudgetDirectory> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proof-budget directory");
+    let directory = Arc::new(MemberOfBudgetDirectory {
+        port: listener.local_addr().expect("proof-budget addr").port(),
+        proofs: AtomicUsize::new(0),
+        group_searches: AtomicUsize::new(0),
+        paused: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let state = Arc::clone(&directory);
+    let checks = Arc::new(std::sync::Mutex::new(checks.into_iter()));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let state = Arc::clone(&state);
+            let checks = Arc::clone(&checks);
+            tokio::spawn(async move {
+                let mut replies = Vec::new().into_iter();
+                while let Ok(request) = try_read_ldap_message_bytes(&mut stream).await {
+                    let (message_id, op) = ldap_request_id_and_op(&request);
+                    let mut response = Vec::new();
+                    match op {
+                        LDAP_OP_BIND_REQUEST => response.extend(bind_response(message_id, 0)),
+                        LDAP_OP_SEARCH_REQUEST => {
+                            let mut result_code = 0;
+                            if ldap_message_contains(&request, "memberOf") {
+                                state.proofs.fetch_add(1, Ordering::SeqCst);
+                                let reply = replies.next().expect("scripted membership proof");
+                                if matches!(reply, BudgetProofReply::PausedListed) {
+                                    state.paused.notify_one();
+                                    state.resume.notified().await;
+                                }
+                                match reply {
+                                    BudgetProofReply::Listed | BudgetProofReply::PausedListed => {
+                                        response.extend(search_result_entry(
+                                            message_id,
+                                            "uid=alice,ou=users,dc=example,dc=com",
+                                            &[],
+                                        ));
+                                    }
+                                    BudgetProofReply::Unavailable => result_code = 52,
+                                    BudgetProofReply::Absent => {}
+                                }
+                            } else if ldap_message_contains(&request, "ou=groups") {
+                                state.group_searches.fetch_add(1, Ordering::SeqCst);
+                                let check = checks
+                                    .lock()
+                                    .expect("group-check scripts")
+                                    .next()
+                                    .expect("scripted group check");
+                                for index in 0..check.len() {
+                                    response.extend(search_result_entry(
+                                        message_id,
+                                        &format!("cn=gateway-admins,ou={index},ou=groups,dc=example,dc=com"),
+                                        &[("cn", &["gateway-admins"])],
+                                    ));
+                                }
+                                replies = check.into_iter();
+                            } else {
+                                response.extend(search_result_entry(
+                                    message_id,
+                                    "uid=alice,ou=users,dc=example,dc=com",
+                                    &[("uid", &[DIRECT_BIND_CANONICAL_IDENTITY])],
+                                ));
+                            }
+                            response.extend(search_result_done(message_id, result_code));
+                        }
+                        LDAP_OP_UNBIND_REQUEST => break,
+                        _ => panic!("unexpected LDAP operation in proof-budget directory"),
+                    }
+                    stream.write_all(&response).await.expect("directory reply");
+                    stream.flush().await.expect("flush directory reply");
+                }
+            });
+        }
+    });
+    directory
+}
+
+/// Failed proof attempts count too. The replica can spend only what the
+/// primary left, and a separate authentication starts with a fresh budget.
+#[tokio::test]
+async fn test_member_of_proof_budget_spans_failover_endpoints() {
+    for (primary_attempts, replica_candidates, allowed) in
+        [(8, 8, true), (8, 9, false), (16, 1, false)]
+    {
+        let mut primary_check = vec![BudgetProofReply::Absent; primary_attempts - 1];
+        primary_check.push(BudgetProofReply::Unavailable);
+        let mut replica_check = vec![BudgetProofReply::Absent; replica_candidates - 1];
+        replica_check.push(BudgetProofReply::Listed);
+        let primary =
+            spawn_member_of_budget_directory(vec![primary_check.clone(), primary_check]).await;
+        let replica =
+            spawn_member_of_budget_directory(vec![replica_check.clone(), replica_check]).await;
+        let plugin = member_of_plugin(
+            primary.port,
+            json!({"failover_ldap_urls": [format!("ldap://127.0.0.1:{}", replica.port)]}),
+        );
+        for request in 1..=2 {
+            let result = authenticate_as(&plugin, "alice", "good-secret").await;
+            if allowed {
+                assert_continue(result);
+            } else {
+                assert_reject(result, Some(500));
+            }
+            assert_eq!(primary.group_searches.load(Ordering::SeqCst), request);
+            assert_eq!(replica.group_searches.load(Ordering::SeqCst), request);
+            assert_eq!(
+                primary.proofs.load(Ordering::SeqCst),
+                primary_attempts * request
+            );
+            assert_eq!(
+                replica.proofs.load(Ordering::SeqCst),
+                (16 - primary_attempts) * request,
+                "the replica must use only the remaining per-request proofs"
+            );
+        }
+    }
+}
+
+/// Evict the observed cache entry while its last re-check proof is held by
+/// a barrier. The stale check must fall back to a bind without refilling the
+/// proof budget. No clock expiry or timer race is needed.
+#[tokio::test]
+async fn test_member_of_proof_budget_spans_stale_cache_fallback() {
+    let mut recheck = vec![BudgetProofReply::Absent; 14];
+    recheck.push(BudgetProofReply::PausedListed);
+    let directory = spawn_member_of_budget_directory(vec![
+        vec![BudgetProofReply::Listed], // Warm Alice's cache entry.
+        recheck,                        // Spend 15 proofs re-checking Alice.
+        vec![BudgetProofReply::Listed], // Bob evicts Alice while the re-check waits.
+        vec![BudgetProofReply::Absent, BudgetProofReply::Listed], // Fallback needs two more.
+    ])
+    .await;
+    let plugin = Arc::new(member_of_plugin(
+        directory.port,
+        json!({"cache_ttl_seconds": 300, "group_cache_ttl_seconds": 0, "max_cache_entries": 1}),
+    ));
+    assert_continue(authenticate_as(&plugin, "alice", "good-secret").await);
+    let rechecking = tokio::spawn({
+        let plugin = Arc::clone(&plugin);
+        async move { authenticate_as(&plugin, "alice", "good-secret").await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), directory.paused.notified())
+        .await
+        .expect("Alice's re-check reached its last proof");
+    assert_continue(authenticate_as(&plugin, "bob", "good-secret").await);
+    directory.resume.notify_one();
+    assert_reject(rechecking.await.expect("cached re-check task"), Some(500));
+    assert_eq!(
+        directory.group_searches.load(Ordering::SeqCst),
+        4,
+        "the stale re-check must reach the uncached fallback"
+    );
+    assert_eq!(
+        directory.proofs.load(Ordering::SeqCst),
+        18,
+        "one warm-up proof, one eviction proof, and 16 across the re-check and fallback"
+    );
+}
