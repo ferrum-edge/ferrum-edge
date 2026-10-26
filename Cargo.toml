@@ -347,7 +347,7 @@ google-cloud-auth = { version = "=1.13.0", optional = true }
 # These pins add no provider features beyond the existing GCP client graph.
 google-cloud-gax-internal = { version = "=0.7.14", default-features = false, optional = true }
 google-cloud-gax = { version = "=1.11.0", default-features = false, optional = true }
-google-cloud-wkt = { version = "=1.9.0", default-features = false, optional = true }
+google-cloud-wkt = { version = "=1.10.0", default-features = false, optional = true }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
 # GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser. This
 # only works while it is on the same 0.x line the AWS SDK crates require: a
