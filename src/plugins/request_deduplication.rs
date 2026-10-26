@@ -1843,7 +1843,7 @@ impl RequestDeduplication {
         // `request_transformer` query rename. Every other query pair stays
         // bound verbatim, and the default credential partition is unchanged.
         let query_credentials = if principal_scoped {
-            principal_query_credential_names(ctx)
+            principal_query_credential_names(ctx, query)
         } else {
             Vec::new()
         };
@@ -1874,11 +1874,6 @@ impl RequestDeduplication {
         // regenerates (`PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS`).
         // A credential header that an earlier `request_transformer` renamed
         // to an ordinary name keeps its credential classification here.
-        let renamed_credential_headers = if principal_scoped {
-            principal_renamed_credential_headers(ctx)
-        } else {
-            Vec::new()
-        };
         let mut fields = request_headers_for_fingerprint(headers, &self.header_name);
         hasher.count("headers", fields.len());
         for (header_name, value) in fields.drain(..) {
@@ -1886,11 +1881,8 @@ impl RequestDeduplication {
             let credential =
                 replay_partition::is_request_credential_context_header(ctx, &header_name);
             if principal_scoped
-                && (credential
-                    || is_principal_scoped_signature_context_header(&header_name)
-                    || renamed_credential_headers
-                        .iter()
-                        .any(|renamed| renamed.eq_ignore_ascii_case(&header_name)))
+                && (principal_header_holds_credential(ctx, &header_name)
+                    || is_principal_scoped_signature_context_header(&header_name))
             {
                 hasher.bool_value("header_value_principal_scoped", true);
             } else if credential {
@@ -3555,32 +3547,26 @@ fn is_principal_scoped_signature_context_header(name: &str) -> bool {
     PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS.contains(&name)
 }
 
-/// Final header names that hold a credential after the recorded
-/// `request_transformer` header renames, replayed in order so chained renames
-/// (`authorization` -> `x-a` -> `x-b`) stay classified. Only the built-in and
-/// configured credential locations seed the walk, so an ordinary header never
-/// becomes presence-bound unless a credential was renamed onto it.
+/// Whether a final header holds a credential after the recorded
+/// `request_transformer` header renames. Walk backwards to the value's original
+/// name, then classify that name once against the built-in and configured
+/// credential locations. Reclassifying each intermediate source would re-seed
+/// credential provenance when business data is renamed onto `authorization`.
 ///
-/// The set tracks the CURRENT holder of each credential, not every name it
-/// passed through: a rename moves the value out of its source (the source
-/// leaves the set) and overwrites its destination, so a destination that
-/// receives an ordinary header is dropped again. Otherwise a chain that parks
-/// a credential on an intermediate name and later renames business data onto
-/// that name would stop the fingerprint from seeing the business value.
-fn principal_renamed_credential_headers(ctx: &RequestContext) -> Vec<&str> {
-    let mut renamed: Vec<&str> = Vec::new();
-    for (source, destination) in ctx.request_header_rename_lineage() {
-        let carries_credential =
-            replay_partition::is_request_credential_context_header(ctx, source)
-                || renamed.iter().any(|name| name.eq_ignore_ascii_case(source));
-        renamed.retain(|name| {
-            !name.eq_ignore_ascii_case(source) && !name.eq_ignore_ascii_case(destination)
-        });
-        if carries_credential {
-            renamed.push(destination.as_str());
+/// A rename overwrites its destination and moves out of its source. If a final
+/// value still occupies a source with no later rename onto it, it was recreated
+/// outside this lineage and must conservatively stay value-bound. Walking the
+/// borrowed lineage needs no per-request credential-name allocation.
+fn principal_header_holds_credential<'a>(ctx: &'a RequestContext, name: &'a str) -> bool {
+    let mut origin = name;
+    for (source, destination) in ctx.request_header_rename_lineage().iter().rev() {
+        if origin.eq_ignore_ascii_case(destination) {
+            origin = source;
+        } else if origin.eq_ignore_ascii_case(source) {
+            return false;
         }
     }
-    renamed
+    replay_partition::is_request_credential_context_header(ctx, origin)
 }
 
 /// Decoded query parameter names that hold a credential in the final query:
@@ -3591,7 +3577,7 @@ fn principal_renamed_credential_headers(ctx: &RequestContext) -> Vec<&str> {
 /// tracked name drops that name, so the set describes the final query rather
 /// than the credential's history. Dropping a name can only make its value
 /// bound again (a conflict), never relax an ordinary parameter.
-fn principal_query_credential_names(ctx: &RequestContext) -> Vec<&str> {
+fn principal_query_credential_names<'a>(ctx: &'a RequestContext, query: &str) -> Vec<&'a str> {
     let mut names: Vec<&str> = ctx
         .query_credential_partition_digests()
         .iter()
@@ -3607,6 +3593,22 @@ fn principal_query_credential_names(ctx: &RequestContext) -> Vec<&str> {
             names.push(destination.as_str());
         }
     }
+    // OrderedQuery::rename preserves existing destination pairs. A name-only
+    // lineage cannot distinguish those business values from the moved token,
+    // so relax only a single final occurrence. This remains conservative
+    // through chained renames and percent-encoded destination aliases.
+    names.retain(|credential| {
+        query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .filter(|pair| {
+                let raw_name = pair.split_once('=').map_or(*pair, |(name, _)| name);
+                percent_encoding::percent_decode_str(raw_name).decode_utf8_lossy() == *credential
+            })
+            .take(2)
+            .count()
+            == 1
+    });
     names
 }
 

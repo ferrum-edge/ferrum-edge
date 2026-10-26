@@ -17,7 +17,7 @@ use ferrum_edge::_test_support::{
     request_deduplication_replay_stored_response_for_test,
     request_deduplication_request_identity_for_test,
     request_deduplication_set_request_state_for_test,
-    request_deduplication_with_instance_id_for_test,
+    request_deduplication_with_instance_id_for_test, set_request_headers_to_redact_for_test,
     set_response_presentation_policy_digest_for_test,
 };
 use ferrum_edge::config::types::Proxy;
@@ -7634,6 +7634,151 @@ async fn authenticated_identity_partition_rebinds_names_reused_after_a_credentia
     }
 
     assert_fingerprint_conflict(run("token-b", "selector-b").await.0);
+}
+
+/// Issue #6884: reusing an original built-in or configured credential name
+/// must not re-seed credential provenance, either at that name or after a
+/// third rename moves the business value to an ordinary selector name.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_value_binds_reused_original_credential_names() {
+    let _policy = pinned_policy_guard();
+    let alice = consumer_principal("consumer-alice", "alice");
+    for credential_name in ["authorization", "x-custom-credential"] {
+        for move_business_again in [false, true] {
+            let dedup = make_plugin(json!({
+                "ttl_seconds": 300,
+                "caller_partition": "authenticated_identity"
+            }));
+            let mut rules = vec![
+                json!({"operation": "rename", "target": "header", "key": credential_name, "new_key": "x-backend-token"}),
+                json!({"operation": "rename", "target": "header", "key": "x-business", "new_key": credential_name}),
+            ];
+            if move_business_again {
+                rules.push(json!({"operation": "rename", "target": "header", "key": credential_name, "new_key": "x-selector"}));
+            }
+            let transformer = RequestTransformer::new(&json!({"rules": rules}))
+                .expect("original credential-name reuse transformer");
+            let business_destination = if move_business_again {
+                "x-selector"
+            } else {
+                credential_name
+            };
+            let dedup_ref = &dedup;
+            let transformer_ref = &transformer;
+            let alice_ref = &alice;
+            let run = move |token: &'static str, business: &'static str| async move {
+                let mut ctx =
+                    principal_ctx("127.0.0.1", "original-name-reuse", Some(alice_ref), token);
+                if credential_name != "authorization" {
+                    ctx.headers.remove("authorization");
+                    ctx.headers
+                        .insert(credential_name.to_string(), format!("Bearer {token}"));
+                    // The route's configured inventory is case-insensitive.
+                    set_request_headers_to_redact_for_test(
+                        &mut ctx,
+                        vec![credential_name.to_ascii_uppercase()],
+                    );
+                }
+                ctx.headers
+                    .insert("x-business".to_string(), business.to_string());
+                let mut headers = ctx.headers.clone();
+                assert!(matches!(
+                    transformer_ref.before_proxy(&mut ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+                assert_eq!(
+                    headers.get(business_destination).map(String::as_str),
+                    Some(business)
+                );
+                assert_eq!(
+                    headers.get("x-backend-token"),
+                    Some(&format!("Bearer {token}"))
+                );
+                let result = dedup_ref.before_proxy(&mut ctx, &mut headers).await;
+                (result, ctx)
+            };
+
+            let (first, mut first_ctx) = run("token-a", "selector-a").await;
+            assert!(matches!(first, PluginResult::Continue));
+            assert!(matches!(
+                dedup
+                    .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), b"created")
+                    .await,
+                PluginResult::Continue
+            ));
+            match run("token-b", "selector-a").await.0 {
+                PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"created"),
+                other => panic!("a refreshed credential must replay: {other:?}"),
+            }
+            assert_fingerprint_conflict(run("token-b", "selector-b").await.0);
+        }
+    }
+}
+
+/// Issue #6884: query rename preserves pre-existing destination pairs. Their
+/// business values must stay bound even when a credential joins the same name,
+/// including percent-encoded aliases and a subsequent rename of both pairs.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_value_binds_query_rename_collisions() {
+    let _policy = pinned_policy_guard();
+    let alice = consumer_principal("consumer-alice", "alice");
+    for business_name in ["backend_token", "back%65nd_token"] {
+        for chained in [false, true] {
+            let dedup = make_plugin(json!({
+                "ttl_seconds": 300,
+                "caller_partition": "authenticated_identity"
+            }));
+            let mut rules = vec![
+                json!({"operation": "rename", "target": "query", "key": "access_token", "new_key": "backend_token"}),
+            ];
+            if chained {
+                rules.push(json!({"operation": "rename", "target": "query", "key": "backend_token", "new_key": "final_token"}));
+            }
+            let transformer = RequestTransformer::new(&json!({"rules": rules}))
+                .expect("query collision transformer");
+            let dedup_ref = &dedup;
+            let transformer_ref = &transformer;
+            let alice_ref = &alice;
+            let run = move |token: &'static str, business: &'static str| async move {
+                let mut ctx = query_principal_ctx("query-rename-collision", alice_ref, token, 100);
+                ctx.set_raw_query_string(format!(
+                    "access_token={token}&amount=100&{business_name}={business}"
+                ));
+                ctx.query_params
+                    .insert("backend_token".to_string(), business.to_string());
+                let mut headers = ctx.headers.clone();
+                assert!(matches!(
+                    transformer_ref.before_proxy(&mut ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+                let query = ctx.outbound_query_string().expect("transformed query");
+                assert!(query.contains(&format!("={token}")));
+                assert!(query.contains(&format!("={business}")));
+                assert_eq!(query.split('&').count(), 3);
+                let result = dedup_ref.before_proxy(&mut ctx, &mut headers).await;
+                (result, ctx)
+            };
+
+            let (first, mut first_ctx) = run("token-a", "selector-a").await;
+            assert!(matches!(first, PluginResult::Continue));
+            assert!(matches!(
+                dedup
+                    .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), b"created")
+                    .await,
+                PluginResult::Continue
+            ));
+            match run("token-a", "selector-a").await.0 {
+                PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"created"),
+                other => panic!("an unchanged colliding query must replay: {other:?}"),
+            }
+            assert_fingerprint_conflict(run("token-a", "selector-b").await.0);
+            // Without per-pair provenance a rotation must also conflict: do
+            // not relax every value under a name shared with business data.
+            assert_fingerprint_conflict(run("token-b", "selector-a").await.0);
+        }
+    }
 }
 
 /// PR6818-MUSE-2: a re-signed retry (fresh `Authorization` signature, `Date`,
