@@ -108,6 +108,7 @@ REQUIRED_ENTRY_FIELDS = (
     "evidence",
     "rationale",
 )
+OPTIONAL_ENTRY_FIELDS = ("required_workflow_ids",)
 
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
@@ -203,7 +204,9 @@ def inventory_errors(inventory: dict) -> list[str]:
         if missing:
             errors.append(f"{located} is missing {sorted(missing)}")
             continue
-        extra = sorted(set(entry) - set(REQUIRED_ENTRY_FIELDS))
+        extra = sorted(
+            set(entry) - set(REQUIRED_ENTRY_FIELDS) - set(OPTIONAL_ENTRY_FIELDS)
+        )
         if extra:
             errors.append(f"{located} carries unknown fields {extra}")
         if not all(isinstance(entry[field], str) for field in REQUIRED_ENTRY_FIELDS):
@@ -224,6 +227,22 @@ def inventory_errors(inventory: dict) -> list[str]:
             )
         if entry["evidence"] not in EVIDENCE_MODES:
             errors.append(f"{located} evidence must be one of {list(EVIDENCE_MODES)}")
+        if "required_workflow_ids" in entry:
+            pins = entry["required_workflow_ids"]
+            if entry["evidence"] != "pr_head":
+                errors.append(
+                    f"{located} required_workflow_ids is only allowed for pr_head"
+                )
+            if (
+                not isinstance(pins, list)
+                or not pins
+                or any(type(pin) is not int or pin <= 0 for pin in pins)
+                or len(set(pins)) != len(pins)
+            ):
+                errors.append(
+                    f"{located} required_workflow_ids must be a non-empty list "
+                    "of unique positive integers"
+                )
         if not entry["rationale"].strip():
             errors.append(f"{located} must carry a non-empty rationale")
     return errors
@@ -833,7 +852,7 @@ def workflow_identity_errors(inventory: dict, read: object) -> list[str]:
             errors.append(
                 f"{entry['workflow_path']} must keep workflow name "
                 f"`{entry['workflow_name']}`; the publication gate binds runs by "
-                "workflow id, path, AND name"
+                "file or ruleset-required workflow identity, path, AND name"
             )
         if job_body(contents, entry["job"]) is None:
             errors.append(
@@ -1100,12 +1119,15 @@ def list_runs(
     sha: str,
     event: str,
     *,
+    repository_wide: bool = False,
     page_size: int = PAGE_SIZE,
     max_pages: int = MAX_PAGES,
 ) -> list[dict]:
     """Return every workflow run for this SHA and event, or fail closed.
 
-    A short page is the only proof that the listing ended. Exhausting
+    A short page and an exact, stable total_count prove that the listing ended.
+    GitHub caps filtered searches at 1,000 results; an empty capped page must
+    not authorize publication from an incomplete set. Exhausting
     `max_pages` on a full page would otherwise let a later failed duplicate
     go unseen, so truncated evidence never counts as "every matching run
     succeeded". Non-object `workflow_runs` members are rejected rather than
@@ -1113,7 +1135,17 @@ def list_runs(
     `event`.
     """
 
+    # Ruleset-required PR runs are absent from the file workflow's endpoint.
+    # Keep push evidence workflow-scoped; PR evidence selects its path after
+    # fully enumerating the repository-wide exact-SHA/event listing.
+    endpoint = (
+        f"/repos/{repository}/actions/runs"
+        if repository_wide
+        else f"/repos/{repository}/actions/workflows/{entry['workflow_file']}/runs"
+    )
     runs: list[dict] = []
+    expected_total: int | None = None
+    seen_ids: set[int] = set()
     for page in range(1, max_pages + 1):
         query = urllib.parse.urlencode(
             {
@@ -1123,13 +1155,17 @@ def list_runs(
                 "page": page,
             }
         )
-        path = (
-            f"/repos/{repository}/actions/workflows/"
-            f"{entry['workflow_file']}/runs?{query}"
-        )
+        path = f"{endpoint}?{query}"
         payload = get(path)
         if not isinstance(payload, dict):
             raise ApiFailure(f"{path} did not return a run listing")
+        total = payload.get("total_count")
+        if type(total) is not int or total < 0:
+            raise ApiFailure(f"{path} returned no valid `total_count`")
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            raise ApiFailure(f"{path} changed `total_count` during pagination")
         page_runs = payload.get("workflow_runs")
         if not isinstance(page_runs, list):
             raise ApiFailure(f"{path} returned no `workflow_runs` array")
@@ -1138,13 +1174,107 @@ def list_runs(
                 raise ApiFailure(
                     f"{path} workflow_runs[{index}] is not a run object"
                 )
+            run_id = run.get("id")
+            if type(run_id) is not int or run_id <= 0:
+                raise ApiFailure(f"{path} workflow_runs[{index}] has no valid run id")
+            if run_id in seen_ids:
+                raise ApiFailure(f"{path} returned duplicate run id {run_id}")
+            seen_ids.add(run_id)
             runs.append(run)
         if len(page_runs) < page_size:
+            if len(runs) != expected_total:
+                raise ApiFailure(
+                    f"{path} ended after {len(runs)} of {expected_total} "
+                    "reported workflow runs; refusing truncated evidence"
+                )
             return runs
     raise ApiFailure(
-        f"/repos/{repository}/actions/workflows/{entry['workflow_file']}/runs "
+        f"{endpoint} "
         f"exhausted {max_pages} pages of {page_size} runs without a short page; "
         "refusing to treat truncated evidence as complete"
+    )
+
+
+def authorized_required_workflow_ids(
+    get,
+    repository: str,
+    entry: dict,
+    main_branch: str,
+    *,
+    page_size: int = PAGE_SIZE,
+    max_pages: int = MAX_PAGES,
+) -> frozenset[int]:
+    """Return reviewed identity pins only while active main rules agree.
+
+    The deprecated required_workflows identity endpoint cannot resolve these
+    runs' historical source. The reviewed inventory pins anchor that trust;
+    active branch rules must also match this repository's numeric id and main
+    ref. Read every page even after a match: a conflicting same-path rule on a
+    later page must block release.
+    This proof is deliberately uncached, including on the permitting sweep.
+    """
+
+    pins = entry.get("required_workflow_ids", [])
+    if entry["evidence"] != "pr_head" or not pins:
+        return frozenset()
+    repository_path = f"/repos/{repository}"
+    record = get(repository_path)
+    if (
+        not isinstance(record, dict)
+        or record.get("full_name") != repository
+        or type(record.get("id")) is not int
+        or record["id"] <= 0
+    ):
+        raise ApiFailure(f"{repository_path} returned no valid repository identity")
+    repository_id = record["id"]
+    branch = urllib.parse.quote(main_branch, safe="")
+    endpoint = f"/repos/{repository}/rules/branches/{branch}"
+    expected_ref = f"refs/heads/{main_branch}"
+    found = False
+    for page in range(1, max_pages + 1):
+        query = urllib.parse.urlencode({"per_page": page_size, "page": page})
+        path = f"{endpoint}?{query}"
+        rules = get(path)
+        if not isinstance(rules, list):
+            raise ApiFailure(f"{path} did not return a branch-rules array")
+        for rule in rules:
+            if not isinstance(rule, dict) or not isinstance(rule.get("type"), str):
+                raise ApiFailure(f"{path} returned a malformed branch rule")
+            if rule["type"] != "workflows":
+                continue
+            parameters = rule.get("parameters")
+            workflows = (
+                parameters.get("workflows") if isinstance(parameters, dict) else None
+            )
+            if not isinstance(workflows, list):
+                raise ApiFailure(f"{path} returned a malformed workflows rule")
+            for workflow in workflows:
+                if (
+                    not isinstance(workflow, dict)
+                    or not isinstance(workflow.get("path"), str)
+                    or not workflow["path"]
+                ):
+                    raise ApiFailure(f"{path} returned a malformed workflow entry")
+                if workflow["path"] != entry["workflow_path"]:
+                    continue
+                if (
+                    type(workflow.get("repository_id")) is not int
+                    or workflow["repository_id"] != repository_id
+                    or workflow.get("ref") != expected_ref
+                ):
+                    raise ApiFailure(
+                        f"{path} has ambiguous required-workflow provenance for "
+                        f"{entry['workflow_path']}: repository_id "
+                        f"{workflow.get('repository_id')!r}, ref "
+                        f"{workflow.get('ref')!r}; expected "
+                        f"{repository_id}, {expected_ref!r}"
+                    )
+                found = True
+        if len(rules) < page_size:
+            return frozenset(pins) if found else frozenset()
+    raise ApiFailure(
+        f"{endpoint} exhausted {max_pages} pages of {page_size} rules without "
+        "a short page; refusing to trust truncated required-workflow provenance"
     )
 
 
@@ -1211,13 +1341,29 @@ def run_identity_errors(
     sha: str,
     event: str,
     expected_branch: str,
+    *,
+    verified_required_workflow_ids: frozenset[int] = frozenset(),
 ) -> list[str]:
     """Reject a run that is not the canonical workflow's run for this SHA."""
 
     problems: list[str] = []
-    if run.get("workflow_id") != workflow_id:
+    run_workflow_id = run.get("workflow_id")
+    required_workflow = (
+        entry["evidence"] == "pr_head"
+        and event == "pull_request_target"
+        and type(run_workflow_id) is int
+        and run_workflow_id > 0
+        and run_workflow_id in entry.get("required_workflow_ids", [])
+        and run_workflow_id in verified_required_workflow_ids
+        and run.get("workflow_url")
+        == f"{API_ROOT}/repos/{repository}/actions/required_workflows/{run_workflow_id}"
+    )
+    if type(run_workflow_id) is not int or (
+        run_workflow_id != workflow_id and not required_workflow
+    ):
         problems.append(
-            f"workflow_id {run.get('workflow_id')!r} != {workflow_id}"
+            f"workflow_id {run_workflow_id!r} != {workflow_id} and is not an "
+            "authorized ruleset-required workflow identity"
         )
     if run.get("path") != entry["workflow_path"]:
         problems.append(f"path {run.get('path')!r} != {entry['workflow_path']!r}")
@@ -1417,7 +1563,28 @@ def evaluate_entry(
         workflow = resolve_workflow(get, repository, entry)
         resolved_workflows[entry["workflow_path"]] = workflow
     workflow_id = workflow["id"]
-    runs = list_runs(get, repository, entry, evidence_sha, event)
+    runs = list_runs(
+        get,
+        repository,
+        entry,
+        evidence_sha,
+        event,
+        repository_wide=evidence == "pr_head",
+    )
+    verified_required_workflow_ids = frozenset()
+    if evidence == "pr_head":
+        # Other workflows legitimately share this repository-wide listing.
+        # Every run at the inventoried path must still authenticate and pass.
+        for run in runs:
+            if not isinstance(run.get("path"), str) or not run["path"]:
+                raise ApiFailure(
+                    f"repository-wide run {run['id']} has no non-empty string path"
+                )
+        runs = [run for run in runs if run["path"] == entry["workflow_path"]]
+        if any(run.get("workflow_id") != workflow_id for run in runs):
+            verified_required_workflow_ids = authorized_required_workflow_ids(
+                get, repository, entry, main_branch
+            )
 
     matching: list[dict] = []
     for run in runs:
@@ -1429,11 +1596,12 @@ def evaluate_entry(
             evidence_sha,
             event,
             expected_branch,
+            verified_required_workflow_ids=verified_required_workflow_ids,
         )
         if problems:
             # A returned run that does not authenticate is never silently
-            # ignored: the workflow-scoped endpoint should not produce one, so
-            # treat it as identity drift and fail closed.
+            # ignored after path selection: treat it as identity drift and
+            # fail closed, including on the repository-wide PR endpoint.
             return (
                 "blocked",
                 f"{entry['context']}: untrusted or mismatched run "
@@ -1670,6 +1838,7 @@ def _fixture_inventory() -> dict:
                 "workflow_name": "Beta Workflow",
                 "job": "verify",
                 "evidence": "pr_head",
+                "required_workflow_ids": [55],
                 "rationale": "self-test",
             },
         ],
@@ -1678,6 +1847,17 @@ def _fixture_inventory() -> dict:
 
 _SHA = "a" * 40
 _PR_HEAD_SHA = "b" * 40
+_REPOSITORY_ID = 44
+
+
+def _workflow_rules(**overrides) -> list[dict]:
+    workflow = {
+        "path": ".github/workflows/beta.yml",
+        "repository_id": _REPOSITORY_ID,
+        "ref": "refs/heads/main",
+    }
+    workflow.update(overrides)
+    return [{"type": "workflows", "parameters": {"workflows": [workflow]}}]
 
 
 def _pull_request(
@@ -1740,6 +1920,8 @@ def _transport(
     compare_status: str = "behind",
     commit_payload: object | None = None,
     pulls_payload: object | None = None,
+    rules_payload: object | None = None,
+    repository_payload: object | None = None,
 ):
     workflows = {
         "alpha.yml": {
@@ -1762,6 +1944,13 @@ def _transport(
         }
     if pulls_payload is None:
         pulls_payload = [_pull_request()]
+    if rules_payload is None:
+        rules_payload = _workflow_rules()
+    if repository_payload is None:
+        repository_payload = {
+            "id": _REPOSITORY_ID,
+            "full_name": "ferrum-edge/ferrum-edge",
+        }
 
     def get(path: str) -> object:
         if "/compare/" in path:
@@ -1771,18 +1960,48 @@ def _transport(
             return commit_payload
         if api_path == f"/repos/ferrum-edge/ferrum-edge/commits/{_SHA}/pulls":
             return pulls_payload
+        if api_path == "/repos/ferrum-edge/ferrum-edge":
+            return repository_payload
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        page = int((query.get("page") or ["1"])[0])
+        per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
+        start = (page - 1) * per_page
+        if api_path == "/repos/ferrum-edge/ferrum-edge/rules/branches/main":
+            if not isinstance(rules_payload, list):
+                return rules_payload
+            return rules_payload[start : start + per_page]
+        if api_path == "/repos/ferrum-edge/ferrum-edge/actions/runs":
+            # Model the real repository-wide query, including other paths.
+            all_runs = [
+                run
+                for file_runs in runs_by_file.values()
+                for run in file_runs
+                if not isinstance(run, dict)
+                or (
+                    run.get("head_sha") == (query.get("head_sha") or [None])[0]
+                    and run.get("event") == (query.get("event") or [None])[0]
+                )
+            ]
+            return {
+                "total_count": len(all_runs),
+                "workflow_runs": all_runs[start : start + per_page],
+            }
         match = re.search(r"/actions/workflows/([^/?]+)(/runs)?", path)
         if match is None:  # pragma: no cover - defensive
             raise ApiFailure(f"unexpected path {path}")
         workflow_file = match.group(1)
         if match.group(2) is None:
             return workflows[workflow_file]
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
-        page = int((query.get("page") or ["1"])[0])
-        per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
-        all_runs = list(runs_by_file.get(workflow_file, []))
-        start = (page - 1) * per_page
-        return {"workflow_runs": all_runs[start : start + per_page]}
+        # Required-workflow ids do not appear on the file workflow endpoint.
+        all_runs = [
+            run for run in runs_by_file.get(workflow_file, [])
+            if not isinstance(run, dict)
+            or run.get("workflow_id") == workflows[workflow_file]["id"]
+        ]
+        return {
+            "total_count": len(all_runs),
+            "workflow_runs": all_runs[start : start + per_page],
+        }
 
     return get
 
@@ -1824,48 +2043,20 @@ def _enforce_across_sweeps(
     inventory = _fixture_inventory()
     state = {"sweep": 0, "t": 0.0}
     slept: list[float] = []
-    workflows = {
-        "alpha.yml": {
-            "id": 11,
-            "path": ".github/workflows/alpha.yml",
-            "name": "Alpha Workflow",
-            "state": "active",
-        },
-        "beta.yml": {
-            "id": 22,
-            "path": ".github/workflows/beta.yml",
-            "name": "Beta Workflow",
-            "state": "active",
-        },
-    }
 
     def get(path: str) -> object:
         index = min(state["sweep"], len(sweep_runs) - 1)
-        if "/compare/" in path:
-            return {"status": compare_status}
+        payload = _transport(sweep_runs[index], compare_status=compare_status)(path)
         api_path = urllib.parse.urlparse(path).path
-        if api_path == f"/repos/ferrum-edge/ferrum-edge/commits/{_SHA}":
-            return {
-                "sha": _SHA,
-                "parents": [{"sha": "c" * 40}, {"sha": _PR_HEAD_SHA}],
-            }
-        if api_path == f"/repos/ferrum-edge/ferrum-edge/commits/{_SHA}/pulls":
-            return [_pull_request()]
-        match = re.search(r"/actions/workflows/([^/?]+)(/runs)?", path)
-        if match is None:  # pragma: no cover - defensive
-            raise ApiFailure(f"unexpected path {path}")
-        workflow_file = match.group(1)
-        if match.group(2) is None:
-            payload = dict(workflows[workflow_file])
-            if workflow_mutations is not None and index < len(workflow_mutations):
-                payload.update(workflow_mutations[index].get(workflow_file, {}))
-            return payload
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
-        page = int((query.get("page") or ["1"])[0])
-        per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
-        all_runs = list(sweep_runs[index].get(workflow_file, []))
-        start = (page - 1) * per_page
-        return {"workflow_runs": all_runs[start : start + per_page]}
+        match = re.fullmatch(r"/repos/[^/]+/[^/]+/actions/workflows/([^/]+)", api_path)
+        if (
+            match
+            and workflow_mutations is not None
+            and index < len(workflow_mutations)
+        ):
+            payload = dict(payload)
+            payload.update(workflow_mutations[index].get(match.group(1), {}))
+        return payload
 
     def sleep(seconds: float) -> None:
         slept.append(seconds)
@@ -1900,6 +2091,15 @@ def _beta_run(**overrides) -> dict:
     }
     defaults.update(overrides)
     return _run(**defaults)
+
+
+def _ruleset_run(**overrides) -> dict:
+    run = _beta_run(workflow_id=55, run_id=55)
+    run["workflow_url"] = (
+        f"{API_ROOT}/repos/ferrum-edge/ferrum-edge/actions/required_workflows/55"
+    )
+    run.update(overrides)
+    return run
 
 
 def _complete_runs() -> dict[str, list[dict]]:
@@ -1966,7 +2166,10 @@ def _tests_transport(
             page = int((query.get("page") or ["1"])[0])
             per_page = int((query.get("per_page") or [str(PAGE_SIZE)])[0])
             start = (page - 1) * per_page
-            return {"workflow_runs": workflow_runs[start : start + per_page]}
+            return {
+                "total_count": len(workflow_runs),
+                "workflow_runs": workflow_runs[start : start + per_page],
+            }
         if path.endswith("/actions/workflows/ci.yml"):
             return {
                 "id": 33,
@@ -2217,10 +2420,10 @@ def self_test() -> list[str]:
 
     # One passing duplicate must never mask a failed run of the same workflow.
     runs = _complete_runs()
-    runs["alpha.yml"] = [_run(), _run(conclusion="failure")]
+    runs["alpha.yml"] = [_run(), _run(run_id=2, conclusion="failure")]
     expect(_enforce(runs) == 1, "a failed duplicate run must block publication")
     runs = _complete_runs()
-    runs["beta.yml"] = [_beta_run(), _beta_run(conclusion="failure")]
+    runs["beta.yml"] = [_beta_run(), _beta_run(run_id=2, conclusion="failure")]
     expect(
         _enforce(runs) == 1,
         "a failed duplicate PR-head run must block publication",
@@ -2385,7 +2588,7 @@ def self_test() -> list[str]:
     )
 
     duplicate_at_permit = _complete_runs()
-    duplicate_at_permit["alpha.yml"] = [_run(), _run(conclusion="failure")]
+    duplicate_at_permit["alpha.yml"] = [_run(), _run(run_id=2, conclusion="failure")]
     code, _slept = _enforce_across_sweeps(
         [pending_then_success_alpha, duplicate_at_permit]
     )
@@ -2426,12 +2629,28 @@ def self_test() -> list[str]:
         ("wrong event", {"event": "workflow_dispatch"}),
         ("wrong branch", {"branch": "release-1.0"}),
         ("wrong path", {"path": ".github/workflows/decoy.yml"}),
-        ("wrong workflow id", {"workflow_id": 99}),
         ("display-name-only match", {"name": "Alpha Workflow (mirror)"}),
     ):
         runs = _complete_runs()
         runs["alpha.yml"] = [_run(**override)]
         expect(_enforce(runs) == 1, f"{label} must block publication")
+
+    # Deliberately return a foreign id from the workflow-scoped endpoint.
+    # The realistic transport normally filters it out, which only tests missing
+    # evidence rather than the identity rejection that must also fail closed.
+    def foreign_workflow_get(path: str) -> object:
+        if "/actions/workflows/alpha.yml/runs?" in path:
+            return {"total_count": 1, "workflow_runs": [_run(workflow_id=99)]}
+        return _transport(_complete_runs())(path)
+
+    verdict, message = evaluate_entry(
+        foreign_workflow_get, "ferrum-edge/ferrum-edge", _SHA,
+        _fixture_inventory()["required_checks"][0], "main",
+    )
+    expect(
+        verdict == "blocked" and "workflow_id 99" in message,
+        "a foreign id returned by the workflow-scoped endpoint must fail identity",
+    )
 
     # Repository identity must be proven independently on both objects.
     # Missing or malformed values block exactly like a fork mismatch.
@@ -2462,16 +2681,20 @@ def self_test() -> list[str]:
     listing_entry = _fixture_inventory()["required_checks"][0]
     requested_paths: list[str] = []
 
-    def _paged_get(pages: list[list[object]]):
+    def _paged_get(pages: list[list[object]], totals: list[object] | None = None):
         requested_paths.clear()
 
         def get(path: str) -> object:
             requested_paths.append(path)
             query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
             page = int((query.get("page") or ["1"])[0])
-            if page > len(pages):
-                return {"workflow_runs": []}
-            return {"workflow_runs": pages[page - 1]}
+            return {
+                "total_count": (
+                    sum(len(items) for items in pages)
+                    if totals is None else totals[min(page - 1, len(totals) - 1)]
+                ),
+                "workflow_runs": pages[page - 1] if page <= len(pages) else [],
+            }
 
         return get
 
@@ -2499,15 +2722,15 @@ def self_test() -> list[str]:
     )
 
     extra = _complete_runs()
-    extra["alpha.yml"] = [_run(run_id=index) for index in range(PAGE_SIZE + 1)]
+    extra["alpha.yml"] = [_run(run_id=index + 1) for index in range(PAGE_SIZE + 1)]
     expect(
         _enforce(extra) == 0,
         "ordinary multi-page exact-SHA success must still publish",
     )
     later_failure = _complete_runs()
     later_failure["alpha.yml"] = [
-        *[_run(run_id=index) for index in range(PAGE_SIZE)],
-        _run(run_id=PAGE_SIZE, conclusion="failure"),
+        *[_run(run_id=index + 1) for index in range(PAGE_SIZE)],
+        _run(run_id=PAGE_SIZE + 1, conclusion="failure"),
     ]
     expect(
         _enforce(later_failure) == 1,
@@ -2515,7 +2738,7 @@ def self_test() -> list[str]:
     )
 
     full_pages = [
-        [_run(run_id=page * 2), _run(run_id=page * 2 + 1)] for page in range(3)
+        [_run(run_id=page * 2 + 1), _run(run_id=page * 2 + 2)] for page in range(3)
     ]
     try:
         list_runs(
@@ -2535,11 +2758,75 @@ def self_test() -> list[str]:
         "a full final allowed listing page must fail closed",
     )
 
+    # Both endpoint modes must prove a stable total, including GitHub's real
+    # filtered-search cap: ten full pages followed by an empty eleventh page.
+    capped_pages = [
+        [_run(run_id=page * PAGE_SIZE + index + 1) for index in range(PAGE_SIZE)]
+        for page in range(10)
+    ]
+    for repository_wide in (False, True):
+        for label, pages, totals, size, diagnostic in (
+            ("missing total", [[_run()]], [_absent], PAGE_SIZE, "total_count"),
+            ("null total", [[_run()]], [None], PAGE_SIZE, "total_count"),
+            ("boolean total", [[_run()]], [True], PAGE_SIZE, "total_count"),
+            ("string total", [[_run()]], ["1"], PAGE_SIZE, "total_count"),
+            ("float total", [[_run()]], [1.0], PAGE_SIZE, "total_count"),
+            ("negative total", [[_run()]], [-1], PAGE_SIZE, "total_count"),
+            ("incomplete total", [[_run()]], [2], PAGE_SIZE, "ended after 1 of 2"),
+            ("excess runs", [[_run()]], [0], PAGE_SIZE, "ended after 1 of 0"),
+            (
+                "inconsistent total", [page_one, page_two], [3, 4], 2,
+                "changed `total_count`",
+            ),
+            (
+                "duplicate id", [page_one, [_run(run_id=1)]], [3], 2,
+                "duplicate run id",
+            ),
+            (
+                "capped unchanged total", [*capped_pages, []], [2500], PAGE_SIZE,
+                "ended after 1000 of 2500",
+            ),
+            (
+                "capped reset total", [*capped_pages, []], [*[2500] * 10, 0],
+                PAGE_SIZE, "changed `total_count`",
+            ),
+        ):
+            paged_get = _paged_get(pages, totals)
+
+            def listing_get(path: str) -> object:
+                payload = paged_get(path)
+                if payload["total_count"] is _absent:
+                    del payload["total_count"]
+                return payload
+
+            try:
+                list_runs(
+                    listing_get, "ferrum-edge/ferrum-edge", listing_entry,
+                    _SHA, "push", repository_wide=repository_wide,
+                    page_size=size,
+                )
+                listing_error = ""
+            except ApiFailure as error:
+                listing_error = str(error)
+            expect(
+                diagnostic in listing_error,
+                f"{label} must fail closed (repository_wide={repository_wide})",
+            )
+            if label.startswith("capped"):
+                expect(
+                    len(requested_paths) == 11,
+                    "the capped-listing fixture must reach the empty eleventh page",
+                )
+
     for label, member in (
         ("string", "not-a-run"),
         ("null", None),
         ("list", [_run()]),
         ("integer", 1),
+        ("zero run id", _run(run_id=0)),
+        ("missing run id", {key: value for key, value in _run().items() if key != "id"}),
+        ("boolean run id", _run(run_id=True)),
+        ("string run id", _run(run_id="2")),
     ):
         try:
             list_runs(
@@ -2623,6 +2910,358 @@ def self_test() -> list[str]:
     runs = _complete_runs()
     runs["beta.yml"] = [_beta_run(branch="main", event="push")]
     expect(_enforce(runs) == 1, "a push run must not satisfy PR-head evidence")
+
+    # Ruleset-required PR runs have a separate workflow id and cannot be
+    # discovered through the file workflow's runs endpoint. Both identities
+    # still need exact path/name/SHA/event/repository/branch authentication.
+    ruleset_runs = _complete_runs()
+    ruleset_runs["beta.yml"] = [_ruleset_run()]
+    expect(
+        _enforce(ruleset_runs) == 0,
+        "a ruleset-required PR run with an active same-repository main rule "
+        "must publish",
+    )
+    expect(
+        _enforce(_complete_runs(), rules_payload=[]) == 0,
+        "file-workflow PR evidence must not require a ruleset rule",
+    )
+    expect(
+        _enforce({**ruleset_runs, "beta.yml": [_beta_run(), _ruleset_run()]}) == 0,
+        "successful file and ruleset-required PR runs may coexist",
+    )
+    pr_entry = _fixture_inventory()["required_checks"][1]
+    expect(
+        list_runs(
+            _transport(ruleset_runs), "ferrum-edge/ferrum-edge", pr_entry,
+            _PR_HEAD_SHA, "pull_request_target",
+        ) == [],
+        "the fake file workflow endpoint must exclude ruleset-required runs",
+    )
+
+    def evaluate_pr(runs, *, listing_override=None, **kwargs) -> tuple[str, str]:
+        base_get = _transport(runs, **kwargs)
+
+        def get(path: str) -> object:
+            if listing_override is not None and "/actions/runs?" in path:
+                return {
+                    "total_count": len(listing_override),
+                    "workflow_runs": listing_override,
+                }
+            return base_get(path)
+
+        try:
+            return evaluate_entry(
+                get,
+                "ferrum-edge/ferrum-edge",
+                _SHA,
+                pr_entry,
+                "main",
+            )
+        except ApiFailure as error:
+            return ("blocked", str(error))
+
+    for label, rules in (
+        ("absent rule", []),
+        ("other path", _workflow_rules(path=".github/workflows/other.yml")),
+        ("other repository", _workflow_rules(repository_id=999)),
+        ("other ref", _workflow_rules(ref="refs/heads/release")),
+        ("missing ref", _workflow_rules(ref=None)),
+        ("malformed rules", {}),
+        ("malformed rule", [None]),
+        ("malformed workflows", [{"type": "workflows", "parameters": {}}]),
+        (
+            "malformed workflow",
+            [{"type": "workflows", "parameters": {"workflows": [None]}}],
+        ),
+        (
+            "conflicting repository",
+            [*_workflow_rules(), *_workflow_rules(repository_id=999)],
+        ),
+        (
+            "conflicting ref",
+            [*_workflow_rules(), *_workflow_rules(ref="refs/heads/other")],
+        ),
+    ):
+        verdict, _message = evaluate_pr(ruleset_runs, rules_payload=rules)
+        expect(verdict == "blocked", f"ruleset identity with {label} must block")
+
+    # Today's valid rule cannot authorize a historical or newly rotated id.
+    # The URL's agreement with its own id is insufficient without the pin.
+    unpinned = _ruleset_run(
+        id=56, workflow_id=56,
+        workflow_url=f"{API_ROOT}/repos/ferrum-edge/ferrum-edge/actions/required_workflows/56",
+    )
+    verdict, message = evaluate_pr({"beta.yml": [_ruleset_run(), unpinned]})
+    expect(
+        verdict == "blocked" and "workflow_id 56" in message,
+        "a successful pinned run and current rule cannot authorize an unpinned identity",
+    )
+    no_pin_entry = dict(pr_entry)
+    del no_pin_entry["required_workflow_ids"]
+    verdict, message = evaluate_entry(
+        _transport(ruleset_runs), "ferrum-edge/ferrum-edge", _SHA,
+        no_pin_entry, "main",
+    )
+    expect(
+        verdict == "blocked" and "workflow_id 55" in message,
+        "an optional pin's absence must never authorize a required-workflow id",
+    )
+    rotated_entry = dict(pr_entry, required_workflow_ids=[55, 56])
+    verdict, _message = evaluate_entry(
+        _transport({"beta.yml": [_ruleset_run(), unpinned]}),
+        "ferrum-edge/ferrum-edge", _SHA, rotated_entry, "main",
+    )
+    expect(
+        verdict == "success",
+        "a reviewed pin update may authorize each identity after live rule proof",
+    )
+
+    for label, repository_record in (
+        ("missing id", {"full_name": "ferrum-edge/ferrum-edge"}),
+        ("boolean id", {"id": True, "full_name": "ferrum-edge/ferrum-edge"}),
+        (
+            "string id",
+            {"id": str(_REPOSITORY_ID), "full_name": "ferrum-edge/ferrum-edge"},
+        ),
+        ("wrong name", {"id": _REPOSITORY_ID, "full_name": "attacker/ferrum-edge"}),
+        ("malformed record", []),
+    ):
+        verdict, _message = evaluate_pr(
+            ruleset_runs, repository_payload=repository_record
+        )
+        expect(verdict == "blocked", f"ruleset provenance with {label} must block")
+
+    required_url = _ruleset_run()["workflow_url"]
+    for label, mutation in (
+        ("absent URL", {"workflow_url": None}),
+        (
+            "other repository URL",
+            {"workflow_url": required_url.replace("repos/ferrum-edge/", "repos/attacker/")},
+        ),
+        (
+            "file workflow URL",
+            {"workflow_url": required_url.replace("required_workflows/", "workflows/")},
+        ),
+        (
+            "other host",
+            {"workflow_url": required_url.replace(API_ROOT, "https://example.invalid")},
+        ),
+        ("other URL id", {"workflow_url": required_url[:-2] + "56"}),
+        ("URL suffix", {"workflow_url": required_url + "?ref=main"}),
+        ("string workflow id", {"workflow_id": "55"}),
+        (
+            "boolean workflow id",
+            {"workflow_id": True, "workflow_url": required_url[:-2] + "True"},
+        ),
+        ("wrong name", {"name": "Beta Workflow mirror"}),
+        ("wrong branch", {"head_branch": "feature/decoy"}),
+        ("wrong repository", {"repository": {"full_name": "attacker/ferrum-edge"}}),
+        ("missing head repository", {"head_repository": None}),
+    ):
+        runs = {**ruleset_runs, "beta.yml": [_ruleset_run(**mutation)]}
+        verdict, _message = evaluate_pr(runs)
+        expect(verdict == "blocked", f"ruleset run with {label} must block")
+
+    for mutation in (
+        {"event": "push"},
+        {"head_sha": _SHA},
+    ):
+        runs = {**ruleset_runs, "beta.yml": [_ruleset_run(**mutation)]}
+        verdict, _message = evaluate_pr(runs)
+        expect(
+            verdict == "pending",
+            f"a ruleset run for {mutation} cannot satisfy PR evidence",
+        )
+        # Even if an API response ignores its query, identity checks block it.
+        expect(
+            bool(
+                run_identity_errors(
+                    _ruleset_run(**mutation), pr_entry, 22,
+                    "ferrum-edge/ferrum-edge", _PR_HEAD_SHA,
+                    "pull_request_target", "feature/beta",
+                    verified_required_workflow_ids=frozenset({55}),
+                )
+            ),
+            f"a returned ruleset run for {mutation} must fail authentication",
+        )
+    expect(
+        bool(run_identity_errors(
+            _ruleset_run(event="push"), pr_entry, 22, "ferrum-edge/ferrum-edge",
+            _PR_HEAD_SHA, "push", "feature/beta",
+            verified_required_workflow_ids=frozenset({55}),
+        )),
+        "required-workflow authentication must never extend to push evidence",
+    )
+
+    other_path = _ruleset_run(
+        id=77, path=".github/workflows/other.yml", conclusion="failure"
+    )
+    verdict, _message = evaluate_pr({**ruleset_runs, "other.yml": [other_path]})
+    expect(
+        verdict == "success",
+        "a failed run at another PR workflow path must be ignored",
+    )
+    verdict, _message = evaluate_pr({"other.yml": [other_path]})
+    expect(
+        verdict == "pending", "other-path runs alone must leave PR evidence pending"
+    )
+    verdict, _message = evaluate_pr({"beta.yml": [_ruleset_run(), None]})
+    expect(verdict == "blocked", "a malformed repository-wide run member must block")
+    for label, value in (
+        ("missing", _absent), ("null", None), ("empty", ""),
+        ("integer", 1), ("list", []), ("object", {}),
+    ):
+        malformed = _ruleset_run(id=56, conclusion="failure")
+        if value is _absent:
+            del malformed["path"]
+        else:
+            malformed["path"] = value
+        verdict, message = evaluate_pr(
+            ruleset_runs, listing_override=[_ruleset_run(), malformed]
+        )
+        expect(
+            verdict == "blocked" and "non-empty string path" in message,
+            f"a successful PR run cannot mask a failed run with {label} path",
+        )
+    verdict, _message = evaluate_pr(
+        ruleset_runs, listing_override=[_ruleset_run(), {}]
+    )
+    expect(
+        verdict == "blocked",
+        "a successful PR run cannot mask an empty run object",
+    )
+    for state in (
+        {"status": "queued", "conclusion": None},
+        {"status": "completed", "conclusion": "failure"},
+        {"status": "completed", "conclusion": "skipped"},
+    ):
+        verdict, _message = evaluate_pr({"beta.yml": [_ruleset_run(**state)]})
+        expect(
+            verdict == ("pending" if state["status"] == "queued" else "blocked"),
+            f"a ruleset run in {state} must not permit publication",
+        )
+    verdict, _message = evaluate_pr({
+        "beta.yml": [_beta_run(), _ruleset_run(conclusion="failure")],
+    })
+    expect(verdict == "blocked", "a passing file run cannot mask a failed ruleset run")
+    verdict, _message = evaluate_pr({
+        "beta.yml": [_ruleset_run(), _beta_run(conclusion="failure")],
+    })
+    expect(
+        verdict == "blocked", "a passing ruleset run cannot mask a failed file run"
+    )
+
+    # Repository-wide enumeration must paginate fully before path selection.
+    # A first page full of unrelated paths cannot hide a later policy failure.
+    paged_pr_runs = {
+        "other.yml": [dict(other_path, id=1000 + index) for index in range(PAGE_SIZE)],
+        "beta.yml": [_ruleset_run()],
+    }
+    expect(
+        evaluate_pr(paged_pr_runs)[0] == "success",
+        "PR evidence must scan beyond other-path pages",
+    )
+    paged_pr_runs["beta.yml"].append(_ruleset_run(id=56, conclusion="failure"))
+    expect(
+        evaluate_pr(paged_pr_runs)[0] == "blocked",
+        "a later-page failed ruleset run must block",
+    )
+    truncated_pr_runs = {
+        "other.yml": [
+            dict(other_path, id=1000 + index) for index in range(PAGE_SIZE * MAX_PAGES)
+        ],
+    }
+    verdict, message = evaluate_pr(truncated_pr_runs)
+    expect(
+        verdict == "blocked" and "truncated evidence" in message,
+        "a truncated repository-wide PR listing must fail closed even without "
+        "matching paths",
+    )
+    requested_paths.clear()
+    collected = list_runs(
+        _paged_get([[_ruleset_run(), other_path], [_ruleset_run(id=56)]]),
+        "ferrum-edge/ferrum-edge", pr_entry, _PR_HEAD_SHA, "pull_request_target",
+        repository_wide=True, page_size=2, max_pages=3,
+    )
+    expect(len(collected) == 3, "repository-wide pagination must retain every run")
+    expect(
+        all(
+            path.startswith("/repos/ferrum-edge/ferrum-edge/actions/runs?")
+            and f"head_sha={_PR_HEAD_SHA}" in path
+            and "event=pull_request_target" in path
+            for path in requested_paths
+        ),
+        "PR run queries must use the repository-wide exact-SHA/event endpoint",
+    )
+
+    # Branch rules also require a short terminal page; a trusted early rule
+    # cannot conceal conflicting provenance later in the active rules list.
+    rule_get = _transport(
+        ruleset_runs, rules_payload=[*_workflow_rules(), {"type": "creation"}]
+    )
+    expect(
+        authorized_required_workflow_ids(
+            rule_get, "ferrum-edge/ferrum-edge", pr_entry, "main",
+            page_size=1, max_pages=3,
+        ) == frozenset({55}),
+        "required-workflow provenance must scan multiple rule pages",
+    )
+    for label, rules, max_pages in (
+        ("truncated", _workflow_rules(), 1),
+        (
+            "later conflict",
+            [*_workflow_rules(), *_workflow_rules(ref="refs/heads/other")], 3,
+        ),
+    ):
+        try:
+            authorized_required_workflow_ids(
+                _transport(ruleset_runs, rules_payload=rules),
+                "ferrum-edge/ferrum-edge", pr_entry, "main",
+                page_size=1, max_pages=max_pages,
+            )
+            blocked_rules = False
+        except ApiFailure:
+            blocked_rules = True
+        expect(blocked_rules, f"{label} branch rules must fail closed")
+
+    # A permitting sweep must re-observe provenance as well as run identity.
+    inventory = _fixture_inventory()
+    for changed_identity in ("rules", "repository"):
+        identity_reads = {"rules": 0, "repository": 0}
+        base_get = _transport(ruleset_runs)
+
+        def changed_provenance_get(path: str) -> object:
+            api_path = urllib.parse.urlparse(path).path
+            if api_path.endswith("/rules/branches/main"):
+                identity_reads["rules"] += 1
+                if changed_identity == "rules" and identity_reads["rules"] > 1:
+                    return []
+            if api_path == "/repos/ferrum-edge/ferrum-edge":
+                identity_reads["repository"] += 1
+                if (
+                    changed_identity == "repository"
+                    and identity_reads["repository"] > 1
+                ):
+                    return {"id": 999, "full_name": "ferrum-edge/ferrum-edge"}
+            return base_get(path)
+
+        try:
+            code = enforce(
+                changed_provenance_get, "ferrum-edge/ferrum-edge", _SHA,
+                inventory, select_entries(inventory, "release"), deadline_seconds=0,
+                sleep=lambda _seconds: None, monotonic=lambda: 1.0,
+                log=lambda *_args, **_kwargs: None,
+            )
+        except ApiFailure:
+            code = 1
+        expect(
+            code == 1,
+            f"changed {changed_identity} provenance must block the permitting sweep",
+        )
+        expect(
+            identity_reads[changed_identity] == 2,
+            f"the permitting sweep must refresh {changed_identity}",
+        )
 
     # Ancestry: only a commit on `main` may publish.
     for status in ("ahead", "diverged", None):
@@ -2753,6 +3392,29 @@ def self_test() -> list[str]:
     duplicated["required_checks"].append(dict(duplicated["required_checks"][0]))
     expect(inventory_errors(duplicated) != [], "a duplicate context must fail")
     expect(inventory_errors(_fixture_inventory()) == [], "the fixture must be valid")
+    for evidence in ("push_main", "check_run", "invalid"):
+        broken = _fixture_inventory()
+        broken["required_checks"][1]["evidence"] = evidence
+        expect(
+            any("only allowed for pr_head" in error for error in inventory_errors(broken)),
+            f"required-workflow pins on {evidence} evidence must fail the schema",
+        )
+    for label, pins in (
+        ("null", None), ("empty", []), ("integer", 55), ("string", "55"),
+        ("object", {}), ("boolean", [True]), ("string member", ["55"]),
+        ("float member", [55.0]), ("zero", [0]), ("negative", [-1]),
+        ("duplicate", [55, 55]), ("nested list", [[55]]),
+        ("nested object", [{"id": 55}]),
+    ):
+        broken = _fixture_inventory()
+        broken["required_checks"][1]["required_workflow_ids"] = pins
+        expect(inventory_errors(broken) != [], f"{label} pins must fail the schema")
+    optional_pins = _fixture_inventory()
+    del optional_pins["required_checks"][1]["required_workflow_ids"]
+    expect(inventory_errors(optional_pins) == [], "pr_head pins must be optional")
+    multiple_pins = _fixture_inventory()
+    multiple_pins["required_checks"][1]["required_workflow_ids"] = [55, 56]
+    expect(inventory_errors(multiple_pins) == [], "distinct positive pins must be valid")
 
     # Static workflow identity: a blank line cannot hide a push paths filter.
     path_filter_inventory = {
