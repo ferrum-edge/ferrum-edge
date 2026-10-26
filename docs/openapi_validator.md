@@ -114,6 +114,7 @@ x-ferrum-validate:
   validate_response: true
   fail_on_unknown_operation: true
   fail_on_missing_response_schema: false
+  reject_unsupported_parameters: false
   max_body_bytes: 1048576
   request:
     enabled: true
@@ -131,7 +132,9 @@ x-ferrum-validate:
 
 `mode` maps to plugin `enforcement_mode`. Supported modes are `block`, `log_only`, and `disabled`.
 
-`x-ferrum-validate` is a closed object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` / `response` accept only `enabled` and `content_types`. Anything else — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion instead of being copied into the generated plugin config, so a typo cannot silently leave a weaker default in force.
+`x-ferrum-validate` is a closed object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `reject_unsupported_parameters`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` / `response` accept only `enabled` and `content_types`. Anything else — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion instead of being copied into the generated plugin config, so a typo cannot silently leave a weaker default in force.
+
+`reject_unsupported_parameters` is an import-only boolean, default `false`; explicit `null` or any other non-boolean is rejected. Set it to `true` to refuse a spec containing an effective optional parameter the validator cannot deserialize, with HTTP 400 `MalformedExtension` naming the first affected operation, parameter, and unsupported form. It applies on both POST and PUT after reference resolution and operation overrides, regardless of `mode` or `validate_request`. OpenAPI-ignored headers stay ignored. The option is consumed at admission and is not included in the generated plugin config.
 
 ## Plugin Config
 
@@ -292,7 +295,7 @@ Parameters are validated in `before_proxy` whenever `validate_request` is true, 
 
 A missing required parameter, a scalar parameter that occurs more than once, a value that cannot be converted to its schema type, and a schema failure are request violations: `block` returns `error_response.request_status_code` (400 by default) with the problem title `Request parameter validation failed`, and `log_only` records `openapi_validator.request_error` and continues. The diagnostic names the declared parameter and its location plus the allowlisted keyword; it never contains the parameter's value. At most 1024 query pairs, 1024 cookie pairs, and 1024 items of one delimited value are processed; a larger request fails closed.
 
-The supported subset is each location's default serialization over scalar, array-of-scalar, and object-of-scalar schemas. Other `style` values (`matrix`, `label`, `spaceDelimited`, `pipeDelimited`, `deepObject`), `content`-form parameters, arrays of arrays or objects, and `form` + `explode: true` objects are not deserialized: a hand-authored descriptor using them is rejected at construction, and the importer omits such a parameter when it is optional — logging a `warn` naming the operation, parameter, and reason at import time — and refuses the import (HTTP 400 `MalformedExtension { which: "x-ferrum-validate" }`) when it is required, so a required parameter is never silently left unenforced.
+The supported subset is each location's default serialization over scalar, array-of-scalar, and object-of-scalar schemas. Other `style` values (`matrix`, `label`, `spaceDelimited`, `pipeDelimited`, `deepObject`), `content`-form parameters, arrays of arrays or objects, and `form` + `explode: true` objects are not deserialized: a hand-authored descriptor using them is rejected at construction. By default, the importer omits such a parameter when it is optional, logging a `warn` naming the operation, parameter, and reason at import time. With `x-ferrum-validate.reject_unsupported_parameters: true`, optional unsupported parameters also refuse import. Required unsupported parameters always refuse import (HTTP 400 `MalformedExtension { which: "x-ferrum-validate" }`), so a required parameter is never silently left unenforced.
 
 ## Metadata
 

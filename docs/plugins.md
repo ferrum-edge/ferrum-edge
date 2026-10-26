@@ -6779,6 +6779,15 @@ The client-contract phase precedes `body_validator` request checks in `before_pr
 
 See [openapi_validator.md](openapi_validator.md) for the full generated config shape, `x-ferrum-validate` options, and emergency override behavior.
 
+For strict spec imports, set the import-only boolean `x-ferrum-validate.reject_unsupported_parameters` to `true` (default `false`):
+
+```yaml
+x-ferrum-validate:
+  reject_unsupported_parameters: true
+```
+
+Both `POST /api-specs` and `PUT /api-specs/{id}` then refuse an unsupported optional parameter with HTTP 400 `MalformedExtension`, naming the first affected operation, parameter, and reason. This covers non-default styles such as `deepObject`, `spaceDelimited`, and `pipeDelimited`, `content`-form parameters, exploded form objects, nested collections, and unsupported Swagger `collectionFormat` values. Omission or `false` preserves the warning and omission of optional unsupported parameters; unsupported required parameters always refuse import. Strict import applies even with `mode: log_only` / `disabled` or `validate_request: false`. It checks effective parameters after reference resolution and operation overrides; OpenAPI-ignored headers remain ignored. The option is consumed during import and does not belong in the generated plugin config.
+
 ### `request_size_limiting`
 
 Enforces per-proxy request body size limits. Rejects with HTTP 413.
