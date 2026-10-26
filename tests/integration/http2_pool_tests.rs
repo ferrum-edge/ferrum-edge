@@ -2058,6 +2058,275 @@ async fn start_direct_h2_test_gateway(
     (gateway_addr, handle)
 }
 
+// Issue #6909: no background probes run on this in-process gateway, so each
+// upload starts with an absent or explicitly Unknown capability deterministically.
+async fn assert_unclassified_https_uploads(
+    h2_backend: bool,
+    pool_http1_direct: bool,
+    seed_unknown: bool,
+) {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind upload backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let certs = CertificateDer::pem_slice_iter(include_bytes!("../certs/server.crt"))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("backend certificates");
+    let key =
+        PrivateKeyDer::from_pem_slice(include_bytes!("../certs/server.key")).expect("backend key");
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("backend TLS versions")
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .expect("backend TLS config");
+    tls_config.alpn_protocols = if h2_backend {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    // JoinSet drops abort the backend listener and client drivers even on
+    // assertion failure. The backend owns its connection tasks too.
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            connections.spawn(async move {
+                let Ok(tls_stream) = acceptor.accept(socket).await else {
+                    return;
+                };
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    let protocol = if req.version() == hyper::Version::HTTP_2 {
+                        "h2"
+                    } else {
+                        "http/1.1"
+                    };
+                    let framing = if req.headers().contains_key("transfer-encoding") {
+                        assert_eq!(req.headers()["transfer-encoding"], "chunked");
+                        "chunked"
+                    } else if req.headers().contains_key("content-length") {
+                        "content-length"
+                    } else {
+                        "none"
+                    };
+                    let content_length = req.headers().get("content-length").cloned();
+                    // A size-limit error must abort the upload, never produce
+                    // a success response with a truncated backend body.
+                    let payload = req.into_body().collect().await?.to_bytes();
+                    let mut response = Response::builder()
+                        .header("x-observed-protocol", protocol)
+                        .header("x-observed-framing", framing)
+                        .header("x-observed-body-len", payload.len())
+                        .header("x-observed-body", payload.as_ref());
+                    if let Some(content_length) = content_length {
+                        response = response.header("x-observed-content-length", content_length);
+                    }
+                    let response = response
+                        .body(Full::new(Bytes::new()))
+                        .expect("upload observation response");
+                    Ok::<_, hyper::Error>(response)
+                });
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls_stream), service)
+                    .await;
+            });
+        }
+    });
+
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = backend_port;
+    proxy.backend_tls_verify_server_cert = false;
+    proxy.pool_enable_http2 = Some(true);
+    // Default policy is intentional: UPGRADE would already classify the
+    // target before the fix and would hide the regression.
+    proxy.h2_upgrade_policy = None;
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "unclassified-upload-limit".to_string(),
+    }];
+    let policy = ferrum_edge::config::types::PluginConfig {
+        labels: Default::default(),
+        id: "unclassified-upload-limit".to_string(),
+        namespace: proxy.namespace.clone(),
+        plugin_name: "request_size_limiting".to_string(),
+        config: serde_json::json!({"max_bytes": 8}),
+        enabled: true,
+        scope: ferrum_edge::config::types::PluginScope::Proxy,
+        proxy_id: Some(proxy.id.clone()),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+    };
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![proxy.clone()],
+        plugin_configs: vec![policy],
+        loaded_at: chrono::Utc::now(),
+        ..Default::default()
+    };
+    let env_config = ferrum_edge::config::EnvConfig {
+        tls_no_verify: true,
+        pool_warmup_enabled: false,
+        pool_http1_direct,
+        // Larger than the plugin ceiling: 413 must come from the route bound.
+        max_request_body_size_bytes: 64,
+        ..Default::default()
+    };
+    let (state, _health_handles) =
+        ProxyState::new(config, create_dns_cache(), env_config, None, None).expect("proxy state");
+    let (gateway_addr, gateway_task) = start_direct_h2_test_gateway(state.clone()).await;
+
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        // Empty HEADERS, empty DATA, below / at / above the ceiling, and a
+        // known-length control. H2 DATA is sent with raw h2 so no client
+        // library can infer Content-Length or silently drop GET/HEAD bodies.
+        for (payload, declared_length) in [
+            (None, false),
+            (Some(&b""[..]), false),
+            (Some(&b"1234"[..]), false),
+            (Some(&b"12345678"[..]), false),
+            (Some(&b"123456789"[..]), false),
+            (Some(&b"12345678"[..]), true),
+        ] {
+            if seed_unknown {
+                // Reset after a previous H1 fallback downgraded the entry.
+                state.backend_capabilities.upsert(
+                    ferrum_edge::proxy::backend_capabilities::capability_key_for_proxy_target(
+                        &proxy, None,
+                    ),
+                    Default::default(),
+                );
+            } else {
+                assert!(state.backend_capabilities.get(&proxy, None).is_none());
+            }
+            let stream = tokio::net::TcpStream::connect(gateway_addr)
+                .await
+                .expect("connect upload gateway");
+            let (mut sender, connection) = h2::client::handshake(stream)
+                .await
+                .expect("H2 frontend handshake");
+            let driver = tasks.spawn(async move {
+                let _ = connection.await;
+            });
+            let mut request = Request::builder()
+                .method(method)
+                .uri(format!("http://{gateway_addr}/h2test"));
+            if declared_length {
+                request = request.header("content-length", payload.expect("known body").len());
+            }
+            let (response, mut upload) = sender
+                .send_request(request.body(()).expect("upload request"), payload.is_none())
+                .expect("upload HEADERS");
+            if let Some(payload) = payload {
+                upload
+                    .send_data(Bytes::copy_from_slice(payload), true)
+                    .expect("upload DATA");
+            }
+            let response = tokio::time::timeout(Duration::from_secs(10), response)
+                .await
+                .expect("upload response timeout")
+                .expect("upload response");
+            let len = payload.map_or(0, <[u8]>::len);
+            if len > 8 {
+                assert_eq!(response.status(), 413, "{method}: {len} bytes");
+            } else {
+                assert_eq!(response.status(), 200, "{method}: {len} bytes");
+                assert_eq!(response.headers()["x-observed-body-len"], len.to_string());
+                assert_eq!(
+                    response.headers()["x-observed-body"].as_bytes(),
+                    payload.unwrap_or_default(),
+                    "{method}: upload bytes must reach the backend intact"
+                );
+                assert_eq!(
+                    response.headers()["x-observed-protocol"],
+                    if h2_backend { "h2" } else { "http/1.1" }
+                );
+                let framing = &response.headers()["x-observed-framing"];
+                if declared_length {
+                    assert_eq!(framing, "content-length");
+                    assert_eq!(
+                        response.headers()["x-observed-content-length"],
+                        len.to_string()
+                    );
+                } else if h2_backend && len == 0 {
+                    // Hyper may infer Content-Length: 0 for an empty H2
+                    // request (e.g. OPTIONS). Transfer-Encoding is still illegal.
+                    assert!(
+                        framing == "none" || framing == "content-length",
+                        "{method}: empty H2 requests must not use Transfer-Encoding"
+                    );
+                    if framing == "content-length" {
+                        assert_eq!(
+                            response.headers()["x-observed-content-length"],
+                            "0",
+                            "{method}: an empty H2 request must advertise zero bytes"
+                        );
+                    }
+                } else if h2_backend || payload.is_none() {
+                    assert_eq!(
+                        framing, "none",
+                        "no Transfer-Encoding on H2 or empty requests"
+                    );
+                } else if len > 0 {
+                    assert_eq!(framing, "chunked", "H1 must frame unknown-length uploads");
+                }
+            }
+            let mut body = response.into_body();
+            let response_bytes = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut bytes = Vec::new();
+                while let Some(data) = body.data().await {
+                    let data = data.expect("response DATA");
+                    body.flow_control()
+                        .release_capacity(data.len())
+                        .expect("response capacity");
+                    bytes.extend_from_slice(&data);
+                }
+                bytes
+            })
+            .await
+            .expect("response body timeout");
+            if len > 8 && method != "HEAD" {
+                assert_eq!(
+                    response_bytes.as_slice(),
+                    br#"{"error":"Request body exceeds maximum size"}"#
+                );
+            }
+            drop(sender);
+            driver.abort();
+            if !seed_unknown {
+                assert!(state.backend_capabilities.get(&proxy, None).is_none());
+            }
+        }
+    }
+    gateway_task.abort();
+}
+
+#[tokio::test]
+async fn unclassified_https_get_head_uploads_honor_route_limit_on_reqwest_h1() {
+    assert_unclassified_https_uploads(false, false, false).await;
+}
+
+#[tokio::test]
+async fn unclassified_https_get_head_uploads_honor_route_limit_with_direct_h1_enabled() {
+    assert_unclassified_https_uploads(false, true, false).await;
+}
+
+#[tokio::test]
+async fn unknown_https_get_head_uploads_honor_route_limit_after_h1_classification() {
+    assert_unclassified_https_uploads(false, true, true).await;
+}
+
+#[tokio::test]
+async fn unclassified_https_get_head_uploads_preserve_h2_without_transfer_encoding() {
+    assert_unclassified_https_uploads(true, true, false).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_h2_backend_sees_matching_host_and_authority_on_non_default_port() {
     assert_direct_h2_host_and_authority(false).await;

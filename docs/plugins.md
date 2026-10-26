@@ -6883,16 +6883,16 @@ refused with `413`. Because hyper's HTTP/1.1 client would otherwise send an
 unknown-length `GET`/`HEAD` body as zero-length, such a request is sent upstream
 with an explicit `Transfer-Encoding: chunked` (only on a dispatch known to be
 HTTP/1.1; HTTP/2 and HTTP/3 requests never carry it, and an exact-length body
-keeps `Content-Length`). One residual case remains. When an HTTPS backend has
-HTTP/2 enabled but its target has no classified HTTP/2 capability yet, the
-reqwest dispatch is not known to be HTTP/1.1 and gets no explicit `chunked`.
-This happens, for example, when pool warmup is off, when a target was added
-dynamically, or on the first requests before the capability probe classifies
-the target. If that dispatch then negotiates HTTP/1.1 through ALPN, an
-unknown-length `GET`/`HEAD` upload can still be sent bodyless until the target
-is classified. `FERRUM_POOL_WARMUP_ENABLED=true` (the default) classifies
-configured targets up front with real capability probes at startup. Only a body
-the transport has already proven empty (no
+keeps `Content-Length`). When an HTTPS backend has HTTP/2 enabled but its
+target has no classified HTTP/2 capability yet, an unknown-length streaming
+`GET`/`HEAD` upload first uses the direct-H2 pool's ALPN handshake to determine
+the protocol. An H2 result uses that sender without `Transfer-Encoding`; an H1
+result falls back with explicit chunked framing, even when the capability
+registry has no entry yet. This also covers warmup-disabled startup, dynamic
+targets, and requests arriving before a background capability probe completes.
+For an H1 result, classification needs an extra TLS connection until the
+registry records the target's capability. An explicit H1-only policy remains
+in force. Only a body the transport has already proven empty (no
 HTTP/1.1 framing, END_STREAM on the HTTP/2 HEADERS frame, or an empty buffered
 body) takes the empty-body fast path and reaches the backend with no framing.
 
