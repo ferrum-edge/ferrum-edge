@@ -2113,14 +2113,19 @@ async fn assert_unclassified_https_uploads(
                     } else {
                         "none"
                     };
+                    let content_length = req.headers().get("content-length").cloned();
                     // A size-limit error must abort the upload, never produce
                     // a success response with a truncated backend body.
                     let payload = req.into_body().collect().await?.to_bytes();
-                    let response = Response::builder()
+                    let mut response = Response::builder()
                         .header("x-observed-protocol", protocol)
                         .header("x-observed-framing", framing)
                         .header("x-observed-body-len", payload.len())
-                        .header("x-observed-body", payload.as_ref())
+                        .header("x-observed-body", payload.as_ref());
+                    if let Some(content_length) = content_length {
+                        response = response.header("x-observed-content-length", content_length);
+                    }
+                    let response = response
                         .body(Full::new(Bytes::new()))
                         .expect("upload observation response");
                     Ok::<_, hyper::Error>(response)
@@ -2245,6 +2250,24 @@ async fn assert_unclassified_https_uploads(
                 let framing = &response.headers()["x-observed-framing"];
                 if declared_length {
                     assert_eq!(framing, "content-length");
+                    assert_eq!(
+                        response.headers()["x-observed-content-length"],
+                        len.to_string()
+                    );
+                } else if h2_backend && len == 0 {
+                    // Hyper may infer Content-Length: 0 for an empty H2
+                    // request (e.g. OPTIONS). Transfer-Encoding is still illegal.
+                    assert!(
+                        framing == "none" || framing == "content-length",
+                        "{method}: empty H2 requests must not use Transfer-Encoding"
+                    );
+                    if framing == "content-length" {
+                        assert_eq!(
+                            response.headers()["x-observed-content-length"],
+                            "0",
+                            "{method}: an empty H2 request must advertise zero bytes"
+                        );
+                    }
                 } else if h2_backend || payload.is_none() {
                     assert_eq!(
                         framing, "none",
