@@ -157,6 +157,10 @@ header violation` from the HTTP 200 Trailers-Only response. Ordinary HTTP and
 WebSocket handshake refusals still use HTTP 400. No configuration changes are
 required.
 
+Mesh WebSocket peers now receive queued policy Close frames during orderly
+backend teardown. No configuration change is required; a non-cooperative
+backend adds at most a bounded 100 ms transport drain.
+
 ### `adaptive_concurrency`: intermediate retry samples follow backend-only timing (#6941, issue #6911)
 
 Intermediate `adaptive_concurrency` retry samples now follow the existing

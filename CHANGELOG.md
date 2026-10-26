@@ -1205,6 +1205,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on completed backend capability warmup; until an unclassified HTTP/1.1
   target's capability is recorded, these uploads need one extra TLS
   classification connection.
+- **Mesh WebSocket policy Close frames survive H2 backend teardown** (issue #6912 / PR #6940).
+  The relay keeps the H2 backend transport for a bounded orderly teardown, so
+  cancellation no longer discards a queued policy Close (1009) DATA frame. A
+  non-cooperative backend adds at most a 100 ms transport drain.
 - **`api_chargeback_sink` delivery and admission hardening** (#6812). A replay
   cancelled mid-delivery (a reload retiring its generation aborts the replay
   worker) now releases its spool claim through the descriptor-bound release,
