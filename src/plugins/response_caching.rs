@@ -1226,6 +1226,7 @@ fn parse_header_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
 /// the proxy, or a later response-shaping plugin derives behavior from them
 /// that stripping would silently change or desynchronize:
 ///
+/// * Host and hop-by-hop framing fields;
 /// * cache entry operations and request directives this plugin interprets
 ///   (`Cache-Control`, `Pragma`, the conditional and range preconditions);
 /// * request framing and representation metadata (`Content-*`, `Expect`);
@@ -1234,21 +1235,29 @@ fn parse_header_list(config: &Value, field: &'static str) -> Result<Option<Vec<S
 ///   output that a HIT would then replay to a client that cannot decode it);
 /// * forwarding identity the proxy regenerates for the origin.
 ///
-/// Host and hop-by-hop framing fields are refused separately through
-/// [`replay_partition::is_non_backend_visible_request_header`], the families in
-/// [`NON_IGNORABLE_REQUEST_HEADER_PREFIXES`] by prefix, gateway-owned
-/// assertions that proxy core re-asserts after lookup through
-/// [`ignored_request_header_refusal`], and every credential / session header
-/// there too. Every comparison folds `_` to `-` as CGI-style backends do.
+/// This fixed-name set uses
+/// [`crate::proxy::headers::field_names_equivalent_for_backends`]: ASCII
+/// case-insensitive with `_` folded to `-` as CGI-style backends do. The
+/// families in [`NON_IGNORABLE_REQUEST_HEADER_PREFIXES`] are refused by prefix;
+/// [`ignored_request_header_refusal`] also refuses gateway-owned assertions
+/// that proxy core re-asserts after lookup and every credential / session header.
 const NON_IGNORABLE_REQUEST_HEADERS: &[&str] = &[
     "accept",
     "accept-encoding",
     "cache-control",
+    "connection",
     "expect",
     "forwarded",
+    "host",
+    "keep-alive",
     "max-forwards",
     "pragma",
+    "proxy-connection",
     "range",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
     "via",
     "x-real-ip",
 ];
@@ -1309,10 +1318,9 @@ fn ignored_request_header_refusal(header: &str) -> Option<&'static str> {
              path-parameter assertion), so it cannot be ignored",
         );
     }
-    if replay_partition::is_non_backend_visible_request_header(header)
-        || NON_IGNORABLE_REQUEST_HEADERS.iter().any(|refused| {
-            crate::proxy::headers::field_names_equivalent_for_backends(header, refused)
-        })
+    if NON_IGNORABLE_REQUEST_HEADERS
+        .iter()
+        .any(|refused| crate::proxy::headers::field_names_equivalent_for_backends(header, refused))
         || NON_IGNORABLE_REQUEST_HEADER_PREFIXES
             .iter()
             .any(|prefix| has_backend_folded_prefix(header, prefix))
