@@ -1,5 +1,6 @@
 //! Tests for response_mock plugin
 
+use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::response_mock::{
     RESPONSE_MOCK_CONFIG_KEYS, RESPONSE_MOCK_MATCH_KEYS, RESPONSE_MOCK_MAX_BODY_BYTES,
     RESPONSE_MOCK_MAX_DELAY_MS, RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES,
@@ -8,6 +9,7 @@ use ferrum_edge::plugins::response_mock::{
 };
 use ferrum_edge::plugins::utils::fault_delay::FaultDelayAdmission;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,6 +73,27 @@ fn make_host_only_ctx(method: &str, full_path: &str) -> RequestContext {
     );
     ctx.matched_proxy = Some(make_host_only_proxy());
     ctx
+}
+
+/// Use the ingress APIs, then move materialized headers out as the proxy may
+/// do before `before_proxy`. The pristine, repeated field lines stay in ctx.
+fn materialize_request(
+    ctx: &mut RequestContext,
+    fields: &[(&str, &str)],
+    query: &str,
+) -> HashMap<String, String> {
+    let mut raw = HeaderMap::new();
+    for &(name, value) in fields {
+        raw.append(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    ctx.set_raw_headers(raw);
+    ctx.materialize_headers();
+    ctx.set_raw_query_string(query.to_string());
+    ctx.materialize_query_params();
+    std::mem::take(&mut ctx.headers)
 }
 
 // === Plugin creation ===
@@ -1652,11 +1675,9 @@ async fn test_indexed_matching_preserves_ordered_first_match() {
         ("GET", "/api/missing", None, None),
     ] {
         let mut ctx = make_ctx(method, path, "/api");
-        if let Some(variant) = variant {
-            ctx.headers
-                .insert("x-variant".to_string(), variant.to_string());
-        }
-        let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+        let field = variant.map(|value| ("X-Variant", value));
+        let mut headers = materialize_request(&mut ctx, field.as_slice(), "");
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         match (result, expected) {
             (
                 PluginResult::RejectBinary {
@@ -1791,6 +1812,29 @@ fn test_response_header_count_and_value_size_are_bounded() {
     );
 }
 
+#[test]
+fn test_size_bounds_apply_independently_per_rule_and_dimension() {
+    let value = "v".repeat(RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES);
+    let response_headers: serde_json::Map<String, serde_json::Value> = (0
+        ..RESPONSE_MOCK_MAX_HEADERS_PER_RULE)
+        .map(|i| (format!("x-h{i}"), json!(value)))
+        .collect();
+    let conditions: serde_json::Map<String, serde_json::Value> = (0
+        ..RESPONSE_MOCK_MAX_MATCH_CONDITIONS)
+        .map(|i| (format!("x-c{i}"), json!(value)))
+        .collect();
+    let rule = json!({
+        "path": "/",
+        "body": "b".repeat(RESPONSE_MOCK_MAX_BODY_BYTES),
+        "headers": response_headers,
+        "match": { "headers": conditions, "query_params": conditions }
+    });
+    assert!(
+        ResponseMock::new(&json!({ "rules": [rule, rule] })).is_ok(),
+        "multiple rules can combine maximum bodies, response headers, and conditions"
+    );
+}
+
 // === Request conditions (response_mock-CLAUDE-5, ACCEPT-lite) ===
 
 #[tokio::test]
@@ -1807,23 +1851,25 @@ async fn test_match_headers_select_a_variant_and_fall_through_otherwise() {
     }))
     .unwrap();
 
-    for (header, expected) in [
-        (Some("empty"), "[]"),
+    for (values, expected) in [
+        (&["empty"][..], "[]"),
         // Values are compared byte-for-byte (case-sensitive).
-        (Some("EMPTY"), "[{\"id\":1}]"),
-        (Some("full"), "[{\"id\":1}]"),
-        (None, "[{\"id\":1}]"),
+        (&["EMPTY"][..], "[{\"id\":1}]"),
+        (&["full"][..], "[{\"id\":1}]"),
+        // Match individual field lines, not their materialized comma fold.
+        (&["full", "empty"][..], "[]"),
+        (&["empty", "full"][..], "[]"),
+        (&["empty, full"][..], "[{\"id\":1}]"),
+        (&[][..], "[{\"id\":1}]"),
     ] {
         let mut ctx = make_ctx("GET", "/api/users", "/api");
-        if let Some(value) = header {
-            ctx.headers
-                .insert("x-scenario".to_string(), value.to_string());
-        }
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        let fields: Vec<_> = values.iter().map(|&value| ("X-Scenario", value)).collect();
+        let mut headers = materialize_request(&mut ctx, &fields, "");
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
             PluginResult::RejectBinary { body, .. } => {
-                assert_eq!(body, expected, "x-scenario {header:?}")
+                assert_eq!(body, expected, "x-scenario {values:?}")
             }
-            other => panic!("Expected a mock for {header:?}, got {other:?}"),
+            other => panic!("Expected a mock for {values:?}, got {other:?}"),
         }
     }
 }
@@ -1836,37 +1882,94 @@ async fn test_match_query_params_and_headers_must_all_hold() {
             "path": "~/items",
             "match": {
                 "headers": { "x-tenant": "acme" },
-                "query_params": { "page": "2", "flag": "" }
+                "query_params": { "page": "2", "flag": "", "label": "café" }
             },
             "body": "page-two"
         }]
     }))
     .unwrap();
 
-    for (tenant, page, flag, matched) in [
-        (Some("acme"), Some("2"), true, true),
-        (Some("acme"), Some("3"), true, false),
-        (Some("acme"), Some("2"), false, false),
-        (None, Some("2"), true, false),
-        (Some("acme"), None, true, false),
+    for (tenant, query, matched) in [
+        (Some("acme"), "page=1&%70age=%32&flag&label=caf%C3%A9", true),
+        (Some("acme"), "page=2&flag=&label=caf%C3%A9", true),
+        (Some("acme"), "page=2&page=3&flag&label=caf%C3%A9", false),
+        (Some("acme"), "page=2&label=caf%C3%A9", false),
+        (Some("acme"), "page=2&flag=1&label=caf%C3%A9", false),
+        (Some("acme"), "page=2&flag&label=cafe", false),
+        (None, "page=2&flag&label=caf%C3%A9", false),
+        (Some("acme"), "flag&label=caf%C3%A9", false),
     ] {
         let mut ctx = make_ctx("GET", "/api/items", "/api");
-        if let Some(tenant) = tenant {
-            ctx.headers
-                .insert("x-tenant".to_string(), tenant.to_string());
-        }
-        if let Some(page) = page {
-            ctx.query_params
-                .insert("page".to_string(), page.to_string());
-        }
-        if flag {
-            ctx.query_params.insert("flag".to_string(), String::new());
-        }
-        let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+        let field = tenant.map(|value| ("X-Tenant", value));
+        let mut headers = materialize_request(&mut ctx, field.as_slice(), query);
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         match (result, matched) {
             (PluginResult::RejectBinary { body, .. }, true) => assert_eq!(body, "page-two"),
             (PluginResult::Continue, false) => {}
-            (other, _) => panic!("{tenant:?} {page:?} {flag}: unexpected {other:?}"),
+            (other, _) => panic!("{tenant:?} {query}: unexpected {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_match_uses_pristine_headers_and_current_transformed_query() {
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            { "operation": "update", "target": "header", "key": "x-scenario", "value": "backend" },
+            { "operation": "remove", "target": "header", "key": "x-removed" },
+            { "operation": "add", "target": "header", "key": "x-added", "value": "generated" },
+            { "operation": "update", "target": "query", "key": "page", "value": "2" },
+            { "operation": "remove", "target": "query", "key": "removed" },
+            { "operation": "add", "target": "query", "key": "flag", "value": "" }
+        ]
+    }))
+    .unwrap();
+
+    for (conditions, matched) in [
+        (
+            json!({
+                "headers": { "x-scenario": "client", "x-removed": "original" },
+                "query_params": { "page": "2", "flag": "" }
+            }),
+            true,
+        ),
+        (json!({ "headers": { "x-scenario": "backend" } }), false),
+        (json!({ "headers": { "x-added": "generated" } }), false),
+        (json!({ "query_params": { "page": "1" } }), false),
+        (json!({ "query_params": { "removed": "original" } }), false),
+    ] {
+        let mock = ResponseMock::new(&json!({
+            "passthrough_on_no_match": true,
+            "rules": [{ "path": "/items", "match": conditions, "body": "matched" }]
+        }))
+        .unwrap();
+        assert!(transformer.priority() < mock.priority());
+        let mut ctx = make_ctx("GET", "/api/items", "/api");
+        let mut headers = materialize_request(
+            &mut ctx,
+            &[("X-Scenario", "client"), ("X-Removed", "original")],
+            "page=1&removed=original",
+        );
+        assert!(matches!(
+            transformer.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            headers.get("x-scenario").map(String::as_str),
+            Some("backend")
+        );
+        assert!(!headers.contains_key("x-removed"));
+        assert_eq!(
+            headers.get("x-added").map(String::as_str),
+            Some("generated")
+        );
+        assert_eq!(ctx.outbound_query_string(), Some("page=2&flag="));
+        // A subsequent materialization must not restore the client query.
+        ctx.materialize_query_params();
+        match (mock.before_proxy(&mut ctx, &mut headers).await, matched) {
+            (PluginResult::RejectBinary { body, .. }, true) => assert_eq!(body, "matched"),
+            (PluginResult::Continue, false) => {}
+            (other, _) => panic!("{conditions}: unexpected {other:?}"),
         }
     }
 }
@@ -1933,6 +2036,18 @@ fn test_match_configuration_is_validated() {
         (
             json!({ "query_params": "page=2" }),
             "`match.query_params` must be an object",
+        ),
+        (
+            json!({ "query_params": {} }),
+            "`match.query_params` must name at least one entry",
+        ),
+        (
+            json!({ "query_params": too_many }),
+            "`match.query_params` must name at most 16 entries",
+        ),
+        (
+            json!({ "query_params": { "page": long_value } }),
+            "`match.query_params` values must be at most 8192 bytes",
         ),
         (
             json!({ "query_params": { "": "2" } }),

@@ -34765,6 +34765,11 @@ components:
         while keeping representation Content-Length; 204/205/304 omit body and
         Content-Length on every frontend (H1/H2/H3). Runtime construction and
         request-flavor enforcement are the authoritative final boundaries.
+        Size limits apply independently per rule and field; there is no
+        aggregate instance memory budget. For example, 1024 rules can retain
+        256 MiB of body payload alone, plus headers, conditions, regexes, and
+        other overhead. Runtime string limits count UTF-8 bytes; maxLength
+        counts Unicode characters and is only a coarse schema guard.
       required:
         - rules
       properties:
@@ -34820,6 +34825,10 @@ components:
                     additionalProperties:
                       type: string
                       maxLength: 8192
+                      description: >-
+                        At most 8192 UTF-8 bytes at runtime. maxLength counts
+                        Unicode characters and is only a coarse schema guard;
+                        runtime byte validation is authoritative.
                     description: >-
                       1–16 header name → exact value pairs. Matches when every
                       named header is present on the client-sent request with
@@ -34829,7 +34838,9 @@ components:
                       the private GeoIP header, path-param headers) are
                       rejected. Values must be valid HTTP header values of at
                       most 8192 bytes and are redacted in non-admin config
-                      projections.
+                      projections. Reads pristine client field lines, so
+                      earlier header additions, rewrites, and removals do not
+                      affect matching.
                   query_params:
                     type: object
                     minProperties: 1
@@ -34838,14 +34849,27 @@ components:
                       type: string
                       minLength: 1
                       maxLength: 256
+                      description: >-
+                        1–256 UTF-8 bytes at runtime. maxLength counts Unicode
+                        characters and is only a coarse schema guard; runtime
+                        byte validation is authoritative.
                     additionalProperties:
                       type: string
                       maxLength: 8192
+                      description: >-
+                        At most 8192 UTF-8 bytes at runtime. maxLength counts
+                        Unicode characters and is only a coarse schema guard;
+                        runtime byte validation is authoritative.
                     description: >-
                       1–16 query parameter name → exact value pairs, compared
-                      against the percent-decoded query (last occurrence wins;
-                      a bare `?flag` has the value ""). Names are 1–256 bytes,
-                      values at most 8192 bytes. Values are redacted in
+                      against the current percent-decoded query map (last
+                      occurrence wins; a bare `?flag` has the value ""). Unlike
+                      match.headers, earlier query additions, rewrites, and
+                      removals affect matching. At default priorities,
+                      request_transformer (3000) runs before response_mock
+                      (3030); priority overrides can change which rewrites
+                      have run at evaluation. Names are 1–256 UTF-8 bytes,
+                      values at most 8192 UTF-8 bytes. Values are redacted in
                       non-admin config projections.
               status_code:
                 description: >-
@@ -34891,10 +34915,12 @@ components:
                 maxLength: 262144
                 description: >-
                   Response body string (default empty), at most 262144 UTF-8
-                  bytes (runtime counts bytes, so a multibyte body can be
-                  refused below this schema's character maxLength). Omitted or
-                  null selects empty. On the wire, HEAD responses omit content bytes
-                  while keeping representation Content-Length. Statuses 204, 205,
+                  bytes at runtime. maxLength counts Unicode characters and
+                  is only a coarse schema guard; runtime byte validation is
+                  authoritative, so a multibyte body can be refused below
+                  maxLength. Omitted or null selects empty. On the wire, HEAD
+                  responses omit content bytes while keeping representation
+                  Content-Length. Statuses 204, 205,
                   and 304 omit both the body and Content-Length even when this
                   field is non-empty. Shared synthetic-response finalization
                   keeps H1, H2, and H3 aligned.

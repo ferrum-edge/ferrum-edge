@@ -92,6 +92,9 @@
 //!     compares the percent-decoded query value exactly (last occurrence
 //!     wins; a bare `?flag` has the value `""`). A rule whose conditions do
 //!     not hold is skipped and evaluation continues with the next rule.
+//!     Headers use the pristine client field lines, ignoring earlier header
+//!     rewrites; query parameters use the current materialized map, including
+//!     earlier query rewrites (for example by `request_transformer`).
 //!   - **status_code**: HTTP status to return (default: 200). Must be a final
 //!     status `200–599`. Informational statuses (`100`–`199`, including `101`)
 //!     are rejected — a mock cannot emit a 1xx as a final response or upgrade
@@ -115,6 +118,9 @@
 //!   continue to the backend. If false (default), unmatched requests get 404.
 //!
 //! Unknown top-level, per-rule, and `match` keys are rejected at construction.
+//! Size limits apply independently per rule and field, not as an aggregate
+//! instance memory budget. String limits count UTF-8 bytes; OpenAPI
+//! `maxLength` counts Unicode characters and is only a coarse schema guard.
 //! The free-form `headers` map rejects protocol-managed hop-by-hop and framing
 //! destinations. HEAD / no-body wire shape is applied by the shared
 //! synthetic-response finalizer so H1, H2, and H3 stay aligned.
@@ -210,7 +216,7 @@ struct RequestMatch {
 
 impl RequestMatch {
     /// Allocation-free: borrows the client's pristine field lines and the
-    /// materialized query map in place.
+    /// current materialized query map (including earlier rewrites) in place.
     fn matches(&self, ctx: &RequestContext) -> bool {
         self.headers.iter().all(|(name, value)| {
             ctx.header_field_lines(name.as_str())

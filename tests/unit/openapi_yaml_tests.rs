@@ -17098,6 +17098,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             "{field}"
         );
     }
+    let header_match_desc = match_schema["properties"]["headers"]["description"]
+        .as_str()
+        .expect("header match description");
+    assert!(header_match_desc.contains("pristine client field lines"));
+    assert!(header_match_desc.contains("do not affect matching"));
+    let query_match_desc = match_schema["properties"]["query_params"]["description"]
+        .as_str()
+        .expect("query match description");
+    assert!(query_match_desc.contains("current percent-decoded query map"));
+    assert!(query_match_desc.contains("earlier query additions, rewrites, and removals"));
+    assert!(query_match_desc.contains("priority overrides"));
     assert_eq!(
         rule["properties"]["headers"]["type"],
         json!(["object", "null"])
@@ -17140,6 +17151,8 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(description.contains("host-only"));
     assert!(description.contains("WebSocket"));
     assert!(description.contains("frame stream"));
+    assert!(description.contains("independently per rule and field"));
+    assert!(description.contains("no aggregate instance memory budget"));
     assert!(
         description.contains("Native gRPC") && description.contains("unsupported"),
         "ResponseMockConfig must document native gRPC exclusion: {description}"
@@ -17308,6 +17321,9 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("Informational statuses (`100`–`199`, including `101`) are rejected"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
+    assert!(guide.contains("there is no aggregate instance memory budget"));
+    assert!(guide.contains("OpenAPI `maxLength` counts Unicode characters"));
+    assert!(guide.contains("including earlier query rewrites"));
 
     let features = include_str!("../../FEATURES.md");
     assert!(
@@ -17326,6 +17342,91 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         ),
         "protocol matrix must mark HTTP+WebSocket support and exclude native gRPC for response_mock"
     );
+}
+
+#[test]
+fn response_mock_schema_character_guards_defer_to_runtime_utf8_byte_limits() {
+    use ferrum_edge::plugins::response_mock::{
+        RESPONSE_MOCK_MAX_BODY_BYTES, RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES,
+        RESPONSE_MOCK_MAX_QUERY_PARAM_NAME_BYTES, ResponseMock,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let validator = component_validator(&spec, "ResponseMockConfig");
+    let properties = &spec["components"]["schemas"]["ResponseMockConfig"]["properties"]["rules"]["items"]
+        ["properties"];
+
+    for (dimension, cap, pointer) in [
+        ("body", RESPONSE_MOCK_MAX_BODY_BYTES, "/body"),
+        (
+            "header condition",
+            RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES,
+            "/match/properties/headers/additionalProperties",
+        ),
+        (
+            "query value",
+            RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES,
+            "/match/properties/query_params/additionalProperties",
+        ),
+        (
+            "query name",
+            RESPONSE_MOCK_MAX_QUERY_PARAM_NAME_BYTES,
+            "/match/properties/query_params/propertyNames",
+        ),
+    ] {
+        let scalar = properties.pointer(pointer).expect("bounded scalar schema");
+        assert_eq!(scalar["maxLength"], cap, "{dimension}");
+        let description = scalar["description"]
+            .as_str()
+            .expect("byte-limit description");
+        assert!(description.contains("UTF-8 bytes"), "{dimension}");
+        assert!(description.contains("maxLength counts"), "{dimension}");
+        assert!(description.contains("coarse schema guard"), "{dimension}");
+
+        let config_for = |text: &str| {
+            let rule = match dimension {
+                "body" => json!({ "path": "/", "body": text }),
+                "header condition" => json!({
+                    "path": "/", "match": { "headers": { "x-scenario": text } }
+                }),
+                "query value" => json!({
+                    "path": "/", "match": { "query_params": { "name": text } }
+                }),
+                "query name" => {
+                    let query = serde_json::Map::from_iter([(text.to_string(), json!(""))]);
+                    json!({ "path": "/", "match": { "query_params": query } })
+                }
+                _ => panic!("unknown dimension {dimension}"),
+            };
+            json!({ "rules": [rule] })
+        };
+        let at_cap = "é".repeat(cap / "é".len());
+        assert_eq!(at_cap.len(), cap);
+        let valid = config_for(&at_cap);
+        assert!(
+            validator.validate(&valid).is_ok(),
+            "{dimension} at byte cap"
+        );
+        assert!(ResponseMock::new(&valid).is_ok(), "{dimension} at byte cap");
+
+        // One byte over the runtime cap still fits the character guard.
+        let over_cap = format!("{at_cap}a");
+        assert_eq!(over_cap.len(), cap + 1);
+        assert!(over_cap.chars().count() < cap);
+        let invalid = config_for(&over_cap);
+        assert!(
+            validator.validate(&invalid).is_ok(),
+            "{dimension} character guard"
+        );
+        let error = ResponseMock::new(&invalid)
+            .err()
+            .expect("runtime must reject the UTF-8 byte overflow");
+        assert!(
+            error.contains(&format!("{cap} bytes")),
+            "{dimension}: {error}"
+        );
+    }
 }
 
 #[test]
