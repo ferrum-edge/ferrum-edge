@@ -5668,12 +5668,16 @@ Configuration must be a top-level object. Unknown top-level, per-rule, and `matc
 
 **Bounds:** at most 1024 `rules`; per rule at most 64 response `headers` with values of at most 8192 bytes, a `body` of at most 262144 UTF-8 bytes, and at most 16 conditions in each of `match.headers` and `match.query_params`. A config over any bound is rejected at construction (startup, reload, and admin API writes) with an error naming the rule index.
 
+These limits apply independently per rule and field; there is no aggregate instance memory budget. For example, 1024 rules can retain 256 MiB of body payload alone, plus headers, conditions, regexes, and other overhead. All string size limits count UTF-8 bytes at runtime. OpenAPI `maxLength` counts Unicode characters and is only a coarse schema guard: a multibyte body, condition value, or query parameter name can satisfy it and still exceed the runtime byte limit. Runtime construction is authoritative.
+
 **Request conditions (`match`):** an optional per-rule object whose conditions must all hold, in addition to `method` and `path`. A rule whose conditions do not hold is skipped and evaluation continues with the next rule, so a conditioned rule placed before an unconditioned one selects a variant (an empty list for `x-scenario: empty`, page two for `?page=2`) while every other request gets the default.
 
 | Field | Type | Description |
 |---|---|---|
 | `match.headers` | Object (1–16 entries) | Header name → exact value. Matches when every named header is present on the client-sent request with a field line byte-for-byte equal to the value (names case-insensitive and unique ignoring case, values case-sensitive). Gateway-asserted names (`x-consumer-*`, the private GeoIP header, path-param headers) are rejected. Matching reads the client's pristine field lines, so an earlier plugin's header rewrite neither adds nor removes a match. |
-| `match.query_params` | Object (1–16 entries) | Query parameter name (1–256 bytes) → exact value, compared against the percent-decoded query (last occurrence wins; a bare `?flag` has the value `""`). |
+| `match.query_params` | Object (1–16 entries) | Query parameter name (1–256 UTF-8 bytes) → exact value, compared against the current percent-decoded query map, including earlier query rewrites (last occurrence wins; a bare `?flag` has the value `""`). |
+
+The two condition types intentionally observe different request views. `match.headers` uses the pristine client field lines; `match.query_params` uses the materialized query at this plugin's `before_proxy` turn. At default priorities, `request_transformer` (3000) runs before `response_mock` (3030), so its query additions, updates, and removals affect matching, while its header changes do not. For example, rewriting a client `x-scenario: empty` to `x-scenario: full` and `?page=1` to `?page=2` still matches `headers: {x-scenario: empty}` together with `query_params: {page: "2"}`. Priority overrides can change which query rewrites have run when the mock evaluates.
 
 Condition values are at most 8192 bytes and are redacted in non-admin plugin-config projections, since operators may target with a shared secret or a credential-bearing header. There is no templating or binary body support; a mock body is a static string.
 
