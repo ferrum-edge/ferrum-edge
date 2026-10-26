@@ -848,6 +848,202 @@ fn single_copy<'a>(headers: &'a HashMap<String, String>, name: &str) -> Vec<&'a 
         .collect()
 }
 
+/// The ordinary response hook, initial-header boundary (including gRPC and
+/// WebSocket handshakes), and response-header simulation share this policy.
+async fn policy_outputs(
+    plugin: &SecurityHeaders,
+    headers: &HashMap<String, String>,
+) -> [HashMap<String, String>; 3] {
+    let mut request = ctx();
+    let mut after_proxy = headers.clone();
+    let result = plugin
+        .after_proxy(&mut request, 200, &mut after_proxy)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    let mut initial = headers.clone();
+    plugin.apply_initial_response_header_policy(&mut initial);
+    let mut simulated = headers.clone();
+    plugin.simulate_after_proxy_response_headers(&mut request, &mut simulated);
+    [after_proxy, initial, simulated]
+}
+
+/// Issue #6900: an ignored spelling must not precede or combine with a valid
+/// STS/nosniff copy on the wire. Preserve the backend protection as one field.
+#[tokio::test]
+async fn override_disabled_collapses_sts_and_nosniff_case_variants() {
+    let plugin = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "hsts": "max-age=600"
+    }))
+    .expect("policy");
+
+    for (name, kept, other) in [
+        (
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+            "",
+        ),
+        (
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+            "max-age=1; max-age=2",
+        ),
+        ("Strict-Transport-Security", "max-age=0", "max-age=0"),
+        ("X-Content-Type-Options", " NOSNIFF ", ""),
+        ("X-Content-Type-Options", "nosniff", "sniff, nosniff"),
+        ("X-Content-Type-Options", "nosniff", "nosniff"),
+    ] {
+        let names = [
+            name.to_string(),
+            name.to_ascii_lowercase(),
+            name.to_ascii_uppercase(),
+        ];
+        for effective_index in 0..names.len() {
+            let headers = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    (
+                        name.clone(),
+                        if index == effective_index {
+                            kept
+                        } else {
+                            other
+                        }
+                        .to_string(),
+                    )
+                })
+                .collect();
+            for mut output in policy_outputs(&plugin, &headers).await {
+                assert_eq!(single_copy(&output, name), vec![kept], "{headers:?}");
+                assert_eq!(
+                    output.get(&name.to_ascii_lowercase()).map(String::as_str),
+                    Some(kept)
+                );
+                for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+                    let response =
+                        apply_response_headers(Response::builder().version(version), &output)
+                            .body(())
+                            .expect("normalized header reaches the response builder");
+                    let values: Vec<_> = response.headers().get_all(name).iter().collect();
+                    assert_eq!(values.len(), 1, "{version:?}: {headers:?}");
+                    assert_eq!(values[0].to_str().expect("ASCII backend value"), kept);
+                }
+                let once = output.clone();
+                plugin.apply_initial_response_header_policy(&mut output);
+                assert_eq!(output, once, "policy replay must be idempotent");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn duplicate_sts_selection_is_independent_of_map_insertion_order() {
+    let plugin =
+        SecurityHeaders::new(&json!({ "override_existing": false, "hsts": true })).expect("policy");
+    let copies = [
+        ("Strict-Transport-Security", "max-age=86400"),
+        ("strict-transport-security", "max-age=0"),
+        (
+            "STRICT-TRANSPORT-SECURITY",
+            "max-age=31536000; includeSubDomains",
+        ),
+    ];
+    for reverse in [false, true] {
+        let mut headers = HashMap::new();
+        for index in 0..copies.len() {
+            let (name, value) = copies[if reverse {
+                copies.len() - 1 - index
+            } else {
+                index
+            }];
+            headers.insert(name.to_string(), value.to_string());
+        }
+        for output in policy_outputs(&plugin, &headers).await {
+            assert_eq!(
+                single_copy(&output, "strict-transport-security"),
+                vec!["max-age=31536000; includeSubDomains"]
+            );
+        }
+    }
+}
+
+/// Issue #6900: ALLOWALL alone and an unknown value alone are ignored, but
+/// their combined X-Frame-Options set blocks framing. Do not weaken it to
+/// SAMEORIGIN. Repeated ALLOWALL and wholly unknown sets remain ineffective.
+#[tokio::test]
+async fn override_disabled_classifies_frame_options_across_case_variants() {
+    let plugin = SecurityHeaders::new(&json!({ "override_existing": false })).expect("policy");
+    for (first, second, effective) in [
+        ("ALLOWALL", "unknown", true),
+        ("allowall", "", true),
+        (
+            "ALLOWALL, ALLOWALL",
+            "ALLOW-FROM https://partner.example",
+            true,
+        ),
+        ("ALLOWALL", "allowall", false),
+        ("unknown", "", false),
+    ] {
+        for reverse in [false, true] {
+            let (first, second) = if reverse {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            let headers = HashMap::from([
+                ("X-Frame-Options".to_string(), first.to_string()),
+                ("x-frame-options".to_string(), second.to_string()),
+            ]);
+            for output in policy_outputs(&plugin, &headers).await {
+                if effective {
+                    assert_eq!(
+                        output.get("X-Frame-Options").map(String::as_str),
+                        Some(first)
+                    );
+                    assert_eq!(
+                        output.get("x-frame-options").map(String::as_str),
+                        Some(second)
+                    );
+                } else {
+                    assert_eq!(single_copy(&output, "x-frame-options"), vec!["SAMEORIGIN"]);
+                }
+            }
+        }
+    }
+}
+
+/// Issue #6900: quoted extension text cannot introduce a real max-age or a
+/// duplicate one. Escaped quotes/backslashes must not change that boundary.
+#[tokio::test]
+async fn override_disabled_tokenizes_backend_hsts_quoted_extensions() {
+    let plugin = SecurityHeaders::new(&json!({
+        "override_existing": false,
+        "hsts": "max-age=600"
+    }))
+    .expect("policy");
+    for (value, effective) in [
+        (r#"max-age=31536000; ext="a; max-age=0""#, true),
+        (r#"ext="a; max-age=0"; max-age=31536000"#, true),
+        (r#"max-age=31536000; ext="a\"; max-age=0""#, true),
+        (r#"ext="a\\"; max-age=31536000"#, true),
+        (r#"max-age="31536000"; ext="; max-age=0; max-age=1""#, true),
+        (r#"ext="a; max-age=31536000;""#, false),
+        (r#"ext="a\"; max-age=31536000;""#, false),
+        (r#"max-age=1; ext="a; max-age=0"; max-age=2"#, false),
+        (r#"ext="a\\"; max-age=1; max-age=2"#, false),
+    ] {
+        let headers = HashMap::from([("Strict-Transport-Security".to_string(), value.to_string())]);
+        for output in policy_outputs(&plugin, &headers).await {
+            assert_eq!(
+                single_copy(&output, "strict-transport-security"),
+                vec![if effective { value } else { "max-age=600" }],
+                "{value:?}"
+            );
+        }
+    }
+}
+
 /// security_headers-CLAUDE-3: with `override_existing: false`, a backend copy
 /// of a built-in security header that a browser ignores ENTIRELY (empty, or
 /// syntactically ineffective for that header) used to satisfy the policy, so no

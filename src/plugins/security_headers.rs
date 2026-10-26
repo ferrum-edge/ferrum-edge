@@ -79,7 +79,7 @@ impl ManagedHeader {
     fn browser_honors(self, value: &str) -> bool {
         match self {
             Self::ContentTypeOptions => backend_nosniff_is_effective(value),
-            Self::FrameOptions => backend_frame_options_is_effective(value),
+            Self::FrameOptions => backend_frame_options_is_effective(std::iter::once(value)),
             Self::ReferrerPolicy => backend_referrer_policy_is_effective(value),
             Self::StrictTransportSecurity => backend_hsts_is_effective(value),
             Self::ContentSecurityPolicy | Self::PermissionsPolicy => !trim_ows(value).is_empty(),
@@ -106,14 +106,14 @@ fn backend_nosniff_is_effective(value: &str) -> bool {
 /// a denial); otherwise it is ignored. A single value is enforced only when it
 /// is `deny` or `sameorigin`. Repeated `DENY, DENY` and conflicting
 /// `DENY, SAMEORIGIN` therefore both still protect.
-fn backend_frame_options_is_effective(value: &str) -> bool {
+fn backend_frame_options_is_effective<'a>(values: impl Iterator<Item = &'a str>) -> bool {
     fn is_framing_directive(token: &str) -> bool {
         token.eq_ignore_ascii_case("deny") || token.eq_ignore_ascii_case("sameorigin")
     }
     let mut first: Option<&str> = None;
     let mut distinct = false;
     let mut recognized = false;
-    for token in value.split(',').map(trim_ows) {
+    for token in values.flat_map(|value| value.split(',')).map(trim_ows) {
         recognized |= is_framing_directive(token) || token.eq_ignore_ascii_case("allowall");
         match first {
             None => first = Some(token),
@@ -143,7 +143,7 @@ fn backend_referrer_policy_is_effective(value: &str) -> bool {
 /// is deliberately not judged here: when in doubt the backend value is kept.
 fn backend_hsts_is_effective(value: &str) -> bool {
     let mut max_age: Option<bool> = None;
-    for directive in value.split(';') {
+    for directive in backend_hsts_directives(value) {
         let (name, argument) = match directive.split_once('=') {
             Some((name, argument)) => (trim_ows(name), Some(trim_ows(argument))),
             None => (trim_ows(directive), None),
@@ -157,6 +157,27 @@ fn backend_hsts_is_effective(value: &str) -> bool {
         max_age = Some(argument.is_some_and(is_delta_seconds));
     }
     max_age == Some(true)
+}
+
+/// Split only at unquoted semicolons. A quoted-pair consumes the next
+/// character, so an escaped quote cannot expose extension text as directives.
+/// Backend extensions are deliberately more permissive than config admission.
+fn backend_hsts_directives(value: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    let mut escaped = false;
+    value.split(move |character| {
+        if escaped {
+            escaped = false;
+            return false;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => return true,
+            _ => {}
+        }
+        false
+    })
 }
 
 /// `1*DIGIT`, optionally as a quoted string.
@@ -192,11 +213,13 @@ impl SetEntry {
 /// What a response already carries for one `set` name.
 enum ExistingValue {
     Absent,
-    /// At least one copy is a value a browser acts on (any copy, for an
-    /// arbitrary header).
+    /// The backend field is effective (any copy, for an arbitrary header).
     Satisfies,
-    /// Every copy is one a browser ignores entirely (empty, or syntactically
-    /// ineffective for that built-in header).
+    /// Several spellings of an order-sensitive field must collapse to this
+    /// effective backend copy, identified by its exact map key.
+    Collapse(String),
+    /// The backend field is ignored entirely under this header's processing
+    /// rules (empty, or syntactically ineffective).
     Ignored,
 }
 
@@ -323,6 +346,14 @@ impl SecurityHeaders {
             }
             match existing_value(headers, entry) {
                 ExistingValue::Satisfies => {}
+                ExistingValue::Collapse(key) => {
+                    // The classifier selected a key from this unchanged map.
+                    // Move its value rather than cloning a backend field.
+                    if let Some(value) = headers.remove(&key) {
+                        headers.retain(|key, _| !key.eq_ignore_ascii_case(&entry.name));
+                        headers.insert(entry.name.clone(), value);
+                    }
+                }
                 ExistingValue::Absent => {
                     headers.insert(entry.name.clone(), entry.value.clone());
                 }
@@ -420,28 +451,49 @@ impl Plugin for SecurityHeaders {
 
 /// Classify every case-insensitive copy of `entry.name` already in the map.
 ///
-/// Conservative across several spellings: one copy a browser acts on keeps
-/// them all, so a combined field view that might still protect is never
-/// replaced.
+/// X-Frame-Options is evaluated across the combined field, since individually
+/// ignored copies can jointly block framing. STS and nosniff instead need one
+/// effective copy: retaining ignored siblings makes their first/combined wire
+/// value depend on unordered map iteration. Other headers retain presence or
+/// per-copy recognition semantics.
 fn existing_value(headers: &HashMap<String, String>, entry: &SetEntry) -> ExistingValue {
-    let mut present = false;
-    for (key, value) in headers {
-        if !key.eq_ignore_ascii_case(&entry.name) {
-            continue;
-        }
-        present = true;
-        if entry
-            .managed
-            .is_none_or(|managed| managed.browser_honors(value))
+    let mut copies = headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(&entry.name))
+        .peekable();
+    if copies.peek().is_none() {
+        return ExistingValue::Absent;
+    }
+    let Some(managed) = entry.managed else {
+        return ExistingValue::Satisfies;
+    };
+    if matches!(managed, ManagedHeader::FrameOptions) {
+        return if backend_frame_options_is_effective(copies.map(|(_, value)| value.as_str())) {
+            ExistingValue::Satisfies
+        } else {
+            ExistingValue::Ignored
+        };
+    }
+    if matches!(
+        managed,
+        ManagedHeader::ContentTypeOptions | ManagedHeader::StrictTransportSecurity
+    ) && copies.clone().nth(1).is_some()
+    {
+        // The map has no backend wire order. Choose the bytewise first
+        // effective spelling so normalization is deterministic, and allocate
+        // only the small key on this duplicate-field path.
+        return match copies
+            .filter(|(_, value)| managed.browser_honors(value))
+            .min_by(|(left, _), (right, _)| left.cmp(right))
         {
-            return ExistingValue::Satisfies;
-        }
+            Some((key, _)) => ExistingValue::Collapse(key.clone()),
+            None => ExistingValue::Ignored,
+        };
     }
-    if present {
-        ExistingValue::Ignored
-    } else {
-        ExistingValue::Absent
+    if copies.any(|(_, value)| managed.browser_honors(value)) {
+        return ExistingValue::Satisfies;
     }
+    ExistingValue::Ignored
 }
 
 /// `remove` ∪ `set` names in first-seen order, deduplicated in one pass.
