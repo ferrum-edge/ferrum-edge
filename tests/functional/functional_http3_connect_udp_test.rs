@@ -467,8 +467,16 @@ async fn functional_h3_connect_udp_is_not_governed_by_backend_circuit_breaker_st
 }
 
 #[ignore]
-#[tokio::test]
-async fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream() {
+#[test]
+fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream() {
+    crate::common::in_process_gateway_runtime(1).block_on(
+        functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream_inner(
+        ),
+    );
+}
+
+async fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream_inner()
+ {
     // Both members of one upstream are live UDP echo sockets, so the only thing
     // separating them is the transport the operator configured. The direct
     // member proves the route works end to end; the HBONE-tagged member must

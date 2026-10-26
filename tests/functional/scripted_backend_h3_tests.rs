@@ -965,9 +965,14 @@ async fn h3_cross_protocol_refused_connect_sets_x_gateway_error() {
     let _keep_port_bound = refused;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test]
 #[ignore]
-async fn h3_quic_phase_failures_are_observable_and_recoverable() {
+fn h3_quic_phase_failures_are_observable_and_recoverable() {
+    crate::common::in_process_gateway_runtime(2)
+        .block_on(h3_quic_phase_failures_are_observable_and_recoverable_inner());
+}
+
+async fn h3_quic_phase_failures_are_observable_and_recoverable_inner() {
     for (name, connection_step) in [
         ("reject-handshake", H3Step::RejectHandshake),
         ("drop-initial", H3Step::DropInitialPacket),

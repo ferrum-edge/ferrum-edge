@@ -56,6 +56,21 @@
 //! progress — once callers in later PRs import them, the allow is a no-op.
 #![allow(dead_code, unused_imports)]
 
+/// Build a runtime for in-process gateway functional tests with the same 8 MiB
+/// worker stacks as `src/gateway_entry.rs`.
+///
+/// Tokio's default 2 MiB worker stack can overflow on the gateway's broad
+/// request futures. Keep the test's worker count while matching production's
+/// multi-thread runtime and enabled I/O and time drivers.
+pub fn in_process_gateway_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build in-process gateway runtime matching src/gateway_entry.rs")
+}
+
 pub mod backend_availability;
 pub mod config_builder;
 pub mod crl_fixtures;

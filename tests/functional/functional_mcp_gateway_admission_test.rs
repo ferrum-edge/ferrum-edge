@@ -949,8 +949,15 @@ fn bridge_call_body(id: i64, name: &str, arguments: Value) -> Value {
 /// A later request-header rule that swaps the mediated upstream session is
 /// refused before any backend request is admitted, on every frontend.
 #[ignore]
-#[tokio::test]
-async fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3() {
+#[test]
+fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3() {
+    crate::common::in_process_gateway_runtime(1).block_on(
+        functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3_inner(),
+    );
+}
+
+async fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3_inner()
+{
     let fixture = Fixture::start(LaterWriter::RequestTransformer).await;
     for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {
         fixture.clear();
@@ -974,8 +981,14 @@ async fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite
 /// cannot replace the mediated upstream session: the upstream sees exactly the
 /// session it minted, once, on every frontend.
 #[ignore]
-#[tokio::test]
-async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay() {
+#[test]
+fn functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay() {
+    crate::common::in_process_gateway_runtime(1).block_on(
+        functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay_inner(),
+    );
+}
+
+async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay_inner() {
     let fixture = Fixture::start(LaterWriter::FunctionOverlay).await;
     for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {
         fixture.clear();
@@ -1005,8 +1018,13 @@ async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_over
 /// headers), and the client gets the converted JSON-RPC result on HTTP 200,
 /// also when the backend answers with a chunked body of unknown length.
 #[ignore]
-#[tokio::test]
-async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
+#[test]
+fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
+    crate::common::in_process_gateway_runtime(1)
+        .block_on(functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3_inner());
+}
+
+async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3_inner() {
     let config = |backend_port: u16, _: u16| bridge_config(backend_port);
     let fixture = Fixture::start_with(Backend::Rest, config).await;
     for protocol in ["HTTP/1.1", "HTTP/2", "HTTP/3"] {

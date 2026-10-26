@@ -1298,9 +1298,14 @@ async fn next_record_h2(
 // Native HTTP/3
 // ===========================================================================
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests() {
+fn functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests() {
+    crate::common::in_process_gateway_runtime(1)
+        .block_on(functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests_inner());
+}
+
+async fn functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests_inner() {
     let mut fixture = SseFixture::start().await;
     let https_port = fixture.https_port();
     let url = format!("https://localhost:{https_port}/mcp");
