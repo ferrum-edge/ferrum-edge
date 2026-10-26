@@ -199,6 +199,7 @@ impl std::fmt::Display for AwsCredentialsUnavailable {
 
 type FetchOutcome = Result<Arc<AwsCredentialSnapshot>, &'static str>;
 type SharedFetch = Shared<BoxFuture<'static, FetchOutcome>>;
+type CredentialClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Freshness {
@@ -210,6 +211,7 @@ enum Freshness {
 struct Inner {
     fetcher: AwsCredentialFetcher,
     timing: AwsCredentialRefreshTiming,
+    clock: CredentialClock,
     current: ArcSwapOption<AwsCredentialSnapshot>,
     /// The fetch every waiter joins. Locked only to start or join a fetch,
     /// never on the fresh-credential path, and never across an `.await`.
@@ -245,10 +247,22 @@ impl RefreshingAwsCredentials {
 
     /// Cache over `fetcher` with explicit timing.
     pub fn with_timing(fetcher: AwsCredentialFetcher, timing: AwsCredentialRefreshTiming) -> Self {
+        Self::with_timing_and_clock(fetcher, timing, SystemTime::now)
+    }
+
+    /// Cache over `fetcher` with explicit timing and a clock for credential
+    /// expiry and retry backoff. The clock must use the same time basis as
+    /// the snapshots' expiry timestamps; fetch timeouts still use Tokio time.
+    pub fn with_timing_and_clock(
+        fetcher: AwsCredentialFetcher,
+        timing: AwsCredentialRefreshTiming,
+        clock: impl Fn() -> SystemTime + Send + Sync + 'static,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 fetcher,
                 timing,
+                clock: Arc::new(clock),
                 current: ArcSwapOption::empty(),
                 in_flight: Mutex::new(None),
                 fetch_running: AtomicBool::new(false),
@@ -269,7 +283,7 @@ impl RefreshingAwsCredentials {
     pub async fn credentials(
         &self,
     ) -> Result<Arc<AwsCredentialSnapshot>, AwsCredentialsUnavailable> {
-        let now = SystemTime::now();
+        let now = (self.inner.clock)();
         if let Some(current) = self.inner.current.load_full() {
             match self.inner.freshness(&current, now) {
                 Freshness::Fresh => return Ok(current),
@@ -292,7 +306,7 @@ impl RefreshingAwsCredentials {
         };
         match tokio::time::timeout(self.inner.timing.fetch_timeout, fetch).await {
             Ok(Ok(snapshot)) => {
-                if self.inner.freshness(&snapshot, SystemTime::now()) == Freshness::Expired {
+                if self.inner.freshness(&snapshot, (self.inner.clock)()) == Freshness::Expired {
                     Err(AwsCredentialsUnavailable {
                         reason: "the credential provider returned expired credentials",
                     })
@@ -342,7 +356,7 @@ impl Inner {
         // A fetch that finished between the caller's snapshot read and this
         // lock already published its result; do not start another.
         if let Some(current) = inner.current.load_full()
-            && inner.freshness(&current, SystemTime::now()) == Freshness::Fresh
+            && inner.freshness(&current, (inner.clock)()) == Freshness::Fresh
         {
             let ready: BoxFuture<'static, FetchOutcome> =
                 futures_util::future::ready(Ok(current)).boxed();
@@ -380,7 +394,7 @@ impl Inner {
             Err(_) => Err("timed out waiting for the credential provider"),
         };
         let outcome = outcome.and_then(|snapshot| {
-            if self.freshness(&snapshot, SystemTime::now()) == Freshness::Expired {
+            if self.freshness(&snapshot, (self.clock)()) == Freshness::Expired {
                 Err("the credential provider returned expired credentials")
             } else {
                 Ok(Arc::new(snapshot))
@@ -396,7 +410,7 @@ impl Inner {
                 let backoff_ms =
                     u64::try_from(self.timing.retry_backoff.as_millis()).unwrap_or(u64::MAX);
                 self.retry_not_before_ms.store(
-                    unix_millis(SystemTime::now()).saturating_add(backoff_ms),
+                    unix_millis((self.clock)()).saturating_add(backoff_ms),
                     Ordering::Release,
                 );
                 warn_sampled!(
