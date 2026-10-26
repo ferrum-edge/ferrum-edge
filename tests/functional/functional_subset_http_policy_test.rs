@@ -43,8 +43,13 @@ const JWT_SECRET: &str = "ferrum-edge-subset-http-policy-secret-0000";
 const JWT_ISSUER: &str = "ferrum-edge-subset-http-policy";
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
+#[test]
+fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
+    crate::common::in_process_gateway_runtime(2)
+        .block_on(functional_subset_http_h2_upgrade_policy_is_observable_at_backend_inner());
+}
+
+async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend_inner() {
     let ca = TestCa::new("subset-http-h2").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -160,8 +165,13 @@ async fn functional_subset_http_h2_upgrade_policy_is_observable_at_backend() {
 }
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn functional_subset_http_max_retries_caps_live_attempts() {
+#[test]
+fn functional_subset_http_max_retries_caps_live_attempts() {
+    crate::common::in_process_gateway_runtime(2)
+        .block_on(functional_subset_http_max_retries_caps_live_attempts_inner());
+}
+
+async fn functional_subset_http_max_retries_caps_live_attempts_inner() {
     // v1 (cap 1): two 503s. unmatched (top-level cap 5): three 503s then 200.
     let (backend_port, hits, shutdown_tx, backend_task) = spawn_status_script_backend(&[
         StatusCode::SERVICE_UNAVAILABLE,
@@ -248,8 +258,13 @@ async fn functional_subset_http_max_retries_caps_live_attempts() {
 }
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn functional_subset_http1_pending_admission_is_subset_isolated() {
+#[test]
+fn functional_subset_http1_pending_admission_is_subset_isolated() {
+    crate::common::in_process_gateway_runtime(2)
+        .block_on(functional_subset_http1_pending_admission_is_subset_isolated_inner());
+}
+
+async fn functional_subset_http1_pending_admission_is_subset_isolated_inner() {
     let (backend_port, hits, first_hit_rx, release, shutdown_tx, backend_task) =
         spawn_holding_backend().await;
     let gateway = start_subset_gateway(

@@ -214,9 +214,15 @@ async fn spawn_unix_gateway(config: String, root: &Path) -> TrustedProjectedGate
     .expect("start trusted projected unix gateway")
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn unix_socket_backend_serves_requests_over_a_real_socket() {
+fn unix_socket_backend_serves_requests_over_a_real_socket() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_socket_backend_serves_requests_over_a_real_socket_inner,
+    );
+}
+
+async fn unix_socket_backend_serves_requests_over_a_real_socket_inner() {
     let temp = TempDir::new().expect("temp dir");
     let root = containment_root(&temp);
     let backend = UnixBackend::start(&root, "app.sock", "alpha").await;
@@ -263,9 +269,15 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket() {
     gateway.shutdown().await;
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
+fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_socket_backend_fails_closed_when_the_socket_is_absent_inner,
+    );
+}
+
+async fn unix_socket_backend_fails_closed_when_the_socket_is_absent_inner() {
     let temp = TempDir::new().expect("temp dir");
     let root = containment_root(&temp);
     let missing = root.join("absent.sock");
@@ -306,9 +318,16 @@ async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
 /// Reload/update/delete via trusted `update_config` (mesh projection boundary),
 /// not SIGHUP/file-loader — operator file reload must keep rejecting `mesh.*`.
 #[cfg(unix)]
-#[tokio::test]
+#[test]
 #[ignore]
-async fn unix_socket_backend_survives_reload_update_and_delete() {
+fn unix_socket_backend_survives_reload_update_and_delete() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_socket_backend_survives_reload_update_and_delete_inner,
+    );
+}
+
+#[cfg(unix)]
+async fn unix_socket_backend_survives_reload_update_and_delete_inner() {
     let temp = TempDir::new().expect("temp dir");
     let root = containment_root(&temp);
     let alpha = UnixBackend::start(&root, "alpha.sock", "alpha").await;
@@ -434,15 +453,27 @@ plugin_configs: []
 /// budget (256 MiB by default; the in-process gateway never resizes it), so the
 /// refusal is deterministic and comes before any byte is read or the socket is
 /// dialed.
-#[tokio::test]
+#[test]
 #[ignore]
-async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
+fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted_inner,
+    );
+}
+
+async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted_inner() {
     assert_unix_grpc_buffer_capacity_refusal(false).await;
 }
 
-#[tokio::test]
+#[test]
 #[ignore]
-async fn unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted() {
+fn unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted_inner,
+    );
+}
+
+async fn unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted_inner() {
     assert_unix_grpc_buffer_capacity_refusal(true).await;
 }
 

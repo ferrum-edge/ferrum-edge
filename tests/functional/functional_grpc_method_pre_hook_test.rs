@@ -31,8 +31,14 @@ const TEST_JWT_SECRET: &str = "ferrum-edge-grpc-pre-hook-test-secret";
 const TEST_JWT_ISSUER: &str = "ferrum-edge-grpc-pre-hook-test";
 
 #[ignore]
-#[tokio::test]
-async fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3() {
+#[test]
+fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3_inner,
+    );
+}
+
+async fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_counting_grpc_backend().await;
     let (function_port, function_hits, function_task) = spawn_counting_function().await;
     let gateway = start_gateway(test_config(backend_port, function_port))

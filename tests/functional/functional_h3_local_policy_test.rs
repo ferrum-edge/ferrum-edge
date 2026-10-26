@@ -29,8 +29,14 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 #[ignore]
-#[tokio::test]
-async fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission_and_retry() {
+#[test]
+fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission_and_retry() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_pending_cap_rejects_before_backend_admission_and_retry_inner,
+    );
+}
+
+async fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission_and_retry_inner() {
     let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     let gateway = start_h3_policy_gateway(pending_cap_config(backend_port))
         .await
@@ -107,8 +113,14 @@ async fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission
 /// takes the `prebuffered_body: Some(..)` (buffered) leg; the streaming leg is
 /// covered below.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered() {
+#[test]
+fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered_inner,
+    );
+}
+
+async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered_inner() {
     let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     let gateway = start_h3_policy_gateway(backend_tls_sni_config(backend_port))
         .await
@@ -148,8 +160,14 @@ async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buff
 /// recv half dangling (the caller passes
 /// `halt_request_body_before_reject = true` for exactly this leg).
 #[ignore]
-#[tokio::test]
-async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming() {
+#[test]
+fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming_inner,
+    );
+}
+
+async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming_inner() {
     let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     let gateway = start_h3_policy_gateway(backend_tls_sni_config(backend_port))
         .await
@@ -186,8 +204,14 @@ async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_stre
 /// `DispatchKind::HttpsPool`). H3 must ignore it identically rather than fail
 /// closed, or the same config is a total outage for HTTP/3 clients only.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches() {
+#[test]
+fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches_inner,
+    );
+}
+
+async fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches_inner() {
     let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     release_backend.release();
     let gateway = start_h3_policy_gateway(plaintext_backend_tls_sni_config(backend_port))
@@ -223,8 +247,14 @@ async fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_d
 /// HTTP/1.1 and HTTP/2 frontends keep advertising HTTP/3 (`Alt-Svc`) on the
 /// port that serves the timed rule.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc() {
+#[test]
+fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc_inner,
+    );
+}
+
+async fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc_inner() {
     let (backend_port, backend_hits, release_backend, backend_task) = spawn_holding_backend().await;
     release_backend.release();
     let config = route_timeout_config(
@@ -281,8 +311,14 @@ async fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc
 /// timeout `504` over native HTTP/3 too: the fixed body, the `backend_timeout`
 /// token, and no second attempt even though the retry policy lists `504`.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_request_timeout_answers_504_before_the_response_head() {
+#[test]
+fn functional_h3_route_request_timeout_answers_504_before_the_response_head() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_answers_504_before_the_response_head_inner,
+    );
+}
+
+async fn functional_h3_route_request_timeout_answers_504_before_the_response_head_inner() {
     let (backend_port, backend_hits, _hold_backend, backend_task) = spawn_holding_backend().await;
     let config = route_timeout_config(
         h3_policy_config(
@@ -341,8 +377,14 @@ async fn functional_h3_route_request_timeout_answers_504_before_the_response_hea
 /// reset rather than finished, so a client can never mistake the truncated
 /// body for a complete one.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_request_timeout_resets_a_committed_body() {
+#[test]
+fn functional_h3_route_request_timeout_resets_a_committed_body() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_resets_a_committed_body_inner,
+    );
+}
+
+async fn functional_h3_route_request_timeout_resets_a_committed_body_inner() {
     let (backend_port, backend_task) = spawn_partial_body_backend().await;
     let config = route_timeout_config(
         plaintext_backend_tls_sni_config(backend_port),
@@ -389,8 +431,14 @@ async fn functional_h3_route_request_timeout_resets_a_committed_body() {
 /// at the deadline the stream is reset and the backend stream is released,
 /// instead of both being held until the client reads again.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading() {
+#[test]
+fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_cuts_a_client_that_stops_reading_inner,
+    );
+}
+
+async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading_inner() {
     let (backend_port, backend_released, backend_task) = spawn_endless_body_backend().await;
     let config = route_timeout_config(
         plaintext_backend_tls_sni_config(backend_port),
@@ -465,8 +513,14 @@ async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading() 
 /// retryable backend-timeout `504`; the retry replays the retained request
 /// body to the next attempt, which answers.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_attempt_budget_retries_and_replays_the_body() {
+#[test]
+fn functional_h3_route_attempt_budget_retries_and_replays_the_body() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_retries_and_replays_the_body_inner,
+    );
+}
+
+async fn functional_h3_route_attempt_budget_retries_and_replays_the_body_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_echo_backend(1).await;
     let config = route_timeout_config(
         h3_policy_config(
@@ -514,8 +568,14 @@ async fn functional_h3_route_attempt_budget_retries_and_replays_the_body() {
 /// With every attempt stalled, each is ended by its own fresh budget and the
 /// last one's ordinary backend-timeout `504` reaches the client.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_attempt_budget_bounds_every_attempt() {
+#[test]
+fn functional_h3_route_attempt_budget_bounds_every_attempt() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_bounds_every_attempt_inner,
+    );
+}
+
+async fn functional_h3_route_attempt_budget_bounds_every_attempt_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_echo_backend(usize::MAX).await;
     let config = route_timeout_config(
         h3_policy_config(
@@ -571,8 +631,14 @@ async fn functional_h3_route_attempt_budget_bounds_every_attempt() {
 /// budget, exactly as on HTTP/1.1 and HTTP/2: two attempts that each fit the
 /// budget complete, although together they overrun a single budget.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry() {
+#[test]
+fn functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry_inner,
+    );
+}
+
+async fn functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry_inner() {
     let (backend_port, backend_hits, backend_task) =
         spawn_delayed_backend(Duration::from_millis(700), 503).await;
     let config = route_timeout_config(
@@ -627,8 +693,14 @@ async fn functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry() {
 /// discarded attempt: the rule's one-shot response `add` appends to the
 /// backend's `x-route-trace` value exactly once.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body() {
+#[test]
+fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_inner,
+    );
+}
+
+async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_stalled_body_backend(1).await;
     let mut config = buffered_route_timeout_config(
         backend_port,
@@ -697,21 +769,9 @@ async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body() {
 #[ignore]
 #[test]
 fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2() {
-    // The in-process gateway serves this H3 -> HTTP/2 buffered retry on the
-    // test's own runtime. `#[tokio::test]` takes Rust's 2 MiB spawned-thread
-    // stack, a quarter of the 8 MiB every production worker gets
-    // (`thread_stack_size` in `src/main.rs`), and this cross-protocol retry
-    // future overflowed it at `opt-level = 0`. Match production, as
-    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone` does.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build 8 MiB-stack runtime matching src/main.rs")
-        .block_on(
-            functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2_inner(),
-        );
+    crate::common::in_process_gateway_runtime(4).block_on(
+        functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2_inner(),
+    );
 }
 
 async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2_inner() {
@@ -802,8 +862,14 @@ async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from
 /// the ordinary backend-timeout `504`; a method the policy does not retry is
 /// answered after one attempt.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy() {
+#[test]
+fn functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy_inner,
+    );
+}
+
+async fn functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_stalled_body_backend(usize::MAX).await;
     let config = buffered_route_timeout_config(
         backend_port,
@@ -849,8 +915,14 @@ async fn functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy(
 /// route timeout `504` and is never retried, even though the attempt budget
 /// has time left and the policy lists `504` (#5738).
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_request_timeout_during_buffered_body_is_not_retried() {
+#[test]
+fn functional_h3_route_request_timeout_during_buffered_body_is_not_retried() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_during_buffered_body_is_not_retried_inner,
+    );
+}
+
+async fn functional_h3_route_request_timeout_during_buffered_body_is_not_retried_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_stalled_body_backend(usize::MAX).await;
     let config = buffered_route_timeout_config(
         backend_port,
@@ -887,8 +959,14 @@ async fn functional_h3_route_request_timeout_during_buffered_body_is_not_retried
 /// retried: the rule's per-attempt budget cuts its body with a stream reset
 /// (#5738 changes only buffered collection).
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_attempt_budget_cuts_a_committed_streamed_body() {
+#[test]
+fn functional_h3_route_attempt_budget_cuts_a_committed_streamed_body() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_cuts_a_committed_streamed_body_inner,
+    );
+}
+
+async fn functional_h3_route_attempt_budget_cuts_a_committed_streamed_body_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_stalled_body_backend(usize::MAX).await;
     let config = route_timeout_config(
         h3_policy_config(
@@ -931,8 +1009,14 @@ async fn functional_h3_route_attempt_budget_cuts_a_committed_streamed_body() {
 /// It is still a final reject that `after_proxy` decorates: a browser client
 /// gets the CORS headers that let it read the gRPC status.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_exceeded() {
+#[test]
+fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_exceeded() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_exceeded_inner,
+    );
+}
+
+async fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_exceeded_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_echo_backend(usize::MAX).await;
     let mut config = route_timeout_config(
         h3_policy_config(
@@ -1037,8 +1121,14 @@ async fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_e
 /// backend never sends the h2c SETTINGS frame: the budget would expire during
 /// connection acquisition instead, which is the gateway's own deadline.
 #[ignore]
-#[tokio::test]
-async fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp() {
+#[test]
+fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp_inner,
+    );
+}
+
+async fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp_inner() {
     for http2 in [false, true] {
         assert_tcp_grpc_web_attempt_budget_expiry_wording(http2).await;
     }
@@ -1168,8 +1258,14 @@ async fn assert_tcp_grpc_web_attempt_budget_expiry_wording(http2: bool) {
 /// deadline (the client's `grpc-timeout` expiring while the backend holds the
 /// call) over HTTP/1.1 and HTTP/2. Each terminal keeps its wording.
 #[ignore]
-#[tokio::test]
-async fn functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp() {
+#[test]
+fn functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp_inner,
+    );
+}
+
+async fn functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp_inner() {
     for http2 in [false, true] {
         assert_tcp_grpc_web_backend_unavailable_carries_cors(http2).await;
         assert_tcp_grpc_web_gateway_deadline_carries_cors(http2).await;
@@ -1233,8 +1329,14 @@ async fn assert_tcp_grpc_web_gateway_deadline_carries_cors(http2: bool) {
 /// too (#5747): a refused backend dial answers `UNAVAILABLE` with the CORS
 /// headers a browser client needs to read it.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_grpc_web_backend_unavailable_carries_cors() {
+#[test]
+fn functional_h3_grpc_web_backend_unavailable_carries_cors() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_backend_unavailable_carries_cors_inner,
+    );
+}
+
+async fn functional_h3_grpc_web_backend_unavailable_carries_cors_inner() {
     let backend_port = refused_backend_port().await;
     let gateway = start_h3_policy_gateway(grpc_web_cors_config(backend_port))
         .await
@@ -1293,8 +1395,14 @@ async fn functional_h3_grpc_web_backend_unavailable_carries_cors() {
 /// head, so the terminal carries that head's gateway decorations. Either way
 /// the browser client gets the CORS headers it needs to read the gRPC status.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_grpc_web_too_large_response_carries_cors() {
+#[test]
+fn functional_h3_grpc_web_too_large_response_carries_cors() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_too_large_response_carries_cors_inner,
+    );
+}
+
+async fn functional_h3_grpc_web_too_large_response_carries_cors_inner() {
     for chunked in [false, true] {
         assert_h3_grpc_web_too_large_response_carries_cors(chunked).await;
     }
@@ -1493,8 +1601,14 @@ fn assert_grpc_web_terminal_carries_cors(protocol: &str, terminal: &TcpGrpcWebTe
 /// the buffered response legs are both covered, and a follow-up request on the
 /// same connection must still be answered.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream() {
+#[test]
+fn functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream_inner,
+    );
+}
+
+async fn functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream_inner() {
     for buffered in [false, true] {
         assert_grpc_web_deadline_after_a_stalled_body_write(buffered).await;
     }
@@ -1581,8 +1695,14 @@ async fn assert_grpc_web_deadline_after_a_stalled_body_write(buffered: bool) {
 /// `grpc-timeout` in place of the client's relative value, as proxy core does
 /// (#5734): the rule's 5 s attempt budget binds over the client's 30 s.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout() {
+#[test]
+fn functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout_inner,
+    );
+}
+
+async fn functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout_inner() {
     let (backend_port, backend_hits, backend_task) = spawn_grpc_timeout_echo_backend().await;
     let config = route_timeout_config(
         h3_policy_config(
@@ -1642,8 +1762,14 @@ async fn functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout() 
 /// before failing with a retried `503`, and the retry is sent a value from a
 /// fresh 5 s budget rather than the ~3.5 s the first attempt had left.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout() {
+#[test]
+fn functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout() {
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout_inner,
+    );
+}
+
+async fn functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout_inner() {
     let (backend_port, seen, backend_task) =
         spawn_grpc_timeout_retry_backend(Duration::from_millis(1500)).await;
     let config = route_timeout_config(

@@ -56,6 +56,49 @@
 //! progress — once callers in later PRs import them, the allow is a no-op.
 #![allow(dead_code, unused_imports)]
 
+/// Build a multi-thread runtime for in-process gateway functional tests with
+/// the same 8 MiB worker stacks as `src/gateway_entry.rs`.
+///
+/// Tokio's default 2 MiB worker stack can overflow on the gateway's broad
+/// request futures. Use this for tests that already used a multi-thread runtime,
+/// preserving their worker count and enabled I/O and time drivers.
+pub fn in_process_gateway_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build in-process gateway runtime matching src/gateway_entry.rs")
+}
+
+/// Run a current-thread in-process gateway test on an 8 MiB thread stack.
+///
+/// Preserve the scheduling semantics of plain `#[tokio::test]` tests while
+/// matching production's stack budget. Construct the future inside the spawned
+/// thread so it never occupies the caller's smaller stack. A one-worker
+/// multi-thread runtime changes scheduling and can reorder concurrent requests.
+pub fn run_in_process_gateway_current_thread_test<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let thread = std::thread::Builder::new()
+        .name("in-process-gateway-current-thread-test".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread in-process gateway runtime");
+            runtime.block_on(test());
+        })
+        .expect("spawn current-thread in-process gateway test thread");
+
+    if let Err(panic) = thread.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 pub mod backend_availability;
 pub mod config_builder;
 pub mod crl_fixtures;

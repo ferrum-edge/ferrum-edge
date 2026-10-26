@@ -44,8 +44,13 @@ const SECONDARY: &str = "secondary";
 const PREFERRED_HEALTHY_HITS: usize = 4;
 
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier() {
+#[test]
+fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier() {
+    crate::common::in_process_gateway_runtime(2)
+        .block_on(live_failover_priority_prefers_label_match_then_fails_over_on_outlier_inner());
+}
+
+async fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier_inner() {
     let preferred_res = reserve_port().await.expect("reserve preferred backend");
     let secondary_res = reserve_port().await.expect("reserve secondary backend");
     let preferred_port = preferred_res.port;

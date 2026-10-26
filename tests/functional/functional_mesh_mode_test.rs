@@ -19709,8 +19709,13 @@ fn h3_mesh_hbone_tags(relay_port: u16, pinned_peer: &str) -> Vec<(&'static str, 
 /// are intact, request DATA arrives byte-for-byte, and `grpc-status` /
 /// `grpc-message` come back as REAL HTTP/2 trailers relayed onto H3 trailers.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 mesh mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -19799,8 +19804,13 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
 /// address actually connected to, verification is scoped to the remote trust
 /// domain with NO pod pinning, and real response trailers still arrive.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 xc mtls identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -19879,8 +19889,13 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
 /// DATA and real `grpc-status` TRAILERS end to end — the exact framing the old
 /// HTTP/1.1-inside-HBONE dispatch could not.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
+#[test]
+fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 hbone identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -19961,8 +19976,13 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
 /// ClientHello must carry the destination-FQDN SNI override with
 /// trust-domain-scoped verification instead of a pinned pod SPIFFE.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
+#[test]
+fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone_inner());
+}
+
+async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 xc hbone identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20048,8 +20068,13 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
 /// cancellation then propagates through the nested HTTP/2 connection as a reset
 /// request stream rather than being absorbed by the gateway.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
+#[test]
+fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_streams_and_cancels_over_ambient_hbone_inner());
+}
+
+async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 hbone streaming identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20123,8 +20148,13 @@ async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
 /// authenticated hop, and when it never answers the H3 client gets
 /// DEADLINE_EXCEEDED (4) rather than hanging or receiving a connection error.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
+#[test]
+fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls_inner());
+}
+
+async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls_inner() {
     let identities = TempDir::new().expect("h3 mesh deadline identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20181,8 +20211,13 @@ async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
 /// client gets gRPC UNAVAILABLE (14), the peer's listener is never dialed, and
 /// the refusal text leaks no SPIFFE ID, SNI name, or trust domain.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
+#[test]
+fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata_inner());
+}
+
+async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata_inner() {
     let identities = TempDir::new().expect("h3 mesh refusal identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20328,8 +20363,13 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
 /// peer's identity pin, and refusing a mesh-tagged rotation — which this bridge
 /// did before #3284 — would fail closed with UNAVAILABLE.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
+#[test]
+fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport_inner());
+}
+
+async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport_inner() {
     let identities = TempDir::new().expect("h3 mesh rotation identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20422,8 +20462,13 @@ async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
 /// 3. the mesh target is restored but its identity pin is CORRUPTED — the RPC
 ///    must fail closed with UNAVAILABLE and dial nothing.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
+#[test]
+fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal_inner());
+}
+
+async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal_inner() {
     let identities = TempDir::new().expect("h3 mesh reload identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -20990,17 +21035,7 @@ async fn h3_mesh_plain_reload(
 #[ignore]
 #[test]
 fn functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls() {
-    // Same production-sized worker stack as
-    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
-    // request future is deliberately broad, and `#[tokio::test]` would run it
-    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
-    // gives every worker.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build 8 MiB-stack runtime matching src/main.rs")
+    crate::common::in_process_gateway_runtime(4)
         .block_on(functional_h3_plain_dispatches_over_same_cluster_sidecar_mesh_mtls_inner());
 }
 
@@ -21091,17 +21126,7 @@ async fn h3_mesh_plain_request(
 #[ignore]
 #[test]
 fn functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token() {
-    // Same production-sized worker stack as
-    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
-    // request future is deliberately broad, and `#[tokio::test]` would run it
-    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
-    // gives every worker.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build 8 MiB-stack runtime matching src/main.rs")
+    crate::common::in_process_gateway_runtime(4)
         .block_on(functional_h3_plain_mesh_mtls_grpc_web_passthrough_and_backend_5xx_token_inner());
 }
 
@@ -21249,21 +21274,7 @@ fn h3_plain_ambient_hbone_inner_app_is_http1_not_h2c() {
 #[ignore]
 #[test]
 fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone() {
-    // Production gives every worker 8 MiB (`thread_stack_size` in `src/main.rs`)
-    // because, as that comment records, "the proxy request future is deliberately
-    // broad ... and a real cross-cluster sidecar HTTP/2 request has exceeded"
-    // Rust's 2 MiB spawned-thread default on hosted Linux runners. `#[tokio::test]`
-    // silently takes that 2 MiB default, so this H3-over-HBONE dispatch — the
-    // broadest request future the gateway has — aborted the worker at
-    // `opt-level = 0` purely because the test under-provisions the stack by 4x
-    // relative to the binary under test. Match production rather than reshaping
-    // the request path to fit a budget production does not use.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build 8 MiB-stack runtime matching src/main.rs")
+    crate::common::in_process_gateway_runtime(4)
         .block_on(functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner());
 }
 
@@ -21334,17 +21345,7 @@ async fn functional_h3_plain_dispatches_over_same_cluster_ambient_hbone_inner() 
 #[ignore]
 #[test]
 fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls() {
-    // Same production-sized worker stack as
-    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
-    // request future is deliberately broad, and `#[tokio::test]` would run it
-    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
-    // gives every worker.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build 8 MiB-stack runtime matching src/main.rs")
+    crate::common::in_process_gateway_runtime(4)
         .block_on(functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls_inner());
 }
 
@@ -21414,8 +21415,13 @@ async fn functional_h3_plain_mixed_retry_skips_unix_and_uses_mesh_mtls_inner() {
 /// An upstream of only Unix-socket targets fails closed — no eligible H3
 /// transport remains.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_all_unix_targets_fail_closed() {
+#[test]
+fn functional_h3_plain_all_unix_targets_fail_closed() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_all_unix_targets_fail_closed_inner());
+}
+
+async fn functional_h3_plain_all_unix_targets_fail_closed_inner() {
     let identities = TempDir::new().expect("h3 plain unix-only identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(identities.path(), &[H3_MESH_GATEWAY_SPIFFE]);
     let dead_backend_port = reserve_unique_mesh_port().await;
@@ -21458,8 +21464,13 @@ async fn functional_h3_plain_all_unix_targets_fail_closed() {
 
 /// Corrupted mesh identity pin fails closed with no plaintext dial.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_plain_mesh_identity_failure_fails_closed() {
+#[test]
+fn functional_h3_plain_mesh_identity_failure_fails_closed() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_plain_mesh_identity_failure_fails_closed_inner());
+}
+
+async fn functional_h3_plain_mesh_identity_failure_fails_closed_inner() {
     let identities = TempDir::new().expect("h3 plain identity-fail tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
@@ -21508,17 +21519,7 @@ async fn functional_h3_plain_mesh_identity_failure_fails_closed() {
 #[ignore]
 #[test]
 fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal() {
-    // Same production-sized worker stack as
-    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone`: the H3
-    // request future is deliberately broad, and `#[tokio::test]` would run it
-    // on the 2 MiB spawned-thread default instead of the 8 MiB `src/main.rs`
-    // gives every worker.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .thread_stack_size(8 * 1024 * 1024)
-        .enable_all()
-        .build()
-        .expect("build 8 MiB-stack runtime matching src/main.rs")
+    crate::common::in_process_gateway_runtime(4)
         .block_on(functional_h3_plain_mesh_transport_follows_reload_and_withdrawal_inner());
 }
 
@@ -21601,8 +21602,13 @@ async fn functional_h3_plain_mesh_transport_follows_reload_and_withdrawal_inner(
 /// H3 WebSocket over Ambient HBONE: Extended CONNECT on the frontend, byte
 /// tunnel + H1 upgrade to the destination echo app.
 #[ignore]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
+#[test]
+fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone() {
+    crate::common::in_process_gateway_runtime(4)
+        .block_on(functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone_inner());
+}
+
+async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone_inner() {
     let identities = TempDir::new().expect("h3 ws hbone identity tempdir");
     let svids = generate_shared_ca_mesh_svid_set(
         identities.path(),
