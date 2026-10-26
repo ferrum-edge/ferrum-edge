@@ -152,7 +152,7 @@ jobs:
 
       - name: Cache Rust dependencies
         if: steps.skip_check.outputs.skip != 'true'
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: "ci-gateways-protocol-bench"
           # Host builds use a nested workspace; root target/ has no reuse here.
