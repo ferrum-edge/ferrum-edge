@@ -349,13 +349,11 @@ google-cloud-gax-internal = { version = "=0.7.14", default-features = false, opt
 google-cloud-gax = { version = "=1.11.0", default-features = false, optional = true }
 google-cloud-wkt = { version = "=1.10.0", default-features = false, optional = true }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
-# GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser. This
-# only works while it is on the same 0.x line the AWS SDK crates require: a
-# requirement on another line resolves a second copy and constrains nothing
-# (issue #6755). Move it together with the SDK crates;
-# `scripts/verify_dependency_security_chain.py` fails a lockfile that holds
-# more than one aws-smithy-json.
-aws-smithy-json = { version = "0.63.1", optional = true }
+# GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser. Keep
+# this direct pin aligned with the resolved SDK graph: another 0.x minor can
+# resolve a second copy and constrain nothing (issue #6755). Move it together
+# with the SDK crates; the dependency-chain check requires one copy.
+aws-smithy-json = { version = "0.65.0", optional = true }
 # Azure SDK 1.x trio: upgrade all three together (`azure_identity` and the
 # Key Vault client implement/consume `azure_core`'s `TokenCredential`, so a
 # mixed major line does not compile). 1.x refuses bearer auth over non-TLS
