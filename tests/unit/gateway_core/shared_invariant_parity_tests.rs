@@ -39,6 +39,64 @@ use ferrum_edge::util::sharding::pool_shard_amount;
 use serde_json::json;
 
 #[test]
+fn request_transformer_header_outcomes_share_every_dispatch_boundary() {
+    // Behavioral tests cover both helper shapes; this inventory pins their
+    // placement after header hooks on H1/H2 and H3, including deferred passes
+    // and externally supplied finalized-egress overlays.
+    let proxy = source("src/proxy/mod.rs");
+    let h3 = source("src/http3/server.rs");
+    for (text, signature) in [
+        (proxy.as_str(), "async fn handle_proxy_request_inner("),
+        (h3.as_str(), "async fn handle_h3_request("),
+    ] {
+        let dispatcher = item_body(text, signature, "\n}");
+        let wire = dispatcher.find("ctx.set_raw_headers(").unwrap();
+        let hooks = dispatcher
+            .find("BackendPathBeforeProxyPass::Initial")
+            .unwrap();
+        let boundary = dispatcher
+            .find("retire_stale_request_integrity_headers(&mut ctx, &mut owned_proxy_headers)")
+            .unwrap();
+        assert!(wire < hooks && hooks < boundary, "{signature}");
+    }
+    let refresh = item_body(
+        &proxy,
+        "fn refresh_effective_backend_gateway_assertion_headers(",
+        "\n}",
+    );
+    assert!(refresh.contains("retire_stale_request_integrity_headers(ctx, owned_proxy_headers)"));
+    let h1_dispatcher = item_body(&proxy, "async fn handle_proxy_request_inner(", "\n}");
+    assert!(
+        h1_dispatcher
+            .matches("refresh_effective_backend_gateway_assertion_headers(&mut ctx,")
+            .count()
+            >= 2
+    );
+    let h3_dispatcher = item_body(&h3, "async fn handle_h3_request(", "\n}");
+    assert!(
+        h3_dispatcher
+            .matches("retire_stale_request_integrity_headers_in_map(")
+            .count()
+            >= 2
+    );
+    for (signature, required) in [
+        (
+            "pub(crate) fn apply_finalized_request_egress_header_overlay(",
+            "refresh_effective_backend_gateway_assertion_headers(ctx, owned_proxy_headers)",
+        ),
+        (
+            "pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(",
+            "retire_stale_request_integrity_headers_in_map(ctx, headers)",
+        ),
+    ] {
+        assert!(
+            item_body(&proxy, signature, "\n}").contains(required),
+            "{signature}"
+        );
+    }
+}
+
+#[test]
 fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
     let entry = source("src/gateway_entry.rs");
     let diagnostics: Vec<&str> = entry

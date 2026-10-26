@@ -10452,10 +10452,18 @@ pub mod _test_support {
     /// Proxy core's stale request-digest retirement over the final outbound
     /// headers (clone-on-write into `owned_proxy_headers`).
     pub fn retire_stale_request_integrity_headers(
-        ctx: &crate::plugins::RequestContext,
+        ctx: &mut crate::plugins::RequestContext,
         owned_proxy_headers: &mut Option<HashMap<String, String>>,
     ) {
         crate::proxy::retire_stale_request_integrity_headers(ctx, owned_proxy_headers)
+    }
+
+    /// Native HTTP/3 deferred-pass variant of the final-header boundary.
+    pub fn retire_stale_request_integrity_headers_in_map(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::retire_stale_request_integrity_headers_in_map(ctx, headers)
     }
 
     pub async fn apply_request_body_plugins(

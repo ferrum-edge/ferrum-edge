@@ -5994,7 +5994,7 @@ async fn handle_h3_request(
     );
     // Stale request digests over the final outbound headers — the same
     // retirement the H1/H2 ladder makes at the same point. Keep both in sync.
-    crate::proxy::retire_stale_request_integrity_headers(&ctx, &mut owned_proxy_headers);
+    crate::proxy::retire_stale_request_integrity_headers(&mut ctx, &mut owned_proxy_headers);
     // Proxy hop limit (issue #6109): the same `X-Ferrum-Hops` re-assertion the
     // H1/H2 ladder makes in `src/proxy/mod.rs::handle_proxy_request_inner`, at
     // the same point; the deferred passes and the finalized-egress overlay
@@ -6410,7 +6410,10 @@ async fn handle_h3_request(
             // Re-establish gateway assertions and egress baggage
             // policy before a deferred function's headers reach a backend.
             crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
-            crate::proxy::retire_stale_request_integrity_headers_in_map(&ctx, &mut proxy_headers);
+            crate::proxy::retire_stale_request_integrity_headers_in_map(
+                &mut ctx,
+                &mut proxy_headers,
+            );
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -6448,7 +6451,10 @@ async fn handle_h3_request(
         }
         if matches!(deferred_result, PluginResult::Continue) {
             crate::proxy::refresh_backend_gateway_assertion_headers(&ctx, &mut proxy_headers);
-            crate::proxy::retire_stale_request_integrity_headers_in_map(&ctx, &mut proxy_headers);
+            crate::proxy::retire_stale_request_integrity_headers_in_map(
+                &mut ctx,
+                &mut proxy_headers,
+            );
             crate::modes::mesh::hbone::strip_egress_baggage_in_map(
                 &mut proxy_headers,
                 &state.mesh_egress_strip_baggage_keys,
@@ -6972,7 +6978,7 @@ async fn handle_h3_request(
         .await;
         crate::proxy::apply_finalized_request_egress_header_overlay_in_map(
             &plugins,
-            &ctx,
+            &mut ctx,
             &mut proxy_headers,
             egress.backend_header_overlay,
             &state.mesh_egress_strip_baggage_keys,

@@ -2810,14 +2810,26 @@ fn integrity_headers(content_type: Option<&str>) -> HashMap<String, String> {
     headers
 }
 
-/// Run `plugins` through `before_proxy` the way the dispatcher does when no
-/// instance advertises a header mutation (the outbound map IS the taken
-/// `ctx.headers`), then proxy core's final-header digest retirement.
+fn retain_client_wire_headers(ctx: &mut RequestContext, headers: &HashMap<String, String>) {
+    let mut wire = http::HeaderMap::new();
+    for (name, value) in headers {
+        wire.insert(
+            http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse::<http::HeaderValue>().unwrap(),
+        );
+    }
+    ctx.set_raw_headers(wire);
+}
+
+/// Run `before_proxy`, then the final-header boundary, retaining the pristine
+/// wire view as both frontends do. An unchanged map takes the no-copy path.
 async fn run_chain_then_retire(
     plugins: &[&RequestTransformer],
     ctx: &mut RequestContext,
     inbound: HashMap<String, String>,
 ) -> Option<HashMap<String, String>> {
+    retain_client_wire_headers(ctx, &inbound);
+    ctx.headers = inbound.clone();
     let mut outbound = inbound.clone();
     for plugin in plugins {
         plugin.before_proxy(ctx, &mut outbound).await;
@@ -2826,6 +2838,224 @@ async fn run_chain_then_retire(
     let mut owned = (outbound != ctx.headers).then_some(outbound);
     ferrum_edge::_test_support::retire_stale_request_integrity_headers(ctx, &mut owned);
     owned
+}
+
+/// Exercise both the ordinary H1/H2/H3 boundary and native H3's owned-map
+/// deferred boundary with the same behavioral assertions.
+fn finalize_body_rule_headers_on_surface(
+    ctx: &mut RequestContext,
+    outbound: &mut HashMap<String, String>,
+    in_map: bool,
+) {
+    if in_map {
+        ferrum_edge::_test_support::retire_stale_request_integrity_headers_in_map(ctx, outbound);
+    } else {
+        let mut owned = Some(std::mem::take(outbound));
+        ferrum_edge::_test_support::retire_stale_request_integrity_headers(ctx, &mut owned);
+        *outbound = owned.expect("an owned outbound map stays owned");
+    }
+}
+
+#[tokio::test]
+async fn body_skip_follows_later_header_and_route_content_type_relabels() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let relabel_rule = json!({"operation": "update", "target": "header",
+        "key": "content-type", "value": "text/plain"});
+    let relabel = RequestTransformer::new(&json!({"rules": [relabel_rule.clone()]})).unwrap();
+    let raw: Vec<RawRouteHeaderTransformRule> =
+        serde_json::from_value(json!([relabel_rule])).unwrap();
+    let route_rules = Arc::new(parse_route_header_transforms(&raw, "test").unwrap());
+
+    for in_map in [false, true] {
+        for via_route in [false, true] {
+            let mut ctx = post_ctx();
+            let mut outbound =
+                HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+            retain_client_wire_headers(&mut ctx, &outbound);
+            body.before_proxy(&mut ctx, &mut outbound).await;
+            assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+            if via_route {
+                ctx.route_override_request_transform = Some(route_rules.clone());
+                finalize_route_override_request_headers(&mut ctx, &mut outbound);
+            } else {
+                relabel.before_proxy(&mut ctx, &mut outbound).await;
+            }
+            // No digest and no body-hook call: this request streams after the
+            // final header relabel, but must still explain the skipped pass.
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            assert_eq!(
+                ctx.metadata
+                    .get(BODY_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some("non_json_content_type"),
+                "in_map={in_map}, via_route={via_route}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn body_skip_is_reconsidered_after_deferred_header_relabels() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let relabel = RequestTransformer::new(&json!({"rules": [
+        {"operation": "update", "target": "header", "key": "content-type", "value": "application/json"}
+    ]}))
+    .unwrap();
+    for in_map in [false, true] {
+        let mut ctx = post_ctx();
+        let mut outbound = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        body.before_proxy(&mut ctx, &mut outbound).await;
+        finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+        assert_eq!(
+            ctx.metadata
+                .get(BODY_SKIPPED_METADATA_KEY)
+                .map(String::as_str),
+            Some("non_json_content_type")
+        );
+        relabel.before_proxy(&mut ctx, &mut outbound).await;
+        finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+        assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+
+        for (bytes, reason) in [
+            (b"not json".as_slice(), "parse_error"),
+            (b"{}".as_slice(), "no_rule_applied"),
+        ] {
+            assert!(
+                body.transform_request_body_with_context(
+                    &mut ctx,
+                    bytes,
+                    Some("application/json"),
+                    &outbound,
+                )
+                .await
+                .is_none()
+            );
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            assert_eq!(
+                ctx.metadata
+                    .get(BODY_SKIPPED_METADATA_KEY)
+                    .map(String::as_str),
+                Some(reason)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn body_skip_requires_an_enabled_body_rule_instance() {
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    for config in [
+        json!({"rules": [{"operation": "remove", "target": "header", "key": "x-unused"}]}),
+        json!({"rules": [{"operation": "remove", "target": "body", "key": "debug"}],
+            "runtime_overlay_scope": "disabled", "default_enabled": false}),
+    ] {
+        let plugin = RequestTransformer::new(&config).unwrap();
+        let mut ctx = post_ctx();
+        let outbound =
+            run_chain_then_retire(&[&plugin], &mut ctx, integrity_headers(Some("text/plain")))
+                .await;
+        assert!(outbound.is_none(), "no digest retirement or header copy");
+        assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+    }
+}
+
+#[tokio::test]
+async fn digest_retirement_uses_client_framing_on_each_dispatch_surface() {
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    for in_map in [false, true] {
+        for (client_length, backend_length, retired) in [
+            (Some("2"), Some("0"), true),
+            (None, Some("0"), true),
+            (Some("0"), None, false),
+            (Some("0"), Some("2"), false),
+        ] {
+            let mut ctx = post_ctx();
+            let mut outbound = integrity_headers(Some("application/json"));
+            if let Some(length) = client_length {
+                outbound.insert("content-length".to_string(), length.to_string());
+            }
+            retain_client_wire_headers(&mut ctx, &outbound);
+            body.before_proxy(&mut ctx, &mut outbound).await;
+            // Other hooks / finalized-egress overlays can mutate the map;
+            // request_transformer itself forbids authoring Content-Length.
+            if let Some(length) = backend_length {
+                outbound.insert("content-length".to_string(), length.to_string());
+            } else {
+                outbound.remove("content-length");
+            }
+            // Even the materialized view can change; only the wire snapshot
+            // can prove the original client framing.
+            ctx.headers = outbound.clone();
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            for name in ["content-digest", "Repr-Digest", "digest", "content-md5"] {
+                assert_eq!(
+                    !outbound.contains_key(name),
+                    retired,
+                    "{name}, in_map={in_map}, client={client_length:?}, backend={backend_length:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn uncertain_client_framing_cannot_exempt_digest_retirement() {
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    for in_map in [false, true] {
+        for uncertain in [
+            "missing_snapshot",
+            "transfer_encoding",
+            "duplicate_length",
+            "invalid_length",
+        ] {
+            let mut ctx = post_ctx();
+            let mut outbound = integrity_headers(Some("application/json"));
+            outbound.insert("content-length".to_string(), "0".to_string());
+            if uncertain != "missing_snapshot" {
+                let mut wire = http::HeaderMap::new();
+                wire.insert("content-length", http::HeaderValue::from_static("0"));
+                match uncertain {
+                    "transfer_encoding" => {
+                        wire.insert(
+                            "transfer-encoding",
+                            http::HeaderValue::from_static("chunked"),
+                        );
+                    }
+                    "duplicate_length" => {
+                        wire.append("content-length", http::HeaderValue::from_static("0"));
+                    }
+                    "invalid_length" => {
+                        wire.append(
+                            "content-length",
+                            http::HeaderValue::from_bytes(b"\xff").unwrap(),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                ctx.set_raw_headers(wire);
+            }
+            body.before_proxy(&mut ctx, &mut outbound).await;
+            finalize_body_rule_headers_on_surface(&mut ctx, &mut outbound, in_map);
+            assert!(!outbound.contains_key("content-digest"), "{uncertain}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -3278,12 +3508,13 @@ async fn body_non_application_publishes_a_value_free_reason() {
     assert!(out.is_some());
     assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
 
-    // A declared non-JSON upload is reported from `before_proxy`, before the
-    // streaming path skips the body hook entirely.
+    // A declared non-JSON upload is reported at the final-header boundary,
+    // before the streaming path skips the body hook entirely.
     let mut ctx = post_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert("content-type".to_string(), "text/plain".to_string());
     plugin.before_proxy(&mut ctx, &mut headers).await;
+    finalize_body_rule_headers_on_surface(&mut ctx, &mut headers, false);
     assert_eq!(
         ctx.metadata
             .get(BODY_SKIPPED_METADATA_KEY)

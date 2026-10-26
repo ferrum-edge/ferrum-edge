@@ -7268,7 +7268,7 @@ pub(crate) fn apply_finalized_request_egress_header_overlay(
 /// the H1/H2 `Option<HashMap>` clone-on-write shape.
 pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
     plugins: &[Arc<dyn Plugin>],
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     overlay: HashMap<String, String>,
     strip_baggage_keys: &[String],
@@ -7280,6 +7280,7 @@ pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
         headers.insert(name, value);
     }
     refresh_backend_gateway_assertion_headers(ctx, headers);
+    retire_stale_request_integrity_headers_in_map(ctx, headers);
     crate::modes::mesh::hbone::strip_egress_baggage_in_map(headers, strip_baggage_keys);
     run_final_backend_header_policy_hooks(plugins, ctx, headers);
 }
@@ -18361,14 +18362,22 @@ pub fn refresh_backend_gateway_assertion_headers(
 /// final map carries no such field: the check is one scan of the header
 /// names, and the outbound map is copied (clone-on-write) only when a field
 /// must be removed. `ctx.headers` keeps the original inbound view.
+/// Also publish the non-JSON body skip here: a later header-only plugin or
+/// route finalizer can change eligibility after the body instance ran, and a
+/// streaming request never reaches its body hook.
 pub(crate) fn retire_stale_request_integrity_headers(
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
     if !ctx.request_body_integrity_retirement {
         return;
     }
     let effective = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    crate::plugins::request_transformer::record_body_rule_header_skip(
+        &ctx.method,
+        effective,
+        &mut ctx.metadata,
+    );
     if !request_integrity_retirement_applies(ctx, effective) {
         return;
     }
@@ -18379,10 +18388,18 @@ pub(crate) fn retire_stale_request_integrity_headers(
 /// Owned-map variant of [`retire_stale_request_integrity_headers`] for the
 /// native HTTP/3 deferred passes, whose outbound map is already a copy.
 pub(crate) fn retire_stale_request_integrity_headers_in_map(
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
-    if ctx.request_body_integrity_retirement && request_integrity_retirement_applies(ctx, headers) {
+    if !ctx.request_body_integrity_retirement {
+        return;
+    }
+    crate::plugins::request_transformer::record_body_rule_header_skip(
+        &ctx.method,
+        headers,
+        &mut ctx.metadata,
+    );
+    if request_integrity_retirement_applies(ctx, headers) {
         crate::plugins::request_transformer::strip_body_bound_integrity_headers(headers);
     }
 }
@@ -18397,7 +18414,7 @@ fn request_integrity_retirement_applies(
     headers
         .keys()
         .any(|name| is_body_bound_request_integrity_header(name))
-        && request_body_rules_may_rewrite(&ctx.method, headers)
+        && request_body_rules_may_rewrite(ctx, headers)
 }
 
 /// The initial dispatch-boundary gateway-assertion refresh shared by the H1/H2
@@ -37684,7 +37701,7 @@ async fn handle_proxy_request_inner(
     // Stale request digests: decided over the final outbound headers, after
     // every `before_proxy` hook and the route-header finalizer. The native
     // HTTP/3 frontend does the same at the same point — keep both in sync.
-    retire_stale_request_integrity_headers(&ctx, &mut owned_proxy_headers);
+    retire_stale_request_integrity_headers(&mut ctx, &mut owned_proxy_headers);
     // Proxy hop limit (issue #6109): re-assert the forwarded `X-Ferrum-Hops`
     // count on the authoritative outbound map now that every request-phase
     // plugin has run, so no plugin can reset the count the next gateway hop
