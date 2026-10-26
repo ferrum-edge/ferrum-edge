@@ -355,7 +355,7 @@ opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = t
 # (issue #6755). Move it together with the SDK crates;
 # `scripts/verify_dependency_security_chain.py` fails a lockfile that holds
 # more than one aws-smithy-json.
-aws-smithy-json = { version = "0.63.1", optional = true }
+aws-smithy-json = { version = "0.65.0", optional = true }
 # Azure SDK 1.x trio: upgrade all three together (`azure_identity` and the
 # Key Vault client implement/consume `azure_core`'s `TokenCredential`, so a
 # mixed major line does not compile). 1.x refuses bearer auth over non-TLS
