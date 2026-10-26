@@ -111,6 +111,8 @@ const MIN_TIMEOUT_MS: u64 = 100;
 const MAX_RETRY_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
 const MAX_RECONNECT_DELAY_MS: u64 = MAX_BATCH_RETRY_DELAY_MS;
 const MAX_RETRIES: u64 = MAX_BATCH_RETRIES;
+// Memory-pressure cleanup must not inherit the operator's batch flush delay.
+const WS_CODEC_RECLAIM_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Largest batch payload a persistent connection keeps open after sending.
 ///
@@ -1599,20 +1601,19 @@ async fn flush_loop(
 
     let mut buffer: Vec<QueuedEntry> = Vec::with_capacity(cfg.batch_size);
     let mut timer = tokio::time::interval(cfg.flush_interval);
+    let mut reclaim_timer =
+        tokio::time::interval(cfg.flush_interval.min(WS_CODEC_RECLAIM_INTERVAL));
+    reclaim_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut closing = *close_rx.borrow();
     if closing {
         worker.wait_for_admissions().await;
         receiver.close();
     }
     timer.tick().await;
+    reclaim_timer.tick().await;
 
     // Lazily connect — the first flush attempt will establish the connection.
     let mut ws_conn: Option<WsConnection> = None;
-    // Ceiling refusals seen so far. Any new refusal (from this or any other
-    // sink sharing the ceiling) means retained bytes are short, so an idle
-    // kept connection gives its codec charge back at the next tick instead of
-    // holding it until the collector disconnects.
-    let mut observed_ceiling_rejections = cfg.ceiling.rejections();
 
     loop {
         tokio::select! {
@@ -1622,6 +1623,19 @@ async fn flush_loop(
                 closing = true;
                 worker.wait_for_admissions().await;
                 receiver.close();
+            }
+
+            // Check pressure before receiving more entries so a continuously
+            // ready queue cannot starve cleanup. This does not flush a partial
+            // batch or change the configured delivery interval.
+            _ = reclaim_timer.tick() => {
+                let rejections = cfg.ceiling.rejections();
+                if let Some(conn) = ws_conn.take_if(|conn| {
+                    conn.codec_charge.held() > 0
+                        && conn.observed_ceiling_rejections != rejections
+                }) {
+                    retire_connection(&cfg, conn).await;
+                }
             }
 
             msg = receiver.recv() => {
@@ -1654,13 +1668,6 @@ async fn flush_loop(
                     let batch_len = batch.len();
                     ws_conn = send_batch(&cfg, batch, ws_conn).await;
                     decrement_outstanding(&outstanding_count, batch_len);
-                }
-                let rejections = cfg.ceiling.rejections();
-                if rejections != observed_ceiling_rejections {
-                    observed_ceiling_rejections = rejections;
-                    if let Some(conn) = ws_conn.take_if(|conn| conn.codec_charge.held() > 0) {
-                        retire_connection(&cfg, conn).await;
-                    }
                 }
             }
 
@@ -1734,6 +1741,9 @@ struct WsConnection {
     /// connection sent). It only grows, matching the buffer, and is released
     /// when the connection (and with it the buffer) drops.
     codec_charge: GrowableProcessReservation,
+    /// Refusals preceding the latest successful retention/headroom check.
+    /// Only newer pressure can invalidate that decision on an idle tick.
+    observed_ceiling_rejections: u64,
 }
 
 impl WsConnection {
@@ -1844,6 +1854,10 @@ async fn send_batch(
                     drop(payload);
                     let retained = codec_output_charge(sent_len);
                     let charged = ws.codec_charge.held();
+                    // Snapshot BEFORE checking retention: refusals preceding
+                    // this fresh decision are stale, while one racing the
+                    // checks must remain visible to the idle reclaimer.
+                    let rejections = cfg.ceiling.rejections();
                     let keep = sent_len <= WS_MAX_PERSISTENT_FRAME_BYTES
                         && (retained <= charged || ws.codec_charge.try_grow(retained - charged))
                         && ceiling_headroom(cfg.ceiling) >= cfg.admission_reserve_bytes;
@@ -1851,6 +1865,7 @@ async fn send_batch(
                         let _ = tokio::time::timeout(cfg.write_timeout, ws.sink.close()).await;
                         return None;
                     }
+                    ws.observed_ceiling_rejections = rejections;
                     return conn;
                 }
                 Ok(Err(e)) => {
@@ -2125,6 +2140,7 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
                 drain: drain.abort_handle(),
                 drain_done: done_rx,
                 codec_charge: GrowableProcessReservation::new(cfg.ceiling),
+                observed_ceiling_rejections: cfg.ceiling.rejections(),
             })
         }
         // No back-off here: the caller (`send_batch`) owns the retry ladder and
