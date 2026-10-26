@@ -2779,6 +2779,10 @@ async fn invalidated_stream_usage_is_labelled_unmetered_on_both_paths() {
 
     // Buffered SSE.
     let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        "ai_unmetered_reason".to_string(),
+        "stream_without_usage".to_string(),
+    );
     let mut headers =
         HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     plugin
@@ -2790,6 +2794,7 @@ async fn invalidated_stream_usage_is_labelled_unmetered_on_both_paths() {
         )
         .await;
     assert!(ctx.authoritative_ai_usage_export().is_none());
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
     assert!(!ctx.metadata.contains_key("ai_streaming"));
     assert_eq!(ctx.metadata["ai_unmetered_reason"], "no_usage");
 
@@ -2797,6 +2802,8 @@ async fn invalidated_stream_usage_is_labelled_unmetered_on_both_paths() {
     let zero =
         "data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n";
     let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_unmetered_reason".to_string(), "no_usage".to_string());
     drive_token_stream(
         &plugin,
         &mut ctx,
@@ -2810,9 +2817,66 @@ async fn invalidated_stream_usage_is_labelled_unmetered_on_both_paths() {
     assert_eq!(ctx.metadata["ai_total_tokens"], "0");
     assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
     let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_unmetered_reason".to_string(), "no_usage".to_string());
     plugin
         .on_response_body(&mut ctx, 200, &mut headers, zero.as_bytes())
         .await;
     assert_eq!(ctx.metadata["ai_total_tokens"], "0");
     assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+}
+
+/// Issue #6892: invalidation split across chunks must retain the diagnostic
+/// under the configured prefix, including when only observer drop publishes it.
+#[tokio::test]
+async fn invalidated_stream_usage_keeps_prefixed_reason_on_completion_and_disconnect() {
+    let plugin = priced_streaming_plugin(json!({"metadata_prefix": "tenant"}));
+    let body = INVALIDATED_ANTHROPIC_STREAM.as_bytes();
+    let split = INVALIDATED_ANTHROPIC_STREAM
+        .find("bad")
+        .expect("fixture contains a malformed counter")
+        + 1;
+    let (first, rest) = body.split_at(split);
+
+    for complete in [true, false] {
+        let mut ctx = create_test_context();
+        ctx.metadata.insert(
+            "tenant_unmetered_reason".to_string(),
+            "no_usage".to_string(),
+        );
+        ctx.metadata.insert(
+            "ai_unmetered_reason".to_string(),
+            "provider_undetected".to_string(),
+        );
+        let forwarded = drive_token_stream(
+            &plugin,
+            &mut ctx,
+            200,
+            "text/event-stream",
+            &[first, rest],
+            complete,
+        )
+        .await
+        .expect("observer attaches");
+
+        assert_eq!(forwarded, vec![first.to_vec(), rest.to_vec()]);
+        assert_eq!(
+            ctx.metadata["tenant_unmetered_reason"],
+            "stream_without_usage"
+        );
+        assert_eq!(ctx.metadata["ai_unmetered_reason"], "provider_undetected");
+        assert!(ctx.authoritative_ai_usage_export().is_none());
+        for key in [
+            "tenant_prompt_tokens",
+            "tenant_completion_tokens",
+            "tenant_total_tokens",
+            "tenant_estimated_cost",
+            "tenant_streaming",
+        ] {
+            assert!(
+                !ctx.metadata.contains_key(key),
+                "complete={complete}, {key}"
+            );
+        }
+    }
 }
