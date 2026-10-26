@@ -5707,37 +5707,60 @@ async fn lowering_the_cookie_cap_keeps_existing_chunked_sessions() {
 }
 
 /// PR6833-SOL-1: a leader cancelled after the provider answered `2xx` (here
-/// while the JWKS keys for the refreshed ID token are still being fetched)
+/// while UserInfo for the refreshed ID token is still being fetched)
 /// must publish the dropped-token state, so the next request carrying the
 /// spent token adopts it instead of becoming a new leader and resubmitting.
+#[serial_test::serial(jwks_remote_global_cache)]
 #[tokio::test]
 async fn cancelled_leader_after_an_accepted_refresh_never_resubmits_the_spent_token() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let server = MockServer::start().await;
+    // A wiremock server address can be reused while its keys remain in the
+    // process-wide cache. Give this fixture its own URI and signing-key id.
+    let kid = uuid::Uuid::new_v4().to_string();
+    let jwks_path = format!("/cancelled-refresh/{kid}/jwks");
     Mock::given(method("GET"))
-        .and(path("/jwks"))
+        .and(path(jwks_path.as_str()))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_secs(5))
-                .set_body_json(json!({"keys": []})),
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem_with_kid(
+                include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+                &kid,
+            )),
         )
         .mount(&server)
         .await;
+    let now = chrono::Utc::now().timestamp();
+    let id_token = create_rs256_token_with_kid(
+        &json!({
+            "iss": TEST_ISSUER,
+            "aud": "ferrum-gateway",
+            "sub": "oidc-subject",
+            "exp": now + 3600
+        }),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        &kid,
+    );
     Mock::given(method("POST"))
         .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "new-access-token",
             "refresh_token": "rotated-refresh-token",
-            "id_token": "refreshed-id-token-awaiting-jwks",
+            "id_token": id_token,
             "token_type": "Bearer",
             "expires_in": 3600
         })))
         .mount(&server)
         .await;
+    let userinfo_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind UserInfo barrier");
+    let userinfo_addr = userinfo_listener.local_addr().expect("UserInfo address");
     let mut config = refresh_config(&format!("{}/token", server.uri()));
-    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}{jwks_path}", server.uri()));
+    config["providers"][0]["userinfo_endpoint"] = json!(format!("http://{userinfo_addr}/userinfo"));
     let plugin =
         OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
-    let now = chrono::Utc::now().timestamp();
     let cookie = oidc_sealed_refresh_session_cookie_for_test(
         &plugin,
         json!({
@@ -5752,15 +5775,45 @@ async fn cancelled_leader_after_an_accepted_refresh_never_resubmits_the_spent_to
     .expect("session seals");
     let consumer_index = ConsumerIndex::new(&[]);
 
-    // The leader posts the grant, receives the 2xx, then blocks on JWKS and is
-    // dropped by the deadline. (If a reused wiremock address left keys cached,
-    // it completes instead; either way the token must be spent exactly once.)
+    // Only the refresh leader can request UserInfo, after accepting the 2xx
+    // and validating the ID token. A JWKS request would not prove that: the
+    // shared store also fetches keys in the background at construction time.
+    let userinfo_received = async {
+        let (socket, _) = userinfo_listener.accept().await.expect("UserInfo request");
+        let mut held = BufReader::new(socket);
+        let mut line = String::new();
+        held.read_line(&mut line)
+            .await
+            .expect("UserInfo request line");
+        assert_eq!(line, "GET /userinfo HTTP/1.1\r\n");
+        loop {
+            line.clear();
+            let read = held.read_line(&mut line).await.expect("UserInfo headers");
+            assert_ne!(read, 0, "UserInfo request ended before its headers");
+            if line == "\r\n" {
+                break;
+            }
+        }
+        // Keep the connection open without answering until after cancellation.
+        held
+    };
     let mut cancelled = session_ctx(&cookie);
-    let _ = tokio::time::timeout(
-        Duration::from_millis(1500),
-        plugin.authenticate(&mut cancelled, &consumer_index),
-    )
-    .await;
+    let mut authentication = plugin.authenticate(&mut cancelled, &consumer_index);
+    let held_userinfo = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::select! {
+            result = &mut authentication => {
+                panic!("the leader completed before the cancellation barrier: {result:?}")
+            }
+            held = userinfo_received => held,
+        }
+    })
+    .await
+    .expect("the refresh leader must reach the UserInfo barrier");
+    assert!(
+        futures_util::poll!(&mut authentication).is_pending(),
+        "the leader must still be pending when cancelled"
+    );
+    drop(authentication);
     let requests = server.received_requests().await.expect("requests");
     assert_eq!(
         token_endpoint_requests(&requests),
@@ -5783,6 +5836,7 @@ async fn cancelled_leader_after_an_accepted_refresh_never_resubmits_the_spent_to
         1,
         "a consumed refresh token must never be resubmitted after cancellation"
     );
+    drop(held_userinfo);
 }
 
 /// MUSE-14: static authorization parameters and `max_age` are sent with the
