@@ -19643,6 +19643,20 @@ async fn h3_mesh_unary_rpc(
         .await
         .expect("send H3 gRPC request message");
     stream.finish().await.expect("half-close H3 gRPC request");
+    h3_mesh_rpc_response(&mut stream).await
+}
+
+/// Observe a pre-body refusal with the upload still open. The gateway writes
+/// the response and then STOP_SENDING(H3_NO_ERROR); sending DATA or FIN here
+/// would race that legitimate early stop (issue #6905).
+async fn h3_mesh_rpc_before_upload(https_port: u16) -> H3MeshRpcResult {
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}{H3_MESH_RPC_PATH}");
+    let mut stream = h3_mesh_open_stream(&client, &url, &[]).await;
+    h3_mesh_rpc_response(&mut stream).await
+}
+
+async fn h3_mesh_rpc_response(stream: &mut Http3GrpcStream) -> H3MeshRpcResult {
     let (status, headers) = stream
         .recv_response()
         .await
@@ -20180,7 +20194,11 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
     let declared_app_port = h3_mesh_declared_app_port().await;
     let frontend = h3_mesh_frontend_certs();
 
-    let cases: Vec<(&str, Vec<(&'static str, String)>)> = vec![
+    let unresolvable_sidecar_identity =
+        "gRPC over the sidecar mesh mTLS transport requires a resolvable destination identity";
+    let incomplete_cross_cluster_metadata = "gRPC over cross-cluster east-west routing requires a destination SNI override \
+         and a remote trust domain";
+    let cases = [
         (
             "corrupt sidecar identity pin",
             vec![
@@ -20188,6 +20206,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.mtls_port", peer.port.to_string()),
                 ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
             ],
+            unresolvable_sidecar_identity,
         ),
         (
             "cross-cluster sidecar missing the SNI override",
@@ -20197,6 +20216,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.cross_cluster", "true".to_string()),
                 ("mesh.trust_domain", "cluster.local".to_string()),
             ],
+            incomplete_cross_cluster_metadata,
         ),
         (
             "cross-cluster sidecar missing the remote trust domain",
@@ -20206,6 +20226,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.cross_cluster", "true".to_string()),
                 ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
             ],
+            incomplete_cross_cluster_metadata,
         ),
         (
             "cross-cluster with no mesh transport tag",
@@ -20214,6 +20235,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.trust_domain", "cluster.local".to_string()),
                 ("mesh.eastwest_sni", H3_MESH_EASTWEST_SNI.to_string()),
             ],
+            "gRPC over cross-cluster east-west routing requires a mesh transport tag",
         ),
         (
             "both mesh transports declared on one target",
@@ -20224,6 +20246,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
                 ("mesh.hbone_port", peer.port.to_string()),
                 ("mesh.spiffe_id", H3_MESH_PEER_SPIFFE.to_string()),
             ],
+            "gRPC dispatch refused: the selected target declares two conflicting mesh transports",
         ),
     ];
 
@@ -20235,7 +20258,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
         "not-a-spiffe-id",
     ];
 
-    for (label, tags) in cases {
+    for (label, tags, expected_message) in cases {
         let dead_backend_port = reserve_unique_mesh_port().await;
         let targets = h3_mesh_target_yaml("127.0.0.1", declared_app_port, &tags);
         let (mut gateway, https_port) = spawn_h3_mesh_gateway(
@@ -20247,10 +20270,13 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
         .await;
 
         let accepts_before = peer.accept_count();
-        let result = h3_mesh_unary_rpc(https_port, b"h3-refused", &[]).await;
+        // The gate must refuse without waiting for any request DATA or FIN.
+        // Read the actual response; an upload reset alone proves no refusal.
+        let result = h3_mesh_rpc_before_upload(https_port).await;
 
+        assert_eq!(result.status, http::StatusCode::OK, "{label}");
         assert_eq!(
-            result.grpc_status().as_deref(),
+            h3_mesh_header(&result.headers, "grpc-status").as_deref(),
             Some("14"),
             "{label}: an unmaterializable mesh transport must fail closed with \
              gRPC UNAVAILABLE: {:?} / {:?}",
@@ -20261,12 +20287,20 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
             result.body.is_empty(),
             "{label}: a pre-dial refusal must carry no response body"
         );
+        assert!(
+            result.trailers.is_empty(),
+            "{label}: expected Trailers-Only refusal"
+        );
         assert_eq!(
             peer.accept_count(),
             accepts_before,
             "{label}: the refusal must happen BEFORE any dial to the peer"
         );
         let message = result.grpc_message().unwrap_or_default();
+        assert_eq!(
+            message, expected_message,
+            "{label}: the refusal must identify the failed transport contract"
+        );
         for secret in secrets {
             assert!(
                 !message.contains(secret),
@@ -20454,12 +20488,12 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     //    ordinary direct-dial one, so the mesh listener must stop being reached.
     let peer_b_accepts = peer_b.accept_count();
     h3_mesh_reload(&gateway, config_for(&[], 2), &[]).await;
-    let withdrawn = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
-    assert_ne!(
+    let withdrawn = h3_mesh_rpc_before_upload(https_port).await;
+    assert_eq!(
         withdrawn.grpc_status().as_deref(),
-        Some("0"),
+        Some("14"),
         "with the mesh transport withdrawn, the declared app port is not \
-         listening, so the RPC must not succeed: {:?} / {:?}",
+         listening, so the RPC must fail with UNAVAILABLE: {:?} / {:?}",
         withdrawn.headers,
         withdrawn.trailers
     );
@@ -20479,7 +20513,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
     ];
     h3_mesh_reload(&gateway, config_for(&corrupted_tags, 3), &corrupted_tags).await;
-    let corrupted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
+    let corrupted = h3_mesh_rpc_before_upload(https_port).await;
     assert_eq!(
         corrupted.grpc_status().as_deref(),
         Some("14"),

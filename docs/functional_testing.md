@@ -4,6 +4,22 @@ This guide covers Ferrum Edge functional testing, with a focus on Control Plane 
 
 ## Test Files
 
+### H3 mesh refusals and direct HTTP/1.1 uploads
+
+`functional_mesh_mode_test.rs` checks malformed mesh transport metadata with
+the H3 request upload still open. It reads the complete trailers-only gRPC
+UNAVAILABLE response without sending request DATA or FIN: the transport gate
+must refuse before reading the body, and the server may stop the unused upload
+with `H3_NO_ERROR`. An upload reset alone is not evidence of a refusal.
+
+`functional_http1_direct_pool_test.rs::direct_h1_streams_uploads_byte_exact`
+waits for `ferrum_connection_pool_h1_idle_connections` to report one idle
+connection after each byte-exact echo. Receiving the response's final bytes
+can precede hyper's sender becoming ready and the pool's asynchronous check-in.
+The next upload starts only after that check-in, and the test still requires
+exactly one backend connection, one dial, and reuse on every later upload.
+The wait polls pool state with a bounded deadline; it does not replay uploads.
+
 ### scripted_backend_matrix_tests.rs
 
 Located in `tests/functional/scripted_backend_matrix_tests.rs`; cross-protocol
