@@ -18,9 +18,9 @@
 # Build the eBPF targets with `FEATURES=cloud-secrets,ebpf`; hosted CI exercises
 # all three contracts.
 ARG FEATURES=cloud-secrets
-# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
-ARG IPROUTE2_BASE=debian:13-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+# Digest resolved 2026-10-26; the tag is kept for readability, the digest is authoritative.
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
+ARG IPROUTE2_BASE=debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 ARG IPROUTE2_VERSION=6.15.0-1
 ARG BPF_LINKER_VERSION=0.11.0
 ARG BPF_LINKER_AMD64_SHA256=10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450
@@ -42,8 +42,8 @@ ARG EBPF_NIGHTLY_TOOLCHAIN=nightly-2026-09-30
 # `cargo +<toolchain>`, which takes precedence over the toolchain file.
 # `--locked` builds exactly ebpf/Cargo.lock and fails instead of re-resolving.
 # core-only build-std matches the crate's `#![no_std]` + `panic = "abort"`.
-# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a AS ebpf-builder
+# Digest resolved 2026-10-26; the tag is kept for readability, the digest is authoritative.
+FROM rust:latest@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
 ARG BPF_LINKER_AMD64_SHA256
@@ -94,8 +94,8 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
         /iproute2-root /distroless-root "${IPROUTE2_VERSION}"
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
-# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a AS builder
+# Digest resolved 2026-10-26; the tag is kept for readability, the digest is authoritative.
+FROM rust:latest@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
 
 # Install build dependencies
 # clang/libclang-dev: required by bindgen (used by zstd-sys)
