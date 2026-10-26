@@ -3883,6 +3883,122 @@ fn record_identity(registry: &ChargebackRegistry, consumer: &str) {
     );
 }
 
+/// Empty bandwidth-only disconnects must not occupy invisible, unevictable
+/// identity rows and force a later real charge into overflow.
+#[test]
+fn test_zero_byte_websocket_disconnects_do_not_exhaust_identity_budget() {
+    for (bytes_sent, bytes_received) in [(100, 0), (0, 200), (100, 200)] {
+        let registry = ChargebackRegistry::new();
+        registry.configure(5, 3600, 0, 2, TEST_MAX_BYTES);
+        let s = scope();
+
+        // Exercise the registry path used by on_ws_disconnect with bandwidth
+        // pricing enabled, across more distinct consumers than max_entries.
+        for index in 0..8 {
+            registry.record_websocket_bandwidth(
+                &s,
+                &format!("empty-ws-{index}"),
+                "proxy-a",
+                "My API",
+                0,
+                0,
+                0.001,
+                0.001,
+            );
+        }
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.reserved_entries_for_tests(), 0);
+        assert_eq!(registry.retained_bytes_for_tests(), 0);
+
+        registry.render_prometheus().unwrap();
+        registry.render_prometheus().unwrap();
+        assert_eq!(registry.evict_stale(0), 0);
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.reserved_entries_for_tests(), 0);
+        assert_eq!(registry.retained_bytes_for_tests(), 0);
+
+        // Either direction alone is activity, even though WebSocket bandwidth
+        // does not count a call. Preserve the consumer's own row and counters.
+        registry.record_websocket_bandwidth(
+            &s,
+            "active-ws",
+            "proxy-a",
+            "My API",
+            bytes_sent,
+            bytes_received,
+            0.001,
+            0.001,
+        );
+        let key = make_key_with_prices(
+            "active-ws",
+            "proxy-a",
+            0,
+            ProtocolFamily::Http,
+            0.0,
+            0.001,
+            0.001,
+        );
+        let entry = registry.entries.get(&key).expect("real charge admitted");
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), bytes_sent);
+        assert_eq!(
+            entry.bytes_received_total.load(Ordering::Relaxed),
+            bytes_received
+        );
+        drop(entry);
+
+        // The earlier empty exports cannot acknowledge this later charge.
+        let retained_bytes = registry.retained_bytes_for_tests();
+        assert!(retained_bytes > 0);
+        assert_eq!(registry.evict_stale(0), 0);
+        assert_eq!(registry.entries.len(), 1);
+        assert!(registry.entries.contains_key(&key));
+        assert_eq!(registry.reserved_entries_for_tests(), 1);
+        assert_eq!(registry.retained_bytes_for_tests(), retained_bytes);
+    }
+}
+
+/// Zero bytes alone do not make HTTP calls or stream connections empty records,
+/// including when their per-call price is zero.
+#[test]
+fn test_zero_byte_calls_and_stream_connections_still_consume_identity_budget() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 0, 2, TEST_MAX_BYTES);
+    let s = scope();
+    registry.record_http(
+        &s,
+        "http-user",
+        "proxy-a",
+        "My API",
+        200,
+        0.0,
+        0,
+        0,
+        0.001,
+        0.001,
+    );
+    registry.record_stream(
+        &s,
+        "stream-user",
+        "proxy-a",
+        "My API",
+        0.0,
+        0,
+        0,
+        0.001,
+        0.001,
+    );
+
+    assert_eq!(registry.evict_stale(0), 0);
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(registry.reserved_entries_for_tests(), 2);
+    for entry in registry.entries.iter() {
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(entry.bytes_sent_total.load(Ordering::Relaxed), 0);
+        assert_eq!(entry.bytes_received_total.load(Ordering::Relaxed), 0);
+    }
+}
+
 /// Distinct identities beyond `max_entries` must not grow the registry, and
 /// their charges must survive in the fixed-cardinality aggregate row.
 #[test]

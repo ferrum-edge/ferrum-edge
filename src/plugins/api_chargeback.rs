@@ -1911,6 +1911,12 @@ impl ChargebackRegistry {
         bw_price_received: f64,
         count_call: bool,
     ) {
+        // Empty WebSocket sessions have neither a call nor bandwidth to retain.
+        // Avoid reserving an invisible identity row that cannot be collected.
+        if !count_call && bytes_sent == 0 && bytes_received == 0 {
+            return;
+        }
+
         // Bound the billing identity collision-resistantly: within the bound
         // this borrows and allocates nothing, and an oversized identity keeps a
         // digest of its complete value so two principals sharing a prefix stay
