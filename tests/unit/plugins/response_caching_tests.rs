@@ -9855,6 +9855,56 @@ fn ignore_request_headers_default_is_not_a_header_mutator() {
 }
 
 #[test]
+fn ignore_request_headers_refuses_host_and_hop_by_hop_backend_folded_spellings() {
+    for header in [
+        "connection",
+        "host",
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        for spelling in [
+            header.to_string(),
+            header.to_ascii_uppercase(),
+            header.replace('-', "_"),
+            header.replace('-', "_").to_ascii_uppercase(),
+        ] {
+            let config = json!({ "ignore_request_headers": ["x-request-id", spelling.as_str()] });
+            let error = ResponseCaching::new(&config)
+                .err()
+                .unwrap_or_else(|| panic!("{spelling} must not be ignorable"));
+            assert!(
+                error.contains("`ignore_request_headers[1]`")
+                    && error.contains("names a request header the cache or the proxy interprets"),
+                "diagnostic must identify the refused transport field: {spelling}: {error}"
+            );
+            assert!(
+                validate_plugin_config("response_caching", &config).is_err(),
+                "shared admission must refuse {spelling}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ignore_request_headers_allows_unrelated_underscore_names() {
+    for header in ["keep_alive_extra", "x_transfer_encoding", "x_cdn_hop"] {
+        let config = json!({ "ignore_request_headers": [header] });
+        assert!(
+            ResponseCaching::new(&config).is_ok(),
+            "unrelated field {header} must remain ignorable"
+        );
+        assert!(
+            validate_plugin_config("response_caching", &config).is_ok(),
+            "shared admission must allow {header}"
+        );
+    }
+}
+
+#[test]
 fn ignore_request_headers_refuses_names_the_cache_cannot_safely_ignore() {
     for header in [
         "authorization",
