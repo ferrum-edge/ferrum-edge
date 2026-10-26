@@ -6,8 +6,9 @@ node-agent, mesh CA) use the sibling [`ferrum-mesh`](../ferrum-mesh) chart
 instead — the two charts share naming, labelling, secret, and validation
 conventions so they feel like one product.
 
-The current `appVersion` is **0.9.17**, the published v0.9.17 release. When
-you override `image.tag`, pin a published release tag and keep the migration
+The current `appVersion` is **0.9.18**, the v0.9.18 release. Until v0.9.18 is
+published, pin the published v0.9.17 tag. When you override `image.tag`, pin a
+published release tag and keep the migration
 Job and gateway pins on the same build.
 
 | Mode | `mode` value | Proxy | Admin | Extra config |

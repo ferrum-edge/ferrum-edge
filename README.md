@@ -607,6 +607,11 @@ at `f7ba1a9b9885900d1e110f76d38e37a02eda13c8`, published on
 exists because Edge v0.9.16 was tagged but never published. Earlier contract
 tags remain unchanged.
 
+The **v0.9.18 candidate** collects the plugin production-launch hardening.
+Its protected production release and the matching `contracts-edge-0.9.18`
+publication must succeed before consumers move their pins. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0918).
+
 **v0.9.17** carries the changes from tagged but unpublished v0.9.16. It adds
 the `loop_detected` gateway-error token, the
 `X-Ferrum-Hops` request header, and rejection phases for hop admission and

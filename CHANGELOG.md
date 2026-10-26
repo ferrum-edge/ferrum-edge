@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-10-26
+
+This release is the production-launch hardening pass across the plugin
+catalog. Every built-in plugin was independently reviewed. The resulting fixes
+tighten authentication, credential and assertion hiding, request and response
+size limits, rate limiting, logging sinks, and the AI-gateway and mesh plugins.
+Many changes refuse configuration or traffic that 0.9.17 accepted. The `V001`
+baseline checksum is unchanged from 0.9.17. Read
+[Upgrading to 0.9.18](docs/upgrade_guide.md#upgrading-to-0918) before updating
+gateways, control planes, custom plugins, charts or contract consumers.
+
 ### Added
 - **Strict OpenAPI parameter imports** (issue #6888 / PR #6918). The opt-in
   `x-ferrum-validate.reject_unsupported_parameters: true` refuses
@@ -11531,7 +11542,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.18...HEAD
+[0.9.18]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.17
 [0.9.16]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.16
 [0.9.15]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.14...v0.9.15
