@@ -11718,3 +11718,87 @@ async fn mesh_authz_matches_a_plugin_inserted_mixed_case_header_on_every_surface
         }
     }
 }
+
+#[tokio::test]
+async fn mesh_authz_case_variant_readings_match_egress_for_lists_cookies_and_singletons() {
+    use ferrum_edge::proxy::headers::merge_proxy_headers_preserving_repeated;
+
+    for (names, joined) in [
+        (["X-Tenant", "x-TENANT", "x-tenant"], "ok, blocked"),
+        (["Cookie", "cOOKIE", "cookie"], "ok; blocked"),
+        (["Authorization", "aUTHORIZATION", "authorization"], "ok"),
+    ] {
+        for with_lowercase in [false, true] {
+            let expected = if with_lowercase {
+                match names[2] {
+                    "authorization" => "lowercase",
+                    "cookie" => "ok; blocked; lowercase",
+                    _ => "ok, blocked, lowercase",
+                }
+            } else {
+                joined
+            };
+            for when_condition in [false, true] {
+                let mut deny = allow_client_policy(PolicyAction::Deny);
+                if when_condition {
+                    deny.rules[0].when = vec![ConditionMatch {
+                        key: format!("request.headers[{}]", names[2]),
+                        values: vec![expected.to_owned()],
+                        not_values: Vec::new(),
+                    }];
+                } else {
+                    deny.rules[0].to = vec![RequestMatch {
+                        headers: HashMap::from([(names[2].to_owned(), expected.to_owned())]),
+                        ..RequestMatch::default()
+                    }];
+                }
+                let plugin = MeshAuthz::new(&json!({ "mesh_policies": [deny] })).unwrap();
+                for materialized in [false, true] {
+                    for reverse_insertion in [false, true] {
+                        let mut ctx =
+                            request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+                        ctx.set_raw_headers(http::HeaderMap::new());
+                        if materialized {
+                            ctx.materialize_headers();
+                        }
+                        let mut entries = vec![(names[0], "ok"), (names[1], "blocked")];
+                        if with_lowercase {
+                            entries.push((names[2], "lowercase"));
+                        }
+                        if reverse_insertion {
+                            entries.reverse();
+                        }
+                        ctx.headers.extend(
+                            entries
+                                .into_iter()
+                                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+                        );
+
+                        // Exercise egress BEFORE authorization has had a chance
+                        // to normalize the map: direct merge callers must agree.
+                        let mut outbound = http::HeaderMap::new();
+                        merge_proxy_headers_preserving_repeated(&mut outbound, &ctx.headers);
+                        assert_eq!(outbound.get(names[2]).unwrap(), expected);
+                        assert_eq!(outbound.get_all(names[2]).iter().count(), 1);
+                        assert!(matches!(
+                            plugin.authorize(&mut ctx).await,
+                            PluginResult::Reject {
+                                status_code: 403,
+                                ..
+                            }
+                        ));
+                        assert_eq!(ctx.headers.get(names[2]).unwrap(), expected);
+                        assert_eq!(ctx.headers.len(), 1);
+
+                        // The positive denial is not an unconditional refusal.
+                        ctx.headers.insert(names[2].to_owned(), "clean".to_owned());
+                        assert!(matches!(
+                            plugin.authorize(&mut ctx).await,
+                            PluginResult::Continue
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}

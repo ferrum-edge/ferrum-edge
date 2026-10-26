@@ -2223,7 +2223,7 @@ content-length: 0\r\n\r\n";
     /// A vetted value an earlier plugin published under an operator-cased key
     /// reaches the provider, read the same way the policy matchers read it.
     #[tokio::test]
-    async fn a_plugin_inserted_mixed_case_header_is_forwarded_to_the_provider() {
+    async fn plugin_inserted_case_variants_are_forwarded_with_the_same_egress_value() {
         let stub = start_stub(StubBehavior::Allow).await;
         let slice = json!({
             "node_id": "node-a",
@@ -2277,6 +2277,27 @@ content-length: 0\r\n\r\n";
             vec!["blocked".to_string()],
             "the provider sees the plugin-published value, not the removed client one"
         );
+
+        // A second operator-cased spelling must be folded, not selected by
+        // either the provider check or egress in their own iteration order.
+        ctx.headers
+            .insert("x-TENANT".to_string(), "second".to_string());
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert_eq!(
+            seen_header_lines(&seen, "x-tenant"),
+            vec!["blocked, second".to_string()]
+        );
+        let mut outbound = http::HeaderMap::new();
+        ferrum_edge::proxy::headers::merge_proxy_headers_preserving_repeated(
+            &mut outbound,
+            &ctx.headers,
+        );
+        assert_eq!(outbound["x-tenant"], "blocked, second");
+        assert_eq!(outbound.get_all("x-tenant").iter().count(), 1);
     }
 
     #[tokio::test]

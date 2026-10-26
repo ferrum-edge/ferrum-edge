@@ -365,6 +365,28 @@ These headers are injected on all proxy paths (HTTP/1.1, HTTP/2, HTTP/3, gRPC, c
 
 ---
 
+## Plugin-written request header names
+
+Plugins should write lowercase request header names. If a plugin leaves several
+case variants of one name in a request map, materialization, mesh authorization,
+and backend dispatch fold them into one lowercase entry. List and extension
+fields join their values in byte-wise key order with `, `; `Cookie` uses `; `.
+Known singleton fields prefer an existing lowercase key; otherwise the byte-wise
+smallest key wins. This avoids hash-order-dependent authorization and forwarding.
+
+Singleton fields are `Authorization`, `Proxy-Authorization`, `Host`,
+`Content-Length`, `Content-Type`, `Content-Location`, `Content-Range`,
+`Content-Disposition`, `Date`, `From`, `If-Modified-Since`,
+`If-Unmodified-Since`, `If-Range`, `Max-Forwards`, `Origin`, `Range`, `Referer`,
+`User-Agent`, `Grpc-Timeout`, `Grpc-Encoding`, `Traceparent`, `Idempotency-Key`,
+`Sec-WebSocket-Key`, and `Sec-WebSocket-Version`.
+
+Maps with no duplicate variants keep their existing storage and spelling. This
+folding adds no allocation to that case. The same rule applies to HTTP/1.1,
+HTTP/2, HTTP/3, gRPC, WebSocket handshakes, secured mesh replay, and secondary
+requests (mirrors and load tests). Ordinary wire-header multiplicity and order
+are unchanged; untouched repeated raw fields remain separate on replay.
+
 ## Final Response Framing
 
 Every H1/H2/H3 response builder is preceded by one shared client-wire
@@ -10490,6 +10512,8 @@ config:
 **Never-match matchers are refused.** Construction also runs the same per-policy matcher validation a mesh document gets from `MeshConfig::validate`, on both the flat `mesh_policies` form and an embedded `mesh_slice`: a `to.headers` pseudo-header (`:path`, `:method`, `:authority`, `:scheme` — use `to.paths` / `to.methods` / `to.hosts`, or `when: request.headers[:path]`), an invalid `hosts` / `not_hosts` pattern, an inadmissible `port_patterns` / `not_port_patterns` entry (for example `70000*` or `8*0`), an empty `from: [{}]` or `to: [{}]` entry, and an empty policy `name` / `namespace` are rejected with a field-specific diagnostic. Each would otherwise be accepted and never match — fail-open for a DENY.
 
 **Repeated headers.** A header the client sends as several field lines is judged as ONE value — every line joined with `, ` (`; ` for `cookie`) — by `to.headers`, `when: request.headers[...]`, and the headers forwarded to a `CUSTOM` provider alike, independent of whether anything materialized the headers first. See [Rule Matching](mesh.md#rule-matching).
+
+Plugin-written case variants use the shared [request-map folding rule](#plugin-written-request-header-names), so those authorization surfaces and backend egress select the same value.
 
 **Trusted identity is required for identity-constrained rules.** `mesh_authz` authorizes the identity another plugin established; it does not authenticate. Without the `spiffe_identity` plugin (or an authenticated HBONE peer), `source_principal` is absent, so every rule carrying a nonempty positive `from` source-principal constraint misses, and a policy set whose ALLOW rules all carry such constraints denies everything. An ALLOW rule with no source-principal (or request-principal / source-negation) constraint is unconstrained and still matches an anonymous request — intentional Istio-style semantics — unless an independent DENY or CUSTOM refusal applies. Deploy it behind mesh mTLS, not on a plaintext listener.
 

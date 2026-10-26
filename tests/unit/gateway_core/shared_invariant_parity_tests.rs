@@ -3144,6 +3144,81 @@ fn without_inline_test_module(text: &str) -> &str {
 }
 
 #[test]
+fn request_header_case_variants_are_folded_at_shared_authz_and_egress_boundaries() {
+    for (path, signature, delegation) in [
+        (
+            "src/plugins/mod.rs",
+            "pub fn materialize_headers(&mut self)",
+            "crate::proxy::headers::canonicalize_request_header_map(&mut self.headers)",
+        ),
+        (
+            "src/plugins/mesh/authz.rs",
+            "async fn authorize(&self, ctx: &mut RequestContext)",
+            "crate::proxy::headers::canonicalize_request_header_map(&mut ctx.headers)",
+        ),
+        (
+            "src/proxy/headers.rs",
+            "pub fn merge_proxy_headers_preserving_repeated(",
+            "canonical_request_header_map(proxy_headers)",
+        ),
+        (
+            "src/proxy/headers.rs",
+            "pub fn filter_secondary_request_headers(",
+            "canonical_request_header_map(headers)",
+        ),
+        (
+            "src/proxy/mod.rs",
+            "pub(crate) fn refresh_initial_backend_gateway_assertion_headers(",
+            "headers_mod::canonicalize_request_header_map(",
+        ),
+        (
+            "src/proxy/mod.rs",
+            "pub fn refresh_backend_gateway_assertion_headers(",
+            "headers_mod::canonicalize_request_header_map(headers)",
+        ),
+        (
+            "src/proxy/mod.rs",
+            "pub(crate) fn run_final_backend_header_policy_hooks(",
+            "headers_mod::canonicalize_request_header_map(headers)",
+        ),
+    ] {
+        let text = source(path);
+        let terminator = if path.starts_with("src/plugins/") {
+            "\n    }"
+        } else {
+            "\n}"
+        };
+        let body = item_body(&text, signature, terminator);
+        assert!(
+            body.contains(delegation),
+            "{path}: {signature} must fold through the shared request-map rule"
+        );
+    }
+    // Both frontends share the initial map boundary for HTTP, gRPC, and
+    // WebSocket dispatch; deferred passes and egress overlays use its refresh.
+    for path in ["src/proxy/mod.rs", "src/http3/server.rs"] {
+        let text = source(path);
+        let minimum = if path == "src/proxy/mod.rs" { 2 } else { 1 };
+        assert!(
+            text.matches("refresh_initial_backend_gateway_assertion_headers(")
+                .count()
+                >= minimum
+        );
+    }
+    let text = source("src/proxy/mod.rs");
+    let initial = item_body(
+        &text,
+        "pub(crate) fn refresh_initial_backend_gateway_assertion_headers(",
+        "\n}",
+    );
+    assert!(
+        initial.find("canonicalize_request_header_map(").unwrap()
+            < initial.find("return;").unwrap(),
+        "anonymous requests must fold before the no-assertion early return"
+    );
+}
+
+#[test]
 fn every_consumer_assertion_boundary_routes_through_the_shared_namespace_predicate() {
     for &(boundary, file, delegation) in CONSUMER_ASSERTION_NAMESPACE_SITES {
         let text = source(file);
