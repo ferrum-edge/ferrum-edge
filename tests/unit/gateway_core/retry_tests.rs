@@ -379,8 +379,20 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
         "candidate maxRetries must be re-resolved after select_next_retry_target"
     );
     let intermediate_record = retry_body
-        .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+        .find("record_backend_admission_retry_outcome(")
         .expect("HTTP retry intermediate outcome recording must remain present");
+    let intermediate_helper = src
+        .split_once("pub(crate) fn record_backend_admission_retry_outcome(")
+        .expect("HTTP retry intermediate outcome helper must remain present")
+        .1
+        .split_once("\n}\n")
+        .expect("HTTP retry intermediate outcome helper end not found")
+        .0;
+    assert!(
+        intermediate_helper.contains("if let Some(permits) = permits.take()")
+            && intermediate_helper.contains("permits.record_backend_outcome(outcome);"),
+        "the retry outcome helper must consume and settle the replaced attempt's permit"
+    );
     assert!(
         retry_cap_gate < intermediate_record
             && retry_body[retry_cap_gate..intermediate_record].contains("break;"),
@@ -402,6 +414,10 @@ fn http_retry_re_resolves_mesh_transport_before_each_dispatch() {
         .find("proxy_to_backend_retry(")
         .expect("plain retry dispatch not found");
 
+    assert!(
+        intermediate_record < admission,
+        "the replaced attempt must be settled before admission and dispatch of each retry"
+    );
     assert!(selection < hbone && selection < mesh_mtls);
     assert!(hbone < admission && mesh_mtls < admission);
     assert!(admission < mesh_dispatch && mesh_dispatch < plain_dispatch);
