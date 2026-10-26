@@ -17,7 +17,9 @@ Companion documents:
 > page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
 > tag). The latest published release is **v0.9.17**, which replaces the
 > v0.9.16 tag that was never published (see the
-> [changelog](../CHANGELOG.md#0917---2026-10-10)). Read
+> [changelog](../CHANGELOG.md#0917---2026-10-10)). **v0.9.18** is the current
+> release candidate (see the
+> [changelog](../CHANGELOG.md#0918---2026-10-26)). Read
 > [support_policy.md](support_policy.md) before treating any item here as a
 > stability commitment.
 >

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.18] - 2026-10-26
+
+This release is the production-launch hardening pass across the plugin
+catalog. Every built-in plugin was independently reviewed. The resulting fixes
+tighten authentication, credential and assertion hiding, request and response
+size limits, rate limiting, logging sinks, and the AI-gateway and mesh plugins.
+Many changes refuse configuration or traffic that 0.9.17 accepted, and the
+`V001` database baseline changed. Read
+[Upgrading to 0.9.18](docs/upgrade_guide.md#upgrading-to-0918) before updating
+gateways, control planes, custom plugins, charts or contract consumers.
+
 ### Added
 - **Strict OpenAPI parameter imports** (issue #6888 / PR #6918). The opt-in
   `x-ferrum-validate.reject_unsupported_parameters: true` refuses

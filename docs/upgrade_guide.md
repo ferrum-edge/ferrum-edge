@@ -26,7 +26,18 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Upgrading to the next release (unreleased)
+## Upgrading to 0.9.18
+
+0.9.18 was prepared on 2026-10-26 UTC from `main` and follows 0.9.17
+directly. It collects the plugin production-launch hardening review together
+with other security and correctness fixes. Many sections below refuse
+configuration or traffic that 0.9.17 accepted, so review every section before
+upgrading. The `V001` database baseline changed after 0.9.17, so the build-out
+database rules above apply: recreate the database instead of pointing the new
+binary at an existing one. CP/DP must run the same build, and the ConfigSync
+revision remains `3`. The matching `contracts-edge-0.9.18` release must be cut
+from the verified release commit; move downstream contract pins when each
+consumer adopts 0.9.18.
 
 ### `response_caching` refuses underscore-spelled transport fields in `ignore_request_headers` (#6913, issue #6887)
 
