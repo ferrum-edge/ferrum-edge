@@ -5106,6 +5106,75 @@ async fn owner_with_corrupted_mode_staging_rejects_on_every_request_hook() {
     ));
 }
 
+/// Route credential names must be removed behaviorally in both wire modes,
+/// including a trailer block whose only field is the credential.
+#[tokio::test]
+async fn custom_credential_request_trailers_are_stripped_before_native_dispatch() {
+    const CREDENTIAL: &str = "x-private-api-key";
+    let message = request_frame(0x00, b"hello");
+    for (block, expected) in [
+        (
+            "X-Private-Api-Key: test-credential-canary\r\nx-app-id: keep\r\n",
+            Some(vec![("x-app-id".to_string(), "keep".to_string())]),
+        ),
+        ("X-Private-Api-Key: test-credential-canary\r\n", None),
+    ] {
+        let mut binary = message.clone();
+        binary.extend_from_slice(&request_frame(0x80, block.as_bytes()));
+        for (content_type, wire) in [
+            ("application/grpc-web+proto", binary.clone()),
+            (
+                "application/grpc-web-text+proto",
+                grpc_web_text_body(&binary),
+            ),
+        ] {
+            // The control proves the name is ordinary metadata without the
+            // route's credential plan, rather than a globally forbidden name.
+            let (_, control, outcome) = run_grpc_web_request_pipeline(content_type, &wire).await;
+            assert!(matches!(outcome, PluginResult::Continue));
+            assert!(control.unwrap().iter().any(|(name, _)| name == CREDENTIAL));
+
+            let plugin = create_plugin_default();
+            let mut ctx = create_grpc_web_context(content_type);
+            ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
+                &mut ctx,
+                vec![CREDENTIAL.to_string()],
+            );
+            assert!(matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ));
+            let mut headers = ctx.headers.clone();
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+            let transformed = plugin
+                .transform_request_body_with_context(&mut ctx, &wire, None, &headers)
+                .await
+                .expect("trailer frame is removed");
+            assert_eq!(
+                transformed, message,
+                "{content_type}: preserve message bytes"
+            );
+            assert_eq!(
+                ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
+                expected,
+                "{content_type}: credential must not reach native trailers"
+            );
+            assert!(
+                matches!(
+                    plugin
+                        .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
+                        .await,
+                    PluginResult::Continue
+                ),
+                "a credential-only block must not cause a staging failure"
+            );
+        }
+    }
+}
+
 /// grpc_web-SOL-2: a request trailer block that admission accepted at the
 /// 8 KiB boundary, written without the optional space after each colon, must
 /// reach dispatch intact rather than be dropped by a stricter re-measure.

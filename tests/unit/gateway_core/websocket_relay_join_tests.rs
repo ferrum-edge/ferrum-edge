@@ -960,3 +960,122 @@ async fn test_lazy_timeout_fast_path_has_no_overhead() {
          (saw {elapsed:?})",
     );
 }
+
+/// Poll the relay before its H2 driver on a single-thread runtime. Before the
+/// fix, both relay halves could finish in that poll, scheduling CANCEL before
+/// the driver had sent the queued Close DATA. No sleep or socket race is needed.
+#[tokio::test]
+async fn policy_close_reaches_h2_backend_before_transport_drop_in_both_directions() {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::{
+        make_ws_session_meta, open_h2_byte_tunnel_for_test, run_framed_websocket_relay_for_test,
+    };
+    use ferrum_edge::plugins::Plugin;
+    use ferrum_edge::plugins::ws_message_size_limiting::WsMessageSizeLimiting;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::WebSocketStream;
+
+    for from_client in [true, false] {
+        let (h2_client, h2_server) = tokio::io::duplex(16 * 1024);
+        let backend = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(h2_server).await.expect("H2 server");
+            let (request, mut respond) = connection.accept().await.unwrap().expect("CONNECT");
+            assert_eq!(request.method(), http::Method::CONNECT);
+            let mut recv = request.into_body();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .expect("CONNECT response");
+            if !from_client {
+                let mut frame = vec![0x82, 17];
+                frame.extend_from_slice(&[0; 17]);
+                send.send_data(Bytes::from(frame), false)
+                    .expect("oversized backend frame");
+            }
+            let receive = async move {
+                let mut wire = Vec::new();
+                while let Some(chunk) = recv.data().await {
+                    let chunk = chunk.expect("Close DATA must survive H2 teardown without CANCEL");
+                    recv.flow_control().release_capacity(chunk.len()).unwrap();
+                    wire.extend_from_slice(&chunk);
+                }
+                send.send_data(Bytes::new(), true).expect("backend EOF");
+                wire
+            };
+            let drive = async {
+                if let Some(request) = connection.accept().await {
+                    panic!("unexpected additional CONNECT: {request:?}");
+                }
+            };
+            let (wire, ()) = tokio::join!(receive, drive);
+            wire
+        });
+        let (sender, mut connection) = h2::client::handshake(h2_client).await.expect("H2 client");
+        let tunnel = tokio::select! {
+            result = open_h2_byte_tunnel_for_test(sender) => result.expect("byte tunnel"),
+            result = &mut connection => panic!("H2 closed during CONNECT: {result:?}"),
+        };
+        // Stop polling the H2 driver until the relay has had its first poll.
+        // The production backend framer receives the backend-direction ceiling
+        // at handshake time; the client framer is configured inside the relay.
+        let config = WebSocketConfig::default().max_frame_size(Some(16));
+        let backend_ws = WebSocketStream::from_raw_socket(tunnel, Role::Client, Some(config)).await;
+        let (gateway_client, client_io) = tokio::io::duplex(1024);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        if from_client {
+            client
+                .send(Message::Binary(vec![0; 17].into()))
+                .await
+                .expect("client attack");
+        }
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+            WsMessageSizeLimiting::new(&serde_json::json!({
+                "max_frame_bytes": 16, "close_reason": "mesh ceiling"
+            }))
+            .expect("size policy"),
+        )];
+        let meta = make_ws_session_meta(
+            "ferrum".to_string(),
+            None,
+            "127.0.0.1".to_string(),
+            "backend.test:80".to_string(),
+            443,
+            None,
+            Default::default(),
+            chrono::Utc::now(),
+        );
+        let relay = run_framed_websocket_relay_for_test(
+            gateway_client,
+            backend_ws,
+            "h2-close",
+            1,
+            &plugins,
+            meta,
+            None,
+        );
+        let (relay_result, driver_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(biased; relay, &mut connection)
+        })
+        .await
+        .expect("bounded relay and H2 transport completion");
+        relay_result.expect("relay completes");
+        driver_result.expect("H2 completes");
+        drop(connection);
+
+        let expected = CloseFrame {
+            code: CloseCode::Size,
+            reason: "mesh ceiling".into(),
+        };
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            Message::Close(Some(expected.clone()))
+        );
+        let wire = backend
+            .await
+            .expect("backend receives Close and END_STREAM");
+        let mut peer = WebSocket::from_raw_socket(std::io::Cursor::new(wire), Role::Server, None);
+        assert_eq!(
+            peer.read().expect("backend Close"),
+            Message::Close(Some(expected))
+        );
+    }
+}

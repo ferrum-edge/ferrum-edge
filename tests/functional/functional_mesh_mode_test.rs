@@ -21665,6 +21665,48 @@ async fn functional_h3_websocket_dispatches_over_same_cluster_ambient_hbone_inne
     gateway.shutdown().await;
 }
 
+/// Directional frame and accumulated-message limits survive the H3 bridge and
+/// its Ambient HBONE carrier; both endpoints must receive the policy Close.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_h3_mesh_websocket_size_limits_are_asymmetric_in_both_directions() {
+    use super::functional_ws_permessage_deflate_test::{
+        TerminateBackend, assert_h3_directional_size_limits, with_directional_size_limits,
+    };
+    let identities = TempDir::new().expect("size-limit HBONE identities");
+    let svids = generate_shared_ca_mesh_svid_set(
+        identities.path(),
+        &[H3_MESH_GATEWAY_SPIFFE, H3_MESH_PEER_SPIFFE],
+    );
+    let mut backend = TerminateBackend::start().await;
+    let relay = start_h3_mesh_hbone_relay(&svids[1]).await;
+    let dead_backend_port = reserve_unique_mesh_port().await;
+    let frontend = h3_mesh_frontend_certs();
+    let targets = h3_mesh_target_yaml(
+        "127.0.0.1",
+        backend.port,
+        &h3_mesh_hbone_tags(relay.port, H3_MESH_PEER_SPIFFE),
+    );
+    let config =
+        with_directional_size_limits(&h3_mesh_plain_config(dead_backend_port, &targets, false));
+    let (mut gateway, https_port) = spawn_h3_mesh_gateway(
+        config,
+        &svids[0],
+        &frontend,
+        &[dead_backend_port, relay.port, backend.port],
+    )
+    .await;
+    assert_h3_directional_size_limits(https_port, "/mesh/", &mut backend).await;
+    assert!(
+        relay
+            .observed_connects()
+            .iter()
+            .any(|authority| authority == &format!("127.0.0.1:{}", backend.port)),
+        "the sessions must use the secured HBONE carrier"
+    );
+    gateway.shutdown().await;
+}
+
 /// Exercise materialized aliases and numeric authority ports over real sidecar
 /// mTLS, with both positive and negative host matchers and a destination-port
 /// control. Every successful request must reach the labeled workload backend.

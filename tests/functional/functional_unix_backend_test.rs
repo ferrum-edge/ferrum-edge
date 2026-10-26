@@ -1242,3 +1242,33 @@ fn unix_h2c_half_closed_client_upload_is_a_400_not_charged() {
         assert_half_closed_client_upload_is_a_400_not_charged(true)
     });
 }
+
+/// The Unix dial branch must install the same directional parser policy as TCP.
+#[ignore]
+#[tokio::test]
+async fn unix_websocket_size_limits_are_asymmetric_in_both_directions() {
+    use super::functional_ws_permessage_deflate_test::{
+        TerminateBackend, assert_h1_directional_size_limits, with_directional_size_limits,
+    };
+    let temp = TempDir::new().expect("Unix WS tempdir");
+    let root = containment_root(&temp);
+    let socket = root.join("size.sock");
+    let mut backend = TerminateBackend::start_unix(&socket).await;
+    let (placeholder_port, _placeholder) = reserve_placeholder_port().await;
+    let config = with_directional_size_limits(&build_config(
+        &[(
+            "unix-ws-size",
+            "/unix",
+            socket.to_str().expect("UTF-8 socket"),
+        )],
+        placeholder_port,
+        0,
+    ));
+    let mut gateway = spawn_unix_gateway(config, &root).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("Unix WS gateway ready");
+    assert_h1_directional_size_limits(gateway.proxy_http_port, "/unix", &mut backend).await;
+    gateway.shutdown().await;
+}

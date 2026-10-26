@@ -654,8 +654,8 @@ enum BackendEvent {
 /// An RFC 7692 backend: it answers [`TERMINATE_BACKEND_ANSWER`] when offered,
 /// sends a compressed "Hello", and echoes every data message as `echo:<text>`,
 /// compressed when negotiated. Pings are answered with Pongs.
-async fn serve_terminate_backend(
-    mut stream: TcpStream,
+async fn serve_terminate_backend<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     events: mpsc::UnboundedSender<BackendEvent>,
 ) {
     let Ok(Ok((head, mut pending))) = timeout(IO_TIMEOUT, read_head(&mut stream)).await else {
@@ -705,6 +705,28 @@ async fn serve_terminate_backend(
                 } else {
                     payload
                 };
+                let scripted = match plaintext.as_slice() {
+                    b"__size_boundary__" => Some(size_test_frames("boundary", negotiate, false)),
+                    b"__size_message_boundary__" => {
+                        Some(size_test_frames("message-boundary", negotiate, false))
+                    }
+                    b"__size_wire__" => Some(size_test_frames("wire", negotiate, false)),
+                    b"__size_frame__" => Some(size_test_frames("frame", negotiate, false)),
+                    b"__size_message__" => Some(size_test_frames("message", negotiate, false)),
+                    _ => None,
+                };
+                if let Some(frames) = scripted {
+                    let _ = events.send(BackendEvent::Message {
+                        compressed,
+                        plaintext,
+                    });
+                    for frame in frames {
+                        if stream.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 let mut echo = b"echo:".to_vec();
                 echo.extend_from_slice(&plaintext);
                 let _ = events.send(BackendEvent::Message {
@@ -730,14 +752,14 @@ async fn serve_terminate_backend(
     }
 }
 
-struct TerminateBackend {
-    port: u16,
+pub(super) struct TerminateBackend {
+    pub(super) port: u16,
     events: mpsc::UnboundedReceiver<BackendEvent>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl TerminateBackend {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
         let listener = TcpListener::bind_test("127.0.0.1:0")
             .await
             .expect("bind terminate backend");
@@ -752,6 +774,25 @@ impl TerminateBackend {
             }
         });
         Self { port, events, task }
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn start_unix(path: &std::path::Path) -> Self {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind Unix WS backend");
+        let (tx, events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(serve_terminate_backend(stream, tx.clone()));
+            }
+        });
+        Self {
+            port: 0,
+            events,
+            task,
+        }
     }
 
     async fn next_event(&mut self) -> BackendEvent {
@@ -1182,4 +1223,395 @@ async fn functional_ws_deflate_terminate_waf_inspects_plaintext() {
         BackendEvent::Close(_) => {}
         other => panic!("the prohibited message must not reach the backend, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Size-plugin wire matrix (issue #6912)
+// ---------------------------------------------------------------------------
+
+/// Defaults are deliberately below BOTH directional overrides. A missing or
+/// swapped override therefore fails a positive boundary control before attack.
+pub(super) fn with_directional_size_limits(config: &str) -> String {
+    let mut config: serde_json::Value = serde_yaml::from_str(config).expect("fixture config");
+    config["plugin_configs"].as_array_mut().expect("plugin configs").push(serde_json::json!({
+        "id": "directional-size", "plugin_name": "ws_message_size_limiting",
+        "scope": "global", "enabled": true,
+        "config": {
+            "max_frame_bytes": 128, "max_message_bytes": 256, "close_reason": "default ceiling",
+            "client_to_backend": {
+                "max_frame_bytes": 256, "max_message_bytes": 384, "close_reason": "client ceiling"
+            },
+            "backend_to_client": {
+                "max_frame_bytes": 512, "max_message_bytes": 768, "close_reason": "backend ceiling"
+            }
+        }
+    }));
+    serde_yaml::to_string(&config).expect("serialize directional config")
+}
+
+/// Produce valid wire frames that isolate compressed-wire, inflated-frame,
+/// and accumulated-message ceilings. Sync-flush between fragments ensures
+/// neither inflated fragment alone crosses the frame ceiling.
+fn size_test_frames(kind: &str, compressed: bool, from_client: bool) -> Vec<Vec<u8>> {
+    let frame_limit = if from_client { 256 } else { 512 };
+    let chunks = match kind {
+        "boundary" => vec![vec![0; frame_limit]],
+        "wire" => {
+            let mut state = 0x1234_5678u32;
+            let payload: Vec<u8> = (0..frame_limit)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect();
+            vec![payload]
+        }
+        "frame" => vec![vec![0; frame_limit + 1]],
+        "message-boundary" => vec![vec![0; frame_limit * 3 / 4], vec![1; frame_limit * 3 / 4]],
+        "message" => vec![
+            vec![0; frame_limit * 3 / 4],
+            vec![1; frame_limit * 3 / 4 + 1],
+        ],
+        _ => panic!("unknown size fixture {kind}"),
+    };
+    let mut compressor = Compress::new(Compression::default(), false);
+    let mut frames = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let last = index + 1 == chunks.len();
+        let payload = if compressed {
+            let mut payload = deflate_with(&mut compressor, chunk);
+            if !last {
+                payload.extend_from_slice(&DEFLATE_TAIL);
+            }
+            payload
+        } else {
+            chunk.clone()
+        };
+        if compressed {
+            if kind == "wire" {
+                assert_eq!(chunk.len(), frame_limit);
+                assert!(
+                    payload.len() > frame_limit,
+                    "only compressed wire crosses frame limit"
+                );
+            } else {
+                assert!(
+                    payload.len() < frame_limit,
+                    "compressed frame fits wire ceiling"
+                );
+            }
+        }
+        let first = (if last { 0x80 } else { 0 })
+            | (if index == 0 {
+                0x02 | if compressed { 0x40 } else { 0 }
+            } else {
+                0
+            });
+        frames.push(ws_frame(
+            first,
+            from_client.then_some(CLIENT_MASK),
+            &payload,
+        ));
+    }
+    frames
+}
+
+async fn size_message(leg: &mut WsLeg, client: &mut ClientDeflate, compressed: bool) -> Vec<u8> {
+    let mut data = Vec::new();
+    loop {
+        let (first, payload) = timeout(IO_TIMEOUT, leg.read_frame())
+            .await
+            .expect("size matrix frame in time");
+        assert!(
+            matches!(first & 0x0f, 0..=2),
+            "expected data, got opcode {first:#x}"
+        );
+        if data.is_empty() {
+            assert_eq!(first & 0x40 != 0, compressed);
+        }
+        data.extend_from_slice(&payload);
+        if first & 0x80 != 0 {
+            break;
+        }
+    }
+    if compressed {
+        client.inflate(&data)
+    } else {
+        data
+    }
+}
+
+async fn exercise_size_limits(
+    mut leg: WsLeg,
+    backend: &mut TerminateBackend,
+    compressed: bool,
+    from_client: bool,
+    kind: &str,
+) {
+    assert_eq!(backend.next_offer().await.is_some(), compressed);
+    let mut client = ClientDeflate::new();
+    assert_eq!(
+        size_message(&mut leg, &mut client, compressed).await,
+        b"Hello"
+    );
+
+    // Exactly the client frame ceiling passes; its echo is above that ceiling
+    // but below the independent backend ceiling.
+    let boundary = vec![0; 256];
+    let payload = if compressed {
+        client.deflate(&boundary)
+    } else {
+        boundary.clone()
+    };
+    leg.write(ws_frame(
+        if compressed { 0xc2 } else { 0x82 },
+        Some(CLIENT_MASK),
+        &payload,
+    ))
+    .await;
+    assert_eq!(backend.next_message().await.1, boundary);
+    let mut echo = b"echo:".to_vec();
+    echo.extend_from_slice(&boundary);
+    assert_eq!(size_message(&mut leg, &mut client, compressed).await, echo);
+
+    // A backend frame at its own ceiling must pass, even though it exceeds
+    // both the common default and the client-direction override.
+    let command = b"__size_boundary__";
+    let payload = if compressed {
+        client.deflate(command)
+    } else {
+        command.to_vec()
+    };
+    leg.write(ws_frame(
+        if compressed { 0xc2 } else { 0x82 },
+        Some(CLIENT_MASK),
+        &payload,
+    ))
+    .await;
+    assert_eq!(backend.next_message().await.1, command);
+    assert_eq!(
+        size_message(&mut leg, &mut client, compressed).await,
+        vec![0; 512]
+    );
+
+    // Fragmented messages exactly at each accumulated ceiling pass even
+    // though the whole message exceeds that direction's frame ceiling.
+    for frame in size_test_frames("message-boundary", compressed, true) {
+        leg.write(frame).await;
+    }
+    let mut boundary_message = vec![0; 192];
+    boundary_message.extend_from_slice(&[1; 192]);
+    assert_eq!(backend.next_message().await.1, boundary_message);
+    let mut echo = b"echo:".to_vec();
+    echo.extend_from_slice(&boundary_message);
+    assert_eq!(size_message(&mut leg, &mut client, compressed).await, echo);
+
+    // The preceding fragmented client message used an independent compressor.
+    // Subsequent client messages must likewise avoid referring to the old
+    // window; reset just the test encoder (the receiver keeps its live window).
+    client.compress = Compress::new(Compression::default(), false);
+    let command = b"__size_message_boundary__";
+    let payload = if compressed {
+        client.deflate(command)
+    } else {
+        command.to_vec()
+    };
+    leg.write(ws_frame(
+        if compressed { 0xc2 } else { 0x82 },
+        Some(CLIENT_MASK),
+        &payload,
+    ))
+    .await;
+    assert_eq!(backend.next_message().await.1, command);
+    let mut backend_boundary = vec![0; 384];
+    backend_boundary.extend_from_slice(&[1; 384]);
+    assert_eq!(
+        size_message(&mut leg, &mut client, compressed).await,
+        backend_boundary
+    );
+
+    if from_client {
+        // Use a fresh compressor for the attack. It does not refer to the old
+        // window, so it is valid even with negotiated context takeover.
+        for frame in size_test_frames(kind, compressed, true) {
+            leg.write(frame).await;
+        }
+    } else {
+        let command = format!("__size_{kind}__");
+        let payload = if compressed {
+            client.deflate(command.as_bytes())
+        } else {
+            command.as_bytes().to_vec()
+        };
+        leg.write(ws_frame(
+            if compressed { 0xc2 } else { 0x82 },
+            Some(CLIENT_MASK),
+            &payload,
+        ))
+        .await;
+        assert_eq!(backend.next_message().await.1, command.as_bytes());
+    }
+    let reason = if from_client {
+        "client ceiling"
+    } else {
+        "backend ceiling"
+    };
+    let mut expected = CLOSE_TOO_BIG.to_vec();
+    expected.extend_from_slice(reason.as_bytes());
+    let (first, payload) = timeout(IO_TIMEOUT, leg.read_frame())
+        .await
+        .expect("policy Close in time");
+    assert_eq!(
+        first, 0x88,
+        "{kind}: rejected data must not reach the client"
+    );
+    assert_eq!(payload, expected, "{kind}: client gets directional reason");
+    match backend.next_event().await {
+        BackendEvent::Close(payload) => {
+            assert_eq!(payload, expected, "{kind}: backend gets same reason")
+        }
+        other => panic!("{kind}: rejected client data reached backend: {other:?}"),
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_ws_size_limit_terminated_deflate_wire_frame_and_message_both_directions() {
+    let mut backend = TerminateBackend::start().await;
+    let gateway = TestGateway::builder()
+        .mode_file(with_directional_size_limits(&build_terminate_config(
+            backend.port,
+        )))
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES", "1048576")
+        .env(
+            "FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES",
+            "1048576",
+        )
+        .spawn()
+        .await
+        .expect("size-plugin terminate gateway");
+    for from_client in [true, false] {
+        for kind in ["wire", "frame", "message"] {
+            let (io, head, pending) = h1_upgrade(gateway.proxy_port, "/terminate").await;
+            assert!(head.starts_with("HTTP/1.1 101"));
+            assert_eq!(
+                header_values(&head, "sec-websocket-extensions"),
+                vec!["permessage-deflate"]
+            );
+            exercise_size_limits(
+                WsLeg::Io {
+                    io: Box::new(io),
+                    pending,
+                },
+                &mut backend,
+                true,
+                from_client,
+                kind,
+            )
+            .await;
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(super) async fn assert_h1_directional_size_limits(
+    port: u16,
+    path: &str,
+    backend: &mut TerminateBackend,
+) {
+    for from_client in [true, false] {
+        for kind in ["frame", "message"] {
+            let (io, head, pending) = h1_upgrade_offering(port, path, None).await;
+            assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+            exercise_size_limits(
+                WsLeg::Io {
+                    io: Box::new(io),
+                    pending,
+                },
+                backend,
+                false,
+                from_client,
+                kind,
+            )
+            .await;
+        }
+    }
+}
+
+pub(super) async fn assert_h3_directional_size_limits(
+    port: u16,
+    path: &str,
+    backend: &mut TerminateBackend,
+) {
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{port}{path}");
+    for from_client in [true, false] {
+        for kind in ["frame", "message"] {
+            // Retry only transport-open failures. Response status and size-policy
+            // observations from an established session must be asserted once.
+            let deadline = Instant::now() + Duration::from_secs(25);
+            let ws = loop {
+                match client.websocket(&url, WebSocketOptions::default()).await {
+                    Ok(ws) => break ws,
+                    Err(error) => {
+                        if Instant::now() >= deadline {
+                            panic!("H3 directional session never opened: {error}");
+                        }
+                        sleep(Duration::from_millis(150)).await;
+                    }
+                }
+            };
+            assert_eq!(ws.status, http::StatusCode::OK);
+            exercise_size_limits(WsLeg::H3(Box::new(ws)), backend, false, from_client, kind).await;
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_ws_size_limit_asymmetric_h2_and_h3_extended_connect() {
+    let mut backend = TerminateBackend::start().await;
+    let gateway = TestGateway::builder()
+        .mode_file(with_directional_size_limits(
+            &build_config(backend.port).replace(
+                "websocket_permessage_deflate: passthrough",
+                "websocket_permessage_deflate: strip",
+            ),
+        ))
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("directional H2/H3 gateway");
+    for from_client in [true, false] {
+        for kind in ["frame", "message"] {
+            let (status, _, io) = h2_extended_connect(gateway.proxy_port, "/strip").await;
+            assert_eq!(status, http::StatusCode::OK);
+            exercise_size_limits(
+                WsLeg::Io {
+                    io: Box::new(io),
+                    pending: Vec::new(),
+                },
+                &mut backend,
+                false,
+                from_client,
+                kind,
+            )
+            .await;
+        }
+    }
+    assert_h3_directional_size_limits(
+        gateway
+            .env_port("FERRUM_PROXY_HTTPS_PORT")
+            .expect("HTTPS port"),
+        "/strip",
+        &mut backend,
+    )
+    .await;
 }

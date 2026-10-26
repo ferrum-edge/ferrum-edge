@@ -1053,6 +1053,14 @@ session-accounting infrastructure the H1/H2 path uses:
 
 ### Pump task teardown
 
+The shared framed relay also finishes the backend transport before releasing
+its handles. On mesh H2 tunnels, flushing a WebSocket Close only queues DATA;
+dropping the stream immediately can cancel and discard that Close. Teardown
+therefore sends the transport's write EOF and retains its receive half until
+peer EOF, bounded by the existing 100 ms polite-close grace. This applies to
+H1/H2/H3 frontends and preserves the directional size-policy Close 1009 on
+Ambient HBONE and Sidecar mesh-mTLS backends.
+
 The recv pump (QUIC → WS framer) is `abort()`ed after
 `run_websocket_proxy` returns, before joining. The send pump (WS framer
 → QUIC) is awaited normally — it exits on EOF when the framer drops

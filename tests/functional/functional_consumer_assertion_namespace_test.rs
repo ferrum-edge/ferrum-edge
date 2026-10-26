@@ -17,9 +17,10 @@
 //! The same request-header ingress boundary also owns `Authorization`: a
 //! request carrying more than one credential (repeated field lines, or a second
 //! credential folded after a comma) is refused with `400` on HTTP/1.1,
-//! HTTP/2, HTTP/3, and a WebSocket upgrade before any auth plugin runs, so a
-//! `key_auth`-authenticated request cannot smuggle a `Basic` password past
-//! `basic_auth`'s `hide_credentials`.
+//! HTTP/2, HTTP/3, and WebSocket Upgrade / Extended CONNECT before any auth
+//! plugin runs, so a `key_auth`-authenticated request cannot smuggle a `Basic` password past
+//! `basic_auth`'s `hide_credentials`. Native gRPC gets Trailers-Only status 3
+//! (`INVALID_ARGUMENT`) with no JSON body on all three frontends.
 //!
 //! Run with:
 //!
@@ -33,7 +34,7 @@ use crate::scaffolding::port_registry::TestSocket;
 use crate::common::TestGateway;
 use crate::scaffolding::backends::{GrpcStep, MatchRpc, ScriptedGrpcBackend};
 use crate::scaffolding::certs::TestCa;
-use crate::scaffolding::clients::{GetOptions, GrpcClient, Http3Client};
+use crate::scaffolding::clients::{GetOptions, GrpcClient, Http3Client, WebSocketOptions};
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 
@@ -518,6 +519,23 @@ fn key_and_basic_auth_config(backend_port: u16) -> String {
     serde_yaml::to_string(&config).expect("serialize authorization ingress config")
 }
 
+fn authorization_credential_cases() -> [(&'static str, Vec<String>); 3] {
+    [
+        (
+            "repeated",
+            vec!["Bearer unused".to_string(), format!("Basic {ALICE_BASIC}")],
+        ),
+        (
+            "reversed",
+            vec![format!("Basic {ALICE_BASIC}"), "Bearer unused".to_string()],
+        ),
+        (
+            "folded",
+            vec![format!("Bearer unused, Basic {ALICE_BASIC}")],
+        ),
+    ]
+}
+
 /// Send one raw HTTP/1.1 request head and return the response status code.
 async fn raw_http1_status(port: u16, head: &str) -> u16 {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
@@ -616,6 +634,27 @@ async fn multiple_authorization_credentials_are_refused_before_auth_on_h1_h2_h3_
     );
     assert_eq!(raw_http1_status(port, &h1_folded).await, 400);
 
+    // Native gRPC errors on the H1/H2 handler share one builder. Pin the H1
+    // sibling too: a protocol rejection must not put a JSON entity in DATA.
+    let h1 = reqwest::Client::builder().http1_only().build().unwrap();
+    for (case, values) in authorization_credential_cases() {
+        let mut request = h1
+            .post(format!("http://127.0.0.1:{port}/authz/h1-grpc-{case}"))
+            .header("content-type", "application/grpc")
+            .header("x-api-key", API_KEY);
+        for value in values {
+            request = request.header("authorization", value);
+        }
+        let response = request.send().await.expect("H1 gRPC refusal");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "3");
+        assert_eq!(
+            response.headers().get("grpc-message").unwrap(),
+            "Protocol header violation"
+        );
+        assert!(response.bytes().await.expect("H1 refusal body").is_empty());
+    }
+
     // HTTP/1.1 WebSocket upgrade: refused before the 101, so no backend
     // handshake ever carries the Basic line.
     let websocket = format!(
@@ -648,9 +687,74 @@ async fn multiple_authorization_credentials_are_refused_before_auth_on_h1_h2_h3_
     let response = sender.send_request(request).await.expect("send h2 request");
     let h2_status = response.status();
     let _ = response.into_body().collect().await;
+    assert_eq!(h2_status, StatusCode::BAD_REQUEST, "HTTP/2 must refuse");
+
+    // Extended CONNECT wins over hostile Content-Type: this is an HTTP
+    // handshake refusal, never a 200 gRPC response or a successful tunnel.
+    for (case, values) in authorization_credential_cases() {
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .version(http::Version::HTTP_2)
+            .uri(format!("http://127.0.0.1:{port}/authz/h2-ws-{case}"))
+            .extension(hyper::ext::Protocol::from_static("websocket"))
+            .header("sec-websocket-version", "13")
+            .header("content-type", "application/grpc")
+            .header("x-api-key", API_KEY);
+        for value in &values {
+            request = request.header("authorization", value);
+        }
+        let response = sender
+            .send_request(request.body(Empty::<Bytes>::new()).unwrap())
+            .await
+            .expect("H2 CONNECT refusal");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "H2 WS {case}");
+        assert!(!response.headers().contains_key("grpc-status"));
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("clean H2 refusal body");
+
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://127.0.0.1:{port}/authz/h2-grpc-{case}"))
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("x-api-key", API_KEY);
+        for value in values {
+            request = request.header("authorization", value);
+        }
+        let response = sender
+            .send_request(request.body(Empty::<Bytes>::new()).unwrap())
+            .await
+            .expect("H2 gRPC refusal");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "H2 gRPC {case}: Trailers-Only"
+        );
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/grpc"
+        );
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "3");
+        assert_eq!(
+            response.headers().get("grpc-message").unwrap(),
+            "Protocol header violation"
+        );
+        assert!(!response.headers().contains_key("content-length"));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("clean gRPC refusal");
+        assert!(
+            body.to_bytes().is_empty(),
+            "no JSON entity may appear in gRPC DATA"
+        );
+    }
     drop(sender);
     conn_task.abort();
-    assert_eq!(h2_status, StatusCode::BAD_REQUEST, "HTTP/2 must refuse");
 
     // HTTP/3: repeated field lines.
     let h3 = Http3Client::insecure().expect("h3 client");
@@ -672,6 +776,69 @@ async fn multiple_authorization_credentials_are_refused_before_auth_on_h1_h2_h3_
     };
     assert_eq!(h3_status, StatusCode::BAD_REQUEST, "HTTP/3 must refuse");
 
+    for (case, values) in authorization_credential_cases() {
+        let mut headers = vec![
+            ("x-api-key".to_string(), API_KEY.to_string()),
+            ("content-type".to_string(), "application/grpc".to_string()),
+        ];
+        headers.extend(
+            values
+                .iter()
+                .map(|value| ("authorization".to_string(), value.clone())),
+        );
+        let ws = h3
+            .websocket(
+                &format!("https://localhost:{https_port}/authz/h3-ws-{case}"),
+                WebSocketOptions {
+                    headers,
+                    ..WebSocketOptions::default()
+                },
+            )
+            .await
+            .expect("H3 CONNECT refusal");
+        assert_eq!(ws.status, StatusCode::BAD_REQUEST, "H3 WS {case}");
+        assert!(!ws.headers.contains_key("grpc-status"));
+        drop(ws);
+
+        let mut options = GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc")
+            .header("x-api-key", API_KEY);
+        for value in values {
+            options = options.header("authorization", value);
+        }
+        let response = h3
+            .get_with_options(
+                &format!("https://localhost:{https_port}/authz/h3-grpc-{case}"),
+                options,
+            )
+            .await
+            .expect("H3 gRPC refusal");
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "H3 gRPC {case}: Trailers-Only"
+        );
+        assert_eq!(
+            response.headers.get("content-type").unwrap(),
+            "application/grpc"
+        );
+        assert_eq!(response.grpc_status(), Some(3));
+        assert_eq!(
+            response.grpc_message().as_deref(),
+            Some("Protocol header violation")
+        );
+        assert!(
+            response.body_bytes.is_empty(),
+            "no JSON entity may appear in gRPC DATA"
+        );
+        assert!(
+            response.body_error.is_none(),
+            "clean H3 stream termination required"
+        );
+        assert!(!response.headers.contains_key("content-length"));
+    }
+
     for path in [
         "/authz/h1-repeated",
         "/authz/h1-reversed",
@@ -679,6 +846,11 @@ async fn multiple_authorization_credentials_are_refused_before_auth_on_h1_h2_h3_
         "/authz/ws-repeated",
         "/authz/h2-repeated",
         "/authz/h3-repeated",
+        "/authz/h1-grpc-",
+        "/authz/h2-ws-",
+        "/authz/h2-grpc-",
+        "/authz/h3-ws-",
+        "/authz/h3-grpc-",
     ] {
         assert!(
             backend.head_for_target_prefix(path).is_none(),
