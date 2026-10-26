@@ -10,6 +10,10 @@
 //!
 //! Run with: cargo test --test unit_plugins_b_tests [filter]
 
+#[allow(dead_code)]
+#[path = "scaffolding/port_registry.rs"]
+pub(crate) mod port_registry;
+
 mod unit {
     pub mod env_lock;
 

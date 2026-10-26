@@ -18794,6 +18794,177 @@ async fn cancelled_initialize_deletes_the_minted_upstream_session() {
     await_one_delete(&server, "minted-then-cancelled", "cancellation").await;
 }
 
+/// Hold the initialized notification until the downstream session is removed,
+/// then hold the lost-owner DELETE until the request is cancelled (or observed
+/// still waiting). No expiry timers or response delays select these boundaries.
+async fn exercise_lost_owner_cleanup(cancel_request: bool) {
+    use crate::port_registry::TestSocket;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .unwrap();
+    let upstream_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let (notification_seen_tx, notification_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_notification_tx, release_notification_rx) = tokio::sync::oneshot::channel();
+    let (delete_seen_tx, delete_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_delete_tx, release_delete_rx) = tokio::sync::oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let mut notification_gate = Some((notification_seen_tx, release_notification_rx));
+        let mut delete_gate = Some((delete_seen_tx, release_delete_rx));
+        for expected in ["initialize", "notifications/initialized", "DELETE"] {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request_line = String::new();
+            socket.read_line(&mut request_line).await.unwrap();
+            let http_method = if expected == "DELETE" {
+                "DELETE"
+            } else {
+                "POST"
+            };
+            assert_eq!(request_line, format!("{http_method} /mcp HTTP/1.1\r\n"));
+            let mut headers = HashMap::new();
+            loop {
+                let mut line = String::new();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap();
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+            }
+            let length = headers
+                .get("content-length")
+                .map(|value| value.parse::<usize>().unwrap())
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            if expected != "DELETE" {
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["method"], expected);
+            }
+
+            let (status, body) = match expected {
+                "initialize" => (
+                    200,
+                    json!({
+                        "jsonrpc": "2.0", "id": "initialize",
+                        "result": {
+                            "protocolVersion": "2025-06-18", "capabilities": {},
+                            "serverInfo": {"name": "gated-cleanup", "version": "1"}
+                        }
+                    })
+                    .to_string(),
+                ),
+                "notifications/initialized" => {
+                    let (seen, release) = notification_gate.take().unwrap();
+                    seen.send(()).unwrap();
+                    release.await.unwrap();
+                    (202, String::new())
+                }
+                "DELETE" => {
+                    assert_eq!(headers["mcp-session-id"], "lost-owner-upstream");
+                    assert_eq!(headers["mcp-protocol-version"], "2025-06-18");
+                    assert_eq!(headers["x-ferrum-hops"], "7");
+                    assert_eq!(headers["x-upstream-credential"], "test-credential");
+                    let (seen, release) = delete_gate.take().unwrap();
+                    seen.send(()).unwrap();
+                    release.await.unwrap();
+                    (200, String::new())
+                }
+                _ => unreachable!(),
+            };
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nMcp-Session-Id: lost-owner-upstream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            socket.get_mut().shutdown().await.unwrap();
+        }
+    });
+    let mut config = tools_only_aggregate_config(&upstream_url);
+    config["endpoint"]["protocol_versions"] = json!(["2025-11-25", "2025-06-18"]);
+    config["servers"]["github"]["headers"] = json!({"x-upstream-credential": "test-credential"});
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let (mut ctx, mut headers) =
+        mcp_ctx(json!({"jsonrpc": "2.0", "id": 1122, "method": "tools/list", "params": {}}));
+    ctx.outbound_proxy_hops = Some(7);
+    let io_ns = Arc::clone(&ctx.plugin_http_call_ns);
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let request_plugin = Arc::clone(&plugin);
+    let request =
+        tokio::spawn(async move { request_plugin.before_proxy(&mut ctx, &mut headers).await });
+    tokio::time::timeout(Duration::from_secs(5), notification_seen_rx)
+        .await
+        .expect("initialize reached the notification barrier")
+        .unwrap();
+
+    // The upstream has minted its id, but has not committed it to the store.
+    // Explicit downstream DELETE deterministically makes this a lost owner.
+    let (mut ctx, mut headers) = mcp_ctx(json!({}));
+    ctx.method = "DELETE".to_string();
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert_eq!(
+        reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await).0,
+        200
+    );
+    release_notification_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), delete_seen_rx)
+        .await
+        .expect("lost-owner cleanup reached the DELETE barrier")
+        .unwrap();
+    let before_cleanup = io_ns.load(Ordering::Relaxed);
+    assert!(
+        !request.is_finished(),
+        "the request awaits cleanup completion"
+    );
+    let request = if cancel_request {
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        None
+    } else {
+        Some(request)
+    };
+    release_delete_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), upstream)
+        .await
+        .unwrap()
+        .unwrap();
+    if let Some(request) = request {
+        let result = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("the request finishes after cleanup")
+            .unwrap();
+        assert!(matches!(result, PluginResult::Reject { .. }));
+    }
+    // Arrival alone is insufficient: the original bug already sent DELETE but
+    // dropped its future at cancellation. Accounting advances only after the
+    // cleanup actually receives the response, proving its task survived.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while io_ns.load(Ordering::Relaxed) == before_cleanup {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lost-owner cleanup completes after request cancellation");
+}
+
+#[tokio::test]
+async fn cancelled_lost_owner_cleanup_completes_the_upstream_delete() {
+    exercise_lost_owner_cleanup(true).await;
+}
+
+#[tokio::test]
+async fn lost_owner_cleanup_awaits_and_accounts_for_the_upstream_delete() {
+    exercise_lost_owner_cleanup(false).await;
+}
+
 /// A resource upstream listing README and the `file:///project/{path}`
 /// template, with each list answering 200 or 500 as requested.
 async fn start_mcp_resource_family_server(resources_ok: bool, templates_ok: bool) -> MockServer {
