@@ -7204,6 +7204,7 @@ pub(crate) fn run_final_backend_header_policy_hooks(
         }
     }
     if ran {
+        headers_mod::canonicalize_request_header_map(headers);
         hop_limit::reassert_outbound_proxy_hops_in_map(
             hop_limit::effective_outbound_proxy_hops(ctx),
             headers,
@@ -18308,6 +18309,7 @@ pub fn refresh_backend_gateway_assertion_headers(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
+    headers_mod::canonicalize_request_header_map(headers);
     hop_limit::reassert_outbound_proxy_hops_in_map(
         hop_limit::effective_outbound_proxy_hops(ctx),
         headers,
@@ -18420,6 +18422,11 @@ pub(crate) fn refresh_initial_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
+    // Even an anonymous request with no gateway assertions needs the same
+    // duplicate-field reading authorization used before any builder sees it.
+    headers_mod::canonicalize_request_header_map(
+        owned_proxy_headers.as_mut().unwrap_or(&mut ctx.headers),
+    );
     let has_principal =
         ctx.backend_consumer_username().is_some() || ctx.backend_authenticated_identity().is_some();
     let source_has_reserved_assertion = owned_proxy_headers

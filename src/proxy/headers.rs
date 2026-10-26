@@ -339,6 +339,8 @@ pub fn filter_secondary_request_headers(
     peer_trusted: bool,
     extra_exclude: &[&str],
 ) -> Vec<(String, String)> {
+    let canonical = canonical_request_header_map(headers);
+    let headers = canonical.as_ref();
     let connection_listed = parse_connection_listed_from_str_map(headers);
     headers
         .iter()
@@ -945,6 +947,11 @@ pub fn merge_proxy_headers_preserving_repeated(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,
 ) {
+    // Direct replay/dispatch callers can supply a plugin-written map without
+    // passing through the dispatch-ladder refresh. Borrow the common case;
+    // copy only a map that actually contains competing case variants.
+    let canonical = canonical_request_header_map(proxy_headers);
+    let proxy_headers = canonical.as_ref();
     // Drop client-supplied reserved assertion headers from the raw base BEFORE
     // the merge, so a verified gateway value carried in `proxy_headers`
     // (post-auth) is layered back on and preserved.
@@ -984,6 +991,120 @@ pub fn merge_proxy_headers_preserving_repeated(
             headers.insert(name, val);
         }
     }
+}
+
+/// Fold plugin-written case variants of a request field into one lowercase key.
+///
+/// List fields (including extension fields) join in byte-wise key order using
+/// the same separator as wire-header materialization: `, `, or `; ` for Cookie.
+/// Known singleton fields prefer the exact lowercase key, otherwise the
+/// byte-wise smallest key. This rule is shared by authorization and egress;
+/// neither may select a value by `HashMap` iteration order.
+///
+/// Maps without duplicate variants are left untouched and allocate nothing,
+/// including maps containing a single operator-cased spelling. Wire-derived
+/// maps have only lowercase names, so detection is linear in their name bytes.
+pub fn canonicalize_request_header_map(headers: &mut std::collections::HashMap<String, String>) {
+    if !request_header_map_has_case_duplicates(headers) {
+        return;
+    }
+    let mixed_names: Vec<String> = headers
+        .keys()
+        .filter(|name| name.bytes().any(|byte| byte.is_ascii_uppercase()))
+        .cloned()
+        .collect();
+    for name in mixed_names {
+        // An earlier spelling in this group may already have folded it.
+        if !headers.contains_key(&name) {
+            continue;
+        }
+        let mut variants: Vec<_> = headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(&name))
+            .collect();
+        if variants.len() < 2 {
+            continue;
+        }
+        variants.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        let lower = name.to_ascii_lowercase();
+        let value = if is_singleton_request_header(&lower) {
+            // `variants` has at least two entries. Use an iterator instead of
+            // indexing so no request-path panic depends on that invariant.
+            let Some(value) = headers
+                .get(&lower)
+                .map(String::as_str)
+                .or_else(|| variants.first().map(|(_, value)| value.as_str()))
+            else {
+                continue;
+            };
+            value.to_owned()
+        } else {
+            let separator = crate::plugins::repeated_request_header_separator(&lower);
+            let mut value = String::new();
+            for (index, (_, part)) in variants.into_iter().enumerate() {
+                if index != 0 {
+                    value.push_str(separator);
+                }
+                value.push_str(part);
+            }
+            value
+        };
+        headers.retain(|key, _| !key.eq_ignore_ascii_case(&lower));
+        headers.insert(lower, value);
+    }
+}
+
+fn request_header_map_has_case_duplicates(
+    headers: &std::collections::HashMap<String, String>,
+) -> bool {
+    headers.keys().any(|name| {
+        name.bytes().any(|byte| byte.is_ascii_uppercase())
+            && headers
+                .keys()
+                .any(|other| other != name && other.eq_ignore_ascii_case(name))
+    })
+}
+
+fn canonical_request_header_map(
+    headers: &std::collections::HashMap<String, String>,
+) -> std::borrow::Cow<'_, std::collections::HashMap<String, String>> {
+    if request_header_map_has_case_duplicates(headers) {
+        let mut canonical = headers.clone();
+        canonicalize_request_header_map(&mut canonical);
+        std::borrow::Cow::Owned(canonical)
+    } else {
+        std::borrow::Cow::Borrowed(headers)
+    }
+}
+
+fn is_singleton_request_header(lower: &str) -> bool {
+    matches!(
+        lower,
+        "authorization"
+            | "proxy-authorization"
+            | "host"
+            | "content-length"
+            | "content-type"
+            | "content-location"
+            | "content-range"
+            | "content-disposition"
+            | "date"
+            | "from"
+            | "if-modified-since"
+            | "if-unmodified-since"
+            | "if-range"
+            | "max-forwards"
+            | "origin"
+            | "range"
+            | "referer"
+            | "user-agent"
+            | "grpc-timeout"
+            | "grpc-encoding"
+            | "traceparent"
+            | "idempotency-key"
+            | "sec-websocket-key"
+            | "sec-websocket-version"
+    )
 }
 
 /// Returns `true` for headers that must NOT cross the backend-response trust

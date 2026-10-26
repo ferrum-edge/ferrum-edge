@@ -7281,7 +7281,8 @@ impl RequestContext {
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
-    /// String>`). This is a one-time operation — subsequent calls are no-ops.
+    /// String>`). Raw fields are copied once; subsequent calls only fold any
+    /// duplicate case variants a plugin has since inserted into the map.
     /// The raw map is retained so plugins can evaluate multi-value and
     /// non-UTF-8 field lines.
     ///
@@ -7309,6 +7310,7 @@ impl RequestContext {
     /// deletes raw headers. It also means the non-UTF-8 values omitted above are
     /// dropped on those outbound paths rather than forwarded byte-exact.
     pub fn materialize_headers(&mut self) {
+        crate::proxy::headers::canonicalize_request_header_map(&mut self.headers);
         if self.headers_materialized {
             return;
         }
@@ -7342,6 +7344,7 @@ impl RequestContext {
                     .or_insert_with(|| v.to_owned());
             }
         }
+        crate::proxy::headers::canonicalize_request_header_map(&mut self.headers);
     }
 
     // -- Lazy query param materialization ------------------------------------

@@ -1291,9 +1291,9 @@ fn http_header_attribute(ctx: &RequestContext, name: &str) -> Option<String> {
 /// only on a miss is the map scanned for a key an earlier plugin inserted in
 /// operator case (`X-Tenant: blocked`) — the egress builders parse such a key
 /// as the ordinary `x-tenant` field, so a `to.headers` DENY must see it. The
-/// scan compares in place and allocates nothing. When several case variants
-/// coexist without a lowercase key, the byte-wise smallest key wins, so the
-/// reading is deterministic rather than hash-order dependent.
+/// scan compares in place and allocates nothing. `authorize` first folds any
+/// duplicate variants through the shared request-map canonicalizer, using the
+/// same list separators and singleton selection as backend dispatch.
 ///
 /// Reserved gateway assertion headers are never read from the raw client block.
 fn http_request_header_value(ctx: &RequestContext, lower: &str) -> Option<String> {
@@ -3361,6 +3361,7 @@ impl Plugin for MeshAuthz {
         if mesh_authz_skips_outbound_capture_leg(self.per_pod_policy_scoping, ctx.mesh_direction) {
             return PluginResult::Continue;
         }
+        crate::proxy::headers::canonicalize_request_header_map(&mut ctx.headers);
         let inbound_hbone_relay_request = ctx.mesh_direction
             == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
             && ctx.matched_proxy.as_ref().is_some_and(|proxy| {
