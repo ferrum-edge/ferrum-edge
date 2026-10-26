@@ -15806,3 +15806,77 @@ fn unrouted_transaction_log_plugins_are_global_trigger_free_stdout_loggers() {
         "removing the global logger restores the no-logger route-miss path"
     );
 }
+
+#[tokio::test]
+async fn unrouted_correlation_policies_are_global_ordered_and_rebuilt() {
+    let mut early = make_plugin_config_with_json(
+        "global-early",
+        "correlation_id",
+        json!({"header_name": "x-internal-id", "inbound_policy": "generate"}),
+        PluginScope::Global,
+        None,
+    );
+    early.priority_override = Some(40);
+    let mut late = make_plugin_config_with_json(
+        "global-late",
+        "correlation_id",
+        json!({"header_name": "x-external-id"}),
+        PluginScope::Global,
+        None,
+    );
+    late.priority_override = Some(60);
+    let without_globals = make_config(
+        vec![make_proxy("p1", "/api", vec!["scoped-id"])],
+        vec![
+            make_plugin_config(
+                "scoped-id",
+                "correlation_id",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "disabled-id",
+                "correlation_id",
+                PluginScope::Global,
+                None,
+                false,
+            ),
+            make_plugin_config(
+                "global-log",
+                "stdout_logging",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&without_globals).unwrap();
+    assert!(cache.unrouted_correlation_plugins().is_empty());
+    let mut with_globals = without_globals.clone();
+    with_globals.plugin_configs.extend([late, early]);
+    cache.rebuild(&with_globals).unwrap();
+    let policies = cache.unrouted_correlation_plugins();
+    assert_eq!(policies.len(), 2);
+    assert_eq!(policies[0].priority(), 40);
+    assert_eq!(policies[1].priority(), 60);
+    for method in ["GET", "POST"] {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), method.into(), "/miss".into());
+        ctx.headers
+            .insert("x-external-id".into(), "client-123".into());
+        let headers = ferrum_edge::proxy::prepare_unrouted_correlation(&policies, &mut ctx).await;
+        let canonical = headers.get("x-internal-id").unwrap();
+        assert!(uuid::Uuid::parse_str(canonical).is_ok());
+        assert_eq!(ctx.metadata.get("request_id"), Some(canonical));
+        assert_eq!(
+            headers.get("x-external-id").map(String::as_str),
+            Some("client-123")
+        );
+        assert!(
+            !headers.contains_key("x-request-id"),
+            "scoped instance never runs"
+        );
+    }
+    cache.rebuild(&without_globals).unwrap();
+    assert!(cache.unrouted_correlation_plugins().is_empty());
+}

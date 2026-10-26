@@ -6251,6 +6251,17 @@ fn collect_unrouted_transaction_log_plugins(globals: &[Arc<dyn Plugin>]) -> Opti
     (!sinks.is_empty()).then(|| Arc::new(sinks))
 }
 
+/// Only registered global correlation policies may run without a matched
+/// proxy. Keep their lifecycle order and priority wrappers.
+fn collect_unrouted_correlation_plugins(globals: &[Arc<dyn Plugin>]) -> Option<PluginList> {
+    let policies: Vec<Arc<dyn Plugin>> = globals
+        .iter()
+        .filter(|plugin| is_builtin_named(plugin, "correlation_id"))
+        .cloned()
+        .collect();
+    (!policies.is_empty()).then(|| Arc::new(policies))
+}
+
 fn build_protocol_entry(
     plugins: &[Arc<dyn Plugin>],
     globals: &[Arc<dyn Plugin>],
@@ -6612,6 +6623,9 @@ pub(crate) struct PluginCacheInner {
     /// route-miss arm pays one pointer check and nothing else. Trigger-gated
     /// instances are excluded because no request hook evaluated their trigger.
     unrouted_transaction_log_plugins: Option<PluginList>,
+    /// Global correlation policies in lifecycle order. `None` keeps a route
+    /// miss to one pointer check without header materialization or allocation.
+    unrouted_correlation_plugins: Option<PluginList>,
     /// Pre-computed: does any plugin for this proxy require response body buffering?
     requires_buffering: BufferingMap,
     /// Whether global-only plugins require response body buffering (fallback).
@@ -6816,10 +6830,13 @@ impl PluginCacheInner {
     ) -> Self {
         let unrouted_transaction_log_plugins =
             collect_unrouted_transaction_log_plugins(global_plugins.as_slice());
+        let unrouted_correlation_plugins =
+            collect_unrouted_correlation_plugins(global_plugins.as_slice());
         Self {
             proxy_plugins,
             global_plugins,
             unrouted_transaction_log_plugins,
+            unrouted_correlation_plugins,
             requires_buffering,
             global_requires_buffering,
             requires_request_buffering,
@@ -6938,6 +6955,11 @@ impl PluginCacheInner {
     #[inline]
     pub(crate) fn unrouted_transaction_log_plugins(&self) -> Option<Arc<Vec<Arc<dyn Plugin>>>> {
         self.unrouted_transaction_log_plugins.clone()
+    }
+
+    #[inline]
+    pub(crate) fn unrouted_correlation_plugins(&self) -> Option<PluginList> {
+        self.unrouted_correlation_plugins.clone()
     }
 
     fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
@@ -7943,6 +7965,17 @@ impl PluginCache {
         self.inner
             .load()
             .unrouted_transaction_log_plugins()
+            .map(|plugins| plugins.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Global correlation policies applied to route-miss responses, in
+    /// lifecycle order; empty when this generation has none.
+    #[allow(dead_code)] // Inspection API for external tests; dispatch reads the epoch.
+    pub fn unrouted_correlation_plugins(&self) -> Vec<Arc<dyn Plugin>> {
+        self.inner
+            .load()
+            .unrouted_correlation_plugins()
             .map(|plugins| plugins.to_vec())
             .unwrap_or_default()
     }

@@ -135,6 +135,7 @@ mod functional_response_mock_grpc_exclusion_test;
 mod functional_response_mock_semantics_test;
 mod functional_response_protocol_managed_headers_test;
 mod functional_retry_test;
+mod functional_route_miss_correlation_test;
 mod functional_router_cache_test;
 mod functional_scale_perf_test;
 mod functional_secrets_test;
