@@ -7247,6 +7247,18 @@ pub mod _test_support {
     }
 
     // ── rate-limit policy isolation (GHSA-gr3x-g777-hm78) ────────────────────
+    /// Construct a gRPC method router with an isolated metrics registry.
+    pub fn grpc_method_router_with_metrics_registry_for_test(
+        config: &serde_json::Value,
+        registry: std::sync::Arc<crate::plugins::prometheus_metrics::MetricsRegistry>,
+    ) -> Result<crate::plugins::grpc_method_router::GrpcMethodRouter, String> {
+        crate::plugins::grpc_method_router::GrpcMethodRouter::new(
+            config,
+            crate::plugins::PluginHttpClient::default(),
+        )
+        .map(|plugin| plugin.with_metrics_registry_for_test(registry))
+    }
+
     /// Effective default Redis key prefix for one rate-limit plugin config.
     ///
     /// Returns `None` for local-only configs. Used to prove that two

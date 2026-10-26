@@ -1,5 +1,6 @@
 use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, create_plugin, priority};
 use serde_json::json;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
@@ -1246,26 +1247,43 @@ fn method_rate_shape_errors_keep_schema_and_suggestions_without_supplied_content
 /// counted in `ferrum_rate_limit_exceeded_total`, not only the capacity 429.
 #[tokio::test]
 async fn quota_refusal_increments_rate_limit_exceeded_metric() {
-    let config = json!({
-        "method_rate_limits": {
-            "/pkg.MetricSvc/Create": { "max_requests": 1, "window_seconds": 60 }
-        }
-    });
-    let plugin = create_plugin("grpc_method_router", &config)
-        .unwrap()
-        .unwrap();
-    assert_continue(call(plugin.as_ref(), "/pkg.MetricSvc/Create").await);
+    use ferrum_edge::_test_support::grpc_method_router_with_metrics_registry_for_test;
+    use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 
-    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
-    let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
-    assert_reject(
-        call(plugin.as_ref(), "/pkg.MetricSvc/Create").await,
-        Some(429),
-    );
-    assert!(
-        registry.rate_limit_exceeded.load(Ordering::Relaxed) > before,
-        "a quota refusal must increment ferrum_rate_limit_exceeded_total"
-    );
+    for mut config in [
+        json!({"method_rate_limits": {
+            "/pkg.MetricSvc/Create": {"max_requests": 1, "window_seconds": 60}
+        }}),
+        json!({"method_rate_limits": {
+            "/pkg.MetricSvc/*": {"max_requests": 1, "window_seconds": 60}
+        }}),
+        json!({"default_rate_limit": {"max_requests": 1, "window_seconds": 60}}),
+    ] {
+        config["deny_methods"] = json!(["/pkg.MetricSvc/Blocked"]);
+        let registry = Arc::new(MetricsRegistry::new());
+        let plugin =
+            grpc_method_router_with_metrics_registry_for_test(&config, Arc::clone(&registry))
+                .unwrap();
+
+        assert_reject(call(&plugin, "/pkg.MetricSvc/Blocked").await, Some(403));
+        assert_continue(call(&plugin, "/pkg.MetricSvc/Create").await);
+        assert_eq!(
+            registry.rate_limit_exceeded.load(Ordering::Relaxed),
+            0,
+            "admission and access denial must not count as quota refusals: {config}"
+        );
+
+        // Only this plugin owns the registry: unrelated tests cannot satisfy
+        // the assertion if quota accounting is removed or incremented twice.
+        for expected in 1..=2 {
+            assert_reject(call(&plugin, "/pkg.MetricSvc/Create").await, Some(429));
+            assert_eq!(
+                registry.rate_limit_exceeded.load(Ordering::Relaxed),
+                expected,
+                "each quota refusal must increment ferrum_rate_limit_exceeded_total once: {config}"
+            );
+        }
+    }
 }
 
 async fn call(plugin: &dyn Plugin, path: &str) -> PluginResult {

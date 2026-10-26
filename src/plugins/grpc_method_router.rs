@@ -15,10 +15,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use super::prometheus_metrics::{MetricsRegistry, global_registry};
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_MESSAGE,
     ENFORCEMENT_UNAVAILABLE_STATUS, LocalStateSemantics, RATE_LIMIT_REDIS_CONFIG_KEYS,
@@ -151,6 +153,7 @@ pub struct GrpcMethodRouter {
     default_rate_limit: Option<RateSpec>,
     limit_by: String,
     limiter: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm>,
+    metrics: Arc<MetricsRegistry>,
     request_counter: AtomicU64,
     epoch_base: Instant,
     last_periodic_sweep_secs: AtomicU64,
@@ -348,10 +351,19 @@ impl GrpcMethodRouter {
                 &semantics,
             )
             .map_err(|error| format!("grpc_method_router: {error}"))?,
+            metrics: global_registry(),
             request_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
         })
+    }
+
+    /// Give external metric tests their own registry instead of racing other
+    /// plugins' process-wide counter updates. Production uses the global registry.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn with_metrics_registry_for_test(mut self, registry: Arc<MetricsRegistry>) -> Self {
+        self.metrics = registry;
+        self
     }
 
     /// Whether this instance enforces on the same live local state as `other`.
@@ -910,7 +922,7 @@ impl Plugin for GrpcMethodRouter {
             let key = self.rate_key(ctx, &spec.rule);
             match self.check_rate(&key, spec).await {
                 None => {
-                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+                    self.metrics.record_rate_limit_exceeded();
                     return PluginResult::Reject {
                         status_code: 429,
                         body: CAPACITY_REJECT_BODY.to_string(),
@@ -931,7 +943,7 @@ impl Plugin for GrpcMethodRouter {
                             headers: grpc_content_type_header(),
                         };
                     }
-                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+                    self.metrics.record_rate_limit_exceeded();
                     warn_sampled!(
                         method = %full_method,
                         plugin = "grpc_method_router",
