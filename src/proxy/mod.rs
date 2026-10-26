@@ -25411,13 +25411,33 @@ pub async fn log_rejected_request(
     .await;
 }
 
+/// Resolve only the generation's registered global `correlation_id` policies
+/// for a route miss. Callers gate this on the precomputed optional list, so
+/// absent policies cost no header materialization or allocation. The cached
+/// lifecycle order determines canonical ID ownership.
+pub async fn prepare_unrouted_correlation(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) -> HashMap<String, String> {
+    ctx.materialize_headers();
+    let mut headers = HashMap::new();
+    for plugin in plugins {
+        // The cache admits only the registered built-in here. Both hooks
+        // always Continue; no other request policy runs without a proxy.
+        plugin.on_request_received(ctx).await;
+        plugin.after_proxy(ctx, 404, &mut headers).await;
+    }
+    headers
+}
+
 /// Deliver the terminal summary of a request that matched no proxy (the
 /// route-miss `404`) to the generation's global access logs
 /// (`PluginCacheInner::unrouted_transaction_log_plugins`).
 ///
-/// Callers reach this only when such a logger exists, so the no-logger route
-/// miss keeps its allocation-free fast path. No request hook ran, so the
-/// summary has no proxy, backend, consumer, or plugin time; it carries
+/// Callers reach this only when such a logger exists, so requests without a
+/// logger pay no logging allocation cost. Only global correlation hooks
+/// may have run, so the summary has no proxy, backend, consumer, or plugin time;
+/// it carries their canonical `request_id` when present, along with
 /// `metadata.rejection_phase = "route_not_found"`. The routing diagnostic was
 /// already recorded by `record_route_miss`, so this does not record another.
 ///
@@ -35987,13 +36007,30 @@ async fn handle_proxy_request_inner(
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
                     ctx.terminal_record.mark_counted();
                     state.request_count.fetch_add(1, Ordering::Relaxed);
-                    let response = build_pre_plugin_reject_response(
+                    let mut response = build_pre_plugin_reject_response(
                         StatusCode::NOT_FOUND,
                         br#"{"error":"Not Found"}"#,
                         &EMPTY_HEADERS,
                         request_uses_grpc_content_type,
                         grpc_web_response_content_type,
                     );
+                    if let Some(correlation_plugins) =
+                        epoch.plugin_cache.unrouted_correlation_plugins()
+                    {
+                        let headers =
+                            Box::pin(prepare_unrouted_correlation(&correlation_plugins, &mut ctx))
+                                .await;
+                        // Configured names and resolved IDs have already been
+                        // validated by the built-in correlation policy.
+                        for (name, value) in &headers {
+                            if let (Ok(name), Ok(value)) = (
+                                hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                                hyper::header::HeaderValue::from_str(value),
+                            ) {
+                                response.headers_mut().insert(name, value);
+                            }
+                        }
+                    }
                     crate::diagnostic_ref::record_route_miss(
                         ctx.diagnostic_slot(),
                         crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,

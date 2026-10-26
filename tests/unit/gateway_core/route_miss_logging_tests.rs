@@ -1,6 +1,6 @@
 //! Source-contract coverage for route-miss (`404`) transaction logging.
 //!
-//! A request that matches no proxy runs no plugin hook, but a global
+//! A request that matches no proxy runs only global correlation hooks, but a global
 //! `stdout_logging` instance must still record it, on H1/H2 and H3 alike
 //! (shared-invariant parity). Without such a logger the route miss must stay a
 //! single pointer check, so the delivery is gated on the cache's precomputed
@@ -95,12 +95,45 @@ fn h3_route_miss_delivers_to_global_access_logs_only_when_configured() {
         "H3 must log before propagating the write result"
     );
     let send = arm
-        .find("let sent = send_h3_error_flavor_aware(")
+        .find("let sent = if let Some(correlation_plugins)")
         .expect("H3 keeps the send result");
     assert!(
         !arm[send..log].contains(".await?"),
         "the 404 write must not return before the access record is delivered"
     );
+}
+
+#[test]
+fn every_route_miss_gates_and_boxes_correlation_before_logging() {
+    for (surface, source, start, end) in [
+        (
+            "H1/H2",
+            include_str!("../../../src/proxy/mod.rs"),
+            "\"No route matched for request path\"",
+            "return Ok(response);",
+        ),
+        (
+            "H3",
+            include_str!("../../../src/http3/server.rs"),
+            "crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE,",
+            "return Ok(());",
+        ),
+    ] {
+        let arm = route_miss_arm(source, start, end);
+        let gate = arm
+            .find("epoch.plugin_cache.unrouted_correlation_plugins()")
+            .expect("optional generation-local correlation list");
+        let prepare = arm
+            .find("prepare_unrouted_correlation(")
+            .expect("resolve global correlation policy");
+        let log = arm.find("log_unrouted_request(").expect("access log");
+        assert!(gate < prepare && prepare < log, "{surface}: {arm}");
+        assert!(arm[gate..prepare].contains("Box::pin("), "{surface}");
+        assert!(
+            !arm[..gate].contains("ctx.materialize_headers()"),
+            "{surface}: absent policies must not materialize headers"
+        );
+    }
 }
 
 #[test]
@@ -192,4 +225,70 @@ async fn unrouted_summary_is_attributed_to_the_serving_namespace() {
         summary.metadata.get("rejection_phase").map(String::as_str),
         Some("route_not_found")
     );
+}
+
+#[tokio::test]
+async fn unrouted_correlation_resolves_policy_and_logs_the_same_request_id() {
+    use ferrum_edge::plugins::correlation_id::CorrelationId;
+    use serde_json::json;
+
+    let oversized = "x".repeat(257);
+    for policy in ["preserve", "generate"] {
+        for echo in [true, false] {
+            let correlation: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+                CorrelationId::new(&json!({
+                    "header_name": "x-audit-id",
+                    "inbound_policy": policy,
+                    "echo_downstream": echo,
+                }))
+                .unwrap(),
+            )];
+            let mut generated = std::collections::HashSet::new();
+            for inbound in [
+                None,
+                Some("client-123"),
+                Some("bad value"),
+                Some(oversized.as_str()),
+            ] {
+                let mut ctx = RequestContext::new(
+                    "203.0.113.7".to_string(),
+                    "GET".to_string(),
+                    "/missing".to_string(),
+                );
+                let mut raw = http::HeaderMap::new();
+                if let Some(value) = inbound {
+                    raw.insert("x-audit-id", http::HeaderValue::from_str(value).unwrap());
+                }
+                ctx.set_raw_headers(raw);
+                let headers =
+                    ferrum_edge::proxy::prepare_unrouted_correlation(&correlation, &mut ctx).await;
+                let id = ctx.metadata.get("request_id").unwrap().clone();
+                if policy == "preserve" && inbound == Some("client-123") {
+                    assert_eq!(id, "client-123");
+                } else {
+                    assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 4);
+                    assert!(generated.insert(id.clone()), "fresh ID per miss");
+                }
+                assert_eq!(headers.get("x-audit-id"), echo.then_some(&id));
+
+                let captured = Arc::new(Mutex::new(Vec::new()));
+                let loggers: Vec<Arc<dyn Plugin>> = vec![Arc::new(CapturingLogger {
+                    captured: Arc::clone(&captured),
+                })];
+                ferrum_edge::proxy::log_unrouted_request(
+                    &loggers,
+                    &ctx,
+                    "payments",
+                    404,
+                    std::time::Instant::now(),
+                )
+                .await;
+                let captured = captured.lock().unwrap();
+                assert_eq!(captured.len(), 1);
+                assert_eq!(captured[0].metadata.get("request_id"), Some(&id));
+                assert!(captured[0].proxy_id.is_none());
+                assert_eq!(captured[0].response_status_code, 404);
+            }
+        }
+    }
 }

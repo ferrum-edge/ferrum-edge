@@ -186,14 +186,19 @@ Request In
 `on_request_received` is therefore a post-route, post-allowed-method hook, not
 a pre-routing receipt hook. Once it runs, `ctx.matched_proxy` is populated and
 the plugin list is the resolved view for that proxy: applicable global plugins
-plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run no
-ordinary request hook, global or scoped, because there is no proxy view to
-select. They do emit one terminal transaction summary to every global
+plus proxy/proxy-group-scoped plugins. Unmatched 404 responses have one narrow
+exception: the generation's global `correlation_id` instances resolve their
+IDs and decorate the error response in priority order. Their `inbound_policy`
+and `echo_downstream` settings apply on H1/H2/H3, and their canonical
+`request_id` reaches the unrouted access log.
+No other ordinary request policy runs because there is no proxy view to
+select. These responses emit one terminal transaction summary to every global
 `stdout_logging` instance that carries no execution trigger (no proxy,
 backend, or consumer; `metadata.rejection_phase = "route_not_found"`), on
 HTTP/1.1, HTTP/2, and HTTP/3 alike, so scanner and stale-route traffic reaches
 the access log. Other sinks and trigger-gated instances do not receive it, and a
-generation with no such logger keeps the allocation-free route-miss path. Matched 405
+generation with neither a global correlation policy nor such a logger keeps
+the allocation-free route-miss path. Matched 405
 responses also return before either kind of ordinary request hook runs, but
 they still emit one terminal transaction summary from the protocol-filtered
 plugin-cache view (`metadata.rejection_phase = "allowed_methods"`) without

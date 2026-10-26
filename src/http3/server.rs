@@ -4135,16 +4135,36 @@ async fn handle_h3_request(
                 ),
             );
             record_h3_flavor_aware_reject(&state, http_flavor, 404);
-            let sent = send_h3_error_flavor_aware(
-                &mut stream,
-                http_flavor,
-                grpc_web_response_content_type,
-                StatusCode::NOT_FOUND,
-                r#"{"error":"Not Found"}"#,
-                crate::proxy::grpc_proxy::grpc_status::NOT_FOUND,
-                "Not Found",
-            )
-            .await;
+            let sent = if let Some(correlation_plugins) =
+                epoch.plugin_cache.unrouted_correlation_plugins()
+            {
+                // Box the entire ladder: nested await state must not grow
+                // handle_h3_request's fixed worker-stack frame.
+                Box::pin(async {
+                    let headers =
+                        crate::proxy::prepare_unrouted_correlation(&correlation_plugins, &mut ctx)
+                            .await;
+                    send_h3_unrouted_response(
+                        &mut stream,
+                        http_flavor,
+                        grpc_web_response_content_type,
+                        headers,
+                    )
+                    .await
+                })
+                .await
+            } else {
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    StatusCode::NOT_FOUND,
+                    r#"{"error":"Not Found"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::NOT_FOUND,
+                    "Not Found",
+                )
+                .await
+            };
             // Same contract as the H1/H2 route miss: global access logs record
             // it, and without one this is a single pointer check. Delivered
             // before the write result propagates, so a peer that resets or
@@ -20901,6 +20921,54 @@ async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(
         return result;
     }
     write.await
+}
+
+/// The ordinary route-miss response with global correlation echoes. Preserve
+/// native gRPC's NOT_FOUND and gRPC-Web's body-framed error signalling.
+async fn send_h3_unrouted_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    flavor: HttpFlavor,
+    grpc_web_response_content_type: Option<&str>,
+    mut headers: HashMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    if let Some(content_type) = grpc_web_response_content_type {
+        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            crate::proxy::grpc_proxy::grpc_status::NOT_FOUND,
+            "Not Found",
+        );
+        crate::proxy::finalize_grpc_web_error_response_headers(
+            &mut translated,
+            &[],
+            Some(&headers),
+        );
+        return send_h3_finalized_reject_response_with_recv_halt(
+            stream,
+            StatusCode::OK,
+            Bytes::from(translated.body),
+            &translated.headers,
+            true,
+            RejectBodyDisposition::WireBody,
+        )
+        .await;
+    }
+    if matches!(flavor, HttpFlavor::Grpc) {
+        crate::proxy::grpc_proxy::finalize_grpc_error_response_headers(
+            &mut headers,
+            crate::proxy::grpc_proxy::grpc_status::NOT_FOUND,
+            "Not Found",
+            &[],
+        );
+    }
+    send_h3_reject_flavor_aware(
+        stream,
+        flavor,
+        StatusCode::NOT_FOUND,
+        Bytes::from_static(br#"{"error":"Not Found"}"#),
+        &headers,
+        RejectBodyDisposition::WireBody,
+    )
+    .await
 }
 
 /// Flavor-aware rejection for H3 with custom response headers (used on the
