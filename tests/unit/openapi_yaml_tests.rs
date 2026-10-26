@@ -4627,20 +4627,57 @@ fn key_auth_location_schema_matches_runtime_whitespace_contract() {
         ("query:   ", false),
         ("query:tenant key", false),
     ] {
-        let config = json!({"key_location": key_location});
-        let schema_valid = validator.validate(&config).is_ok();
-        let runtime_valid = KeyAuth::new(&config).is_ok();
+        for value in [json!(key_location), json!(["header:X-Other", key_location])] {
+            let config = json!({"key_location": value});
+            assert_eq!(
+                validator.validate(&config).is_ok(),
+                expected_valid,
+                "OpenAPI: {config}"
+            );
+            assert_eq!(
+                KeyAuth::new(&config).is_ok(),
+                expected_valid,
+                "runtime: {config}"
+            );
+        }
+    }
+
+    for (value, expected_valid) in [
+        (json!([]), false),
+        (json!(vec!["header:X-Key"; 9]), false),
+        (json!([null]), false),
+        (json!([123]), false),
+        (json!([true]), false),
+        (json!([{}]), false),
+        (json!([["header:X-Key"]]), false),
+        (json!(["header:X-Key", "cookie:key"]), false),
+        (json!(["header:X-Key", "header:"]), false),
+        (json!(["query:"]), false),
+        (json!(["header:X-Key"]), true),
+        (json!(["query:key"]), true),
+        (
+            json!(["header:X-Key", "header:x-key", "query:key", "query:key"]),
+            true,
+        ),
+        (
+            json!(
+                (0..8)
+                    .map(|i| format!("header:X-Key-{i}"))
+                    .collect::<Vec<_>>()
+            ),
+            true,
+        ),
+    ] {
+        let config = json!({"key_location": value});
         assert_eq!(
-            schema_valid, expected_valid,
-            "unexpected OpenAPI result for {key_location:?}"
+            validator.validate(&config).is_ok(),
+            expected_valid,
+            "OpenAPI: {config}"
         );
         assert_eq!(
-            runtime_valid, expected_valid,
-            "unexpected runtime result for {key_location:?}"
-        );
-        assert_eq!(
-            schema_valid, runtime_valid,
-            "OpenAPI/runtime key_location drift for {key_location:?}"
+            KeyAuth::new(&config).is_ok(),
+            expected_valid,
+            "runtime: {config}"
         );
     }
 }

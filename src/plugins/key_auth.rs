@@ -1,6 +1,6 @@
 //! API key authentication plugin.
 //!
-//! Extracts an API key from a configurable location (header or query parameter)
+//! Extracts an API key from configurable locations (headers or query parameters)
 //! and looks up the corresponding consumer via the `ConsumerIndex` for O(1)
 //! credential matching. Provides transport-level authentication only — the key
 //! reaches the gateway in plaintext, so TLS is required in production.
@@ -9,8 +9,10 @@
 //! wins a multi-auth chain.
 //!
 //! Default key location: `header:X-API-Key`. Configurable via `key_location`
-//! in the plugin config (e.g., `"query:api_key"` for query parameter extraction).
+//! in the plugin config (a string or an ordered array of up to eight locations).
 //! Location values are whitespace-sensitive and are never trimmed.
+//! Credentials in two different configured locations are ambiguous, even when
+//! their values match, and are refused with 401.
 //!
 //! A `query:<name>` credential that also appears as a `;`-separated
 //! sub-parameter (`?carrier=;api_key=k`) is ambiguous: Ferrum's `&`-only query
@@ -41,6 +43,8 @@ use super::{PluginResult, RequestContext};
 
 const INVALID_API_KEY_FORMAT_BODY: &str = r#"{"error":"Invalid API key format"}"#;
 const AMBIGUOUS_QUERY_API_KEY_BODY: &str = r#"{"error":"Ambiguous API key query parameter"}"#;
+const AMBIGUOUS_API_KEY_LOCATIONS_BODY: &str = r#"{"error":"Ambiguous API key locations"}"#;
+const MAX_KEY_LOCATIONS: usize = 8;
 
 /// One extraction of the configured key location, borrowing from the request
 /// whenever the representation allows it.
@@ -50,19 +54,97 @@ enum KeyLookup<'a> {
     InvalidFormat(&'static str),
 }
 
+enum KeyLocation {
+    Header {
+        /// Pre-lowercased to avoid allocating during extraction.
+        lower: String,
+        original: String,
+    },
+    Query {
+        name: String,
+        /// Precomputed key for the shared outbound-query strip funnel.
+        strip_metadata_key: String,
+    },
+}
+
+impl KeyLocation {
+    fn parse(key_location: &str) -> Result<Self, String> {
+        if key_location.is_empty() {
+            return Err("key_auth: `key_location` must not be empty".to_string());
+        }
+        if key_location.trim() != key_location {
+            return Err(
+                "key_auth: `key_location` must not have leading or trailing whitespace".to_string(),
+            );
+        }
+        if let Some(name) = key_location.strip_prefix("header:") {
+            if name.is_empty() {
+                return Err("key_auth: `key_location` header name must not be empty".to_string());
+            }
+            let normalized_name = name.to_ascii_lowercase();
+            let header_name = HeaderName::from_bytes(normalized_name.as_bytes()).map_err(|_| {
+                "key_auth: `key_location` header name is not a valid HTTP header name".to_string()
+            })?;
+            Ok(Self::Header {
+                lower: header_name.as_str().to_string(),
+                original: name.to_string(),
+            })
+        } else if let Some(name) = key_location.strip_prefix("query:") {
+            if name.is_empty() {
+                return Err("key_auth: `key_location` query name must not be empty".to_string());
+            }
+            if name.chars().any(char::is_whitespace) {
+                return Err(
+                    "key_auth: `key_location` query name must not contain whitespace".to_string(),
+                );
+            }
+            let mut strip_metadata_key =
+                String::with_capacity(STRIP_QUERY_PARAM_METADATA_PREFIX.len() + name.len());
+            strip_metadata_key.push_str(STRIP_QUERY_PARAM_METADATA_PREFIX);
+            strip_metadata_key.push_str(name);
+            Ok(Self::Query {
+                name: name.to_string(),
+                strip_metadata_key,
+            })
+        } else {
+            Err("key_auth: `key_location` must use `header:<name>` or `query:<name>`".to_string())
+        }
+    }
+
+    fn same_location(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Header { lower: a, .. }, Self::Header { lower: b, .. }) => a == b,
+            (Self::Query { name: a, .. }, Self::Query { name: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Borrow a single field line or decoded query value; only folded,
+    /// repeated header field lines allocate.
+    fn lookup<'a>(&'a self, ctx: &'a RequestContext) -> KeyLookup<'a> {
+        match self {
+            Self::Header { lower, original } => {
+                utf8_header_lookup_to_key(lookup_configured_header_utf8(ctx, lower, Some(original)))
+            }
+            Self::Query { name, .. } => {
+                if query_has_semicolon_credential_alias(ctx.raw_query_string(), name) {
+                    return KeyLookup::InvalidFormat(AMBIGUOUS_QUERY_API_KEY_BODY);
+                }
+                match ctx.query_params.get(name) {
+                    Some(key) => KeyLookup::Present(Cow::Borrowed(key.as_str())),
+                    None => KeyLookup::Missing,
+                }
+            }
+        }
+    }
+}
+
 pub struct KeyAuth {
-    /// Pre-lowercased header name for header-based key extraction.
-    /// Avoids a per-request `to_lowercase()` allocation.
-    header_name_lower: Option<String>,
-    /// Original (non-lowered) header name for case-sensitive fallback lookup.
-    header_name_original: Option<String>,
-    /// Query parameter name for query-based key extraction.
-    query_param_name: Option<String>,
-    /// Precomputed metadata key used to strip the configured query parameter.
-    strip_query_metadata_key: Option<String>,
+    /// Validated, distinct locations in configured order.
+    locations: Vec<KeyLocation>,
     /// Configured request headers that diagnostics and policy calls must omit.
     request_headers_to_redact: Vec<String>,
-    /// Remove the configured credential location before the backend request.
+    /// Remove every configured credential location before the backend request.
     hide_credentials: bool,
 }
 
@@ -93,125 +175,72 @@ impl KeyAuth {
                 .ok_or_else(|| "key_auth: `hide_credentials` must be a boolean".to_string())?,
             None => true,
         };
-        let key_location = match config_obj.get("key_location") {
-            Some(value) => value.as_str().ok_or_else(|| {
-                format!(
-                    "key_auth: `key_location` must be a string, got: {value:?}",
+        let locations = match config_obj.get("key_location") {
+            None => vec![KeyLocation::parse("header:X-API-Key")?],
+            Some(Value::String(location)) => vec![KeyLocation::parse(location)?],
+            Some(Value::Array(values)) => {
+                if values.is_empty() || values.len() > MAX_KEY_LOCATIONS {
+                    return Err(
+                        "key_auth: `key_location` array must contain 1 to 8 locations".to_string(),
+                    );
+                }
+                let mut locations = Vec::with_capacity(values.len());
+                for (index, value) in values.iter().enumerate() {
+                    let location = value.as_str().ok_or_else(|| {
+                        format!(
+                            "key_auth: `key_location` array element {index} must be a string, got: {value:?}",
+                            value = value.to_string()
+                        )
+                    })?;
+                    let location = KeyLocation::parse(location)?;
+                    // Header names are case-insensitive. Repeating the same
+                    // location cannot create a second credential source.
+                    if !locations
+                        .iter()
+                        .any(|known: &KeyLocation| known.same_location(&location))
+                    {
+                        locations.push(location);
+                    }
+                }
+                locations
+            }
+            Some(value) => {
+                return Err(format!(
+                    "key_auth: `key_location` must be a string or an array of strings, got: {value:?}",
                     value = value.to_string()
-                )
-            })?,
-            None => "header:X-API-Key",
+                ));
+            }
         };
-        if key_location.is_empty() {
-            return Err("key_auth: `key_location` must not be empty".to_string());
-        }
-        if key_location.trim() != key_location {
-            return Err(
-                "key_auth: `key_location` must not have leading or trailing whitespace".to_string(),
-            );
-        }
-
-        let (
-            header_name_lower,
-            header_name_original,
-            query_param_name,
-            strip_query_metadata_key,
-            request_headers_to_redact,
-        ) = if let Some(name) = key_location.strip_prefix("header:") {
-            if name.is_empty() {
-                return Err("key_auth: `key_location` header name must not be empty".to_string());
-            }
-            let normalized_name = name.to_ascii_lowercase();
-            let header_name = HeaderName::from_bytes(normalized_name.as_bytes()).map_err(|_| {
-                "key_auth: `key_location` header name is not a valid HTTP header name".to_string()
-            })?;
-            let canonical_name = header_name.as_str().to_string();
-            (
-                Some(canonical_name.clone()),
-                Some(name.to_string()),
-                None,
-                None,
-                vec![canonical_name],
-            )
-        } else if let Some(name) = key_location.strip_prefix("query:") {
-            if name.is_empty() {
-                return Err("key_auth: `key_location` query name must not be empty".to_string());
-            }
-            if name.chars().any(char::is_whitespace) {
-                return Err(
-                    "key_auth: `key_location` query name must not contain whitespace".to_string(),
-                );
-            }
-            let mut strip_key =
-                String::with_capacity(STRIP_QUERY_PARAM_METADATA_PREFIX.len() + name.len());
-            strip_key.push_str(STRIP_QUERY_PARAM_METADATA_PREFIX);
-            strip_key.push_str(name);
-            (
-                None,
-                None,
-                Some(name.to_string()),
-                Some(strip_key),
-                Vec::new(),
-            )
-        } else {
-            return Err(
-                "key_auth: `key_location` must use `header:<name>` or `query:<name>`".to_string(),
-            );
-        };
+        let request_headers_to_redact = locations
+            .iter()
+            .filter_map(|location| match location {
+                KeyLocation::Header { lower, .. } => Some(lower.clone()),
+                KeyLocation::Query { .. } => None,
+            })
+            .collect();
 
         Ok(Self {
-            header_name_lower,
-            header_name_original,
-            query_param_name,
-            strip_query_metadata_key,
+            locations,
             request_headers_to_redact,
             hide_credentials,
         })
     }
 
-    /// Read the configured key location. Borrowed for a single header field
-    /// line and for the decoded query map; only a repeated header field line
-    /// that needs folding allocates.
+    /// Scan in configured order, but never let a valid key mask another
+    /// configured source (including a blank or malformed credential).
     fn lookup_key<'a>(&'a self, ctx: &'a RequestContext) -> KeyLookup<'a> {
-        if let Some(lower) = self.header_name_lower.as_deref() {
-            let original = self.header_name_original.as_deref();
-            utf8_header_lookup_to_key(lookup_configured_header_utf8(ctx, lower, original))
-        } else if let Some(param) = self.query_param_name.as_deref() {
-            // An alias behind `;` makes the credential ambiguous; refuse it
-            // before the decoded map can authenticate either spelling.
-            if query_has_semicolon_credential_alias(ctx.raw_query_string(), param) {
-                return KeyLookup::InvalidFormat(AMBIGUOUS_QUERY_API_KEY_BODY);
+        let mut found = None;
+        for location in &self.locations {
+            let candidate = location.lookup(ctx);
+            if matches!(candidate, KeyLookup::Missing) {
+                continue;
             }
-            match ctx.query_params.get(param) {
-                Some(key) => KeyLookup::Present(Cow::Borrowed(key.as_str())),
-                None => KeyLookup::Missing,
+            if found.is_some() {
+                return KeyLookup::InvalidFormat(AMBIGUOUS_API_KEY_LOCATIONS_BODY);
             }
-        } else {
-            utf8_header_lookup_to_key(lookup_configured_header_utf8(
-                ctx,
-                "x-api-key",
-                Some("X-API-Key"),
-            ))
+            found = Some(candidate);
         }
-    }
-
-    /// Whether the configured query credential is present in any spelling a
-    /// backend may read: the decoded map entry, or a `;`-separated sub-pair.
-    fn query_credential_present(&self, ctx: &RequestContext) -> bool {
-        self.query_param_name.as_deref().is_some_and(|name| {
-            ctx.query_params.contains_key(name)
-                || query_has_semicolon_credential_alias(ctx.raw_query_string(), name)
-        })
-    }
-
-    /// Arm the shared outbound-query strip for the configured query name. The
-    /// strip funnel (`query_string_after_plugin_strips`) is `;`-aware, so the
-    /// marker also removes a sub-pair spelling.
-    fn mark_query_credential_for_stripping(&self, ctx: &mut RequestContext) {
-        if let Some(metadata_key) = &self.strip_query_metadata_key {
-            ctx.metadata
-                .insert(metadata_key.clone(), "true".to_string());
-        }
+        found.unwrap_or(KeyLookup::Missing)
     }
 }
 
@@ -342,18 +371,25 @@ auth_flow::impl_auth_plugin!(
     crate::plugins::HTTP_FAMILY_PROTOCOLS,
     run_key_auth;
 
-    /// Mark the configured query credential — in the decoded map or behind a
+    /// Mark every configured query credential — in the decoded map or behind a
     /// `;` — for policy redaction and, with `hide_credentials`, for removal
     /// from the forwarded query. Runs for every auth instance before the
     /// chain can short-circuit, so a sub-pair spelling is hidden even when
     /// another mechanism authenticates the request.
     fn mark_query_credentials_for_redaction(&self, ctx: &mut crate::plugins::RequestContext) {
-        if let Some(name) = self.query_param_name.as_deref()
-            && self.query_credential_present(ctx)
-        {
-            crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
-            if self.hide_credentials {
-                self.mark_query_credential_for_stripping(ctx);
+        for location in &self.locations {
+            if let KeyLocation::Query {
+                name,
+                strip_metadata_key,
+            } = location
+                && (ctx.query_params.contains_key(name)
+                    || query_has_semicolon_credential_alias(ctx.raw_query_string(), name))
+            {
+                crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+                if self.hide_credentials {
+                    ctx.metadata
+                        .insert(strip_metadata_key.clone(), "true".to_string());
+                }
             }
         }
     }
@@ -363,18 +399,18 @@ auth_flow::impl_auth_plugin!(
     }
 
     fn modifies_request_headers(&self) -> bool {
-        self.hide_credentials && self.header_name_lower.is_some()
+        self.hide_credentials && !self.request_headers_to_redact.is_empty()
     }
 
-    /// `hide_credentials` removes only the configured key header.
+    /// `hide_credentials` removes every configured key header.
     fn modified_request_header_names(&self) -> Option<Vec<String>> {
-        Some(self.header_name_lower.iter().cloned().collect())
+        Some(self.request_headers_to_redact.clone())
     }
 
-    /// `authenticate` marks a query credential for stripping from the
-    /// forwarded query, and `before_proxy` removes it.
+    /// Query discovery marks every present query credential for stripping;
+    /// `before_proxy` also removes it from the decoded query map.
     fn modifies_request_query(&self) -> bool {
-        self.hide_credentials && self.query_param_name.is_some()
+        self.hide_credentials && self.requires_decoded_query_params()
     }
 
     async fn before_proxy(
@@ -386,24 +422,33 @@ auth_flow::impl_auth_plugin!(
             return crate::plugins::PluginResult::Continue;
         }
 
-        if let Some(header_name) = self.header_name_lower.as_deref() {
-            headers.remove(header_name);
-            if let Some(original) = self.header_name_original.as_deref()
-                && original != header_name
-            {
-                headers.remove(original);
-            }
-        }
-        if let Some(name) = self.query_param_name.as_deref() {
-            let sub_pair_alias = query_has_semicolon_credential_alias(ctx.raw_query_string(), name);
-            if ctx.query_params.remove(name).is_some() || sub_pair_alias {
-                self.mark_query_credential_for_stripping(ctx);
+        for location in &self.locations {
+            match location {
+                KeyLocation::Header { lower, original } => {
+                    headers.remove(lower);
+                    if original != lower {
+                        headers.remove(original);
+                    }
+                }
+                KeyLocation::Query {
+                    name,
+                    strip_metadata_key,
+                } => {
+                    let sub_pair_alias =
+                        query_has_semicolon_credential_alias(ctx.raw_query_string(), name);
+                    if ctx.query_params.remove(name).is_some() || sub_pair_alias {
+                        ctx.metadata
+                            .insert(strip_metadata_key.clone(), "true".to_string());
+                    }
+                }
             }
         }
         crate::plugins::PluginResult::Continue
     }
 
     fn requires_decoded_query_params(&self) -> bool {
-        self.query_param_name.is_some()
+        self.locations
+            .iter()
+            .any(|location| matches!(location, KeyLocation::Query { .. }))
     }
 );
