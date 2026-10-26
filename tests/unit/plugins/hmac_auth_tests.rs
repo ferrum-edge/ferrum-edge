@@ -4780,3 +4780,48 @@ async fn rfc9421_request_target_covers_absolute_form_and_empty_query() {
         assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
     }
 }
+
+/// Classic CONNECT has no path or query to reconstruct its authority-form
+/// target from. Keep the exact wire spelling separate from the normalized
+/// authority, on both HTTP/1.x and H2/H3 without `:path`.
+#[test]
+fn rfc9421_request_target_covers_authority_form_connect() {
+    use ferrum_edge::_test_support::record_wire_request_line_for_hmac_for_test;
+    use ferrum_edge::plugins::hmac_auth::unreconstructible_request_target;
+
+    for target in [
+        "api.example.com:443",
+        "API.Example.com:8443",
+        "[2001:db8::1]:443",
+    ] {
+        let uri: http::Uri = target.parse().unwrap();
+        assert!(uri.path_and_query().is_none());
+        for version in [
+            http::Version::HTTP_10,
+            http::Version::HTTP_11,
+            http::Version::HTTP_2,
+            http::Version::HTTP_3,
+        ] {
+            assert_eq!(
+                unreconstructible_request_target(version, &uri).as_deref(),
+                Some(target),
+                "{version:?} must retain the authority-form wire target"
+            );
+            let mut ctx = make_ctx("CONNECT", uri.path());
+            record_wire_request_line_for_hmac_for_test(&mut ctx, "CONNECT", version, &uri);
+            let components = r#"("@method" "@request-target" "@path" "@query")"#;
+            ctx.headers
+                .insert("signature-input".to_string(), format!("sig1={components}"));
+            // Signature-base derivation does not verify this placeholder MAC.
+            ctx.headers
+                .insert("signature".to_string(), "sig1=:AA==:".to_string());
+            assert_eq!(
+                HmacAuth::rfc9421_signature_base_for_test(&ctx).unwrap(),
+                format!(
+                    "\"@method\": CONNECT\n\"@request-target\": {target}\n\"@path\": /\n\"@query\": ?\n\"@signature-params\": {components}"
+                ),
+                "{version:?} must derive the signature base from the wire target"
+            );
+        }
+    }
+}
