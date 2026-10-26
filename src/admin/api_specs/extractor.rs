@@ -603,10 +603,22 @@ pub fn extract_with_external_refs(
     let validate_ext = parse_x_ferrum_validate_extension(&root)?;
     let validate_enabled = validate_ext.is_some();
     if let Some(validate_ext) = validate_ext {
+        let reject_unsupported_parameters = match validate_ext.get("reject_unsupported_parameters")
+        {
+            None => false,
+            Some(Value::Bool(reject)) => *reject,
+            Some(_) => {
+                return Err(validator_parameter_error(
+                    "`x-ferrum-validate.reject_unsupported_parameters` must be a boolean"
+                        .to_string(),
+                ));
+            }
+        };
         let operations = extract_operation_schemas(
             &root,
             &version,
             proxy.listen_path.as_deref(),
+            reject_unsupported_parameters,
             &effective.document_base,
             &external_docs,
         )?;
@@ -902,6 +914,7 @@ const X_FERRUM_VALIDATE_KEYS: &[&str] = &[
     "bypass",
     "fail_on_unknown_operation",
     "fail_on_missing_response_schema",
+    "reject_unsupported_parameters",
     "max_body_bytes",
     "error_response",
     "error_truncate_chars",
@@ -945,6 +958,9 @@ fn apply_validate_extension(
                 validate_openapi_validator_bypass("x-ferrum-validate", &value)?;
                 config.insert(key, value);
             }
+            // Import-only policy, already checked before extracting operations.
+            // Runtime descriptors always reject unsupported serializations.
+            "reject_unsupported_parameters" => {}
             // Enumerated above; every remaining key is a plugin config field
             // that carries the same name.
             _ => {
@@ -2213,6 +2229,7 @@ fn extract_operation_schemas(
     root: &Value,
     version: &str,
     listen_path: Option<&str>,
+    reject_unsupported_parameters: bool,
     document_base: &Url,
     externals: &HashMap<String, LoadedExternalDocument>,
 ) -> Result<Vec<Value>, ExtractError> {
@@ -2342,6 +2359,7 @@ fn extract_operation_schemas(
                 operation,
                 version,
                 &format!("paths.{path_template}.{method}"),
+                reject_unsupported_parameters,
                 &resolver,
                 &mut operation_budget,
                 &mut resolution_state,
@@ -2846,8 +2864,8 @@ fn validator_parameter_error(error: String) -> ExtractError {
 /// `explode`. A parameter whose serialization the validator cannot
 /// deserialize (a `content` map, a non-default `style`, a Swagger
 /// `collectionFormat` other than `csv` / `multi`, nested collections) is
-/// omitted when it is optional and REFUSES the import when it is required, so
-/// a required parameter is never silently left unenforced. The support rule
+/// omitted with a warning when it is optional, unless strict import is enabled.
+/// Required unsupported parameters always REFUSE the import. The support rule
 /// is the plugin constructor's own
 /// ([`crate::plugins::openapi_validator::parameter_serialization_support`]).
 /// Header parameters OpenAPI says are ignored (`Accept`, `Content-Type`,
@@ -2860,6 +2878,7 @@ fn extract_operation_parameters(
     operation: &Map<String, Value>,
     version: &str,
     location: &str,
+    reject_unsupported_parameters: bool,
     resolver: &LocalSchemaResolver,
     budget: &mut GeneratedOperationBudget,
     state: &mut ResolutionState,
@@ -2947,6 +2966,11 @@ fn extract_operation_parameters(
             Err(reason) if required => {
                 return Err(validator_parameter_error(format!(
                     "`{location}` required {location_in} parameter {name:?} cannot be validated by openapi_validator ({reason}); the import is refused rather than leaving a required parameter unenforced"
+                )));
+            }
+            Err(reason) if reject_unsupported_parameters => {
+                return Err(validator_parameter_error(format!(
+                    "{location:?}: optional {location_in:?} parameter {name:?} cannot be validated by openapi_validator ({reason}); `reject_unsupported_parameters` is true"
                 )));
             }
             // An optional parameter the validator cannot deserialize stays
