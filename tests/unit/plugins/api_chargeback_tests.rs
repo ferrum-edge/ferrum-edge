@@ -5294,6 +5294,30 @@ fn reservation_config(
     }
 }
 
+fn with_reservation_budget(config: &GatewayConfig, budget: usize) -> GatewayConfig {
+    let mut config = config.clone();
+    for plugin in &mut config.plugin_configs {
+        if plugin.plugin_name == "api_chargeback" {
+            plugin.config["max_retained_bytes"] = json!(budget);
+        }
+    }
+    config
+}
+
+fn reserve_generation(
+    registry: &Arc<ChargebackRegistry>,
+    config: &GatewayConfig,
+) -> ferrum_edge::plugins::api_chargeback::OverflowReservation {
+    let reservation = registry
+        .prepare_overflow_reservations(&with_reservation_budget(
+            config,
+            registry.max_retained_bytes_for_test(),
+        ))
+        .unwrap_or_else(|error| panic!("reserve generation: {error}"));
+    reservation.activate();
+    reservation
+}
+
 fn total_registry_calls(registry: &ChargebackRegistry) -> u64 {
     registry
         .entries
@@ -5324,13 +5348,10 @@ fn test_reserved_overflow_matrix_absorbs_every_refused_tuple() {
         "the scenario budget admits the protected matrix ({matrix_bytes} bytes)"
     );
 
-    let registry = ChargebackRegistry::new();
+    let registry = Arc::new(ChargebackRegistry::new());
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
-    registry.publish_overflow_reservations(&config);
-    assert_eq!(
-        registry.outstanding_overflow_reserve_for_tests(),
-        matrix_bytes
-    );
+    let _reservation = reserve_generation(&registry, &config);
+    assert_eq!(registry.retained_bytes_for_tests(), matrix_bytes);
 
     for index in 0..500 {
         record_identity(&registry, &format!("user-{index}"));
@@ -5357,11 +5378,7 @@ fn test_reserved_overflow_matrix_absorbs_every_refused_tuple() {
         502,
         "no billable call is lost"
     );
-    assert_eq!(
-        registry.outstanding_overflow_reserve_for_tests(),
-        0,
-        "every reserved overflow row now exists"
-    );
+    assert!(matrix.keys().all(|key| registry.entries.contains_key(key)));
     let rendered: serde_json::Value =
         serde_json::from_str(&registry.render_json().unwrap()).unwrap();
     assert_eq!(rendered["registry"]["dropped_charges_total"], 0);
@@ -5447,16 +5464,11 @@ fn dropped_charges(registry: &ChargebackRegistry) -> serde_json::Value {
 /// dropping current-generation charges.
 #[test]
 fn test_reload_whose_overflow_rows_do_not_fit_beside_retained_history_is_refused() {
-    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
-
     let budget = 4096;
     let generation_a = single_tier_config(0.00001);
-    let registry = ChargebackRegistry::new();
+    let registry = Arc::new(ChargebackRegistry::new());
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
-    registry
-        .check_overflow_reservation_fits(&overflow_reservation_matrix(&generation_a), budget)
-        .expect("an empty registry holds generation A's overflow rows");
-    registry.publish_overflow_reservations(&generation_a);
+    let _reservation = reserve_generation(&registry, &generation_a);
     for index in 0..500 {
         record_identity(&registry, &format!("user-{index}"));
     }
@@ -5468,20 +5480,21 @@ fn test_reload_whose_overflow_rows_do_not_fit_beside_retained_history_is_refused
         "My API",
         json!({"pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00002}]}),
     );
-    let error = registry
-        .check_overflow_reservation_fits(&overflow_reservation_matrix(&generation_b), budget)
-        .expect_err("B's overflow rows do not fit beside the retained rows");
+    let error = match registry
+        .prepare_overflow_reservations(&with_reservation_budget(&generation_b, budget))
+    {
+        Err(error) => error,
+        Ok(_) => panic!("B's overflow rows must not fit beside the retained rows"),
+    };
     assert!(
         error.contains("`max_retained_bytes`") && error.contains("retained"),
         "{error}"
     );
 
     // The same reload against a registry with free space is admitted.
-    let fresh = ChargebackRegistry::new();
+    let fresh = Arc::new(ChargebackRegistry::new());
     fresh.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
-    fresh
-        .check_overflow_reservation_fits(&overflow_reservation_matrix(&generation_b), budget)
-        .expect("an unsaturated registry holds generation B's overflow rows");
+    let _fresh_reservation = reserve_generation(&fresh, &generation_b);
     assert_eq!(dropped_charges(&registry), 0);
 }
 
@@ -5490,21 +5503,17 @@ fn test_reload_whose_overflow_rows_do_not_fit_beside_retained_history_is_refused
 /// reload is refused, and every accepted generation loses nothing.
 #[test]
 fn test_repeated_repricing_is_refused_once_retained_history_fills_the_budget() {
-    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
-
     let budget = 4096;
-    let registry = ChargebackRegistry::new();
+    let registry = Arc::new(ChargebackRegistry::new());
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
-    registry.publish_overflow_reservations(&single_tier_config(0.00001));
+    let reservation_a = reserve_generation(&registry, &single_tier_config(0.00001));
     for index in 0..500 {
         record_identity(&registry, &format!("user-{index}"));
     }
 
     let generation_b = single_tier_config(0.00002);
-    registry
-        .check_overflow_reservation_fits(&overflow_reservation_matrix(&generation_b), budget)
-        .expect("one more overflow row still fits");
-    registry.publish_overflow_reservations(&generation_b);
+    let _reservation_b = reserve_generation(&registry, &generation_b);
+    drop(reservation_a);
     registry.record_http(
         &scope(),
         "after-b",
@@ -5521,9 +5530,12 @@ fn test_repeated_repricing_is_refused_once_retained_history_fills_the_budget() {
     assert_eq!(dropped_charges(&registry), 0, "generation B lost nothing");
 
     let generation_c = single_tier_config(0.00003);
-    registry
-        .check_overflow_reservation_fits(&overflow_reservation_matrix(&generation_c), budget)
-        .expect_err("generation C's overflow row no longer fits");
+    assert!(
+        registry
+            .prepare_overflow_reservations(&with_reservation_budget(&generation_c, budget))
+            .is_err(),
+        "generation C's overflow row no longer fits"
+    );
 }
 
 fn record_generation_b(registry: &ChargebackRegistry, consumer: &str) {
@@ -5541,28 +5553,28 @@ fn record_generation_b(registry: &ChargebackRegistry, consumer: &str) {
     );
 }
 
-/// PR6842-SOL-6: a current-generation charge that folds into an overflow row
-/// an eviction pass has unlinked (but still holds, with its reservation) is
-/// filed with the pass instead of reserving a second copy of the row, so it
-/// is kept even though no free space exists for a duplicate.
+/// #6891: a current-generation overflow row stays pinned during eviction,
+/// including when the pass removes ordinary rows and records another charge.
+/// It never needs a second byte reservation.
 #[test]
-fn test_charge_on_an_overflow_row_unlinked_by_eviction_is_kept() {
+fn test_charge_on_a_pinned_overflow_row_during_eviction_is_kept() {
     let budget = 4096;
-    let registry = ChargebackRegistry::new();
+    let registry = Arc::new(ChargebackRegistry::new());
     registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, budget);
-    registry.publish_overflow_reservations(&single_tier_config(0.00001));
+    let reservation_a = reserve_generation(&registry, &single_tier_config(0.00001));
     for index in 0..500 {
         record_identity(&registry, &format!("user-{index}"));
     }
-    registry.publish_overflow_reservations(&single_tier_config(0.00002));
+    let _reservation_b = reserve_generation(&registry, &single_tier_config(0.00002));
+    drop(reservation_a);
     record_generation_b(&registry, "after-b");
     registry.render_prometheus().unwrap();
     registry.render_prometheus().unwrap();
     let overflow_before = by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL);
     let ordinary_rows = registry.reserved_entries_for_tests();
 
-    // Every row is idle and confirmed collected; the charge lands after the
-    // pass unlinked them and before it decides their fate.
+    // Every row is idle and collected; the pass unlinks the ordinary rows.
+    // The current overflow row and its exported history remain pinned.
     let evicted = registry.evict_stale_interleaved_for_tests(
         0,
         || {},
@@ -5572,7 +5584,7 @@ fn test_charge_on_an_overflow_row_unlinked_by_eviction_is_kept() {
     assert_eq!(
         by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL),
         overflow_before + 1,
-        "the charge is merged into the restored overflow row"
+        "the charge is recorded on the pinned overflow row"
     );
     assert_eq!(dropped_charges(&registry), 0);
     assert_eq!(
@@ -5587,12 +5599,10 @@ fn test_charge_on_an_overflow_row_unlinked_by_eviction_is_kept() {
 /// and does not refuse a budget lowered below occupancy when every reserved
 /// row already exists (that keeps draining through eviction).
 #[test]
-fn test_live_overflow_reservation_check_uses_the_candidate_budget() {
-    use ferrum_edge::plugins::api_chargeback::live_overflow_reservation_check;
-
-    let registry = ChargebackRegistry::new();
+fn test_overflow_preparation_uses_the_candidate_budget() {
+    let registry = Arc::new(ChargebackRegistry::new());
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, 4096);
-    registry.publish_overflow_reservations(&single_tier_config(0.00001));
+    let reservation_a = reserve_generation(&registry, &single_tier_config(0.00001));
     for index in 0..500 {
         record_identity(&registry, &format!("user-{index}"));
     }
@@ -5605,8 +5615,10 @@ fn test_live_overflow_reservation_check_uses_the_candidate_budget() {
             "max_retained_bytes": 4096
         }),
     );
-    live_overflow_reservation_check(&expanded, &registry)
-        .expect_err("the expanded matrix does not fit beside retained rows");
+    assert!(
+        registry.prepare_overflow_reservations(&expanded).is_err(),
+        "the expanded matrix does not fit beside retained rows"
+    );
 
     let lowered = reservation_config(
         "proxy-a",
@@ -5616,8 +5628,10 @@ fn test_live_overflow_reservation_check_uses_the_candidate_budget() {
             "max_retained_bytes": 2048
         }),
     );
-    live_overflow_reservation_check(&lowered, &registry)
+    let _lowered_reservation = registry
+        .prepare_overflow_reservations(&lowered)
         .expect("lowering the budget with every reserved row present is not refused");
+    drop(reservation_a);
 }
 
 /// PR6842-SOL-5: creating an aggregate overflow row never waits for an
@@ -5625,16 +5639,16 @@ fn test_live_overflow_reservation_check_uses_the_candidate_budget() {
 /// retirement lock exclusively; a blocking acquisition would never return.
 #[test]
 fn test_overflow_creation_during_an_eviction_pass_does_not_wait() {
-    let registry = ChargebackRegistry::new();
+    let registry = Arc::new(ChargebackRegistry::new());
     registry.configure(0, 3600, 0, 2, TEST_MAX_BYTES);
-    registry.publish_overflow_reservations(&single_tier_config(0.00001));
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
     record_identity(&registry, "old-user");
     registry.render_prometheus().unwrap();
     registry.render_prometheus().unwrap();
     record_identity(&registry, "live-user");
 
     // Both ordinary slots are taken, so this identity folds into the reserved
-    // overflow row, created mid-pass.
+    // overflow row, already created during staging.
     let evicted = registry.evict_stale_interleaved_for_tests(
         0,
         || record_identity(&registry, "burst-user"),
@@ -5642,11 +5656,7 @@ fn test_overflow_creation_during_an_eviction_pass_does_not_wait() {
     );
     assert_eq!(evicted, 1, "the idle, collected old-user group retires");
     assert_eq!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL), 1);
-    assert_eq!(
-        registry.outstanding_overflow_reserve_for_tests(),
-        0,
-        "the pass reconciles the row created while it held the lock"
-    );
+    assert!(registry.retained_bytes_for_tests() <= TEST_MAX_BYTES);
     assert_eq!(dropped_charges(&registry), 0);
 }
 
@@ -5660,7 +5670,7 @@ fn test_concurrent_first_creation_of_one_overflow_row_drops_nothing() {
     let overflow_row_bytes: usize = overflow_reservation_matrix(&single_tier_config(0.00001))
         .values()
         .sum();
-    let registry = ChargebackRegistry::new();
+    let registry = Arc::new(ChargebackRegistry::new());
     registry.configure(5, 3600, 500, 1, TEST_MAX_BYTES);
     record_identity(&registry, "seed");
     let seed_bytes = registry.retained_bytes_for_tests();
@@ -6101,4 +6111,434 @@ fn test_cleanup_interval_above_one_year_is_rejected() {
     let mut at_max = base;
     at_max["cleanup_interval_seconds"] = json!(MAX_CLEANUP_INTERVAL_SECS);
     assert!(ApiChargeback::new(&at_max, "ferrum").is_ok());
+}
+
+/// #6891: staged rows own their bytes before publication, including a matrix
+/// larger than the live generation's headroom. Old-generation traffic cannot
+/// spend those bytes between admission and activation.
+#[test]
+fn test_staged_overflow_matrix_survives_prepublication_saturation() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    let budget = 8192;
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, budget);
+    let live = reserve_generation(&registry, &single_tier_config(0.00001));
+    let candidate = with_reservation_budget(
+        &reservation_config(
+            "proxy-a",
+            "My API",
+            json!({
+                "pricing_tiers": [{"status_codes": [200, 201, 202], "price_per_call": 0.00002}]
+            }),
+        ),
+        budget,
+    );
+    let matrix = overflow_reservation_matrix(&candidate);
+    let staged = registry.prepare_overflow_reservations(&candidate).unwrap();
+    assert!(matrix.keys().all(|key| registry.entries.contains_key(key)));
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+    let before: serde_json::Value = serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert!(
+        before["consumers"].as_object().unwrap().is_empty(),
+        "unused reservations are not billing rows"
+    );
+
+    // Saturate while the old cache/budgets are still serving. No call to
+    // staged.activate() has occurred yet.
+    for index in 0..500 {
+        record_identity(&registry, &format!("live-{index}"));
+    }
+    let bytes_before = registry.retained_bytes_for_tests();
+    let rows_before = registry.entries.len();
+    for status in [200, 201, 202] {
+        registry.record_http(
+            &scope(),
+            "new-generation",
+            "proxy-a",
+            "My API",
+            status,
+            0.00002,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
+    assert_eq!(registry.retained_bytes_for_tests(), bytes_before);
+    assert_eq!(registry.entries.len(), rows_before);
+    assert_eq!(total_registry_calls(&registry), 503);
+    assert_eq!(dropped_charges(&registry), 0);
+    assert!(bytes_before <= budget);
+    staged.activate();
+    drop(live);
+}
+
+/// #6891: two distinct reserved rows can receive their first charges while a
+/// maintenance pass holds the retirement lock. Neither row needs a second
+/// reservation, and the pass cannot double-count either one.
+#[test]
+fn test_two_reserved_overflow_rows_record_during_one_eviction_pass() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, 4096);
+    let config = reservation_config(
+        "proxy-a",
+        "My API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200, 201], "price_per_call": 0.00001}]
+        }),
+    );
+    let _reservation = reserve_generation(&registry, &config);
+    record_identity(&registry, "collected-seed");
+    registry.render_prometheus().unwrap();
+    registry.render_prometheus().unwrap();
+    let bytes_before = registry.retained_bytes_for_tests();
+    let rows_before = registry.entries.len();
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || {
+            for status in [200, 201] {
+                registry.record_http(
+                    &scope(),
+                    "during-pass",
+                    "proxy-a",
+                    "My API",
+                    status,
+                    0.00001,
+                    7,
+                    11,
+                    0.0,
+                    0.0,
+                );
+            }
+            assert_eq!(registry.retained_bytes_for_tests(), bytes_before);
+            assert_eq!(registry.entries.len(), rows_before);
+        },
+        || {},
+    );
+    assert_eq!(evicted, 1);
+    assert_eq!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL), 2);
+    assert_eq!(dropped_charges(&registry), 0);
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+}
+
+/// #6891: concurrent first use of a prepared row does not create or reserve
+/// anything on the request path, even when the ordinary byte budget is full.
+#[test]
+fn test_concurrent_first_use_of_precreated_overflow_row_keeps_exact_budget() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, 4096);
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
+    record_identity(&registry, "seed");
+    let before = registry.retained_bytes_for_tests();
+    registry.configure(0, 3600, 0, 1, before);
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|threads| {
+        for _ in 0..16 {
+            let registry = &registry;
+            let barrier = &barrier;
+            threads.spawn(move || {
+                barrier.wait();
+                record_identity(registry, "first-use");
+            });
+        }
+    });
+    assert_eq!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL), 16);
+    assert_eq!(registry.retained_bytes_for_tests(), before);
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// #6891: competing stages cannot both pass a fit check and publish above the
+/// byte ceiling. The losing stage leaves no partial rows or reservations.
+#[test]
+fn test_concurrent_matrix_preparations_reserve_atomically_and_roll_back() {
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let a = single_tier_config(0.00001);
+    let b = single_tier_config(0.00002);
+    let a_bytes: usize = overflow_reservation_matrix(&a).values().sum();
+    let b_bytes: usize = overflow_reservation_matrix(&b).values().sum();
+    let budget = a_bytes + b_bytes - 1;
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, budget);
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|threads| {
+        let handles: Vec<_> = [a, b]
+            .into_iter()
+            .map(|config| {
+                let registry = &registry;
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    barrier.wait();
+                    registry
+                        .prepare_overflow_reservations(&with_reservation_budget(&config, budget))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(registry.entries.len(), 1);
+    assert!(registry.retained_bytes_for_tests() <= budget);
+    drop(results);
+    assert!(registry.entries.is_empty());
+    assert_eq!(registry.retained_bytes_for_tests(), 0);
+}
+
+#[test]
+fn test_abandoned_stage_releases_only_its_unused_rows() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, TEST_MAX_BYTES);
+    let active = reserve_generation(&registry, &single_tier_config(0.00001));
+    let active_bytes = registry.retained_bytes_for_tests();
+    let duplicate = registry
+        .prepare_overflow_reservations(&single_tier_config(0.00001))
+        .unwrap();
+    drop(duplicate);
+    assert_eq!(registry.retained_bytes_for_tests(), active_bytes);
+    let unused = registry
+        .prepare_overflow_reservations(&single_tier_config(0.00002))
+        .unwrap();
+    assert!(registry.retained_bytes_for_tests() > active_bytes);
+    drop(unused);
+    assert_eq!(registry.retained_bytes_for_tests(), active_bytes);
+
+    // The current row stays allocated even after idle collection and only the
+    // ordinary seed row is retired. Its fallback is ready for the next charge.
+    record_identity(&registry, "seed");
+    record_identity(&registry, "overflow");
+    registry.render_json().unwrap();
+    registry.render_json().unwrap();
+    assert_eq!(registry.evict_stale(0), 1);
+    assert_eq!(registry.entries.len(), 1);
+    assert_eq!(registry.retained_bytes_for_tests(), active_bytes);
+    drop(active);
+    assert_eq!(
+        registry.entries.len(),
+        1,
+        "dropping a pin never discards billed counters"
+    );
+    assert_eq!(registry.evict_stale(0), 1);
+    assert_eq!(registry.retained_bytes_for_tests(), 0);
+}
+
+/// #6891: the global chain's unknown-proxy fallback is a bounded, prepared
+/// matrix too, across its namespace and the namespaces known by the config.
+#[test]
+fn test_global_unknown_proxy_overflow_is_reserved_for_http_and_streams() {
+    use ferrum_edge::config::types::PluginScope;
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+
+    let mut config = single_tier_config(0.00001);
+    config.plugin_configs[0].scope = PluginScope::Global;
+    config.plugin_configs[0].proxy_id = None;
+    config.plugin_configs[0].config["stream_connection_pricing"] =
+        json!({"price_per_connection": 0.5});
+    config.plugin_configs[0].config["bandwidth_pricing"] = json!({"price_per_byte_sent": 0.000001});
+    config.known_namespaces = vec!["tenant-b".to_string()];
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 1, TEST_MAX_BYTES);
+    let _reservation = reserve_generation(&registry, &config);
+    let matrix = overflow_reservation_matrix(&config);
+    assert_eq!(
+        matrix.len(),
+        8,
+        "configured HTTP rows plus HTTP/bandwidth/stream fallback per namespace"
+    );
+    record_identity(&registry, "seed");
+    let bytes_before = registry.retained_bytes_for_tests();
+    registry.configure(0, 3600, 0, 1, bytes_before);
+    for namespace in ["ferrum", "tenant-b"] {
+        let scope = scope_for("USD", namespace);
+        registry.record_http(
+            &scope,
+            "http-user",
+            "unknown",
+            "unknown",
+            200,
+            0.00001,
+            3,
+            5,
+            0.000001,
+            0.0,
+        );
+        registry.record_stream(
+            &scope,
+            "stream-user",
+            "unknown",
+            "unknown",
+            0.5,
+            7,
+            11,
+            0.000001,
+            0.0,
+        );
+        registry.record_websocket_bandwidth(
+            &scope, "ws-user", "unknown", "unknown", 13, 17, 0.000001, 0.0,
+        );
+    }
+    assert_eq!(total_registry_calls(&registry), 5);
+    assert_eq!(registry.retained_bytes_for_tests(), bytes_before);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// #6891: a budget-lowering reload can refuse the whole candidate if it also
+/// needs a missing fallback row. It leaves live knobs and all charges intact.
+#[test]
+fn test_lower_budget_reload_with_missing_rows_is_refused_without_mutation() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, 8192);
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    let before = registry.retained_bytes_for_tests();
+    let lowered = with_reservation_budget(&single_tier_config(0.00002), 4096);
+    assert!(registry.prepare_overflow_reservations(&lowered).is_err());
+    assert_eq!(registry.retained_bytes_for_tests(), before);
+    assert_eq!(registry.max_retained_bytes_for_test(), 8192);
+    assert_eq!(total_registry_calls(&registry), 500);
+    assert_eq!(dropped_charges(&registry), 0);
+}
+
+/// #6891: response-extension clones represent one body hand-off, and cannot
+/// masquerade as two separate responses for the collection heuristic.
+#[test]
+fn test_duplicate_delivery_ack_does_not_confirm_collection() {
+    use ferrum_edge::plugins::api_chargeback::ChargesDeliveryAck;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    let (_, receipt) = registry.render_json_pending().unwrap();
+    let ack = ChargesDeliveryAck::new(Arc::clone(&registry), receipt);
+    ack.acknowledge();
+    ack.clone().acknowledge();
+    ack.acknowledge();
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "one response is only one hand-off"
+    );
+    ChargesDeliveryAck::new(Arc::clone(&registry), receipt).acknowledge();
+    assert_eq!(registry.evict_stale(0), 1);
+}
+
+/// The last generation owner can be released by a request. It must not wait
+/// for an eviction pass to release its pins; the next pass finishes cleanup.
+#[test]
+fn test_generation_drop_during_retirement_defers_unused_row_cleanup() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let mut staged = Some(
+        registry
+            .prepare_overflow_reservations(&single_tier_config(0.00002))
+            .unwrap(),
+    );
+    record_identity(&registry, "collected-seed");
+    registry.render_json().unwrap();
+    registry.render_json().unwrap();
+    let evicted = registry.evict_stale_interleaved_for_tests(
+        0,
+        || {
+            drop(staged.take());
+        },
+        || {},
+    );
+    assert_eq!(evicted, 1);
+    assert_eq!(registry.entries.len(), 1, "unused row cleanup was deferred");
+    assert_eq!(registry.evict_stale(0), 0);
+    assert!(registry.entries.is_empty());
+    assert_eq!(registry.retained_bytes_for_tests(), 0);
+}
+
+/// Composition validation was already pure on the assigned base. Keep its
+/// config-only decision separate from the stateful, atomic staging decision;
+/// this fixture owns its registry and has no process-order precondition.
+#[test]
+fn test_composition_validation_remains_independent_of_live_admission() {
+    use ferrum_edge::plugins::api_chargeback::validate_composition;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, 8192);
+    let _reservation = reserve_generation(&registry, &single_tier_config(0.00001));
+    let candidate = with_reservation_budget(&single_tier_config(0.00002), 4096);
+    validate_composition(&candidate).unwrap();
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+    assert!(registry.prepare_overflow_reservations(&candidate).is_err());
+    validate_composition(&candidate).unwrap();
+}
+
+/// Both full cache builds and incremental rebuilds must own their fallback
+/// matrix before serving any transaction, even if it has never overflowed.
+#[tokio::test]
+async fn test_cache_build_full_reload_and_delta_precreate_overflow_rows() {
+    use ferrum_edge::config::db_backend::NamespacedResourceId;
+    use ferrum_edge::plugins::api_chargeback::overflow_reservation_matrix;
+    use std::collections::HashSet;
+
+    const PROXY_ID: &str = "issue-6891-cache-preallocation";
+    let mut config = reservation_config(
+        PROXY_ID,
+        "Preallocation API",
+        json!({
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]
+        }),
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let registry = global_registry();
+    let assert_precreated = |config: &GatewayConfig| {
+        let matrix = overflow_reservation_matrix(config);
+        assert!(!matrix.is_empty());
+        for key in matrix.keys() {
+            let entry = registry
+                .entries
+                .get(key)
+                .expect("fallback exists before first transaction");
+            assert_eq!(entry.call_count.load(Ordering::Relaxed), 0);
+        }
+    };
+    assert_precreated(&config);
+    config.plugin_configs[0].config["pricing_tiers"] =
+        json!([{"status_codes": [200, 201], "price_per_call": 0.00002}]);
+    let changed = HashSet::from([NamespacedResourceId::new("ferrum", PROXY_ID)]);
+    cache.apply_delta(&config, &changed, &[], false).unwrap();
+    assert_precreated(&config);
+    config.plugin_configs[0].config["pricing_tiers"] =
+        json!([{"status_codes": [200, 201, 202], "price_per_call": 0.00003}]);
+    cache.rebuild(&config).unwrap();
+    assert_precreated(&config);
+    let final_keys = overflow_reservation_matrix(&config);
+    drop(cache);
+    assert!(
+        final_keys
+            .keys()
+            .all(|key| !registry.entries.contains_key(key))
+    );
+}
+
+/// An unused scoped definition may exist before any instance claims the global
+/// registry. Cache construction must behave the same in either process order.
+#[tokio::test]
+async fn test_unattached_chargeback_definition_needs_no_registry_reservation() {
+    let mut config = reservation_config(
+        "issue-6891-unattached",
+        "Unattached API",
+        json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]}),
+    );
+    config.proxies[0].plugins.clear();
+    let cache = PluginCache::new(&config).unwrap();
+    assert!(
+        cache
+            .get_plugins("ferrum", "issue-6891-unattached")
+            .iter()
+            .all(|plugin| plugin.name() != "api_chargeback")
+    );
 }

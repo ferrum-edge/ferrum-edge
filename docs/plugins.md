@@ -2229,41 +2229,48 @@ retained billing rows (complete registry entry keys) and at most
 `max_retained_bytes` of retained state. A registry key includes consumer,
 proxy, billable status, protocol family, currency, namespace, and prices, so one
 authenticated principal can occupy many slots. Once either ceiling is reached,
-further *new rows* are not dropped: their charges are folded into a
-fixed-cardinality aggregate row whose `consumer` label is the internal sentinel
+further *new ordinary rows* use their prepared fallback: charges are folded into
+a fixed-cardinality aggregate row whose `consumer` label is the internal sentinel
 `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
 keeping every other dimension (proxy, billable status, protocol family,
 currency, namespace, prices) intact so invoice totals still reconcile — only
 per-identity attribution is lost when a new row cannot be admitted.
 
-The overflow rows themselves are reserved from the published configuration
-before any ordinary row can use their bytes. For every proxy with an effective
-instance, the matrix holds one overflow row per priced status (HTTP family),
+The overflow rows themselves are created and reserved from the candidate
+configuration before publishing a cache generation. For every proxy with an
+effective instance, the matrix holds one overflow row per priced status (HTTP family),
 plus one shared status-`0` row when bandwidth is priced. That row also takes
-WebSocket disconnect bandwidth, and the overflow row files the bandwidth of
-statuses no tier prices there, so the matrix stays bounded by configuration.
-A stream proxy has a single stream row. Ordinary rows may not use the bytes
-of reserved rows that do not exist yet, nor an equal amount of headroom kept
-for a pricing reload's next generation while the retired one drains.
-Admission therefore refuses a `max_retained_bytes` smaller than twice the
-matrix, and a flood of distinct identities can never take the bytes the
-overflow fallback needs. Reserving cannot free bytes that retained history
-already occupies: retained rows may hold uncollected charges, and an active
-series keeps its retired pricing generations. So a reload is also refused, and
-the live generation stays in place, when the new configuration's overflow rows
-that do not exist yet need more than the registry's free space. Typically that
-is a repricing against a saturated registry. Raise `max_retained_bytes`, or let
-retained rows be collected and evicted first. Rows admitted between that check
-and the reload's publication are not counted. A reload whose reserved overflow
-rows all exist already is never refused this way, so lowering the budget below
-current occupancy still just drains through eviction. This check runs where a
-node builds the plugin generation it will serve, so offline `validate` and
-control-plane validation cannot predict it. Creating an overflow row never
-waits for an eviction pass. A charge whose overflow row the running pass has
-unlinked is filed with the pass, which still holds that row and its reservation,
-instead of reserving a second copy; the pass then merges it back. Concurrent
-first creations of the same overflow row serialize, so they cannot each reserve
-its bytes and drop charges one row would hold. That
+WebSocket disconnect bandwidth and bandwidth of statuses no tier prices. A
+stream proxy has a single stream row. A global instance additionally reserves
+unknown-proxy HTTP and stream fallback rows in its own namespace and every
+namespace known to the configuration.
+
+Staging creates the complete matrix and reserves its missing bytes in one atomic
+operation against ordinary admission. Those bytes cannot be spent by requests
+between the fit decision and publication. Rows stay pinned while a cache
+generation owns them, including during staging; request recording never waits
+for the retirement lock or creates a configured fallback row. Two different
+rows first charged during one eviction pass therefore need no reservation
+transfer or reconciliation. Unused preallocations do not appear as billing
+series, but their bytes are included in `registry.retained_bytes`. Dropping an
+abandoned stage releases its pins and unused rows; cleanup is deferred to the
+next maintenance pass if the retirement lock is busy. Charged rows are never
+discarded by rollback. A current aggregate row that has received charges stays
+cumulative while pinned; it and the retired pricing rows in its exported series
+become eligible for ordinary idle eviction after the owning generations retire.
+
+Ordinary rows also leave one accepted matrix's worth of headroom for a pricing
+reload. Admission refuses a `max_retained_bytes` smaller than twice the candidate
+matrix. Headroom cannot guarantee that a larger matrix or repeated repricing
+will fit beside retained history. A node refuses the **whole reload**, keeping
+the live configuration, when missing fallback rows cannot be reserved under the
+candidate's budget. This includes a budget-lowering reload that also needs new
+fallback rows. Raise `max_retained_bytes`, or let retained history be collected
+and evicted first. If every candidate fallback row already exists, lowering a
+budget below occupancy remains allowed: retained charges drain through normal
+eviction, and new ordinary rows overflow until occupancy falls. Offline
+`validate` and control-plane validation check configuration only; they cannot
+predict a node's live occupancy. The
 sentinel lives in the digest-form
 billing-identity class (`~sha256:` marker, non-hex suffix), so
 `bounded_billing_identity` can never return it for a real authenticated claim
@@ -2281,15 +2288,14 @@ as fixed-cardinality, identity-free series
 `ferrum_api_chargeback_identity_overflow_total`,
 `ferrum_api_chargeback_dropped_charges_total`,
 `ferrum_api_chargeback_uncollected_retained_entries`) and as the `registry`
-object in the JSON format. `dropped_charges_total` is the only genuine loss path: it can
-advance only when an aggregate row cannot reserve bytes. That covers a charge
-outside the reserved matrix: traffic attributed to no configured proxy
-(`proxy_id` `unknown`), or a retired pricing generation's late completion once
-the reload headroom is spent. It also covers a current-generation charge when
-rows admitted between a reload's fit check and its publication took the space
-its overflow rows needed.
+object in the JSON format. `dropped_charges_total` counts a charge that cannot
+reserve an aggregate row outside a prepared matrix, such as an unconfigured
+namespace/direct registry caller or a retired generation's late completion
+after its fallback has been evicted and free space is exhausted. It does not
+measure transport failures or collector ingestion. Configured rows are prepared
+before publication, so request-time admission cannot consume their reservation.
 Because `/charges` renders the whole registry in one pass, render cost is
-bounded by `max_entries`; size it for the row cardinality you are willing to
+bounded by ordinary `max_entries` plus the retained overflow rows; size it for the row cardinality you are willing to
 scrape. An uncached render runs on the blocking thread pool rather than an async
 worker, and a render whose walk keeps being invalidated by a concurrent reload
 (a proxy-name or projection change) is retried at most three times and then
@@ -2310,9 +2316,9 @@ before the gateway hands over the response body (for example a collector that
 times out during a long render). Two deliveries are required because taking
 the body is the last signal the HTTP stack offers. HTTP/2 takes it before
 flow-control capacity is granted and HTTP/1 before the write is flushed, so one
-delivered document may still never reach the collector. A single failed
-delivery can never authorize deletion. A retry served from the render cache
-counts as a hand-off of the walk that produced the cached document. These are
+handed-off document may still never reach the collector. One response is
+insufficient, and cloned response extensions count only once. A retry served
+from the render cache counts as a hand-off of the walk that produced the cached document. These are
 hand-offs, not proof of receipt. Two hand-offs on one connection can fail
 together (for example two HTTP/2 streams behind a zero receive window that is
 then reset), so a collector that systematically fails after the gateway hands
@@ -2353,9 +2359,11 @@ records.
 Neither budget accepts `0` — there is no unlimited mode. Budgets (and the other
 process-global tunables) are applied only once a plugin generation is accepted
 and installed, so admin validation and a rejected reload candidate never repoint
-the registry the live generation is still using. Lowering a budget never deletes
-retained billable state: existing entries keep their reservations and drain
-through normal TTL eviction while new rows overflow until occupancy falls
+the registry knobs the live generation is still using. A staged cache temporarily
+reserves its fallback rows as described above. Lowering a budget can refuse the
+whole reload if new fallback rows would not fit; an accepted decrease never
+deletes retained billable state: existing entries keep their reservations and
+drain through normal TTL eviction while new rows overflow until occupancy falls
 back under the ceiling. Authenticated `GET /charges` before any
 `api_chargeback` plugin is configured returns the empty response shape without
 creating the process-global registry, so a later accepted generation can still
@@ -2436,11 +2444,11 @@ Successful H1, H2, and H3 WebSocket handshakes all use the `101` call-pricing ti
 | `stream_connection_pricing` | Object | _(optional)_ | Per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS) |
 | `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Finite, non-negative, ≤ `1e288` |
 | `render_cache_ttl_seconds` | Integer (u64) | `5` | How long the cached `/charges` response is served before rebuilding. Process-global: every enabled instance must use the same value |
-| `stale_entry_ttl_seconds` | Integer (u64) | `3600` | How long a chargeback entry may sit idle before it becomes *eligible* for eviction. Eligibility is not deletion: an idle entry is removed only after two delivered `/charges` exports have collected its current counters (see the collection contract above), so uncollected billing state is never discarded on age alone. Process-global: every enabled instance must use the same value |
+| `stale_entry_ttl_seconds` | Integer (u64) | `3600` | How long a chargeback entry may sit idle before it becomes *eligible* for eviction. Eligibility is not deletion: an unpinned idle entry also requires two `/charges` body hand-offs containing its current counters (a heuristic, not proof of receipt; see above). Current aggregate rows stay pinned while their cache generation exists. Process-global: every enabled instance must use the same value |
 | `cache_invalidation_min_age_ms` | Integer (u64) | `500` | Minimum age (ms) of a render cache before `record()` will invalidate it. Evaluated **per format** against that document's own timestamp, so a JSON-only collector gets the same protection as a Prometheus one and neither format's cache lifetime depends on whether the other is being scraped. An already-empty cache is left alone rather than restamped. Process-global: every enabled instance must use the same value |
 | `cleanup_interval_seconds` | Integer (u64) | `300` | How often (seconds) a background task evicts entries that are idle longer than `stale_entry_ttl_seconds` **and** already collected. Set to `0` to disable the periodic cleanup task. At most `31536000` (one year); larger values are rejected because the task's sleep deadline would overflow. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
-| `max_entries` | Integer (u64) | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped (per-identity attribution lost; invoice totals preserved). Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
-| `max_retained_bytes` | Integer (u64) | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. The overflow rows the configured proxies and pricing tiers can create are reserved, plus equal headroom for a pricing reload, and admission refuses a value smaller than twice that matrix. Must be `> 0`. Process-global: every enabled instance must use the same value |
+| `max_entries` | Integer (u64) | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row when its prepared fallback exists (per-identity attribution lost; recorded totals preserved). Charges outside the prepared matrix can be dropped if a new aggregate cannot reserve bytes; inspect `dropped_charges_total`. Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
+| `max_retained_bytes` | Integer (u64) | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. The configured overflow rows, including global unknown-proxy fallback rows, are created and reserved before publication, plus equal headroom for a pricing reload. Admission refuses a value smaller than twice that matrix; a node also refuses the whole reload if missing fallback rows do not fit beside retained history under the candidate budget. Must be `> 0`. Process-global: every enabled instance must use the same value |
 | `schema` | Object | *(none)* | Inline projection for the `/charges` per-proxy billing row (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref`. `summary_type`, `timestamp_format`, `metadata`, `order`, and every derived kind except `summary_kind` are rejected for this record family; `omit` names and `rename` sources must be billing-row fields. Process-global: every enabled instance must resolve to the same projection |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 

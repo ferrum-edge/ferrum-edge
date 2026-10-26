@@ -41148,16 +41148,22 @@ components:
         billing rows (complete registry entry keys) and at most
         `max_retained_bytes` of state. Keys include consumer, proxy, status,
         protocol family, currency, namespace, and prices, so one principal can
-        occupy many slots. A new row beyond either ceiling is not dropped —
-        its charges are folded into a fixed-cardinality aggregate row whose
-        `consumer` label is the internal sentinel
+        occupy many slots. A new ordinary row beyond either ceiling uses its
+        prepared aggregate fallback, preserving totals while losing per-identity
+        attribution. Outside a prepared matrix, an aggregate that cannot reserve
+        bytes drops the charge and increments `dropped_charges_total`. The
+        aggregate `consumer` label is the internal sentinel
         `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
         preserving billable totals while losing only per-identity attribution.
-        The aggregate overflow rows the configured proxies and pricing tiers can
-        create are reserved up front (one per priced status, one shared
-        status-0 bandwidth row when bandwidth is priced, or one row per stream
-        proxy), plus as much headroom again for a pricing reload's next
-        generation, so ordinary rows can never take the bytes the fallback needs.
+        The aggregate overflow rows are created and their missing bytes reserved
+        atomically while staging, before the cache generation can serve. There
+        is one row per priced status, one shared status-0 bandwidth row when
+        bandwidth is priced, or one row per stream proxy. Global instances also
+        reserve unknown-proxy fallback rows in their own and all known namespaces.
+        Rows stay pinned while a cache generation owns them; unused preallocations
+        consume estimated bytes but do not appear as billing series. Ordinary
+        admission leaves an additional matrix of reload headroom. This cannot
+        guarantee that a larger matrix or repeated repricing fits beside history.
         That sentinel lives in the digest-form billing-identity class, so a real
         authenticated or configured identity can never share its registry key.
         Billing identities are never prefix-truncated: an external identity
@@ -41171,8 +41177,12 @@ components:
         the whole `pricing_tiers` array; `max_retained_bytes` must hold twice
         the configured overflow-row matrix, and a reload whose not-yet-created
         overflow rows do not fit beside the billing state the live registry
-        retains is refused when a node builds that generation (not by offline
-        validation); and `stale_entry_ttl_seconds` /
+        retains is refused wholesale when a node builds that generation (not by
+        offline validation). This includes a budget-lowering reload needing new
+        fallback rows; if every fallback row already exists, a lower budget is
+        accepted and existing state drains through eviction. Current aggregate
+        rows and their cumulative exported series remain retained while pinned.
+        `stale_entry_ttl_seconds` /
         `cleanup_interval_seconds` interact with the collection contract
         described in docs/plugins.md.
       allOf:
@@ -41371,8 +41381,10 @@ components:
             namespace, and prices. Charges for a new row beyond this ceiling are
             folded into the fixed-cardinality internal overflow aggregate row
             (`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`)
-            instead of being dropped — per-identity attribution is lost; invoice
-            totals are preserved. 0 is rejected — there is no unlimited mode.
+            when its prepared fallback exists — per-identity attribution is lost
+            while recorded totals are preserved. A charge outside a prepared
+            matrix may be dropped if no aggregate can reserve bytes; inspect
+            dropped_charges_total. 0 is rejected — there is no unlimited mode.
             Process-global: every enabled api_chargeback instance must use the
             same value.
         max_retained_bytes:
@@ -41384,9 +41396,14 @@ components:
             Hard ceiling on estimated retained registry bytes, covering ordinary
             billing rows and aggregate overflow rows together. The overflow rows
             the configured proxies and pricing tiers can create are reserved
-            (plus equal headroom for a pricing reload), so refused identities
-            always fold into an overflow row instead of being dropped; admission
-            refuses a budget that cannot hold twice that matrix. 0 is rejected.
+            and created during cache staging, plus equal headroom for a pricing
+            reload. Admission refuses a budget that cannot hold twice that matrix.
+            A node also refuses the whole reload if missing fallback rows cannot
+            fit beside retained state under the candidate budget, including a
+            budget decrease needing new rows. A decrease with all rows already
+            present is allowed and drains existing state through eviction. Charges
+            outside a prepared matrix can still be dropped when a new aggregate
+            cannot reserve bytes; inspect dropped_charges_total. 0 is rejected.
             Process-global: every enabled api_chargeback instance must use the
             same value.
         schema:
@@ -42198,10 +42215,14 @@ components:
             overflow row after a new row could not be admitted under
             `max_entries` (billable totals preserved, per-identity attribution
             lost); `dropped_charges_total` counts charges that could not be
-            retained at all. The configured overflow-row matrix is reserved, so
-            this is reachable only for charges outside it (traffic attributed to
-            no configured proxy, or a retired pricing generation late enough to
-            need a new overflow row once the reload headroom is spent).
+            retained at all because an aggregate row could not reserve bytes.
+            Current fallback rows are created and pinned before publication.
+            Charges outside a prepared matrix, including an unconfigured
+            namespace/direct registry caller or a retired generation needing a
+            new row after eviction, may still be dropped when space is exhausted.
+            This counter does not report HTTP delivery or collector ingestion
+            failures: the two-body-hand-off collection heuristic is not proof
+            of peer receipt, and both hand-offs can fail together.
             `uncollected_retained_entries` reports rows held past
             `stale_entry_ttl_seconds` awaiting collection.
           properties:

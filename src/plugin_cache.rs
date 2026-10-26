@@ -6645,6 +6645,9 @@ pub(crate) struct PluginCacheInner {
     /// single `ArcSwap` load — never by scanning plugins and never by
     /// retaining a stale removed/replaced instance across reloads.
     mesh_bpf_metrics_exporter: Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter>,
+    /// Precreated aggregate rows are pinned before this generation is visible.
+    /// Dropping a rejected stage releases unused rows and their byte budget.
+    chargeback_overflow: Option<Arc<crate::plugins::api_chargeback::OverflowReservation>>,
 }
 
 /// Advance or assign per-proxy lifecycle ownership generations for `config`.
@@ -6791,6 +6794,7 @@ impl PluginCacheInner {
         mesh_bpf_metrics_exporter: Option<
             crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter,
         >,
+        chargeback_overflow: Option<Arc<crate::plugins::api_chargeback::OverflowReservation>>,
     ) -> Self {
         let unrouted_transaction_log_plugins =
             collect_unrouted_transaction_log_plugins(global_plugins.as_slice());
@@ -6815,6 +6819,7 @@ impl PluginCacheInner {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
+            chargeback_overflow,
         }
     }
 
@@ -7597,7 +7602,6 @@ impl PluginCache {
         previous_lifecycle_generation_high_water: u64,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
-        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -7650,6 +7654,7 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
+            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)?,
         )))
     }
 
@@ -7781,6 +7786,7 @@ impl PluginCache {
             current.proxy_lifecycle_generations.clone(),
             current.proxy_lifecycle_generation_high_water,
             current.mesh_bpf_metrics_exporter.clone(),
+            current.chargeback_overflow.clone(),
         ));
         self.store_inner(next);
         Ok(())
@@ -7822,6 +7828,9 @@ impl PluginCache {
         // order, so a late retired-generation request cannot restore an old
         // proxy name (issue #2572).
         crate::plugins::api_chargeback::publish_active_proxy_names(config);
+        if let Some(reservation) = &inner.chargeback_overflow {
+            reservation.activate();
+        }
 
         // Ownership generations are keyed by the namespace-qualified runtime key
         // (`namespace|id`), the same identity the request/frame samples resolve,
@@ -8058,7 +8067,6 @@ impl PluginCache {
         country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
-        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -8922,6 +8930,7 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
+            crate::plugins::api_chargeback::prepare_global_overflow_reservations(config)?,
         ));
         jwks_rollback.disarm();
         Ok(inner)
