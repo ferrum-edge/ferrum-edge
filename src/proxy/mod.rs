@@ -35115,6 +35115,15 @@ async fn handle_proxy_request_inner(
         warn!("Rejected request: {}", error_body);
         ctx.terminal_record.mark_counted();
         record_request(&state, 400);
+        // Even a pre-routing protocol refusal must use native gRPC framing.
+        // Classify the full request so WebSocket Extended CONNECT retains its
+        // HTTP handshake refusal when it carries a hostile gRPC Content-Type.
+        if crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                "Protocol header violation",
+            ));
+        }
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 

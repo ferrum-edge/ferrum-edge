@@ -568,6 +568,79 @@ async fn valid_mmdb_preserves_direct_country_precedence() {
     ));
 }
 
+/// Remove only the encoded direct-country key from the pinned upstream DB.
+/// Keeping its byte length preserves every MMDB pointer and leaves the
+/// independent registered_country record available for the lazy fallback.
+#[tokio::test]
+async fn registered_country_only_record_drives_http_and_stream_policy() {
+    let mut bytes = country_mmdb_bytes();
+    let key = b"\x47country";
+    let offsets: Vec<usize> = bytes
+        .windows(key.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == key).then_some(offset))
+        .collect();
+    assert!(
+        !offsets.is_empty(),
+        "fixture contains the encoded country key"
+    );
+    for offset in offsets {
+        bytes[offset..offset + key.len()].copy_from_slice(b"\x47ignored");
+    }
+    let reader = maxminddb::Reader::from_source(bytes.as_slice()).expect("derived fixture opens");
+    reader.verify().expect("derived fixture remains valid");
+    let lookup = reader.lookup("89.160.20.112".parse().unwrap()).unwrap();
+    let direct: Option<&str> = lookup
+        .decode_path(&maxminddb::path!["country", "iso_code"])
+        .unwrap();
+    let registered: Option<&str> = lookup
+        .decode_path(&maxminddb::path!["registered_country", "iso_code"])
+        .unwrap();
+    assert_eq!(
+        direct, None,
+        "this fixture must exercise the fallback alone"
+    );
+    assert_eq!(registered, Some("DE"));
+    drop(reader);
+
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "registered-only.mmdb", &bytes);
+    for (policy, admitted) in [
+        (json!({"allow_countries": ["DE"]}), true),
+        (json!({"allow_countries": ["SE"]}), false),
+        (json!({"deny_countries": ["DE"]}), false),
+    ] {
+        let mut config = policy;
+        config["db_path"] = json!(path_text(&path));
+        config["on_lookup_failure"] = json!("deny");
+        let plugin = GeoRestriction::new(&config).unwrap();
+        let mut ctx = request_context("89.160.20.112");
+        assert_eq!(
+            matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ),
+            admitted
+        );
+        assert_eq!(
+            ctx.metadata.get("geo.country").map(String::as_str),
+            Some("DE")
+        );
+        let mut stream = geo_stream_context("89.160.20.112");
+        assert_eq!(
+            matches!(
+                plugin.on_stream_connect(&mut stream).await,
+                PluginResult::Continue
+            ),
+            admitted
+        );
+        assert_eq!(
+            stream.metadata.get("geo.country").map(String::as_str),
+            Some("DE")
+        );
+    }
+}
+
 #[tokio::test]
 async fn valid_mmdb_canonicalizes_ipv4_mapped_ipv6_for_policy() {
     let directory = TempDir::new().unwrap();
