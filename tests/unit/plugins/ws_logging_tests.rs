@@ -2891,9 +2891,9 @@ async fn ws_logging_codec_charge_never_starves_later_admissions() {
     server.abort();
 }
 
-/// A refusal while connecting precedes the successful send's fresh retention
-/// check. Both size-triggered and timer-triggered sends must supersede it.
-/// Later partial batches positively witness timer turns without sleeping.
+/// Refusals while connecting and after a kept send precede the next send's
+/// fresh retention check. Both initial flush triggers and a reused connection
+/// must supersede stale pressure. Partial batches witness timer turns.
 #[tokio::test]
 async fn ws_logging_fresh_keep_decision_supersedes_stale_ceiling_rejection() {
     use ferrum_edge::plugins::ws_logging::codec_output_charge;
@@ -2955,11 +2955,62 @@ async fn ws_logging_fresh_keep_decision_supersedes_stale_ceiling_rejection() {
         let charge = codec_output_charge(first_len);
         assert_eq!(wait_for_ceiling_used(ceiling, charge).await, charge);
 
+        plugin.log(&summary).await;
+        let (connection, _) = next_batch(&mut batches, "timed batch before new pressure").await;
+        assert_eq!(connection, 1);
+
+        // The timed batch witnesses a flush/reclaim turn on the kept socket.
+        // Freeze the clock so the next reclaim cannot race the size-triggered
+        // keep decision, even if this test is descheduled by a busy CI runner.
+        tokio::time::pause();
+        // First send without new pressure: the worker checks ready reclaim
+        // ticks before receiving records, so its settled batch is a barrier
+        // for any reclaim tick still pending from the witnessed flush turn.
+        for inject_pressure in [false, true] {
+            if inject_pressure {
+                assert!(ceiling.try_acquire(usize::MAX).is_none());
+            }
+            for _ in 0..2 {
+                plugin.log(&summary).await;
+            }
+            let (connection, _) = {
+                let kept_batch = async {
+                    let (connection, len) =
+                        next_batch(&mut batches, "fresh keep on reused socket").await;
+                    let expected = charge.max(codec_output_charge(len));
+                    while ceiling.used() != expected {
+                        tokio::task::yield_now().await;
+                    }
+                    (connection, len)
+                };
+                tokio::pin!(kept_batch);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for a settled keep on the reused socket"
+                    );
+                    let result = std::future::Future::poll(kept_batch.as_mut(), cx);
+                    if result.is_pending() {
+                        // Keep the runtime runnable while polling real socket I/O:
+                        // paused Tokio time must not auto-advance to reclamation.
+                        cx.waker().wake_by_ref();
+                    }
+                    result
+                })
+                .await
+            };
+            assert_eq!(connection, 1, "fresh keep must reuse the existing socket");
+        }
+        tokio::time::resume();
+
         for turn in 1..=2 {
             plugin.log(&summary).await;
             // One record cannot trigger the size threshold: receiving each
-            // batch proves a flush tick ran. The third send also witnesses
-            // retirement immediately after the second send on the old code.
+            // batch proves a flush tick ran. Two turns also catch retirement
+            // if the reclaim tick follows the first timed send. Connect-time
+            // initialization cannot supersede the second pressure injection:
+            // removing only the per-send snapshot refresh must fail here.
             let (connection, _) = next_batch(&mut batches, "later timed batch").await;
             assert_eq!(
                 connection, 1,
