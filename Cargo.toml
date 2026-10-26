@@ -602,7 +602,7 @@ rcgen = { version = "0.14", features = ["aws_lc_rs"] }
 # with dev-dependency edges excluded for exactly this reason.
 ring = "0.17"
 rustls = { version = "0.23", features = ["ring"] }
-rstest = "0.27"
+rstest = "0.28"
 time = "0.3"
 # Phase 6 cross-protocol matrix macro: concatenates idents at macro
 # expansion to generate one #[tokio::test] per (frontend, backend)
