@@ -18,17 +18,20 @@ const UNICODE_API_KEY: &str = "ユニコード-api-key-value-32chars-min";
 
 #[test]
 fn constructor_type_diagnostics_quote_complete_json_values() {
-    for value in [
-        json!(9876543210u64),
-        json!(["prefix'\"UNREGISTERED_TYPE_TOKEN"]),
-        json!({"nested": "prefix'\"UNREGISTERED_TYPE_TOKEN"}),
+    for (value, expected) in [
+        (json!(9876543210u64), "`key_location` must be a string"),
+        (
+            json!([["prefix'\"UNREGISTERED_TYPE_TOKEN"]]),
+            "`key_location` array element 0 must be a string",
+        ),
+        (
+            json!({"nested": "prefix'\"UNREGISTERED_TYPE_TOKEN"}),
+            "`key_location` must be a string",
+        ),
     ] {
         let error = KeyAuth::new(&json!({"key_location": value})).err().unwrap();
         let diagnostic = ferrum_edge::startup::render_startup_error(anyhow::anyhow!(error), &[]);
-        assert!(
-            diagnostic.contains("`key_location` must be a string"),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.contains(expected), "{diagnostic}");
         assert!(diagnostic.contains("<redacted scalar>"), "{diagnostic}");
         assert!(!diagnostic.contains("9876543210"), "{diagnostic}");
         assert!(
@@ -986,4 +989,227 @@ async fn test_key_auth_borrowed_lookup_keeps_the_shared_auth_contract() {
         r#"{"error":"Invalid API key"}"#,
     );
     assert!(repeated.identified_consumer.is_none());
+}
+
+// Multiple credential locations (issue #6910).
+
+#[test]
+fn test_key_auth_array_bounds_and_element_validation() {
+    for locations in [
+        json!([]),
+        json!(vec!["header:X-Key"; 9]),
+        json!([null]),
+        json!([123]),
+        json!([true]),
+        json!([{}]),
+        json!([["header:X-Key"]]),
+        json!(["header:X-Key", ""]),
+        json!(["header:X-Key", "cookie:key"]),
+        json!(["header:X-Key", "header:"]),
+        json!(["header:X-Key", "header:Bad Name"]),
+        json!(["header:X-Key", "query:"]),
+        json!(["header:X-Key", "query: bad"]),
+        json!(["header:X-Key", "query:key "]),
+    ] {
+        assert!(KeyAuth::new(&json!({"key_location": locations})).is_err());
+    }
+    for locations in [
+        json!(["header:X-Key"]),
+        json!(["query:key"]),
+        json!(
+            (0..8)
+                .map(|i| format!("header:X-Key-{i}"))
+                .collect::<Vec<_>>()
+        ),
+    ] {
+        assert!(KeyAuth::new(&json!({"key_location": locations})).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn test_key_auth_authenticates_each_location_and_ignores_unconfigured_sources() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": ["header:X-First", "query:first", "header:X-Last", "query:last"]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    assert!(plugin.requires_decoded_query_params());
+    assert!(plugin.modifies_request_query());
+    assert!(plugin.modifies_request_headers());
+    assert_eq!(plugin.request_headers_to_redact(), &["x-first", "x-last"]);
+    assert_eq!(
+        plugin.modified_request_header_names().unwrap(),
+        ["x-first", "x-last"]
+    );
+
+    for (header, name) in [
+        (true, "x-first"),
+        (false, "first"),
+        (true, "X-Last"),
+        (false, "last"),
+    ] {
+        let mut ctx = context_with_raw_query("unconfigured=test-api-key");
+        ctx.headers
+            .insert("x-api-key".into(), "unconfigured-key".into());
+        if header {
+            ctx.headers.insert(name.into(), "test-api-key".into());
+        } else {
+            ctx.query_params.insert(name.into(), "test-api-key".into());
+        }
+        assert_continue(plugin.authenticate(&mut ctx, &index).await);
+        assert_eq!(ctx.auth_method, Some("key_auth"));
+        assert!(ctx.identified_consumer.is_some());
+    }
+    let mut missing = context_with_raw_query("unconfigured=test-api-key");
+    assert_continue(plugin.authenticate(&mut missing, &index).await);
+    assert!(missing.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn test_key_auth_refuses_two_different_configured_locations() {
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    // Header/header, query/query, and both mixed orderings must agree. Blank
+    // and invalid credentials are still present; equality never excuses two.
+    for locations in [
+        ["header:X-First", "header:X-Second"],
+        ["query:first", "query:second"],
+        ["header:X-First", "query:second"],
+        ["query:first", "header:X-Second"],
+    ] {
+        let plugin = KeyAuth::new(&json!({"key_location": locations})).unwrap();
+        for values in [
+            ["test-api-key", "test-api-key"],
+            ["test-api-key", "wrong"],
+            ["", "test-api-key"],
+            ["test-api-key", ""],
+        ] {
+            let mut ctx = context_with_raw_query("");
+            for (location, value) in locations.into_iter().zip(values) {
+                if let Some(name) = location.strip_prefix("header:") {
+                    ctx.headers.insert(name.into(), value.into());
+                } else {
+                    ctx.query_params.insert(
+                        location.strip_prefix("query:").unwrap().into(),
+                        value.into(),
+                    );
+                }
+            }
+            match plugin.authenticate(&mut ctx, &index).await {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
+                    assert_eq!(status_code, 401);
+                    assert_eq!(body, r#"{"error":"Ambiguous API key locations"}"#);
+                    assert_eq!(
+                        headers.get("WWW-Authenticate").map(String::as_str),
+                        Some(r#"ApiKey realm="ferrum-edge""#)
+                    );
+                }
+                other => panic!("expected ambiguous credential rejection, got {other:?}"),
+            }
+            assert!(ctx.identified_consumer.is_none());
+            assert!(ctx.auth_method.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_key_auth_array_retains_raw_utf8_and_semicolon_validation() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": ["header:X-First", "header:X-Last", "query:ticket"]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_unicode_key_consumer()]);
+    let mut ctx = context_with_materialized_raw_header("X-Last", UNICODE_API_KEY);
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    assert_eq!(ctx.auth_method, Some("key_auth"));
+
+    let mut malformed = context_with_materialized_raw_header_bytes("X-Last", b"\xff");
+    assert_reject_body(
+        plugin.authenticate(&mut malformed, &index).await,
+        r#"{"error":"Invalid API key format"}"#,
+    );
+    malformed
+        .headers
+        .insert("X-First".into(), UNICODE_API_KEY.into());
+    assert_reject_body(
+        plugin.authenticate(&mut malformed, &index).await,
+        r#"{"error":"Ambiguous API key locations"}"#,
+    );
+
+    let mut alias = context_with_raw_query("carrier=;ticket=test-api-key");
+    assert_reject_body(
+        plugin.authenticate(&mut alias, &index).await,
+        AMBIGUOUS_QUERY_BODY,
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_repeated_locations_are_one_source_but_query_case_is_distinct() {
+    let plugin = KeyAuth::new(&json!({
+        "key_location": ["header:X-Key", "header:x-key", "query:key", "query:key", "query:Key"]
+    }))
+    .unwrap();
+    let index = ConsumerIndex::new(&[create_test_consumer()]);
+    let mut ctx = context_with_materialized_raw_header("x-key", "test-api-key");
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    assert_eq!(plugin.request_headers_to_redact(), &["x-key"]);
+    let mut ctx = context_with_raw_query("key=test-api-key");
+    assert_continue(plugin.authenticate(&mut ctx, &index).await);
+    let mut ctx = context_with_raw_query("key=test-api-key&Key=test-api-key");
+    assert_reject_body(
+        plugin.authenticate(&mut ctx, &index).await,
+        r#"{"error":"Ambiguous API key locations"}"#,
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_marks_and_hides_all_locations_when_another_mechanism_wins() {
+    for hide in [true, false] {
+        let plugin = KeyAuth::new(&json!({
+            "key_location": ["header:X-First", "query:first", "header:X-Last", "query:last"],
+            "hide_credentials": hide
+        }))
+        .unwrap();
+        // Deliberately skip key_auth.authenticate, as when an earlier mechanism
+        // wins. Discovery and before_proxy must still cover all locations.
+        let mut ctx = context_with_raw_query("first=a&first=b&carrier=;last=c&keep=1");
+        plugin.mark_query_credentials_for_redaction(&mut ctx);
+        let mut headers = HashMap::from([
+            ("x-first".to_string(), "a".to_string()),
+            ("X-Last".to_string(), "c".to_string()),
+            ("x-benign".to_string(), "keep".to_string()),
+        ]);
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(headers.contains_key("x-first"), !hide);
+        assert_eq!(headers.contains_key("X-Last"), !hide);
+        assert_eq!(headers.get("x-benign").map(String::as_str), Some("keep"));
+        for name in ["first", "last"] {
+            assert_eq!(
+                ctx.metadata
+                    .get(&format!("auth.query_credential_param.{name}"))
+                    .map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                ctx.metadata
+                    .contains_key(&format!("auth.strip_query_param.{name}")),
+                hide
+            );
+        }
+        let forwarded = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+        assert_eq!(
+            forwarded,
+            if hide {
+                "keep=1"
+            } else {
+                "first=a&first=b&carrier=;last=c&keep=1"
+            }
+        );
+        assert_eq!(plugin.modifies_request_headers(), hide);
+        assert_eq!(plugin.modifies_request_query(), hide);
+        assert_eq!(plugin.request_headers_to_redact(), &["x-first", "x-last"]);
+    }
 }

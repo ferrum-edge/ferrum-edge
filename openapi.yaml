@@ -25685,25 +25685,37 @@ components:
       description: "Plugin: key_auth — API key authentication."
       properties:
         key_location:
-          type: string
+          oneOf:
+            - type: string
+              pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:\\S+)$"
+            - type: array
+              minItems: 1
+              maxItems: 8
+              items:
+                type: string
+                pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:\\S+)$"
           default: "header:X-API-Key"
-          pattern: "^(header:[!#$%&'*+.^_`|~0-9A-Za-z-]+|query:\\S+)$"
           description: >-
-            Exact credential location (header:<name> or query:<name>).
+            Exact credential location (header:<name> or query:<name>), or an
+            ordered array of 1 to 8 such locations. Locations are evaluated in
+            order; credentials present in two different configured locations
+            are refused with 401 as ambiguous, even when their values match.
+            Repeated locations count once (header names are case-insensitive;
+            query names are case-sensitive).
             Whitespace is not trimmed; header names must be valid HTTP tokens,
             and query names must be non-empty and contain no whitespace. A
             query name that also appears as a `;`-separated sub-parameter
             (`carrier=;api_key=k`, raw or percent/form-decoded) is ambiguous:
             the request is refused with 401 and the alias never
-            authenticates. A configured header name is always removed from
+            authenticates. Every configured header name is always removed from
             client request trailers.
         hide_credentials:
           type: boolean
           default: true
           description: >-
-            Remove the configured API-key header or query parameter before
+            Remove every configured API-key header and query parameter before
             forwarding an authenticated request upstream, including when
-            another mechanism wins a multi-auth chain. For a query location
+            another mechanism wins a multi-auth chain. For each query location
             this also removes a `;`-separated sub-parameter alias. Disable only
             when a legacy backend explicitly requires the reusable credential.
 

@@ -4510,6 +4510,53 @@ fn test_request_view_precomputes_key_auth_header_redaction() {
     );
 }
 
+#[tokio::test]
+async fn test_request_view_filters_every_key_auth_array_header_from_trailers() {
+    use ferrum_edge::_test_support::{
+        h1_h2_upload_source_forwarded_frames_for_route,
+        sanitized_backend_request_trailers_for_route,
+    };
+
+    for hide_credentials in [true, false] {
+        let config = make_config(
+            vec![make_proxy("p1", "/api", vec!["keyauth"])],
+            vec![make_plugin_config_with_json(
+                "keyauth",
+                "key_auth",
+                json!({
+                    "key_location": ["query:key", "header:X-First", "header:X-Last"],
+                    "hide_credentials": hide_credentials
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        );
+        let cache = PluginCache::new(&config).unwrap();
+        // Each protocol view publishes the list carried by its late request
+        // trailer boundaries, regardless of primary-header preservation.
+        for protocol in [
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+        ] {
+            let view = cache.request_view("ferrum", "p1", protocol);
+            let names = view.request_headers_to_redact();
+            assert_eq!(names.as_ref(), &["x-first", "x-last"]);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let trailers = [("x-first", "a"), ("x-last", "b"), ("x-checksum", "keep")];
+            let expected = vec![("x-checksum".to_string(), "keep".to_string())];
+            let (data, forwarded) =
+                h1_h2_upload_source_forwarded_frames_for_route(b"payload", &trailers, &names).await;
+            assert_eq!(data.as_slice(), b"payload");
+            assert_eq!(forwarded, expected);
+            assert_eq!(
+                sanitized_backend_request_trailers_for_route(&trailers, &names),
+                expected
+            );
+        }
+    }
+}
+
 #[test]
 fn test_request_view_redacts_openapi_validator_bypass_header() {
     let config = make_config(

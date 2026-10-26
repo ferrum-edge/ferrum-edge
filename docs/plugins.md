@@ -3311,8 +3311,25 @@ Authenticates requests using an API key matched against consumer credentials.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `key_location` | String | `header:X-API-Key` | Exact location of the key (`header:<name>` or `query:<name>`). Whitespace is not trimmed. |
-| `hide_credentials` | Boolean | `true` | Remove the configured key location before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable credential. |
+| `key_location` | String or Array of Strings | `header:X-API-Key` | One location (`header:<name>` or `query:<name>`) or an ordered array of 1–8 locations. Whitespace is not trimmed. |
+| `hide_credentials` | Boolean | `true` | Remove every configured key location before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable credential. |
+
+For migrations between credential names, configure several locations:
+
+```yaml
+key_location: ["header:X-API-Key", "header:X-Legacy-Key", "query:api_key"]
+hide_credentials: true
+```
+
+Locations are evaluated in order. A key in any one location can authenticate;
+credentials present in two different configured locations are refused with
+`401` `{"error":"Ambiguous API key locations"}`, even when the values match
+or one is blank or malformed. Repeating the same location counts once: header
+names are case-insensitive and query names are case-sensitive. Every configured
+header is registered for diagnostic and policy redaction, and every present
+configured query credential is marked for policy redaction, including when
+another mechanism wins a multi-auth chain. The field remains `key_location`;
+`key_names` is not accepted.
 
 Header locations must use a valid HTTP header name. Query names must be non-empty
 and contain no whitespace; query names and values use the same percent-decoded
@@ -3332,7 +3349,7 @@ redaction and, with `hide_credentials`, the whole carrying `&` segment is
 removed from the forwarded query. A `;` inside a value (`api_key=k;x=1`) is
 part of that value, not an alias.
 
-**Request trailers.** A configured `header:<name>` location is also removed
+**Request trailers.** Every configured `header:<name>` location is also removed
 from the client's request trailers on every protocol path (HTTP/1.1, HTTP/2,
 HTTP/3, native gRPC, gRPC-Web), whatever `hide_credentials` says: trailers are
 never a credential location, so a client cannot re-send the key after the
