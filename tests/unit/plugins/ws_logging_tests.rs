@@ -2207,6 +2207,25 @@ async fn ws_logging_connect_failures_charge_one_backoff_and_none_after_the_last_
 // Endpoint admission: credential-shaped query names, port 0, fragments
 // ---------------------------------------------------------------------------
 
+/// These names match only the `auth` substring rule, not another credential
+/// marker. Reverting that rule to `authorization` must fail this regression.
+#[tokio::test]
+async fn ws_logging_refuses_x_auth_query_credentials() {
+    for name in ["x-auth", "X-AuTh", "x-%61uth"] {
+        let error = WsLogging::new(
+            &json!({
+                "endpoint_url": format!("ws://localhost:9300/logs?{name}=xauth-canary")
+            }),
+            default_client(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{name} credential must be refused"));
+        assert!(error.contains("names a credential"), "{name}: {error}");
+        assert!(error.contains("custom_headers"), "{name}: {error}");
+        assert!(!error.contains("xauth-canary"), "{name}: {error}");
+    }
+}
+
 #[tokio::test]
 async fn ws_logging_refuses_credential_query_parameters_port_zero_and_fragments() {
     for endpoint in [
@@ -2358,7 +2377,7 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let endpoint = format!("ws://{addr}/logs?stream=edge");
-    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, String, String)>();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, String, String, String)>();
     let (batch_tx, batch_rx) = tokio::sync::oneshot::channel::<String>();
 
     let server = tokio::spawn(async move {
@@ -2380,6 +2399,7 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
             let _ = seen_tx.send((
                 header("authorization"),
                 header("x-collector-tenant"),
+                header("x-auth"),
                 target,
             ));
             Ok(res)
@@ -2405,7 +2425,8 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
                 "endpoint_url": endpoint,
                 "custom_headers": {
                     "Authorization": "Bearer ${FERRUM_PLUGIN_SECRET_WS_LOGGING_TEST_TOKEN}",
-                    "X-Collector-Tenant": "acme"
+                    "X-Collector-Tenant": "acme",
+                    "X-Auth": "${FERRUM_PLUGIN_SECRET_WS_LOGGING_TEST_TOKEN}"
                 },
                 "batch_size": 1,
                 "flush_interval_ms": 100,
@@ -2422,11 +2443,12 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
     plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
 
-    let (authorization, tenant, target) = await_within("captured handshake", seen_rx)
+    let (authorization, tenant, x_auth, target) = await_within("captured handshake", seen_rx)
         .await
         .expect("handshake channel closed");
     assert_eq!(authorization, format!("Bearer {SECRET_CANARY}"));
     assert_eq!(tenant, "acme");
+    assert_eq!(x_auth, SECRET_CANARY);
     assert_eq!(target, "/logs?stream=edge");
     assert!(!target.contains(SECRET_CANARY));
     let batch = await_within("authenticated batch", batch_rx)
@@ -2869,9 +2891,141 @@ async fn ws_logging_codec_charge_never_starves_later_admissions() {
     server.abort();
 }
 
-/// PR6852-SOL-5 (several sinks): an idle kept connection gives its codec
-/// charge back at the next flush tick after any refusal on the shared ceiling,
-/// so idle connections cannot jointly starve admission.
+/// Refusals while connecting and after a kept send precede the next send's
+/// fresh retention check. Both initial flush triggers and a reused connection
+/// must supersede stale pressure. Partial batches witness timer turns.
+#[tokio::test]
+async fn ws_logging_fresh_keep_decision_supersedes_stale_ceiling_rejection() {
+    use ferrum_edge::plugins::ws_logging::codec_output_charge;
+
+    for first_batch_entries in [1, 2] {
+        let ceiling = leaked_ceiling(64 * 1024 * 1024);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (connecting_tx, connecting_rx) = tokio::sync::oneshot::channel();
+        let (upgrade_tx, upgrade_rx) = tokio::sync::oneshot::channel();
+        let (batch_tx, mut batches) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut first_upgrade = Some((connecting_tx, upgrade_rx));
+            let mut connection = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                connection += 1;
+                if let Some((connecting_tx, upgrade_rx)) = first_upgrade.take() {
+                    connecting_tx.send(()).expect("signal connect");
+                    upgrade_rx.await.expect("release upgrade");
+                }
+                let batch_tx = batch_tx.clone();
+                tokio::spawn(async move {
+                    let ws = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("collector upgrade");
+                    let (_sink, mut read) = ws.split();
+                    while let Some(Ok(message)) = read.next().await {
+                        if let Message::Text(payload) = message {
+                            let _ = batch_tx.send((connection, payload.len()));
+                        }
+                    }
+                });
+            }
+        });
+        let plugin = ws_logging_with_ceiling(
+            json!({
+                "endpoint_url": format!("ws://{addr}/logs"),
+                "batch_size": 2,
+                "flush_interval_ms": 1000,
+                "max_retries": 0
+            }),
+            ceiling,
+        );
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let summary = create_test_transaction_summary();
+        for _ in 0..first_batch_entries {
+            plugin.log(&summary).await;
+        }
+        await_within("worker connecting", connecting_rx)
+            .await
+            .expect("connect signal");
+        // The worker has started and is blocked in establishment. There is
+        // plenty of headroom by the time it can decide to keep the connection.
+        assert!(ceiling.try_acquire(usize::MAX).is_none());
+        upgrade_tx.send(()).expect("allow upgrade");
+        let (connection, first_len) = next_batch(&mut batches, "freshly kept batch").await;
+        assert_eq!(connection, 1);
+        let charge = codec_output_charge(first_len);
+        assert_eq!(wait_for_ceiling_used(ceiling, charge).await, charge);
+
+        plugin.log(&summary).await;
+        let (connection, _) = next_batch(&mut batches, "timed batch before new pressure").await;
+        assert_eq!(connection, 1);
+
+        // The timed batch witnesses a flush/reclaim turn on the kept socket.
+        // Freeze the clock so the next reclaim cannot race the size-triggered
+        // keep decision, even if this test is descheduled by a busy CI runner.
+        tokio::time::pause();
+        // First send without new pressure: the worker checks ready reclaim
+        // ticks before receiving records, so its settled batch is a barrier
+        // for any reclaim tick still pending from the witnessed flush turn.
+        for inject_pressure in [false, true] {
+            if inject_pressure {
+                assert!(ceiling.try_acquire(usize::MAX).is_none());
+            }
+            for _ in 0..2 {
+                plugin.log(&summary).await;
+            }
+            let (connection, _) = {
+                let kept_batch = async {
+                    let (connection, len) =
+                        next_batch(&mut batches, "fresh keep on reused socket").await;
+                    let expected = charge.max(codec_output_charge(len));
+                    while ceiling.used() != expected {
+                        tokio::task::yield_now().await;
+                    }
+                    (connection, len)
+                };
+                tokio::pin!(kept_batch);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for a settled keep on the reused socket"
+                    );
+                    let result = std::future::Future::poll(kept_batch.as_mut(), cx);
+                    if result.is_pending() {
+                        // Keep the runtime runnable while polling real socket I/O:
+                        // paused Tokio time must not auto-advance to reclamation.
+                        cx.waker().wake_by_ref();
+                    }
+                    result
+                })
+                .await
+            };
+            assert_eq!(connection, 1, "fresh keep must reuse the existing socket");
+        }
+        tokio::time::resume();
+
+        for turn in 1..=2 {
+            plugin.log(&summary).await;
+            // One record cannot trigger the size threshold: receiving each
+            // batch proves a flush tick ran. Two turns also catch retirement
+            // if the reclaim tick follows the first timed send. Connect-time
+            // initialization cannot supersede the second pressure injection:
+            // removing only the per-send snapshot refresh must fail here.
+            let (connection, _) = next_batch(&mut batches, "later timed batch").await;
+            assert_eq!(
+                connection, 1,
+                "stale pressure retired a fresh keep: first batch {first_batch_entries}, turn {turn}"
+            );
+        }
+
+        drop(plugin);
+        assert_eq!(wait_for_ceiling_used(ceiling, 0).await, 0);
+        server.abort();
+    }
+}
+
+/// An idle kept connection gives its codec charge back on the independent
+/// reclaim timer, even with a ten-minute partial-batch flush interval.
 #[tokio::test]
 async fn ws_logging_idle_connection_releases_codec_charge_under_ceiling_pressure() {
     use ferrum_edge::plugins::ws_logging::codec_output_charge;
@@ -2881,7 +3035,7 @@ async fn ws_logging_idle_connection_releases_codec_charge_under_ceiling_pressure
         json!({
             "endpoint_url": format!("ws://{addr}/logs"),
             "batch_size": 1,
-            "flush_interval_ms": 100,
+            "flush_interval_ms": 600000,
             "max_retries": 1,
             "retry_delay_ms": 50,
             "reconnect_delay_ms": 50,
@@ -2920,7 +3074,7 @@ async fn ws_logging_idle_connection_releases_codec_charge_under_ceiling_pressure
 
     // Any refusal on the shared ceiling (here a reservation larger than the
     // whole ceiling) is pressure: both idle connections must close and give
-    // their charges back within a flush tick or two.
+    // their charges back without waiting for the ten-minute flush tick.
     assert!(ceiling.try_acquire(usize::MAX).is_none());
     assert_eq!(
         wait_for_ceiling_used(ceiling, 0).await,
