@@ -11857,3 +11857,115 @@ async fn sibling_warn_survives_another_instance_re_evaluating_its_own_record() {
         vec!["escalation".to_string()]
     );
 }
+
+#[tokio::test]
+async fn final_request_decision_survives_hook_context_round_trip_and_response_sibling() {
+    use ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test;
+
+    let server = nonmatching_embedding_server().await;
+    let endpoint = format!("{}/v1/embeddings", server.uri());
+    let request_only: Arc<dyn Plugin> = Arc::new(plugin(&json!({
+        "inspect": {"request": true, "response": false},
+        "on_error": "reject",
+        "provider": provider(&endpoint),
+        "builtins": disabled_builtins(),
+        "custom_rules": [{
+            "id": "escalation",
+            "direction": "request",
+            "action": "warn",
+            "examples": ["escalate privileges immediately"],
+            "threshold": 0.50
+        }]
+    })));
+    let response_only: Arc<dyn Plugin> = Arc::new(plugin(&json!({
+        "inspect": {"request": false, "response": true},
+        "on_error": "reject",
+        "streaming_response": "skip",
+        "provider": provider(&endpoint),
+        "builtins": disabled_builtins_with("response_leakage")
+    })));
+    let plugins = vec![request_only.clone(), response_only.clone()];
+    let clean = json!({
+        "messages": [{"role": "user", "content": "This is harmless governed text."}]
+    });
+    let warning = json!({
+        "messages": [{"role": "user", "content": "Please escalate privileges immediately now."}]
+    });
+
+    for (initial, final_body, expected_decision) in [
+        (None, &warning, "warn"),
+        (Some(&clean), &warning, "warn"),
+        (Some(&warning), &clean, "allow"),
+    ] {
+        let mut ctx = make_post_ctx(initial.unwrap_or(final_body));
+        if initial.is_some() {
+            assert_continue(
+                request_only
+                    .before_proxy(&mut ctx, &mut json_headers())
+                    .await,
+            );
+        }
+        // Exercise the H1/H2 compatibility clone and the dispatcher's actual
+        // state handback, including a verdict first created in the final hook
+        // and replacement of this instance's earlier allow/warn record.
+        let bytes = serde_json::to_vec(final_body).unwrap();
+        let (outbound, result) = run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &json_headers(),
+            bytes.clone(),
+        )
+        .await;
+        assert_continue(result);
+        assert_eq!(outbound, bytes);
+
+        let expected_rule_ids = if expected_decision == "warn" {
+            vec!["escalation".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.decision")
+                .map(String::as_str),
+            Some(expected_decision)
+        );
+        assert_eq!(
+            metadata_list(&ctx, "ai_semantic_firewall.rule_ids"),
+            expected_rule_ids
+        );
+
+        // Both response passes must aggregate against the final request
+        // decision on the live context, rather than an absent or stale record.
+        for final_response in [false, true] {
+            let body = if final_response {
+                br#"{"choices":[{"message":{"content":"Still harmless governed text."}}]}"#
+                    .as_slice()
+            } else {
+                br#"{"choices":[{"message":{"content":"This is harmless governed text."}}]}"#
+                    .as_slice()
+            };
+            let result = if final_response {
+                response_only
+                    .on_final_response_body(&mut ctx, 200, &response_headers(), body)
+                    .await
+            } else {
+                response_only
+                    .on_response_body(&mut ctx, 200, &mut response_headers(), body)
+                    .await
+            };
+            assert_continue(result);
+            assert_eq!(
+                ctx.metadata
+                    .get("ai_semantic_firewall.decision")
+                    .map(String::as_str),
+                Some(expected_decision),
+                "the final request verdict must survive a clean sibling response decision"
+            );
+            assert_eq!(
+                metadata_list(&ctx, "ai_semantic_firewall.rule_ids"),
+                expected_rule_ids
+            );
+        }
+    }
+}

@@ -4483,16 +4483,17 @@ impl RequestContext {
     /// Carry a final-request-body hook context's plugin state back onto the
     /// live request context.
     ///
-    /// Exactly the four families the handler has always written back field by
-    /// field: WAF-owned metadata and per-instance scores, plus
+    /// Transfer WAF-owned metadata and per-instance scores, plus
     /// `ai_semantic_cache`'s staged scope key and embedding — its store hook
     /// runs later against the live context, so without these a semantic miss
-    /// would silently store as exact-only. Everything else the compatibility
-    /// context staged is discarded with it, exactly as before.
+    /// would silently store as exact-only. Merge `ai_semantic_firewall`'s latest
+    /// per-instance decisions so later response hooks aggregate the final
+    /// request verdicts. Other compatibility-context plugin state is discarded.
     ///
-    /// A donor that materialized no plugin state means all four are empty, and
-    /// the live context's copies are cleared to match, which is what the
-    /// unconditional field moves produced.
+    /// A donor that materialized no plugin state clears the four transferred
+    /// families, matching the original unconditional field moves. Firewall
+    /// decisions already on the live context remain unless the donor replaces
+    /// that instance's record in the same scope.
     pub(crate) fn adopt_final_request_body_hook_plugin_state(&mut self, donor: &mut Self) {
         let Some(donor_state) = donor.plugin_state.as_deref_mut() else {
             if let Some(state) = self.plugin_state.as_deref_mut() {
@@ -4509,14 +4510,17 @@ impl RequestContext {
             std::mem::take(&mut donor_state.ai_semantic_cache_embeddings);
         let ai_semantic_cache_scope_keys =
             std::mem::take(&mut donor_state.ai_semantic_cache_scope_keys);
+        let ai_semantic_firewall_decision_records =
+            std::mem::take(&mut donor_state.ai_semantic_firewall_decision_records);
         if self.plugin_state.is_none()
             && waf_owned_metadata.is_empty()
             && waf_instance_scores.is_empty()
             && ai_semantic_cache_embeddings.is_empty()
             && ai_semantic_cache_scope_keys.is_empty()
+            && ai_semantic_firewall_decision_records.is_empty()
         {
             // Nothing to carry and nothing to clear: do not materialize live
-            // state just to hold four empty collections.
+            // state just to hold empty collections.
             return;
         }
         let state = self.plugin_state_mut();
@@ -4524,6 +4528,13 @@ impl RequestContext {
         state.waf_instance_scores = waf_instance_scores;
         state.ai_semantic_cache_embeddings = ai_semantic_cache_embeddings;
         state.ai_semantic_cache_scope_keys = ai_semantic_cache_scope_keys;
+        if state.ai_semantic_firewall_decision_records.is_empty() {
+            state.ai_semantic_firewall_decision_records = ai_semantic_firewall_decision_records;
+        } else {
+            state
+                .ai_semantic_firewall_decision_records
+                .extend(ai_semantic_firewall_decision_records);
+        }
     }
 
     /// Release the request-scoped leases a deferred terminal never owned.
@@ -12652,13 +12663,16 @@ pub trait Plugin: Any + Send + Sync {
     /// can override this hook and the proxy will call it instead.
     ///
     /// **Contract on the H1/H2 path**: `ctx` is a lightweight clone built by
-    /// [`RequestContext::clone_for_final_request_body_hooks`]; only
-    /// `ctx.metadata` is copied back to the real request context after the
-    /// hook returns. Mutations to other fields (`ctx.headers`,
-    /// `ctx.query_params`, `ctx.route_override_*`, …) on H1/H2 are dropped.
+    /// [`RequestContext::clone_for_final_request_body_hooks`]. `ctx.metadata`
+    /// and the typed state explicitly carried by
+    /// [`RequestContext::adopt_final_request_body_hook_terminals`] and
+    /// [`RequestContext::adopt_final_request_body_hook_plugin_state`] are
+    /// written back after the hook returns. Mutations to other fields
+    /// (`ctx.headers`, `ctx.query_params`, `ctx.route_override_*`, …) on H1/H2
+    /// are dropped.
     /// On the H3 path the hook receives the real `&mut RequestContext`, so
-    /// implementations MUST limit observable side effects to `ctx.metadata`
-    /// if they want consistent behavior across protocols.
+    /// implementations MUST limit observable side effects to this handback
+    /// contract for consistent behavior across protocols.
     async fn on_final_request_body_with_context(
         &self,
         _ctx: &mut RequestContext,
