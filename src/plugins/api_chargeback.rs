@@ -22,10 +22,10 @@
 //!
 //! **Hot-path optimization**: The recording methods use a thread-local `String`
 //! buffer for the DashMap lookup key, achieving **zero heap allocation on cache
-//! hits** (99%+ of requests). Only the first
-//! record per unique (consumer, proxy, status_code, scope, pricing) combination
-//! allocates — subsequent records reuse the existing DashMap entry via a
-//! read-lock `get()` on a borrowed `&str`. Published proxy names live in a
+//! hits** (99%+ of requests). Configured aggregate fallback rows are precreated
+//! while staging each cache generation. Only the first ordinary record per
+//! unique (consumer, proxy, status_code, scope, pricing) combination allocates.
+//! Subsequent records reuse the existing DashMap entry via a read-lock `get()` on a borrowed `&str`. Published proxy names live in a
 //! separate lock-free snapshot used only while rendering, so a name-only reload
 //! preserves counter continuity without letting a late retired-generation
 //! request restore stale display metadata. Stream entries use a `status_code`
@@ -203,93 +203,153 @@ pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayC
         );
     }
     registry.set_active_proxy_names(names);
-    registry.publish_overflow_reservations(config);
 }
 
-/// The aggregate overflow rows the configuration can create, keyed by their
-/// registry key, with each row's estimated retained bytes.
-///
-/// One row per proxy with an effective `api_chargeback` instance and per
-/// billable tuple a refused identity can fold into: every priced status of an
-/// HTTP-family proxy, plus the shared status-`0` bandwidth row when bandwidth
-/// is priced (WebSocket disconnect bandwidth, and bandwidth of statuses no
-/// tier prices, fold there); or the single stream row of a stream proxy. The
-/// registry reserves these bytes ([`ChargebackRegistry::publish_overflow_reservations`])
-/// and [`validate_composition`] refuses a `max_retained_bytes` that cannot hold
-/// twice the matrix (the live generation plus a pricing reload's next one).
-/// Traffic recorded under no configured proxy (`proxy_id` `unknown`) is not
-/// part of the matrix.
+/// The aggregate overflow rows reserved before a cache generation can serve.
+/// Includes the global chain's unknown-proxy fallback in each known namespace.
 pub fn overflow_reservation_matrix(
     config: &crate::config::types::GatewayConfig,
 ) -> HashMap<String, usize> {
+    overflow_row_templates(config, Instant::now())
+        .into_iter()
+        .map(|(key, entry)| (key, entry.retained_bytes))
+        .collect()
+}
+
+fn overflow_row_templates(
+    config: &crate::config::types::GatewayConfig,
+    epoch: Instant,
+) -> HashMap<String, ChargebackEntry> {
     let mut matrix = HashMap::new();
     for (proxy, effective) in effective_chargeback_plugins_by_proxy(config, "api_chargeback") {
         let [plugin] = effective.as_slice() else {
             continue;
         };
-        let Ok(currency) = instance_currency(&plugin.config) else {
-            continue;
-        };
-        let Ok(pricing) = PricingConfig::from_config(&plugin.config, "api_chargeback") else {
-            continue;
-        };
-        let scope = InstanceScope::new(currency, &proxy.namespace);
-        let proxy_id = bounded_billing_identity(&proxy.id, MAX_REGISTRY_IDENTITY_BYTES);
-        let proxy_name = bounded_display(
+        add_overflow_templates(
+            &mut matrix,
+            plugin,
+            &proxy.namespace,
+            &proxy.id,
             proxy.name.as_deref().unwrap_or("unknown"),
-            MAX_REGISTRY_IDENTITY_BYTES,
+            proxy
+                .backend_scheme
+                .as_ref()
+                .is_some_and(|scheme| scheme.is_stream()),
+            epoch,
         );
-        let namespace_label = InstanceScope::namespace_label_for(&proxy.namespace);
-        let bandwidth_priced = pricing_requires_websocket_framing(&pricing);
-        let mut reserve = |status_code: u16, protocol_family: ProtocolFamily, call: f64| {
-            let mut key = String::new();
-            write_chargeback_key(
-                &mut key,
-                OVERFLOW_CONSUMER_SENTINEL,
-                &proxy.namespace,
-                &proxy_id,
-                status_code,
-                protocol_family,
-                &scope,
-                EntryPrices {
-                    call,
-                    bandwidth_sent: pricing.bandwidth_price_sent,
-                    bandwidth_received: pricing.bandwidth_price_received,
-                },
-            );
-            let bytes = entry_retained_bytes(
-                key.len(),
-                OVERFLOW_CONSUMER_SENTINEL.len(),
-                proxy_id.len(),
-                proxy.namespace.len(),
-                proxy_name.len(),
-                namespace_label.len(),
-                &scope,
-            );
-            matrix.insert(key, bytes);
-        };
-        let stream_proxy = proxy
-            .backend_scheme
-            .as_ref()
-            .is_some_and(|scheme| scheme.is_stream());
-        if stream_proxy {
-            if pricing.stream_connection_price > 0.0 || bandwidth_priced {
-                reserve(
-                    STREAM_STATUS_SENTINEL,
-                    ProtocolFamily::Stream,
-                    pricing.stream_connection_price,
+    }
+    for plugin in config.plugin_configs.iter().filter(|plugin| {
+        plugin.enabled
+            && plugin.plugin_name == "api_chargeback"
+            && plugin.scope == crate::config::types::PluginScope::Global
+    }) {
+        let namespaces: HashSet<&str> = config
+            .known_namespaces
+            .iter()
+            .map(String::as_str)
+            .chain(config.proxies.iter().map(|proxy| proxy.namespace.as_str()))
+            .chain(std::iter::once(plugin.namespace.as_str()))
+            .collect();
+        for namespace in namespaces {
+            // The global fallback can receive both HTTP and stream summaries.
+            for stream in [false, true] {
+                add_overflow_templates(
+                    &mut matrix,
+                    plugin,
+                    namespace,
+                    "unknown",
+                    "unknown",
+                    stream,
+                    epoch,
                 );
-            }
-        } else {
-            for (&status_code, &price) in &pricing.price_by_status {
-                reserve(status_code, ProtocolFamily::Http, price);
-            }
-            if bandwidth_priced {
-                reserve(STREAM_STATUS_SENTINEL, ProtocolFamily::Http, 0.0);
             }
         }
     }
     matrix
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_overflow_templates(
+    matrix: &mut HashMap<String, ChargebackEntry>,
+    plugin: &crate::config::types::PluginConfig,
+    namespace: &str,
+    proxy_id: &str,
+    proxy_name: &str,
+    stream: bool,
+    epoch: Instant,
+) {
+    let Ok(currency) = instance_currency(&plugin.config) else {
+        return;
+    };
+    let Ok(pricing) = PricingConfig::from_config(&plugin.config, "api_chargeback") else {
+        return;
+    };
+    let scope = InstanceScope::new(currency, namespace);
+    let proxy_id = bounded_billing_identity(proxy_id, MAX_REGISTRY_IDENTITY_BYTES);
+    let proxy_name = bounded_display(proxy_name, MAX_REGISTRY_IDENTITY_BYTES);
+    let namespace_label = InstanceScope::namespace_label_for(namespace);
+    let bandwidth_priced = pricing_requires_websocket_framing(&pricing);
+    let mut reserve = |status_code: u16, protocol_family: ProtocolFamily, call: f64| {
+        let mut key = String::new();
+        write_chargeback_key(
+            &mut key,
+            OVERFLOW_CONSUMER_SENTINEL,
+            namespace,
+            &proxy_id,
+            status_code,
+            protocol_family,
+            &scope,
+            EntryPrices {
+                call,
+                bandwidth_sent: pricing.bandwidth_price_sent,
+                bandwidth_received: pricing.bandwidth_price_received,
+            },
+        );
+        let bytes = entry_retained_bytes(
+            key.len(),
+            OVERFLOW_CONSUMER_SENTINEL.len(),
+            proxy_id.len(),
+            namespace.len(),
+            proxy_name.len(),
+            namespace_label.len(),
+            &scope,
+        );
+        matrix.insert(
+            key,
+            ChargebackEntry::new(
+                epoch,
+                Arc::from(OVERFLOW_CONSUMER_SENTINEL),
+                Arc::from(proxy_id.as_ref()),
+                Arc::from(namespace),
+                Arc::from(proxy_name),
+                status_code,
+                protocol_family,
+                call,
+                pricing.bandwidth_price_sent,
+                pricing.bandwidth_price_received,
+                Arc::clone(&scope.currency),
+                Arc::from(namespace_label.as_str()),
+                bytes,
+                false,
+            ),
+        );
+    };
+    if stream {
+        if pricing.stream_connection_price > 0.0 || bandwidth_priced {
+            reserve(
+                STREAM_STATUS_SENTINEL,
+                ProtocolFamily::Stream,
+                pricing.stream_connection_price,
+            );
+        }
+    } else {
+        for (&status, &price) in &pricing.price_by_status {
+            reserve(status, ProtocolFamily::Http, price);
+        }
+        if bandwidth_priced {
+            reserve(STREAM_STATUS_SENTINEL, ProtocolFamily::Http, 0.0);
+        }
+    }
 }
 
 /// After an accepted generation is installed, publish the absence of a
@@ -446,13 +506,6 @@ fn entry_retained_bytes(
         .saturating_add(ENTRY_FIXED_OVERHEAD_BYTES)
 }
 
-/// Subtract from a byte counter without wrapping below zero.
-fn saturating_fetch_sub(counter: &AtomicUsize, amount: usize) {
-    let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-        Some(value.saturating_sub(amount))
-    });
-}
-
 // Keep the hot-path key fields as borrowed scalars: wrapping them in an
 // aggregate would add ceremony without reducing the call-site data flow, and
 // this helper deliberately writes directly into a reused thread-local buffer.
@@ -576,6 +629,8 @@ pub struct ChargebackEntry {
     /// configuration — proxy × status × family × currency/namespace × prices —
     /// not by attacker-chosen principals).
     counts_against_identity_budget: bool,
+    /// Cache generations pin their preallocated overflow rows until retirement.
+    overflow_owners: AtomicUsize,
 }
 
 impl ChargebackEntry {
@@ -614,7 +669,14 @@ impl ChargebackEntry {
             namespace_label,
             retained_bytes,
             counts_against_identity_budget,
+            overflow_owners: AtomicUsize::new(0),
         }
+    }
+
+    fn has_activity(&self) -> bool {
+        self.call_count.load(Ordering::Relaxed) != 0
+            || self.bytes_sent_total.load(Ordering::Relaxed) != 0
+            || self.bytes_received_total.load(Ordering::Relaxed) != 0
     }
 
     /// A fresh row with this row's identity, pricing, metadata, and byte
@@ -1003,7 +1065,7 @@ pub fn validate_composition(
             errors.push(format!(
                 "api_chargeback `max_retained_bytes` ({}) cannot hold the aggregate overflow rows \
                  the configured proxies and pricing tiers need: {matrix_bytes} bytes, reserved \
-                 twice ({required_bytes} bytes) so a pricing reload's next generation also fits. \
+                 twice ({required_bytes} bytes) to leave one matrix of reload headroom. \
                  Raise `max_retained_bytes`",
                 reference_tunables.max_retained_bytes
             ));
@@ -1017,43 +1079,31 @@ pub fn validate_composition(
     }
 }
 
-/// Refuse a candidate configuration whose not-yet-created overflow rows do
-/// not fit beside the billing state `registry` already retains (see
-/// [`ChargebackRegistry::check_overflow_reservation_fits`]).
-///
-/// Kept apart from [`validate_composition`], which stays a pure function of
-/// the configuration: this rule depends on live registry state.
-pub fn live_overflow_reservation_check(
+/// Reserve and create the complete fallback matrix while building a cache,
+/// before any request can observe that generation. Offline validation never
+/// calls this. Dropping an unpublished candidate releases its unused rows.
+pub(crate) fn prepare_global_overflow_reservations(
     config: &crate::config::types::GatewayConfig,
-    registry: &ChargebackRegistry,
-) -> Result<(), String> {
-    let Some(reference) = config
-        .plugin_configs
-        .iter()
-        .find(|plugin| plugin.enabled && plugin.plugin_name == "api_chargeback")
-    else {
-        return Ok(());
-    };
-    // `validate_composition` already required every enabled instance to agree
-    // on the shared tunables, so any one of them carries the budget.
-    let tunables = SharedRegistryTunables::from_config(&reference.config)?;
-    registry.check_overflow_reservation_fits(
-        &overflow_reservation_matrix(config),
-        tunables.max_retained_bytes,
-    )
-}
-
-/// [`live_overflow_reservation_check`] against the process-global registry,
-/// when one exists. Called only where the plugin cache builds a generation for
-/// publication, so offline and candidate configuration validation never
-/// depend on this process's live billing state.
-pub(crate) fn validate_live_overflow_reservation(
-    config: &crate::config::types::GatewayConfig,
-) -> Result<(), String> {
-    match try_global_registry() {
-        Some(registry) => live_overflow_reservation_check(config, &registry),
-        None => Ok(()),
+) -> Result<Option<Arc<OverflowReservation>>, String> {
+    let has_global = config.plugin_configs.iter().any(|plugin| {
+        plugin.enabled
+            && plugin.plugin_name == "api_chargeback"
+            && plugin.scope == crate::config::types::PluginScope::Global
+    });
+    if !has_global
+        && effective_chargeback_plugins_by_proxy(config, "api_chargeback")
+            .iter()
+            .all(|(_, effective)| effective.is_empty())
+    {
+        // An enabled but unattached definition never constructs an instance
+        // and must not require (or claim) the process-global registry.
+        return Ok(None);
     }
+    let registry = try_global_registry()
+        .ok_or_else(|| "api_chargeback registry missing after plugin construction".to_string())?;
+    registry
+        .prepare_overflow_reservations(config)
+        .map(|reservation| Some(Arc::new(reservation)))
 }
 
 /// The `/charges` render-projection configuration of one plugin config.
@@ -1123,13 +1173,51 @@ impl PendingAggregateCharges {
     }
 }
 
-/// One aggregate overflow row the accepted configuration reserved bytes for.
-struct ReservedOverflowRow {
-    /// Estimated retained bytes of the row.
-    bytes: usize,
-    /// Whether the row currently exists in the registry (its bytes are then
-    /// counted in `retained_bytes` rather than in the outstanding reserve).
-    present: AtomicBool,
+/// Ownership of a generation's preallocated overflow rows. Staging runs on the
+/// cold path; releasing the last owner never waits for retirement. Pins prevent
+/// eviction from unlinking a fallback that this generation can still use.
+pub struct OverflowReservation {
+    registry: Arc<ChargebackRegistry>,
+    keys: Vec<String>,
+    headroom: usize,
+}
+
+impl OverflowReservation {
+    /// Publish reload headroom once the owning cache generation is accepted.
+    /// Its fallback rows already exist and own their bytes before this call.
+    pub fn activate(&self) {
+        self.registry
+            .overflow_reserve_headroom
+            .store(self.headroom, Ordering::Release);
+    }
+}
+
+impl Drop for OverflowReservation {
+    fn drop(&mut self) {
+        // The final generation owner can disappear on a request thread.
+        // Release pins without waiting for the cold-path retirement lock.
+        for key in &self.keys {
+            if let Some(entry) = self.registry.entries.get(key.as_str()) {
+                entry.overflow_owners.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _retiring = match self.registry.retirement_lock.try_write() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            // The next maintenance pass reclaims unused, unpinned rows.
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        for key in &self.keys {
+            // An abandoned stage cannot discard charges recorded meanwhile by
+            // another generation using the same key. Only unused rows go away.
+            if let Some((_, entry)) = self.registry.entries.remove_if(key.as_str(), |_, entry| {
+                entry.overflow_owners.load(Ordering::Acquire) == 0 && !entry.has_activity()
+            }) {
+                self.registry
+                    .release_reservation(entry.retained_bytes, false);
+            }
+        }
+    }
 }
 
 /// One cached Prometheus `/charges` document.
@@ -1174,16 +1262,24 @@ pub struct CollectionReceipt {
 pub struct ChargesDeliveryAck {
     registry: Arc<ChargebackRegistry>,
     receipt: CollectionReceipt,
+    acknowledged: Arc<AtomicBool>,
 }
 
 impl ChargesDeliveryAck {
     pub fn new(registry: Arc<ChargebackRegistry>, receipt: CollectionReceipt) -> Self {
-        Self { registry, receipt }
+        Self {
+            registry,
+            receipt,
+            acknowledged: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    /// Acknowledge collection of the delivered document. Idempotent.
+    /// Count at most one body hand-off per response, including extension clones.
+    /// This is not a transport or collector acknowledgement.
     pub fn acknowledge(&self) {
-        self.registry.acknowledge_collection(self.receipt);
+        if !self.acknowledged.swap(true, Ordering::AcqRel) {
+            self.registry.acknowledge_collection(self.receipt);
+        }
     }
 }
 
@@ -1237,7 +1333,7 @@ pub struct ChargebackRegistry {
     /// entry whose `last_updated` precedes it had its current counters in at
     /// least TWO delivered `/charges` documents.
     ///
-    /// Idle-age eviction requires that confirmation (issue #5276): without it,
+    /// Idle-age eviction requires that heuristic (issue #5276): without it,
     /// `stale_entry_ttl_seconds` could delete call/byte counters that no
     /// collector ever saw. Two deliveries are required because the gateway has
     /// no transport signal proving one response reached its collector (see
@@ -1245,19 +1341,13 @@ pub struct ChargebackRegistry {
     collection_watermark_nanos: AtomicU64,
     /// Walk start of the most recent delivered `/charges` document.
     latest_acknowledged_walk_nanos: std::sync::Mutex<u64>,
-    /// Aggregate overflow rows reserved for the accepted configuration, keyed
-    /// by their registry key (see [`overflow_reservation_matrix`]).
-    overflow_reservations: ArcSwap<HashMap<String, ReservedOverflowRow>>,
-    /// Bytes reserved for reserved overflow rows that do not currently exist.
-    outstanding_overflow_reserve: AtomicUsize,
     /// Total bytes of the accepted overflow matrix. Ordinary rows also leave
-    /// this much headroom free so the next pricing generation's overflow rows
-    /// still fit while retired-generation rows drain.
+    /// this much headroom for another matrix. A larger or repeated repricing
+    /// can still be refused beside retained history.
     overflow_reserve_headroom: AtomicUsize,
     /// Excludes `/charges` walks and overflow-reservation publication while an
     /// eviction pass retires series groups, so no export observes a partially
-    /// retired group. Never waited on by the recording path: aggregate-row
-    /// creation only TRIES it (see `record_new_aggregate_row`).
+    /// retired group. Never acquired by the recording path.
     retirement_lock: std::sync::RwLock<()>,
     /// Aggregate overflow rows the running eviction pass has unlinked (or is
     /// about to), with the charges recorded onto them meanwhile. Empty outside
@@ -1336,8 +1426,6 @@ impl ChargebackRegistry {
             // Nothing has been exported yet, so nothing is collected.
             collection_watermark_nanos: AtomicU64::new(0),
             latest_acknowledged_walk_nanos: std::sync::Mutex::new(0),
-            overflow_reservations: ArcSwap::from_pointee(HashMap::new()),
-            outstanding_overflow_reserve: AtomicUsize::new(0),
             overflow_reserve_headroom: AtomicUsize::new(0),
             retirement_lock: std::sync::RwLock::new(()),
             retiring_aggregates: DashMap::with_shard_amount(EMPTY_CHARGES_RENDER_SHARD_AMOUNT),
@@ -1376,104 +1464,87 @@ impl ChargebackRegistry {
         self.json_cache.store(Arc::new(None));
     }
 
-    /// Reserve bytes for the aggregate overflow rows the published
-    /// configuration can create (see [`overflow_reservation_matrix`]).
-    ///
-    /// Reserved rows that already exist are marked present (their bytes are
-    /// in `retained_bytes`); the rest form the outstanding reserve that
-    /// ordinary rows may not consume, and the whole matrix is additionally
-    /// kept as headroom for the next pricing generation. Runs on the reload
-    /// cold path under the retirement lock so it cannot race an eviction pass.
-    /// A reserved row created concurrently (aggregate-row creation never waits
-    /// for the lock) may stay counted as outstanding — protecting more than
-    /// needed — until the next eviction pass reconciles every flag.
-    /// The plugin cache has already refused a matrix that does not fit beside
-    /// the retained rows ([`live_overflow_reservation_check`]).
-    #[doc(hidden)]
-    pub fn publish_overflow_reservations(&self, config: &crate::config::types::GatewayConfig) {
-        let matrix = overflow_reservation_matrix(config);
+    /// Atomically reserve and precreate a candidate's overflow matrix. A single
+    /// byte-counter CAS competes with ordinary admission, so the fit check and
+    /// reservation have no check-then-publish gap. The retirement lock keeps
+    /// eviction and other preparations out; requests never acquire it.
+    pub fn prepare_overflow_reservations(
+        self: &Arc<Self>,
+        config: &crate::config::types::GatewayConfig,
+    ) -> Result<OverflowReservation, String> {
+        let templates = overflow_row_templates(config, self.epoch);
+        let budget = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.enabled && plugin.plugin_name == "api_chargeback")
+            .map(|plugin| SharedRegistryTunables::from_config(&plugin.config))
+            .transpose()?
+            .map_or(DEFAULT_MAX_RETAINED_BYTES, |tunables| {
+                tunables.max_retained_bytes
+            });
         let _retiring = self
             .retirement_lock
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut outstanding = 0usize;
-        let mut total = 0usize;
-        let reservations: HashMap<String, ReservedOverflowRow> = matrix
+        let templates: Vec<_> = templates
             .into_iter()
-            .map(|(key, bytes)| {
-                let present = self.entries.contains_key(key.as_str());
-                total = total.saturating_add(bytes);
-                if !present {
-                    outstanding = outstanding.saturating_add(bytes);
-                }
-                (
-                    key,
-                    ReservedOverflowRow {
-                        bytes,
-                        present: AtomicBool::new(present),
-                    },
-                )
+            .map(|(key, entry)| {
+                let missing = !self.entries.contains_key(key.as_str());
+                (key, entry, missing)
             })
             .collect();
-        self.overflow_reservations.store(Arc::new(reservations));
-        self.outstanding_overflow_reserve
-            .store(outstanding, Ordering::Release);
-        self.overflow_reserve_headroom
-            .store(total, Ordering::Release);
-    }
-
-    /// Refuse a candidate overflow matrix this live registry cannot reserve
-    /// beside the billing state it already retains.
-    ///
-    /// Reserving only records which bytes ordinary rows must leave free; it
-    /// cannot free bytes retained history already occupies. Retained rows are
-    /// never deleted to make room (they may hold uncollected charges, and an
-    /// active series keeps its retired pricing generations), so a candidate
-    /// whose overflow rows that do not exist yet need more than the free
-    /// space would leave its own current-generation charges to be dropped.
-    /// [`live_overflow_reservation_check`] refuses such a candidate when the
-    /// plugin cache builds it, and the live generation stays in place. Rows
-    /// admitted between this check and the candidate's publication are not
-    /// counted. A candidate whose reserved rows all exist already is never
-    /// refused here, so lowering the budget below current occupancy still just
-    /// drains through eviction.
-    #[doc(hidden)]
-    pub fn check_overflow_reservation_fits(
-        &self,
-        matrix: &HashMap<String, usize>,
-        max_retained_bytes: usize,
-    ) -> Result<(), String> {
-        let missing_bytes: usize = matrix
+        let missing_bytes = templates
             .iter()
-            .filter(|(key, _)| !self.entries.contains_key(key.as_str()))
-            .map(|(_, bytes)| *bytes)
-            .sum();
-        if missing_bytes == 0 {
-            // Every reserved row already exists, so none is at risk. A budget
-            // lowered below current occupancy keeps its drain-by-eviction
-            // semantics: new rows are refused until occupancy falls.
-            return Ok(());
-        }
-        let retained_bytes = self.retained_bytes.load(Ordering::Acquire);
-        let required_bytes = retained_bytes.saturating_add(missing_bytes);
-        if required_bytes > max_retained_bytes {
+            .filter(|(_, _, missing)| *missing)
+            .try_fold(0usize, |bytes, (_, entry, _)| {
+                bytes.checked_add(entry.retained_bytes)
+            })
+            .ok_or_else(|| "api_chargeback overflow matrix byte count overflow".to_string())?;
+        if missing_bytes > 0
+            && self
+                .retained_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(missing_bytes)
+                        .filter(|next| *next <= budget)
+                })
+                .is_err()
+        {
             return Err(format!(
-                "api_chargeback `max_retained_bytes` ({max_retained_bytes}) cannot reserve the \
-                 aggregate overflow rows this configuration needs beside the billing state the \
-                 live `/charges` registry already retains: {retained_bytes} bytes retained plus \
-                 {missing_bytes} bytes of overflow rows not yet created. Raise \
-                 `max_retained_bytes`, or let retained rows be collected and evicted before \
-                 changing pricing"
+                "api_chargeback `max_retained_bytes` ({budget}) cannot reserve {missing_bytes} \
+                 bytes of new overflow rows beside retained billing state; raise the budget \
+                 or collect and evict retained rows before reloading"
             ));
         }
-        Ok(())
-    }
-
-    /// Bytes currently reserved for reserved overflow rows that do not exist.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn outstanding_overflow_reserve_for_tests(&self) -> usize {
-        self.outstanding_overflow_reserve.load(Ordering::Acquire)
+        let headroom = templates.iter().fold(0usize, |bytes, (_, entry, _)| {
+            bytes.saturating_add(entry.retained_bytes)
+        });
+        let mut keys = Vec::with_capacity(templates.len());
+        for (key, template, was_missing) in templates {
+            // A request may have created an unreserved aggregate after the scan.
+            // It owns its own bytes; give back our redundant reservation.
+            let bytes = template.retained_bytes;
+            keys.push(key.clone());
+            match self.entries.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                    occupied
+                        .get()
+                        .overflow_owners
+                        .fetch_add(1, Ordering::AcqRel);
+                    if was_missing {
+                        self.release_reservation(bytes, false);
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    template.overflow_owners.store(1, Ordering::Release);
+                    vacant.insert(template);
+                }
+            }
+        }
+        Ok(OverflowReservation {
+            registry: Arc::clone(self),
+            keys,
+            headroom,
+        })
     }
 
     /// Configure the process-global render/cleanup knobs that govern the SHARED
@@ -1811,13 +1882,15 @@ impl ChargebackRegistry {
     ///
     /// **Admission (GHSA-wxmv-8mwr-92xf)**: the cold path reserves one retained
     /// entry-key slot and its retained bytes against the process-global budget
-    /// before publishing a new key. A refusal does not discard the charge — it
-    /// is re-recorded under the fixed-cardinality
+    /// before publishing a new key. A refusal records against the preallocated,
+    /// fixed-cardinality
     /// [`OVERFLOW_CONSUMER_SENTINEL`] row, which keeps every non-identity
     /// dimension (proxy, status, family, currency, namespace, prices) and
     /// therefore preserves the billable totals an operator invoices from.
     /// Per-identity attribution is what is lost when a new row cannot be
-    /// admitted. The budget counts complete registry keys, not distinct
+    /// admitted. Outside a prepared matrix, creating an aggregate can itself
+    /// fail and increments `dropped_charges_total`. The budget counts complete
+    /// registry keys, not distinct
     /// principals — one identity across multiple statuses/proxies/prices can
     /// consume many slots.
     #[allow(clippy::too_many_arguments)]
@@ -1838,6 +1911,12 @@ impl ChargebackRegistry {
         bw_price_received: f64,
         count_call: bool,
     ) {
+        // Empty WebSocket sessions have neither a call nor bandwidth to retain.
+        // Avoid reserving an invisible identity row that cannot be collected.
+        if !count_call && bytes_sent == 0 && bytes_received == 0 {
+            return;
+        }
+
         // Bound the billing identity collision-resistantly: within the bound
         // this borrows and allocates nothing, and an oversized identity keeps a
         // digest of its complete value so two principals sharing a prefix stay
@@ -2001,7 +2080,7 @@ impl ChargebackRegistry {
                 return;
             }
 
-            if !self.try_reserve(entry_bytes, true, 0) {
+            if !self.try_reserve(entry_bytes, true) {
                 // Budget exhausted. Fold the charge into the fixed-cardinality
                 // aggregate row rather than losing billable state.
                 self.maybe_invalidate_caches();
@@ -2046,22 +2125,9 @@ impl ChargebackRegistry {
         self.maybe_invalidate_caches();
     }
 
-    /// Cold path for an aggregate overflow row that the fast path did not
-    /// find.
-    ///
-    /// **Never waits.** A running eviction pass or reservation publication
-    /// holds the retirement lock exclusively for a whole-registry walk, and
-    /// the request path must not block behind it. The lock is only TRIED: with
-    /// it, a newly created reserved row also moves its bytes out of the
-    /// outstanding reserve; without it, the row is still created against its
-    /// own reservation, and its bytes simply stay counted as outstanding
-    /// (conservatively, protecting more than needed) until the pass that holds
-    /// the lock re-derives every reservation flag from the rows that exist.
-    ///
-    /// The byte reservation is taken under the row's shard lock, so
-    /// concurrent first creations of the same aggregate row serialize: the
-    /// later ones find the row and record into it instead of each reserving
-    /// its bytes speculatively and dropping charges one row would hold.
+    /// Best-effort cold path for rows outside a prepared matrix (for example a
+    /// retired generation's late completion). Configured rows already exist
+    /// and never enter here. No retirement lock is acquired on this path.
     fn record_new_aggregate_row(
         &self,
         owned_key: String,
@@ -2071,37 +2137,20 @@ impl ChargebackRegistry {
         bytes_received: u64,
         count_call: bool,
     ) {
-        let reservation_guard = match self.retirement_lock.try_read() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        };
-        // A running eviction pass may have unlinked this very row while still
-        // holding it and its byte reservation. File the charge with the pass
-        // instead of reserving a second copy of the row. Checked before the
-        // entries map is touched, so the pass (which finalizes a pending
-        // record under its lock and then inserts into the entries map) and
-        // this path never wait on each other's locks in opposite order.
-        if reservation_guard.is_none()
-            && let Some(pending) = self.retiring_aggregates.get(owned_key.as_str())
-        {
+        if let Some(pending) = self.retiring_aggregates.get(owned_key.as_str()) {
             pending.record(bytes_sent, bytes_received, count_call, self.epoch);
             return;
         }
-        let reservations = self.overflow_reservations.load_full();
-        let reserved_slot = reservations.get(owned_key.as_str());
-        let own_reserved_bytes = reserved_slot
-            .filter(|slot| !slot.present.load(Ordering::Acquire))
-            .map_or(0, |slot| slot.bytes);
-        let created = match self.entries.entry(owned_key) {
+        match self.entries.entry(owned_key) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
                 occupied
                     .get()
                     .record(bytes_sent, bytes_received, count_call, self.epoch);
-                false
             }
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                if !self.try_reserve(entry_bytes, false, own_reserved_bytes) {
+                // Reserve under the shard lock: concurrent first creations of
+                // this key share one reservation and lose no charges.
+                if !self.try_reserve(entry_bytes, false) {
                     drop(vacant);
                     self.dropped_charges_total.fetch_add(1, Ordering::Relaxed);
                     self.warn_on_admission("retained-byte budget exhausted");
@@ -2113,40 +2162,8 @@ impl ChargebackRegistry {
                     count_call,
                     self.epoch,
                 );
-                true
-            }
-        };
-        if created
-            && reservation_guard.is_some()
-            && let Some(slot) = reserved_slot
-            && slot
-                .present
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            // The reserved row now exists: its bytes moved from the
-            // outstanding reserve into `retained_bytes`.
-            saturating_fetch_sub(&self.outstanding_overflow_reserve, slot.bytes);
-        }
-        drop(reservation_guard);
-    }
-
-    /// Re-derive every reservation flag and the outstanding reserve from the
-    /// rows that exist. Runs under the exclusive retirement lock at the end of
-    /// each eviction pass, which also heals the conservative over-count left
-    /// by aggregate rows created while the lock was held elsewhere.
-    fn reconcile_overflow_reservations(&self) {
-        let reservations = self.overflow_reservations.load_full();
-        let mut outstanding = 0usize;
-        for (key, slot) in reservations.iter() {
-            let present = self.entries.contains_key(key.as_str());
-            slot.present.store(present, Ordering::Release);
-            if !present {
-                outstanding = outstanding.saturating_add(slot.bytes);
             }
         }
-        self.outstanding_overflow_reserve
-            .store(outstanding, Ordering::Release);
     }
 
     /// Reserve one entry's retained bytes, and a retained-row slot when the
@@ -2158,21 +2175,9 @@ impl ChargebackRegistry {
     /// principals. They still reserve bytes, so the retained-byte ceiling stays
     /// a hard bound on total registry footprint.
     ///
-    /// Bytes reserved for the accepted configuration's overflow matrix are
-    /// protected: an ordinary row may not use the outstanding reserve of
-    /// overflow rows that do not exist yet, nor the one-matrix headroom kept
-    /// for the next pricing generation; an aggregate row may use everything
-    /// except the outstanding reserve of OTHER reserved rows
-    /// (`own_reserved_bytes` is its own still-absent reservation). Without this,
-    /// ordinary rows could fill the budget and leave no room for the overflow
-    /// row a later refused identity folds into, turning a refusal into a
-    /// dropped charge.
-    fn try_reserve(
-        &self,
-        entry_bytes: usize,
-        identity_admission: bool,
-        own_reserved_bytes: usize,
-    ) -> bool {
+    /// Prepared overflow rows already own their bytes. Ordinary rows also
+    /// leave the accepted matrix's headroom for the next pricing generation.
+    fn try_reserve(&self, entry_bytes: usize, identity_admission: bool) -> bool {
         if identity_admission {
             let max_entries = self.max_entries.load(Ordering::Acquire);
             if self
@@ -2185,11 +2190,10 @@ impl ChargebackRegistry {
                 return false;
             }
         }
-        let outstanding = self.outstanding_overflow_reserve.load(Ordering::Acquire);
         let protected = if identity_admission {
-            outstanding.saturating_add(self.overflow_reserve_headroom.load(Ordering::Acquire))
+            self.overflow_reserve_headroom.load(Ordering::Acquire)
         } else {
-            outstanding.saturating_sub(own_reserved_bytes)
+            0
         };
         let max_bytes = self
             .max_retained_bytes
@@ -2382,15 +2386,17 @@ impl ChargebackRegistry {
     /// failed render produces no receipt, and a scrape abandoned before its
     /// body is taken acknowledges nothing.
     ///
-    /// **Two deliveries confirm collection.** Hyper exposes no per-response
+    /// **Two body hand-offs permit idle eviction.** Hyper exposes no per-response
     /// signal that a body reached the peer: it takes a `Full` body before HTTP/2
     /// flow-control capacity is granted and before an HTTP/1 write is flushed,
-    /// so one acknowledged document may still never arrive. A row therefore
-    /// becomes evictable only once its current counters were in two delivered
-    /// documents — the confirmed watermark is the earlier walk start of the two
-    /// most recent deliveries (two deliveries of one cached document count, as
-    /// two hand-offs of the same counters). A single failed delivery can never
-    /// authorize deletion. Each receipt's walk start is taken BEFORE its walk,
+    /// so one acknowledged document may still never arrive. Two hand-offs can
+    /// also fail together: this is only a retention heuristic, not proof of
+    /// peer receipt or ingestion. Use `api_chargeback_sink` for durable billing.
+    /// An unpinned row becomes evictable once its current counters were in two
+    /// handed-off documents — the watermark is the earlier walk start of the
+    /// two most recent hand-offs (two deliveries of one cached document count, as
+    /// two hand-offs of the same counters). One hand-off is insufficient.
+    /// Each receipt's walk start is taken BEFORE its walk,
     /// so a charge recorded mid-walk stays uncollected. Out-of-order deliveries
     /// keep the confirmed watermark monotonic.
     pub fn acknowledge_collection(&self, receipt: CollectionReceipt) {
@@ -2411,8 +2417,8 @@ impl ChargebackRegistry {
     /// in-memory registry is authoritative for `/charges`, and dropping an entry
     /// that no export ever observed destroys billable state with no record that
     /// it existed (issue #5276). An idle entry whose last update postdates the
-    /// registry's confirmed collection watermark is therefore retained until
-    /// exports collect it, and counted into `uncollected_retained_entries` so
+    /// registry's collection watermark is therefore retained until
+    /// exports include it in the required hand-offs, and counted into `uncollected_retained_entries` so
     /// the condition is observable.
     ///
     /// This does not weaken the registry's memory bound: retained rows still
@@ -2447,8 +2453,8 @@ impl ChargebackRegistry {
     /// [`Self::evict_stale`] with callbacks run after candidate selection and
     /// after candidate removal, so tests can interleave a record with a pass
     /// deterministically. A callback may record onto existing rows or create
-    /// new ones, including aggregate overflow rows: their creation only tries
-    /// the retirement lock this pass holds, so it proceeds without waiting.
+    /// new ones, including unreserved aggregate rows: recording never acquires
+    /// the retirement lock this pass holds.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn evict_stale_interleaved_for_tests(
@@ -2470,9 +2476,23 @@ impl ChargebackRegistry {
             .retirement_lock
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Generation Drop never waits for this lock. Finish any unused-row
+        // cleanup it deferred while a render, preparation, or pass held it.
+        self.entries.retain(|_, entry| {
+            if !entry.counts_against_identity_budget
+                && entry.overflow_owners.load(Ordering::Acquire) == 0
+                && !entry.has_activity()
+            {
+                self.release_reservation(entry.retained_bytes, false);
+                false
+            } else {
+                true
+            }
+        });
         let collected_before = self.collection_watermark_nanos.load(Ordering::Acquire);
         let evictable = |v: &ChargebackEntry| {
-            v.nanos_since_update(self.epoch) >= ttl_nanos
+            v.overflow_owners.load(Ordering::Acquire) == 0
+                && v.nanos_since_update(self.epoch) >= ttl_nanos
                 && v.last_updated.load(Ordering::Relaxed) < collected_before
         };
 
@@ -2484,6 +2504,9 @@ impl ChargebackRegistry {
         let mut candidates: Vec<(EvictionGroupKey, String, bool)> = Vec::new();
         for entry in self.entries.iter() {
             let v = entry.value();
+            if !v.has_activity() {
+                continue;
+            }
             if evictable(v) {
                 candidates.push((
                     eviction_group_key(v),
@@ -2492,7 +2515,9 @@ impl ChargebackRegistry {
                 ));
                 continue;
             }
-            if v.nanos_since_update(self.epoch) >= ttl_nanos {
+            if v.nanos_since_update(self.epoch) >= ttl_nanos
+                && v.last_updated.load(Ordering::Relaxed) >= collected_before
+            {
                 // Idle, but its current counters have not been confirmed
                 // collected. Deleting it would silently discard charges.
                 uncollected += 1;
@@ -2503,7 +2528,6 @@ impl ChargebackRegistry {
             .store(uncollected, Ordering::Relaxed);
         candidates.retain(|(group, _, _)| !retained_groups.contains(group));
         if candidates.is_empty() {
-            self.reconcile_overflow_reservations();
             return 0;
         }
         after_selection();
@@ -2540,6 +2564,9 @@ impl ChargebackRegistry {
         let removed_groups: HashSet<EvictionGroupKey> =
             removed.iter().map(|(group, _, _)| group.clone()).collect();
         for entry in self.entries.iter() {
+            if !entry.value().has_activity() {
+                continue;
+            }
             let group = eviction_group_key(entry.value());
             if removed_groups.contains(&group) {
                 revived.insert(group);
@@ -2574,9 +2601,6 @@ impl ChargebackRegistry {
             // exactly.
             self.release_reservation(entry.retained_bytes, entry.counts_against_identity_budget);
         }
-        // A retired reserved overflow row returns its bytes to the outstanding
-        // reserve; rows created during the pass are counted as present.
-        self.reconcile_overflow_reservations();
         if evicted > 0 {
             self.prometheus_cache.store(Arc::new(None));
             self.json_cache.store(Arc::new(None));
@@ -2824,6 +2848,9 @@ impl ChargebackRegistry {
 
         for entry in self.entries.iter() {
             let v = entry.value();
+            if !v.has_activity() {
+                continue;
+            }
             let proxy_name = active_proxy_names
                 .get(v.proxy_namespace.as_ref())
                 .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
@@ -2961,6 +2988,9 @@ impl ChargebackRegistry {
         let mut bw_aggregates: HashMap<BandwidthAggregateKey, BandwidthAggregate> = HashMap::new();
         for entry in self.entries.iter() {
             let v = entry.value();
+            if !v.has_activity() {
+                continue;
+            }
             let proxy_name = active_proxy_names
                 .get(v.proxy_namespace.as_ref())
                 .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
@@ -3257,6 +3287,9 @@ impl ChargebackRegistry {
 
         for entry in self.entries.iter() {
             let v = entry.value();
+            if !v.has_activity() {
+                continue;
+            }
             let calls = v.call_count.load(Ordering::Relaxed);
             let call_charge = v.call_charge()?;
             let bytes_sent = v.bytes_sent_total.load(Ordering::Relaxed);
