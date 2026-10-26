@@ -256,16 +256,33 @@ For Trusted Cross Build Policy, the gate enumerates repository-wide
 selects `.github/workflows/cross-build-policy.yml`. GitHub records ruleset-required
 runs under a separate workflow identity, so the file workflow's runs endpoint
 does not contain them. Each selected run must authenticate as either the resolved
-file workflow id or an integer workflow id with the exact URL
+file workflow id or a reviewed integer id in the entry's `required_workflow_ids`
+pin list (currently `382932593`) with the exact URL
 `https://api.github.com/repos/ferrum-edge/ferrum-edge/actions/required_workflows/{id}`.
 The latter also requires an active `main` branch `workflows` rule for the same
-path, this repository's numeric id, and `refs/heads/main`. Any same-path rule
-referencing another repository or ref blocks publication. Name, path, SHA, event,
-repository, head repository, and PR branch checks apply to both identities.
-Other-path runs are ignored; every selected run must complete successfully.
-Both run and branch-rule listings require complete pagination with a short final
-page, and the permitting sweep freshly reads identities, rules, and evidence.
+path, this repository's numeric id, and `refs/heads/main`. Any same-path entry
+in the effective `main` branch rules referencing another repository or ref blocks
+publication. Name, path, SHA, event, repository, head repository, and PR branch
+checks apply to both identities.
+Every repository-wide run must have a non-empty string path before selection;
+identified other-path runs are ignored, and every selected run must complete
+successfully. Run listings require unique run ids, a stable non-negative integer
+`total_count`, and a short final page whose collected count equals that total.
+GitHub's 1,000-result search cap or inconsistent totals block publication.
+Branch-rule listings also require a short final page, and the permitting sweep
+freshly reads identities, rules, and evidence.
 Push-based evidence continues to use the file workflow identities and endpoints.
+
+The optional `required_workflow_ids` field is allowed only for `pr_head` evidence
+and must contain a non-empty list of unique positive integers. Unknown required
+identities block even when their URLs are self-consistent and today's rules match.
+Rotating the ruleset to a new id blocks publication until a reviewed protected
+change updates the inventory pin. GitHub's deprecated `required_workflows` API
+cannot query a pinned identity's historical source. Acceptance therefore trusts
+that administrators have not re-pointed its rule between execution and
+publication; such administrator changes are outside this gate's trust model.
+The pin and current rule checks do not prove the individual run's historical
+source repository/ref.
 
 A Dependabot merge made by `dependabot-auto-merge.yml` passes every trusted
 check, but GitHub starts no `push` workflows for a merge queued through
@@ -2744,6 +2761,13 @@ exact SHA before any release binary or image job starts. A version mismatch fail
 immediately, and every build and publishing job depends transitively on this
 guard.
 
+A change to the protected publication-gate surfaces cannot itself be a release
+commit: its own PR head's Trusted Cross Build Policy run fails by design, and a
+policy override cannot turn that failure into successful release evidence.
+After the reviewed policy change lands, cut the release from a later PR merged
+with **Create a merge commit**, whose PR head has successful trusted-policy
+evidence and whose merge commit has all exact-SHA publication checks.
+
 Release runs use the shared `production-release` concurrency group with
 `cancel-in-progress: false`. One production release runs at a time because
 version releases update shared major/minor image aliases; GitHub retains only
@@ -3005,7 +3029,9 @@ git tag v0.3.0
    the release commit's second parent to the associated PR head; squash and
    rebase merges cannot satisfy that check. Do not tag an unvalidated direct
    push. If the version PR was squash-merged, land a follow-up PR with a merge
-   commit and validate that main commit before releasing.
+   commit and validate that main commit before releasing. If a PR changes the
+   protected publication-gate surfaces, its own trusted-policy run fails by
+   design; release from a later merge-commit PR with successful evidence.
 2. In Actions, select **Start Production Release**, choose branch **main**, and
    enter the new stable version tag matching Cargo.toml, for example `v1.2.3`.
    The CLI equivalent is:
