@@ -364,7 +364,7 @@ impl Opa {
 
     /// The upstream request headers allow obligations may set (lowercase).
     /// Plugin-cache composition admission compares them against the credential
-    /// locations authentication plugins on the same chain own.
+    /// locations all plugins on the same chain publish.
     pub(crate) fn decision_request_header_destinations(&self) -> &[String] {
         &self.decision_request_headers
     }
@@ -372,9 +372,7 @@ impl Opa {
     /// Whether an obligation destination is one of this route's active
     /// credential locations (any plugin's `request_headers_to_redact`, built
     /// with the plugin cache), compared as backends read names. Admission
-    /// refuses the authentication-owned overlaps; this is the per-request
-    /// backstop that also covers credential names non-authentication plugins
-    /// publish.
+    /// refuses these overlaps; this is the per-request fail-closed backstop.
     fn obligation_destination_owns_a_credential(&self, ctx: &RequestContext) -> bool {
         if self.decision_request_headers.is_empty() {
             return false;
