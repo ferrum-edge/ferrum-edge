@@ -250,6 +250,23 @@ skipped, stale, or ambiguous evidence blocks release. Tests is bound to the
 canonical CI check suite; trusted policy evidence is bound to the associated
 merged PR head. A policy override does not fabricate successful evidence: a
 commit landed with a failed trusted check is not a releasable commit.
+
+For Trusted Cross Build Policy, the gate enumerates repository-wide
+`pull_request_target` runs for the associated merged PR's exact head SHA and
+selects `.github/workflows/cross-build-policy.yml`. GitHub records ruleset-required
+runs under a separate workflow identity, so the file workflow's runs endpoint
+does not contain them. Each selected run must authenticate as either the resolved
+file workflow id or an integer workflow id with the exact URL
+`https://api.github.com/repos/ferrum-edge/ferrum-edge/actions/required_workflows/{id}`.
+The latter also requires an active `main` branch `workflows` rule for the same
+path, this repository's numeric id, and `refs/heads/main`. Any same-path rule
+referencing another repository or ref blocks publication. Name, path, SHA, event,
+repository, head repository, and PR branch checks apply to both identities.
+Other-path runs are ignored; every selected run must complete successfully.
+Both run and branch-rule listings require complete pagination with a short final
+page, and the permitting sweep freshly reads identities, rules, and evidence.
+Push-based evidence continues to use the file workflow identities and endpoints.
+
 A Dependabot merge made by `dependabot-auto-merge.yml` passes every trusted
 check, but GitHub starts no `push` workflows for a merge queued through
 `GITHUB_TOKEN`. That merge commit therefore has no push-to-`main` evidence of
@@ -2765,8 +2782,11 @@ the same inventory `release-dispatch.yml` checks before creating the tag.
 
 Every inventoried required check must be successful for the exact tag target
 under canonical workflow identity, the expected event, and the expected branch.
-Manual workflow dispatches do not satisfy this gate. Dedicated workflows are
-queried on their canonical endpoints; `Tests` is bound instead to the named
+Manual workflow dispatches do not satisfy this gate. Push-based workflows are
+queried on their file workflow endpoints; PR-head policy runs use the
+repository-wide listing and authenticate file or ruleset-required identity as
+described in [Publish-blocking required checks](#publish-blocking-required-checks).
+`Tests` is bound to the named
 GitHub Actions check run owned by each canonical `ci.yml` push run, so failures
 in later jobs of that run (such as the main image packaging) do not replace the
 `Tests` result. The job holds only

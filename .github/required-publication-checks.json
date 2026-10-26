@@ -46,7 +46,7 @@
       "workflow_name": "Cross Build Policy",
       "job": "verify",
       "evidence": "pr_head",
-      "rationale": "This protected workflow is a PR-admission gate and cannot be given a push trigger by an ordinary change. The publication gate resolves the unique merged pull request associated with the product commit, requires that pull request to target main, binds its head SHA to the product commit's second parent, and then requires every canonical pull_request_target run of this workflow at that PR head to succeed. A direct push has no associated pull request and therefore does not publish."
+      "rationale": "This protected workflow is a PR-admission gate and cannot be given a push trigger by an ordinary change. The publication gate resolves the unique merged pull request associated with the product commit, requires that pull request to target main, and binds its head SHA to the product commit's second parent. It enumerates repository-wide pull_request_target runs at that PR head and requires every run at this workflow path to succeed under either the canonical file workflow id or this repository's exact required_workflows URL and integer id. Ruleset-required identity also requires an active main-branch workflows rule for this path, this repository's numeric id, and refs/heads/main; conflicting same-path repository or ref provenance blocks release. A direct push has no associated pull request and therefore does not publish."
     },
     {
       "context": "Multicluster Federation Live",
