@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ferrum_edge::plugins::utils::aws_refreshing_credentials::{
     AwsCredentialFetchFuture, AwsCredentialFetcher, AwsCredentialRefreshTiming,
@@ -157,35 +157,54 @@ async fn credentials_inside_the_refresh_window_renew_in_the_background() {
     assert!(calls.load(Ordering::SeqCst) >= 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn expired_credentials_are_refused_when_renewal_fails() {
+    // Map paused Tokio time onto a fixed wall clock so neither publication nor
+    // reuse can race the runner's scheduling delay against credential expiry.
+    let started_at = tokio::time::Instant::now();
+    let clock = move || UNIX_EPOCH + Duration::from_secs(1_700_000_000) + started_at.elapsed();
+    let expires_at = clock() + Duration::from_secs(2);
     let (fetcher, calls) = counting_fetcher(
         Duration::ZERO,
-        plan(|generation| {
+        plan(move |generation| {
             if generation == 1 {
-                // Long enough that no scheduling stall makes the first answer
-                // look expired; the test then waits past it.
-                Ok(snapshot(generation, Some(Duration::from_secs(2))))
+                Ok(AwsCredentialSnapshot::new(
+                    "ASIAGENERATION0001",
+                    "fixture-secret",
+                    Some("fixture-session-token-1".to_string()),
+                    Some(expires_at),
+                ))
             } else {
                 Err("provider unavailable".to_string())
             }
         }),
     );
     // No refresh window: the credential is fresh until it expires.
-    let cache =
-        RefreshingAwsCredentials::with_timing(fetcher, timing(Duration::ZERO, Duration::ZERO));
+    let cache = RefreshingAwsCredentials::with_timing_and_clock(
+        fetcher,
+        timing(Duration::ZERO, Duration::ZERO),
+        clock,
+    );
 
     cache
         .credentials()
         .await
         .expect("the first credential is valid");
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::advance(Duration::from_millis(1999)).await;
+    let still_valid = cache.credentials().await.expect("valid just before expiry");
+    assert_eq!(still_valid.access_key_id(), "ASIAGENERATION0001");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no renewal before expiry");
+
+    tokio::time::advance(Duration::from_millis(1)).await;
 
     let refused = cache
         .credentials()
         .await
         .expect_err("an expired credential must never be returned");
-    assert!(!refused.reason.contains("fixture"), "{}", refused.reason);
+    assert_eq!(
+        refused.reason,
+        "the credential provider returned no credentials"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,
