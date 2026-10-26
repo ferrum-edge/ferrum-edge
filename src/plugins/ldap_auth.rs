@@ -1835,11 +1835,17 @@ impl LdapAuth {
         &self,
         user_dn: &str,
         canonical_identity: &str,
+        member_of_proofs_remaining: &mut usize,
     ) -> Result<bool, AuthError> {
         let mut last_unavailable = None;
         for (index, endpoint) in self.endpoints.iter().enumerate() {
             match self
-                .check_group_membership(endpoint, user_dn, canonical_identity)
+                .check_group_membership(
+                    endpoint,
+                    user_dn,
+                    canonical_identity,
+                    member_of_proofs_remaining,
+                )
                 .await
             {
                 Err(AuthError::Unavailable(message)) => {
@@ -2141,6 +2147,7 @@ impl LdapAuth {
         endpoint: &LdapEndpoint,
         user_dn: &str,
         canonical_identity: &str,
+        member_of_proofs_remaining: &mut usize,
     ) -> Result<bool, AuthError> {
         if self.required_groups.is_empty() {
             return Ok(true);
@@ -2182,8 +2189,13 @@ impl LdapAuth {
             )
         };
         let membership = if self.group_membership_mode == GroupMembershipMode::MemberOf {
-            self.search_member_of_groups(&mut connection.ldap, user_dn, used_service_account)
-                .await
+            self.search_member_of_groups(
+                &mut connection.ldap,
+                user_dn,
+                used_service_account,
+                member_of_proofs_remaining,
+            )
+            .await
         } else {
             let filter = self.group_search_filter(user_dn, canonical_identity);
             self.search_required_groups(
@@ -2365,6 +2377,7 @@ impl LdapAuth {
         ldap: &mut Ldap,
         user_dn: &str,
         used_service_account: bool,
+        member_of_proofs_remaining: &mut usize,
     ) -> Result<bool, AuthError> {
         let attribute = self
             .group_member_attribute
@@ -2394,18 +2407,21 @@ impl LdapAuth {
             return Err(directory_result_error(&search_result.1, "group search"));
         }
 
-        let mut proofs = 0usize;
+        let mut found_candidate = false;
         let mut unproven_candidates = false;
         for result_entry in search_result.0 {
             let entry = SearchEntry::construct(result_entry);
             if !self.entry_matches_required_group(&entry)? {
                 continue;
             }
-            if proofs == LDAP_AUTH_MAX_MEMBER_OF_PROOFS {
+            found_candidate = true;
+            if *member_of_proofs_remaining == 0 {
                 unproven_candidates = true;
                 break;
             }
-            proofs += 1;
+            // Charge before awaiting: unavailable endpoints and cancelled
+            // cached re-checks cannot restore a proof already attempted.
+            *member_of_proofs_remaining -= 1;
             if self
                 .user_entry_lists_group(ldap, user_dn, attribute, &entry.dn)
                 .await?
@@ -2413,7 +2429,7 @@ impl LdapAuth {
                 return Ok(true);
             }
         }
-        if proofs == 0 && !used_service_account {
+        if !found_candidate && !used_service_account {
             warn!(
                 "ldap_auth: no required group was found under '{}' over an anonymous bind; configure a service account if the directory restricts group reads",
                 group_base
@@ -3124,8 +3140,9 @@ fn required_group_name_filter(group_attribute: &str, required_groups: &[String])
     filter
 }
 
-/// Most required-group entries whose membership `member_of` mode proves
-/// per flow; more same-named candidates fail closed.
+/// Maximum `member_of` proof attempts per authentication request, shared by
+/// all endpoints, cached re-checks, and uncached fallback. Additional
+/// same-named candidates fail closed when no proof slots remain.
 const LDAP_AUTH_MAX_MEMBER_OF_PROOFS: usize = 16;
 
 /// Keyed digest over a domain tag, a length-framed username, and optionally
@@ -3578,6 +3595,9 @@ impl AuthMechanism for LdapAuth {
         // One wall-clock budget for the whole authentication: a group re-check
         // and any uncached fallback after it share it.
         let deadline = tokio::time::Instant::now() + self.request_timeout;
+        // One reverse-membership proof budget across every endpoint and any
+        // uncached fallback after a stale cached group re-check.
+        let mut member_of_proofs_remaining = LDAP_AUTH_MAX_MEMBER_OF_PROOFS;
 
         // Check cache first
         if let Some(cached) = self.check_cache(&username, &password) {
@@ -3586,7 +3606,14 @@ impl AuthMechanism for LdapAuth {
                 return self.identity_outcome(&cached.canonical_identity, consumer_index);
             }
             match self
-                .revalidate_cached_groups(&username, &password, cached, consumer_index, deadline)
+                .revalidate_cached_groups(
+                    &username,
+                    &password,
+                    cached,
+                    consumer_index,
+                    deadline,
+                    &mut member_of_proofs_remaining,
+                )
                 .await
             {
                 CachedGroupRevalidation::Decided(outcome) => return outcome,
@@ -3631,7 +3658,12 @@ impl AuthMechanism for LdapAuth {
 
         match tokio::time::timeout_at(
             deadline,
-            self.verify_uncached(&username, &password, consumer_index),
+            self.verify_uncached(
+                &username,
+                &password,
+                consumer_index,
+                &mut member_of_proofs_remaining,
+            ),
         )
         .await
         {
@@ -3712,6 +3744,7 @@ impl LdapAuth {
         cached: CachedAuthentication,
         consumer_index: &ConsumerIndex,
         deadline: tokio::time::Instant,
+        member_of_proofs_remaining: &mut usize,
     ) -> CachedGroupRevalidation {
         let remaining = cached.expires_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -3731,7 +3764,11 @@ impl LdapAuth {
         };
         let membership = tokio::time::timeout(
             budget,
-            self.check_group_membership_with_failover(&cached.user_dn, &cached.canonical_identity),
+            self.check_group_membership_with_failover(
+                &cached.user_dn,
+                &cached.canonical_identity,
+                member_of_proofs_remaining,
+            ),
         )
         .await;
         let outcome = match membership {
@@ -3773,6 +3810,7 @@ impl LdapAuth {
         presented_username: &str,
         password: &str,
         consumer_index: &ConsumerIndex,
+        member_of_proofs_remaining: &mut usize,
     ) -> VerifyOutcome {
         // Authenticate against LDAP. Distinguish a genuine credential failure
         // (401) from a backend/config failure (500); see finding #32. The
@@ -3804,6 +3842,7 @@ impl LdapAuth {
                 .check_group_membership_with_failover(
                     &authenticated_user.dn,
                     &authenticated_user.canonical_identity,
+                    member_of_proofs_remaining,
                 )
                 .await
             {
