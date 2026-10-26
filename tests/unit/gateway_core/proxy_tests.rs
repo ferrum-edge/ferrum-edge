@@ -823,14 +823,14 @@ fn test_backend_path_bound_retries_preflight_before_backoff() {
         .find("Aborting retry because the candidate would change")
         .expect("generic H1/H2 retries must reject a path-changing target");
     let generic_intermediate_record = generic_after_preflight
-        .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+        .find("record_backend_admission_retry_outcome(")
         .expect("generic H1/H2 retry accounting must remain present");
     let generic_backoff = generic_after_preflight
         .find("let delay = retry::retry_delay(retry_config, attempt);")
         .expect("generic H1/H2 retry backoff must remain present");
     assert!(
         generic_mismatch < generic_intermediate_record
-            && generic_mismatch < generic_backoff
+            && generic_intermediate_record < generic_backoff
             && generic_after_preflight[generic_mismatch..generic_intermediate_record]
                 .contains("break;"),
         "generic H1/H2 path mismatch must abort before intermediate accounting and retry backoff"

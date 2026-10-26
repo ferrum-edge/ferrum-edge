@@ -43736,14 +43736,17 @@ async fn handle_proxy_request_inner(
                 None
             };
 
-            if let Some(permits) = backend_admission_permits.take() {
-                permits.record_backend_outcome(BackendAdmissionOutcome {
+            record_backend_admission_retry_outcome(
+                &mut backend_admission_permits,
+                BackendAdmissionOutcome {
                     response_status: result.status_code,
                     connection_error: result.connection_error,
                     error_class: result.error_class,
                     backend_elapsed: backend_admission_started_at.elapsed(),
-                });
-            }
+                },
+                backend_admission_started_at,
+                direct_h2_client_upload_gate,
+            );
             // Record the failed attempt against the current target's circuit breaker
             // before potentially switching to a different target for the next retry.
             if let Some(cb) = cb_probe.current_breaker(
@@ -44952,14 +44955,11 @@ async fn handle_proxy_request_inner(
     // shortens another attempt's sample. Streamed responses therefore sample
     // response-header arrival (TTFB) and buffered ones the backend round trip,
     // never the client's upload time (`docs/plugins.md`).
-    let backend_admission_elapsed = {
-        let (gate_attempt_started_at, gate_wait) = direct_h2_client_upload_gate;
-        if gate_attempt_started_at == backend_admission_started_at {
-            final_backend_dispatch_elapsed.saturating_sub(gate_wait)
-        } else {
-            final_backend_dispatch_elapsed
-        }
-    };
+    let backend_admission_elapsed = backend_admission_attempt_elapsed(
+        backend_admission_started_at,
+        final_backend_dispatch_elapsed,
+        direct_h2_client_upload_gate,
+    );
     let mut is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
@@ -49210,6 +49210,39 @@ fn h3_mesh_buffered_retry_response(
     response.error_class = Some(retry::ErrorClass::RequestBodyTooLarge);
     response.connection_error = false;
     response
+}
+
+/// Dispatch-relative adaptive latency for intermediate and final attempts.
+/// A direct-H2 upload gate belongs only to the attempt that measured it.
+pub(crate) fn backend_admission_attempt_elapsed(
+    attempt_started_at: Instant,
+    elapsed: Duration,
+    client_upload_gate: (Instant, Duration),
+) -> Duration {
+    let (gate_attempt_started_at, gate_wait) = client_upload_gate;
+    if gate_attempt_started_at == attempt_started_at {
+        elapsed.saturating_sub(gate_wait)
+    } else {
+        elapsed
+    }
+}
+
+/// Settle the attempt a retry replaces before its permit is released or the
+/// next attempt starts. Preserve the backend outcome while excluding client time.
+pub(crate) fn record_backend_admission_retry_outcome(
+    permits: &mut Option<BackendAdmissionPermitSet>,
+    mut outcome: BackendAdmissionOutcome,
+    attempt_started_at: Instant,
+    client_upload_gate: (Instant, Duration),
+) {
+    if let Some(permits) = permits.take() {
+        outcome.backend_elapsed = backend_admission_attempt_elapsed(
+            attempt_started_at,
+            outcome.backend_elapsed,
+            client_upload_gate,
+        );
+        permits.record_backend_outcome(outcome);
+    }
 }
 
 /// Proxy the request to the backend.

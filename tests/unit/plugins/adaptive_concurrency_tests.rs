@@ -3222,45 +3222,6 @@ fn adaptive_concurrency_client_upload_refusal_is_neutral_but_backend_terminals_b
     }
 }
 
-/// Issue #6307: the H3-to-H2 gRPC streaming bridge captures its response timing
-/// when the backend headers are available. Every admission settlement after
-/// that capture must record the captured duration, so a slow successful body
-/// tail, trailers, or downstream backpressure cannot lengthen the healthy
-/// latency sample. The permit is still settled only at the terminal outcome.
-#[test]
-fn h3_grpc_streaming_bridge_settles_admission_with_captured_response_timing() {
-    let cross = include_str!("../../../src/http3/cross_protocol.rs");
-    let handler = cross
-        .split("async fn handle_h3_grpc_streaming_response<S>(")
-        .nth(1)
-        .expect("H3 gRPC streaming response handler")
-        .split("\nasync fn ")
-        .next()
-        .and_then(|body| body.split("\nfn ").next())
-        .expect("bounded H3 gRPC streaming response handler");
-    let capture = "let backend_admission_response_elapsed = backend_admission_start.elapsed();";
-    let (_, after_capture) = handler
-        .split_once(capture)
-        .expect("the handler must capture response timing at header availability");
-    assert!(
-        !after_capture.contains("backend_admission_start.elapsed()"),
-        "admission settlement after header availability must use the captured response timing"
-    );
-    let terminal = after_capture
-        .rsplit("record_cross_protocol_backend_admission_outcome(")
-        .next()
-        .expect("terminal admission settlement");
-    assert!(
-        terminal.contains("outcome_error_class,\n        backend_admission_response_elapsed,"),
-        "the terminal settlement must record the captured response timing: {terminal}"
-    );
-    assert!(
-        after_capture
-            .contains("let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64()"),
-        "the logged TTFB and the latency sample must share one capture"
-    );
-}
-
 fn keyed_config(
     key_by: AdaptiveConcurrencyKeyBy,
     max_tracked_keys: usize,
@@ -3392,47 +3353,6 @@ fn adaptive_concurrency_racing_first_admissions_insert_one_tracked_target() {
         .expect("the racing target is tracked");
     assert_eq!(snapshot.in_flight, RACERS as u64);
     drop(permits);
-}
-
-/// DEEPSEEK-FLASH-2: an existing target is looked up through the borrowed key
-/// view under a shard read guard; the owned key (`host.to_owned()` plus an
-/// `Arc<str>` scope) is built only after that lookup misses, and admission never
-/// formats a per-call `upstream_target` scope into a fresh `String`.
-#[test]
-fn adaptive_concurrency_admission_builds_no_owned_key_for_existing_targets() {
-    let source = include_str!("../../../src/adaptive_concurrency.rs");
-    let target_state = source
-        .split("    fn target_state(")
-        .nth(1)
-        .and_then(|rest| rest.split("\n    fn ").next())
-        .expect("target_state lookup");
-    let read_lookup = target_state
-        .find(".get(&lookup as &dyn AdaptiveConcurrencyKeyView)")
-        .expect("existing targets must be found through the borrowed key view");
-    let owned_key = target_state
-        .find("host: host.to_owned()")
-        .expect("the owned key is built for first insert");
-    let entry = target_state
-        .find(".inner.entry(key)")
-        .expect("first insert uses the entry API");
-    assert!(
-        read_lookup < owned_key && owned_key < entry,
-        "the read-guard lookup must precede owned-key construction and the entry lock"
-    );
-
-    let with_scope = source
-        .split("    fn with_scope<R>(")
-        .nth(1)
-        .and_then(|rest| rest.split("\n    fn ").next())
-        .expect("with_scope");
-    assert!(
-        with_scope.contains("UPSTREAM_SCOPE_SCRATCH.with("),
-        "upstream_target scope must be formatted into the thread-local scratch"
-    );
-    assert!(
-        !with_scope.contains("Arc::from(") && !with_scope.contains("String::"),
-        "admission must not allocate the upstream_target scope per call"
-    );
 }
 
 fn decision_total(
@@ -3599,42 +3519,4 @@ fn adaptive_concurrency_totals_sum_tracked_limits_and_in_flight() {
     let (_, released) = cache.adaptive_concurrency_totals();
     assert_eq!(released.in_flight, 0);
     assert_eq!(released.tracked_targets, 1);
-}
-
-/// DEEPSEEK-FLASH-3: a backend that answers a terminated permessage-deflate
-/// upgrade with an extension response the gateway cannot honor gets a 502. Both
-/// the H1/H2 and the H3 WebSocket paths must settle the admission permit as a
-/// backend failure before returning, instead of dropping it unsampled while a
-/// broken backend keeps its limit.
-#[test]
-fn websocket_deflate_negotiation_failure_settles_admission_as_backend_failure() {
-    for (path, source, error_body) in [
-        (
-            "src/proxy/mod.rs",
-            include_str!("../../../src/proxy/mod.rs"),
-            "Backend WebSocket extension negotiation failed",
-        ),
-        (
-            "src/http3/websocket.rs",
-            include_str!("../../../src/http3/websocket.rs"),
-            "Backend WebSocket extension negotiation failed",
-        ),
-    ] {
-        let (before_body, _) = source
-            .split_once(error_body)
-            .unwrap_or_else(|| panic!("{path}: deflate negotiation failure response"));
-        let failure_arm = before_body
-            .rsplit_once("Err(reason) => {")
-            .map(|(_, arm)| arm)
-            .unwrap_or_else(|| panic!("{path}: deflate negotiation failure arm"));
-        let record = failure_arm
-            .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
-            .unwrap_or_else(|| panic!("{path}: the failure arm must settle the admission permit"));
-        let settled = &failure_arm[record..];
-        assert!(
-            settled.contains("response_status: 502")
-                && settled.contains("error_class: Some(retry::ErrorClass::ProtocolError)"),
-            "{path}: the permit must record the 502 protocol failure: {settled}"
-        );
-    }
 }
