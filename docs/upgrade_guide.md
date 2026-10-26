@@ -32,10 +32,11 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 directly. It collects the plugin production-launch hardening review together
 with other security and correctness fixes. Many sections below refuse
 configuration or traffic that 0.9.17 accepted, so review every section before
-upgrading. The `V001` database baseline changed after 0.9.17, so the build-out
-database rules above apply: recreate the database instead of pointing the new
-binary at an existing one. CP/DP must run the same build, and the ConfigSync
-revision remains `3`. The matching `contracts-edge-0.9.18` release must be cut
+upgrading. The `V001` baseline checksum is unchanged from 0.9.17, so a 0.9.17
+database is not refused on migration-history grounds. Stored configuration the
+sections below now refuse still fails validation when it is loaded, so fix or
+remove it first. CP/DP must run the same build, and the ConfigSync revision
+remains `3`. The matching `contracts-edge-0.9.18` release must be cut
 from the verified release commit; move downstream contract pins when each
 consumer adopts 0.9.18.
 

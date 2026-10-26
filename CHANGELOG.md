@@ -13,8 +13,8 @@ This release is the production-launch hardening pass across the plugin
 catalog. Every built-in plugin was independently reviewed. The resulting fixes
 tighten authentication, credential and assertion hiding, request and response
 size limits, rate limiting, logging sinks, and the AI-gateway and mesh plugins.
-Many changes refuse configuration or traffic that 0.9.17 accepted, and the
-`V001` database baseline changed. Read
+Many changes refuse configuration or traffic that 0.9.17 accepted. The `V001`
+baseline checksum is unchanged from 0.9.17. Read
 [Upgrading to 0.9.18](docs/upgrade_guide.md#upgrading-to-0918) before updating
 gateways, control planes, custom plugins, charts or contract consumers.
 
@@ -11542,7 +11542,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.18...HEAD
+[0.9.18]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.17
 [0.9.16]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.16
 [0.9.15]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.14...v0.9.15
