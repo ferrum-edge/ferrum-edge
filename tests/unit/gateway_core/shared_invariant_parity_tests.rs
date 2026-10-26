@@ -91,6 +91,71 @@ fn every_config_publication_commits_jwt_history_under_the_same_lock() {
 }
 
 #[test]
+fn request_transformer_header_outcomes_share_every_dispatch_boundary() {
+    // Behavioral tests cover both helper shapes; this inventory pins their
+    // placement after initial/deferred header hooks on H1/H2 and H3. Post-body
+    // finalized-egress overlays retire digests without relabeling body outcomes.
+    let proxy = source("src/proxy/mod.rs");
+    let h3 = source("src/http3/server.rs");
+    for (text, signature) in [
+        (proxy.as_str(), "async fn handle_proxy_request_inner("),
+        (h3.as_str(), "async fn handle_h3_request("),
+    ] {
+        let dispatcher = item_body(text, signature, "\n}");
+        let wire = dispatcher.find("ctx.set_raw_headers(").unwrap();
+        let hooks = dispatcher
+            .find("BackendPathBeforeProxyPass::Initial")
+            .unwrap();
+        let boundary = dispatcher
+            .find("finalize_request_transformer_headers(&mut ctx, &mut owned_proxy_headers)")
+            .unwrap();
+        assert!(wire < hooks && hooks < boundary, "{signature}");
+    }
+    let h1_dispatcher = item_body(&proxy, "async fn handle_proxy_request_inner(", "\n}");
+    assert_eq!(
+        h1_dispatcher
+            .matches("finalize_request_transformer_headers(&mut ctx,")
+            .count(),
+        3
+    );
+    let h3_dispatcher = item_body(&h3, "async fn handle_h3_request(", "\n}");
+    assert_eq!(
+        h3_dispatcher
+            .matches("finalize_request_transformer_headers_in_map(")
+            .count(),
+        2
+    );
+    for (signature, required) in [
+        (
+            "pub(crate) fn apply_finalized_request_egress_header_overlay(",
+            "retire_stale_request_integrity_headers(ctx, owned_proxy_headers)",
+        ),
+        (
+            "pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(",
+            "retire_stale_request_integrity_headers_in_map(ctx, headers)",
+        ),
+    ] {
+        let overlay = item_body(&proxy, signature, "\n}");
+        assert!(overlay.contains(required), "{signature}");
+        assert!(
+            !overlay.contains("finalize_request_transformer_headers"),
+            "{signature}"
+        );
+    }
+    for signature in [
+        "pub(crate) fn retire_stale_request_integrity_headers(",
+        "pub(crate) fn retire_stale_request_integrity_headers_in_map(",
+    ] {
+        let retirement = item_body(&proxy, signature, "\n}");
+        assert!(
+            !retirement.contains("record_body_rule_header_skip"),
+            "{signature}"
+        );
+        assert!(!retirement.contains("&mut RequestContext"), "{signature}");
+    }
+}
+
+#[test]
 fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
     let entry = source("src/gateway_entry.rs");
     let diagnostics: Vec<&str> = entry

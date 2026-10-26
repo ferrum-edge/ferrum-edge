@@ -81,7 +81,7 @@
 //! request (a plain bool); core then inspects the FINAL outbound headers
 //! (after every `before_proxy` hook and the route-header finalizer) and, when
 //! such a field is present and the body rules may rewrite the request (the
-//! body is not proven empty by `Content-Length: 0` and the effective
+//! original client framing does not prove an empty body and the effective
 //! `Content-Type` is absent or JSON), removes the fields clone-on-write (`proxy::
 //! retire_stale_request_integrity_headers`). Client JSON number lexemes are
 //! preserved exactly across a rewrite (see
@@ -149,7 +149,7 @@ use tracing::debug;
 use super::utils::body_transform::{self, BodyRule, RequestBodyRulesOutcome};
 use super::utils::query::OrderedQuery;
 use super::utils::transformer_gate;
-use super::{Plugin, PluginResult, RequestContext};
+use super::{MetadataMap, Plugin, PluginResult, RequestContext};
 
 pub mod runtime_overlay;
 
@@ -1023,20 +1023,6 @@ impl RequestTransformer {
         })
     }
 
-    /// Whether this instance's body rules decline this request outright for
-    /// a declared non-JSON `Content-Type` that may carry a body.
-    fn body_rules_decline_declared_non_json(
-        &self,
-        ctx: &RequestContext,
-        headers: &HashMap<String, String>,
-    ) -> bool {
-        !self.body_rules.is_empty()
-            && crate::proxy::request_may_have_body(&ctx.method, headers)
-            && headers
-                .get("content-type")
-                .is_some_and(|content_type| !body_transform::is_json_content_type(content_type))
-    }
-
     /// Shared body pass for the context-free and context-aware hooks.
     fn transform_body(&self, body: &[u8], content_type: Option<&str>) -> BodyPass {
         // The same immutable decision `before_proxy` used. A marker header and
@@ -1082,14 +1068,23 @@ pub(crate) fn is_body_bound_request_integrity_header(name: &str) -> bool {
 ///
 /// The method is deliberately NOT consulted: an HTTP/2 or HTTP/3 `GET` may
 /// carry DATA without `Content-Length`, and the body pass buffers and rewrites
-/// it all the same. Only an explicit `Content-Length: 0` proves emptiness here.
+/// it all the same. Only a single original client `Content-Length: 0` without
+/// `Transfer-Encoding` proves emptiness here. The mutable outbound map cannot
+/// supply that proof; contexts without retained wire headers fail closed.
 pub(crate) fn request_body_rules_may_rewrite(
-    _method: &str,
+    ctx: &RequestContext,
     headers: &HashMap<String, String>,
 ) -> bool {
-    !headers
-        .get("content-length")
-        .is_some_and(|length| length.trim() == "0")
+    let mut client_lengths = ctx.raw_header_value_bytes("content-length");
+    let client_framing_proves_empty = ctx
+        .raw_header_value_bytes("transfer-encoding")
+        .next()
+        .is_none()
+        && client_lengths
+            .next()
+            .is_some_and(|length| length.trim_ascii() == b"0")
+        && client_lengths.next().is_none();
+    !client_framing_proves_empty
         && headers
             .get("content-type")
             .map(String::as_str)
@@ -1097,6 +1092,32 @@ pub(crate) fn request_body_rules_may_rewrite(
                 body_transform::is_json_content_type(content_type)
                     && !body_transform::is_framed_grpc_content_type(content_type)
             })
+}
+
+/// Publish the media-type skip at a pre-body final-header boundary, including
+/// when streaming skips the body hook. Reconsider only this provisional reason
+/// on deferred header passes; a body hook's parse/no-rule outcome remains
+/// authoritative. Post-body egress overlays must not call this function.
+pub(crate) fn record_body_rule_header_skip(
+    method: &str,
+    headers: &HashMap<String, String>,
+    metadata: &mut MetadataMap,
+) {
+    let skipped = crate::proxy::request_may_have_body(method, headers)
+        && headers
+            .get("content-type")
+            .is_some_and(|content_type| !body_transform::is_json_content_type(content_type));
+    let previous = metadata.get(BODY_SKIPPED_METADATA_KEY).map(String::as_str);
+    if skipped {
+        if previous.is_none() {
+            metadata.insert(
+                BODY_SKIPPED_METADATA_KEY.to_string(),
+                BODY_SKIPPED_NON_JSON_CONTENT_TYPE.to_string(),
+            );
+        }
+    } else if previous == Some(BODY_SKIPPED_NON_JSON_CONTENT_TYPE) {
+        metadata.remove(BODY_SKIPPED_METADATA_KEY);
+    }
 }
 
 /// Remove request integrity fields computed over the client's bytes.
@@ -1260,12 +1281,6 @@ impl Plugin for RequestTransformer {
         if !self.query_rules.is_empty() {
             apply_query_rules(self, ctx, &original_query, &mut rule_skipped);
         }
-        if self.body_rules_decline_declared_non_json(ctx, headers) {
-            ctx.metadata.insert(
-                BODY_SKIPPED_METADATA_KEY.to_string(),
-                BODY_SKIPPED_NON_JSON_CONTENT_TYPE.to_string(),
-            );
-        }
         // Body rules may rewrite the bytes a client digest describes. Whether
         // they can — and whether a digest is even present — is decided by
         // proxy core over the FINAL outbound headers: a later header rule, a
@@ -1307,7 +1322,7 @@ impl Plugin for RequestTransformer {
     ) -> Option<Vec<u8>> {
         match self.transform_body(body, content_type) {
             BodyPass::Replaced(bytes) => {
-                // A `before_proxy` non-JSON verdict is superseded when a later
+                // A provisional final-header skip is superseded when a later
                 // header change made the body rewritable after all.
                 ctx.metadata.remove(BODY_SKIPPED_METADATA_KEY);
                 Some(bytes)

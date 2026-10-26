@@ -7252,6 +7252,9 @@ pub(crate) fn apply_finalized_request_egress_header_overlay(
     for (name, value) in overlay {
         headers.insert(name, value);
     }
+    // Body hooks have already published their outcome. Recheck digest
+    // retirement without reconsidering the provisional pre-body skip.
+    retire_stale_request_integrity_headers(ctx, owned_proxy_headers);
     refresh_effective_backend_gateway_assertion_headers(ctx, owned_proxy_headers);
     hbone_proxy::strip_egress_baggage_in_proxy_headers(
         owned_proxy_headers,
@@ -7281,6 +7284,7 @@ pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
         headers.insert(name, value);
     }
     refresh_backend_gateway_assertion_headers(ctx, headers);
+    retire_stale_request_integrity_headers_in_map(ctx, headers);
     crate::modes::mesh::hbone::strip_egress_baggage_in_map(headers, strip_baggage_keys);
     run_final_backend_header_policy_hooks(plugins, ctx, headers);
 }
@@ -18344,6 +18348,39 @@ pub fn refresh_backend_gateway_assertion_headers(
     }
 }
 
+/// Publish the provisional request-transformer media-type skip and retire
+/// stale digests after initial or deferred header hooks, before body hooks.
+/// Post-body egress overlays only retire digests: a header relabel there cannot
+/// change whether the body hooks parsed, skipped, or replaced the body.
+pub(crate) fn finalize_request_transformer_headers(
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if ctx.request_body_integrity_retirement {
+        crate::plugins::request_transformer::record_body_rule_header_skip(
+            &ctx.method,
+            owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+            &mut ctx.metadata,
+        );
+    }
+    retire_stale_request_integrity_headers(ctx, owned_proxy_headers);
+}
+
+/// Native HTTP/3 owned-map variant of [`finalize_request_transformer_headers`].
+pub(crate) fn finalize_request_transformer_headers_in_map(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    if ctx.request_body_integrity_retirement {
+        crate::plugins::request_transformer::record_body_rule_header_skip(
+            &ctx.method,
+            headers,
+            &mut ctx.metadata,
+        );
+    }
+    retire_stale_request_integrity_headers_in_map(ctx, headers);
+}
+
 /// Retire request content-integrity fields (`Content-Digest`, `Repr-Digest`,
 /// `Digest`, `Content-MD5`) that `request_transformer` body rules may
 /// invalidate, judged over the FINAL outbound headers — after every
@@ -18379,7 +18416,10 @@ pub(crate) fn retire_stale_request_integrity_headers_in_map(
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
 ) {
-    if ctx.request_body_integrity_retirement && request_integrity_retirement_applies(ctx, headers) {
+    if !ctx.request_body_integrity_retirement {
+        return;
+    }
+    if request_integrity_retirement_applies(ctx, headers) {
         crate::plugins::request_transformer::strip_body_bound_integrity_headers(headers);
     }
 }
@@ -18394,7 +18434,7 @@ fn request_integrity_retirement_applies(
     headers
         .keys()
         .any(|name| is_body_bound_request_integrity_header(name))
-        && request_body_rules_may_rewrite(&ctx.method, headers)
+        && request_body_rules_may_rewrite(ctx, headers)
 }
 
 /// The initial dispatch-boundary gateway-assertion refresh shared by the H1/H2
@@ -18448,8 +18488,6 @@ fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
-    // A deferred pass or egress overlay can change `Content-Type` again.
-    retire_stale_request_integrity_headers(ctx, owned_proxy_headers);
     if let Some(headers) = owned_proxy_headers.as_mut() {
         refresh_backend_gateway_assertion_headers(ctx, headers);
     } else {
@@ -37720,10 +37758,10 @@ async fn handle_proxy_request_inner(
     // GeoIP-only request refreshes `ctx.headers` in place. The native HTTP/3
     // frontend makes the same call at the same point — keep both in sync.
     refresh_initial_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
-    // Stale request digests: decided over the final outbound headers, after
-    // every `before_proxy` hook and the route-header finalizer. The native
-    // HTTP/3 frontend does the same at the same point — keep both in sync.
-    retire_stale_request_integrity_headers(&ctx, &mut owned_proxy_headers);
+    // Provisional body skips and stale request digests: decided over the final
+    // outbound headers after every `before_proxy` hook and the route-header
+    // finalizer. The native HTTP/3 frontend does the same at the same point.
+    finalize_request_transformer_headers(&mut ctx, &mut owned_proxy_headers);
     // Proxy hop limit (issue #6109): re-assert the forwarded `X-Ferrum-Hops`
     // count on the authoritative outbound map now that every request-phase
     // plugin has run, so no plugin can reset the count the next gateway hop
@@ -38024,6 +38062,7 @@ async fn handle_proxy_request_inner(
             // A deferred routing function can return arbitrary headers.
             // Restore gateway-owned assertions and reapply the egress baggage
             // policy before those headers can reach any backend transport.
+            finalize_request_transformer_headers(&mut ctx, &mut owned_proxy_headers);
             refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,
@@ -38081,6 +38120,7 @@ async fn handle_proxy_request_inner(
             ctx.path = backend_ctx_path;
         }
         if matches!(deferred_result, PluginResult::Continue) {
+            finalize_request_transformer_headers(&mut ctx, &mut owned_proxy_headers);
             refresh_effective_backend_gateway_assertion_headers(&mut ctx, &mut owned_proxy_headers);
             hbone_proxy::strip_egress_baggage_in_proxy_headers(
                 &mut owned_proxy_headers,

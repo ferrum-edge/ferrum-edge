@@ -10493,13 +10493,53 @@ pub mod _test_support {
         crate::proxy::h1_request_requires_explicit_chunked_framing(method, body)
     }
 
-    /// Proxy core's stale request-digest retirement over the final outbound
-    /// headers (clone-on-write into `owned_proxy_headers`).
-    pub fn retire_stale_request_integrity_headers(
-        ctx: &crate::plugins::RequestContext,
+    /// Proxy core's pre-body final-header boundary: provisional media-type
+    /// skip recording and clone-on-write stale request-digest retirement.
+    pub fn finalize_request_transformer_headers(
+        ctx: &mut crate::plugins::RequestContext,
         owned_proxy_headers: &mut Option<HashMap<String, String>>,
     ) {
-        crate::proxy::retire_stale_request_integrity_headers(ctx, owned_proxy_headers)
+        crate::proxy::finalize_request_transformer_headers(ctx, owned_proxy_headers)
+    }
+
+    /// Native HTTP/3 deferred-pass variant of the final-header boundary.
+    pub fn finalize_request_transformer_headers_in_map(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::finalize_request_transformer_headers_in_map(ctx, headers)
+    }
+
+    pub fn apply_finalized_request_egress_header_overlay(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<HashMap<String, String>>,
+        overlay: HashMap<String, String>,
+        strip_baggage_keys: &[String],
+    ) {
+        crate::proxy::apply_finalized_request_egress_header_overlay(
+            plugins,
+            ctx,
+            owned_proxy_headers,
+            overlay,
+            strip_baggage_keys,
+        );
+    }
+
+    pub fn apply_finalized_request_egress_header_overlay_in_map(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        overlay: HashMap<String, String>,
+        strip_baggage_keys: &[String],
+    ) {
+        crate::proxy::apply_finalized_request_egress_header_overlay_in_map(
+            plugins,
+            ctx,
+            headers,
+            overlay,
+            strip_baggage_keys,
+        );
     }
 
     pub async fn apply_request_body_plugins(
