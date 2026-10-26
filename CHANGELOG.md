@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Strict OpenAPI parameter imports** (issue #6888 / PR #6918). The opt-in
+  `x-ferrum-validate.reject_unsupported_parameters: true` refuses
+  OpenAPI/Swagger imports (HTTP 400 on POST and PUT) whose optional parameters
+  use forms the validator cannot enforce, naming the operation, parameter, and
+  reason. The default still warns and omits them. The flag is import-only and
+  is not copied into the generated plugin config. See [API
+  specs](docs/api_specs.md#x-ferrum-validate-optional).
+- **`key_auth` accepts several credential locations** (issue/PR #6937).
+  `key_location` now also takes an ordered array of 1–8 locations, alongside
+  the existing string form, for example `["header:X-API-Key",
+  "header:X-Legacy-Key", "query:api_key"]`. A request with credentials in more
+  than one configured location is refused with `401`, even when the values
+  match. `hide_credentials` covers every configured location, and every
+  configured credential header is filtered from request trailers. Existing
+  string values and the default need no change.
 - **`ai_federation` credentials can be `${FERRUM_PLUGIN_SECRET_<NAME>}`
   references** (#6816). `api_key`, `google_service_account_json`,
   `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token`
@@ -106,6 +121,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions closed with 1009 by `ws_message_size_limiting`.
 
 ### Changed
+- **BREAKING — `response_caching` `ignore_request_headers` refuses
+  underscore-spelled transport fields** (issue #6887 / PR #6913).
+  `ignore_request_headers` now rejects `keep_alive`, `proxy_connection`, and
+  `transfer_encoding` in any ASCII case, treating `_` as `-` for every
+  Host/hop-by-hop admission refusal. The stale source comment and the `401`
+  replay example in the docs are corrected.
+- **BREAKING — `request_deduplication` keeps credential provenance through
+  rename chains** (issue #6884 / PR #6914). With `caller_partition:
+  authenticated_identity`, business headers that reuse an original credential
+  name stay value-bound through rename chains. Repeated credential query
+  names, including rename destination collisions, now bind every value, so
+  changing a business value or rotating a token in such a query returns `409`
+  instead of replaying.
+- **BREAKING — `a2a_gateway` refuses partial Agent Card representations of any
+  media type** (issue/PR #6919). With Agent Card URL rewriting enabled,
+  buffered partial HTTP Agent Card responses are now refused independently of
+  their top-level media type, including `multipart/byteranges`, with the
+  existing `502` representation terminal. Responses retained under earlier
+  card presentation policies are retired automatically.
+- **BREAKING — `ldap_auth` `member_of` proof budget is per request** (issue
+  #6893 / PR #6922). `group_membership_mode: member_of` now permits at most 16
+  proof attempts in total per authentication request, including failed
+  attempts across failover endpoints and the cached re-check / uncached
+  fallback. A request that needs a 17th attempt fails closed with `500`
+  instead of receiving another per-endpoint or fallback budget.
+- **BREAKING — `hmac_auth` RFC 9421 authority-form `@request-target` is the
+  exact CONNECT target** (issue #6890 / PR #6925). `@request-target` now uses
+  the exact pathless CONNECT authority target, including the original hostname
+  spelling, port, and IPv6 brackets, instead of a reconstructed `/`. Clients
+  that signed the reconstructed value must sign the actual target.
+- **BREAKING — `opa` `decision_request_headers` cannot overlap credential
+  headers** (issue/PR #6926). Admission now rejects `decision_request_headers`
+  that overlap any same-protocol plugin's credential headers, including WAF
+  exemption secrets, OpenAPI validator bypass secrets, and MCP session IDs.
+  Configurations that were admitted but failed every request are now refused
+  before publication.
+- **BREAKING — `request_transformer` empty-body digest exemption follows the
+  original client framing** (issue #6898 / PR #6927). The stale-digest
+  empty-body exemption is now derived from the original client framing, so an
+  outbound `Content-Length: 0` rewrite cannot keep potentially stale request
+  digests. Non-JSON body-skip reasons follow pre-body final header and route
+  relabels, post-body finalized-egress overlays preserve the actual body-hook
+  outcomes, and native HTTP/3 overlays reapply digest retirement.
+- **BREAKING — `security_headers` collapses backend STS/nosniff case variants
+  and parses quoted HSTS extensions** (issue/PR #6929). With
+  `override_existing: false`, backend `Strict-Transport-Security` and
+  `X-Content-Type-Options` case variants collapse to one effective lowercase
+  field, `X-Frame-Options` combinations that jointly deny framing are
+  preserved, and quoted HSTS extension boundaries are recognized, so `max-age`
+  text inside an extension can neither replace an effective policy nor satisfy
+  a missing one.
+- **BREAKING — plugin-written request header case variants resolve one way**
+  (issue #6899 / PR #6932). Duplicate case variants in plugin-written request
+  header maps now resolve identically for mesh authorization, CUSTOM
+  providers, and backend forwarding. List and extension fields fold in
+  byte-wise key order with the repeated-field separator (`Cookie` uses `; `);
+  singleton fields prefer lowercase, otherwise the byte-wise smallest key.
+  Duplicate-free maps add no normalization allocation.
+- **BREAKING — `api_chargeback` preallocates and pins configured aggregate
+  rows** (issue #6891 / PR #6934). Configured aggregate rows, including global
+  unknown-proxy fallbacks, are preallocated and pinned; their estimated bytes
+  count immediately, and active aggregate series stay retained until no cache
+  generation owns their rows. A whole reload is refused when missing fallback
+  rows cannot fit under the candidate budget, including on budget decreases.
+- **BREAKING — global `correlation_id` policies apply to route misses** (issue
+  #6907 / PR #6938). Global `correlation_id` policies now apply to
+  unmatched-route `404`s on HTTP/1.1, HTTP/2, and HTTP/3, honoring
+  `inbound_policy` and `echo_downstream`, and unrouted access logs include the
+  canonical `request_id`. Gateways without a global correlation policy keep
+  the allocation-free bypass.
+- **BREAKING — native gRPC protocol-header refusals on HTTP/1.1 and HTTP/2 are
+  Trailers-Only** (issue/PR #6940). Native gRPC requests rejected by HTTP/1.1
+  or HTTP/2 protocol-header validation now receive HTTP 200 with Trailers-Only
+  `grpc-status: 3` (`INVALID_ARGUMENT`) and no JSON DATA, matching HTTP/3,
+  instead of an HTTP 400 JSON body.
+- **BREAKING — `adaptive_concurrency` intermediate retry samples exclude the
+  client-upload gate** (issue #6911 / PR #6941). Intermediate retry-attempt
+  latency samples now exclude the originating direct-HTTP/2 client-upload
+  gate, matching final-attempt samples, and later attempts cannot inherit that
+  subtraction.
 - **`waf` records the matched field names** (#6813). `waf.matched_fields` lists the
   `query:` / `header:` / `cookie:` / `response_header:` NAMES that rule hits
   came from (percent-encoded, at most 16 per scan, each cut at 128 bytes;
@@ -1043,6 +1138,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`mcp_gateway` keeps lost-owner cleanup ownership when a request is
+  cancelled** (issue #6885 / PR #6915). When a downstream MCP session
+  disappears during upstream initialization, the newly minted upstream
+  session's cleanup stays owned after the originating request is cancelled,
+  and the bounded best-effort upstream `DELETE` (up to 10 seconds) continues
+  independently.
+- **`ai_token_metrics` unmetered reasons after SSE usage invalidation are
+  documented** (issue #6892 / PR #6920). Invalidated SSE usage is labelled
+  with `{prefix}_unmetered_reason` `stream_without_usage` for live streams
+  (including client disconnects) or `no_usage` for collected SSE, and an
+  explicit usable zero clears the reason. Regression coverage now includes
+  split chunks, custom prefixes, client disconnects, and explicit-zero
+  controls.
+- **`ai_semantic_firewall` keeps final-request decisions through response
+  inspection** (issue #6894 / PR #6921). Final-request audit records were lost
+  at the buffered HTTP/1.1 and HTTP/2 hook-context handback. With several
+  instances, response-side sibling decisions now preserve final-body warnings,
+  and an instance's final verdict replaces its earlier one, so stale early
+  warnings are discarded when the final verdict allows the transformed body.
+- **`grpc_method_router` reload docs match centralized Redis behavior** (PR
+  #6923). Reloads do not reset centralized Redis counters: unchanged
+  caller/rule/window keys keep recent usage even when `max_requests` changes.
+  Local and Redis-fallback counters still keep state on compatible reloads and
+  start fresh after effective budget changes. To use a separate Redis budget
+  on purpose, coordinate a new `redis_key_prefix` across all replicas.
+  Quota-rejection metric coverage now uses isolated exact-count assertions.
+- **`ai_request_guard` caps a lone null Gemini/Vertex generation container**
+  (issue/PR #6924). With `default_max_tokens` configured, a lone
+  `generationConfig: null` or `generation_config: null` is replaced in place
+  with an object holding the default `maxOutputTokens` under the original
+  spelling, so the cap is no longer missing and the injection no longer
+  creates an ambiguity at final validation. Requests carrying both container
+  spellings are still rejected as ambiguous.
+- **`hmac_auth` replay pruning uses bounded temporary storage** (issue #6890 /
+  PR #6925). Shared process replay pruning holds at most 64 digests on the
+  stack at a time, including mass expirations; live-marker retention and
+  fail-closed capacity semantics are unchanged. `FEATURES.md` now lists the
+  existing RFC 9421 profile, `signed_headers`, and `max_body_bytes`.
+- **`ws_logging` idle codec reclamation no longer waits on long flush
+  intervals** (issue #6901 / PR #6928). After ceiling refusals newer than its
+  last successful retention check, `ws_logging` checks idle codec-buffer
+  retention every `min(flush_interval_ms, 1000)` ms, then allows up to
+  `write_timeout_ms` for a graceful close. A stale refusal can no longer close
+  a freshly retained connection. Partial-batch flush timing and the
+  100–600,000 ms configuration range are unchanged.
+- **`response_mock` matching views and size limits are documented** (issue/PR
+  #6933). `match.headers` reads pristine client field lines, while
+  `match.query_params` observes earlier query rewrites. Size limits apply
+  independently per rule and field and count UTF-8 bytes; the OpenAPI
+  `maxLength` is only a character-count guard. Matching is now covered through
+  the production raw-header/query APIs and transformer composition.
+- **`api_chargeback` overflow admission races and empty WebSocket sessions**
+  (issue #6891 / PR #6934). Each generation's complete fallback matrix is
+  reserved and created before publication, so charges are kept during
+  concurrent first use, reload staging, and eviction. Empty WebSocket sessions
+  no longer exhaust identity slots and retained bytes; nonzero bandwidth and
+  counted zero-byte calls and connections are unchanged. The docs state that
+  `/charges` uses a two-body-hand-off collection heuristic, not proof of peer
+  receipt, and cloned response extensions now count only once.
+- **`GET`/`HEAD` uploads reach unclassified HTTPS backends that negotiate
+  HTTP/1.1** (issue #6909 / PR #6939). `request_size_limiting` no longer loses
+  unknown-length `GET`/`HEAD` upload bodies when an unclassified HTTPS backend
+  negotiates HTTP/1.1: permitted payloads reach the backend intact, and
+  uploads over the route limit return `413`. Correct framing no longer depends
+  on completed backend capability warmup; until an unclassified HTTP/1.1
+  target's capability is recorded, these uploads need one extra TLS
+  classification connection.
+- **Mesh WebSocket policy Close frames survive H2 backend teardown** (issue #6912 / PR #6940).
+  The relay keeps the H2 backend transport for a bounded orderly teardown, so
+  cancellation no longer discards a queued policy Close (1009) DATA frame. A
+  non-cooperative backend adds at most a 100 ms transport drain.
 - **`api_chargeback_sink` delivery and admission hardening** (#6812). A replay
   cancelled mid-delivery (a reload retiring its generation aborts the replay
   worker) now releases its spool claim through the descriptor-bound release,
@@ -1971,6 +2137,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. EastWestGateway keeps the unscoped fail-closed fallback.
 
 ### Security
+
+- **BREAKING — `jwt_auth` shared-secret history covers every rotation key**
+  (issue #6902 / PR #6930). `jwt_auth` now remembers every rotation key in a
+  credential quarantined for sharing, seeds raw startup snapshots, and records
+  history atomically with accepted publication. Stale or rejected comparisons
+  no longer seed history, and candidates whose keys become tainted during
+  staging are rejected for retry.
 
 - **BREAKING — `waf` inspects gRPC bodies message by message** (issue n/a,
   PR #6813). A framed gRPC or

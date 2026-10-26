@@ -28,6 +28,147 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `response_caching` refuses underscore-spelled transport fields in `ignore_request_headers` (#6913, issue #6887)
+
+Remove `keep_alive`, `proxy_connection`, and `transfer_encoding` (in any ASCII
+case) from `response_caching.ignore_request_headers` before upgrading; these
+transport-owned names are now rejected at configuration admission. There is no
+supported replacement ignore entry for these reserved fields. Runtime header
+stripping and cache-key matching keep their documented exact field-name
+semantics.
+
+### `request_deduplication`: credential names reused through rename chains (#6914, issue #6884)
+
+With `caller_partition: authenticated_identity`, keep credential query
+destinations distinct from business parameters, and make sure each credential
+name occurs once in the final query if token rotation must replay. Repeated
+names now require byte-identical query values. Reused credential header names
+that carry business data also require identical business values. Retained
+operations whose corrected fingerprint differs return `409` for the rest of
+their protection window. No configuration migration is needed.
+
+### `a2a_gateway`: rewritten Agent Cards must be complete JSON (#6919)
+
+Origins serving rewritten Agent Cards must return a complete JSON
+representation rather than multipart byte ranges. No configuration migration
+is required; previously retained responses are invalidated by the new
+presentation-policy digest. Routes with `discovery.rewrite_agent_card_urls:
+false` keep their existing handling.
+
+### `ldap_auth` `member_of`: one 16-attempt proof budget per request (#6922, issue #6893)
+
+Directory failover and stale-cache fallback no longer reset the fixed
+16-attempt proof budget. Requests that previously relied on more than 16
+attempts in total now receive `500`. Resolve ambiguous required-group names
+(prefer a directory-unique `group_attribute`) and directory availability
+problems. No configuration field or schema changes.
+
+### `hmac_auth` RFC 9421: authority-form `@request-target` (#6925, issue #6890)
+
+RFC 9421 clients that cover an authority-form `@request-target` must sign the
+exact CONNECT `host:port` target, including original case and IPv6 brackets.
+For a pathless target, `@path` remains `/` and `@query` remains `?`. HBONE
+CONNECT remains incompatible with `hmac_auth` because its DATA is tunnel
+traffic. The replay-prune memory fix needs no configuration or backend
+migration.
+
+### `opa`: `decision_request_headers` and credential publishers need distinct names (#6926)
+
+Before upgrading, give `opa` `decision_request_headers` and credential
+publishers distinct backend-visible header names. Names are compared
+case-insensitively with `_` and `-` treated as equivalent. WAF
+`global_exemptions.header_present`, `openapi_validator`
+`bypass.header_present`, MCP session headers, and custom credential publishers
+now take part in admission alongside authentication plugins. Changing
+`fail_open` does not permit a conflict.
+
+### `request_transformer`: request digests and outbound `Content-Length` rewrites (#6927, issue #6898)
+
+Do not rely on outbound `Content-Length` rewrites to preserve
+`Content-Digest`, `Repr-Digest`, `Digest`, or `Content-MD5` behind
+`request_transformer` body rules. Only retained original client zero-length
+framing supplies that exemption. Routes whose backend requires a client
+request digest must avoid body rules that may rewrite the request. No
+configuration syntax changes; logs now reflect pre-body late non-JSON relabels
+while preserving actual body-hook outcomes across finalized-egress overlays.
+
+### `security_headers`: duplicate backend STS/nosniff spellings emit one field (#6929)
+
+With `override_existing: false`, duplicate backend `Strict-Transport-Security`
+and `X-Content-Type-Options` spellings now emit one lowercase field. When
+several backend copies are effective, the bytewise-first header-name spelling
+supplies the value; emit a single upstream field to choose a particular
+policy. `X-Frame-Options` combinations that jointly deny framing, and
+effective HSTS values containing quoted extensions, are preserved.
+Configuration fields and strict HSTS admission are unchanged.
+
+### `jwt_auth`: replace the whole rotation array of a quarantined credential (#6930, issue #6902)
+
+Replace the entire JWT rotation array with new, distinct secrets on every
+former holder of a quarantined credential. Reusing a previously unique
+secondary key from that removed array now stays quarantined in the running
+process. History is still bounded and process-local; restarts, CP full
+reloads, stripped DP snapshots, and eviction are not substitutes for rotation.
+Concurrently staged updates that meet newly tainted keys retry from the
+authoritative source.
+
+### Custom plugins: one lowercase entry per plugin-written request header (#6932, issue #6899)
+
+Update custom plugins to write one lowercase entry per request field. If
+several case variants remain, list and extension values now join
+deterministically, and known singletons prefer lowercase, otherwise the
+byte-wise smallest key; policies and CUSTOM providers judge that same
+forwarded value. See [plugin-written request header
+names](plugins.md#plugin-written-request-header-names) for the singleton
+inventory. Ordinary client wire-header repetition is unchanged.
+
+### `api_chargeback`: preallocated overflow rows and reload refusal (#6934, issue #6891)
+
+Size `max_retained_bytes` for at least twice the expanded overflow matrix,
+including global unknown-proxy fallback rows. Unused preallocations consume
+estimated bytes. Charged aggregate series stay pinned while a cache generation
+needs their rows and become eligible for ordinary collection/TTL eviction
+after those owners retire. A node keeps its entire live configuration when
+missing fallback rows cannot fit under a reload's budget; raise the budget, or
+collect or evict retired history, before retrying. A lower budget with every
+fallback row already present is still allowed and drains existing state
+without deleting it.
+
+Zero-byte WebSocket bandwidth disconnects create no retained billing row.
+Later payload activity remains attributable to the consumer, and zero-byte
+HTTP calls and stream connections still count normally. `/charges` body
+hand-offs do not prove collector ingestion; use `api_chargeback_sink` for
+durable billing.
+
+### Global `correlation_id` applies to unmatched routes (#6938, issue #6907)
+
+Existing global `correlation_id` configurations now apply to unmatched routes
+as well as matched traffic. Expect the configured echoed ID header on
+route-miss responses when `echo_downstream` is enabled, and the canonical
+`request_id` in global stdout access records even when echo is disabled. No
+configuration migration is required; proxy and proxy-group policies still
+apply only after route matching.
+
+### Native gRPC protocol-header refusals on HTTP/1.1 and HTTP/2 (#6940)
+
+Clients that interpret native-gRPC protocol-header validation failures on
+HTTP/1.1 or HTTP/2 must read `grpc-status: 3` and `grpc-message: Protocol
+header violation` from the HTTP 200 Trailers-Only response. Ordinary HTTP and
+WebSocket handshake refusals still use HTTP 400. No configuration changes are
+required.
+
+Mesh WebSocket peers now receive queued policy Close frames during orderly
+backend teardown. No configuration change is required; a non-cooperative
+backend adds at most a bounded 100 ms transport drain.
+
+### `adaptive_concurrency`: intermediate retry samples follow backend-only timing (#6941, issue #6911)
+
+Intermediate `adaptive_concurrency` retry samples now follow the existing
+backend-only timing contract: the originating direct-HTTP/2 client-upload gate
+is excluded, and a new retry timer ignores an earlier attempt's gate. No
+configuration changes are required; final-attempt timing and failure backoff
+keep their prior behavior.
+
 ### `waf` governs bodies on every method and inspects gRPC per message (PR #6813)
 
 - Request bodies are no longer gated by `body_methods`: a request on any
