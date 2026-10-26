@@ -1547,15 +1547,23 @@ pub(super) async fn assert_h3_directional_size_limits(
     backend: &mut TerminateBackend,
 ) {
     let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{port}{path}");
     for from_client in [true, false] {
         for kind in ["frame", "message"] {
-            let ws = client
-                .websocket(
-                    &format!("https://localhost:{port}{path}"),
-                    WebSocketOptions::default(),
-                )
-                .await
-                .expect("H3 directional session");
+            // Retry only transport-open failures. Response status and size-policy
+            // observations from an established session must be asserted once.
+            let deadline = Instant::now() + Duration::from_secs(25);
+            let ws = loop {
+                match client.websocket(&url, WebSocketOptions::default()).await {
+                    Ok(ws) => break ws,
+                    Err(error) => {
+                        if Instant::now() >= deadline {
+                            panic!("H3 directional session never opened: {error}");
+                        }
+                        sleep(Duration::from_millis(150)).await;
+                    }
+                }
+            };
             assert_eq!(ws.status, http::StatusCode::OK);
             exercise_size_limits(WsLeg::H3(Box::new(ws)), backend, false, from_client, kind).await;
         }
