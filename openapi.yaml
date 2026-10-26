@@ -30347,8 +30347,9 @@ components:
             content-encoding, content-range), and credential-bearing names
             (the built-in redact_headers list and the shared sensitive-name
             classifier). Effective-chain admission also refuses a destination
-            an authentication plugin on the same chain owns as a credential
-            location (ASCII case and `_`/`-` folded), and a request whose
+            any plugin on the same chain and an overlapping protocol publishes
+            as a credential location (ASCII case and `_`/`-` folded), including
+            WAF exemption, OpenAPI bypass, and MCP session headers. A request whose
             route's active credential headers include a destination is refused
             fail closed before the decision call, even under fail_open. Empty
             disables allow obligations.

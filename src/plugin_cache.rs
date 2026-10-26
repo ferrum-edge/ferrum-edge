@@ -218,6 +218,7 @@ struct FinalizedRequestPolicyCompositionPlugin {
     name: &'static str,
     priority: u16,
     protocols: &'static [ProxyProtocol],
+    request_headers_to_redact: Vec<String>,
 }
 
 #[async_trait]
@@ -236,6 +237,10 @@ impl Plugin for FinalizedRequestPolicyCompositionPlugin {
 
     fn enforces_finalized_request_policy(&self) -> bool {
         true
+    }
+
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.request_headers_to_redact
     }
 }
 
@@ -760,12 +765,12 @@ fn builtin_opa<'a>(plugin: &'a (dyn Plugin + 'static)) -> Option<&'a crate::plug
 }
 
 /// An `opa` allow obligation (`decision_request_headers`) must never author a
-/// header an authentication plugin on the same effective chain owns as a
+/// header any plugin on the same effective chain publishes as a
 /// credential location: the policy would replace the client's credential on
 /// the upstream request, or the owner's `hide_credentials` strip would silently
 /// drop the obligation after OPA recorded an allow. Names are compared as
-/// backends read them (ASCII case, `_` and `-` equivalent). Credential names a
-/// non-authentication plugin publishes are refused per request by OPA itself.
+/// backends read them (ASCII case, `_` and `-` equivalent). OPA repeats this
+/// refusal per request as a fail-closed backstop.
 fn validate_opa_obligations_against_credential_owners(
     plugins: &[Arc<dyn Plugin>],
 ) -> Result<(), String> {
@@ -778,11 +783,10 @@ fn validate_opa_obligations_against_credential_owners(
             continue;
         }
         for owner in plugins.iter().filter(|owner| {
-            owner.is_auth_plugin()
-                && owner
-                    .supported_protocols()
-                    .iter()
-                    .any(|protocol| plugin.supported_protocols().contains(protocol))
+            owner
+                .supported_protocols()
+                .iter()
+                .any(|protocol| plugin.supported_protocols().contains(protocol))
         }) {
             if let Some(credential) = owner.request_headers_to_redact().iter().find(|credential| {
                 destinations.iter().any(|destination| {
@@ -794,7 +798,7 @@ fn validate_opa_obligations_against_credential_owners(
             }) {
                 return Err(format!(
                     "opa `decision_request_headers` cannot name {credential:?}, which \
-                     authentication plugin {:?} on the same effective plugin chain owns as a \
+                     plugin {:?} on the same effective plugin chain publishes as a \
                      credential location; a policy decision must never author or replace a \
                      credential",
                     owner.name()
@@ -5297,13 +5301,31 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         } else if let Some(spec) =
             finalized_request_policy_composition_spec(plugin_config.plugin_name.as_str())
         {
-            Ok(Some(Arc::new(FinalizedRequestPolicyCompositionPlugin {
-                name: spec.name,
-                priority: plugin_config
-                    .priority_override
-                    .unwrap_or(spec.default_priority),
-                protocols: spec.protocols,
-            }) as Arc<dyn Plugin>))
+            // Preserve credential publishers in the cheap view too: WAF and
+            // OpenAPI bypass headers contain reusable secrets even though
+            // neither plugin participates in authentication. Reuse their
+            // parsers without compiling rule packs or operation schemas.
+            let credential_headers = match spec.name {
+                "waf" => crate::plugins::waf::Waf::credential_headers_for_composition(
+                    &plugin_config.config,
+                ),
+                "openapi_validator" => {
+                    crate::plugins::openapi_validator::OpenapiValidator::credential_headers_for_composition(
+                        &plugin_config.config,
+                    )
+                }
+                _ => Ok(Vec::new()),
+            };
+            credential_headers.map(|request_headers_to_redact| {
+                Some(Arc::new(FinalizedRequestPolicyCompositionPlugin {
+                    name: spec.name,
+                    priority: plugin_config
+                        .priority_override
+                        .unwrap_or(spec.default_priority),
+                    protocols: spec.protocols,
+                    request_headers_to_redact,
+                }) as Arc<dyn Plugin>)
+            })
         } else {
             try_create_plugin(
                 plugin_config,

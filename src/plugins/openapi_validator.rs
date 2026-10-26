@@ -783,6 +783,21 @@ pub struct OpenapiValidator {
 }
 
 impl OpenapiValidator {
+    /// Credential header metadata for candidate admission without compiling
+    /// operation schemas. Use the runtime bypass parser to keep names aligned.
+    pub(crate) fn credential_headers_for_composition(
+        config: &Value,
+    ) -> Result<Vec<String>, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| "openapi_validator: config must be an object".to_string())?;
+        let bypass = optional_object(object, "bypass")?;
+        let headers = parse_header_present(bypass.and_then(|b| b.get("header_present")))?;
+        let mut names: Vec<String> = headers.into_keys().collect();
+        names.sort_unstable();
+        Ok(names)
+    }
+
     pub fn new(config: &Value) -> Result<Self, String> {
         let object = config
             .as_object()

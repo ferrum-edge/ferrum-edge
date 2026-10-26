@@ -391,6 +391,18 @@ impl Waf {
         Self::new_with_config_id(config, None)
     }
 
+    /// Credential header metadata for candidate admission without compiling
+    /// WAF rule packs. Use the runtime exemption parser to keep names aligned.
+    pub(crate) fn credential_headers_for_composition(
+        config: &Value,
+    ) -> Result<Vec<String>, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| "waf: config must be an object".to_string())?;
+        CompiledExemptions::from_config(object.get("global_exemptions"))
+            .map(|exemptions| exemptions.header_present_names())
+    }
+
     /// Construct a WAF instance with an optional stable plugin-config resource id.
     ///
     /// Production `PluginCache` passes `Some(&pc.id)` so request-private anomaly

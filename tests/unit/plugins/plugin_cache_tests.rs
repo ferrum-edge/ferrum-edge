@@ -5285,21 +5285,12 @@ fn streaming_ai_federation_deduplication_gate_fires_in_candidate_and_runtime() {
 
 /// `opa` allow obligations (`decision_request_headers`) make it a request-header
 /// mutator. An untriggered instance must therefore be constructed in candidate
-/// admission, so a late OPA mutator ordered after `response_caching` is refused
+/// admission, so a late OPA mutator ordered at or after a replay gate is refused
 /// before an admin write is stored, exactly as runtime cache construction
 /// refuses it (PR #6860 review). Without obligations, or at OPA's default
 /// priority, both boundaries admit the composition.
 #[test]
-fn opa_obligation_header_mutation_gates_response_caching_in_candidate_and_runtime() {
-    let cache = || {
-        make_plugin_config(
-            "cache",
-            "response_caching",
-            PluginScope::Proxy,
-            Some("p1"),
-            true,
-        )
-    };
+fn opa_obligation_header_mutation_gates_replay_in_candidate_and_runtime() {
     let opa = |obligations: bool, priority_override: Option<u16>| {
         let mut config = json!({
             "opa_host": "http://127.0.0.1:8181",
@@ -5313,36 +5304,54 @@ fn opa_obligation_header_mutation_gates_response_caching_in_candidate_and_runtim
         plugin.priority_override = priority_override;
         plugin
     };
-    let config_with = |opa_config: PluginConfig| {
-        make_config(
-            vec![make_proxy("p1", "/api", vec!["cache", "opa"])],
-            vec![cache(), opa_config],
-        )
-    };
-
-    let late_mutator = config_with(opa(true, Some(4000)));
-    let candidate_error =
-        validate_plugin_composition_candidate_with_real_ip_header_for_test(&late_mutator, None)
-            .expect_err("candidate must reject a late OPA header mutator after response_caching");
-    assert!(
-        candidate_error.contains("must run before every response_caching"),
-        "{candidate_error}"
-    );
-    let runtime_error = PluginCache::new(&late_mutator)
-        .err()
-        .expect("runtime cache must repeat the fail-closed ordering refusal");
-    assert!(
-        runtime_error.contains("must run before every response_caching"),
-        "{runtime_error}"
-    );
-
-    for admitted in [
-        config_with(opa(false, Some(4000))),
-        config_with(opa(true, None)),
+    for (replay_name, replay_priority) in [
+        (
+            "response_caching",
+            ferrum_edge::plugins::priority::RESPONSE_CACHING,
+        ),
+        (
+            "request_deduplication",
+            ferrum_edge::plugins::priority::REQUEST_DEDUPLICATION,
+        ),
     ] {
-        validate_plugin_composition_candidate_with_real_ip_header_for_test(&admitted, None)
-            .expect("candidate must admit OPA without a late header mutation");
-        PluginCache::new(&admitted).expect("runtime must admit OPA without a late header mutation");
+        let config_with = |opa_config: PluginConfig| {
+            make_config(
+                vec![make_proxy("p1", "/api", vec!["replay", "opa"])],
+                vec![
+                    make_plugin_config("replay", replay_name, PluginScope::Proxy, Some("p1"), true),
+                    opa_config,
+                ],
+            )
+        };
+        let expected_error = format!("every {replay_name} instance");
+        for priority in [replay_priority, 4000] {
+            let late_mutator = config_with(opa(true, Some(priority)));
+            let candidate_error =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                    &late_mutator,
+                    None,
+                )
+                .expect_err("candidate must reject OPA header mutation at or after replay");
+            assert!(
+                candidate_error.contains(&expected_error),
+                "{candidate_error}"
+            );
+            let runtime_error = PluginCache::new(&late_mutator)
+                .err()
+                .expect("runtime cache must repeat the fail-closed ordering refusal");
+            assert!(runtime_error.contains(&expected_error), "{runtime_error}");
+        }
+
+        for admitted in [
+            config_with(opa(false, Some(4000))),
+            config_with(opa(true, None)),
+            config_with(opa(true, Some(replay_priority - 1))),
+        ] {
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&admitted, None)
+                .expect("candidate must admit OPA without a late header mutation");
+            PluginCache::new(&admitted)
+                .expect("runtime must admit OPA without a late header mutation");
+        }
     }
 }
 
@@ -5352,14 +5361,15 @@ fn opa_obligation_header_mutation_gates_response_caching_in_candidate_and_runtim
 /// equivalent spelling (ASCII case, `_` or `-`) names it (PR #6860 review).
 #[test]
 fn opa_obligation_destination_cannot_be_an_active_credential_location() {
-    let key_auth = |hide_credentials: bool| {
-        make_plugin_config_with_json(
-            "keyauth",
-            "key_auth",
-            json!({"key_location": "header:X-Account", "hide_credentials": hide_credentials}),
-            PluginScope::Proxy,
-            Some("p1"),
-        )
+    let owner = |owner_name: &str, hide_credentials: bool| {
+        let mut config = json!({"hide_credentials": hide_credentials});
+        let location_key = match owner_name {
+            "key_auth" => "key_location",
+            "jwt_auth" => "token_lookup",
+            _ => panic!("unexpected credential owner {owner_name}"),
+        };
+        config[location_key] = json!("header:X-Account");
+        make_plugin_config_with_json("owner", owner_name, config, PluginScope::Proxy, Some("p1"))
     };
     let opa = |destination: &str| {
         make_plugin_config_with_json(
@@ -5374,37 +5384,181 @@ fn opa_obligation_destination_cannot_be_an_active_credential_location() {
             Some("p1"),
         )
     };
-    let config_with = |hide_credentials: bool, destination: &str| {
+    let config_with = |owner_name: &str, hide_credentials: bool, destination: &str| {
         make_config(
-            vec![make_proxy("p1", "/api", vec!["keyauth", "opa"])],
-            vec![key_auth(hide_credentials), opa(destination)],
+            vec![make_proxy("p1", "/api", vec!["owner", "opa"])],
+            vec![owner(owner_name, hide_credentials), opa(destination)],
         )
     };
 
-    for hide_credentials in [true, false] {
+    for (owner_name, hide_credentials) in [
+        ("key_auth", true),
+        ("key_auth", false),
+        ("jwt_auth", true),
+        ("jwt_auth", false),
+    ] {
         for destination in ["x-account", "X-Account", "x_account"] {
-            let config = config_with(hide_credentials, destination);
+            let config = config_with(owner_name, hide_credentials, destination);
             let candidate_error =
                 validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
                     .expect_err("candidate must refuse a credential-owned obligation destination");
             assert!(
-                candidate_error.contains("decision_request_headers"),
-                "{destination} hide={hide_credentials}: {candidate_error}"
+                candidate_error.contains("decision_request_headers")
+                    && candidate_error.contains(owner_name),
+                "{owner_name} {destination} hide={hide_credentials}: {candidate_error}"
             );
             let runtime_error = PluginCache::new(&config)
                 .err()
                 .expect("runtime cache must repeat the refusal");
             assert!(
-                runtime_error.contains("decision_request_headers"),
-                "{destination} hide={hide_credentials}: {runtime_error}"
+                runtime_error.contains("decision_request_headers")
+                    && runtime_error.contains(owner_name),
+                "{owner_name} {destination} hide={hide_credentials}: {runtime_error}"
             );
         }
 
-        let unrelated = config_with(hide_credentials, "x-tenant");
+        let unrelated = config_with(owner_name, hide_credentials, "x-tenant");
         validate_plugin_composition_candidate_with_real_ip_header_for_test(&unrelated, None)
-            .expect("an unrelated obligation destination composes with key_auth");
+            .expect("an unrelated obligation destination composes with the credential owner");
         PluginCache::new(&unrelated)
-            .expect("an unrelated obligation destination composes with key_auth at runtime");
+            .expect("an unrelated obligation destination composes with the credential owner");
+    }
+}
+
+/// WAF/OpenAPI bypass secrets and MCP session IDs are credential publishers
+/// without being authentication plugins. Candidate views and runtime cache
+/// construction must reject their conflicts before publishing a generation.
+#[test]
+fn opa_obligation_destination_cannot_be_a_non_auth_credential_location() {
+    for owner_name in ["waf", "openapi_validator", "mcp_gateway"] {
+        let mut owner_config = minimal_plugin_config(owner_name);
+        match owner_name {
+            "waf" => {
+                owner_config["global_exemptions"] = json!({
+                    "header_present": {"X-Account": "trusted-hop-shared-secret"}
+                });
+            }
+            "openapi_validator" => {
+                owner_config["bypass"] = json!({
+                    "header_present": {"X-Account": "trusted-hop-shared-secret"}
+                });
+            }
+            "mcp_gateway" => {
+                owner_config["sessions"] = json!({"downstream_session_header": "X-Account"});
+            }
+            _ => unreachable!("all credential publishers are listed above"),
+        }
+        let config_with = |destination: &str, owner_enabled: bool| {
+            let mut owner = make_plugin_config_with_json(
+                "owner",
+                owner_name,
+                owner_config.clone(),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            owner.enabled = owner_enabled;
+            // Exercise built-in OPA detection through the priority wrapper.
+            let mut opa = make_plugin_config_with_json(
+                "opa",
+                "opa",
+                json!({
+                    "opa_host": "http://127.0.0.1:8181",
+                    "policy_path": "ferrum/authz/allow",
+                    "decision_request_headers": [destination],
+                    "fail_open": true
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            opa.priority_override = Some(ferrum_edge::plugins::priority::OPA + 1);
+            make_config(
+                vec![make_proxy("p1", "/api", vec!["owner", "opa"])],
+                vec![owner, opa],
+            )
+        };
+
+        for destination in ["x-account", "X-Account", "x_account"] {
+            let config = config_with(destination, true);
+            let candidate_error =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                    .expect_err("candidate must refuse non-authentication credential conflicts");
+            let runtime_error = PluginCache::new(&config)
+                .err()
+                .expect("runtime construction must repeat the credential conflict refusal");
+            for error in [candidate_error, runtime_error] {
+                assert!(
+                    error.contains("decision_request_headers") && error.contains(owner_name),
+                    "{owner_name} {destination}: {error}"
+                );
+                assert!(!error.contains("trusted-hop-shared-secret"));
+            }
+        }
+
+        for admitted in [
+            config_with("x-tenant", true),
+            config_with("x-account", false),
+        ] {
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&admitted, None)
+                .expect("unrelated destinations and disabled owners must be admitted");
+            PluginCache::new(&admitted)
+                .expect("runtime must admit unrelated destinations and disabled owners");
+        }
+    }
+}
+
+#[test]
+fn opa_obligations_check_custom_credential_publishers_on_overlapping_protocols() {
+    struct CredentialPublisher {
+        headers: Vec<String>,
+        protocols: &'static [ProxyProtocol],
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for CredentialPublisher {
+        fn name(&self) -> &str {
+            "custom_credential_publisher"
+        }
+
+        fn request_headers_to_redact(&self) -> &[String] {
+            &self.headers
+        }
+
+        fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+            self.protocols
+        }
+    }
+
+    let opa: Arc<dyn Plugin> = Arc::new(
+        ferrum_edge::plugins::opa::Opa::new(
+            &json!({
+                "opa_host": "http://127.0.0.1:8181",
+                "policy_path": "ferrum/authz/allow",
+                "decision_request_headers": ["x-account"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("valid OPA config"),
+    );
+    for (protocols, conflicts) in [
+        (ferrum_edge::plugins::HTTP_ONLY_PROTOCOLS, true),
+        (ferrum_edge::plugins::TCP_ONLY_PROTOCOLS, false),
+    ] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::clone(&opa),
+            Arc::new(CredentialPublisher {
+                headers: vec!["X_Account".to_string()],
+                protocols,
+            }),
+        ];
+        let result =
+            ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins);
+        if conflicts {
+            let error = result.expect_err("custom credential conflicts must fail admission");
+            assert!(error.contains("custom_credential_publisher"), "{error}");
+            assert!(error.contains("decision_request_headers"), "{error}");
+        } else {
+            result.expect("a stream-only credential publisher cannot conflict with OPA");
+        }
     }
 }
 
