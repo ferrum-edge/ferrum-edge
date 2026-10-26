@@ -8762,6 +8762,20 @@ impl PendingUpstreamCleanup {
         )
         .await;
     }
+
+    /// Own the DELETE independently of the request, including while its caller
+    /// awaits completion. Dropping the returned handle detaches the task.
+    fn spawn(self, accumulator: Arc<AtomicU64>) -> Option<tokio::task::JoinHandle<()>> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        Some(runtime.spawn(async move {
+            if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, self.run(&accumulator))
+                .await
+                .is_err()
+            {
+                warn_sampled!("MCP upstream session cleanup after a failed initialize timed out");
+            }
+        }))
+    }
 }
 
 /// Cleanup ownership of an upstream session minted by an in-flight
@@ -8793,11 +8807,14 @@ impl PendingUpstreamSession {
         self.cleanup = None;
     }
 
-    /// Delete the minted upstream session on the current request (its owner is
-    /// already gone), charging the call to `accumulator`.
-    async fn clean_up_now(&mut self, accumulator: &AtomicU64) {
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup.run(accumulator).await;
+    /// Await independently owned cleanup (the downstream owner is already
+    /// gone), charging the call to `accumulator` even if this request is cancelled.
+    async fn clean_up_now(&mut self, accumulator: &Arc<AtomicU64>) {
+        if let Some(cleanup) = self.cleanup.take()
+            && let Some(task) = cleanup.spawn(Arc::clone(accumulator))
+            && let Err(error) = task.await
+        {
+            warn_sampled!(error = %error, "MCP upstream session cleanup task failed");
         }
     }
 }
@@ -8807,18 +8824,7 @@ impl Drop for PendingUpstreamSession {
         let Some(cleanup) = self.cleanup.take() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        runtime.spawn(async move {
-            let accumulator = AtomicU64::new(0);
-            if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, cleanup.run(&accumulator))
-                .await
-                .is_err()
-            {
-                warn_sampled!("MCP upstream session cleanup after a failed initialize timed out");
-            }
-        });
+        let _ = cleanup.spawn(Arc::new(AtomicU64::new(0)));
     }
 }
 
