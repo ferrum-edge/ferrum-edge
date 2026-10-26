@@ -951,8 +951,8 @@ fn bridge_call_body(id: i64, name: &str, arguments: Value) -> Value {
 #[ignore]
 #[test]
 fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite_on_h1_h2_h3_inner,
     );
 }
 
@@ -983,8 +983,8 @@ async fn functional_mcp_gateway_admission_refuses_a_later_session_header_rewrite
 #[ignore]
 #[test]
 fn functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_mcp_gateway_admission_reasserts_session_over_a_function_overlay_inner,
     );
 }
 
@@ -1020,8 +1020,9 @@ async fn functional_mcp_gateway_admission_reasserts_session_over_a_function_over
 #[ignore]
 #[test]
 fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3_inner,
+    );
 }
 
 async fn functional_mcp_gateway_openapi_bridge_call_on_h1_h2_h3_inner() {

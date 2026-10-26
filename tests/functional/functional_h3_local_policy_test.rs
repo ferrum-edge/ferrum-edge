@@ -31,8 +31,8 @@ use tokio::time::sleep;
 #[ignore]
 #[test]
 fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission_and_retry() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_h3_local_policy_pending_cap_rejects_before_backend_admission_and_retry_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_pending_cap_rejects_before_backend_admission_and_retry_inner,
     );
 }
 
@@ -115,8 +115,8 @@ async fn functional_h3_local_policy_pending_cap_rejects_before_backend_admission
 #[ignore]
 #[test]
 fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buffered_inner,
     );
 }
 
@@ -162,8 +162,8 @@ async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_buff
 #[ignore]
 #[test]
 fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_streaming_inner,
     );
 }
 
@@ -206,8 +206,8 @@ async fn functional_h3_local_policy_backend_tls_sni_unpinnable_fails_closed_stre
 #[ignore]
 #[test]
 fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_dispatches_inner,
     );
 }
 
@@ -249,8 +249,9 @@ async fn functional_h3_local_policy_backend_tls_sni_on_plaintext_backend_still_d
 #[ignore]
 #[test]
 fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc_inner,
+    );
 }
 
 async fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc_inner() {
@@ -312,8 +313,9 @@ async fn functional_h3_route_request_timeout_serves_plain_http_and_keeps_alt_svc
 #[ignore]
 #[test]
 fn functional_h3_route_request_timeout_answers_504_before_the_response_head() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_request_timeout_answers_504_before_the_response_head_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_answers_504_before_the_response_head_inner,
+    );
 }
 
 async fn functional_h3_route_request_timeout_answers_504_before_the_response_head_inner() {
@@ -377,8 +379,9 @@ async fn functional_h3_route_request_timeout_answers_504_before_the_response_hea
 #[ignore]
 #[test]
 fn functional_h3_route_request_timeout_resets_a_committed_body() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_request_timeout_resets_a_committed_body_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_resets_a_committed_body_inner,
+    );
 }
 
 async fn functional_h3_route_request_timeout_resets_a_committed_body_inner() {
@@ -430,8 +433,9 @@ async fn functional_h3_route_request_timeout_resets_a_committed_body_inner() {
 #[ignore]
 #[test]
 fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_request_timeout_cuts_a_client_that_stops_reading_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_cuts_a_client_that_stops_reading_inner,
+    );
 }
 
 async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading_inner() {
@@ -511,8 +515,9 @@ async fn functional_h3_route_request_timeout_cuts_a_client_that_stops_reading_in
 #[ignore]
 #[test]
 fn functional_h3_route_attempt_budget_retries_and_replays_the_body() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_attempt_budget_retries_and_replays_the_body_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_retries_and_replays_the_body_inner,
+    );
 }
 
 async fn functional_h3_route_attempt_budget_retries_and_replays_the_body_inner() {
@@ -565,8 +570,9 @@ async fn functional_h3_route_attempt_budget_retries_and_replays_the_body_inner()
 #[ignore]
 #[test]
 fn functional_h3_route_attempt_budget_bounds_every_attempt() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_attempt_budget_bounds_every_attempt_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_bounds_every_attempt_inner,
+    );
 }
 
 async fn functional_h3_route_attempt_budget_bounds_every_attempt_inner() {
@@ -627,8 +633,9 @@ async fn functional_h3_route_attempt_budget_bounds_every_attempt_inner() {
 #[ignore]
 #[test]
 fn functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry_inner,
+    );
 }
 
 async fn functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry_inner() {
@@ -688,8 +695,9 @@ async fn functional_h3_grpc_web_route_attempt_budget_is_fresh_for_each_retry_inn
 #[ignore]
 #[test]
 fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_inner,
+    );
 }
 
 async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_inner() {
@@ -856,8 +864,9 @@ async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from
 #[ignore]
 #[test]
 fn functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy_inner,
+    );
 }
 
 async fn functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy_inner() {
@@ -908,8 +917,9 @@ async fn functional_h3_route_attempt_budget_stalled_body_keeps_the_retry_policy_
 #[ignore]
 #[test]
 fn functional_h3_route_request_timeout_during_buffered_body_is_not_retried() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_request_timeout_during_buffered_body_is_not_retried_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_request_timeout_during_buffered_body_is_not_retried_inner,
+    );
 }
 
 async fn functional_h3_route_request_timeout_during_buffered_body_is_not_retried_inner() {
@@ -951,8 +961,9 @@ async fn functional_h3_route_request_timeout_during_buffered_body_is_not_retried
 #[ignore]
 #[test]
 fn functional_h3_route_attempt_budget_cuts_a_committed_streamed_body() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_route_attempt_budget_cuts_a_committed_streamed_body_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_route_attempt_budget_cuts_a_committed_streamed_body_inner,
+    );
 }
 
 async fn functional_h3_route_attempt_budget_cuts_a_committed_streamed_body_inner() {
@@ -1000,8 +1011,8 @@ async fn functional_h3_route_attempt_budget_cuts_a_committed_streamed_body_inner
 #[ignore]
 #[test]
 fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_exceeded() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_exceeded_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_exceeded_inner,
     );
 }
 
@@ -1112,8 +1123,9 @@ async fn functional_h3_grpc_web_attempt_budget_expiry_answers_backend_deadline_e
 #[ignore]
 #[test]
 fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp_inner,
+    );
 }
 
 async fn functional_grpc_web_attempt_budget_expiry_keeps_backend_wording_over_tcp_inner() {
@@ -1248,8 +1260,9 @@ async fn assert_tcp_grpc_web_attempt_budget_expiry_wording(http2: bool) {
 #[ignore]
 #[test]
 fn functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp_inner,
+    );
 }
 
 async fn functional_grpc_web_gateway_error_terminals_carry_cors_over_tcp_inner() {
@@ -1318,8 +1331,9 @@ async fn assert_tcp_grpc_web_gateway_deadline_carries_cors(http2: bool) {
 #[ignore]
 #[test]
 fn functional_h3_grpc_web_backend_unavailable_carries_cors() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_grpc_web_backend_unavailable_carries_cors_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_backend_unavailable_carries_cors_inner,
+    );
 }
 
 async fn functional_h3_grpc_web_backend_unavailable_carries_cors_inner() {
@@ -1383,8 +1397,9 @@ async fn functional_h3_grpc_web_backend_unavailable_carries_cors_inner() {
 #[ignore]
 #[test]
 fn functional_h3_grpc_web_too_large_response_carries_cors() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_grpc_web_too_large_response_carries_cors_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_too_large_response_carries_cors_inner,
+    );
 }
 
 async fn functional_h3_grpc_web_too_large_response_carries_cors_inner() {
@@ -1588,8 +1603,8 @@ fn assert_grpc_web_terminal_carries_cors(protocol: &str, terminal: &TcpGrpcWebTe
 #[ignore]
 #[test]
 fn functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_deadline_after_a_stalled_body_write_resets_only_its_stream_inner,
     );
 }
 
@@ -1682,8 +1697,9 @@ async fn assert_grpc_web_deadline_after_a_stalled_body_write(buffered: bool) {
 #[ignore]
 #[test]
 fn functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout_inner,
+    );
 }
 
 async fn functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout_inner() {
@@ -1748,8 +1764,9 @@ async fn functional_h3_grpc_web_forwards_the_remaining_budget_as_grpc_timeout_in
 #[ignore]
 #[test]
 fn functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout_inner,
+    );
 }
 
 async fn functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout_inner() {

@@ -469,9 +469,8 @@ async fn functional_h3_connect_udp_is_not_governed_by_backend_circuit_breaker_st
 #[ignore]
 #[test]
 fn functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream_inner(
-        ),
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_h3_connect_udp_refuses_a_transport_constrained_target_in_a_mixed_upstream_inner,
     );
 }
 

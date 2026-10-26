@@ -1301,8 +1301,9 @@ async fn next_record_h2(
 #[test]
 #[ignore]
 fn functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests_inner,
+    );
 }
 
 async fn functional_mcp_aggregate_sse_h3_multiplexes_concurrent_requests_inner() {

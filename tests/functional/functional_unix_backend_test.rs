@@ -217,8 +217,9 @@ async fn spawn_unix_gateway(config: String, root: &Path) -> TrustedProjectedGate
 #[test]
 #[ignore]
 fn unix_socket_backend_serves_requests_over_a_real_socket() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(unix_socket_backend_serves_requests_over_a_real_socket_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_socket_backend_serves_requests_over_a_real_socket_inner,
+    );
 }
 
 async fn unix_socket_backend_serves_requests_over_a_real_socket_inner() {
@@ -271,8 +272,9 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket_inner() {
 #[test]
 #[ignore]
 fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(unix_socket_backend_fails_closed_when_the_socket_is_absent_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_socket_backend_fails_closed_when_the_socket_is_absent_inner,
+    );
 }
 
 async fn unix_socket_backend_fails_closed_when_the_socket_is_absent_inner() {
@@ -319,8 +321,9 @@ async fn unix_socket_backend_fails_closed_when_the_socket_is_absent_inner() {
 #[test]
 #[ignore]
 fn unix_socket_backend_survives_reload_update_and_delete() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(unix_socket_backend_survives_reload_update_and_delete_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_socket_backend_survives_reload_update_and_delete_inner,
+    );
 }
 
 #[cfg(unix)]
@@ -453,8 +456,9 @@ plugin_configs: []
 #[test]
 #[ignore]
 fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted_inner,
+    );
 }
 
 async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted_inner() {
@@ -464,8 +468,8 @@ async fn unix_h2c_grpc_buffer_capacity_refusal_is_resource_exhausted_inner() {
 #[test]
 #[ignore]
 fn unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted() {
-    crate::common::in_process_gateway_runtime(1).block_on(
-        unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted_inner(),
+    crate::common::run_in_process_gateway_current_thread_test(
+        unix_h2c_translated_grpc_web_buffer_capacity_refusal_is_resource_exhausted_inner,
     );
 }
 

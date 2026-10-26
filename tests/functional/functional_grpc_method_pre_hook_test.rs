@@ -33,8 +33,9 @@ const TEST_JWT_ISSUER: &str = "ferrum-edge-grpc-pre-hook-test";
 #[ignore]
 #[test]
 fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3() {
-    crate::common::in_process_gateway_runtime(1)
-        .block_on(functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3_inner());
+    crate::common::run_in_process_gateway_current_thread_test(
+        functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3_inner,
+    );
 }
 
 async fn functional_grpc_method_rate_limit_precedes_external_hook_on_h2_and_h3_inner() {
