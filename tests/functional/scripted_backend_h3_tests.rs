@@ -869,6 +869,79 @@ async fn spawn_h3_harness_with_explicit_https_port_config_and_env(
     );
 }
 
+/// Exercise the card refusal with native H3 on both sides of the gateway.
+/// The TCP responder supplies only an ordinary complete body, and the recorded
+/// H3 request proves this assertion did not run through a fallback backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn multipart_partial_agent_card_is_refused_on_native_h3() {
+    use super::functional_a2a_gateway_http_card_test::{
+        CARD_PATH, MULTIPART_TYPE, assert_partial_card_refused, card_gateway_config,
+        multipart_card_body,
+    };
+
+    let ca = TestCa::new("a2a-multipart-h3").expect("backend CA");
+    let (cert, key) = ca.valid().expect("backend certificate");
+    let (tcp, udp) = reserve_colocated_tcp_udp().await.expect("backend ports");
+    let backend_port = tcp.port;
+    let _tcp_backend = spawn_h2_bridge_backend(tcp.into_listener(), &cert, &key, b"fallback");
+    let body = multipart_card_body();
+    // Leave the connection waiting for the next request after each completed
+    // response, so QUIC connection teardown cannot race the client's body read.
+    let steps = (0..8).flat_map(|_| {
+        vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "206".to_string()),
+                ("content-type", MULTIPART_TYPE.to_string()),
+                ("content-length", body.len().to_string()),
+                ("etag", "\"card-v1\"".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::RespondTrailers(vec![]),
+        ]
+    });
+    let backend = ScriptedH3Backend::builder(udp.into_socket(), H3TlsConfig::new(cert, key))
+        .steps(steps)
+        .spawn()
+        .expect("native H3 backend");
+    let mut config = card_gateway_config(backend_port, true);
+    config["proxies"][0]["backend_scheme"] = json!("https");
+    config["proxies"][0]["backend_tls_verify_server_cert"] = json!(false);
+    config["proxies"][0]["pool_enable_http2"] = json!(true);
+    let (gateway, _, https_port) = spawn_h3_harness_with_explicit_https_port_config_and_env(
+        serde_yaml::to_string(&config).expect("config YAML"),
+        true,
+        None,
+        &[],
+    )
+    .await;
+    let entry = wait_for_h3_class(&gateway, "supported", Duration::from_secs(15))
+        .await
+        .expect("capability registry")
+        .expect("native H3 supported");
+    assert_eq!(entry["plain_http"]["h3"], "supported");
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let response = client
+        .get_with_options(
+            &format!("https://127.0.0.1:{https_port}{CARD_PATH}"),
+            GetOptions::default().header("range", "bytes=0-17,19-"),
+        )
+        .await
+        .expect("H3 card response");
+    assert!(response.body_error.is_none(), "{:?}", response.body_error);
+    assert_partial_card_refused(response.status, &response.headers, &response.body_bytes);
+    assert!(
+        backend
+            .received_requests()
+            .await
+            .iter()
+            .any(|request| request.path == CARD_PATH)
+    );
+    assert!(backend.step_errors().await.is_empty());
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 1 — H2/TLS backend with no UDP listener.
 // Capability probe must classify h3 = Unsupported, h2_tls = Supported.

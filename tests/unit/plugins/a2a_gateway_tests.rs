@@ -6283,7 +6283,8 @@ async fn streaming_jsonrpc_observation_behind_a_deferred_cut_counts_the_cleared_
 use ferrum_edge::_test_support::{
     BufferedRepresentationOutcome, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES,
     ResponseBufferBudgetProbe, a2a_sse_retained_semantic_bytes_for_test,
-    stamp_original_response_metadata_for_test,
+    representation_rejection_reason_for_test, stamp_original_response_metadata_for_test,
+    transform_buffered_response_body_with_deadline_full_for_test,
 };
 
 fn gzip_bytes(data: &[u8]) -> Vec<u8> {
@@ -6455,9 +6456,80 @@ async fn partial_http_agent_card_is_refused_by_the_representation_gate() {
     );
 }
 
+/// A multi-range response has no top-level JSON label or Content-Range. Its
+/// JSON parts still belong to the requested card, so the shared lifecycle must
+/// refuse it even when a later header hook relabels the pristine fragment.
+#[tokio::test]
+async fn multipart_partial_http_agent_card_is_refused_by_the_response_lifecycle() {
+    let card = r#"{"name":"planner", "url":"https://planner.internal/a2a"}"#;
+    let gap = card.find(" \"url\"").expect("card has a field separator");
+    let multipart = format!(
+        "--card-parts\r\nContent-Type: application/json\r\nContent-Range: bytes 0-{}/{}\r\n\r\n{}\r\n\
+         --card-parts\r\nContent-Type: application/json\r\nContent-Range: bytes {}-{}/{}\r\n\r\n{}\r\n\
+         --card-parts--\r\n",
+        gap - 1,
+        card.len(),
+        &card[..gap],
+        gap + 1,
+        card.len() - 1,
+        card.len(),
+        &card[gap + 1..],
+    );
+    for relabeled in [false, true] {
+        let gateway = plugin(json!({}));
+        let plugins = vec![Arc::clone(&gateway)];
+        let mut ctx = detect_http_agent_card(&gateway).await;
+        let mut status = 206;
+        let mut headers = HashMap::from([
+            (
+                "content-type".to_string(),
+                "multipart/byteranges; boundary=card-parts".to_string(),
+            ),
+            ("etag".to_string(), "\"card-v1\"".to_string()),
+        ]);
+        let mut body = Bytes::from(multipart.clone());
+        stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+        if relabeled {
+            status = 200;
+            headers.insert("content-type".to_string(), "text/plain".to_string());
+        }
+        assert!(matches!(
+            gateway
+                .on_response_body(&mut ctx, status, &mut headers, &body)
+                .await,
+            PluginResult::Continue
+        ));
+        let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            false,
+        )
+        .await;
+        assert!(replaced);
+        assert!(!transformed);
+        assert_eq!(status, 502);
+        assert_eq!(
+            representation_rejection_reason_for_test(&ctx),
+            Some("partial_representation")
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(!headers.contains_key("etag"));
+        let error = String::from_utf8_lossy(&body);
+        assert!(!error.contains("planner.internal"));
+        assert!(!error.contains("card-parts"));
+    }
+}
+
 /// The claim covers exactly the HTTP card responses the rewrite cannot read
 /// as received; complete identity cards, other operations, disabled rewriting,
-/// other media, and native gRPC cards are not claimed.
+/// other media on complete responses, and native gRPC cards are not claimed.
 #[tokio::test]
 async fn representation_gate_claim_is_scoped_to_uninspectable_http_cards() {
     let gateway = plugin(json!({}));
@@ -6473,19 +6545,35 @@ async fn representation_gate_claim_is_scoped_to_uninspectable_http_cards() {
     assert!(gateway.enforces_response_body_policy(&ctx, None, b"x"));
     assert!(!gateway.enforces_response_body_policy(&ctx, Some("text/html"), b"x"));
 
+    let multipart_type = "multipart/byteranges; boundary=card-parts";
+    assert!(!gateway.enforces_response_body_policy(&ctx, Some(multipart_type), b"x"));
+    stamp_original_response_metadata_for_test(&mut ctx, 206, &HashMap::new());
+    assert!(gateway.enforces_response_body_policy(&ctx, Some(multipart_type), b"x"));
+    assert!(gateway.enforces_response_body_policy(&ctx, Some("text/html"), b"x"));
+
     let (mut task_ctx, mut task_headers) = rest_ctx("GET", "/a2a/tasks/task-1");
     assert!(matches!(
         gateway.before_proxy(&mut task_ctx, &mut task_headers).await,
         PluginResult::Continue
     ));
     assert!(!gateway.may_enforce_response_body_policy(&task_ctx));
+    stamp_original_response_metadata_for_test(&mut task_ctx, 206, &HashMap::new());
+    assert!(!gateway.enforces_response_body_policy(&task_ctx, Some(multipart_type), b"x"));
 
     let passthrough = plugin(json!({"discovery": {"rewrite_agent_card_urls": false}}));
-    let passthrough_ctx = detect_http_agent_card(&passthrough).await;
+    let mut passthrough_ctx = detect_http_agent_card(&passthrough).await;
     assert!(!passthrough.may_enforce_response_body_policy(&passthrough_ctx));
+    stamp_original_response_metadata_for_test(&mut passthrough_ctx, 206, &HashMap::new());
+    assert!(!passthrough.enforces_response_body_policy(
+        &passthrough_ctx,
+        Some(multipart_type),
+        b"x"
+    ));
 
-    let grpc_card = detect_grpc_agent_card(&gateway, "GetAgentCard").await;
+    let mut grpc_card = detect_grpc_agent_card(&gateway, "GetAgentCard").await;
     assert!(!gateway.may_enforce_response_body_policy(&grpc_card));
+    stamp_original_response_metadata_for_test(&mut grpc_card, 206, &HashMap::new());
+    assert!(!gateway.enforces_response_body_policy(&grpc_card, Some(multipart_type), b"x"));
 }
 
 /// a2a_gateway-SOL-2: an allowed operation a later body transformer turns into
@@ -7134,21 +7222,25 @@ async fn same_class_final_method_change_drops_a_stale_task_id() {
     assert!(!ctx.metadata.contains_key("a2a.task_id.truncated"));
 }
 
-/// PR6841-SOL-2: the presentation semantics changed (encoded/partial cards,
-/// GRPC and HTTP+JSON rewriting), so a representation retained under the
-/// previous replay-provenance domain must no longer match.
+/// A representation retained before the encoded/partial card handling and the
+/// multipart refusal must no longer match the current presentation policy.
 #[test]
-fn a2a_presentation_digest_moved_past_the_v1_domain() {
+fn a2a_presentation_digest_retires_previous_card_policy_domains() {
     let config = configured_base_config();
-    let v1 = ferrum_edge::plugins::utils::policy_digest::static_config_digest(
+    for previous_domain in [
         "ferrum.plugin.a2a_gateway.static.v1",
-        &config,
-    );
-    assert_ne!(
-        static_presentation_digest(config),
-        v1,
-        "replays stored under the pre-fix card semantics must be refused"
-    );
+        "ferrum.plugin.a2a_gateway.static.v2",
+    ] {
+        let previous = ferrum_edge::plugins::utils::policy_digest::static_config_digest(
+            previous_domain,
+            &config,
+        );
+        assert_ne!(
+            static_presentation_digest(config.clone()),
+            previous,
+            "replays stored under previous card semantics must be refused"
+        );
+    }
 }
 
 // ── PR #6841 fix round 2 ──────────────────────────────────────────────────
