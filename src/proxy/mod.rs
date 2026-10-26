@@ -7712,13 +7712,14 @@ pub struct ProxyState {
     /// release) → SVID material (install, then release) → request epoch
     /// (commit). No helper called inside this boundary reacquires publication.
     pub gateway_trust_publication_lock: Arc<std::sync::Mutex<()>>,
-    /// Consumer `jwt` secrets this process has seen configured on more than
-    /// one Consumer of a namespace (namespace-bound digests only). Every
+    /// Consumer `jwt` secrets removed from credentials quarantined for sharing,
+    /// including other rotation keys (namespace-bound digests only). Every
     /// full and incremental swap quarantines against it, so a later point
     /// delta cannot reactivate a key another Consumer is known to hold after
     /// the live snapshot already stripped that other holder. Locked only on
     /// the config-swap cold path, never on the request path. Only accepted
-    /// candidates record into it, and it is bounded per namespace.
+    /// candidates record into it, under the publication lock, and it is bounded
+    /// per namespace. Lock order: gateway publication -> JWT history -> epoch.
     pub jwt_shared_secret_history:
         Arc<std::sync::Mutex<crate::config::types::JwtSharedSecretHistory>>,
     /// Whether this process cannot know its namespace's AUTHORITATIVE gateway
@@ -9969,6 +9970,7 @@ impl ProxyState {
         &self,
         candidate: &GatewayConfig,
         explicit_trust: Option<GatewayTrustCommit>,
+        jwt_shared: &crate::config::types::JwtSharedSecretRecords,
         build: impl FnOnce(&RequestEpoch) -> Result<Option<StagedRequestEpoch>, String>,
         mirror: impl FnOnce(&RequestEpoch),
     ) -> Result<Option<Arc<RequestEpoch>>, String> {
@@ -9987,9 +9989,39 @@ impl ProxyState {
         } else {
             GatewayTrustStaging::Carry
         };
+        // Lock order: gateway publication -> JWT history -> request epoch.
+        // Quarantine can run before async file validation, so another accepted
+        // generation may have tainted a remaining key in the meantime. Refuse
+        // that candidate before publishing any of its already-staged caches;
+        // the source must retry against the current history.
+        let mut history = self
+            .jwt_shared_secret_history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if candidate.consumers.iter().any(|consumer| {
+            consumer.credentials.get("jwt").is_some_and(|value| {
+                crate::config::types::jwt_credential_secret_values(value)
+                    .iter()
+                    .any(|secret| history.contains(&consumer.namespace, secret))
+            })
+        }) {
+            return Err(
+                "JWT shared-secret history changed during configuration staging; retry from the authoritative source"
+                    .to_string(),
+            );
+        }
         let published = self
             .request_epoch
             .update_config_with_trust(staging, build, mirror)?;
+        // Keep history locked through the store AND recording: neither a
+        // comparison nor another quarantine can observe the published config
+        // without its accepted records. An Err above records nothing, while
+        // an accepted no-op still remembers keys its full loader stripped.
+        let evicted = history.merge(jwt_shared);
+        drop(history);
+        if evicted > 0 {
+            warn_jwt_shared_secret_history_evicted();
+        }
         if published.is_some() {
             // Every published generation may carry a new authorize chain, a
             // changed mesh termination inventory, or a withdrawn proxy. Live
@@ -10642,11 +10674,21 @@ impl ProxyState {
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
         reserved_gateway_ports: HashSet<u16>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
-        // Seed the shared-secret history from the shared JWT secrets the
-        // full loader already stripped from this initial snapshot.
+        // Seed from loader-stripped credentials and quarantine raw initial
+        // snapshots too, before any ConsumerIndex or request epoch is built.
         let mut initial_jwt_history = crate::config::types::JwtSharedSecretHistory::default();
         let initial_jwt_shared = std::mem::take(&mut config.quarantined_jwt_shared_secrets);
-        if initial_jwt_history.merge(&initial_jwt_shared) > 0 {
+        let mut evicted = initial_jwt_history.merge(&initial_jwt_shared);
+        let initial_jwt_outcome =
+            config.quarantine_invalid_jwt_credentials_against(&initial_jwt_history);
+        for message in initial_jwt_outcome.messages {
+            error!(
+                "Initial config: {}",
+                crate::startup::sanitize_startup_cause(message, &[])
+            );
+        }
+        evicted += initial_jwt_history.merge(&initial_jwt_outcome.shared);
+        if evicted > 0 {
             warn_jwt_shared_secret_history_evicted();
         }
         if let Err(errors) = validate_mesh_route_dispatch_upstream_references(&config) {
@@ -14097,29 +14139,13 @@ impl ProxyState {
         trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
         explicit_trust: Option<GatewayTrustCommit>,
     ) -> ConfigApplyOutcome {
+        use crate::config_delta::ConfigDelta;
+
         // Weak, malformed, or cross-Consumer shared JWT secrets (including
         // ones shared in an earlier accepted generation) never reach the
         // ConsumerIndex. Shared secrets this candidate reveals are recorded
         // only if the candidate is accepted.
         let jwt_shared = self.quarantine_jwt_credentials(&mut new_config, Some("Config reload"));
-        let outcome = self.update_config_with_mesh_ids_quarantined(
-            new_config,
-            trusted_mesh_ids,
-            explicit_trust,
-        );
-        if outcome.accepted() {
-            self.record_jwt_shared_secrets(&jwt_shared);
-        }
-        outcome
-    }
-
-    fn update_config_with_mesh_ids_quarantined(
-        &self,
-        mut new_config: GatewayConfig,
-        trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
-        explicit_trust: Option<GatewayTrustCommit>,
-    ) -> ConfigApplyOutcome {
-        use crate::config_delta::ConfigDelta;
 
         // Normalize hostnames (ASCII-lowercase) and pre-compute each
         // proxy's `dispatch_kind` for O(1) hot-path dispatch. Both must run
@@ -14205,6 +14231,7 @@ impl ProxyState {
             let published = match self.publish_request_epoch_with_gateway_trust(
                 new_config,
                 explicit_trust,
+                &jwt_shared,
                 |_| {
                     Ok(Some(StagedRequestEpoch {
                         config: Arc::clone(&staged_config),
@@ -14327,15 +14354,25 @@ impl ProxyState {
         // revocation is authoritative even for a gateway that currently serves
         // no resources (issue #3727).
         if old_is_empty && new_is_empty {
-            if let Some(commit) = explicit_trust.filter(GatewayTrustCommit::changes_live_trust) {
-                let _publication = self
-                    .gateway_trust_publication_lock
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let commit = self.normalize_gateway_trust_commit_locked(commit);
-                if commit.changes_live_trust() {
-                    self.commit_gateway_trust_generation_locked(commit);
-                }
+            if let Err(error) = self.publish_request_epoch_with_gateway_trust(
+                &new_config,
+                Some(explicit_trust.unwrap_or(GatewayTrustCommit::Unchanged)),
+                &jwt_shared,
+                |current| {
+                    // The empty fast path was selected before taking the
+                    // publication lock. Do not attach its records to resources
+                    // another writer has published in the meantime.
+                    if !config_empty_ignoring_gateway_managed_plugins(
+                        &current.config,
+                        &self.env_config.namespace,
+                    ) {
+                        return Err("Configuration changed during empty snapshot staging; retry from the authoritative source".to_string());
+                    }
+                    Ok(None)
+                },
+                |_| {},
+            ) {
+                return ConfigApplyOutcome::rejected_one(error);
             }
             return ConfigApplyOutcome::Unchanged;
         }
@@ -14355,6 +14392,7 @@ impl ProxyState {
         let publish_result = self.publish_request_epoch_with_gateway_trust(
             new_config,
             explicit_trust,
+            &jwt_shared,
             |current| {
                 let delta = ConfigDelta::compute(&current.config, new_config);
                 if delta.is_empty() {
@@ -14813,34 +14851,6 @@ impl ProxyState {
             u64,
         )>,
     ) -> IncrementalApplyResult {
-        let mut jwt_shared = crate::config::types::JwtSharedSecretRecords::default();
-        let applied = self
-            .apply_incremental_staged(
-                result,
-                explicit_trust,
-                database_topology_fence,
-                &mut jwt_shared,
-            )
-            .await;
-        if matches!(&applied, IncrementalApplyResult::Outcome(outcome) if outcome.accepted()) {
-            self.record_jwt_shared_secrets(&jwt_shared);
-        }
-        applied
-    }
-
-    /// [`Self::apply_incremental_inner`] without the history commit: shared
-    /// JWT secrets the patched snapshot reveals are written to `jwt_shared`
-    /// and recorded by the caller only if the delta is accepted.
-    async fn apply_incremental_staged(
-        &self,
-        result: crate::config::db_loader::IncrementalResult,
-        explicit_trust: Option<GatewayTrustCommit>,
-        database_topology_fence: Option<(
-            &Arc<dyn crate::config::db_backend::DatabaseBackend>,
-            u64,
-        )>,
-        jwt_shared: &mut crate::config::types::JwtSharedSecretRecords,
-    ) -> IncrementalApplyResult {
         if result.is_empty() {
             // An empty resource delta still has to commit an explicit trust
             // decision: a CP trust-only update carries no resources at all.
@@ -15013,7 +15023,8 @@ impl ProxyState {
         // patched snapshot no longer shows holders an earlier generation
         // already stripped, so the process-local shared-secret history is
         // what keeps a later delta from reactivating such a key.
-        *jwt_shared = self.quarantine_jwt_credentials(&mut new_config, Some("Incremental config"));
+        let jwt_shared =
+            self.quarantine_jwt_credentials(&mut new_config, Some("Incremental config"));
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -15114,6 +15125,7 @@ impl ProxyState {
         let publish_result = self.publish_request_epoch_with_gateway_trust(
             new_config,
             explicit_trust,
+            &jwt_shared,
             |current| {
                 let delta = crate::config_delta::ConfigDelta::compute(&current.config, new_config);
                 if delta.is_empty() {
@@ -15388,7 +15400,7 @@ impl ProxyState {
     /// history, logging each quarantine under `context` (`None` discards the
     /// diagnostics, for read-only comparison). Returns the shared
     /// secrets the candidate revealed, including those its full loader
-    /// already stripped, for [`Self::record_jwt_shared_secrets`] once the
+    /// already stripped, for the publication boundary to record once the
     /// candidate is accepted. Cold path only.
     fn quarantine_jwt_credentials(
         &self,
@@ -15410,21 +15422,6 @@ impl ProxyState {
         }
         shared.extend(outcome.shared);
         shared
-    }
-
-    /// Merge shared JWT secrets from an accepted candidate into the history.
-    fn record_jwt_shared_secrets(&self, shared: &crate::config::types::JwtSharedSecretRecords) {
-        if shared.is_empty() {
-            return;
-        }
-        let evicted = self
-            .jwt_shared_secret_history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .merge(shared);
-        if evicted > 0 {
-            warn_jwt_shared_secret_history_evicted();
-        }
     }
 
     /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
@@ -15455,11 +15452,9 @@ impl ProxyState {
         candidate.resolve_upstream_tls();
         let _ = candidate.quarantine_invalid_hmac_credentials();
         // Quarantine against the live history without cloning it (diagnostics
-        // discarded like the HMAC ones above). Shared secrets a raw candidate
-        // reveals are kept: the source really assigns them to several
-        // Consumers, so recording them only fails closed.
-        let shared = self.quarantine_jwt_credentials(&mut candidate, None);
-        self.record_jwt_shared_secrets(&shared);
+        // discarded like the HMAC ones above). This candidate may still be
+        // fenced as stale or rejected on apply, so discard its records too.
+        let _ = self.quarantine_jwt_credentials(&mut candidate, None);
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
             &self.gateway_svid_bundle,

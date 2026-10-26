@@ -2231,6 +2231,52 @@ fn test_quarantine_jwt_history_keeps_a_once_shared_secret_quarantined() {
     assert!(config.consumers[2].has_credential("jwt"));
 }
 
+/// Issue #6902: stripping a rotation array must retain every omitted key,
+/// including new rotation keys on a credential quarantined by old history.
+#[test]
+fn test_jwt_history_retains_other_keys_in_quarantined_rotation_arrays() {
+    use ferrum_edge::config::types::JwtSharedSecretHistory;
+
+    let shared = "rotation-shared-jwt-secret-at-least-32-chars";
+    let other = "rotation-other-jwt-secret-at-least-32-chars";
+    let later = "rotation-later-jwt-secret-at-least-32-chars";
+    let mut history = JwtSharedSecretHistory::default();
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[shared, other]),
+        jwt_consumer("eve", "eve", &[shared]),
+    ];
+    let outcome = config.quarantine_invalid_jwt_credentials_against(&history);
+    assert_eq!(outcome.messages.len(), 2);
+    assert_eq!(outcome.shared.len(), 2, "retain the whole stripped array");
+    history.merge(&outcome.shared);
+
+    // Only the previously unique rotation key is reintroduced, together with
+    // a new key. Historical quarantine must retain that new key as well.
+    config.consumers = vec![jwt_consumer("eve", "eve", &[other, later])];
+    let outcome = config.quarantine_invalid_jwt_credentials_against(&history);
+    assert_eq!(outcome.messages.len(), 1);
+    assert_eq!(outcome.shared.len(), 2);
+    history.merge(&outcome.shared);
+
+    let mut other_namespace = jwt_consumer("tenant", "tenant", &[later]);
+    other_namespace.namespace = "tenant-b".to_string();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[later]),
+        other_namespace,
+        jwt_consumer(
+            "bob",
+            "bob",
+            &["entirely-new-jwt-secret-at-least-32-characters"],
+        ),
+    ];
+    let outcome = config.quarantine_invalid_jwt_credentials_against(&history);
+    assert_eq!(outcome.messages.len(), 1);
+    assert!(!config.consumers[0].has_credential("jwt"));
+    assert!(config.consumers[1].has_credential("jwt"));
+    assert!(config.consumers[2].has_credential("jwt"));
+}
+
 /// PR #6865 review (SOL-5 / MUSE-4): the history is bounded per namespace;
 /// past the bound the oldest digests are evicted and the eviction is
 /// reported so the caller can warn.
@@ -2361,7 +2407,7 @@ fn test_jwt_secret_policy_is_wired_into_every_boundary() {
     const ADMIN: &str = include_str!("../../../src/admin/mod.rs");
 
     // Full and incremental swaps quarantine against the shared-secret
-    // history; the comparison helper uses a read-only copy of it.
+    // history; the comparison helper only reads it.
     assert_eq!(
         PROXY
             .matches("self.quarantine_jwt_credentials(&mut new_config, Some(")
@@ -2375,13 +2421,10 @@ fn test_jwt_secret_policy_is_wired_into_every_boundary() {
         .expect("canonicalize_snapshot_for_comparison");
     let canonicalize = &canonicalize[..canonicalize.find("\n    }\n").expect("function end")];
     assert!(canonicalize.contains("self.quarantine_jwt_credentials(&mut candidate, None)"));
-    // Only accepted candidates record into the history.
-    assert!(PROXY.contains(
-        "if outcome.accepted() {\n            self.record_jwt_shared_secrets(&jwt_shared);"
-    ));
-    assert!(PROXY.contains(
-        "if matches!(&applied, IncrementalApplyResult::Outcome(outcome) if outcome.accepted()) {"
-    ));
+    assert!(!canonicalize.contains("record_jwt"));
+    assert!(!canonicalize.contains(".merge("));
+
+    assert!(!PROXY.contains("fn record_jwt_shared_secrets("));
 
     // Both full loaders judge JWT ownership before identity quarantine can
     // remove a holder.

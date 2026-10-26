@@ -38,6 +38,58 @@ use ferrum_edge::tls::backend::SvidGenerationMatcher;
 use ferrum_edge::util::sharding::pool_shard_amount;
 use serde_json::json;
 
+/// Issue #6902: history reads and accepted recording must share the epoch's
+/// publication boundary on every sibling config path. Pin the private cold
+/// path without timer races or production-visible pause hooks.
+#[test]
+fn every_config_publication_commits_jwt_history_under_the_same_lock() {
+    let proxy = source("src/proxy/mod.rs");
+    let function_body = |signature: &str| {
+        proxy
+            .split(signature)
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .unwrap_or_else(|| panic!("missing function {signature}"))
+    };
+    for (signature, publications) in [
+        ("fn update_config_with_mesh_ids(", 3),
+        ("async fn apply_incremental_inner(", 1),
+    ] {
+        let body = function_body(signature);
+        let sites: Vec<_> = body
+            .split("self.publish_request_epoch_with_gateway_trust(")
+            .skip(1)
+            .collect();
+        assert_eq!(sites.len(), publications, "{signature}");
+        for site in sites {
+            let (arguments, _) = site
+                .split_once("&jwt_shared,")
+                .expect("publication receives JWT records");
+            assert!(
+                !arguments.contains('|'),
+                "{signature}: pass the records before the staging/mirror closures"
+            );
+        }
+    }
+    let full = function_body("fn update_config_with_mesh_ids(");
+    assert!(full.contains("Configuration changed during empty snapshot staging"));
+
+    let mut publication = function_body("fn publish_request_epoch_with_gateway_trust(");
+    for step in [
+        ".gateway_trust_publication_lock",
+        ".jwt_shared_secret_history",
+        "history.contains(&consumer.namespace, secret)",
+        ".update_config_with_trust(staging, build, mirror)?",
+        "history.merge(jwt_shared)",
+        "drop(history)",
+    ] {
+        publication = publication
+            .split_once(step)
+            .unwrap_or_else(|| panic!("publication must perform {step} in order"))
+            .1;
+    }
+}
+
 #[test]
 fn every_startup_failure_site_renders_the_sanitized_cause_chain() {
     let entry = source("src/gateway_entry.rs");

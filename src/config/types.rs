@@ -367,7 +367,7 @@ fn jwt_credential_value_is_admissible(value: &serde_json::Value) -> bool {
 enum JwtQuarantineReason {
     /// Another Consumer in the namespace holds one of its secrets.
     Shared(String),
-    /// One of its secrets was shared in an earlier generation.
+    /// One of its secrets belonged to a credential quarantined for sharing.
     PreviouslyShared,
     /// Malformed, or a secret below the strength floor.
     Weak,
@@ -390,8 +390,9 @@ fn jwt_shared_secret_digest(namespace: &str, secret: &str) -> [u8; 32] {
     hasher.finalize()
 }
 
-/// Consumer `jwt` secrets one quarantine pass saw configured on more than one
-/// Consumer of a namespace, as namespace-bound digests (never the secret).
+/// Consumer `jwt` secrets removed from credentials quarantined for sharing,
+/// including their other rotation keys, as namespace-bound digests (never the
+/// secret).
 ///
 /// The quarantine only *reports* these; the owner of a
 /// [`JwtSharedSecretHistory`] merges them once the candidate they came from
@@ -426,7 +427,7 @@ impl JwtSharedSecretRecords {
         }
     }
 
-    /// Number of distinct recorded shared secrets.
+    /// Number of distinct recorded quarantined secrets.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -443,8 +444,8 @@ pub struct JwtQuarantineOutcome {
     /// One human-readable message per quarantined credential (never the
     /// secret); callers log these at `error!` severity.
     pub messages: Vec<String>,
-    /// Secrets shared in this snapshot, for the caller to merge into its
-    /// history once the snapshot is accepted.
+    /// Secrets removed from credentials quarantined for sharing, for the caller
+    /// to merge into its history once the snapshot is accepted.
     pub shared: JwtSharedSecretRecords,
 }
 
@@ -455,12 +456,12 @@ struct NamespaceJwtSharedSecrets {
     order: std::collections::VecDeque<[u8; 32]>,
 }
 
-/// Process-local record of Consumer `jwt` secrets that were configured on
-/// more than one Consumer of a namespace.
+/// Process-local record of Consumer `jwt` secrets removed from credentials
+/// quarantined for sharing within a namespace, including other rotation keys.
 ///
-/// A secret that was ever shared is known to another Consumer, so it must not
-/// be reactivated by a later incremental swap that no longer shows the other
-/// holder (the live snapshot it patches is already quarantined). Entries are
+/// A removed key is still known to its former holder, so it must not be
+/// reactivated by a later incremental swap that no longer shows that holder
+/// (the live snapshot it patches is already quarantined). Entries are
 /// SHA-256 digests bound to the namespace; the secret itself is never kept.
 /// Each namespace keeps at most
 /// [`JWT_SHARED_SECRET_HISTORY_MAX_PER_NAMESPACE`] digests, evicting the
@@ -506,7 +507,7 @@ impl JwtSharedSecretHistory {
         evicted
     }
 
-    /// Number of recorded shared secrets across namespaces.
+    /// Number of recorded quarantined secrets across namespaces.
     pub fn len(&self) -> usize {
         self.namespaces
             .values()
@@ -3827,7 +3828,8 @@ pub struct GatewayConfig {
     /// a rejected `POST /plugins`, prefixed with the plugin name and config id.
     #[serde(skip)]
     pub quarantined_plugin_configs: Vec<String>,
-    /// Consumer `jwt` secrets a full load found shared and stripped
+    /// Consumer `jwt` secrets a full load stripped from credentials quarantined
+    /// for sharing, including other rotation keys
     /// (namespace-bound digests, never the secret).
     ///
     /// DERIVED, PROCESS-LOCAL ONLY: `#[serde(skip)]`, never persisted and
@@ -5494,7 +5496,8 @@ impl GatewayConfig {
     ///   carrying a string `secret` with at least [`MIN_JWT_SECRET_LENGTH`]
     ///   non-whitespace characters.
     ///
-    /// Secrets shared in this snapshot are returned in
+    /// All secrets in a credential quarantined for current or historical
+    /// sharing are returned in
     /// [`JwtQuarantineOutcome::shared`] (as namespace-bound digests, never the
     /// secret); `history` itself is only read, so the caller decides whether
     /// the candidate was accepted before recording them. The same secret may be
@@ -5568,7 +5571,19 @@ impl GatewayConfig {
             let Some(reason) = decision else {
                 continue;
             };
-            consumer.credentials.remove("jwt");
+            if let Some(value) = consumer.credentials.remove("jwt")
+                && matches!(
+                    &reason,
+                    JwtQuarantineReason::Shared(_) | JwtQuarantineReason::PreviouslyShared
+                )
+            {
+                // The whole rotation array disappears from the live snapshot.
+                // Keep every key so a later delta cannot assign an omitted key
+                // to another Consumer while its former holder still knows it.
+                for secret in jwt_credential_secret_values(&value) {
+                    shared.push(&consumer.namespace, secret);
+                }
+            }
             messages.push(match reason {
                 JwtQuarantineReason::Shared(other_id) => format!(
                     "Quarantined jwt credential of consumer {:?}: one of its secrets is also \
@@ -5580,10 +5595,10 @@ impl GatewayConfig {
                     consumer.id, other_id, consumer.namespace
                 ),
                 JwtQuarantineReason::PreviouslyShared => format!(
-                    "Quarantined jwt credential of consumer {:?}: one of its secrets was \
-                     shared with another Consumer in namespace {:?} in an earlier \
-                     configuration generation of this process, so another Consumer can still \
-                     sign tokens as this one. Give the Consumer a new, distinct secret to \
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets belonged \
+                     to a credential quarantined for sharing in namespace {:?} in an earlier \
+                     configuration generation of this process, so a former holder may still \
+                     know it. Replace the entire credential with new, distinct secrets to \
                      restore it.",
                     consumer.id, consumer.namespace
                 ),
