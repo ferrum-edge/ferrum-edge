@@ -5991,6 +5991,25 @@ pub mod _test_support {
         crate::proxy::observe_ws_policy_close(plugins, proxy_id, connection_id, direction, close)
     }
 
+    /// Open the production H2 byte transport over an in-memory test connection.
+    pub async fn open_h2_byte_tunnel_for_test(
+        sender: h2::client::SendRequest<bytes::Bytes>,
+    ) -> Result<crate::proxy::hbone_pool::H2ConnectTunnel, crate::proxy::hbone_pool::HbonePoolError>
+    {
+        crate::proxy::hbone_pool::open_h2_connect_stream(
+            crate::proxy::hbone_pool::MeshH2Transport {
+                sender,
+                gate: crate::proxy::mesh_trust_registry::MeshTransportGate::new(),
+                load: crate::proxy::hbone_pool::HboneConnectionLoad::default(),
+            },
+            "backend.test",
+            80,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// Drive the production framed WebSocket relay (`run_websocket_session`,
     /// shared by H1 Upgrade and H2/H3 Extended CONNECT) end to end over
     /// caller-owned transports.

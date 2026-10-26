@@ -20881,6 +20881,39 @@ where
     }
 }
 
+/// Let a queued backend Close leave a multiplexed transport before dropping it.
+/// H2 tunnel writes queue DATA and flush is a no-op. Dropping both stream
+/// handles then schedules CANCEL, which discards that DATA. Keep the receive
+/// half alive while END_STREAM and the peer's EOF complete, under the same
+/// polite-close bound.
+async fn finish_ws_backend_transport<B>(mut backend: B)
+where
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = crate::lazy_timeout::lazy_timeout(
+        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
+        async {
+            backend.shutdown().await?;
+            let mut discard = [0u8; 1024];
+            loop {
+                match backend.read(&mut discard).await {
+                    Ok(0) => return Ok::<(), std::io::Error>(()),
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(_) => {
+                        // A deflate reader can remain faulted after a policy
+                        // rejection. Do not read it again, but retain its H2
+                        // handles for the remaining grace to deliver the Close.
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        },
+    )
+    .await;
+}
+
 pub(crate) fn publish_ws_policy_close(
     policy_close: &std::sync::OnceLock<CloseFrame>,
     cancel: &tokio_util::sync::CancellationToken,
@@ -21824,7 +21857,9 @@ where
 
     // Split streams for bidirectional communication
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
-    let (mut backend_sink, mut backend_stream) = backend_ws_stream.split();
+    // Borrow the backend framer so teardown can finish its transport after both
+    // relay halves release their split handles instead of cancelling queued DATA.
+    let (mut backend_sink, mut backend_stream) = (&mut backend_ws_stream).split();
 
     // Clone Arc'd plugin list for each direction task.
     // When ws_frame_plugins is empty these clones are zero-cost (empty Vec).
@@ -22858,6 +22893,7 @@ where
     // the relay's own first failure keeps its direction and side.
     drop(c2b);
     drop(b2c);
+    finish_ws_backend_transport(backend_ws_stream.into_inner()).await;
     if let Some(settle) = client_transport_settle
         && let Some(failure) = settle.await
     {
