@@ -1,4 +1,6 @@
 mod adaptive_buffer_tests;
+mod adaptive_concurrency_allocation_tests;
+mod adaptive_concurrency_timing_tests;
 mod allowed_methods_logging_tests;
 mod ambient_host_udp_live_contract_tests;
 mod ambient_udp_placement_established_helm_tests;

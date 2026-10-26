@@ -6,6 +6,10 @@
 //! Covers: pool construction, pool_size tracking, get_sender error paths,
 //! and live connection lifecycle against a real TLS+H2 echo backend.
 
+// Keep bridge/admission regressions under this module so the existing CI and
+// coverage pool/protocol shard filters execute them.
+mod adaptive_concurrency_dispatch_tests;
+
 use crate::scaffolding::port_registry::TestSocket;
 
 use bytes::Bytes;

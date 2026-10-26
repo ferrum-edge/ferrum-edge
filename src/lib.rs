@@ -3190,6 +3190,38 @@ pub mod _test_support {
     }
 
     // ── adaptive_concurrency lifecycle ──────────────────────────────────────
+
+    /// The timing correction shared by intermediate retry settlement and the
+    /// final response/stream settlement. Explicit durations keep tests independent
+    /// of wall-clock delays and scheduler timing.
+    pub fn backend_admission_attempt_elapsed_for_test(
+        attempt_started_at: std::time::Instant,
+        elapsed: Duration,
+        client_upload_gate: (std::time::Instant, Duration),
+    ) -> Duration {
+        crate::proxy::backend_admission_attempt_elapsed(
+            attempt_started_at,
+            elapsed,
+            client_upload_gate,
+        )
+    }
+
+    /// Settle a replaced retry attempt through the production timing/ownership
+    /// funnel, with explicit elapsed time for deterministic external tests.
+    pub fn record_backend_admission_retry_outcome_for_test(
+        permits: &mut Option<crate::plugins::BackendAdmissionPermitSet>,
+        outcome: crate::plugins::BackendAdmissionOutcome,
+        attempt_started_at: std::time::Instant,
+        client_upload_gate: (std::time::Instant, Duration),
+    ) {
+        crate::proxy::record_backend_admission_retry_outcome(
+            permits,
+            outcome,
+            attempt_started_at,
+            client_upload_gate,
+        );
+    }
+
     pub struct AdaptiveConcurrencyDecreaseHarness {
         limit: AtomicU64,
         config: crate::adaptive_concurrency::AdaptiveConcurrencyConfig,
