@@ -2009,6 +2009,21 @@ full-release ABI job are removed; fast test artifacts make no production ABI
 claim. Existing frozen parser, shell, action, and artifact-ownership checks
 continue to protect the production lane.
 
+The v0.9.19 recovery candidate retains Ubuntu 24.04 and provisions an
+additional **32 GiB** swapfile on the runner root filesystem before the
+checksum-pinned `before` resource observation. Fixed host commands create a
+new `0600` file and enable it; `swapon --show --bytes`, `/proc/swaps` and
+`/proc/meminfo` verify activation and capacity. Any provisioning or capacity
+check failure stops compilation. Existing swap stays enabled. The observer
+records the resulting total/free swap before and after compilation. No
+third-party swap automation or compiler-environment change is involved.
+The job has a **240-minute** budget to allow slower disk-backed fat LTO.
+Attempt 2 of v0.9.18 proved host OOM in a single gateway binary `rustc` after
+dependencies finished, so reducing Cargo job concurrency does not bound that
+process's memory. See the [evidence, timeout rationale and qualification
+limits](releases/v0.9.18-arm64-recovery.md). The immutable v0.9.18 tag was not
+published; rerunning it cannot load the replacement producer.
+
 `Cross.toml` image, the complete ordered `pre-build` list, and
 `env.passthrough` are allowlisted by identity in `verify_cross_build_policy.py`.
 The Cross 0.2.5 image is pinned to the GHCR-published OCI index
@@ -4371,9 +4386,11 @@ every input-size limit, and every execution bound remain as they are.
 the shipping-profile experiment remains not adopted.** The `build-release-binaries`
 job now carries `timeout-minutes: 180` with 165 on each build step and uploads
 `target/cargo-timings/` as `release-build-timings-<target>` (14-day retention),
-and `build-release-arm64-cross` carries `timeout-minutes: 120`; the frozen
-ARM64 job digest in `verify_cross_build_policy.py` was moved in the same
-commit. Everything below records why those numbers were chosen and why the
+and `build-release-arm64-cross` originally carried `timeout-minutes: 120`.
+The v0.9.19 OOM recovery candidate raises only ARM64 to **240 minutes** for
+disk-backed fat LTO and refreezes its job digest in
+`verify_cross_build_policy.py`. Everything below records the original budget
+evidence and why the
 change could not travel through a pull request: `release.yml`'s
 `build-release-arm64-cross` is digest-frozen in `WORKFLOW_CONTRACTS`, and
 `build-release-binaries` is read as Cross-sensitive and held to `main`'s own
@@ -4409,11 +4426,15 @@ cold cache and a slow runner:
   observed job. This matches the 180/165 pair the non-publishing
   `release-platform-study.yml` uses for the same three cold shipping-profile
   compiles.
-- `build-release-arm64-cross`: **`timeout-minutes: 120`** — 2.6× its 45m39s
-  observed compile step, leaving room for image pull and sysroot preparation.
+- `build-release-arm64-cross`: originally **`timeout-minutes: 120`** — 2.6×
+  its 45m39s observed compile step. The v0.9.19 recovery uses **240 minutes**,
+  twice that allowance and over 5× the observed compile, to include swap
+  provisioning, image/sysroot preparation and disk-backed LTO. This budget
+  still needs successful production timing evidence.
 
-Both are far below 360 and above anything ever observed to succeed. Raise a
-number when a *successful* run exceeds it; do not raise one to absorb a hang.
+Both remain below 360. The ARM64 increase accompanies a demonstrated OOM
+capacity fix, rather than an unexplained hang. Subsequent budget changes
+should use successful production timing evidence.
 
 #### Timings capture that preserves logs on timeout
 
