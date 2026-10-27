@@ -149,6 +149,13 @@ pub struct MeshAuthz {
     /// from the CONNECT authority/backend, not from `slice.namespace` (the
     /// waypoint namespace). This applies to byte-stream and UDP CONNECTs alike.
     service_waypoint_destination_scope_required: bool,
+    /// Scopes of the RequestAuthentications translation refused (issue #6656)
+    /// that this waypoint slice carries for the destinations it fronts (issue
+    /// #6670). An inbound HBONE relay to a destination one of them selects is
+    /// refused, because the relay cannot validate tunnelled JWTs and the
+    /// refusal is the only enforcement a refused resource has. Empty off
+    /// NodeWaypoint / ServiceWaypoint.
+    refused_request_auth_scopes: Vec<PolicyScope>,
     destination_policy_scopes_by_upstream:
         HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     destination_policy_scopes_by_backend:
@@ -553,8 +560,13 @@ struct DestinationScopeMatch<'a> {
     scopes: &'a [crate::modes::mesh::runtime::PolicyScopeCache],
 }
 
+/// Destination workload scopes indexed by the route target a request is
+/// dispatched to. `mesh_authz` builds one per generation for NodeWaypoint and
+/// ServiceWaypoint; NodeWaypoint RequestAuthentication selection
+/// (`crate::modes::mesh`) builds the same index so both decide "which
+/// workloads does this route reach" identically.
 #[derive(Default)]
-struct DestinationPolicyScopeIndex {
+pub(crate) struct DestinationPolicyScopeIndex {
     by_upstream: HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     by_backend: HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     by_namespaced_backend: HashMap<
@@ -569,6 +581,50 @@ struct DestinationPolicyScopeIndex {
     service_backend_hosts: HashSet<String>,
     namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     route_upstreams_requiring_scope: HashSet<String>,
+}
+
+impl DestinationPolicyScopeIndex {
+    /// Destination workload scopes for one route target, resolved exactly as
+    /// `mesh_authz` resolves a matched proxy: an `upstream_id` is decided by
+    /// the upstream index alone, and a direct backend by its qualified alias
+    /// first, then by its name in `namespace`. `None` means the target is not
+    /// a modeled destination (or not fully resolvable).
+    pub(crate) fn scopes_for_target(
+        &self,
+        namespace: &str,
+        upstream_id: Option<&str>,
+        backend_host: &str,
+        backend_port: u16,
+    ) -> Option<&[crate::modes::mesh::runtime::PolicyScopeCache]> {
+        if let Some(upstream_id) = upstream_id {
+            return self.by_upstream.get(upstream_id).map(Vec::as_slice);
+        }
+        let backend_key = DestinationBackendKey::new(backend_host, backend_port)?;
+        if let Some(scopes) = self.by_backend.get(&backend_key) {
+            return Some(scopes);
+        }
+        let namespaced_backend_key =
+            NamespacedDestinationBackendKey::new(namespace, backend_host, backend_port)?;
+        self.by_namespaced_backend
+            .get(&namespaced_backend_key)
+            .map(Vec::as_slice)
+    }
+}
+
+/// Build the NodeWaypoint destination scope index from the same config keys
+/// the `mesh_authz` instance reads (`cluster_domain`, `cluster_domains`,
+/// `node_waypoint_route_upstreams`).
+pub(crate) fn node_waypoint_destination_scope_index(
+    slice: &MeshSlice,
+    config: &Value,
+) -> Result<DestinationPolicyScopeIndex, String> {
+    let cluster_domains = normalized_cluster_domains(config);
+    let (_, route_upstreams) = parse_node_waypoint_route_upstreams(config)?;
+    Ok(destination_policy_scope_index(
+        slice,
+        &cluster_domains,
+        &route_upstreams,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2134,6 +2190,17 @@ impl MeshAuthz {
         let has_scoped_policies = has_scoped_ordinary_policies;
         let service_waypoint_destination_scope_required =
             ambient_udp_source_scoping && slice.waypoint_name.is_some();
+        let refused_request_auth_scopes: Vec<PolicyScope> =
+            if per_pod_policy_scoping || service_waypoint_destination_scope_required {
+                slice
+                    .request_authentications
+                    .iter()
+                    .filter(|resource| resource.refused)
+                    .map(|resource| resource.scope.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let mut has_route_upstream_metadata = false;
         // Only NodeWaypoint per-pod scoping consults the capture-destination
         // scopes (for the synthesized inbound HBONE relay).
@@ -2309,6 +2376,7 @@ impl MeshAuthz {
             ambient_udp_source_scopes,
             ambient_udp_source_scoping,
             service_waypoint_destination_scope_required,
+            refused_request_auth_scopes,
             destination_policy_scopes_by_upstream: destination_policy_scope_index.by_upstream,
             destination_policy_scopes_by_backend: destination_policy_scope_index.by_backend,
             destination_policy_scopes_by_namespaced_backend: destination_policy_scope_index
@@ -2749,6 +2817,57 @@ impl MeshAuthz {
                 })
             }
         }
+    }
+
+    /// Refuse an inbound HBONE relay whose destination workload is selected by
+    /// a RequestAuthentication that translation refused (issues #6656, #6670).
+    ///
+    /// A waypoint's relay is Layer 4: it cannot validate a JWT carried inside
+    /// the tunnel, so for a refused resource (whose intended providers are
+    /// unknown) refusing the CONNECT is the only enforcement there is. The
+    /// destination is resolved exactly as authorization resolves it, so an
+    /// unrelated destination on the same waypoint keeps flowing. A NodeWaypoint
+    /// relay whose destination cannot be resolved cannot be shown to be outside
+    /// every refused resource and is refused too; a ServiceWaypoint relay
+    /// without a destination scope is already rejected by authorization.
+    fn refused_request_auth_relay_rejection(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Option<PluginResult> {
+        let proxy = ctx.matched_proxy.as_ref()?;
+        let scope_match = if self.per_pod_policy_scoping {
+            self.node_waypoint_destination_scope_match(proxy)
+        } else {
+            self.destination_scope_match_for_proxy(proxy)
+        };
+        let refused = match scope_match {
+            Some(scope_match) => scope_match.scopes.iter().any(|destination| {
+                self.refused_request_auth_scopes.iter().any(|refused| {
+                    crate::modes::mesh::config::scope_applies_to_workload(
+                        refused,
+                        &destination.namespace,
+                        &destination.labels,
+                    )
+                })
+            }),
+            None => self.per_pod_policy_scoping,
+        };
+        if !refused {
+            return None;
+        }
+        ctx.metadata.insert(
+            "mesh_authz.deny_policy".to_string(),
+            "request_authentication_refused".to_string(),
+        );
+        Some(PluginResult::Reject {
+            status_code: 503,
+            body: serde_json::json!({
+                "message": crate::modes::mesh::MESH_REQUEST_AUTH_REFUSED_MESSAGE,
+                "status_code": 503,
+            })
+            .to_string(),
+            headers: HashMap::new(),
+        })
     }
 
     fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
@@ -3375,6 +3494,12 @@ impl Plugin for MeshAuthz {
                 .is_some_and(|value| value == "udp");
         let service_waypoint_destination_scope_request =
             self.service_waypoint_destination_scope_required && inbound_hbone_relay_request;
+        if inbound_hbone_relay_request
+            && !self.refused_request_auth_scopes.is_empty()
+            && let Some(rejection) = self.refused_request_auth_relay_rejection(ctx)
+        {
+            return rejection;
+        }
         let relay_policy_superset_request =
             ambient_udp_source_scope_request || service_waypoint_destination_scope_request;
         let unauthenticated_hbone_baggage = is_hbone_request(ctx)

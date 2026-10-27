@@ -1349,13 +1349,34 @@ impl CpGrpcServer {
                 entry.namespace == namespace
             }
         });
+        // A waypoint also needs the RequestAuthentications that select the
+        // destinations it fronts (issue #6670): the visible namespaces its
+        // routes reach and, on a NodeWaypoint, its capture destinations'
+        // namespaces. The slice builder narrows them to those exact workloads.
+        let capture_destination_namespaces: BTreeSet<&str> = mesh
+            .node_waypoint_capture_destinations
+            .iter()
+            .map(|workload| workload.namespace.as_str())
+            .collect();
+        let waypoint_destination_request_auth =
+            request.waypoint_name.is_some() || request.node_waypoint_capture_scoping;
         mesh.request_authentications.retain(|resource| {
-            Self::policy_scope_can_apply_to_namespace(
-                &resource.namespace,
-                &resource.scope,
-                namespace,
-                &istio_root_namespace,
-            )
+            let can_apply_to = |candidate_namespace: &str| {
+                Self::policy_scope_can_apply_to_namespace(
+                    &resource.namespace,
+                    &resource.scope,
+                    candidate_namespace,
+                    &istio_root_namespace,
+                )
+            };
+            can_apply_to(namespace)
+                || (waypoint_destination_request_auth
+                    && (visible_namespaces
+                        .iter()
+                        .any(|destination_namespace| can_apply_to(destination_namespace))
+                        || capture_destination_namespaces
+                            .iter()
+                            .any(|destination_namespace| can_apply_to(destination_namespace))))
         });
         mesh.telemetry_resources.retain(|resource| {
             Self::policy_scope_can_apply_to_namespace(

@@ -521,6 +521,10 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub service_entries: Vec<ServiceEntry>,
+    /// RequestAuthentications selecting this workload. A waypoint slice
+    /// (NodeWaypoint or ServiceWaypoint) also carries those selecting the
+    /// destination workloads it fronts (issue #6670); the data plane applies
+    /// each one only to requests for the workloads it selects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub request_authentications: Vec<MeshRequestAuthentication>,
@@ -1936,13 +1940,31 @@ impl MeshSlice {
                 narrow_service_entry_ports(entry, sidecar)
             })
             .collect();
+        // A waypoint (NodeWaypoint or ServiceWaypoint) terminates requests for
+        // OTHER workloads, so it also carries the RequestAuthentications that
+        // select the destinations it fronts (issue #6670): the visible
+        // workloads its routes reach and, on a NodeWaypoint, its capture
+        // destinations. The data plane selects among them per destination;
+        // the waypoint's own identity still selects its own set.
+        let waypoint_destination_request_auth =
+            request.waypoint_name.is_some() || request.node_waypoint_capture_scoping;
         let request_authentications: Vec<MeshRequestAuthentication> = mesh
             .request_authentications
             .iter()
             .filter(|ra| {
                 policy_candidate_labels.iter().any(|labels| {
                     scope_applies_to_workload(&ra.scope, effective_namespace, *labels)
-                })
+                }) || (waypoint_destination_request_auth
+                    && workloads
+                        .iter()
+                        .chain(node_waypoint_capture_destinations.iter())
+                        .any(|workload| {
+                            scope_applies_to_workload(
+                                &ra.scope,
+                                &workload.namespace,
+                                &workload.selector.labels,
+                            )
+                        }))
             })
             .cloned()
             .collect();

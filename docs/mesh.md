@@ -2859,6 +2859,36 @@ for those it chooses refusal over running without validation. The status reports
 `FerrumAccepted=False` / `Invalid` and `status.ferrum.translation.enforcement:
 refuse_all`.
 
+**Shared waypoints follow the destination** (issue #6670). A NodeWaypoint or
+ServiceWaypoint terminates requests for other workloads, so a
+RequestAuthentication is matched against the workloads a request reaches, not
+against the waypoint's own namespace and labels. A waypoint slice therefore
+also carries the resources that select the destinations it fronts: the
+visible workloads its routes reach and, on a NodeWaypoint, its capture
+destinations.
+
+- **NodeWaypoint Service routes (Layer 7).** Each HTTP route is resolved to its
+  destination workloads through the same index `mesh_authz` uses for
+  destination policy, including every `mesh_route_dispatch` destination it may
+  be rewritten to. A route whose destination set differs from the waypoint's
+  own set gets a proxy-group `jwks_auth` instance (`__mesh_request_auth_dst_*`)
+  that replaces the global `__mesh_request_auth` on that route, so JWT
+  validation, token stripping and claim-header ownership apply to requests for
+  the selected destination and never to an unrelated one. A route whose
+  destination is selected by a refused resource is refused (`503`) through the
+  same `__mesh_request_auth_refused` instance, scoped to that route's namespace
+  and id. A destination that cannot be resolved contributes the waypoint's own
+  set, and a route with no modeled destination (or a destination selected by
+  no resource with a usable JWT rule) keeps the global instance.
+- **Inbound HBONE relays (Layer 4).** A waypoint relay does not parse tunnelled
+  HTTP, so no JWT can be validated there, on either waypoint type. A relay
+  whose destination workload a refused resource selects is refused by
+  `mesh_authz` with the same `503` (`mesh_authz.deny_policy:
+  request_authentication_refused`); a NodeWaypoint relay whose destination
+  cannot be resolved is refused while any refused resource is present. Use an
+  `AuthorizationPolicy` to require a principal: an ALLOW that needs
+  `requestPrincipals` never matches a relayed CONNECT.
+
 **Deferred JWT-rule fields**: `outputPayloadToHeader` and `fromCookies` are
 recognized but not enforced. Both are surfaced in
 `status.ferrum.translation.deferred_fields` by FIELD NAME only — a `fromCookies`

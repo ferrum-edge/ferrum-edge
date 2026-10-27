@@ -124,8 +124,18 @@ pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
 /// request to a workload selected by a RequestAuthentication Ferrum refused
 /// (issue #6656).
 pub const MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID: &str = "__mesh_request_auth_refused";
+/// Id prefix of the proxy-group `jwks_auth` instances that enforce a
+/// NodeWaypoint route's destination RequestAuthentications (issue #6670).
+pub const MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX: &str = "__mesh_request_auth_dst_";
+
+/// Whether `id` names a mesh-managed RequestAuthentication `jwks_auth`
+/// instance (the global one or a NodeWaypoint destination one).
+pub fn is_mesh_request_auth_plugin_id(id: &str) -> bool {
+    id == MESH_REQUEST_AUTH_PLUGIN_ID
+        || id.starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+}
 /// Body of the fail-closed refusal. Fixed text: it names no resource.
-const MESH_REQUEST_AUTH_REFUSED_MESSAGE: &str = "RequestAuthentication for this workload was rejected by the gateway; requests are refused until it is fixed";
+pub(crate) const MESH_REQUEST_AUTH_REFUSED_MESSAGE: &str = "RequestAuthentication for this workload was rejected by the gateway; requests are refused until it is fixed";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
 pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 pub const MESH_BPF_METRICS_PLUGIN_ID: &str = "__mesh_bpf_metrics";
@@ -1670,7 +1680,9 @@ fn prepare_normalized_gateway_config_for_mesh(
     // under the service-port key or dial-port key their dispatch path uses.
     // Topology-aware: Ambient emits HBONE routes; Sidecar emits SVID-mTLS routes.
     materialize_mesh_outbound_proxies(&mut config, runtime, mesh_slice);
-    scope_request_auth_refusal_to_inbound_routes(&mut config, runtime);
+    let refused_destination_routes =
+        scope_request_auth_to_node_waypoint_destinations(&mut config, runtime, mesh_slice);
+    scope_request_auth_refusal_to_inbound_routes(&mut config, runtime, &refused_destination_routes);
     // VirtualService-derived CORS attaches to the just-materialized outbound
     // routes (issue #1973) — after materialization so the proxy ids exist,
     // before DR application like every other route-policy overlay.
@@ -13664,6 +13676,50 @@ fn mirror_mesh_authz_baggage_gate_fields(target: &mut serde_json::Value, gate: &
     }
 }
 
+/// The VirtualService / Gateway API route upstreams a NodeWaypoint
+/// destination index resolves (`node_waypoint_route_upstreams`), with each
+/// target's Service identity. Shared by `mesh_authz` and RequestAuthentication
+/// destination selection so both resolve a route to the same workloads.
+fn node_waypoint_authz_route_upstreams(config: &GatewayConfig) -> Vec<serde_json::Value> {
+    config
+        .upstreams
+        .iter()
+        .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
+        .map(|upstream| {
+            serde_json::json!({
+                "id": upstream.id.clone(),
+                "namespace": upstream.namespace.clone(),
+                "targets": upstream.targets.iter().map(|target| {
+                    let service_port = target.service_port_policy_key.or_else(|| {
+                        target
+                            .tags
+                            .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
+                            .and_then(|value| value.parse::<u16>().ok())
+                            .filter(|port| *port != 0)
+                    });
+                    let mut target_config = serde_json::json!({
+                        "host": target.host.clone(),
+                        "port": target.port,
+                    });
+                    if let Some(service_port) = service_port {
+                        target_config["service_port"] = serde_json::json!(service_port);
+                    }
+                    if let Some(namespace) =
+                        target.tags.get(UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG)
+                    {
+                        target_config["service_namespace"] =
+                            serde_json::json!(namespace.clone());
+                    }
+                    if let Some(name) = target.tags.get(UPSTREAM_TARGET_SERVICE_NAME_TAG) {
+                        target_config["service_name"] = serde_json::json!(name.clone());
+                    }
+                    target_config
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 fn inject_mesh_global_plugins(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -13692,44 +13748,8 @@ fn inject_mesh_global_plugins(
     if runtime.topology == MeshTopology::NodeWaypoint {
         mesh_authz_config["cluster_domains"] =
             serde_json::json!(node_waypoint_authz_cluster_domains(&runtime.cluster_domain));
-        let route_upstreams: Vec<_> = config
-            .upstreams
-            .iter()
-            .filter(|upstream| node_waypoint_route_upstream_for_authz(&upstream.id))
-            .map(|upstream| {
-                serde_json::json!({
-                    "id": upstream.id.clone(),
-                    "namespace": upstream.namespace.clone(),
-                    "targets": upstream.targets.iter().map(|target| {
-                        let service_port = target.service_port_policy_key.or_else(|| {
-                            target
-                                .tags
-                                .get(UPSTREAM_TARGET_SERVICE_PORT_TAG)
-                                .and_then(|value| value.parse::<u16>().ok())
-                                .filter(|port| *port != 0)
-                        });
-                        let mut target_config = serde_json::json!({
-                            "host": target.host.clone(),
-                            "port": target.port,
-                        });
-                        if let Some(service_port) = service_port {
-                            target_config["service_port"] = serde_json::json!(service_port);
-                        }
-                        if let Some(namespace) =
-                            target.tags.get(UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG)
-                        {
-                            target_config["service_namespace"] =
-                                serde_json::json!(namespace.clone());
-                        }
-                        if let Some(name) = target.tags.get(UPSTREAM_TARGET_SERVICE_NAME_TAG) {
-                            target_config["service_name"] = serde_json::json!(name.clone());
-                        }
-                        target_config
-                    }).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        mesh_authz_config["node_waypoint_route_upstreams"] = serde_json::json!(route_upstreams);
+        mesh_authz_config["node_waypoint_route_upstreams"] =
+            serde_json::json!(node_waypoint_authz_route_upstreams(config));
     }
     // Only thread the mesh-managed assertor list when it is explicit or when
     // an identity-backed NodeWaypoint received the CP-derived exact assertor
@@ -14182,71 +14202,20 @@ fn merge_tracing_config(
 /// passes through. An invalid JWT is rejected. Enforcement (requiring a
 /// JWT) comes from AuthorizationPolicy. So the plugin is configured with
 /// `anonymous_on_missing_token: true`.
+///
+/// The global instance carries the resources that select THIS proxy's own
+/// identity. On a NodeWaypoint, routes that reach a modeled destination are
+/// re-scoped to that destination's resources afterwards by
+/// [`scope_request_auth_to_node_waypoint_destinations`].
 fn inject_mesh_request_auth_plugin(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) {
-    use crate::modes::mesh::config::scope_applies_to_workload;
-
-    // FAIL CLOSED on an ambiguous shared-SPIFFE slice. When `labels_ambiguous`
-    // is set, `mesh_slice.labels` is only the partial intersection of the
-    // divergent candidates sharing this SPIFFE, NOT this workload's
-    // authoritative labels, and `request_authentications` carries the
-    // candidate-any superset (a JWT RequestAuthentication that matches only ONE
-    // candidate rode in). Filtering solely by the partial intersection would
-    // silently DROP such a selector-scoped RA, so a forged token for that issuer
-    // would pass unvalidated — a fail-OPEN. Since we cannot prove the selector
-    // does NOT apply to this workload, INCLUDE candidate-any selector-scoped RAs
-    // the intersection cannot resolve so their JWT providers are still installed
-    // (Istio RequestAuthentication stays permissive: a request with no token
-    // passes; only a forged/invalid token for that issuer is rejected). A
-    // non-ambiguous slice (unique SPIFFE / concrete labels / a DP that resolved
-    // its authoritative labels) is enforcement-IDENTICAL: only the partial-
-    // intersection branch runs. The operator pins
-    // `FERRUM_MESH_WORKLOAD_LABELS` / `mesh_slice.labels` to clear the marker and
-    // re-filter the superset deterministically.
-    let mut included_fail_closed = false;
-    let applicable: Vec<&MeshRequestAuthentication> = mesh_slice
-        .request_authentications
-        .iter()
-        .filter(|ra| {
-            if scope_applies_to_workload(&ra.scope, &mesh_slice.namespace, &mesh_slice.labels) {
-                return true;
-            }
-            // Unresolvable candidate-only selector RA on an ambiguous slice:
-            // include it fail-closed. Only WorkloadSelector scopes are at risk —
-            // MeshWide always matched above, and Namespace resolves against the
-            // authoritative `mesh_slice.namespace`, not the ambiguous labels. A
-            // selector whose NAMESPACE does not match is also authoritatively
-            // non-applicable (namespace is never ambiguous), so escalate ONLY on
-            // label divergence within this workload's namespace.
-            let unresolvable_selector = mesh_slice.labels_ambiguous
-                && match &ra.scope {
-                    crate::modes::mesh::config::PolicyScope::WorkloadSelector { selector } => {
-                        selector
-                            .namespace
-                            .as_deref()
-                            .is_none_or(|ns| ns == mesh_slice.namespace)
-                    }
-                    _ => false,
-                };
-            if unresolvable_selector {
-                included_fail_closed = true;
-            }
-            unresolvable_selector
-        })
+    let applicable: Vec<&MeshRequestAuthentication> = own_request_authentications(mesh_slice)
+        .into_iter()
+        .map(|index| &mesh_slice.request_authentications[index])
         .collect();
-
-    if included_fail_closed {
-        warn!(
-            "mesh RequestAuthentication: ambiguous shared-SPIFFE slice carries a candidate-only \
-             selector RequestAuthentication the partial label intersection cannot resolve; \
-             installing its JWT provider(s) (fail closed) so forged tokens cannot bypass \
-             validation. Set FERRUM_MESH_WORKLOAD_LABELS / mesh_slice.labels to pin this \
-             workload's identity for deterministic resolution"
-        );
-    }
 
     // FAIL CLOSED on a refused RequestAuthentication (issue #6656). Kubernetes
     // translation publishes a resource it could not translate as a rule-less
@@ -14272,11 +14241,7 @@ fn inject_mesh_request_auth_plugin(
             config,
             MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
             "request_termination",
-            serde_json::json!({
-                "status_code": 503,
-                "content_type": "application/json",
-                "message": MESH_REQUEST_AUTH_REFUSED_MESSAGE,
-            }),
+            mesh_request_auth_refusal_config(),
             &runtime.namespace,
         );
         return;
@@ -14287,13 +14252,106 @@ fn inject_mesh_request_auth_plugin(
         &runtime.namespace,
     );
 
-    if applicable.is_empty() {
-        // No applicable RequestAuthentication — remove any previously injected
-        // mesh request auth plugin so it doesn't persist across config updates.
-        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
-        return;
+    match mesh_request_auth_jwks_config(&applicable, runtime) {
+        Some(jwks_config) => ensure_global_plugin(
+            config,
+            MESH_REQUEST_AUTH_PLUGIN_ID,
+            "jwks_auth",
+            jwks_config,
+            &runtime.namespace,
+        ),
+        // No applicable RequestAuthentication with a usable JWT rule — remove
+        // any previously injected mesh request auth plugin so it doesn't
+        // persist across config updates.
+        None => remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace),
     }
+}
 
+/// Indices into `mesh_slice.request_authentications` of the resources that
+/// select this proxy's OWN identity.
+///
+/// FAIL CLOSED on an ambiguous shared-SPIFFE slice. When `labels_ambiguous`
+/// is set, `mesh_slice.labels` is only the partial intersection of the
+/// divergent candidates sharing this SPIFFE, NOT this workload's
+/// authoritative labels, and `request_authentications` carries the
+/// candidate-any superset (a JWT RequestAuthentication that matches only ONE
+/// candidate rode in). Filtering solely by the partial intersection would
+/// silently DROP such a selector-scoped RA, so a forged token for that issuer
+/// would pass unvalidated — a fail-OPEN. Since we cannot prove the selector
+/// does NOT apply to this workload, INCLUDE candidate-any selector-scoped RAs
+/// the intersection cannot resolve so their JWT providers are still installed
+/// (Istio RequestAuthentication stays permissive: a request with no token
+/// passes; only a forged/invalid token for that issuer is rejected). A
+/// non-ambiguous slice (unique SPIFFE / concrete labels / a DP that resolved
+/// its authoritative labels) is enforcement-IDENTICAL: only the partial-
+/// intersection branch runs. The operator pins
+/// `FERRUM_MESH_WORKLOAD_LABELS` / `mesh_slice.labels` to clear the marker and
+/// re-filter the superset deterministically.
+fn own_request_authentications(mesh_slice: &MeshSlice) -> BTreeSet<usize> {
+    use crate::modes::mesh::config::scope_applies_to_workload;
+
+    let mut included_fail_closed = false;
+    let applicable: BTreeSet<usize> = mesh_slice
+        .request_authentications
+        .iter()
+        .enumerate()
+        .filter(|(_, ra)| {
+            if scope_applies_to_workload(&ra.scope, &mesh_slice.namespace, &mesh_slice.labels) {
+                return true;
+            }
+            // Unresolvable candidate-only selector RA on an ambiguous slice:
+            // include it fail-closed. Only WorkloadSelector scopes are at risk —
+            // MeshWide always matched above, and Namespace resolves against the
+            // authoritative `mesh_slice.namespace`, not the ambiguous labels. A
+            // selector whose NAMESPACE does not match is also authoritatively
+            // non-applicable (namespace is never ambiguous), so escalate ONLY on
+            // label divergence within this workload's namespace.
+            let unresolvable_selector = mesh_slice.labels_ambiguous
+                && match &ra.scope {
+                    crate::modes::mesh::config::PolicyScope::WorkloadSelector { selector } => {
+                        selector
+                            .namespace
+                            .as_deref()
+                            .is_none_or(|ns| ns == mesh_slice.namespace)
+                    }
+                    _ => false,
+                };
+            if unresolvable_selector {
+                included_fail_closed = true;
+            }
+            unresolvable_selector
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    if included_fail_closed {
+        warn!(
+            "mesh RequestAuthentication: ambiguous shared-SPIFFE slice carries a candidate-only \
+             selector RequestAuthentication the partial label intersection cannot resolve; \
+             installing its JWT provider(s) (fail closed) so forged tokens cannot bypass \
+             validation. Set FERRUM_MESH_WORKLOAD_LABELS / mesh_slice.labels to pin this \
+             workload's identity for deterministic resolution"
+        );
+    }
+    applicable
+}
+
+/// The `request_termination` config that answers a refused
+/// RequestAuthentication (issue #6656).
+fn mesh_request_auth_refusal_config() -> serde_json::Value {
+    serde_json::json!({
+        "status_code": 503,
+        "content_type": "application/json",
+        "message": MESH_REQUEST_AUTH_REFUSED_MESSAGE,
+    })
+}
+
+/// The `jwks_auth` config enforcing `applicable`, or `None` when no resource
+/// carries a usable JWT rule.
+fn mesh_request_auth_jwks_config(
+    applicable: &[&MeshRequestAuthentication],
+    runtime: &MeshRuntimeConfig,
+) -> Option<serde_json::Value> {
     // Several applicable RequestAuthentications are combined into one
     // `jwks_auth` instance. Identical rules are installed once: verifying the
     // same provider twice is pointless and would count twice against the
@@ -14304,7 +14362,7 @@ fn inject_mesh_request_auth_plugin(
     // Collection stops one past the provider cap, so dedupe work stays
     // bounded and the oversized union still fails construction.
     let mut providers: Vec<serde_json::Value> = Vec::new();
-    'collect: for ra in &applicable {
+    'collect: for ra in applicable {
         for rule in &ra.jwt_rules {
             if providers.len() > crate::plugins::jwks_auth::MAX_JWKS_PROVIDERS {
                 break 'collect;
@@ -14318,8 +14376,7 @@ fn inject_mesh_request_auth_plugin(
     }
 
     if providers.is_empty() {
-        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
-        return;
+        return None;
     }
 
     // Istio RequestAuthentication is permissive: a request with no token
@@ -14334,20 +14391,266 @@ fn inject_mesh_request_auth_plugin(
     // `exp`, so operators can relax this with
     // `FERRUM_MESH_REQUEST_AUTH_REQUIRE_EXP=false`. Expiry *validation* stays
     // on regardless — a present-but-expired `exp` is always rejected.
-    let jwks_config = serde_json::json!({
+    Some(serde_json::json!({
         "providers": providers,
         "require_exp": runtime.request_auth_require_exp,
         "emit_mesh_request_principal_metadata": true,
         "allow_missing_token": true,
-    });
+    }))
+}
 
-    ensure_global_plugin(
-        config,
-        MESH_REQUEST_AUTH_PLUGIN_ID,
-        "jwks_auth",
-        jwks_config,
-        &runtime.namespace,
-    );
+/// Re-scope RequestAuthentication on a NodeWaypoint's routes to the
+/// workloads each route reaches (issue #6670).
+///
+/// A NodeWaypoint is shared: its own identity says nothing about the captured
+/// pods it terminates HTTP for, so a selector RequestAuthentication naming a
+/// destination (`app=api`) never matched the waypoint and its JWT validation,
+/// token stripping, claim-header ownership, and #6656 refusal were all absent
+/// on the Layer-7 Service routes the waypoint serves for that destination.
+///
+/// Each HTTP route is resolved to its destination workloads through the same
+/// index `mesh_authz` uses for destination policy (including every
+/// `mesh_route_dispatch` override destination it may be rewritten to after
+/// authentication), and receives exactly the resources that select those
+/// workloads:
+///
+/// * a set that differs from the waypoint's own set gets a proxy-group
+///   `jwks_auth` instance (`__mesh_request_auth_dst_*`) attached to its routes,
+///   which replaces the global `__mesh_request_auth` there, so one
+///   destination's providers and claim headers never apply to another;
+/// * a set that contains a refused resource returns the route for the scoped
+///   refusal instead (see [`scope_request_auth_refusal_to_inbound_routes`]).
+///
+/// A destination that cannot be resolved contributes the waypoint's own set,
+/// and a route with no modeled destination keeps the global instance
+/// unchanged. The inbound HBONE relay is Layer 4 and is handled by
+/// `mesh_authz`. Returns the refused routes as `(namespace, proxy id)`.
+fn scope_request_auth_to_node_waypoint_destinations(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) -> Vec<(String, String)> {
+    use crate::modes::mesh::config::scope_applies_to_workload;
+
+    // Every prepare re-derives the destination instances from scratch.
+    config.plugin_configs.retain(|plugin| {
+        !plugin
+            .id
+            .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+    });
+    for proxy in &mut config.proxies {
+        proxy.plugins.retain(|association| {
+            !association
+                .plugin_config_id
+                .starts_with(MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX)
+        });
+    }
+    if runtime.topology != MeshTopology::NodeWaypoint
+        || mesh_slice.request_authentications.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let index_config = serde_json::json!({
+        "cluster_domain": runtime.cluster_domain,
+        "cluster_domains": node_waypoint_authz_cluster_domains(&runtime.cluster_domain),
+        "node_waypoint_route_upstreams": node_waypoint_authz_route_upstreams(config),
+    });
+    let index = match crate::plugins::mesh::authz::node_waypoint_destination_scope_index(
+        mesh_slice,
+        &index_config,
+    ) {
+        Ok(index) => index,
+        Err(error) => {
+            // `mesh_authz` rejects the same input, so this generation is not
+            // published; nothing is re-scoped here.
+            warn!(
+                error = %sanitize_startup_cause(error, &[]),
+                "mesh RequestAuthentication: NodeWaypoint destination index could not be built; \
+                 routes keep the waypoint's own RequestAuthentication set"
+            );
+            return Vec::new();
+        }
+    };
+
+    let resources = &mesh_slice.request_authentications;
+    let own = own_request_authentications(mesh_slice);
+    let route_dispatch_rules: HashMap<(&str, &str), &serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "mesh_route_dispatch")
+        .map(|plugin| {
+            (
+                (plugin.namespace.as_str(), plugin.id.as_str()),
+                &plugin.config,
+            )
+        })
+        .collect();
+
+    let mut refused_routes: Vec<(String, String)> = Vec::new();
+    let mut groups: BTreeMap<(String, BTreeSet<usize>), Vec<usize>> = BTreeMap::new();
+    for (proxy_index, proxy) in config.proxies.iter().enumerate() {
+        if proxy
+            .backend_scheme
+            .is_some_and(|scheme| scheme.is_stream())
+            || is_mesh_inbound_route_id(&proxy.id)
+        {
+            continue;
+        }
+        let mut destinations: Vec<(Option<&str>, &str, u16)> = vec![(
+            proxy.upstream_id.as_deref(),
+            proxy.backend_host.as_str(),
+            proxy.backend_port,
+        )];
+        for association in &proxy.plugins {
+            let Some(dispatch) = route_dispatch_rules.get(&(
+                proxy.namespace.as_str(),
+                association.plugin_config_id.as_str(),
+            )) else {
+                continue;
+            };
+            for rule in dispatch
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(destination) = rule.get("destination") else {
+                    continue;
+                };
+                let upstream_id = destination
+                    .get("upstream_id")
+                    .and_then(serde_json::Value::as_str);
+                let backend_host = destination
+                    .get("backend_host")
+                    .and_then(serde_json::Value::as_str);
+                if upstream_id.is_none() && backend_host.is_none() {
+                    continue;
+                }
+                let backend_port = destination
+                    .get("backend_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(proxy.backend_port);
+                destinations.push((
+                    upstream_id,
+                    backend_host.unwrap_or(proxy.backend_host.as_str()),
+                    backend_port,
+                ));
+            }
+        }
+
+        let mut selected: BTreeSet<usize> = BTreeSet::new();
+        let mut resolved = false;
+        let mut unresolved = false;
+        for (upstream_id, backend_host, backend_port) in destinations {
+            let Some(scopes) =
+                index.scopes_for_target(&proxy.namespace, upstream_id, backend_host, backend_port)
+            else {
+                unresolved = true;
+                continue;
+            };
+            resolved = true;
+            selected.extend(
+                resources
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, resource)| {
+                        scopes
+                            .iter()
+                            .any(|scope| {
+                                scope_applies_to_workload(
+                                    &resource.scope,
+                                    &scope.namespace,
+                                    &scope.labels,
+                                )
+                            })
+                            .then_some(index)
+                    }),
+            );
+        }
+        if !resolved {
+            continue;
+        }
+        if unresolved {
+            selected.extend(own.iter().copied());
+        }
+        if selected.iter().any(|&index| resources[index].refused) {
+            refused_routes.push((proxy.namespace.clone(), proxy.id.clone()));
+            continue;
+        }
+        if selected == own {
+            continue;
+        }
+        groups
+            .entry((proxy.namespace.clone(), selected))
+            .or_default()
+            .push(proxy_index);
+    }
+
+    // An operator global `jwks_auth` suppresses mesh RequestAuthentication
+    // injection (see `ensure_global_plugin`); a proxy-group instance would
+    // replace it on the routes it attaches to.
+    let operator_jwks_override = config.plugin_configs.iter().any(|plugin| {
+        plugin.scope == PluginScope::Global
+            && plugin.plugin_name == "jwks_auth"
+            && plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID
+    });
+    if operator_jwks_override {
+        return refused_routes;
+    }
+
+    let now = chrono::Utc::now();
+    for ((namespace, selected), proxy_indices) in groups {
+        let applicable: Vec<&MeshRequestAuthentication> =
+            selected.iter().map(|&index| &resources[index]).collect();
+        // A destination selected by no usable JWT rule keeps the global
+        // instance: a proxy-group instance needs at least one provider.
+        let Some(jwks_config) = mesh_request_auth_jwks_config(&applicable, runtime) else {
+            continue;
+        };
+        let id = mesh_request_auth_destination_plugin_id(&namespace, &applicable);
+        for proxy_index in proxy_indices {
+            config.proxies[proxy_index].plugins.push(PluginAssociation {
+                plugin_config_id: id.clone(),
+            });
+        }
+        config.plugin_configs.push(PluginConfig {
+            labels: Default::default(),
+            id,
+            plugin_name: "jwks_auth".to_string(),
+            namespace,
+            config: jwks_config,
+            scope: PluginScope::ProxyGroup,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+    refused_routes
+}
+
+/// Stable id for the destination `jwks_auth` instance enforcing `applicable`
+/// in `namespace`: equal resource sets reuse one instance across generations.
+fn mesh_request_auth_destination_plugin_id(
+    namespace: &str,
+    applicable: &[&MeshRequestAuthentication],
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    namespace.hash(&mut hasher);
+    for resource in applicable {
+        resource.namespace.hash(&mut hasher);
+        resource.name.hash(&mut hasher);
+    }
+    format!(
+        "{MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX}{:016x}",
+        hasher.finish()
+    )
 }
 
 /// Restrict the RequestAuthentication refusal (issue #6656) to requests
@@ -14368,48 +14671,100 @@ fn inject_mesh_request_auth_plugin(
 /// (all but EastWestGateway's SNI passthrough). Without them the
 /// refusal fell back to unscoped on Ambient and refused the workload's
 /// *outbound* requests instead (issue #6736).
+///
+/// `refused_destination_routes` are NodeWaypoint Service routes whose
+/// destination workloads a refused resource selects (issue #6670). They are
+/// refused too, and install the refusal on their own when the waypoint's own
+/// identity is not refused.
 fn scope_request_auth_refusal_to_inbound_routes(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
+    refused_destination_routes: &[(String, String)],
 ) {
-    let mut inbound: Vec<String> = config
-        .proxies
-        .iter()
-        .filter(|proxy| {
-            proxy.namespace == runtime.namespace
-                && (is_mesh_inbound_route_id(&proxy.id)
-                    // An EgressGateway's materialized `mesh-egress-*` HTTP
-                    // proxies are its inbound HTTP execution routes.
-                    || (runtime.topology == MeshTopology::EgressGateway
-                        && proxy.id.starts_with("mesh-egress-")))
-        })
-        .map(|proxy| proxy.id.clone())
-        .collect();
-    if runtime.topology.has_inbound_tls_termination_listener() {
-        inbound.push(MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string());
-        inbound.push(MESH_INGRESS_HBONE_RELAY_PROXY_ID.to_string());
+    let own_refused = config.plugin_configs.iter().any(|plugin| {
+        plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+    });
+    if !own_refused && refused_destination_routes.is_empty() {
+        return;
     }
-    inbound.sort();
-    inbound.dedup();
+    // A `proxy_id` leaf holds at most `MAX_TRIGGER_LIST_LEN` ids; a workload
+    // with more inbound routes gets an `any` of chunked leaves.
+    let mut leaves: Vec<serde_json::Value> = Vec::new();
+    if own_refused {
+        let mut inbound: Vec<String> = config
+            .proxies
+            .iter()
+            .filter(|proxy| {
+                proxy.namespace == runtime.namespace
+                    && (is_mesh_inbound_route_id(&proxy.id)
+                        // An EgressGateway's materialized `mesh-egress-*` HTTP
+                        // proxies are its inbound HTTP execution routes.
+                        || (runtime.topology == MeshTopology::EgressGateway
+                            && proxy.id.starts_with("mesh-egress-")))
+            })
+            .map(|proxy| proxy.id.clone())
+            .collect();
+        if runtime.topology.has_inbound_tls_termination_listener() {
+            inbound.push(MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string());
+            inbound.push(MESH_INGRESS_HBONE_RELAY_PROXY_ID.to_string());
+        }
+        inbound.sort();
+        inbound.dedup();
+        if inbound.is_empty() {
+            // No mesh inbound route identifies this workload's ingress, so the
+            // refusal stays on every route (fail closed).
+            return;
+        }
+        leaves.extend(
+            inbound
+                .chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
+                .map(|chunk| serde_json::json!({ "match": { "proxy_id": chunk } })),
+        );
+    } else {
+        warn!(
+            routes = refused_destination_routes.len(),
+            "mesh RequestAuthentication: a RequestAuthentication selecting a NodeWaypoint \
+             destination was rejected by translation; refusing every HTTP request on the \
+             waypoint routes to it (fail closed) until it is fixed. See the resource's \
+             FerrumAccepted status"
+        );
+        force_ensure_global_plugin(
+            config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            mesh_request_auth_refusal_config(),
+            &runtime.namespace,
+        );
+    }
+    // Materialized route ids are unique only within a namespace, so each
+    // destination leaf also pins the route's namespace.
+    let mut by_namespace: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (namespace, id) in refused_destination_routes {
+        by_namespace
+            .entry(namespace.as_str())
+            .or_default()
+            .push(id.as_str());
+    }
+    for (namespace, mut ids) in by_namespace {
+        ids.sort_unstable();
+        ids.dedup();
+        for chunk in ids.chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN) {
+            leaves.push(serde_json::json!({
+                "all": [
+                    { "match": { "namespace": [namespace] } },
+                    { "match": { "proxy_id": chunk } },
+                ]
+            }));
+        }
+    }
     let Some(refusal) = config.plugin_configs.iter_mut().find(|plugin| {
         plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
     }) else {
         return;
     };
-    if inbound.is_empty() {
-        // No mesh inbound route identifies this workload's ingress, so the
-        // refusal stays on every route (fail closed).
-        return;
-    }
-    // A `proxy_id` leaf holds at most `MAX_TRIGGER_LIST_LEN` ids; a workload
-    // with more inbound routes gets an `any` of chunked leaves. The trigger is
-    // compiled here so one the plugin cache would reject (which would veto the
-    // whole reload and keep the previous, possibly fail-open, configuration)
-    // falls back to the unscoped refusal instead.
-    let leaves: Vec<serde_json::Value> = inbound
-        .chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
-        .map(|chunk| serde_json::json!({ "match": { "proxy_id": chunk } }))
-        .collect();
+    // The trigger is compiled here so one the plugin cache would reject (which
+    // would veto the whole reload and keep the previous, possibly fail-open,
+    // configuration) falls back to the unscoped refusal instead.
     let when = if leaves.len() == 1 {
         leaves.into_iter().next().unwrap_or_default()
     } else {
@@ -36330,7 +36685,7 @@ mod tests {
             serde_json::json!({"status_code": 503}),
             &runtime.namespace,
         );
-        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime, &[]);
         let refusal = config
             .plugin_configs
             .iter()
@@ -36357,7 +36712,7 @@ mod tests {
             serde_json::json!({"status_code": 503}),
             &runtime.namespace,
         );
-        scope_request_auth_refusal_to_inbound_routes(&mut bare, &runtime);
+        scope_request_auth_refusal_to_inbound_routes(&mut bare, &runtime, &[]);
         // Even with no materialized inbound route, a Sidecar still serves
         // inbound HBONE through the synthesized relays, so the refusal is
         // scoped to exactly those ids rather than left unscoped.
@@ -36399,7 +36754,7 @@ mod tests {
             serde_json::json!({"status_code": 503}),
             &runtime.namespace,
         );
-        scope_request_auth_refusal_to_inbound_routes(&mut wide, &runtime);
+        scope_request_auth_refusal_to_inbound_routes(&mut wide, &runtime, &[]);
         let trigger = wide.plugin_configs[0]
             .trigger
             .as_ref()
@@ -36465,7 +36820,7 @@ mod tests {
                 serde_json::json!({"status_code": 503}),
                 &runtime.namespace,
             );
-            scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+            scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime, &[]);
             let refusal = config
                 .plugin_configs
                 .iter()
@@ -36508,7 +36863,7 @@ mod tests {
             serde_json::json!({"status_code": 503}),
             &runtime.namespace,
         );
-        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime, &[]);
         assert!(config.plugin_configs[0].enabled);
         assert!(config.plugin_configs[0].trigger.is_none());
     }
