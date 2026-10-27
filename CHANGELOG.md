@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.19] - 2026-10-27
 
 This replacement candidate carries forward the changes prepared for 0.9.18.
-That immutable tag was created, but production ARM64 failed and attempt 2
+That immutable tag was created, but production ARM64 failed and attempts 2 and 3
 proved host OOM during fat LTO; no GitHub Release was published. The entries
 below describe 0.9.19, whose publication still requires the protected release
 gates. The latest published release remains 0.9.17.
@@ -3650,8 +3650,8 @@ gateways, control planes, custom plugins, charts or contract consumers.
 
 The immutable tag points to `57966eb9d047378ef6ebf8aa97c94ebf96a38fa6`.
 [Production run 40403791934](https://github.com/ferrum-edge/ferrum-edge/actions/runs/40403791934)
-lost the ARM64 runner in attempt 1; attempt 2 proved host OOM in the gateway's
-fat-LTO `rustc`. ARM64-dependent publication skipped and the GNU ABI and
+lost the ARM64 runner in attempt 1; attempts 2 and 3 proved host OOM in the
+gateway's fat-LTO `rustc`. ARM64-dependent publication skipped and the GNU ABI and
 image-attestation gates failed closed; no GitHub Release was published. The
 tag remains unchanged. Its planned changes are carried forward once under
 0.9.19 above. See the [recovery record](docs/releases/v0.9.18-arm64-recovery.md).

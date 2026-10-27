@@ -2018,7 +2018,7 @@ check failure stops compilation. Existing swap stays enabled. The observer
 records the resulting total/free swap before and after compilation. No
 third-party swap automation or compiler-environment change is involved.
 The job has a **240-minute** budget to allow slower disk-backed fat LTO.
-Attempt 2 of v0.9.18 proved host OOM in a single gateway binary `rustc` after
+Attempts 2 and 3 of v0.9.18 proved host OOM in a single gateway binary `rustc` after
 dependencies finished, so reducing Cargo job concurrency does not bound that
 process's memory. See the [evidence, timeout rationale and qualification
 limits](releases/v0.9.18-arm64-recovery.md). The immutable v0.9.18 tag was not
