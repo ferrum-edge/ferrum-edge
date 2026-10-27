@@ -355,13 +355,12 @@ jobs:
     name: Build (ferrum-edge-linux-aarch64)
     needs: validate-release-sha
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    # Recovery candidate: v0.9.15 succeeded on this explicit host image.
-    # The v0.9.16 Ubuntu 26.04 SIGKILL cause remains unproven.
+    # Retain the v0.9.17 recovery host; v0.9.18 proved host OOM at fat LTO.
     runs-on: ubuntu-24.04
-    # Issue #4674: 2.6x the 45m39s observed compile step, leaving room for the
-    # image pull and sysroot preparation. Raise only when a successful run
-    # exceeds it.
-    timeout-minutes: 120
+    # Allow disk-backed fat LTO twice the prior 120-minute budget (over 5x
+    # the historical 45m39s compile), including swap/image/sysroot setup.
+    # This bounded recovery allowance needs production timing evidence.
+    timeout-minutes: 240
     defaults:
       run:
         shell: bash
@@ -390,6 +389,20 @@ jobs:
             --cargo-config Cargo.toml \
             --ci-workflow .github/workflows/ci.yml \
             --release-workflow .github/workflows/release.yml
+
+      - name: Provision and verify 32 GiB of ARM64 release swap
+        run: |
+          set -euo pipefail
+          test ! -e /swapfile-ferrum-release
+          test ! -L /swapfile-ferrum-release
+          sudo -n fallocate -l 32G /swapfile-ferrum-release
+          sudo -n chmod 600 /swapfile-ferrum-release
+          sudo -n mkswap /swapfile-ferrum-release
+          sudo -n swapon /swapfile-ferrum-release
+          sudo -n swapon --show --bytes
+          # /proc reports KiB; allow at most 1 MiB for swap metadata.
+          awk '$1 == "/swapfile-ferrum-release" && $3 >= 33553408 {found=1} END {exit !found}' /proc/swaps
+          awk '/^SwapTotal:/ && $2 >= 33553408 {found=1} END {exit !found}' /proc/meminfo
 
       - name: Observe ARM64 release host before compilation
         run: |
