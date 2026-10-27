@@ -260,20 +260,8 @@ jobs:
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools
 
-      - name: Create both kind clusters
-        run: |
-          set -euo pipefail
-          kind create cluster --name "$CLUSTER_A" --wait 180s
-          kind create cluster --name "$CLUSTER_B" --wait 180s
-          kubectl --context "kind-$CLUSTER_A" get nodes -o wide
-          kubectl --context "kind-$CLUSTER_B" get nodes -o wide
-
-      - name: Load runtime image into both clusters
-        run: |
-          set -euo pipefail
-          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$CLUSTER_A"
-          kind load docker-image "${FERRUM_IMAGE_REPOSITORY}:${FERRUM_IMAGE_TAG}" --name "$CLUSTER_B"
-
+      # The fixture creates the kind clusters and loads this packaged image.
+      # Keep lifecycle setup in one place to avoid duplicate cluster creation.
       - name: Run live multicluster federation datapath validation
         env:
           FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE: "true"
