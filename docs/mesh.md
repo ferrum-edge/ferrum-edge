@@ -2848,10 +2848,13 @@ the materialized Sidecar inbound routes, an EgressGateway's `mesh-egress-*`
 HTTP proxies, plus the synthesized HBONE relay
 proxies (`__mesh-inbound-hbone-relay` / `__mesh-ingress-connect-relay`), whose
 CONNECT admission runs the global HTTP plugin chain before the tunnel opens.
-On Ambient (and NodeWaypoint/ServiceWaypoint) no inbound HTTP route
-materializes, so those relay ids are what makes the refusal refuse inbound
-CONNECTs there instead of falling back to unscoped and refusing the workload's
-outbound requests (issue #6736). EastWestGateway (SNI passthrough, no HBONE
+On Ambient no inbound HTTP route materializes, so those relay ids are what
+makes the refusal refuse inbound CONNECTs there instead of falling back to
+unscoped and refusing the workload's outbound requests (issue #6736). On
+NodeWaypoint and ServiceWaypoint the managed `mesh_authz` refuses relays per
+destination instead (see "Shared waypoints follow the destination" below); the
+relay ids are used only when an operator `mesh_authz` replaces the managed
+one. EastWestGateway (SNI passthrough, no HBONE
 listener) keeps the unscoped fail-closed fallback. This deliberately differs from
 Istio, whose validating webhook would never admit such a resource; Ferrum
 accepts some resources Istio admits but Ferrum cannot enforce faithfully, and

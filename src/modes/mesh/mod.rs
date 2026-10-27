@@ -14513,30 +14513,32 @@ fn scope_request_auth_to_node_waypoint_destinations(
     // resolve cannot be shown to be outside them.
     let carries_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
     let secured_transport = runtime.node_waypoint_secured_transport_required();
-    // Mesh Service upstreams backed by at least one LOCAL workload. A Service
-    // whose workloads are all in a remote cluster has no local scope by
-    // design (its destination cluster enforces its own resources), so it is
-    // not an unresolved destination here.
-    let locally_backed_upstreams: HashSet<(&str, String)> = mesh_slice
-        .services
-        .iter()
-        .filter(|service| {
-            !matched_local_service_workloads(
-                service,
-                &mesh_slice.workloads,
-                mesh_slice.multi_cluster.as_ref(),
-            )
-            .is_empty()
-        })
-        .flat_map(|service| {
-            service.ports.iter().map(|port| {
+    // The LOCAL workloads behind each mesh Service upstream, keyed by
+    // `(namespace, id)`: the same membership the outbound targets and the
+    // destination index use. A Service whose workloads are all in a remote
+    // cluster has none (its destination cluster enforces its own resources),
+    // so it is not an unresolved destination here.
+    let mut local_upstream_workloads: HashMap<(&str, String), Vec<&config::Workload>> =
+        HashMap::new();
+    for service in &mesh_slice.services {
+        let local = matched_local_service_workloads(
+            service,
+            &mesh_slice.workloads,
+            mesh_slice.multi_cluster.as_ref(),
+        );
+        if local.is_empty() {
+            continue;
+        }
+        for port in &service.ports {
+            local_upstream_workloads.insert(
                 (
                     service.namespace.as_str(),
                     mesh_outbound_upstream_id(&service.namespace, &service.name, port.port),
-                )
-            })
-        })
-        .collect();
+                ),
+                local.clone(),
+            );
+        }
+    }
 
     let mut refused_routes: Vec<(String, String)> = Vec::new();
     let mut divergent_routes = 0usize;
@@ -14626,8 +14628,8 @@ fn scope_request_auth_to_node_waypoint_destinations(
                     index.target_requires_scope(&proxy.namespace, upstream_id, backend_host)
                         && upstream_id.is_none_or(|id| {
                             !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
-                                || locally_backed_upstreams
-                                    .contains(&(proxy.namespace.as_str(), id.to_string()))
+                                || local_upstream_workloads
+                                    .contains_key(&(proxy.namespace.as_str(), id.to_string()))
                         });
                 admit(own.clone());
                 continue;
@@ -14636,16 +14638,22 @@ fn scope_request_auth_to_node_waypoint_destinations(
             for scope in scopes {
                 // A secured NodeWaypoint never dials a Service workload
                 // without NodeWaypoint metadata (`build_outbound_mesh_targets`),
-                // so that workload is not reachable through this route.
+                // so that workload is not reachable through this route. Only
+                // the Service's own LOCAL workloads count: a remote replica
+                // with the same identity is never a target here.
                 if secured_transport
-                    && upstream_id
-                        .is_some_and(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
-                    && !mesh_slice.workloads.iter().any(|workload| {
-                        workload.node_waypoint.is_some()
-                            && workload.spiffe_id == scope.spiffe_id
-                            && workload.namespace == scope.namespace
-                            && workload.selector.labels == scope.labels
-                    })
+                    && let Some(id) =
+                        upstream_id.filter(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
+                    && !local_upstream_workloads
+                        .get(&(proxy.namespace.as_str(), id.to_string()))
+                        .is_some_and(|workloads| {
+                            workloads.iter().any(|workload| {
+                                workload.node_waypoint.is_some()
+                                    && workload.spiffe_id == scope.spiffe_id
+                                    && workload.namespace == scope.namespace
+                                    && workload.selector.labels == scope.labels
+                            })
+                        })
                 {
                     continue;
                 }
@@ -14857,8 +14865,10 @@ fn exclude_routes_from_global_request_auth(
         }));
     }
     // `not`, an outer `any`, and up to two inner `any` nodes leave 124 of the
-    // 128 trigger nodes for leaves, each `any` within the child limit. A set
-    // that still does not fit fails compilation below and is refused.
+    // 128 trigger nodes for leaves, each `any` within the child limit. A plain
+    // `proxy_id` leaf costs one node and a namespace-pinned one three, so
+    // about 42 colliding leaves already exhaust the budget. A set that does
+    // not fit fails compilation below and is refused (fail closed).
     const INNER_LEAVES: usize = 62;
     let excluded = match leaves.len() {
         1 => leaves.into_iter().next().unwrap_or_default(),
@@ -14983,6 +14993,8 @@ fn scope_request_auth_refusal_to_inbound_routes(
     let relays_refused_per_destination = runtime.topology.is_waypoint()
         && config.plugin_configs.iter().any(|plugin| {
             plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
                 && plugin.namespace == runtime.namespace
                 && plugin.id == MESH_AUTHZ_PLUGIN_ID
         });
@@ -37109,7 +37121,10 @@ mod tests {
     /// refusal scopes to the synthesized relay ids there — refusing
     /// inbound CONNECTs without touching the workload's outbound routes.
     /// EastWestGateway (SNI passthrough, no HBONE listener) keeps the
-    /// unscoped fail-closed fallback.
+    /// unscoped fail-closed fallback. The config here carries no managed
+    /// `__mesh_authz`, so the NodeWaypoint/ServiceWaypoint arms cover the
+    /// operator-override fallback; with the managed instance, waypoint relays
+    /// are refused per destination by `mesh_authz` instead (issue #6670).
     #[test]
     fn request_auth_refusal_scopes_to_synthesized_hbone_relays() {
         let now = chrono::Utc::now();

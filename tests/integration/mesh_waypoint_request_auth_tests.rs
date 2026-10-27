@@ -478,6 +478,13 @@ fn node_waypoint_secured_transport_ignores_unreachable_workloads() {
         [("app", "api"), ("version", "v2")],
         ["10.0.0.22"],
     );
+    // An enrolled remote-cluster replica sharing the unenrolled local
+    // workload's identity is never a local target, so it must not make that
+    // local workload count as reachable.
+    let mut remote_replica = unenrolled.clone();
+    remote_replica.addresses = vec!["10.9.0.22".to_string()];
+    remote_replica.remote_provenance = true;
+    remote_replica.node_waypoint = enrolled.node_waypoint.clone();
     let services = vec![service_for(
         "api",
         DEFAULT_NAMESPACE,
@@ -493,7 +500,12 @@ fn node_waypoint_secured_transport_ignores_unreachable_workloads() {
     };
     let slice = MeshSlice {
         request_authentications: vec![request_auth("v1-jwt", v1_only)],
-        ..mesh_slice_with(&runtime, vec![enrolled, unenrolled], services, Vec::new())
+        ..mesh_slice_with(
+            &runtime,
+            vec![enrolled, unenrolled, remote_replica],
+            services,
+            Vec::new(),
+        )
     };
     let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
         .expect("NodeWaypoint slice preparation must succeed");
@@ -620,6 +632,48 @@ fn node_waypoint_own_refusal_does_not_blanket_refuse_relays() {
     assert!(
         !trigger.contains("__mesh-inbound-hbone-relay"),
         "relays are refused per destination by mesh_authz, not wholesale: {trigger}"
+    );
+}
+
+/// A ServiceWaypoint has no Layer-7 Service routes, so with the managed
+/// `mesh_authz` refusing relays per destination, a refused resource selecting
+/// the waypoint's own namespace leaves no blanket refusal behind.
+#[test]
+fn service_waypoint_own_refusal_defers_relays_to_mesh_authz() {
+    let mut runtime = runtime_for_topology(MeshTopology::ServiceWaypoint);
+    runtime.waypoint_name = Some("waypoint".to_string());
+    let (api, web) = api_and_web();
+    let services = vec![
+        service_for("api", DEFAULT_NAMESPACE, &[&api]),
+        service_for("web", DEFAULT_NAMESPACE, &[&web]),
+    ];
+    let slice = MeshSlice {
+        request_authentications: vec![refused_request_auth(
+            "ns-jwt",
+            PolicyScope::Namespace {
+                namespace: DEFAULT_NAMESPACE.to_string(),
+            },
+        )],
+        ..mesh_slice_with(&runtime, vec![api, web], services, Vec::new())
+    };
+    let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("ServiceWaypoint slice preparation must succeed");
+
+    let authz = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == ferrum_edge::modes::mesh::MESH_AUTHZ_PLUGIN_ID)
+        .expect("the managed mesh_authz is injected");
+    assert_eq!(
+        authz.config["mesh_slice"]["request_authentications"][0]["refused"], true,
+        "mesh_authz carries the refused resource for its per-destination relay check"
+    );
+    assert!(
+        config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID),
+        "no blanket relay refusal on a ServiceWaypoint with the managed mesh_authz"
     );
 }
 
