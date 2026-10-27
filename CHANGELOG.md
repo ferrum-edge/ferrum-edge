@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.18] - 2026-10-26
+## [0.9.19] - 2026-10-27
+
+This replacement candidate carries forward the changes prepared for 0.9.18.
+That immutable tag was created, but production ARM64 failed and attempts 2 and 3
+proved host OOM during fat LTO; no GitHub Release was published. The entries
+below describe 0.9.19, whose publication still requires the protected release
+gates. The latest published release remains 0.9.17.
 
 This release is the production-launch hardening pass across the plugin
 catalog. Every built-in plugin was independently reviewed. The resulting fixes
@@ -15,7 +21,7 @@ tighten authentication, credential and assertion hiding, request and response
 size limits, rate limiting, logging sinks, and the AI-gateway and mesh plugins.
 Many changes refuse configuration or traffic that 0.9.17 accepted. The `V001`
 baseline checksum is unchanged from 0.9.17. Read
-[Upgrading to 0.9.18](docs/upgrade_guide.md#upgrading-to-0918) before updating
+[Upgrading to 0.9.19](docs/upgrade_guide.md#upgrading-to-0919) before updating
 gateways, control planes, custom plugins, charts or contract consumers.
 
 ### Added
@@ -132,6 +138,11 @@ gateways, control planes, custom plugins, charts or contract consumers.
   sessions closed with 1009 by `ws_message_size_limiting`.
 
 ### Changed
+- **Refresh public trust data** (PR #6954). Update bundled public TLS roots
+  (`webpki-roots` 1.0.11) and the Public Suffix List (`psl` 2.1.245), including
+  the generated CORS ancestor index. Credentialed wildcard-origin admission
+  follows the updated shared-hosting boundaries; revalidate those policies
+  before upgrading.
 - **BREAKING — `response_caching` `ignore_request_headers` refuses
   underscore-spelled transport fields** (issue #6887 / PR #6913).
   `ignore_request_headers` now rejects `keep_alive`, `proxy_connection`, and
@@ -3623,6 +3634,27 @@ gateways, control planes, custom plugins, charts or contract consumers.
   connector with an `http://` URI, so tonic does not expect to add a second
   TLS layer. The request keeps the original `https` origin and authority, and
   the verifier keeps the configured server name, trust and CRLs.
+
+### Release recovery
+
+- Provision and verify an additional 32 GiB host swapfile before the protected
+  ARM64 Cross build to address the proven single-process fat-LTO OOM. Retain
+  Ubuntu 24.04 and checksum-pinned resource observations; raise the job budget
+  from 120 to 240 minutes for disk-backed LTO. Refreeze the exact job contract
+  and add swap/deadline tamper regressions. The sanitized compiler invocation,
+  fat LTO, codegen-units=1, features, pins, ABI checks, signing and publication
+  gates remain unchanged. Production recovery still needs hosted evidence;
+  see the [recovery record](docs/releases/v0.9.18-arm64-recovery.md).
+
+## [0.9.18] - 2026-10-26 [TAGGED, NOT PUBLISHED]
+
+The immutable tag points to `57966eb9d047378ef6ebf8aa97c94ebf96a38fa6`.
+[Production run 40403791934](https://github.com/ferrum-edge/ferrum-edge/actions/runs/40403791934)
+lost the ARM64 runner in attempt 1; attempts 2 and 3 proved host OOM in the
+gateway's fat-LTO `rustc`. ARM64-dependent publication skipped and the GNU ABI and
+image-attestation gates failed closed; no GitHub Release was published. The
+tag remains unchanged. Its planned changes are carried forward once under
+0.9.19 above. See the [recovery record](docs/releases/v0.9.18-arm64-recovery.md).
 
 ## [0.9.17] - 2026-10-10
 
@@ -11542,7 +11574,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.18...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.19...HEAD
+[0.9.19]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.19
 [0.9.18]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.17
 [0.9.16]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.16
