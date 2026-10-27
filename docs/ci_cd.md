@@ -2009,7 +2009,7 @@ full-release ABI job are removed; fast test artifacts make no production ABI
 claim. Existing frozen parser, shell, action, and artifact-ownership checks
 continue to protect the production lane.
 
-The v0.9.19 recovery candidate retains Ubuntu 24.04 and provisions an
+The v0.9.19 recovery retains Ubuntu 24.04 and provisions an
 additional **32 GiB** swapfile on the runner root filesystem before the
 checksum-pinned `before` resource observation. Fixed host commands create a
 new `0600` file and enable it; `swapon --show --bytes`, `/proc/swaps` and
@@ -4387,7 +4387,7 @@ the shipping-profile experiment remains not adopted.** The `build-release-binari
 job now carries `timeout-minutes: 180` with 165 on each build step and uploads
 `target/cargo-timings/` as `release-build-timings-<target>` (14-day retention),
 and `build-release-arm64-cross` originally carried `timeout-minutes: 120`.
-The v0.9.19 OOM recovery candidate raises only ARM64 to **240 minutes** for
+The v0.9.19 OOM recovery raises only ARM64 to **240 minutes** for
 disk-backed fat LTO and refreezes its job digest in
 `verify_cross_build_policy.py`. Everything below records the original budget
 evidence and why the
@@ -4429,8 +4429,10 @@ cold cache and a slow runner:
 - `build-release-arm64-cross`: originally **`timeout-minutes: 120`** — 2.6×
   its 45m39s observed compile step. The v0.9.19 recovery uses **240 minutes**,
   twice that allowance and over 5× the observed compile, to include swap
-  provisioning, image/sysroot preparation and disk-backed LTO. This budget
-  still needs successful production timing evidence.
+  provisioning, image/sysroot preparation and disk-backed LTO. The v0.9.19
+  production run 40457120201 supplied the timing evidence: the ARM64 build
+  step, including the fat-LTO link, took 36 minutes 1 second with the 32 GiB
+  swap provisioned.
 
 Both remain below 360. The ARM64 increase accompanies a demonstrated OOM
 capacity fix, rather than an unexplained hang. Subsequent budget changes

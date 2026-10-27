@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.19] - 2026-10-27
 
-This replacement candidate carries forward the changes prepared for 0.9.18.
+This replacement release carries forward the changes prepared for 0.9.18.
 That immutable tag was created, but production ARM64 failed and attempts 2 and 3
-proved host OOM during fat LTO; no GitHub Release was published. The entries
-below describe 0.9.19, whose publication still requires the protected release
-gates. The latest published release remains 0.9.17.
+proved host OOM during fat LTO; no GitHub Release was published for it. 0.9.19
+was published on 2026-10-27 from commit
+`510ce7121c3d9754110d330a30a3bd9b7a7b278e`; see the
+[publication record](docs/releases/v0.9.19-candidate.md).
 
 This release is the production-launch hardening pass across the plugin
 catalog. Every built-in plugin was independently reviewed. The resulting fixes
@@ -3643,7 +3644,7 @@ gateways, control planes, custom plugins, charts or contract consumers.
   from 120 to 240 minutes for disk-backed LTO. Refreeze the exact job contract
   and add swap/deadline tamper regressions. The sanitized compiler invocation,
   fat LTO, codegen-units=1, features, pins, ABI checks, signing and publication
-  gates remain unchanged. Production recovery still needs hosted evidence;
+  gates remain unchanged. The v0.9.19 production run qualified the recovery;
   see the [recovery record](docs/releases/v0.9.18-arm64-recovery.md).
 
 ## [0.9.18] - 2026-10-26 [TAGGED, NOT PUBLISHED]
