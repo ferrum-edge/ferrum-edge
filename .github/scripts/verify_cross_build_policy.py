@@ -13683,7 +13683,17 @@ CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
 WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
     tuple[str, str, str, str], ...
 ] = (
-    # Empty: no workflow-directory job transition is currently admitted.
+    # PR #6958's coverage-merge timeout increase. The only admitted change is
+    # the exact current-main 45-minute job block to the reviewed 75-minute
+    # timeout-only block. This path/job-bound, one-way pair does not admit any
+    # other coverage workflow or job revision; retire it once the 75-minute
+    # destination reaches main.
+    (
+        "coverage.yml",
+        "coverage-merge",
+        "7baca228a7d71bd47c103466d86f5f00c308a1e5ae8dc83a7e7a6b9544d5b9e3",
+        "3c5ce317143ed0d5d87994f5cbfd322cd941c52e97a64b6e55089cc5ecfe18a4",
+    ),
     #
     # The `coverage.yml` `coverage-merge` pair for PR #3917 (issue #3907) was
     # retired here. Both are closed -- #3917 merged 2026-08-18 and its
