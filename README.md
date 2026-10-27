@@ -599,20 +599,14 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The latest published tag is
-[`contracts-edge-0.9.17`](https://github.com/ferrum-edge/ferrum-contracts/tree/f7ba1a9b9885900d1e110f76d38e37a02eda13c8)
-at `f7ba1a9b9885900d1e110f76d38e37a02eda13c8`, published on
-2026-10-10 for Edge **v0.9.17** at release commit
-`669c574c1d1e88e84dccb26a8159939e6694644d`. No `contracts-edge-0.9.16` tag
-exists because Edge v0.9.16 was tagged but never published. Earlier contract
+Edge source. The current published Edge release is **v0.9.19**. Its matching
+Contracts tag is
+[`contracts-edge-0.9.19`](https://github.com/ferrum-edge/ferrum-contracts/tree/d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b)
+at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, published on
+2026-10-27 for Edge release commit
+`510ce7121c3d9754110d330a30a3bd9b7a7b278e`. No `contracts-edge-0.9.18` tag
+exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
-
-The **v0.9.19 candidate** carries the plugin production-launch hardening
-from tagged but unpublished v0.9.18 and adds the [ARM64 OOM
-recovery](docs/releases/v0.9.18-arm64-recovery.md). Its protected production
-release and the matching `contracts-edge-0.9.19`
-publication must succeed before consumers move their pins. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0919).
 
 **v0.9.17** carries the changes from tagged but unpublished v0.9.16. It adds
 the `loop_detected` gateway-error token, the
@@ -620,9 +614,9 @@ the `loop_detected` gateway-error token, the
 cancelled uploads. Namespace-bounded admin tokens gain a tenant health tier
 and cannot read fleet-wide routes or `/metrics`. Admin cached-fallback misses
 return `503 CachedReadUnavailable`, and plugin trust follows registered types.
-Consumers move their pins to `contracts-edge-0.9.17` when they adopt Edge
-v0.9.17. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0917).
+Consumers move their pins to `contracts-edge-0.9.19` when they adopt Edge
+v0.9.19. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0919).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the

@@ -2009,7 +2009,7 @@ full-release ABI job are removed; fast test artifacts make no production ABI
 claim. Existing frozen parser, shell, action, and artifact-ownership checks
 continue to protect the production lane.
 
-The v0.9.19 recovery candidate retains Ubuntu 24.04 and provisions an
+The v0.9.19 recovery retains Ubuntu 24.04 and provisions an
 additional **32 GiB** swapfile on the runner root filesystem before the
 checksum-pinned `before` resource observation. Fixed host commands create a
 new `0600` file and enable it; `swapon --show --bytes`, `/proc/swaps` and
@@ -4387,7 +4387,7 @@ the shipping-profile experiment remains not adopted.** The `build-release-binari
 job now carries `timeout-minutes: 180` with 165 on each build step and uploads
 `target/cargo-timings/` as `release-build-timings-<target>` (14-day retention),
 and `build-release-arm64-cross` originally carried `timeout-minutes: 120`.
-The v0.9.19 OOM recovery candidate raises only ARM64 to **240 minutes** for
+The v0.9.19 OOM recovery raises only ARM64 to **240 minutes** for
 disk-backed fat LTO and refreezes its job digest in
 `verify_cross_build_policy.py`. Everything below records the original budget
 evidence and why the
