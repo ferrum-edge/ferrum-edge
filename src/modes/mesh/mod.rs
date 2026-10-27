@@ -14513,12 +14513,15 @@ fn scope_request_auth_to_node_waypoint_destinations(
     // resolve cannot be shown to be outside them.
     let carries_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
     let secured_transport = runtime.node_waypoint_secured_transport_required();
-    // The LOCAL workloads behind each mesh Service upstream, keyed by
-    // `(namespace, id)`: the same membership the outbound targets and the
-    // destination index use. A Service whose workloads are all in a remote
-    // cluster has none (its destination cluster enforces its own resources),
-    // so it is not an unresolved destination here.
-    let mut local_upstream_workloads: HashMap<(&str, String), Vec<&config::Workload>> =
+    // The workloads each mesh Service upstream can actually dial, keyed by
+    // `(namespace, id)` and derived with the same rules as
+    // `build_outbound_mesh_targets`: the Service's LOCAL members, with a
+    // resolvable app port and an address, and (on a secured NodeWaypoint)
+    // NodeWaypoint metadata. RA sets are compared over exactly these. An
+    // upstream with no local member at all (a Service whose workloads are all
+    // in a remote cluster, which enforces its own resources) is absent, so it
+    // is not an unresolved destination here.
+    let mut dialable_upstream_workloads: HashMap<(&str, String), Vec<&config::Workload>> =
         HashMap::new();
     for service in &mesh_slice.services {
         let local = matched_local_service_workloads(
@@ -14530,12 +14533,28 @@ fn scope_request_auth_to_node_waypoint_destinations(
             continue;
         }
         for port in &service.ports {
-            local_upstream_workloads.insert(
+            let dialable = local
+                .iter()
+                .copied()
+                .filter(|workload| {
+                    !workload.addresses.is_empty()
+                        && (!secured_transport || workload.node_waypoint.is_some())
+                        && match port.target_port.as_ref() {
+                            Some(_) => config::resolve_target_port(
+                                port.target_port.as_ref(),
+                                &workload.ports,
+                            )
+                            .is_some_and(|app_port| app_port != 0),
+                            None => port.port != 0,
+                        }
+                })
+                .collect();
+            dialable_upstream_workloads.insert(
                 (
                     service.namespace.as_str(),
                     mesh_outbound_upstream_id(&service.namespace, &service.name, port.port),
                 ),
-                local.clone(),
+                dialable,
             );
         }
     }
@@ -14620,57 +14639,47 @@ fn scope_request_auth_to_node_waypoint_destinations(
             Some(_) => {}
         };
         let mut unresolved_modeled = false;
+        let resources_selecting = |namespace: &str, labels: &HashMap<String, String>| {
+            resources
+                .iter()
+                .enumerate()
+                .filter(|(_, resource)| {
+                    scope_applies_to_workload(&resource.scope, namespace, labels)
+                })
+                .map(|(index, _)| index)
+                .collect::<BTreeSet<usize>>()
+        };
         for (upstream_id, backend_host, backend_port) in destinations {
+            if let Some(dialable) = upstream_id
+                .filter(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
+                .and_then(|id| {
+                    dialable_upstream_workloads.get(&(proxy.namespace.as_str(), id.to_string()))
+                })
+            {
+                resolved = true;
+                for workload in dialable {
+                    admit(resources_selecting(
+                        &workload.namespace,
+                        &workload.selector.labels,
+                    ));
+                }
+                continue;
+            }
             let Some(scopes) =
                 index.scopes_for_target(&proxy.namespace, upstream_id, backend_host, backend_port)
             else {
+                // A mesh Service upstream with local members was handled
+                // above, so a missing one here has none locally.
                 unresolved_modeled |=
                     index.target_requires_scope(&proxy.namespace, upstream_id, backend_host)
-                        && upstream_id.is_none_or(|id| {
-                            !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
-                                || local_upstream_workloads
-                                    .contains_key(&(proxy.namespace.as_str(), id.to_string()))
-                        });
+                        && upstream_id
+                            .is_none_or(|id| !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX));
                 admit(own.clone());
                 continue;
             };
             resolved = true;
             for scope in scopes {
-                // A secured NodeWaypoint never dials a Service workload
-                // without NodeWaypoint metadata (`build_outbound_mesh_targets`),
-                // so that workload is not reachable through this route. Only
-                // the Service's own LOCAL workloads count: a remote replica
-                // with the same identity is never a target here.
-                if secured_transport
-                    && let Some(id) =
-                        upstream_id.filter(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
-                    && !local_upstream_workloads
-                        .get(&(proxy.namespace.as_str(), id.to_string()))
-                        .is_some_and(|workloads| {
-                            workloads.iter().any(|workload| {
-                                workload.node_waypoint.is_some()
-                                    && workload.spiffe_id == scope.spiffe_id
-                                    && workload.namespace == scope.namespace
-                                    && workload.selector.labels == scope.labels
-                            })
-                        })
-                {
-                    continue;
-                }
-                admit(
-                    resources
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, resource)| {
-                            scope_applies_to_workload(
-                                &resource.scope,
-                                &scope.namespace,
-                                &scope.labels,
-                            )
-                        })
-                        .map(|(index, _)| index)
-                        .collect(),
-                );
+                admit(resources_selecting(&scope.namespace, &scope.labels));
             }
         }
         if unresolved_modeled && carries_destination_resources {

@@ -24,8 +24,8 @@ use ferrum_edge::config::types::{GatewayConfig, PluginScope, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::{
-    MeshJwtRule, MeshRequestAuthentication, NodeWaypointEndpoint, PolicyScope, Workload,
-    WorkloadSelector,
+    MeshJwtRule, MeshRequestAuthentication, NodeWaypointEndpoint, PolicyScope, ServiceTargetPort,
+    Workload, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
@@ -674,6 +674,83 @@ fn service_waypoint_own_refusal_defers_relays_to_mesh_authz() {
             .iter()
             .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID),
         "no blanket relay refusal on a ServiceWaypoint with the managed mesh_authz"
+    );
+}
+
+/// An enrolled replica that cannot serve the Service port (its named
+/// targetPort does not resolve) must not make an unenrolled twin with the same
+/// identity count as reachable: only workloads the route can dial are compared.
+#[test]
+fn node_waypoint_secured_transport_compares_only_dialable_replicas() {
+    let mut runtime = node_waypoint_runtime();
+    runtime.workload_svid_cert_path = Some("/var/run/secrets/svid.pem".to_string());
+    runtime.workload_svid_key_path = Some("/var/run/secrets/svid.key".to_string());
+    runtime.workload_svid_trust_bundle_path = Some("/var/run/secrets/bundle.pem".to_string());
+    let endpoint = |workload: &Workload| NodeWaypointEndpoint {
+        address: "192.0.2.10".to_string(),
+        hbone_port: 15008,
+        spiffe_id: workload.spiffe_id.clone(),
+        node_name: None,
+        node_uid: None,
+        network: None,
+        cluster: None,
+    };
+    let mut enrolled_v1 = workload_for(
+        "api-v1",
+        DEFAULT_NAMESPACE,
+        [("app", "api"), ("version", "v1")],
+        ["10.0.0.21"],
+    );
+    enrolled_v1.node_waypoint = Some(endpoint(&enrolled_v1));
+    let unenrolled_v2 = workload_for(
+        "api-v2",
+        DEFAULT_NAMESPACE,
+        [("app", "api"), ("version", "v2")],
+        ["10.0.0.22"],
+    );
+    // Same identity and labels as `unenrolled_v2`, enrolled, but it declares
+    // no `http` port, so the Service's named targetPort never resolves on it.
+    let mut portless_v2 = unenrolled_v2.clone();
+    portless_v2.addresses = vec!["10.0.0.23".to_string()];
+    portless_v2.ports[0].name = Some("metrics".to_string());
+    portless_v2.node_waypoint = Some(endpoint(&portless_v2));
+    let mut service = service_for(
+        "api",
+        DEFAULT_NAMESPACE,
+        &[&enrolled_v1, &unenrolled_v2, &portless_v2],
+    );
+    service.ports[0].target_port = Some(ServiceTargetPort::Name("http".to_string()));
+    let v1_only = PolicyScope::WorkloadSelector {
+        selector: WorkloadSelector {
+            labels: [("version".to_string(), "v1".to_string())]
+                .into_iter()
+                .collect(),
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+        },
+    };
+    let slice = MeshSlice {
+        request_authentications: vec![request_auth("v1-jwt", v1_only)],
+        ..mesh_slice_with(
+            &runtime,
+            vec![enrolled_v1, unenrolled_v2, portless_v2],
+            vec![service],
+            Vec::new(),
+        )
+    };
+    let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("NodeWaypoint slice preparation must succeed");
+
+    assert_eq!(
+        destination_issuers(&config, service_route(&config, "api")),
+        Some(vec!["https://v1-jwt.example.com".to_string()]),
+        "only the dialable v1 replica governs the route"
+    );
+    assert!(
+        config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID),
+        "the route must not be refused for replicas it cannot dial"
     );
 }
 
