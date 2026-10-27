@@ -124,6 +124,9 @@ pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
 /// request to a workload selected by a RequestAuthentication Ferrum refused
 /// (issue #6656).
 pub const MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID: &str = "__mesh_request_auth_refused";
+/// Id prefix of the additional refusal instances a refusal too large for one
+/// execution trigger is split across.
+pub const MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX: &str = "__mesh_request_auth_refused_";
 /// Id prefix of the proxy-group `jwks_auth` instances that enforce a
 /// NodeWaypoint route's destination RequestAuthentications (issue #6670).
 pub const MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX: &str = "__mesh_request_auth_dst_";
@@ -14509,6 +14512,29 @@ fn scope_request_auth_to_node_waypoint_destinations(
     // exist, a route that reaches a modeled destination this index cannot
     // resolve cannot be shown to be outside them.
     let carries_destination_resources = (0..resources.len()).any(|index| !own.contains(&index));
+    let secured_transport = runtime.node_waypoint_secured_transport_required();
+    // Mesh Service upstreams backed by at least one LOCAL workload. A Service
+    // whose workloads are all in a remote cluster has no local scope by
+    // design (its destination cluster enforces its own resources), so it is
+    // not an unresolved destination here.
+    let locally_backed_upstreams: HashSet<String> = mesh_slice
+        .services
+        .iter()
+        .filter(|service| {
+            !matched_local_service_workloads(
+                service,
+                &mesh_slice.workloads,
+                mesh_slice.multi_cluster.as_ref(),
+            )
+            .is_empty()
+        })
+        .flat_map(|service| {
+            service
+                .ports
+                .iter()
+                .map(|port| mesh_outbound_upstream_id(&service.namespace, &service.name, port.port))
+        })
+        .collect();
 
     let mut refused_routes: Vec<(String, String)> = Vec::new();
     let mut divergent_routes = 0usize;
@@ -14595,12 +14621,31 @@ fn scope_request_auth_to_node_waypoint_destinations(
                 index.scopes_for_target(&proxy.namespace, upstream_id, backend_host, backend_port)
             else {
                 unresolved_modeled |=
-                    index.target_requires_scope(&proxy.namespace, upstream_id, backend_host);
+                    index.target_requires_scope(&proxy.namespace, upstream_id, backend_host)
+                        && upstream_id.is_none_or(|id| {
+                            !id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+                                || locally_backed_upstreams.contains(id)
+                        });
                 admit(own.clone());
                 continue;
             };
             resolved = true;
             for scope in scopes {
+                // A secured NodeWaypoint never dials a Service workload
+                // without NodeWaypoint metadata (`build_outbound_mesh_targets`),
+                // so that workload is not reachable through this route.
+                if secured_transport
+                    && upstream_id
+                        .is_some_and(|id| id.starts_with(MESH_OUTBOUND_UPSTREAM_ID_PREFIX))
+                    && !mesh_slice.workloads.iter().any(|workload| {
+                        workload.node_waypoint.is_some()
+                            && workload.spiffe_id == scope.spiffe_id
+                            && workload.namespace == scope.namespace
+                            && workload.selector.labels == scope.labels
+                    })
+                {
+                    continue;
+                }
                 admit(
                     resources
                         .iter()
@@ -14686,16 +14731,24 @@ fn scope_request_auth_to_node_waypoint_destinations(
         if let Some(jwks_config) = &jwks_config
             && jwks_config["providers"]
                 .as_array()
-                .is_some_and(|providers| {
-                    providers.len() > crate::plugins::jwks_auth::MAX_JWKS_PROVIDERS
+                .and_then(|providers| {
+                    crate::plugins::jwks_auth::jwks_provider_bound_error(providers.iter().map(
+                        |provider| {
+                            provider["issuer"]
+                                .as_str()
+                                .filter(|issuer| !issuer.is_empty())
+                        },
+                    ))
                 })
+                .is_some()
         {
             // An instance that cannot construct would veto the whole
             // generation; refuse only these routes instead.
             warn!(
                 routes = proxy_indices.len(),
                 "mesh RequestAuthentication: a NodeWaypoint destination is selected by more JWT \
-                 providers than one instance can verify; refusing its routes (fail closed)"
+                 providers than one instance can verify (in total or for one issuer); refusing \
+                 its routes (fail closed)"
             );
             refused_routes.extend(
                 proxy_indices
@@ -14734,7 +14787,11 @@ fn scope_request_auth_to_node_waypoint_destinations(
             updated_at: now,
         });
     }
-    exclude_routes_from_global_request_auth(config, runtime, &without_jwt_rules);
+    if !exclude_routes_from_global_request_auth(config, runtime, &without_jwt_rules) {
+        // The waypoint's own providers would keep governing destinations no
+        // resource selects; refuse those routes rather than leak them there.
+        refused_routes.extend(without_jwt_rules);
+    }
     refused_routes
 }
 
@@ -14743,66 +14800,78 @@ fn scope_request_auth_to_node_waypoint_destinations(
 /// selects. A proxy-group instance cannot replace it there (it needs at least
 /// one provider), and the waypoint's own providers must not reject or claim
 /// tokens on a destination they do not govern.
+///
+/// Returns `false` when the exclusion cannot be represented as a trigger, so
+/// the caller can refuse those routes instead.
 fn exclude_routes_from_global_request_auth(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
     routes: &[(String, String)],
-) {
+) -> bool {
     if routes.is_empty() {
-        return;
+        return true;
     }
+    // A `proxy_id` leaf cannot pin a namespace. An id that also names a route
+    // in another namespace stays under the global instance: excluding it
+    // there could drop validation that route needs.
+    let mut namespaces_by_id: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    for proxy in &config.proxies {
+        namespaces_by_id
+            .entry(proxy.id.as_str())
+            .or_default()
+            .insert(proxy.namespace.as_str());
+    }
+    let mut ids: Vec<&str> = routes
+        .iter()
+        .map(|(_, id)| id.as_str())
+        .filter(|id| {
+            namespaces_by_id
+                .get(id)
+                .is_none_or(|namespaces| namespaces.len() == 1)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return true;
+    }
+    let leaves = proxy_id_trigger_leaves(&ids);
+    // `not`, an outer `any`, and up to two inner `any` nodes leave 124 of the
+    // 128 trigger nodes for leaves, each `any` within the child limit.
+    const INNER_LEAVES: usize = 62;
+    let excluded = match leaves.len() {
+        1 => leaves.into_iter().next().unwrap_or_default(),
+        count if count <= crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN => {
+            serde_json::json!({ "any": leaves })
+        }
+        _ => serde_json::json!({
+            "any": leaves
+                .chunks(INNER_LEAVES)
+                .map(|chunk| serde_json::json!({ "any": chunk }))
+                .collect::<Vec<_>>()
+        }),
+    };
     let Some(global) = config.plugin_configs.iter_mut().find(|plugin| {
         plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID
     }) else {
-        return;
+        return true;
     };
-    let leaves = namespaced_proxy_id_trigger_leaves(routes);
-    let excluded = if leaves.len() == 1 {
-        leaves.into_iter().next().unwrap_or_default()
-    } else {
-        serde_json::json!({ "any": leaves })
-    };
-    let trigger = serde_json::from_value::<crate::config::plugin_trigger::PluginTrigger>(
-        serde_json::json!({ "when": { "not": excluded } }),
-    )
-    .map_err(|error| error.to_string())
-    .and_then(|trigger| trigger.validate().map(|()| trigger));
-    match trigger {
-        Ok(trigger) => global.trigger = Some(trigger),
-        Err(error) => warn!(
-            error = %sanitize_startup_cause(error.to_string(), &[]),
-            routes = routes.len(),
-            "mesh RequestAuthentication: the waypoint's own JWT providers could not be scoped \
-             off routes whose destination has none; they keep applying there"
-        ),
-    }
-}
-
-/// `all[namespace, proxy_id]` trigger leaves naming exactly `routes`; route
-/// ids are unique only within a namespace. A `proxy_id` leaf holds at most
-/// `MAX_TRIGGER_LIST_LEN` ids, so larger sets are chunked.
-fn namespaced_proxy_id_trigger_leaves(routes: &[(String, String)]) -> Vec<serde_json::Value> {
-    let mut by_namespace: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (namespace, id) in routes {
-        by_namespace
-            .entry(namespace.as_str())
-            .or_default()
-            .push(id.as_str());
-    }
-    let mut leaves = Vec::new();
-    for (namespace, mut ids) in by_namespace {
-        ids.sort_unstable();
-        ids.dedup();
-        for chunk in ids.chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN) {
-            leaves.push(serde_json::json!({
-                "all": [
-                    { "match": { "namespace": [namespace] } },
-                    { "match": { "proxy_id": chunk } },
-                ]
-            }));
+    match compile_mesh_trigger(serde_json::json!({ "not": excluded })) {
+        Ok(trigger) => {
+            global.trigger = Some(trigger);
+            true
+        }
+        Err(error) => {
+            warn!(
+                error = %sanitize_startup_cause(error, &[]),
+                routes = ids.len(),
+                "mesh RequestAuthentication: the waypoint's own JWT providers could not be \
+                 scoped off routes whose destination has none; refusing those routes (fail \
+                 closed)"
+            );
+            false
         }
     }
-    leaves
 }
 
 /// Stable id for the destination `jwks_auth` instance enforcing `applicable`
@@ -14811,17 +14880,28 @@ fn mesh_request_auth_destination_plugin_id(
     namespace: &str,
     applicable: &[&MeshRequestAuthentication],
 ) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
-    namespace.hash(&mut hasher);
-    for resource in applicable {
-        resource.namespace.hash(&mut hasher);
-        resource.name.hash(&mut hasher);
+    // FNV-1a 64-bit: stable across Rust versions unlike DefaultHasher. Each
+    // field is terminated so adjacent fields cannot run together.
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut hash = FNV_OFFSET;
+    let fields = std::iter::once(namespace).chain(
+        applicable
+            .iter()
+            .flat_map(|resource| [resource.namespace.as_str(), resource.name.as_str()]),
+    );
+    for field in fields {
+        for byte in field
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(0xFF))
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
     }
-    format!(
-        "{MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX}{:016x}",
-        hasher.finish()
-    )
+    format!("{MESH_REQUEST_AUTH_DESTINATION_PLUGIN_ID_PREFIX}{hash:016x}")
 }
 
 /// Restrict the RequestAuthentication refusal (issue #6656) to requests
@@ -14852,6 +14932,12 @@ fn scope_request_auth_refusal_to_inbound_routes(
     runtime: &MeshRuntimeConfig,
     refused_destination_routes: &[(String, String)],
 ) {
+    // Every prepare re-derives the partition instances from scratch.
+    config.plugin_configs.retain(|plugin| {
+        !plugin
+            .id
+            .starts_with(MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX)
+    });
     let own_refused = config.plugin_configs.iter().any(|plugin| {
         plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
     });
@@ -14886,11 +14972,8 @@ fn scope_request_auth_refusal_to_inbound_routes(
             // refusal stays on every route (fail closed).
             return;
         }
-        leaves.extend(
-            inbound
-                .chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
-                .map(|chunk| serde_json::json!({ "match": { "proxy_id": chunk } })),
-        );
+        let inbound: Vec<&str> = inbound.iter().map(String::as_str).collect();
+        leaves.extend(proxy_id_trigger_leaves(&inbound));
     } else {
         warn!(
             routes = refused_destination_routes.len(),
@@ -14918,41 +15001,77 @@ fn scope_request_auth_refusal_to_inbound_routes(
         .collect();
     destination_ids.sort_unstable();
     destination_ids.dedup();
-    leaves.extend(
-        destination_ids
-            .chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
-            .map(|chunk| serde_json::json!({ "match": { "proxy_id": chunk } })),
-    );
-    let Some(refusal) = config.plugin_configs.iter_mut().find(|plugin| {
-        plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
-    }) else {
-        return;
-    };
-    // The trigger is compiled here so one the plugin cache would reject (which
-    // would veto the whole reload and keep the previous, possibly fail-open,
-    // configuration) falls back to the unscoped refusal instead.
-    let when = if leaves.len() == 1 {
-        leaves.into_iter().next().unwrap_or_default()
-    } else {
-        serde_json::json!({ "any": leaves })
-    };
-    let trigger = serde_json::from_value::<crate::config::plugin_trigger::PluginTrigger>(
+    leaves.extend(proxy_id_trigger_leaves(&destination_ids));
+    // One trigger holds at most `MAX_TRIGGER_LIST_LEN` leaves under an `any`,
+    // inside both the child and node budgets. Larger refusals are split across
+    // additional forced instances rather than pushed into the unscoped
+    // fallback, which would refuse healthy destinations too.
+    let partitions: Vec<Vec<serde_json::Value>> = leaves
+        .chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
+        .map(<[serde_json::Value]>::to_vec)
+        .collect();
+    for (partition_index, partition) in partitions.into_iter().enumerate() {
+        let id = if partition_index == 0 {
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID.to_string()
+        } else {
+            format!("{MESH_REQUEST_AUTH_REFUSED_PARTITION_ID_PREFIX}{partition_index}")
+        };
+        if partition_index > 0 {
+            force_ensure_global_plugin(
+                config,
+                &id,
+                "request_termination",
+                mesh_request_auth_refusal_config(),
+                &runtime.namespace,
+            );
+        }
+        let Some(refusal) = config
+            .plugin_configs
+            .iter_mut()
+            .find(|plugin| plugin.namespace == runtime.namespace && plugin.id == id)
+        else {
+            continue;
+        };
+        // The trigger is compiled here so one the plugin cache would reject
+        // (which would veto the whole reload and keep the previous, possibly
+        // fail-open, configuration) falls back to the unscoped refusal instead.
+        let when = if partition.len() == 1 {
+            partition.into_iter().next().unwrap_or_default()
+        } else {
+            serde_json::json!({ "any": partition })
+        };
+        match compile_mesh_trigger(when) {
+            Ok(trigger) => refusal.trigger = Some(trigger),
+            Err(error) => {
+                // Fail closed: an unrepresentable trigger leaves the refusal on
+                // every route rather than dropping it.
+                warn!(
+                    error = %sanitize_startup_cause(error, &[]),
+                    "mesh RequestAuthentication refusal could not be scoped to its routes; \
+                     refusing on every route"
+                );
+            }
+        }
+    }
+}
+
+/// Parse and validate a mesh-generated execution trigger exactly as the plugin
+/// cache will, so an unrepresentable one is caught here.
+fn compile_mesh_trigger(
+    when: serde_json::Value,
+) -> Result<crate::config::plugin_trigger::PluginTrigger, String> {
+    serde_json::from_value::<crate::config::plugin_trigger::PluginTrigger>(
         serde_json::json!({ "when": when }),
     )
     .map_err(|error| error.to_string())
-    .and_then(|trigger| trigger.validate().map(|()| trigger));
-    match trigger {
-        Ok(trigger) => refusal.trigger = Some(trigger),
-        Err(error) => {
-            // Fail closed: an unrepresentable trigger leaves the refusal on
-            // every route rather than dropping it.
-            warn!(
-                error = %sanitize_startup_cause(error.to_string(), &[]),
-                "mesh RequestAuthentication refusal could not be scoped to inbound routes; \
-                 refusing on every route"
-            );
-        }
-    }
+    .and_then(|trigger| trigger.validate().map(|()| trigger))
+}
+
+/// `proxy_id` trigger leaves naming `ids`, `MAX_TRIGGER_LIST_LEN` per leaf.
+fn proxy_id_trigger_leaves(ids: &[&str]) -> Vec<serde_json::Value> {
+    ids.chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
+        .map(|chunk| serde_json::json!({ "match": { "proxy_id": chunk } }))
+        .collect()
 }
 
 /// Build a single `jwks_auth` provider configuration from a [`MeshJwtRule`].

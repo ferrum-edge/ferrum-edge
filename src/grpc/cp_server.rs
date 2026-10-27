@@ -1353,6 +1353,10 @@ impl CpGrpcServer {
         // destinations it fronts (issue #6670): the visible namespaces its
         // routes reach and, on a NodeWaypoint, its capture destinations'
         // namespaces. The slice builder narrows them to those exact workloads.
+        // Like the `mesh_policies` waypoint expansion above, this is NOT
+        // narrowed by the bearer namespaces: those destinations are served
+        // under the waypoint's binding, so withholding their resources would
+        // serve them with an incomplete policy set (fail open).
         let capture_destination_namespaces: BTreeSet<&str> = mesh
             .node_waypoint_capture_destinations
             .iter()
@@ -1373,10 +1377,6 @@ impl CpGrpcServer {
                 || (waypoint_destination_request_auth
                     && (visible_namespaces
                         .iter()
-                        .filter(|destination_namespace| {
-                            bearer_namespaces
-                                .is_none_or(|allowed| allowed.contains(*destination_namespace))
-                        })
                         .any(|destination_namespace| can_apply_to(destination_namespace))
                         || capture_destination_namespaces
                             .iter()

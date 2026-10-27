@@ -24,7 +24,8 @@ use ferrum_edge::config::types::{GatewayConfig, PluginScope, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::modes::mesh::config::{
-    MeshJwtRule, MeshRequestAuthentication, PolicyScope, Workload, WorkloadSelector,
+    MeshJwtRule, MeshRequestAuthentication, NodeWaypointEndpoint, PolicyScope, Workload,
+    WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use ferrum_edge::modes::mesh::{
@@ -416,6 +417,99 @@ fn node_waypoint_refuses_route_whose_workloads_disagree() {
         .to_string();
     assert!(trigger.contains(&api_route.id), "{trigger}");
     assert!(!trigger.contains(&web_route.id), "{trigger}");
+}
+
+/// A destination whose providers one `jwks_auth` instance cannot verify (here
+/// nine sharing one issuer, over the per-issuer candidate bound) refuses its
+/// routes instead of vetoing the whole generation.
+#[test]
+fn node_waypoint_refuses_destination_over_the_provider_bound() {
+    let mut over_bound = request_auth("api-jwt", selector("api"));
+    let rule = over_bound.jwt_rules[0].clone();
+    over_bound.jwt_rules = (0..9)
+        .map(|index| MeshJwtRule {
+            audiences: vec![format!("aud-{index}")],
+            ..rule.clone()
+        })
+        .collect();
+    let config = prepare_node_waypoint(vec![over_bound]);
+
+    let api_route = service_route(&config, "api");
+    let web_route = service_route(&config, "web");
+    assert_eq!(destination_issuers(&config, api_route), None);
+    let refusal = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+        .expect("the over-bound destination is refused");
+    let trigger = serde_json::to_value(refusal.trigger.as_ref().expect("scoped refusal"))
+        .expect("trigger serializes")
+        .to_string();
+    assert!(trigger.contains(&api_route.id), "{trigger}");
+    assert!(!trigger.contains(&web_route.id), "{trigger}");
+}
+
+/// A secured NodeWaypoint never dials a Service workload without NodeWaypoint
+/// metadata, so that workload's (empty) set does not make the route disagree.
+#[test]
+fn node_waypoint_secured_transport_ignores_unreachable_workloads() {
+    let mut runtime = node_waypoint_runtime();
+    runtime.workload_svid_cert_path = Some("/var/run/secrets/svid.pem".to_string());
+    runtime.workload_svid_key_path = Some("/var/run/secrets/svid.key".to_string());
+    runtime.workload_svid_trust_bundle_path = Some("/var/run/secrets/bundle.pem".to_string());
+    let mut enrolled = workload_for(
+        "api-v1",
+        DEFAULT_NAMESPACE,
+        [("app", "api"), ("version", "v1")],
+        ["10.0.0.21"],
+    );
+    enrolled.node_waypoint = Some(NodeWaypointEndpoint {
+        address: "192.0.2.10".to_string(),
+        hbone_port: 15008,
+        spiffe_id: enrolled.spiffe_id.clone(),
+        node_name: None,
+        node_uid: None,
+        network: None,
+        cluster: None,
+    });
+    let unenrolled = workload_for(
+        "api-v2",
+        DEFAULT_NAMESPACE,
+        [("app", "api"), ("version", "v2")],
+        ["10.0.0.22"],
+    );
+    let services = vec![service_for(
+        "api",
+        DEFAULT_NAMESPACE,
+        &[&enrolled, &unenrolled],
+    )];
+    let v1_only = PolicyScope::WorkloadSelector {
+        selector: WorkloadSelector {
+            labels: [("version".to_string(), "v1".to_string())]
+                .into_iter()
+                .collect(),
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+        },
+    };
+    let slice = MeshSlice {
+        request_authentications: vec![request_auth("v1-jwt", v1_only)],
+        ..mesh_slice_with(&runtime, vec![enrolled, unenrolled], services, Vec::new())
+    };
+    let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("NodeWaypoint slice preparation must succeed");
+
+    assert_eq!(
+        destination_issuers(&config, service_route(&config, "api")),
+        Some(vec!["https://v1-jwt.example.com".to_string()]),
+        "only the enrolled workload is reachable, so its set governs the route"
+    );
+    assert!(
+        config
+            .plugin_configs
+            .iter()
+            .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID),
+        "the route must not be refused for an unreachable workload"
+    );
 }
 
 #[test]

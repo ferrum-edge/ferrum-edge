@@ -2877,7 +2877,14 @@ destinations.
     stripping and claim-header ownership then apply to requests for the
     selected destination and never to an unrelated one.
   - A route whose destination is selected by no resource with a usable JWT
-    rule is excluded from the global instance by its execution trigger.
+    rule is excluded from the global instance by its execution trigger. If
+    that exclusion cannot be represented as one trigger, those routes are
+    refused instead.
+  - Workloads the route cannot reach are not compared: a secured NodeWaypoint
+    (CA backend or configured SVID) never dials a Service workload that lacks
+    NodeWaypoint metadata. A Service whose workloads are all in a remote
+    cluster has no local destination set; its destination cluster enforces
+    its own resources.
   - The route is refused (`503`, through the trigger of
     `__mesh_request_auth_refused`) when:
     - its destination is selected by a refused resource;
@@ -2889,7 +2896,11 @@ destinations.
     - it reaches a modeled destination whose workloads cannot be resolved
       while destination resources exist;
     - its destination's provider union exceeds what one `jwks_auth` instance
-      can verify.
+      can verify (64 providers in total, or more than 8 sharing one issuer).
+  - Refused routes are named by id in the refusal's execution trigger. A
+    refusal too large for one trigger is split across additional forced
+    instances (`__mesh_request_auth_refused_<n>`), so a large refusal never
+    falls back to refusing healthy destinations.
   - A route with no modeled destination (for example an external
     `ServiceEntry` host) keeps the global instance.
 - **Inbound relays (Layer 4).** A waypoint relay does not parse tunnelled HTTP,
