@@ -1295,6 +1295,7 @@ jobs:
               integration::mesh_authz_negative_match_tests
               integration::mesh_ext_authz_custom_tests
               integration::mesh_service_waypoint_tests
+              integration::mesh_waypoint_request_auth_tests
               integration::mesh_stock_xds_tests
               integration::mesh_xds_stream_lifecycle_tests
               integration::mesh_ew_egress_e2e_tests

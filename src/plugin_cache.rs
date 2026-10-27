@@ -2430,6 +2430,9 @@ impl Plugin for PluginInstanceWrapper {
     fn has_execution_trigger(&self) -> bool {
         self.trigger.is_some() || self.inner.has_execution_trigger()
     }
+    fn admits_missing_credential(&self) -> bool {
+        self.inner.admits_missing_credential()
+    }
     fn authentication_applies(&self, ctx: &RequestContext) -> bool {
         self.runs_cached(ctx) && self.inner.authentication_applies(ctx)
     }
@@ -6397,6 +6400,11 @@ fn build_protocol_snapshot(
                     .auth_plugins
                     .iter()
                     .all(|plugin| plugin.has_execution_trigger())
+                && !entry
+                    .phase
+                    .auth_plugins
+                    .iter()
+                    .all(|plugin| plugin.admits_missing_credential())
             {
                 warn!(
                     proxy_id = %crate::startup::sanitize_startup_scalar(proxy_id),

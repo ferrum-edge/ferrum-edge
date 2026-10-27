@@ -2869,25 +2869,40 @@ destinations.
 
 - **NodeWaypoint Service routes (Layer 7).** Each HTTP route is resolved to its
   destination workloads through the same index `mesh_authz` uses for
-  destination policy, including every `mesh_route_dispatch` destination it may
-  be rewritten to. A route whose destination set differs from the waypoint's
-  own set gets a proxy-group `jwks_auth` instance (`__mesh_request_auth_dst_*`)
-  that replaces the global `__mesh_request_auth` on that route, so JWT
-  validation, token stripping and claim-header ownership apply to requests for
-  the selected destination and never to an unrelated one. A route whose
-  destination is selected by a refused resource is refused (`503`) through the
-  same `__mesh_request_auth_refused` instance, scoped to that route's namespace
-  and id. A destination that cannot be resolved contributes the waypoint's own
-  set, and a route with no modeled destination (or a destination selected by
-  no resource with a usable JWT rule) keeps the global instance.
-- **Inbound HBONE relays (Layer 4).** A waypoint relay does not parse tunnelled
-  HTTP, so no JWT can be validated there, on either waypoint type. A relay
-  whose destination workload a refused resource selects is refused by
-  `mesh_authz` with the same `503` (`mesh_authz.deny_policy:
-  request_authentication_refused`); a NodeWaypoint relay whose destination
-  cannot be resolved is refused while any refused resource is present. Use an
-  `AuthorizationPolicy` to require a principal: an ALLOW that needs
-  `requestPrincipals` never matches a relayed CONNECT.
+  destination policy, including every `mesh_route_dispatch` destination
+  (associated or global) it may be rewritten to after authentication.
+  - A route whose destination set differs from the waypoint's own set gets a
+    proxy-group `jwks_auth` instance (`__mesh_request_auth_dst_*`) that replaces
+    the global `__mesh_request_auth` on that route. JWT validation, token
+    stripping and claim-header ownership then apply to requests for the
+    selected destination and never to an unrelated one.
+  - A route whose destination is selected by no resource with a usable JWT
+    rule is excluded from the global instance by its execution trigger.
+  - The route is refused (`503`, through the trigger of
+    `__mesh_request_auth_refused`) when:
+    - its destination is selected by a refused resource;
+    - the workloads it can reach (several pods behind one Service, or a
+      dispatch rewrite target) are selected by **different** resource sets,
+      because the backend is chosen after authentication and a union would let
+      one destination's providers mint principals and claim headers for
+      another;
+    - it reaches a modeled destination whose workloads cannot be resolved
+      while destination resources exist;
+    - its destination's provider union exceeds what one `jwks_auth` instance
+      can verify.
+  - A route with no modeled destination (for example an external
+    `ServiceEntry` host) keeps the global instance.
+- **Inbound relays (Layer 4).** A waypoint relay does not parse tunnelled HTTP,
+  so no JWT can be validated there, on either waypoint type. `mesh_authz`
+  refuses (`503`, `mesh_authz.deny_policy: request_authentication_refused`) an
+  inbound HBONE relay, or a NodeWaypoint transparent-capture plaintext
+  connection, whose destination workload a refused resource selects. A
+  NodeWaypoint relay whose destination cannot be resolved is refused while any
+  refused resource is present. To require a principal, use an
+  `AuthorizationPolicy`: an ALLOW that needs `requestPrincipals` never matches
+  a relayed CONNECT. This relay check lives in the mesh-managed `mesh_authz`,
+  so an operator global `mesh_authz` that replaces it (possible only without
+  transparent capture) also replaces the check.
 
 **Deferred JWT-rule fields**: `outputPayloadToHeader` and `fromCookies` are
 recognized but not enforced. Both are surfaced in

@@ -2069,6 +2069,10 @@ impl super::Plugin for JwksAuth {
         true
     }
 
+    fn admits_missing_credential(&self) -> bool {
+        self.allow_missing_token
+    }
+
     fn priority(&self) -> u16 {
         super::priority::JWKS_AUTH
     }

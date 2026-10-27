@@ -1373,6 +1373,10 @@ impl CpGrpcServer {
                 || (waypoint_destination_request_auth
                     && (visible_namespaces
                         .iter()
+                        .filter(|destination_namespace| {
+                            bearer_namespaces
+                                .is_none_or(|allowed| allowed.contains(*destination_namespace))
+                        })
                         .any(|destination_namespace| can_apply_to(destination_namespace))
                         || capture_destination_namespaces
                             .iter()

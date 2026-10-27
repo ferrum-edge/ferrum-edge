@@ -611,6 +611,32 @@ impl DestinationPolicyScopeIndex {
     }
 }
 
+impl DestinationPolicyScopeIndex {
+    /// Whether a route target reaches a modeled destination, so a missing
+    /// scope means "unresolved" rather than "not a mesh workload". Mirrors
+    /// `MeshAuthz::proxy_requires_destination_scope` for an index built with
+    /// route-upstream metadata.
+    pub(crate) fn target_requires_scope(
+        &self,
+        namespace: &str,
+        upstream_id: Option<&str>,
+        backend_host: &str,
+    ) -> bool {
+        if let Some(upstream_id) = upstream_id {
+            return upstream_id.starts_with("__mesh-out-upstream-")
+                || (node_waypoint_generated_route_upstream_id(upstream_id)
+                    && self.route_upstreams_requiring_scope.contains(upstream_id));
+        }
+        if normalize_destination_backend_host(backend_host)
+            .is_some_and(|host| self.service_backend_hosts.contains(&host))
+        {
+            return true;
+        }
+        NamespacedDestinationBackendHostKey::new(namespace, backend_host)
+            .is_some_and(|key| self.namespaced_service_backend_hosts.contains(&key))
+    }
+}
+
 /// Build the NodeWaypoint destination scope index from the same config keys
 /// the `mesh_authz` instance reads (`cluster_domain`, `cluster_domains`,
 /// `node_waypoint_route_upstreams`).
@@ -2841,15 +2867,7 @@ impl MeshAuthz {
             self.destination_scope_match_for_proxy(proxy)
         };
         let refused = match scope_match {
-            Some(scope_match) => scope_match.scopes.iter().any(|destination| {
-                self.refused_request_auth_scopes.iter().any(|refused| {
-                    crate::modes::mesh::config::scope_applies_to_workload(
-                        refused,
-                        &destination.namespace,
-                        &destination.labels,
-                    )
-                })
-            }),
+            Some(scope_match) => self.refused_request_auth_applies_to(scope_match.scopes),
             None => self.per_pod_policy_scoping,
         };
         if !refused {
@@ -2859,14 +2877,22 @@ impl MeshAuthz {
             "mesh_authz.deny_policy".to_string(),
             "request_authentication_refused".to_string(),
         );
-        Some(PluginResult::Reject {
-            status_code: 503,
-            body: serde_json::json!({
-                "message": crate::modes::mesh::MESH_REQUEST_AUTH_REFUSED_MESSAGE,
-                "status_code": 503,
+        Some(refused_request_auth_reject())
+    }
+
+    /// Whether a refused RequestAuthentication selects any of `destinations`.
+    fn refused_request_auth_applies_to(
+        &self,
+        destinations: &[crate::modes::mesh::runtime::PolicyScopeCache],
+    ) -> bool {
+        destinations.iter().any(|destination| {
+            self.refused_request_auth_scopes.iter().any(|refused| {
+                crate::modes::mesh::config::scope_applies_to_workload(
+                    refused,
+                    &destination.namespace,
+                    &destination.labels,
+                )
             })
-            .to_string(),
-            headers: HashMap::new(),
         })
     }
 
@@ -3129,6 +3155,20 @@ impl MeshAuthz {
 /// fail-closed branches must therefore gate on this, exactly as the per-pod
 /// missing-scope check in `MeshAuthz::new` (`has_scoped_policies`) already does
 /// — an unscopable audit-only selector policy is skipped, not rejected.
+/// The `503` a refused RequestAuthentication answers with, matching the
+/// mesh-managed `request_termination` refusal body.
+fn refused_request_auth_reject() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 503,
+        body: serde_json::json!({
+            "message": crate::modes::mesh::MESH_REQUEST_AUTH_REFUSED_MESSAGE,
+            "status_code": 503,
+        })
+        .to_string(),
+        headers: HashMap::new(),
+    }
+}
+
 fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
     policy.rules.iter().any(|rule| rule.action.is_enforcing())
 }
@@ -4481,6 +4521,34 @@ impl Plugin for MeshAuthz {
         // nothing.
         if mesh_authz_skips_outbound_capture_leg(self.per_pod_policy_scoping, ctx.mesh_direction) {
             return PluginResult::Continue;
+        }
+        // The NodeWaypoint transparent capture relay carries direct plaintext
+        // to its destination pod and stamps that DESTINATION's scope; a
+        // refused RequestAuthentication selecting it refuses the connection
+        // just as it refuses an HBONE relay (issue #6670). Other per-pod stream
+        // paths stamp a SOURCE scope and are not judged here.
+        if self.per_pod_policy_scoping
+            && !self.refused_request_auth_scopes.is_empty()
+            && ctx.mesh_direction == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+            && ctx
+                .proxy_id
+                .starts_with(crate::modes::mesh::MESH_INBOUND_TCP_RELAY_PROXY_ID_PREFIX)
+        {
+            let refused = ctx
+                .node_waypoint_policy_scope
+                .as_deref()
+                .is_none_or(|destination| {
+                    self.refused_request_auth_applies_to(std::slice::from_ref(destination))
+                });
+            if refused {
+                let mut metadata = ctx.metadata.take().unwrap_or_default();
+                metadata.insert(
+                    "mesh_authz.deny_policy".to_string(),
+                    "request_authentication_refused".to_string(),
+                );
+                ctx.metadata = Some(metadata);
+                return refused_request_auth_reject();
+            }
         }
         let mut metadata = ctx.metadata.clone().unwrap_or_default();
         let source_principal = metadata

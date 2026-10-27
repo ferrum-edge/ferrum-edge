@@ -1618,6 +1618,82 @@ async fn mesh_authz_service_waypoint_refuses_relay_to_refused_request_auth_desti
     );
 }
 
+/// The NodeWaypoint transparent capture relay carries direct plaintext to the
+/// destination pod whose scope it stamps; a refused RequestAuthentication
+/// selecting that pod refuses the connection, and an unrelated pod is not
+/// affected (issue #6670).
+#[tokio::test]
+async fn mesh_authz_node_waypoint_capture_stream_refuses_refused_request_auth_destination() {
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    let slice = MeshSlice {
+        namespace: "default".to_string(),
+        request_authentications: vec![MeshRequestAuthentication {
+            name: "api-jwt".to_string(),
+            namespace: "default".to_string(),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                    namespace: Some("default".to_string()),
+                },
+            },
+            jwt_rules: Vec::new(),
+            refused: true,
+        }],
+        ..MeshSlice::default()
+    };
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": slice,
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let capture_context = |app: &str| {
+        let mut ctx = StreamConnectionContext::new(
+            "10.0.0.50".to_string(),
+            "10.0.0.50".to_string(),
+            format!("__mesh-in-tcp-relay-default-{app}-8080"),
+            None,
+            8080,
+            BackendScheme::Tcp,
+            Arc::new(ConsumerIndex::new(&[])),
+        );
+        ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
+        ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+            SpiffeId::new(format!("spiffe://cluster.local/ns/default/sa/{app}")).expect("spiffe"),
+            "default",
+            HashMap::from([("app".to_string(), app.to_string())]),
+        )));
+        ctx
+    };
+
+    let mut api = capture_context("api");
+    let api_result = plugin.on_stream_connect(&mut api).await;
+    assert!(
+        matches!(
+            api_result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "captured plaintext to the refused destination must be refused, got {api_result:?}"
+    );
+    assert_eq!(
+        api.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("mesh_authz.deny_policy"))
+            .map(String::as_str),
+        Some("request_authentication_refused")
+    );
+
+    let mut web = capture_context("web");
+    let web_result = plugin.on_stream_connect(&mut web).await;
+    assert!(
+        matches!(web_result, PluginResult::Continue),
+        "an unrelated captured destination must not be refused, got {web_result:?}"
+    );
+}
+
 #[tokio::test]
 async fn mesh_authz_service_waypoint_byte_stream_missing_destination_scope_fails_closed() {
     let slice = ambient_udp_service_waypoint_slice(vec![policy_with_scope(

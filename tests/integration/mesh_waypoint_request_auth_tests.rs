@@ -252,10 +252,6 @@ fn node_waypoint_refused_destination_resource_refuses_only_that_route() {
         !rendered.contains(&web_route.id),
         "refusal trigger must not name the app=web route: {rendered}"
     );
-    assert!(
-        rendered.contains(&format!("\"namespace\":[\"{DEFAULT_NAMESPACE}\"]")),
-        "destination leaves pin the route namespace: {rendered}"
-    );
 }
 
 /// The published chain replaces the global instance on the destination route
@@ -311,6 +307,115 @@ async fn node_waypoint_destination_instance_replaces_the_global_instance_in_the_
             route.id
         );
     }
+}
+
+/// The waypoint's own providers must not govern a destination no resource
+/// selects: they would reject that destination's tokens and mint principals
+/// for it. The global instance is gated off that route.
+#[test]
+fn node_waypoint_global_instance_is_gated_off_destinations_without_resources() {
+    let runtime = node_waypoint_runtime();
+    let api = workload_for("api", DEFAULT_NAMESPACE, [("app", "api")], ["10.0.0.11"]);
+    let web = workload_for("web", "other", [("app", "web")], ["10.0.0.12"]);
+    let services = vec![
+        service_for("api", DEFAULT_NAMESPACE, &[&api]),
+        service_for("web", "other", &[&web]),
+    ];
+    let slice = MeshSlice {
+        request_authentications: vec![request_auth(
+            "ns-jwt",
+            PolicyScope::Namespace {
+                namespace: DEFAULT_NAMESPACE.to_string(),
+            },
+        )],
+        ..mesh_slice_with(&runtime, vec![api, web], services, Vec::new())
+    };
+    let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("NodeWaypoint slice preparation must succeed");
+
+    let web_upstream = "__mesh-out-upstream-other-web-8080";
+    let web_route = config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.upstream_id.as_deref() == Some(web_upstream))
+        .expect("route to other/web");
+    let api_route = service_route(&config, "api");
+    assert_eq!(destination_issuers(&config, web_route), None);
+    let global = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
+        .expect("the namespace-wide resource selects the waypoint's own namespace");
+    let trigger = serde_json::to_value(
+        global
+            .trigger
+            .as_ref()
+            .expect("the global instance is gated off other/web"),
+    )
+    .expect("trigger serializes")
+    .to_string();
+    assert!(trigger.contains("\"not\""), "{trigger}");
+    assert!(trigger.contains(&web_route.id), "{trigger}");
+    assert!(
+        !trigger.contains(&api_route.id),
+        "default/api is governed by the namespace-wide resource: {trigger}"
+    );
+}
+
+/// Workloads behind one Service with different RequestAuthentication sets
+/// cannot share one instance: the backend is chosen after authentication.
+#[test]
+fn node_waypoint_refuses_route_whose_workloads_disagree() {
+    let runtime = node_waypoint_runtime();
+    let v1 = workload_for(
+        "api-v1",
+        DEFAULT_NAMESPACE,
+        [("app", "api"), ("version", "v1")],
+        ["10.0.0.21"],
+    );
+    let v2 = workload_for(
+        "api-v2",
+        DEFAULT_NAMESPACE,
+        [("app", "api"), ("version", "v2")],
+        ["10.0.0.22"],
+    );
+    let (_, web) = api_and_web();
+    let services = vec![
+        service_for("api", DEFAULT_NAMESPACE, &[&v1, &v2]),
+        service_for("web", DEFAULT_NAMESPACE, &[&web]),
+    ];
+    let v2_only = PolicyScope::WorkloadSelector {
+        selector: WorkloadSelector {
+            labels: [("version".to_string(), "v2".to_string())]
+                .into_iter()
+                .collect(),
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+        },
+    };
+    let slice = MeshSlice {
+        request_authentications: vec![request_auth("v2-jwt", v2_only)],
+        ..mesh_slice_with(&runtime, vec![v1, v2, web], services, Vec::new())
+    };
+    let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("NodeWaypoint slice preparation must succeed");
+
+    let api_route = service_route(&config, "api");
+    let web_route = service_route(&config, "web");
+    assert_eq!(
+        destination_issuers(&config, api_route),
+        None,
+        "no union instance may be installed for workloads that disagree"
+    );
+    let refusal = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+        .expect("the disagreeing route is refused");
+    let trigger = serde_json::to_value(refusal.trigger.as_ref().expect("scoped refusal"))
+        .expect("trigger serializes")
+        .to_string();
+    assert!(trigger.contains(&api_route.id), "{trigger}");
+    assert!(!trigger.contains(&web_route.id), "{trigger}");
 }
 
 #[test]
