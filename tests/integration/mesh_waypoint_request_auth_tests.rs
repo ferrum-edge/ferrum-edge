@@ -512,6 +512,117 @@ fn node_waypoint_secured_transport_ignores_unreachable_workloads() {
     );
 }
 
+/// The generated upstream id of `service` port 8080 in `namespace`
+/// (`mesh_outbound_upstream_id`).
+fn outbound_upstream_id(namespace: &str, service: &str) -> String {
+    format!("__mesh-out-upstream-{namespace}-{service}-8080")
+}
+
+/// The route to `service` in `namespace`, found by its namespace as well:
+/// generated route and upstream ids are unique only within a namespace.
+fn namespaced_service_route<'a>(
+    config: &'a GatewayConfig,
+    namespace: &str,
+    service: &str,
+) -> &'a Proxy {
+    let upstream = outbound_upstream_id(namespace, service);
+    config
+        .proxies
+        .iter()
+        .find(|proxy| {
+            proxy.namespace == namespace && proxy.upstream_id.as_deref() == Some(upstream.as_str())
+        })
+        .unwrap_or_else(|| panic!("no route to {namespace}/{service}"))
+}
+
+/// `a`/`b-c` and `a-b`/`c` share one generated upstream id. The destination
+/// index keys upstreams by namespace too, so each route keeps its own set.
+#[test]
+fn node_waypoint_colliding_upstream_ids_keep_each_destination_set() {
+    let runtime = node_waypoint_runtime();
+    let protected = workload_for("bc", "a", [("app", "protected")], ["10.0.0.31"]);
+    let open = workload_for("c", "a-b", [("app", "open")], ["10.0.0.32"]);
+    let services = vec![
+        service_for("b-c", "a", &[&protected]),
+        service_for("c", "a-b", &[&open]),
+    ];
+    assert_eq!(
+        outbound_upstream_id("a", "b-c"),
+        outbound_upstream_id("a-b", "c"),
+        "fixture precondition: the two upstream ids collide"
+    );
+    let protected_scope = PolicyScope::WorkloadSelector {
+        selector: WorkloadSelector {
+            labels: [("app".to_string(), "protected".to_string())]
+                .into_iter()
+                .collect(),
+            namespace: Some("a".to_string()),
+        },
+    };
+    let slice = MeshSlice {
+        request_authentications: vec![MeshRequestAuthentication {
+            namespace: "a".to_string(),
+            ..request_auth("protected-jwt", protected_scope)
+        }],
+        ..mesh_slice_with(&runtime, vec![protected, open], services, Vec::new())
+    };
+    let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("NodeWaypoint slice preparation must succeed");
+
+    assert_eq!(
+        destination_issuers(&config, namespaced_service_route(&config, "a", "b-c")),
+        Some(vec!["https://protected-jwt.example.com".to_string()]),
+        "a/b-c must keep its own destination set despite the id collision"
+    );
+    assert_eq!(
+        destination_issuers(&config, namespaced_service_route(&config, "a-b", "c")),
+        None
+    );
+}
+
+/// A refused resource selecting the waypoint's own namespace must not refuse
+/// relays to destinations it does not select: on a waypoint the managed
+/// `mesh_authz` refuses relays per destination, so the generated refusal
+/// carries only the refused Service routes.
+#[test]
+fn node_waypoint_own_refusal_does_not_blanket_refuse_relays() {
+    let runtime = node_waypoint_runtime();
+    let api = workload_for("api", DEFAULT_NAMESPACE, [("app", "api")], ["10.0.0.11"]);
+    let web = workload_for("web", "other", [("app", "web")], ["10.0.0.12"]);
+    let services = vec![
+        service_for("api", DEFAULT_NAMESPACE, &[&api]),
+        service_for("web", "other", &[&web]),
+    ];
+    let slice = MeshSlice {
+        request_authentications: vec![refused_request_auth(
+            "ns-jwt",
+            PolicyScope::Namespace {
+                namespace: DEFAULT_NAMESPACE.to_string(),
+            },
+        )],
+        ..mesh_slice_with(&runtime, vec![api, web], services, Vec::new())
+    };
+    let config = prepare_gateway_config_from_mesh_slice(&slice, &runtime)
+        .expect("NodeWaypoint slice preparation must succeed");
+
+    let api_route = namespaced_service_route(&config, DEFAULT_NAMESPACE, "api");
+    let web_route = namespaced_service_route(&config, "other", "web");
+    let refusal = config
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+        .expect("the refused destination route is refused");
+    let trigger = serde_json::to_value(refusal.trigger.as_ref().expect("scoped refusal"))
+        .expect("trigger serializes")
+        .to_string();
+    assert!(trigger.contains(&api_route.id), "{trigger}");
+    assert!(!trigger.contains(&web_route.id), "{trigger}");
+    assert!(
+        !trigger.contains("__mesh-inbound-hbone-relay"),
+        "relays are refused per destination by mesh_authz, not wholesale: {trigger}"
+    );
+}
+
 #[test]
 fn sidecar_materialization_ignores_destination_resources() {
     let runtime = runtime_for_topology(MeshTopology::Sidecar);

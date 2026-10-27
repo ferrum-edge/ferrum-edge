@@ -157,7 +157,7 @@ pub struct MeshAuthz {
     /// NodeWaypoint / ServiceWaypoint.
     refused_request_auth_scopes: Vec<PolicyScope>,
     destination_policy_scopes_by_upstream:
-        HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+        NamespacedUpstreamMap<Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     destination_policy_scopes_by_backend:
         HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     destination_policy_scopes_by_namespaced_backend: HashMap<
@@ -176,7 +176,7 @@ pub struct MeshAuthz {
     /// [`NodeWaypointCaptureDestinationScopes`].
     node_waypoint_capture_destination_scopes: NodeWaypointCaptureDestinationScopes,
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
-    destination_route_upstreams_requiring_scope: HashSet<String>,
+    destination_route_upstreams_requiring_scope: NamespacedUpstreamMap<()>,
     has_route_upstream_metadata: bool,
     /// Distinct lowercase request-header names referenced by any loaded
     /// `to.headers` predicate, precomputed at construction. The request path
@@ -560,6 +560,35 @@ struct DestinationScopeMatch<'a> {
     scopes: &'a [crate::modes::mesh::runtime::PolicyScopeCache],
 }
 
+/// Generated upstream ids are unique only within a namespace:
+/// `mesh_outbound_upstream_id` joins namespace and Service name with `-`, so
+/// `a`/`b-c` and `a-b`/`c` share one id. Every upstream-keyed destination
+/// lookup is therefore keyed by `(namespace, id)`, without allocating.
+pub(crate) struct NamespacedUpstreamMap<T> {
+    by_namespace: HashMap<String, HashMap<String, T>>,
+}
+
+impl<T> Default for NamespacedUpstreamMap<T> {
+    fn default() -> Self {
+        Self {
+            by_namespace: HashMap::new(),
+        }
+    }
+}
+
+impl<T> NamespacedUpstreamMap<T> {
+    fn insert(&mut self, namespace: &str, id: String, value: T) {
+        self.by_namespace
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(id, value);
+    }
+
+    fn get(&self, namespace: &str, id: &str) -> Option<&T> {
+        self.by_namespace.get(namespace)?.get(id)
+    }
+}
+
 /// Destination workload scopes indexed by the route target a request is
 /// dispatched to. `mesh_authz` builds one per generation for NodeWaypoint and
 /// ServiceWaypoint; NodeWaypoint RequestAuthentication selection
@@ -567,7 +596,7 @@ struct DestinationScopeMatch<'a> {
 /// workloads does this route reach" identically.
 #[derive(Default)]
 pub(crate) struct DestinationPolicyScopeIndex {
-    by_upstream: HashMap<String, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    by_upstream: NamespacedUpstreamMap<Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     by_backend: HashMap<DestinationBackendKey, Vec<crate::modes::mesh::runtime::PolicyScopeCache>>,
     by_namespaced_backend: HashMap<
         NamespacedDestinationBackendKey,
@@ -580,7 +609,7 @@ pub(crate) struct DestinationPolicyScopeIndex {
         HashMap<NamespacedDestinationBackendKey, DestinationBackendKey>,
     service_backend_hosts: HashSet<String>,
     namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
-    route_upstreams_requiring_scope: HashSet<String>,
+    route_upstreams_requiring_scope: NamespacedUpstreamMap<()>,
 }
 
 impl DestinationPolicyScopeIndex {
@@ -597,7 +626,10 @@ impl DestinationPolicyScopeIndex {
         backend_port: u16,
     ) -> Option<&[crate::modes::mesh::runtime::PolicyScopeCache]> {
         if let Some(upstream_id) = upstream_id {
-            return self.by_upstream.get(upstream_id).map(Vec::as_slice);
+            return self
+                .by_upstream
+                .get(namespace, upstream_id)
+                .map(Vec::as_slice);
         }
         let backend_key = DestinationBackendKey::new(backend_host, backend_port)?;
         if let Some(scopes) = self.by_backend.get(&backend_key) {
@@ -625,7 +657,10 @@ impl DestinationPolicyScopeIndex {
         if let Some(upstream_id) = upstream_id {
             return upstream_id.starts_with("__mesh-out-upstream-")
                 || (node_waypoint_generated_route_upstream_id(upstream_id)
-                    && self.route_upstreams_requiring_scope.contains(upstream_id));
+                    && self
+                        .route_upstreams_requiring_scope
+                        .get(namespace, upstream_id)
+                        .is_some());
         }
         if normalize_destination_backend_host(backend_host)
             .is_some_and(|host| self.service_backend_hosts.contains(&host))
@@ -1093,6 +1128,7 @@ fn destination_policy_scope_index(
             service_port_scopes.insert(service_key.clone(), scopes.scopes.clone());
             service_port_endpoints.insert(service_key.clone(), scopes.endpoint_backends.clone());
             index.by_upstream.insert(
+                &service.namespace,
                 crate::modes::mesh::mesh_outbound_upstream_id(
                     &service.namespace,
                     &service.name,
@@ -1194,18 +1230,22 @@ fn destination_policy_scope_index(
             }
         }
         if requires_destination_scope {
-            index
-                .route_upstreams_requiring_scope
-                .insert(upstream.id.clone());
+            index.route_upstreams_requiring_scope.insert(
+                &upstream.namespace,
+                upstream.id.clone(),
+                (),
+            );
         }
         if requires_destination_scope
             && !unscoped_target_seen
             && !external_target_seen
             && !route_scopes.is_empty()
         {
-            index
-                .by_upstream
-                .insert(upstream.id.clone(), route_scopes.into_vec());
+            index.by_upstream.insert(
+                &upstream.namespace,
+                upstream.id.clone(),
+                route_scopes.into_vec(),
+            );
         }
     }
     index
@@ -2745,7 +2785,10 @@ impl MeshAuthz {
         proxy: &Proxy,
     ) -> Option<DestinationScopeMatch<'_>> {
         if let Some(upstream_id) = proxy.upstream_id.as_deref() {
-            if let Some(scopes) = self.destination_policy_scopes_by_upstream.get(upstream_id) {
+            if let Some(scopes) = self
+                .destination_policy_scopes_by_upstream
+                .get(&proxy.namespace, upstream_id)
+            {
                 return Some(DestinationScopeMatch {
                     authorized_destination: NodeWaypointAuthorizedDestination::Upstream(
                         upstream_id.to_string(),
@@ -2905,7 +2948,8 @@ impl MeshAuthz {
                 return !self.has_route_upstream_metadata
                     || self
                         .destination_route_upstreams_requiring_scope
-                        .contains(upstream_id);
+                        .get(&proxy.namespace, upstream_id)
+                        .is_some();
             }
             return false;
         }
@@ -6021,7 +6065,11 @@ mod tests {
 
         let upstream = crate::modes::mesh::mesh_outbound_upstream_id("shop", "reviews", 9080);
         assert_eq!(
-            index.by_upstream[&upstream].len(),
+            index
+                .by_upstream
+                .get("shop", &upstream)
+                .expect("upstream scopes")
+                .len(),
             1,
             "300 identical replicas must cost one policy evaluation, not 300"
         );
@@ -6041,7 +6089,10 @@ mod tests {
         let index = destination_policy_scope_index(&reviews_slice(replicas), &[], &[]);
 
         let upstream = crate::modes::mesh::mesh_outbound_upstream_id("shop", "reviews", 9080);
-        let versions: Vec<_> = index.by_upstream[&upstream]
+        let versions: Vec<_> = index
+            .by_upstream
+            .get("shop", &upstream)
+            .expect("upstream scopes")
             .iter()
             .map(|scope| scope.labels["version"].as_str())
             .collect();
@@ -6108,7 +6159,11 @@ mod tests {
             "equal records on one endpoint must not repeat its scope"
         );
         assert_eq!(
-            index.by_upstream["route-reviews"].len(),
+            index
+                .by_upstream
+                .get("shop", "route-reviews")
+                .expect("route scopes")
+                .len(),
             1,
             "a route over two ports of one Service evaluates its scope once"
         );

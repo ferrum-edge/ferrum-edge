@@ -2869,7 +2869,8 @@ destinations.
 
 - **NodeWaypoint Service routes (Layer 7).** Each HTTP route is resolved to its
   destination workloads through the same index `mesh_authz` uses for
-  destination policy, including every `mesh_route_dispatch` destination
+  destination policy (keyed by namespace and upstream id, because generated
+  upstream ids are unique only within a namespace), including every `mesh_route_dispatch` destination
   (associated or global) it may be rewritten to after authentication.
   - A route whose destination set differs from the waypoint's own set gets a
     proxy-group `jwks_auth` instance (`__mesh_request_auth_dst_*`) that replaces
@@ -2909,7 +2910,10 @@ destinations.
   inbound HBONE relay, or a NodeWaypoint transparent-capture plaintext
   connection, whose destination workload a refused resource selects. A
   NodeWaypoint relay whose destination cannot be resolved is refused while any
-  refused resource is present. To require a principal, use an
+  refused resource is present. On a waypoint this per-destination check also
+  replaces the blanket relay refusal for a refused resource that selects the
+  waypoint's own namespace or identity, so a relay to a destination that
+  resource does not select keeps flowing. To require a principal, use an
   `AuthorizationPolicy`: an ALLOW that needs `requestPrincipals` never matches
   a relayed CONNECT. This relay check lives in the mesh-managed `mesh_authz`,
   so an operator global `mesh_authz` that replaces it (possible only without
