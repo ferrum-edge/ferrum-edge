@@ -26,19 +26,25 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
-## Upgrading to 0.9.18
+## Upgrading to 0.9.19
 
-0.9.18 was prepared on 2026-10-26 UTC from `main` and follows 0.9.17
-directly. It collects the plugin production-launch hardening review together
+0.9.19 is the replacement candidate prepared on 2026-10-27 UTC. It carries
+the changes prepared for 0.9.18 on 2026-10-26 UTC: that immutable tag exists,
+but its production ARM64 build failed and no GitHub Release was published.
+Keep deployed pins on published 0.9.17 until 0.9.19 and its matching Contracts
+publication are verified. See the [ARM64 OOM recovery record](releases/v0.9.18-arm64-recovery.md).
+
+The upgrade follows published 0.9.17 directly. It collects the plugin
+production-launch hardening review together
 with other security and correctness fixes. Many sections below refuse
 configuration or traffic that 0.9.17 accepted, so review every section before
 upgrading. The `V001` baseline checksum is unchanged from 0.9.17, so a 0.9.17
 database is not refused on migration-history grounds. Stored configuration the
 sections below now refuse still fails validation when it is loaded, so fix or
 remove it first. CP/DP must run the same build, and the ConfigSync revision
-remains `3`. The matching `contracts-edge-0.9.18` release must be cut
+remains `3`. The matching `contracts-edge-0.9.19` release must be cut
 from the verified release commit; move downstream contract pins when each
-consumer adopts 0.9.18.
+consumer adopts 0.9.19.
 
 ### `response_caching` refuses underscore-spelled transport fields in `ignore_request_headers` (#6913, issue #6887)
 
@@ -1517,6 +1523,10 @@ the new key, move clients, then delete the old entry).
 ### `cors` credentialed origin matchers (PR #6639)
 
 With `allow_credentials: true`, a `"*.suffix"` origin is refused when the suffix is a single label, a public suffix, or has a Public Suffix List rule beneath it (`*.com`, `*.co.uk`, `*.github.io`, `*.amazonaws.com`). A credentialed `regex` origin must prove that it pins the host. Use exact origins, a registrable-domain wildcard such as `"*.example.com"`, an anchored regex ending in a fixed domain, or the host-bounded prefix `scheme://host:`. Without credentials these matchers are unchanged.
+
+0.9.19 refreshes the bundled Public Suffix List to `psl` 2.1.245 and regenerates
+the ancestor index (PR #6954). Revalidate credentialed wildcard origins
+against the updated shared-hosting boundaries before upgrading.
 
 ### `access_control` refuses an explicitly empty allow-list (#6607)
 
