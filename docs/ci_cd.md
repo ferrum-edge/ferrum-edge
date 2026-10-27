@@ -4429,8 +4429,10 @@ cold cache and a slow runner:
 - `build-release-arm64-cross`: originally **`timeout-minutes: 120`** — 2.6×
   its 45m39s observed compile step. The v0.9.19 recovery uses **240 minutes**,
   twice that allowance and over 5× the observed compile, to include swap
-  provisioning, image/sysroot preparation and disk-backed LTO. This budget
-  still needs successful production timing evidence.
+  provisioning, image/sysroot preparation and disk-backed LTO. The v0.9.19
+  production run 40457120201 supplied the timing evidence: the ARM64 build
+  step, including the fat-LTO link, took 36 minutes 1 second with the 32 GiB
+  swap provisioned.
 
 Both remain below 360. The ARM64 increase accompanies a demonstrated OOM
 capacity fix, rather than an unexplained hang. Subsequent budget changes

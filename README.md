@@ -608,15 +608,21 @@ at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, published on
 exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
 
+**v0.9.19** carries the plugin production-launch hardening from tagged but
+unpublished v0.9.18 and adds the [ARM64 OOM
+recovery](docs/releases/v0.9.18-arm64-recovery.md). Consumers move their pins
+to `contracts-edge-0.9.19` when they adopt Edge v0.9.19. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0919).
+
 **v0.9.17** carries the changes from tagged but unpublished v0.9.16. It adds
 the `loop_detected` gateway-error token, the
 `X-Ferrum-Hops` request header, and rejection phases for hop admission and
 cancelled uploads. Namespace-bounded admin tokens gain a tenant health tier
 and cannot read fleet-wide routes or `/metrics`. Admin cached-fallback misses
 return `503 CachedReadUnavailable`, and plugin trust follows registered types.
-Consumers move their pins to `contracts-edge-0.9.19` when they adopt Edge
-v0.9.19. See the
-[upgrade guide](docs/upgrade_guide.md#upgrading-to-0919).
+Consumers move their pins to `contracts-edge-0.9.17` when they adopt Edge
+v0.9.17. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0917).
 
 Changing any of the Edge source files below changes an Edge-owned contract and
 requires a matching ferrum-contracts PR that refreshes the vocabulary from the
