@@ -518,7 +518,7 @@ jobs:
   coverage-merge:
     name: Merge Coverage
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     needs:
       - coverage-plan
       - coverage-shard
