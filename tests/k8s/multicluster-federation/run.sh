@@ -125,7 +125,13 @@ FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true" >&2
 }
 
 cluster_exists() {
-  kind get clusters | grep -Fxq "$1"
+  local cluster="$1"
+  if kind get clusters | grep -Fxq "$cluster"; then
+    return 0
+  fi
+  # The PR workflow creates the kind clusters in an earlier step. Confirm the
+  # live Kubernetes context as a fallback when kind's cluster listing is stale.
+  kubectl --context "kind-$cluster" get nodes --request-timeout=5s >/dev/null 2>&1
 }
 
 create_cluster() {

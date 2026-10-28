@@ -412,7 +412,7 @@ jobs:
       - name: Cache FIPS Rust, AWS-LC, and sccache outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache
@@ -891,7 +891,7 @@ jobs:
       - name: Cache FIPS Rust, AWS-LC, and sccache outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache
@@ -1463,7 +1463,7 @@ jobs:
       - name: Cache FIPS Rust, AWS-LC, and sccache outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache
@@ -2031,7 +2031,7 @@ jobs:
       - name: Cache FIPS Rust, AWS-LC, and sccache outputs
         if: github.event.inputs.force_cold_cache != 'true'
         id: rust-cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-fips-contract-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', '.github/workflows/fips-build.yml', '.github/scripts/check_fips_feature_policy.py', 'src/fips/**', 'vendor/**') }}
           cache-directories: ${{ github.workspace }}/.cache/sccache

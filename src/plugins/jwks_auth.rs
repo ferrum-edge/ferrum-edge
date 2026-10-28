@@ -609,7 +609,7 @@ impl JwksAuth {
         // instance under any other id is an operator opt-in to optional auth.
         if allow_missing_token
             && let Some(config_id) = plugin_config_id
-            && config_id != crate::modes::mesh::MESH_REQUEST_AUTH_PLUGIN_ID
+            && !crate::modes::mesh::is_mesh_request_auth_plugin_id(config_id)
         {
             warn!(
                 plugin_config_id = %config_id,
@@ -2067,6 +2067,10 @@ impl super::Plugin for JwksAuth {
 
     fn is_auth_plugin(&self) -> bool {
         true
+    }
+
+    fn admits_missing_credential(&self) -> bool {
+        self.allow_missing_token
     }
 
     fn priority(&self) -> u16 {

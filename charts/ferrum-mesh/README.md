@@ -19,8 +19,7 @@ Example value overlays live under [`examples/`](examples/).
 
 ## Container image tag
 
-The current `appVersion` is **0.9.18**, the v0.9.18 release; until it is
-published, pin the published v0.9.17 tag. The
+The current `appVersion` is **0.9.19**, the published v0.9.19 release. The
 shared tag feeds mesh/control-plane, injector sidecar/capture-init and
 CNI/node-agent images; explicit node-agent or injector overrides must match the same release.
 Existing `-ebpf` and `-ebpf-tools` selection still applies to capture paths.

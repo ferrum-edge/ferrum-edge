@@ -250,6 +250,40 @@ skipped, stale, or ambiguous evidence blocks release. Tests is bound to the
 canonical CI check suite; trusted policy evidence is bound to the associated
 merged PR head. A policy override does not fabricate successful evidence: a
 commit landed with a failed trusted check is not a releasable commit.
+
+For Trusted Cross Build Policy, the gate enumerates repository-wide
+`pull_request_target` runs for the associated merged PR's exact head SHA and
+selects `.github/workflows/cross-build-policy.yml`. GitHub records ruleset-required
+runs under a separate workflow identity, so the file workflow's runs endpoint
+does not contain them. Each selected run must authenticate as either the resolved
+file workflow id or a reviewed integer id in the entry's `required_workflow_ids`
+pin list (currently `382932593`) with the exact URL
+`https://api.github.com/repos/ferrum-edge/ferrum-edge/actions/required_workflows/{id}`.
+The latter also requires an active `main` branch `workflows` rule for the same
+path, this repository's numeric id, and `refs/heads/main`. Any same-path entry
+in the effective `main` branch rules referencing another repository or ref blocks
+publication. Name, path, SHA, event, repository, head repository, and PR branch
+checks apply to both identities.
+Every repository-wide run must have a non-empty string path before selection;
+identified other-path runs are ignored, and every selected run must complete
+successfully. Run listings require unique run ids, a stable non-negative integer
+`total_count`, and a short final page whose collected count equals that total.
+GitHub's 1,000-result search cap or inconsistent totals block publication.
+Branch-rule listings also require a short final page, and the permitting sweep
+freshly reads identities, rules, and evidence.
+Push-based evidence continues to use the file workflow identities and endpoints.
+
+The optional `required_workflow_ids` field is allowed only for `pr_head` evidence
+and must contain a non-empty list of unique positive integers. Unknown required
+identities block even when their URLs are self-consistent and today's rules match.
+Rotating the ruleset to a new id blocks publication until a reviewed protected
+change updates the inventory pin. GitHub's deprecated `required_workflows` API
+cannot query a pinned identity's historical source. Acceptance therefore trusts
+that administrators have not re-pointed its rule between execution and
+publication; such administrator changes are outside this gate's trust model.
+The pin and current rule checks do not prove the individual run's historical
+source repository/ref.
+
 A Dependabot merge made by `dependabot-auto-merge.yml` passes every trusted
 check, but GitHub starts no `push` workflows for a merge queued through
 `GITHUB_TOKEN`. That merge commit therefore has no push-to-`main` evidence of
@@ -1975,6 +2009,21 @@ full-release ABI job are removed; fast test artifacts make no production ABI
 claim. Existing frozen parser, shell, action, and artifact-ownership checks
 continue to protect the production lane.
 
+The v0.9.19 recovery retains Ubuntu 24.04 and provisions an
+additional **32 GiB** swapfile on the runner root filesystem before the
+checksum-pinned `before` resource observation. Fixed host commands create a
+new `0600` file and enable it; `swapon --show --bytes`, `/proc/swaps` and
+`/proc/meminfo` verify activation and capacity. Any provisioning or capacity
+check failure stops compilation. Existing swap stays enabled. The observer
+records the resulting total/free swap before and after compilation. No
+third-party swap automation or compiler-environment change is involved.
+The job has a **240-minute** budget to allow slower disk-backed fat LTO.
+Attempts 2 and 3 of v0.9.18 proved host OOM in a single gateway binary `rustc` after
+dependencies finished, so reducing Cargo job concurrency does not bound that
+process's memory. See the [evidence, timeout rationale and qualification
+limits](releases/v0.9.18-arm64-recovery.md). The immutable v0.9.18 tag was not
+published; rerunning it cannot load the replacement producer.
+
 `Cross.toml` image, the complete ordered `pre-build` list, and
 `env.passthrough` are allowlisted by identity in `verify_cross_build_policy.py`.
 The Cross 0.2.5 image is pinned to the GHCR-published OCI index
@@ -2727,6 +2776,13 @@ exact SHA before any release binary or image job starts. A version mismatch fail
 immediately, and every build and publishing job depends transitively on this
 guard.
 
+A change to the protected publication-gate surfaces cannot itself be a release
+commit: its own PR head's Trusted Cross Build Policy run fails by design, and a
+policy override cannot turn that failure into successful release evidence.
+After the reviewed policy change lands, cut the release from a later PR merged
+with **Create a merge commit**, whose PR head has successful trusted-policy
+evidence and whose merge commit has all exact-SHA publication checks.
+
 Release runs use the shared `production-release` concurrency group with
 `cancel-in-progress: false`. One production release runs at a time because
 version releases update shared major/minor image aliases; GitHub retains only
@@ -2765,8 +2821,11 @@ the same inventory `release-dispatch.yml` checks before creating the tag.
 
 Every inventoried required check must be successful for the exact tag target
 under canonical workflow identity, the expected event, and the expected branch.
-Manual workflow dispatches do not satisfy this gate. Dedicated workflows are
-queried on their canonical endpoints; `Tests` is bound instead to the named
+Manual workflow dispatches do not satisfy this gate. Push-based workflows are
+queried on their file workflow endpoints; PR-head policy runs use the
+repository-wide listing and authenticate file or ruleset-required identity as
+described in [Publish-blocking required checks](#publish-blocking-required-checks).
+`Tests` is bound to the named
 GitHub Actions check run owned by each canonical `ci.yml` push run, so failures
 in later jobs of that run (such as the main image packaging) do not replace the
 `Tests` result. The job holds only
@@ -2985,7 +3044,9 @@ git tag v0.3.0
    the release commit's second parent to the associated PR head; squash and
    rebase merges cannot satisfy that check. Do not tag an unvalidated direct
    push. If the version PR was squash-merged, land a follow-up PR with a merge
-   commit and validate that main commit before releasing.
+   commit and validate that main commit before releasing. If a PR changes the
+   protected publication-gate surfaces, its own trusted-policy run fails by
+   design; release from a later merge-commit PR with successful evidence.
 2. In Actions, select **Start Production Release**, choose branch **main**, and
    enter the new stable version tag matching Cargo.toml, for example `v1.2.3`.
    The CLI equivalent is:
@@ -4325,9 +4386,11 @@ every input-size limit, and every execution bound remain as they are.
 the shipping-profile experiment remains not adopted.** The `build-release-binaries`
 job now carries `timeout-minutes: 180` with 165 on each build step and uploads
 `target/cargo-timings/` as `release-build-timings-<target>` (14-day retention),
-and `build-release-arm64-cross` carries `timeout-minutes: 120`; the frozen
-ARM64 job digest in `verify_cross_build_policy.py` was moved in the same
-commit. Everything below records why those numbers were chosen and why the
+and `build-release-arm64-cross` originally carried `timeout-minutes: 120`.
+The v0.9.19 OOM recovery raises only ARM64 to **240 minutes** for
+disk-backed fat LTO and refreezes its job digest in
+`verify_cross_build_policy.py`. Everything below records the original budget
+evidence and why the
 change could not travel through a pull request: `release.yml`'s
 `build-release-arm64-cross` is digest-frozen in `WORKFLOW_CONTRACTS`, and
 `build-release-binaries` is read as Cross-sensitive and held to `main`'s own
@@ -4363,11 +4426,17 @@ cold cache and a slow runner:
   observed job. This matches the 180/165 pair the non-publishing
   `release-platform-study.yml` uses for the same three cold shipping-profile
   compiles.
-- `build-release-arm64-cross`: **`timeout-minutes: 120`** — 2.6× its 45m39s
-  observed compile step, leaving room for image pull and sysroot preparation.
+- `build-release-arm64-cross`: originally **`timeout-minutes: 120`** — 2.6×
+  its 45m39s observed compile step. The v0.9.19 recovery uses **240 minutes**,
+  twice that allowance and over 5× the observed compile, to include swap
+  provisioning, image/sysroot preparation and disk-backed LTO. The v0.9.19
+  production run 40457120201 supplied the timing evidence: the ARM64 build
+  step, including the fat-LTO link, took 36 minutes 1 second with the 32 GiB
+  swap provisioned.
 
-Both are far below 360 and above anything ever observed to succeed. Raise a
-number when a *successful* run exceeds it; do not raise one to absorb a hang.
+Both remain below 360. The ARM64 increase accompanies a demonstrated OOM
+capacity fix, rather than an unexplained hang. Subsequent budget changes
+should use successful production timing evidence.
 
 #### Timings capture that preserves logs on timeout
 
