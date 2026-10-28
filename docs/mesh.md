@@ -2848,16 +2848,79 @@ the materialized Sidecar inbound routes, an EgressGateway's `mesh-egress-*`
 HTTP proxies, plus the synthesized HBONE relay
 proxies (`__mesh-inbound-hbone-relay` / `__mesh-ingress-connect-relay`), whose
 CONNECT admission runs the global HTTP plugin chain before the tunnel opens.
-On Ambient (and NodeWaypoint/ServiceWaypoint) no inbound HTTP route
-materializes, so those relay ids are what makes the refusal refuse inbound
-CONNECTs there instead of falling back to unscoped and refusing the workload's
-outbound requests (issue #6736). EastWestGateway (SNI passthrough, no HBONE
+On Ambient no inbound HTTP route materializes, so those relay ids are what
+makes the refusal refuse inbound CONNECTs there instead of falling back to
+unscoped and refusing the workload's outbound requests (issue #6736). On
+NodeWaypoint and ServiceWaypoint the managed `mesh_authz` refuses relays per
+destination instead (see "Shared waypoints follow the destination" below); the
+relay ids are used only when an operator `mesh_authz` replaces the managed
+one. EastWestGateway (SNI passthrough, no HBONE
 listener) keeps the unscoped fail-closed fallback. This deliberately differs from
 Istio, whose validating webhook would never admit such a resource; Ferrum
 accepts some resources Istio admits but Ferrum cannot enforce faithfully, and
 for those it chooses refusal over running without validation. The status reports
 `FerrumAccepted=False` / `Invalid` and `status.ferrum.translation.enforcement:
 refuse_all`.
+
+**Shared waypoints follow the destination** (issue #6670). A NodeWaypoint or
+ServiceWaypoint terminates requests for other workloads, so a
+RequestAuthentication is matched against the workloads a request reaches, not
+against the waypoint's own namespace and labels. A waypoint slice therefore
+also carries the resources that select the destinations it fronts: the
+visible workloads its routes reach and, on a NodeWaypoint, its capture
+destinations.
+
+- **NodeWaypoint Service routes (Layer 7).** Each HTTP route is resolved to its
+  destination workloads through the same index `mesh_authz` uses for
+  destination policy (keyed by namespace and upstream id, because generated
+  upstream ids are unique only within a namespace), including every `mesh_route_dispatch` destination
+  (associated or global) it may be rewritten to after authentication.
+  - A route whose destination set differs from the waypoint's own set gets a
+    proxy-group `jwks_auth` instance (`__mesh_request_auth_dst_*`) that replaces
+    the global `__mesh_request_auth` on that route. JWT validation, token
+    stripping and claim-header ownership then apply to requests for the
+    selected destination and never to an unrelated one.
+  - A route whose destination is selected by no resource with a usable JWT
+    rule is excluded from the global instance by its execution trigger. If
+    that exclusion cannot be represented as one trigger, those routes are
+    refused instead.
+  - Workloads the route cannot reach are not compared: a secured NodeWaypoint
+    (CA backend or configured SVID) never dials a Service workload that lacks
+    NodeWaypoint metadata. A Service whose workloads are all in a remote
+    cluster has no local destination set; its destination cluster enforces
+    its own resources.
+  - The route is refused (`503`, through the trigger of
+    `__mesh_request_auth_refused`) when:
+    - its destination is selected by a refused resource;
+    - the workloads it can reach (several pods behind one Service, or a
+      dispatch rewrite target) are selected by **different** resource sets,
+      because the backend is chosen after authentication and a union would let
+      one destination's providers mint principals and claim headers for
+      another;
+    - it reaches a modeled destination whose workloads cannot be resolved
+      while destination resources exist;
+    - its destination's provider union exceeds what one `jwks_auth` instance
+      can verify (64 providers in total, or more than 8 sharing one issuer).
+  - Refused routes are named by id in the refusal's execution trigger. A
+    refusal too large for one trigger is split across additional forced
+    instances (`__mesh_request_auth_refused_<n>`), so a large refusal never
+    falls back to refusing healthy destinations.
+  - A route with no modeled destination (for example an external
+    `ServiceEntry` host) keeps the global instance.
+- **Inbound relays (Layer 4).** A waypoint relay does not parse tunnelled HTTP,
+  so no JWT can be validated there, on either waypoint type. `mesh_authz`
+  refuses (`503`, `mesh_authz.deny_policy: request_authentication_refused`) an
+  inbound HBONE relay, or a NodeWaypoint transparent-capture plaintext
+  connection, whose destination workload a refused resource selects. A
+  NodeWaypoint relay whose destination cannot be resolved is refused while any
+  refused resource is present. On a waypoint this per-destination check also
+  replaces the blanket relay refusal for a refused resource that selects the
+  waypoint's own namespace or identity, so a relay to a destination that
+  resource does not select keeps flowing. To require a principal, use an
+  `AuthorizationPolicy`: an ALLOW that needs `requestPrincipals` never matches
+  a relayed CONNECT. This relay check lives in the mesh-managed `mesh_authz`,
+  so an operator global `mesh_authz` that replaces it (possible only without
+  transparent capture) also replaces the check.
 
 **Deferred JWT-rule fields**: `outputPayloadToHeader` and `fromCookies` are
 recognized but not enforced. Both are surfaced in

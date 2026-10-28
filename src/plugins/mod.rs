@@ -13187,6 +13187,15 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Cache-build diagnostic: whether this authentication instance already
+    /// lets a request without any credential through (for example the mesh
+    /// RequestAuthentication `jwks_auth`, which is permissive by design). A
+    /// trigger that skips such an instance cannot leave a request less
+    /// authenticated than the instance itself would.
+    fn admits_missing_credential(&self) -> bool {
+        false
+    }
+
     /// Whether this authentication instance applies to the current request.
     ///
     /// Ordinary authentication plugins are always applicable. Instance
