@@ -261,6 +261,12 @@ struct NodeWaypointSlice {
     capture_sources_by_pod_uid: std::collections::HashMap<[u8; 16], (SpiffeId, u64)>,
     /// Pod UIDs carried by disagreeing workload records: never resolved.
     conflicted_pod_uids: std::collections::HashSet<[u8; 16]>,
+    /// Capture-inventory pod UIDs with no ordinary `workloads` record (the
+    /// cross-namespace sources). UDP/DTLS registry attribution (issue #3286)
+    /// never proves these: that channel keeps its pre-#6800 source set, so a
+    /// later withdrawal or conflict cannot turn an attributed, scoped session
+    /// into an unattributed mesh-wide-only one.
+    capture_only_pod_uids: std::collections::HashSet<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +329,7 @@ fn build_node_waypoint_slice<'a, 'b>(
     let mut spiffe_by_pod_uid: HashMap<[u8; 16], SpiffeId> = HashMap::new();
     let mut conflicted_pod_uids: HashSet<[u8; 16]> = HashSet::new();
     let mut capture_uids: Vec<[u8; 16]> = Vec::new();
+    let mut ordinary_uids: HashSet<[u8; 16]> = HashSet::new();
     for (workload, from_capture) in ordinary
         .iter()
         .map(|workload| (*workload, false))
@@ -344,6 +351,8 @@ fn build_node_waypoint_slice<'a, 'b>(
         };
         if from_capture {
             capture_uids.push(uid);
+        } else {
+            ordinary_uids.insert(uid);
         }
         if conflicted_pod_uids.contains(&uid) {
             continue;
@@ -369,6 +378,11 @@ fn build_node_waypoint_slice<'a, 'b>(
     }
     // Capture-inventory sources resolve ONLY through their exact pod UID.
     let mut capture_sources_by_pod_uid: HashMap<[u8; 16], (SpiffeId, u64)> = HashMap::new();
+    let capture_only_pod_uids: HashSet<[u8; 16]> = capture_uids
+        .iter()
+        .filter(|uid| !ordinary_uids.contains(*uid))
+        .copied()
+        .collect();
     for uid in capture_uids {
         if let Some(spiffe_id) = spiffe_by_pod_uid.get(&uid) {
             capture_sources_by_pod_uid
@@ -401,6 +415,7 @@ fn build_node_waypoint_slice<'a, 'b>(
             scopes_by_pod_uid,
             capture_sources_by_pod_uid,
             conflicted_pod_uids,
+            capture_only_pod_uids,
         },
     }
 }
@@ -1014,7 +1029,11 @@ impl NodeWaypointIdentityResolver {
     ) -> (u64, Option<Arc<PolicyScopeCache>>) {
         let slice = self.slice.load();
         let generation = slice.generation;
-        if slice.spiffe_for_pod_uid(pod_uid) != Some(expected_spiffe_id) {
+        // Cross-namespace capture sources are outside the UDP/DTLS attribution
+        // channel (see `NodeWaypointSlice::capture_only_pod_uids`).
+        if slice.capture_only_pod_uids.contains(pod_uid)
+            || slice.spiffe_for_pod_uid(pod_uid) != Some(expected_spiffe_id)
+        {
             return (generation, None);
         }
         (generation, slice.scope_for(pod_uid))

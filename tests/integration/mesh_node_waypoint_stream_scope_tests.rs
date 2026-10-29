@@ -1773,9 +1773,14 @@ mod node_waypoint_cross_namespace_source_resolution {
                 .is_err(),
             "per-request liveness must refuse the withdrawn pod on an existing connection"
         );
-        // A fresh (lazy) record for the withdrawn pod: refused too.
-        stamp(&resolver, 52, SIBLING_UID, &ledger);
-        assert_unknown_pod(&resolver, 52, SIBLING_UID);
+        // Lazy enrollment for the withdrawn pod on a resolver that never cached
+        // it: refused too (the shared hash is not hash-joinable).
+        let fresh = NodeWaypointIdentityResolver::new(0);
+        seed(&fresh, &with_sibling(OTHER_WAYPOINT));
+        stamp(&fresh, 52, SIBLING_UID, &ledger);
+        assert_unknown_pod(&fresh, 52, SIBLING_UID);
+        stamp(&fresh, 53, LEDGER_UID, &ledger);
+        assert!(fresh.resolve_cookie(53).is_ok());
         // The still-enrolled pod sharing the SPIFFE keeps resolving.
         let (identity, scope) = resolver.resolve_cookie(50).expect("ledger stays enrolled");
         assert_eq!(identity.spiffe_id, ledger);
@@ -1821,12 +1826,14 @@ mod node_waypoint_cross_namespace_source_resolution {
         );
     }
 
-    /// The secondary consumers of the same generation see the cross-namespace
-    /// source too: the pod-specific in-netns listener fallback
-    /// (`resolve_expected_pod_identity`) and the UDP/DTLS exact-principal proof
-    /// (`policy_scope_for_pod_identity`), which still refuses a wrong principal.
+    /// The pod-specific in-netns listener fallback (`resolve_expected_pod_identity`)
+    /// sees the cross-namespace source. The UDP/DTLS registry proof
+    /// (`policy_scope_for_pod_identity`) deliberately does NOT: that channel
+    /// keeps its pre-#6800 source set, so a later withdrawal or conflict can
+    /// never flip an attributed, scoped UDP session into an unattributed
+    /// mesh-wide-only one. A same-namespace enrolled pod keeps its UDP proof.
     #[test]
-    fn pod_uid_consumers_resolve_the_cross_namespace_source_and_refuse_a_wrong_principal() {
+    fn pod_uid_consumers_see_the_cross_namespace_source_only_where_intended() {
         let slice =
             MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
         let resolver = NodeWaypointIdentityResolver::new(0);
@@ -1840,16 +1847,24 @@ mod node_waypoint_cross_namespace_source_resolution {
         assert_eq!(identity.spiffe_id, ledger);
         assert_eq!(scope.expect("scope").namespace, "payments");
 
-        assert_eq!(
+        assert!(
             resolver
                 .policy_scope_for_pod_identity(&ledger_uid, &ledger)
-                .expect("UDP/DTLS principal proof")
+                .is_none(),
+            "cross-namespace capture sources stay outside UDP/DTLS attribution"
+        );
+        let local_uid = parse_pod_uid(LOCAL_UID).unwrap();
+        let local = spiffe_for("ferrum", "local");
+        assert_eq!(
+            resolver
+                .policy_scope_for_pod_identity(&local_uid, &local)
+                .expect("same-namespace UDP/DTLS principal proof")
                 .namespace,
-            "payments"
+            "ferrum"
         );
         assert!(
             resolver
-                .policy_scope_for_pod_identity(&ledger_uid, &spiffe_for("payments", "reports"))
+                .policy_scope_for_pod_identity(&local_uid, &spiffe_for("ferrum", "other"))
                 .is_none(),
             "a registry principal that is not this pod's identity proves nothing"
         );

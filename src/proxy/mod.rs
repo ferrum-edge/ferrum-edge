@@ -35075,7 +35075,22 @@ async fn handle_proxy_request_inner(
         if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
             match resolver.current_policy_scope_for_identity(&identity) {
                 Ok(scope) => ctx.node_waypoint_policy_scope = scope,
-                Err(_) => {
+                Err(error) => {
+                    record_node_waypoint_identity_drop(&state.overload, &error);
+                    static REVOKED_IDENTITY_WARN:
+                        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter =
+                        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::new();
+                    if let Some(suppressed) =
+                        REVOKED_IDENTITY_WARN.on_event(crate::socket_opts::monotonic_now_ms())
+                    {
+                        warn!(
+                            pod_uid = %pod_uid_label(&identity.pod_uid),
+                            spiffe_id = %identity.spiffe_id,
+                            suppressed,
+                            "Refusing node-waypoint request: the source pod identity is no longer \
+                             vouched by the live mesh slice"
+                        );
+                    }
                     ctx.terminal_record.mark_counted();
                     record_request(&state, 403);
                     return Ok(build_response(
