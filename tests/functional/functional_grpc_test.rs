@@ -1450,10 +1450,10 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
 /// long-lived streaming RPCs.
 ///
 /// With the limit at 1 and stream #1 parked mid-response, a SECOND request from
-/// the same IP must be rejected with **HTTP 429**. The per-IP reject fires in
-/// `proxy::handle_request` BEFORE gRPC dispatch and returns a plain
-/// `build_response(StatusCode::TOO_MANY_REQUESTS, ...)` — so the rejection is a
-/// real HTTP 429, NOT a `grpc-status` trailer frame.
+/// the same IP must be rejected. The per-IP reject fires in
+/// `proxy::handle_request` BEFORE gRPC dispatch and, like every pre-routing
+/// refusal (issue #6943), answers native gRPC in its own framing: HTTP 200 with
+/// a Trailers-Only `grpc-status: 8` (`RESOURCE_EXHAUSTED`), as on HTTP/3.
 ///
 /// Structural inverse of the WebSocket case
 /// `test_h3_websocket_releases_per_ip_request_slot_after_200` (WS releases the
@@ -1518,30 +1518,37 @@ async fn test_grpc_streaming_holds_per_ip_request_slot() {
     );
 
     // Request #2 from the SAME IP while stream #1 holds the only slot. The
-    // per-IP limiter must reject it with a plain HTTP 429 BEFORE gRPC dispatch.
+    // per-IP limiter must reject it with Trailers-Only RESOURCE_EXHAUSTED
+    // BEFORE gRPC dispatch.
     //
     // The 5s timeout converts the pre-fix regression into a fast, descriptive
     // failure instead of a hang: pre-fix, the slot was released at stream #1's
     // header flush, so request #2 would be ADMITTED — and `send_grpc_request`
     // would then block in `collect()` on the still-stalled streaming backend
-    // (no EOF until release), hanging the test. Post-fix, the 429 returns
+    // (no EOF until release), hanging the test. Post-fix, the refusal returns
     // immediately, well inside the timeout.
-    let (status2, _headers2, _body2) = tokio::time::timeout(
+    let (status2, headers2, body2) = tokio::time::timeout(
         Duration::from_secs(5),
         send_grpc_request(&gateway_addr, "/grpc/my.EchoService/Echo", b"", &[]),
     )
     .await
     .expect(
-        "request #2 must resolve fast with a 429; a hang here means it was \
+        "request #2 must resolve fast with a per-IP refusal; a hang here means it was \
          wrongly admitted to the stalled streaming backend (F15 regression)",
     )
-    .expect("request #2 should complete (with a 429)");
+    .expect("request #2 should complete (with a per-IP refusal)");
     assert_eq!(
-        status2, 429,
+        (status2, headers2.get("grpc-status").map(String::as_str)),
+        (200, Some("8")),
         "a 2nd same-IP request while a streaming RPC holds the slot must be \
-         rejected with HTTP 429 (per-IP limit), not admitted — this is the F15 \
-         evasion the fix closes"
+         rejected with Trailers-Only RESOURCE_EXHAUSTED (per-IP limit), not \
+         admitted — this is the F15 evasion the fix closes"
     );
+    assert_eq!(
+        headers2.get("grpc-message").map(String::as_str),
+        Some("Too many concurrent requests from this IP")
+    );
+    assert!(body2.is_empty(), "the per-IP refusal carries no gRPC DATA");
 
     // Release the backend (flips the watch to `true`, waking every parked
     // streaming response) and drain stream #1 to completion so the gateway
