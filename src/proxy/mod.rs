@@ -34666,8 +34666,9 @@ fn pre_routing_refusal_response(
 
 /// The protocol-level `405` for TRACE and non-WebSocket CONNECT, in the
 /// client's wire representation. Ordinary HTTP keeps the JSON body and the
-/// `Allow` header; gRPC and gRPC-Web go through the shared reject normalizer,
-/// as the HTTP/3 frontend's `send_h3_protocol_method_not_allowed` does.
+/// `Allow` header; gRPC and gRPC-Web go through the shared reject normalizer
+/// and keep `Allow` too, as the HTTP/3 frontend's
+/// `send_h3_protocol_method_not_allowed` does.
 #[inline(never)]
 fn pre_routing_method_not_allowed_response(
     grpc_web_response_content_type: Option<&str>,
@@ -34678,13 +34679,30 @@ fn pre_routing_method_not_allowed_response(
         return build_method_not_allowed_response(http_body);
     }
     let headers = HashMap::from([("allow".to_string(), PROTOCOL_LEVEL_405_ALLOW.to_string())]);
-    build_pre_plugin_reject_response(
+    let reject = normalize_reject_response(
         StatusCode::METHOD_NOT_ALLOWED,
-        http_body.as_bytes(),
+        Bytes::from_static(http_body.as_bytes()),
         &headers,
-        native_grpc,
-        grpc_web_response_content_type,
-    )
+        true,
+    );
+    if let (Some(content_type), Some(grpc_status)) =
+        (grpc_web_response_content_type, reject.grpc_status)
+    {
+        let message = reject
+            .grpc_message
+            .as_deref()
+            .unwrap_or_else(|| grpc_status_reason(grpc_status));
+        // Carry the normalized reject headers (`Allow`) onto the gRPC-Web
+        // answer, as the HTTP/3 gRPC-Web reject path does.
+        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            grpc_status,
+            message,
+        );
+        finalize_grpc_web_error_response_headers(&mut translated, &[], Some(&reject.headers));
+        return build_grpc_web_error_response_from_parts(translated, grpc_status, message);
+    }
+    build_response_from_normalized_reject(reject)
 }
 
 /// The answer to a request refused by the proxy hop limit (issue #6109):

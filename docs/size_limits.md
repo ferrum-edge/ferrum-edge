@@ -288,10 +288,11 @@ The three header limits are the exception for gRPC-Web: they are enforced
 before the gateway negotiates a gRPC-Web response media type from request
 headers, so that parsing never runs on unbounded headers, and gRPC-Web
 receives the JSON `431` there. Native gRPC needs no negotiation and gets the
-Trailers-Only status. The proxy hop limit and the HTTP/1.1 and HTTP/2
-connection-level admission fences (overload, stale configuration, withdrawn
-client-certificate trust) run before the header limits too, so gRPC-Web also
-gets their plain HTTP answer; see [Proxy hop limit](routing.md#proxy-hop-limit).
+Trailers-Only status. The HTTP/1.1 and HTTP/2 connection-level admission
+fences (overload, stale configuration, withdrawn client-certificate trust) run
+before the header limits, so gRPC-Web also gets their plain HTTP answer. The
+proxy hop limit runs right after the header limits and keeps the plain HTTP
+answer for gRPC-Web by contract; see [Proxy hop limit](routing.md#proxy-hop-limit).
 A WebSocket handshake gets the plain HTTP answer from every one of them. No refused request reaches a
 plugin or a backend.
 

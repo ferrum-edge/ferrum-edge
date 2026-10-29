@@ -506,6 +506,14 @@ async fn functional_pre_routing_refusal_framing_matches_client_flavor_on_h1_and_
                 )
                 .await;
                 assert_refusal(&case, *wire, flavor, &response);
+                if case.http_status == StatusCode::METHOD_NOT_ALLOWED {
+                    assert_eq!(
+                        response.header("allow"),
+                        Some("GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"),
+                        "{} over {wire:?} as {flavor:?}: every 405 keeps Allow",
+                        case.name
+                    );
+                }
             }
         }
     }
