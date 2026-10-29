@@ -1030,7 +1030,7 @@ impl NodeWaypointIdentityResolver {
     /// set.
     ///
     /// Used by tests and direct resolver callers. Mesh slice apply should
-    /// prefer [`build_policy_scope_snapshot_from_workloads`] and
+    /// use [`build_policy_scope_snapshot_from_slice`] and
     /// [`install_policy_scope_snapshot`] so it can stage the slice before config
     /// validation while publishing it only after the proxy config is accepted.
     pub fn install_policy_scopes_from_workloads<'a, I>(&self, workloads: I)
@@ -1052,7 +1052,7 @@ impl NodeWaypointIdentityResolver {
     /// inventory is exactly the set of workloads whose trusted
     /// `Workload.node_waypoint.spiffe_id` names THIS NodeWaypoint, already
     /// bounded by CP scope and the bearer namespace claim, so it is also the
-    /// least-privilege source inventory. It is consulted only here: it never
+    /// least-privilege source inventory. Seeding the resolver from it never
     /// widens `workloads` / routing visibility.
     ///
     /// Capture-inventory sources are vouched by their EXACT pod UID, never by

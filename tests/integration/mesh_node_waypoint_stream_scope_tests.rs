@@ -1377,8 +1377,8 @@ mod node_waypoint_cross_namespace_source_resolution {
     use ferrum_edge::identity::SpiffeId;
     use ferrum_edge::identity::spiffe::TrustDomain;
     use ferrum_edge::modes::mesh::config::{
-        AppProtocol, MeshConfig, NodeWaypointCaptureInventoryState, NodeWaypointEndpoint, Workload,
-        WorkloadPort, WorkloadSelector,
+        AppProtocol, MeshConfig, MeshPolicy, MeshRule, NodeWaypointCaptureInventoryState,
+        NodeWaypointEndpoint, PolicyAction, PolicyScope, Workload, WorkloadPort, WorkloadSelector,
     };
     use ferrum_edge::modes::mesh::node_waypoint::{
         NodeWaypointIdentityError, NodeWaypointIdentityResolver, parse_pod_uid,
@@ -1819,5 +1819,179 @@ mod node_waypoint_cross_namespace_source_resolution {
                 .expect("re-enrolled")
                 .is_some()
         );
+    }
+
+    /// The secondary consumers of the same generation see the cross-namespace
+    /// source too: the pod-specific in-netns listener fallback
+    /// (`resolve_expected_pod_identity`) and the UDP/DTLS exact-principal proof
+    /// (`policy_scope_for_pod_identity`), which still refuses a wrong principal.
+    #[test]
+    fn pod_uid_consumers_resolve_the_cross_namespace_source_and_refuse_a_wrong_principal() {
+        let slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+        let ledger_uid = parse_pod_uid(LEDGER_UID).unwrap();
+        let ledger = spiffe_for("payments", "ledger");
+
+        let (identity, scope) = resolver
+            .resolve_expected_pod_identity(ledger_uid)
+            .expect("in-netns listener fallback resolves the enrolled source");
+        assert_eq!(identity.spiffe_id, ledger);
+        assert_eq!(scope.expect("scope").namespace, "payments");
+
+        assert_eq!(
+            resolver
+                .policy_scope_for_pod_identity(&ledger_uid, &ledger)
+                .expect("UDP/DTLS principal proof")
+                .namespace,
+            "payments"
+        );
+        assert!(
+            resolver
+                .policy_scope_for_pod_identity(&ledger_uid, &spiffe_for("payments", "reports"))
+                .is_none(),
+            "a registry principal that is not this pod's identity proves nothing"
+        );
+        assert!(
+            resolver
+                .resolve_expected_pod_identity(parse_pod_uid(REPORTS_UID).unwrap())
+                .is_err()
+        );
+    }
+
+    /// No least-privilege inventory → no cross-namespace source: an
+    /// identity-less NodeWaypoint request and a narrowed-but-unresolved
+    /// (`NotResolved`) document both leave the foreign pod unknown.
+    #[test]
+    fn identity_less_and_not_resolved_inventories_resolve_no_foreign_source() {
+        let ledger = spiffe_for("payments", "ledger");
+
+        let mut identity_less = node_waypoint_request();
+        identity_less.workload_spiffe_id = None;
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), identity_less),
+        );
+        stamp(&resolver, 70, LEDGER_UID, &ledger);
+        assert_unknown_pod(&resolver, 70, LEDGER_UID);
+
+        let mut config = document(THIS_WAYPOINT);
+        config
+            .mesh
+            .as_mut()
+            .expect("mesh")
+            .node_waypoint_capture_inventory_state = NodeWaypointCaptureInventoryState::NotResolved;
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&config, node_waypoint_request()),
+        );
+        stamp(&resolver, 71, LEDGER_UID, &ledger);
+        assert_unknown_pod(&resolver, 71, LEDGER_UID);
+    }
+
+    /// Same pod UID, different SPIFFE: conflicted, so neither identity resolves.
+    #[test]
+    fn same_pod_uid_with_differing_spiffe_ids_resolves_neither() {
+        let mut slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        let mut impostor = slice
+            .node_waypoint_capture_destinations
+            .iter()
+            .find(|workload| workload.service_name == "ledger")
+            .cloned()
+            .expect("ledger destination");
+        impostor.spiffe_id = spiffe_for("payments", "impostor");
+        slice.node_waypoint_capture_destinations.push(impostor);
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+
+        stamp(&resolver, 80, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        assert_unknown_pod(&resolver, 80, LEDGER_UID);
+        stamp(
+            &resolver,
+            81,
+            LEDGER_UID,
+            &spiffe_for("payments", "impostor"),
+        );
+        assert_unknown_pod(&resolver, 81, LEDGER_UID);
+    }
+
+    /// Pins the deliberate parity: a resolved cross-namespace source's scope
+    /// selects the policies that select IT — including its own-namespace policy
+    /// that reaches the NodeWaypoint only through the capture inventory — just
+    /// as a same-namespace enrolled pod's scope selects its ordinary policies.
+    /// It never selects a policy for another namespace or workload.
+    #[test]
+    fn cross_namespace_source_scope_selects_only_its_own_policies() {
+        fn policy(namespace: &str, name: &str, scope: PolicyScope) -> MeshPolicy {
+            MeshPolicy {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                scope,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: Vec::new(),
+                    request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
+                    never_matches: false,
+                    action: PolicyAction::Deny,
+                }],
+            }
+        }
+        fn app(namespace: &str, app: &str) -> PolicyScope {
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), app.to_string())]),
+                    namespace: Some(namespace.to_string()),
+                },
+            }
+        }
+        let ledger_deny = policy("payments", "ledger-deny", app("payments", "ledger"));
+        let reports_deny = policy("payments", "reports-deny", app("payments", "reports"));
+        let ferrum_deny = policy(
+            "ferrum",
+            "ferrum-deny",
+            PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
+        );
+        let mut config = document(THIS_WAYPOINT);
+        config.mesh.as_mut().expect("mesh").mesh_policies = vec![
+            ledger_deny.clone(),
+            reports_deny.clone(),
+            ferrum_deny.clone(),
+        ];
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+        assert!(
+            slice
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "ledger-deny"),
+            "the source's own-namespace policy rides the capture inventory"
+        );
+        assert!(
+            slice
+                .mesh_policies
+                .iter()
+                .all(|policy| policy.namespace == "ferrum"),
+            "the foreign policy must not widen the ordinary policy view"
+        );
+
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+        stamp(&resolver, 90, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let scope = resolver
+            .resolve_cookie(90)
+            .expect("ledger")
+            .1
+            .expect("scope");
+        assert!(scope.policy_applies(&ledger_deny));
+        assert!(!scope.policy_applies(&reports_deny));
+        assert!(!scope.policy_applies(&ferrum_deny));
     }
 }
