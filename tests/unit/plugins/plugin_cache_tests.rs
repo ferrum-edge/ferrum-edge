@@ -5918,6 +5918,211 @@ fn finalized_request_policy_candidate_inventory_covers_every_builtin_override() 
     }
 }
 
+/// Built-ins whose `request_headers_to_redact()` names are deliberately not
+/// candidate-visible: candidate admission neither constructs them nor gives
+/// them a stand-in credential parser. Each entry names the only header the
+/// plugin can publish, and that header must be one `opa`
+/// `decision_request_headers` already refuses at config parse, so the
+/// candidate-time `opa` obligation refusal cannot miss it.
+const CREDENTIAL_PUBLISHER_CANDIDATE_EXEMPTIONS: &[(&str, &str)] = &[
+    // `ldap_auth` always publishes exactly `authorization`.
+    ("ldap_auth", "authorization"),
+];
+
+/// The body of the function whose `fn` keyword starts at `fn_offset`, with
+/// line comments removed and whitespace squeezed out.
+fn squeezed_fn_body(source: &str, fn_offset: usize) -> Option<String> {
+    let after = &source[fn_offset..];
+    let open = after.find('{')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in after[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                // Braces inside string or char literals are not parsed; an
+                // unbalanced one ends the scan instead of underflowing.
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &after[open + 1..close?];
+    Some(
+        body.lines()
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .flat_map(str::chars)
+            .filter(|ch| !ch.is_whitespace())
+            .collect(),
+    )
+}
+
+/// The name a built-in plugin reports: the string literal after the nearest
+/// preceding `fn name(&self) -> &str {` or `impl_auth_plugin!(` invocation.
+fn reported_plugin_name(before: &str) -> Option<String> {
+    let marker = [
+        before.rfind("fn name(&self) -> &str {"),
+        before.rfind("impl_auth_plugin!("),
+    ]
+    .into_iter()
+    .flatten()
+    .max()?;
+    let rest = &before[marker..];
+    let rest = &rest[rest.find('"')? + 1..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+fn collect_plugin_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+    for entry in std::fs::read_dir(dir).expect("plugin source directory must be readable") {
+        let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            collect_plugin_sources(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            let source = std::fs::read_to_string(&path).expect("read plugin source");
+            out.push((path, source));
+        }
+    }
+}
+
+#[test]
+fn every_request_header_redaction_publisher_is_candidate_visible() {
+    // `opa` refuses a `decision_request_headers` destination that any plugin
+    // on the chain publishes through `request_headers_to_redact()`, and the
+    // admin write sees only the candidate view of that chain. A built-in that
+    // publishes credential names but is neither fully constructed
+    // (SECURITY_COMPOSITION_PLUGIN_NAMES) nor given a stand-in parser in the
+    // cheap finalized-policy view would let a write persist an obligation that
+    // every later cache rebuild refuses. Pin every production override.
+    let cache_source = include_str!("../../../src/plugin_cache.rs");
+    let bounded = |start: &str, end: &str| -> &'static str {
+        let from = cache_source
+            .find(start)
+            .unwrap_or_else(|| panic!("{start} must exist"));
+        let to = cache_source[from..]
+            .find(end)
+            .map(|offset| from + offset)
+            .unwrap_or_else(|| panic!("{start} must terminate"));
+        &cache_source[from..to]
+    };
+    let full_names = bounded("const SECURITY_COMPOSITION_PLUGIN_NAMES", "];");
+    let cheap_specs = bounded("const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS", "];");
+    let stand_in_parsers = bounded(
+        "let credential_headers = match spec.name {",
+        "_ => Ok(Vec::new()),",
+    );
+
+    let plugins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut sources = Vec::new();
+    collect_plugin_sources(&plugins_dir, &mut sources);
+
+    let mut publishers: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for (path, source) in &sources {
+        let mut offset = 0;
+        while let Some(found) = source[offset..].find("fn request_headers_to_redact(&self)") {
+            let at = offset + found;
+            offset = at + "fn request_headers_to_redact(&self)".len();
+            let body = squeezed_fn_body(source, at)
+                .unwrap_or_else(|| panic!("{}: request_headers_to_redact() body", path.display()));
+            // The `Plugin` trait default publishes nothing.
+            if body == "&[]" {
+                continue;
+            }
+            let name = reported_plugin_name(&source[..at]).unwrap_or_else(|| {
+                panic!(
+                    "{}: request_headers_to_redact() override must follow the plugin's name()",
+                    path.display()
+                )
+            });
+            publishers.push((name, path.clone()));
+        }
+    }
+    publishers.sort();
+    publishers.dedup();
+    assert!(
+        publishers.iter().any(|(name, _)| name == "key_auth")
+            && publishers.iter().any(|(name, _)| name == "waf"),
+        "the scan must find the known macro-implemented and direct publishers: {publishers:?}"
+    );
+
+    for (name, path) in &publishers {
+        let quoted = format!("\"{name}\"");
+        let constructed = full_names.contains(&quoted);
+        let parsed = cheap_specs.contains(&quoted)
+            && stand_in_parsers
+                .find(&format!("{quoted} =>"))
+                .map(|start| {
+                    let arm = &stand_in_parsers[start + quoted.len() + 3..];
+                    &arm[..arm.find("=>").unwrap_or(arm.len())]
+                })
+                .is_some_and(|arm| arm.contains("credential_headers_for_composition("));
+        let exemption = CREDENTIAL_PUBLISHER_CANDIDATE_EXEMPTIONS
+            .iter()
+            .find(|(exempt, _)| exempt == name);
+        assert!(
+            constructed || parsed || exemption.is_some(),
+            "{name} ({}) publishes request_headers_to_redact() but candidate admission cannot \
+             see it: add it to SECURITY_COMPOSITION_PLUGIN_NAMES, give its \
+             FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS entry a credential_headers_for_composition \
+             stand-in parser, or record a reserved-name exemption",
+            path.display()
+        );
+        assert!(
+            exemption.is_none() || !(constructed || parsed),
+            "{name} is candidate-visible, so its exemption is stale"
+        );
+    }
+
+    for (exempt, header) in CREDENTIAL_PUBLISHER_CANDIDATE_EXEMPTIONS {
+        let (_, path) = publishers
+            .iter()
+            .find(|(name, _)| name == exempt)
+            .unwrap_or_else(|| panic!("exemption {exempt} names no current publisher"));
+        let source = std::fs::read_to_string(path).expect("read exempt plugin source");
+        let squeezed: String = source.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let published = format!("request_headers_to_redact:vec![\"{header}\".to_string()],");
+        let mut initializers = 0;
+        let mut rest = squeezed.as_str();
+        while let Some(at) = rest.find("request_headers_to_redact:") {
+            let tail = &rest[at..];
+            if !tail.starts_with("request_headers_to_redact:Vec<String>,") {
+                assert!(
+                    tail.starts_with(&published),
+                    "{exempt} may publish only {header:?}: {}",
+                    tail.chars().take(120).collect::<String>()
+                );
+                initializers += 1;
+            }
+            rest = &tail["request_headers_to_redact:".len()..];
+        }
+        assert!(initializers >= 1, "{exempt}: publisher initializer");
+        assert!(
+            !squeezed.contains("request_headers_to_redact.push(")
+                && !squeezed.contains("request_headers_to_redact.extend("),
+            "{exempt} must not grow its published names at runtime"
+        );
+
+        let opa = |destination: &str| {
+            json!({
+                "opa_host": "http://127.0.0.1:8181",
+                "policy_path": "ferrum/authz/allow",
+                "decision_request_headers": [destination],
+            })
+        };
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("opa", &opa("x-tenant")).is_ok(),
+            "control: an ordinary obligation destination is accepted"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("opa", &opa(header)).is_err(),
+            "opa must refuse {header:?} at parse, which is what exempts {exempt}"
+        );
+    }
+}
+
 #[test]
 fn candidate_rejects_legacy_early_egress_with_omitted_final_policy_validators() {
     if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {

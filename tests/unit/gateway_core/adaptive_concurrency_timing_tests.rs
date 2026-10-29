@@ -108,3 +108,63 @@ fn adaptive_attempt_without_a_gate_keeps_elapsed_and_subtraction_saturates() {
         Duration::ZERO,
     );
 }
+
+/// The helper is pinned behaviorally above; this pins the H1/H2 retry-loop
+/// call site that feeds it. A wire test cannot deterministically drive a
+/// retried direct-H2 attempt whose client-upload gate is held measurably long,
+/// so the arguments are anchored here instead: the replaced attempt is settled
+/// with its own dispatch clock and with the gate captured under that same
+/// clock, before the loop restarts the clock for the next attempt.
+#[test]
+fn http_retry_loop_settles_the_replaced_attempt_with_its_own_clock_and_gate() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let squeeze =
+        |text: &str| -> String { text.chars().filter(|ch| !ch.is_whitespace()).collect() };
+    let loop_start = source
+        .find("while retry::should_retry(retry_config, &method, &result, attempt)")
+        .expect("HTTP retry loop");
+    let loop_tail = &source[loop_start..];
+    let loop_body = &loop_tail[..loop_tail
+        .find("(result, current_cb_target_key, final_upstream_target)")
+        .expect("HTTP retry loop end")];
+
+    let record = loop_body
+        .find("record_backend_admission_retry_outcome(")
+        .expect("intermediate retry settlement");
+    let call = &loop_body[record..];
+    let call = squeeze(&call[..call.find(");").expect("settlement call end") + 2]);
+    assert!(
+        call.contains("backend_elapsed:backend_admission_started_at.elapsed(),"),
+        "the replaced attempt must be sampled on its own dispatch clock: {call}"
+    );
+    assert!(
+        call.ends_with("},backend_admission_started_at,direct_h2_client_upload_gate,);"),
+        "the settlement must pass that attempt's start and the captured gate: {call}"
+    );
+
+    let first_reset = loop_body
+        .find(" backend_admission_started_at = Instant::now();")
+        .expect("each retry restarts the dispatch clock");
+    assert!(
+        record < first_reset,
+        "the replaced attempt must be settled before the next attempt restarts the clock"
+    );
+
+    let mut assignments = 0;
+    let mut rest = source;
+    while let Some(at) = rest.find("direct_h2_client_upload_gate =") {
+        let tail = &rest[at..];
+        let end = tail.find(';').expect("gate assignment end") + 1;
+        assert_eq!(
+            squeeze(&tail[..end]),
+            "direct_h2_client_upload_gate=(backend_admission_started_at,client_upload_gate_wait);",
+            "the gate must be captured with the clock of the dispatch that measured it"
+        );
+        assignments += 1;
+        rest = &tail[end..];
+    }
+    assert!(
+        assignments >= 1,
+        "dispatch must capture the direct-H2 client-upload gate"
+    );
+}

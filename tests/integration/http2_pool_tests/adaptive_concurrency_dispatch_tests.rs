@@ -17,6 +17,7 @@ use ferrum_edge::plugins::{
     TransactionSummary,
 };
 use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::retry::ErrorClass;
 use http::StatusCode;
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -136,6 +137,7 @@ fn config(backend_port: u16, adaptive: bool) -> GatewayConfig {
 }
 
 struct AdmissionProbe {
+    protocol: ProxyProtocol,
     live: Arc<AtomicUsize>,
     outcomes: mpsc::UnboundedSender<BackendAdmissionOutcome>,
     summaries: mpsc::UnboundedSender<f64>,
@@ -177,7 +179,7 @@ impl Plugin for AdmissionProbe {
         _ctx: &RequestContext,
         admission: &BackendAdmissionContext<'_>,
     ) -> BackendAdmissionDecision {
-        assert_eq!(admission.protocol, ProxyProtocol::Grpc);
+        assert_eq!(admission.protocol, self.protocol);
         self.live.fetch_add(1, Ordering::SeqCst);
         BackendAdmissionDecision::Admit(Arc::new(ProbePermit {
             live: Arc::clone(&self.live),
@@ -192,10 +194,24 @@ impl Plugin for AdmissionProbe {
     }
 }
 
+/// Permit release runs on whichever worker drops the permit set, which can be
+/// after the outcome or log record a test already observed.
+async fn wait_for_released_permits(live: &AtomicUsize) {
+    tokio::time::timeout(WAIT, async {
+        while live.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every admission permit must be released");
+}
+
 /// Headers reach the client while the backend is held at a barrier. Settlement
 /// waits for terminal trailers, but must use exactly the TTFB capture the
 /// dispatcher logs. This catches re-reading the clock at any later settlement.
-#[tokio::test]
+/// The in-process gateway runs on a multi-thread runtime, as in production, so
+/// dispatch, the connection drivers, and the test client run in parallel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h3_grpc_bridge_records_captured_latency_only_after_terminal_trailers() {
     for buffered_request in [false, true] {
         let listener = reserve_port().await.expect("H2 backend reservation");
@@ -221,6 +237,7 @@ async fn h3_grpc_bridge_records_captured_latency_only_after_terminal_trailers() 
         let (summary_tx, mut summaries) = mpsc::unbounded_channel();
         let live = Arc::new(AtomicUsize::new(0));
         let probe = Arc::new(AdmissionProbe {
+            protocol: ProxyProtocol::Grpc,
             live: Arc::clone(&live),
             outcomes: outcome_tx,
             summaries: summary_tx,
@@ -269,11 +286,7 @@ async fn h3_grpc_bridge_records_captured_latency_only_after_terminal_trailers() 
         assert!(!outcome.connection_error);
         assert!(outcome.error_class.is_none());
         assert_eq!(outcome.backend_elapsed.as_secs_f64() * 1000.0, ttfb_ms);
-        assert_eq!(
-            live.load(Ordering::SeqCst),
-            0,
-            "terminal releases the permit"
-        );
+        wait_for_released_permits(&live).await;
         assert!(matches!(
             outcomes.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -285,7 +298,10 @@ async fn h3_grpc_bridge_records_captured_latency_only_after_terminal_trailers() 
 
 /// A valid 101 with an invalid RFC 7692 answer must reach extension validation,
 /// then settle the real limiter as a backend fault before returning its 502.
-#[tokio::test]
+/// A probe admission plugin beside the real limiter pins the settled outcome
+/// itself — exactly one `502` / `ProtocolError` record per frontend, before
+/// the permit is released — not only the limiter's reaction to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn websocket_invalid_deflate_answer_backs_off_admission_on_h1_h2_and_h3() {
     let listener = reserve_port().await.expect("WebSocket backend reservation");
     let backend_port = listener.port;
@@ -321,7 +337,16 @@ async fn websocket_invalid_deflate_answer_backs_off_admission_on_h1_h2_and_h3() 
             });
         }
     });
-    let gateway = DispatchGateway::start(config(backend_port, true), None).await;
+    let (outcome_tx, mut outcomes) = mpsc::unbounded_channel();
+    let (summary_tx, _summaries) = mpsc::unbounded_channel();
+    let live = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(AdmissionProbe {
+        protocol: ProxyProtocol::WebSocket,
+        live: Arc::clone(&live),
+        outcomes: outcome_tx,
+        summaries: summary_tx,
+    });
+    let gateway = DispatchGateway::start(config(backend_port, true), Some(probe)).await;
     let client = reqwest::Client::builder()
         .http1_only()
         .build()
@@ -343,6 +368,7 @@ async fn websocket_invalid_deflate_answer_backs_off_admission_on_h1_h2_and_h3() 
             .expect("H1 body")
             .contains("Backend WebSocket extension negotiation failed")
     );
+    assert_settled_once_as_backend_protocol_fault("H1", &mut outcomes, &live).await;
     assert_adaptive_limit(&gateway.state, 4).await;
 
     let socket = tokio::net::TcpStream::connect(("127.0.0.1", gateway.http_port))
@@ -374,6 +400,7 @@ async fn websocket_invalid_deflate_answer_backs_off_admission_on_h1_h2_and_h3() 
     assert!(
         String::from_utf8_lossy(&body).contains("Backend WebSocket extension negotiation failed")
     );
+    assert_settled_once_as_backend_protocol_fault("H2", &mut outcomes, &live).await;
     assert_adaptive_limit(&gateway.state, 2).await;
     connection.abort();
 
@@ -393,9 +420,35 @@ async fn websocket_invalid_deflate_answer_backs_off_admission_on_h1_h2_and_h3() 
             .expect("H3 body")
             .contains("Backend WebSocket extension negotiation failed")
     );
+    assert_settled_once_as_backend_protocol_fault("H3", &mut outcomes, &live).await;
     assert_adaptive_limit(&gateway.state, 1).await;
     gateway.shutdown().await;
     backend.abort();
+}
+
+/// The extension-validation failure arm records one backend protocol fault,
+/// then the permit is released and never settled again.
+async fn assert_settled_once_as_backend_protocol_fault(
+    frontend: &str,
+    outcomes: &mut mpsc::UnboundedReceiver<BackendAdmissionOutcome>,
+    live: &AtomicUsize,
+) {
+    let outcome = tokio::time::timeout(WAIT, outcomes.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{frontend}: settlement deadline"))
+        .unwrap_or_else(|| panic!("{frontend}: settlement"));
+    assert_eq!(outcome.response_status, 502, "{frontend}");
+    assert_eq!(
+        outcome.error_class,
+        Some(ErrorClass::ProtocolError),
+        "{frontend}"
+    );
+    assert!(!outcome.connection_error, "{frontend}");
+    wait_for_released_permits(live).await;
+    assert!(
+        matches!(outcomes.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "{frontend}: the failed upgrade is settled exactly once"
+    );
 }
 
 async fn assert_adaptive_limit(state: &ProxyState, expected: u64) {

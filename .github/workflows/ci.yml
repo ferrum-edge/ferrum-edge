@@ -2193,6 +2193,7 @@ jobs:
               functional_chunked_response_size_limits_test
               functional_body_size_limits_test
               functional_url_query_limits_test
+              functional_pre_routing_refusal_framing_test
               functional_header_size_limits_test
               functional_protocol_h3_request_body_test
               functional_protocol_h3_body_limit_config_test

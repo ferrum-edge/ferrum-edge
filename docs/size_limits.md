@@ -243,12 +243,58 @@ Pre-commit gateway rejections below are JSON with `Content-Type: application/jso
 |-----------|------------------|---------------|
 | Single header too large | `431 Request Header Fields Too Large` | `{"error":"Request header '{name}' exceeds maximum size of {n} bytes"}` |
 | Total headers too large | `431 Request Header Fields Too Large` | `{"error":"Total request headers exceed maximum size"}` |
+| Too many headers | `431 Request Header Fields Too Large` | `{"error":"Request header count ({count}) exceeds maximum of {n}"}` |
+| URL too long | `414 URI Too Long` | `{"error":"Request URL length ({len} bytes) exceeds maximum of {n} bytes"}` |
+| Too many query parameters | `400 Bad Request` | `{"error":"Query parameter count ({count}) exceeds maximum of {n}"}` |
 | Request body too large (Content-Length) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
 | Request body too large (streaming) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
 | Request body too large (`request_size_limiting` route ceiling, any enforcement point) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` (the same body; the limit is recorded in request metadata, not the body) |
 | Admin API body too large | `413 Payload Too Large` | Request rejected by body size middleware |
 | Response body too large (declared `Content-Length` or buffered collection, pre-commit) | `502 Bad Gateway` (HTTP); trailers-only `RESOURCE_EXHAUSTED` (native gRPC buffered) | HTTP: `{"error":"Backend response body exceeds maximum size"}` |
 | Response body too large (unknown-length streaming, post-commit) | Committed backend status, then the body/stream terminates (`ResponseBodyTooLarge`); the gateway yields once before the error so the frontend can flush the head and the bytes accepted within the limit (deterministic on HTTP/1.1 once the socket accepts the write, best effort on HTTP/2 and HTTP/3, where the flush runs on the connection task) | No JSON `502` replacement after headers are committed |
+
+### gRPC and gRPC-Web framing of pre-routing refusals
+
+The header, URL-length, and query-parameter limits run before routing, next
+to the protocol-header guard, the Host/`:authority` checks, the TRACE /
+unsupported CONNECT method refusal, the 0-RTT early-data method refusal, the
+retired Gateway listener refusal, and the per-IP concurrent-request limit.
+Every one of these refusals is framed for the client the same way on HTTP/1.1,
+HTTP/2, and HTTP/3:
+
+| Client | Response |
+|--------|----------|
+| Ordinary HTTP | The HTTP status and JSON body listed above |
+| Native gRPC (`application/grpc…`) | HTTP `200`, Trailers-Only `grpc-status` and `grpc-message`, no DATA |
+| gRPC-Web (`application/grpc-web…`) | HTTP `200` with the negotiated gRPC-Web `Content-Type`; `grpc-status` and `grpc-message` in the body trailer frame |
+| WebSocket Upgrade / Extended CONNECT | The HTTP status and JSON body, even when the handshake carries a gRPC or gRPC-Web `Content-Type` |
+
+| Refusal | `grpc-status` | `grpc-message` |
+|---------|---------------|----------------|
+| Single header too large | `8` (`RESOURCE_EXHAUSTED`) | `Request header exceeds maximum size` |
+| Total headers too large | `8` (`RESOURCE_EXHAUSTED`) | `Total request headers exceed maximum size` |
+| Too many headers | `8` (`RESOURCE_EXHAUSTED`) | `Request header count exceeds maximum` |
+| URL too long | `8` (`RESOURCE_EXHAUSTED`) | `Request URL too long` |
+| Too many query parameters | `3` (`INVALID_ARGUMENT`) | `Too many query parameters` |
+| Protocol-header guard violation that reaches the handler (HTTP/1.1 parse-layer rejects keep their `400`; see [error classification](error_classification.md#http11-parse-layer-400-contract)) | `3` (`INVALID_ARGUMENT`) | `Protocol header violation` |
+| HTTP/2 / HTTP/3 Host and `:authority` disagreement | `3` (`INVALID_ARGUMENT`) | `Invalid :authority or Host` |
+| Malformed Host or `:authority` value (`400`) | `3` (`INVALID_ARGUMENT`) | `Malformed Host or authority` |
+| TRACE or unsupported CONNECT (`405`, with `Allow`) | `12` (`UNIMPLEMENTED`) | `TRACE method is not allowed` / `CONNECT method is not allowed` |
+| Per-IP concurrent-request limit (`429`) | `8` (`RESOURCE_EXHAUSTED`) | `Too many concurrent requests from this IP` |
+| Method not allowed in 0-RTT early data (`425`) | `14` (`UNAVAILABLE`) | `Method not allowed in 0-RTT early data` |
+| Retired Gateway listener (`421`) | `14` (`UNAVAILABLE`) | `Gateway listener retired; retry on a new connection` |
+
+The three header limits are the exception for gRPC-Web: they are enforced
+before the gateway negotiates a gRPC-Web response media type from request
+headers, so that parsing never runs on unbounded headers, and gRPC-Web
+receives the JSON `431` there. Native gRPC needs no negotiation and gets the
+Trailers-Only status. The HTTP/1.1 and HTTP/2 connection-level admission
+fences (overload, stale configuration, withdrawn client-certificate trust) run
+before the header limits, so gRPC-Web also gets their plain HTTP answer. The
+proxy hop limit runs right after the header limits and keeps the plain HTTP
+answer for gRPC-Web by contract; see [Proxy hop limit](routing.md#proxy-hop-limit).
+A WebSocket handshake gets the plain HTTP answer from every one of them. No refused request reaches a
+plugin or a backend.
 
 **Why 502 for pre-commit response overruns?** The backend sent a response that violates the gateway's configured limits before the gateway committed a downstream response. The client is not at fault — the backend is misbehaving. This matches HTTP semantics: 502 indicates the gateway received an invalid response from the upstream server. Once streaming has begun, that replacement is no longer possible; clients must treat mid-body termination / stream reset as the overrun signal.
 
