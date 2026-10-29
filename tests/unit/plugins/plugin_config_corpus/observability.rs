@@ -215,6 +215,7 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                 "sampling_percentage": 10.0,
                 "custom_tags": {"team": "payments"},
                 "custom_header_tags": {"region": "x-region"},
+                "custom_env_tags": {"cluster": "ISTIO_META_CLUSTER_ID"},
                 "safe_tag_sources": ["x-region"],
                 "metrics": {
                     "disabled_metrics": ["REQUEST_SIZE"],
@@ -289,7 +290,12 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
             }),
         ])
         // Kubernetes label keys and custom tag names are operator-chosen.
-        .with_free_form_objects(&["labels", "custom_tags", "custom_header_tags"]),
+        .with_free_form_objects(&[
+            "labels",
+            "custom_tags",
+            "custom_header_tags",
+            "custom_env_tags",
+        ]),
         "api_chargeback" => PluginConfigContract::closed(vec![json!({
             "currency": "USD",
             "pricing_tiers": [{"status_codes": [200, 201], "price_per_call": 0.001}],
