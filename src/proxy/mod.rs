@@ -34655,6 +34655,29 @@ fn pre_routing_refusal_response(
     build_response(http_status, http_body)
 }
 
+/// The protocol-level `405` for TRACE and non-WebSocket CONNECT, in the
+/// client's wire representation. Ordinary HTTP keeps the JSON body and the
+/// `Allow` header; gRPC and gRPC-Web go through the shared reject normalizer,
+/// as the HTTP/3 frontend's `send_h3_protocol_method_not_allowed` does.
+#[inline(never)]
+fn pre_routing_method_not_allowed_response(
+    grpc_web_response_content_type: Option<&str>,
+    native_grpc: bool,
+    http_body: &'static str,
+) -> Response<ProxyBody> {
+    if grpc_web_response_content_type.is_none() && !native_grpc {
+        return build_method_not_allowed_response(http_body);
+    }
+    let headers = HashMap::from([("allow".to_string(), PROTOCOL_LEVEL_405_ALLOW.to_string())]);
+    build_pre_plugin_reject_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        http_body.as_bytes(),
+        &headers,
+        native_grpc,
+        grpc_web_response_content_type,
+    )
+}
+
 /// The answer to a request refused by the proxy hop limit (issue #6109):
 /// `508 Loop Detected` with `X-Gateway-Error: loop_detected` when the received
 /// `X-Ferrum-Hops` count reached `FERRUM_MAX_PROXY_HOPS`, or `400` (no token)
@@ -35181,10 +35204,12 @@ async fn handle_proxy_request_inner(
             ctx.outbound_proxy_hops = Some(hops);
         }
         refused => {
+            // Classify the full request, not just Content-Type, so a WebSocket
+            // Upgrade / Extended CONNECT keeps its HTTP refusal, as on HTTP/3.
             return Ok(proxy_hop_limit_refusal_response(
                 &state,
                 &ctx,
-                grpc_proxy::is_grpc_request(&req),
+                crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc,
                 refused == hop_limit::ProxyHopDecision::LoopDetected,
             ));
         }
@@ -35412,7 +35437,9 @@ async fn handle_proxy_request_inner(
         warn!("Rejected TRACE request");
         ctx.terminal_record.mark_counted();
         record_request(&state, 405);
-        return Ok(build_method_not_allowed_response(
+        return Ok(pre_routing_method_not_allowed_response(
+            grpc_web_response_content_type,
+            request_uses_grpc_content_type,
             r#"{"error":"TRACE method is not allowed"}"#,
         ));
     }
@@ -35430,7 +35457,9 @@ async fn handle_proxy_request_inner(
         warn!("Rejected non-WebSocket CONNECT request");
         ctx.terminal_record.mark_counted();
         record_request(&state, 405);
-        return Ok(build_method_not_allowed_response(
+        return Ok(pre_routing_method_not_allowed_response(
+            grpc_web_response_content_type,
+            request_uses_grpc_content_type,
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
     }
@@ -35567,9 +35596,13 @@ async fn handle_proxy_request_inner(
             );
             ctx.terminal_record.mark_counted();
             record_request(&state, 429);
-            return Ok(build_response(
+            return Ok(pre_routing_refusal_response(
+                grpc_web_response_content_type,
+                request_uses_grpc_content_type,
                 StatusCode::TOO_MANY_REQUESTS,
                 r#"{"error":"Too many concurrent requests from this IP"}"#,
+                grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                "Too many concurrent requests from this IP",
             ));
         }
         guard
@@ -35599,9 +35632,13 @@ async fn handle_proxy_request_inner(
                     warn!("Rejected request: malformed Host/authority value");
                     ctx.terminal_record.mark_counted();
                     record_request(&state, 400);
-                    return Ok(build_response(
+                    return Ok(pre_routing_refusal_response(
+                        grpc_web_response_content_type,
+                        request_uses_grpc_content_type,
                         StatusCode::BAD_REQUEST,
                         r#"{"error":"Request contains malformed Host or authority"}"#,
+                        grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                        "Malformed Host or authority",
                     ));
                 }
                 authority_port = port.and_then(|p| p.parse().ok());
@@ -35611,9 +35648,13 @@ async fn handle_proxy_request_inner(
                 warn!("Rejected request: malformed Host/authority value");
                 ctx.terminal_record.mark_counted();
                 record_request(&state, 400);
-                return Ok(build_response(
+                return Ok(pre_routing_refusal_response(
+                    grpc_web_response_content_type,
+                    request_uses_grpc_content_type,
                     StatusCode::BAD_REQUEST,
                     r#"{"error":"Request contains malformed Host or authority"}"#,
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    "Malformed Host or authority",
                 ));
             }
         },

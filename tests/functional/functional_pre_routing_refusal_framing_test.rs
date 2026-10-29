@@ -18,6 +18,7 @@
 //! Run with: `cargo test --test functional_tests functional_pre_routing_refusal -- --ignored --nocapture`
 
 use crate::common::TestGateway;
+use crate::scaffolding::port_registry::TestSocket;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full};
@@ -38,6 +39,7 @@ const MAX_QUERY_PARAMS: usize = 2;
 const MAX_SINGLE_HEADER_SIZE_BYTES: usize = 4096;
 const GRPC_INVALID_ARGUMENT: u32 = 3;
 const GRPC_RESOURCE_EXHAUSTED: u32 = 8;
+const GRPC_UNIMPLEMENTED: u32 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Wire {
@@ -64,6 +66,9 @@ const FLAVORS: [Flavor; 4] = [
 
 struct Refusal {
     name: &'static str,
+    /// Replaces the flavor's request method. A WebSocket handshake is defined
+    /// by its method, so such a case skips the WebSocket flavor.
+    method: Option<Method>,
     target: String,
     headers: Vec<(&'static str, String)>,
     http_status: StatusCode,
@@ -78,6 +83,7 @@ struct Refusal {
 fn refusals() -> Vec<Refusal> {
     vec![
         Refusal {
+            method: None,
             name: "url_length",
             target: format!("/refusal-{}", "a".repeat(MAX_URL_LENGTH_BYTES * 2)),
             headers: Vec::new(),
@@ -89,6 +95,7 @@ fn refusals() -> Vec<Refusal> {
             wires: &[Wire::H1, Wire::H2],
         },
         Refusal {
+            method: None,
             name: "query_count",
             target: "/refusal?a=1&b=2&c=3".to_string(),
             headers: Vec::new(),
@@ -100,6 +107,7 @@ fn refusals() -> Vec<Refusal> {
             wires: &[Wire::H1, Wire::H2],
         },
         Refusal {
+            method: None,
             name: "protocol_header_guard",
             target: "/refusal".to_string(),
             headers: vec![
@@ -116,6 +124,7 @@ fn refusals() -> Vec<Refusal> {
         Refusal {
             // HTTP/1.1 carries no `:authority`; its absolute-form disagreement
             // is part of the protocol-header guard above.
+            method: None,
             name: "host_authority_disagreement",
             target: "/refusal".to_string(),
             headers: vec![("host", "evil.example".to_string())],
@@ -127,6 +136,7 @@ fn refusals() -> Vec<Refusal> {
             wires: &[Wire::H2],
         },
         Refusal {
+            method: None,
             name: "single_header_size",
             target: "/refusal".to_string(),
             headers: vec![("x-padding", "p".repeat(MAX_SINGLE_HEADER_SIZE_BYTES + 1))],
@@ -135,6 +145,18 @@ fn refusals() -> Vec<Refusal> {
             grpc_status: GRPC_RESOURCE_EXHAUSTED,
             grpc_message: "Request header exceeds maximum size",
             grpc_web_framed: false,
+            wires: &[Wire::H1, Wire::H2],
+        },
+        Refusal {
+            name: "trace_method",
+            method: Some(Method::TRACE),
+            target: "/refusal".to_string(),
+            headers: Vec::new(),
+            http_status: StatusCode::METHOD_NOT_ALLOWED,
+            json_fragment: "TRACE method is not allowed",
+            grpc_status: GRPC_UNIMPLEMENTED,
+            grpc_message: "TRACE method is not allowed",
+            grpc_web_framed: true,
             wires: &[Wire::H1, Wire::H2],
         },
     ]
@@ -163,7 +185,7 @@ impl RecordingBackend {
 /// rather than connections because the gateway's startup capability probe
 /// and pool warmup also dial the backend.
 async fn spawn_recording_backend() -> RecordingBackend {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind recording backend");
     let port = listener.local_addr().expect("backend address").port();
@@ -226,6 +248,7 @@ async fn send(
     port: u16,
     wire: Wire,
     flavor: Flavor,
+    method: Option<&Method>,
     target: &str,
     headers: &[(&'static str, String)],
 ) -> WireResponse {
@@ -261,6 +284,9 @@ async fn send(
             .uri(format!("http://127.0.0.1:{port}{target}"))
             .header("te", "trailers"),
     };
+    if let Some(method) = method {
+        builder = builder.method(method.clone());
+    }
     builder = match flavor {
         Flavor::Plain => builder,
         Flavor::Grpc | Flavor::WebSocket => builder.header("content-type", "application/grpc"),
@@ -439,7 +465,18 @@ async fn functional_pre_routing_refusal_framing_matches_client_flavor_on_h1_and_
     for case in refusals() {
         for wire in case.wires {
             for flavor in FLAVORS {
-                let response = send(port, *wire, flavor, &case.target, &case.headers).await;
+                if case.method.is_some() && flavor == Flavor::WebSocket {
+                    continue;
+                }
+                let response = send(
+                    port,
+                    *wire,
+                    flavor,
+                    case.method.as_ref(),
+                    &case.target,
+                    &case.headers,
+                )
+                .await;
                 assert_refusal(&case, *wire, flavor, &response);
             }
         }
@@ -448,7 +485,7 @@ async fn functional_pre_routing_refusal_framing_matches_client_flavor_on_h1_and_
     // dispatch delivers, so an absent refused path is evidence rather than an
     // idle backend.
     for (wire, path) in [(Wire::H1, "/control-h1"), (Wire::H2, "/control-h2")] {
-        let control = send(port, wire, Flavor::Plain, &format!("{path}?a=1"), &[]).await;
+        let control = send(port, wire, Flavor::Plain, None, &format!("{path}?a=1"), &[]).await;
         assert_eq!(control.status, StatusCode::OK, "{wire:?} admitted control");
         assert_eq!(
             control.body.as_ref(),

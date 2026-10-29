@@ -256,8 +256,9 @@ Pre-commit gateway rejections below are JSON with `Content-Type: application/jso
 ### gRPC and gRPC-Web framing of pre-routing refusals
 
 The header, URL-length, and query-parameter limits run before routing, next
-to the protocol-header guard and the Host/`:authority` agreement check. Every
-one of these refusals is framed for the client the same way on HTTP/1.1,
+to the protocol-header guard, the Host/`:authority` checks, the TRACE /
+unsupported CONNECT method refusal, and the per-IP concurrent-request limit.
+Every one of these refusals is framed for the client the same way on HTTP/1.1,
 HTTP/2, and HTTP/3:
 
 | Client | Response |
@@ -276,12 +277,17 @@ HTTP/2, and HTTP/3:
 | Too many query parameters | `3` (`INVALID_ARGUMENT`) | `Too many query parameters` |
 | Protocol-header guard violation | `3` (`INVALID_ARGUMENT`) | `Protocol header violation` |
 | HTTP/2 / HTTP/3 Host and `:authority` disagreement | `3` (`INVALID_ARGUMENT`) | `Invalid :authority or Host` |
+| Malformed Host or `:authority` value (`400`) | `3` (`INVALID_ARGUMENT`) | `Malformed Host or authority` |
+| TRACE or unsupported CONNECT (`405`, with `Allow`) | `12` (`UNIMPLEMENTED`) | `TRACE method is not allowed` / `CONNECT method is not allowed` |
+| Per-IP concurrent-request limit (`429`) | `8` (`RESOURCE_EXHAUSTED`) | `Too many concurrent requests from this IP` |
 
 The three header limits are the exception for gRPC-Web: they are enforced
 before the gateway negotiates a gRPC-Web response media type from request
 headers, so that parsing never runs on unbounded headers, and gRPC-Web
 receives the JSON `431` there. Native gRPC needs no negotiation and gets the
-Trailers-Only status. No refused request reaches a plugin or a backend.
+Trailers-Only status. The proxy hop limit is the other gRPC-Web exception; see
+[Proxy hop limit](routing.md#proxy-hop-limit). No refused request reaches a
+plugin or a backend.
 
 **Why 502 for pre-commit response overruns?** The backend sent a response that violates the gateway's configured limits before the gateway committed a downstream response. The client is not at fault — the backend is misbehaving. This matches HTTP semantics: 502 indicates the gateway received an invalid response from the upstream server. Once streaming has begun, that replacement is no longer possible; clients must treat mid-body termination / stream reset as the overrun signal.
 

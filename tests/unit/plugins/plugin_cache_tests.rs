@@ -6115,7 +6115,7 @@ fn every_request_header_redaction_publisher_is_candidate_visible() {
             "control: an ordinary obligation destination is accepted"
         );
         assert!(
-            ferrum_edge::plugins::validate_plugin_config("opa", &opa(*header)).is_err(),
+            ferrum_edge::plugins::validate_plugin_config("opa", &opa(header)).is_err(),
             "opa must refuse {header:?} at parse, which is what exempts {exempt}"
         );
     }
