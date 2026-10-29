@@ -10322,13 +10322,6 @@ pub struct StreamConnectionContext {
     /// Mirrors `RequestContext::node_waypoint_policy_scope`; `None` for
     /// non-waypoint stream proxies.
     pub node_waypoint_policy_scope: Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
-    /// NodeWaypoint TCP: the connection carried an eBPF capture record but its
-    /// source identity did not resolve (withdrawn, conflicted, unauthorized, or
-    /// not yet enrolled; issue #6800). `mesh_authz` then also counts the
-    /// capture-inventory scoped policies in its missing-scope census, so such a
-    /// stream cannot slip from a capture-only scoped policy to mesh-wide-only
-    /// admission. `false` for every other stream (including UDP/DTLS).
-    pub node_waypoint_capture_identity_unresolved: bool,
     /// Opening client bytes captured for stream-aware inspection plugins (e.g.
     /// the WAF). Populated by the stream proxy only when some plugin opts in via
     /// `requires_stream_first_bytes()`, before `on_stream_connect` runs; `None`
@@ -10428,7 +10421,6 @@ impl StreamConnectionContext {
             sni_hostname: None,
             mesh_direction: None,
             node_waypoint_policy_scope: None,
-            node_waypoint_capture_identity_unresolved: false,
             first_bytes: None,
             first_bytes_kind: None,
             destination_ip: None,

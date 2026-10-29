@@ -177,19 +177,18 @@ impl NodeWaypointIdentityWarnLimiter {
 /// accept-side record and resolve `None` (fail-closed). The full datapath is CI
 /// compile/load-tested but unverified on a live multi-pod node.
 ///
-/// This helper never refuses the stream itself — unlike the HBONE listener,
-/// which drops a connection without a resolved identity — because raw TCP
-/// proxies in node-waypoint topology may legitimately carry non-captured
-/// traffic; it returns `(None, None, None)` and lets `mesh_authz` make the
-/// fail-closed-vs-mesh-wide decision above. The scope (`PolicyScopeCache`) may
+/// Traffic with no capture record (`UnknownCookie`, `SocketCookieUnavailable`)
+/// returns `(None, None, None, None)` and lets `mesh_authz` make the
+/// fail-closed-vs-mesh-wide decision above, because raw TCP proxies in
+/// node-waypoint topology may legitimately carry non-captured traffic. A
+/// failure AFTER a capture record was found
+/// (`NodeWaypointIdentityError::carries_capture_evidence`) is returned as the
+/// fourth element instead, and the accept loop refuses the stream, matching the
+/// HBONE/HTTP listener (issue #6800). The scope (`PolicyScopeCache`) may
 /// be `None` even when the identity resolves — the workload carries no scoped
 /// policy, or it left the current slice — and is taken from the same slice
 /// generation that resolved the identity, so a resolved identity can never be
 /// paired with an old/missing scope from a concurrent reload.
-///
-/// Also returns whether resolution failed AFTER a capture record was found
-/// (`NodeWaypointIdentityError::carries_capture_evidence`); the accept loop
-/// stamps that onto `StreamConnectionContext::node_waypoint_capture_identity_unresolved`.
 fn resolve_node_waypoint_stream_identity(
     resolver: Option<&crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
     stream: &TcpStream,
@@ -200,10 +199,10 @@ fn resolve_node_waypoint_stream_identity(
     Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
     Option<String>,
     Option<SocketAddr>,
-    bool,
+    Option<crate::modes::mesh::node_waypoint::NodeWaypointIdentityError>,
 ) {
     let Some(resolver) = resolver else {
-        return (None, None, None, false);
+        return (None, None, None, None);
     };
     // Take the scope FROM the resolve result so the identity gate and the
     // per-pod scope come from the SAME slice generation (the "never partial"
@@ -215,11 +214,12 @@ fn resolve_node_waypoint_stream_identity(
             resolved.policy_scope,
             Some(resolved.identity.spiffe_id.as_str().to_string()),
             Some(resolved.orig_dst),
-            false,
+            None,
         ),
         Err(error) => {
             warn_node_waypoint_identity_scope_missing(proxy_id, client_ip, &error, warn_limiter);
-            (None, None, None, error.carries_capture_evidence())
+            let refused = error.carries_capture_evidence().then_some(error);
+            (None, None, None, refused)
         }
     }
 }
@@ -238,7 +238,7 @@ fn resolve_node_waypoint_stream_scope(
     Option<String>,
     Option<SocketAddr>,
 ) {
-    let (scope, principal, orig_dst, _capture_identity_unresolved) =
+    let (scope, principal, orig_dst, _capture_identity_error) =
         resolve_node_waypoint_stream_identity(resolver, stream, proxy_id, client_ip, warn_limiter);
     (scope, principal, orig_dst)
 }
@@ -2813,7 +2813,7 @@ async fn run_tcp_accept_loop(
                         node_waypoint_policy_scope,
                         node_waypoint_peer_spiffe_id,
                         node_waypoint_orig_dst,
-                        node_waypoint_capture_identity_unresolved,
+                        node_waypoint_capture_identity_error,
                     ) =
                         resolve_node_waypoint_stream_identity(
                             node_waypoint_identity_resolver.as_deref(),
@@ -2822,6 +2822,20 @@ async fn run_tcp_accept_loop(
                             &client_ip,
                             &node_waypoint_identity_warn_limiter,
                         );
+                    // A captured pod (an eBPF capture record exists) whose
+                    // identity the live slice does not vouch — withdrawn,
+                    // conflicted, unauthorized, or not yet enrolled — is
+                    // refused here, exactly as the HTTP/HBONE accept path
+                    // refuses it (issue #6800). Falling through to mesh-wide-only
+                    // evaluation would let a source drop out of scoped policy
+                    // that applied to it while enrolled, including policy that
+                    // left the capture inventory together with the source.
+                    // Traffic with no capture record keeps the fallback below.
+                    if let Some(error) = node_waypoint_capture_identity_error {
+                        super::record_node_waypoint_identity_drop(&overload_for_conn, &error);
+                        drop(stream);
+                        return;
+                    }
                     let base_proxy =
                         epoch.proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref());
                     let consumer_index =
@@ -2889,8 +2903,6 @@ async fn run_tcp_accept_loop(
                     // connection's source pod identity cannot be resolved
                     // (mesh-wide-only fallback + `mesh_authz.scope_missing`).
                     stream_ctx.node_waypoint_policy_scope = node_waypoint_policy_scope;
-                    stream_ctx.node_waypoint_capture_identity_unresolved =
-                        node_waypoint_capture_identity_unresolved;
                     // In node-waypoint topology the resolved pod SPIFFE ID is
                     // the authenticated source principal for this connection
                     // (mirrors `RequestContext.peer_spiffe_id` on the HTTP

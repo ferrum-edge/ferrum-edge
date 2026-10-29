@@ -2009,4 +2009,98 @@ mod node_waypoint_cross_namespace_source_resolution {
         assert!(!scope.policy_applies(&reports_deny));
         assert!(!scope.policy_applies(&ferrum_deny));
     }
+
+    /// Withdrawing the LAST pod a capture-only scoped DENY selects also drops
+    /// that DENY from the capture inventory, so no missing-scope census can
+    /// still see it. The TCP accept path therefore refuses any stream whose
+    /// capture record exists but whose identity no longer resolves
+    /// (`carries_capture_evidence`), instead of falling back to mesh-wide-only
+    /// evaluation. Traffic with no capture record keeps that fallback.
+    #[test]
+    fn withdrawn_last_selected_source_is_refused_at_accept_not_downgraded() {
+        let deny = MeshPolicy {
+            name: "ledger-deny".to_string(),
+            namespace: "payments".to_string(),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                    namespace: Some("payments".to_string()),
+                },
+            },
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: Vec::new(),
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Deny,
+            }],
+        };
+        let slice_for = |ledger_waypoint: &str| {
+            let mut config = document(ledger_waypoint);
+            config.mesh.as_mut().expect("mesh").mesh_policies = vec![deny.clone()];
+            MeshSlice::from_gateway_config(&config, node_waypoint_request())
+        };
+        let enrolled = slice_for(THIS_WAYPOINT);
+        let withdrawn = slice_for(OTHER_WAYPOINT);
+        assert!(
+            enrolled
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "ledger-deny")
+        );
+        assert!(
+            withdrawn
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .all(|policy| policy.name != "ledger-deny"),
+            "the DENY leaves the inventory with its last selected destination"
+        );
+
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &enrolled);
+        stamp(
+            &resolver,
+            100,
+            LEDGER_UID,
+            &spiffe_for("payments", "ledger"),
+        );
+        let scope = resolver
+            .resolve_cookie(100)
+            .expect("enrolled")
+            .1
+            .expect("scope");
+        assert!(
+            scope.policy_applies(&deny),
+            "the DENY applies while enrolled"
+        );
+
+        seed(&resolver, &withdrawn);
+        let cached = resolver.resolve_cookie(100).err().expect("withdrawn");
+        assert!(
+            cached.carries_capture_evidence(),
+            "a captured-but-unvouched stream must be refused at accept, got {cached:?}"
+        );
+        stamp(
+            &resolver,
+            101,
+            LEDGER_UID,
+            &spiffe_for("payments", "ledger"),
+        );
+        let fresh = NodeWaypointIdentityResolver::new(0);
+        seed(&fresh, &withdrawn);
+        stamp(&fresh, 101, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let lazy = fresh
+            .resolve_cookie(101)
+            .err()
+            .expect("never enrolled here");
+        assert!(lazy.carries_capture_evidence(), "got {lazy:?}");
+
+        // No capture record at all: keep the documented mesh-wide fallback.
+        let uncaptured = resolver.resolve_cookie(999).err().expect("unknown cookie");
+        assert_eq!(uncaptured, NodeWaypointIdentityError::UnknownCookie(999));
+        assert!(!uncaptured.carries_capture_evidence());
+    }
 }

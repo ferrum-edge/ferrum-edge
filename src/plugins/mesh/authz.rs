@@ -4669,17 +4669,7 @@ impl Plugin for MeshAuthz {
                 // scope), so only the ordinary census applies: capture-inventory
                 // policies select capture destinations and are evaluated against
                 // the destination scope the capture relay stamps.
-                //
-                // Exception (issue #6800): a NodeWaypoint TCP stream that carried
-                // an eBPF capture record whose identity did not resolve may be a
-                // cross-namespace enrolled source that was withdrawn or became
-                // conflicted. While enrolled its own-namespace (capture-inventory)
-                // scoped policies applied to it, so dropping to mesh-wide-only
-                // would fail open; count them too.
-                if self.has_scoped_policies
-                    || (ctx.node_waypoint_capture_identity_unresolved
-                        && self.has_scoped_capture_destination_policies)
-                {
+                if self.has_scoped_policies {
                     metadata.insert(
                         "mesh_authz.deny_policy".to_string(),
                         "scope_missing".to_string(),
