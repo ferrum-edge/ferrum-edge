@@ -34596,29 +34596,38 @@ fn admission_fence_head_status(is_grpc: bool, status: StatusCode) -> u16 {
 /// has retired (issue #5921): `421 Misdirected Request`, which tells the client
 /// to retry on a new connection. That connection reaches the replacement
 /// listener. HTTP/1 closes this connection so the retry cannot reuse it, and
-/// gRPC gets `UNAVAILABLE`, which clients retry. The body is a compiled-in
+/// gRPC and gRPC-Web get `UNAVAILABLE`, which clients retry; a WebSocket
+/// handshake keeps the HTTP answer. The body is a compiled-in
 /// literal.
 fn retired_gateway_listener_response(
     state: &ProxyState,
     ctx: &RequestContext,
     version: hyper::Version,
-    is_grpc: bool,
+    native_grpc: bool,
+    grpc_web_response_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
     record_request(state, StatusCode::MISDIRECTED_REQUEST.as_u16());
     crate::diagnostic_ref::record_admission_fence(
         ctx.diagnostic_slot(),
         crate::diagnostic_ref::RETIRED_GATEWAY_LISTENER_PHASE,
-        admission_fence_head_status(is_grpc, StatusCode::MISDIRECTED_REQUEST),
+        admission_fence_head_status(
+            native_grpc || grpc_web_response_content_type.is_some(),
+            StatusCode::MISDIRECTED_REQUEST,
+        ),
     );
-    if is_grpc {
+    if native_grpc {
         return grpc_proxy::build_grpc_error_response(
             grpc_proxy::grpc_status::UNAVAILABLE,
             "Gateway listener retired; retry on a new connection",
         );
     }
-    let mut response = build_response(
+    let mut response = pre_routing_refusal_response(
+        grpc_web_response_content_type,
+        false,
         StatusCode::MISDIRECTED_REQUEST,
         r#"{"error":"Misdirected Request"}"#,
+        grpc_proxy::grpc_status::UNAVAILABLE,
+        "Gateway listener retired; retry on a new connection",
     );
     if matches!(version, hyper::Version::HTTP_10 | hyper::Version::HTTP_11) {
         response.headers_mut().insert(
@@ -34786,7 +34795,7 @@ async fn admit_proxy_request_on_frontend_port(
     // longer be told to withdraw, so a challenge must not be the one request
     // shape that walks past a stale-config gate.
     if crate::dp_config_freshness::new_traffic_blocked() {
-        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        let is_grpc = crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc;
         record_request(&state, 503);
         crate::diagnostic_ref::record_admission_fence(
             connection_metadata.diagnostic_slot.as_ref(),
@@ -34827,7 +34836,7 @@ async fn admit_proxy_request_on_frontend_port(
         && session.is_retired()
     {
         session.record_fenced();
-        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        let is_grpc = crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc;
         record_request(&state, 401);
         crate::diagnostic_ref::record_admission_fence(
             connection_metadata.diagnostic_slot.as_ref(),
@@ -34873,7 +34882,7 @@ async fn admit_proxy_request_on_frontend_port(
         .reject_new_requests
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        let is_grpc = crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc;
         record_request(&state, 503);
         crate::diagnostic_ref::record_admission_fence(
             connection_metadata.diagnostic_slot.as_ref(),
@@ -35489,22 +35498,19 @@ async fn handle_proxy_request_inner(
             // WebSocket on `CONNECT` before the same rewrite.
             let wire_method = req.method().as_str();
             if !state.early_data_methods.contains(wire_method) {
-                let is_grpc = grpc_proxy::is_grpc_request(&req);
                 warn!(
                     "Rejected 0-RTT request: method {} not in allowed early data methods",
                     wire_method
                 );
                 ctx.terminal_record.mark_counted();
                 record_request(&state, 425);
-                if is_grpc {
-                    return Ok(grpc_proxy::build_grpc_error_response(
-                        grpc_proxy::grpc_status::UNAVAILABLE,
-                        "Method not allowed in 0-RTT early data",
-                    ));
-                }
-                return Ok(build_response(
+                return Ok(pre_routing_refusal_response(
+                    grpc_web_response_content_type,
+                    request_uses_grpc_content_type,
                     StatusCode::TOO_EARLY,
                     r#"{"error":"Method not allowed in 0-RTT early data"}"#,
+                    grpc_proxy::grpc_status::UNAVAILABLE,
+                    "Method not allowed in 0-RTT early data",
                 ));
             }
         }
@@ -35686,12 +35692,12 @@ async fn handle_proxy_request_inner(
     // publishes the admission that could serve this port, so a request that
     // loaded that admission always sees the retirement.
     if gateway_listener::is_retired_connection(gateway_listener_identity.as_ref()) {
-        let is_grpc = grpc_proxy::is_grpc_request(&req);
         return Ok(retired_gateway_listener_response(
             &state,
             &ctx,
             inbound_version,
-            is_grpc,
+            request_uses_grpc_content_type,
+            grpc_web_response_content_type,
         ));
     }
 

@@ -37,6 +37,7 @@ const WAIT: Duration = Duration::from_secs(10);
 const MAX_URL_LENGTH_BYTES: usize = 64;
 const MAX_QUERY_PARAMS: usize = 2;
 const MAX_SINGLE_HEADER_SIZE_BYTES: usize = 4096;
+const MAX_HEADER_COUNT: usize = 24;
 const GRPC_INVALID_ARGUMENT: u32 = 3;
 const GRPC_RESOURCE_EXHAUSTED: u32 = 8;
 const GRPC_UNIMPLEMENTED: u32 = 12;
@@ -55,13 +56,23 @@ enum Flavor {
     /// A WebSocket handshake (H1 Upgrade / H2 Extended CONNECT) carrying a
     /// hostile native-gRPC Content-Type.
     WebSocket,
+    /// The same handshake carrying a hostile gRPC-Web Content-Type, which must
+    /// not select a gRPC-Web response representation.
+    WebSocketGrpcWeb,
 }
 
-const FLAVORS: [Flavor; 4] = [
+impl Flavor {
+    fn is_websocket(self) -> bool {
+        matches!(self, Flavor::WebSocket | Flavor::WebSocketGrpcWeb)
+    }
+}
+
+const FLAVORS: [Flavor; 5] = [
     Flavor::Plain,
     Flavor::Grpc,
     Flavor::GrpcWeb,
     Flavor::WebSocket,
+    Flavor::WebSocketGrpcWeb,
 ];
 
 struct Refusal {
@@ -144,6 +155,20 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "exceeds maximum size of 4096 bytes",
             grpc_status: GRPC_RESOURCE_EXHAUSTED,
             grpc_message: "Request header exceeds maximum size",
+            grpc_web_framed: false,
+            wires: &[Wire::H1, Wire::H2],
+        },
+        Refusal {
+            method: None,
+            name: "header_count",
+            target: "/refusal".to_string(),
+            headers: (0..MAX_HEADER_COUNT + 6)
+                .map(|_| ("x-count", "1".to_string()))
+                .collect(),
+            http_status: StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            json_fragment: "exceeds maximum of 24",
+            grpc_status: GRPC_RESOURCE_EXHAUSTED,
+            grpc_message: "Request header count exceeds maximum",
             grpc_web_framed: false,
             wires: &[Wire::H1, Wire::H2],
         },
@@ -259,14 +284,14 @@ async fn send(
     let io = TokioIo::new(stream);
 
     let mut builder = match (wire, flavor) {
-        (Wire::H1, Flavor::WebSocket) => Request::builder()
+        (Wire::H1, Flavor::WebSocket | Flavor::WebSocketGrpcWeb) => Request::builder()
             .method(Method::GET)
             .uri(target)
             .header("connection", "Upgrade")
             .header("upgrade", "websocket")
             .header("sec-websocket-version", "13")
             .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
-        (Wire::H2, Flavor::WebSocket) => Request::builder()
+        (Wire::H2, Flavor::WebSocket | Flavor::WebSocketGrpcWeb) => Request::builder()
             .method(Method::CONNECT)
             .version(http::Version::HTTP_2)
             .uri(format!("http://127.0.0.1:{port}{target}"))
@@ -290,7 +315,9 @@ async fn send(
     builder = match flavor {
         Flavor::Plain => builder,
         Flavor::Grpc | Flavor::WebSocket => builder.header("content-type", "application/grpc"),
-        Flavor::GrpcWeb => builder.header("content-type", "application/grpc-web+proto"),
+        Flavor::GrpcWeb | Flavor::WebSocketGrpcWeb => {
+            builder.header("content-type", "application/grpc-web+proto")
+        }
     };
     if wire == Wire::H1 && !headers.iter().any(|(name, _)| *name == "host") {
         builder = builder.header("host", format!("127.0.0.1:{port}"));
@@ -416,7 +443,7 @@ fn assert_refusal(case: &Refusal, wire: Wire, flavor: Flavor, response: &WireRes
                 "{label}"
             );
         }
-        Flavor::Plain | Flavor::GrpcWeb | Flavor::WebSocket => {
+        Flavor::Plain | Flavor::GrpcWeb | Flavor::WebSocket | Flavor::WebSocketGrpcWeb => {
             assert_eq!(response.status, case.http_status, "{label}: {body_text}");
             assert!(
                 !response.headers.contains_key("grpc-status"),
@@ -448,6 +475,7 @@ async fn functional_pre_routing_refusal_framing_matches_client_flavor_on_h1_and_
             MAX_URL_LENGTH_BYTES.to_string(),
         )
         .env("FERRUM_MAX_QUERY_PARAMS", MAX_QUERY_PARAMS.to_string())
+        .env("FERRUM_MAX_HEADER_COUNT", MAX_HEADER_COUNT.to_string())
         .env(
             "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES",
             MAX_SINGLE_HEADER_SIZE_BYTES.to_string(),
@@ -465,7 +493,7 @@ async fn functional_pre_routing_refusal_framing_matches_client_flavor_on_h1_and_
     for case in refusals() {
         for wire in case.wires {
             for flavor in FLAVORS {
-                if case.method.is_some() && flavor == Flavor::WebSocket {
+                if case.method.is_some() && flavor.is_websocket() {
                     continue;
                 }
                 let response = send(

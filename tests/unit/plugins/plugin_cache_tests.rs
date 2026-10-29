@@ -5940,7 +5940,9 @@ fn squeezed_fn_body(source: &str, fn_offset: usize) -> Option<String> {
         match ch {
             '{' => depth += 1,
             '}' => {
-                depth -= 1;
+                // Braces inside string or char literals are not parsed; an
+                // unbalanced one ends the scan instead of underflowing.
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     close = Some(open + i);
                     break;
