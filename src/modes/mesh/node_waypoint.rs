@@ -487,6 +487,23 @@ pub enum NodeWaypointIdentityError {
     },
 }
 
+impl NodeWaypointIdentityError {
+    /// Whether the failure happened AFTER an eBPF capture record was found for
+    /// the connection, i.e. this is captured pod traffic whose identity the
+    /// live slice no longer (or never) vouches — as opposed to traffic with no
+    /// capture evidence at all (`UnknownCookie`, `SocketCookieUnavailable`).
+    pub fn carries_capture_evidence(&self) -> bool {
+        match self {
+            Self::SocketCookieUnavailable(_) | Self::UnknownCookie(_) => false,
+            Self::MissingPodUid(_)
+            | Self::MissingWorkloadHash { .. }
+            | Self::UnknownPod(_)
+            | Self::WorkloadHashMismatch { .. }
+            | Self::PodUidMismatch { .. } => true,
+        }
+    }
+}
+
 impl fmt::Display for NodeWaypointIdentityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

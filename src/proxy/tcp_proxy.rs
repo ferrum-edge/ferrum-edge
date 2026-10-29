@@ -186,7 +186,11 @@ impl NodeWaypointIdentityWarnLimiter {
 /// policy, or it left the current slice — and is taken from the same slice
 /// generation that resolved the identity, so a resolved identity can never be
 /// paired with an old/missing scope from a concurrent reload.
-fn resolve_node_waypoint_stream_scope(
+///
+/// Also returns whether resolution failed AFTER a capture record was found
+/// (`NodeWaypointIdentityError::carries_capture_evidence`); the accept loop
+/// stamps that onto `StreamConnectionContext::node_waypoint_capture_identity_unresolved`.
+fn resolve_node_waypoint_stream_identity(
     resolver: Option<&crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
     stream: &TcpStream,
     proxy_id: &str,
@@ -196,9 +200,10 @@ fn resolve_node_waypoint_stream_scope(
     Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
     Option<String>,
     Option<SocketAddr>,
+    bool,
 ) {
     let Some(resolver) = resolver else {
-        return (None, None, None);
+        return (None, None, None, false);
     };
     // Take the scope FROM the resolve result so the identity gate and the
     // per-pod scope come from the SAME slice generation (the "never partial"
@@ -210,12 +215,32 @@ fn resolve_node_waypoint_stream_scope(
             resolved.policy_scope,
             Some(resolved.identity.spiffe_id.as_str().to_string()),
             Some(resolved.orig_dst),
+            false,
         ),
         Err(error) => {
             warn_node_waypoint_identity_scope_missing(proxy_id, client_ip, &error, warn_limiter);
-            (None, None, None)
+            (None, None, None, error.carries_capture_evidence())
         }
     }
+}
+
+/// Test-only `(scope, principal, orig_dst)` view of
+/// [`resolve_node_waypoint_stream_identity`].
+#[cfg(test)]
+fn resolve_node_waypoint_stream_scope(
+    resolver: Option<&crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
+    stream: &TcpStream,
+    proxy_id: &str,
+    client_ip: &str,
+    warn_limiter: &NodeWaypointIdentityWarnLimiter,
+) -> (
+    Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    Option<String>,
+    Option<SocketAddr>,
+) {
+    let (scope, principal, orig_dst, _capture_identity_unresolved) =
+        resolve_node_waypoint_stream_identity(resolver, stream, proxy_id, client_ip, warn_limiter);
+    (scope, principal, orig_dst)
 }
 
 fn warn_node_waypoint_identity_scope_missing(
@@ -2788,8 +2813,9 @@ async fn run_tcp_accept_loop(
                         node_waypoint_policy_scope,
                         node_waypoint_peer_spiffe_id,
                         node_waypoint_orig_dst,
+                        node_waypoint_capture_identity_unresolved,
                     ) =
-                        resolve_node_waypoint_stream_scope(
+                        resolve_node_waypoint_stream_identity(
                             node_waypoint_identity_resolver.as_deref(),
                             &stream,
                             &proxy_id,
@@ -2863,6 +2889,8 @@ async fn run_tcp_accept_loop(
                     // connection's source pod identity cannot be resolved
                     // (mesh-wide-only fallback + `mesh_authz.scope_missing`).
                     stream_ctx.node_waypoint_policy_scope = node_waypoint_policy_scope;
+                    stream_ctx.node_waypoint_capture_identity_unresolved =
+                        node_waypoint_capture_identity_unresolved;
                     // In node-waypoint topology the resolved pod SPIFFE ID is
                     // the authenticated source principal for this connection
                     // (mirrors `RequestContext.peer_spiffe_id` on the HTTP

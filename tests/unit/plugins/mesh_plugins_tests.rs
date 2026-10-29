@@ -7461,6 +7461,94 @@ async fn mesh_authz_node_waypoint_enforces_capture_destination_allow_floor() {
 }
 
 #[tokio::test]
+async fn mesh_authz_node_waypoint_unresolved_capture_identity_counts_capture_policies() {
+    // Issue #6800: a NodeWaypoint TCP stream that carried an eBPF capture
+    // record whose identity did NOT resolve (a cross-namespace source withdrawn
+    // or conflicted after enrollment) must not drop from its own-namespace
+    // capture-inventory scoped policy to mesh-wide-only admission. Such a
+    // stream counts the capture-inventory policies in the missing-scope census;
+    // a stream with no capture evidence keeps the ordinary census, and a
+    // mesh-wide-only mesh still falls through.
+    let capture_only = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mesh_wide_only = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            mesh_policies: vec![policy_with_scope(
+                "mesh-wide-allow",
+                PolicyScope::MeshWide,
+                PolicyAction::Allow,
+            )],
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let tcp_stream = |capture_identity_unresolved: bool| {
+        let mut ctx = StreamConnectionContext::new(
+            "10.244.1.7".to_string(),
+            "10.244.1.7".to_string(),
+            "__mesh-nw-tcp".to_string(),
+            None,
+            15001,
+            BackendScheme::Tcp,
+            Arc::new(ConsumerIndex::new(&[])),
+        );
+        ctx.node_waypoint_capture_identity_unresolved = capture_identity_unresolved;
+        ctx
+    };
+
+    let mut unresolved = tcp_stream(true);
+    let result = capture_only.on_stream_connect(&mut unresolved).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "an unresolved captured identity must not bypass capture-only scoped policy, got {result:?}"
+    );
+    assert_eq!(
+        unresolved
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("mesh_authz.deny_policy"))
+            .map(String::as_str),
+        Some("scope_missing")
+    );
+
+    let mut no_capture_evidence = tcp_stream(false);
+    assert!(
+        matches!(
+            capture_only
+                .on_stream_connect(&mut no_capture_evidence)
+                .await,
+            PluginResult::Continue
+        ),
+        "traffic with no capture record keeps the ordinary source census"
+    );
+
+    let mut unresolved = tcp_stream(true);
+    assert!(
+        matches!(
+            mesh_wide_only.on_stream_connect(&mut unresolved).await,
+            PluginResult::Continue
+        ),
+        "a mesh-wide-only mesh stays evaluable without a scope"
+    );
+}
+
+#[tokio::test]
 async fn mesh_authz_node_waypoint_source_scope_census_ignores_capture_destination_policies() {
     // A stream without a per-pod scope is SOURCE-attributed (UDP/DTLS sessions,
     // outbound capture): the transparent capture relay always stamps its
