@@ -269,9 +269,9 @@ fn unresolved_cookie_yields_no_scope() {
 /// identity outlives its workload only when the control plane removed it;
 /// `resolve_record` re-validates the cached identity against the live slice
 /// index (`workload_identities_by_hash`) and fails closed rather than resolving
-/// to a now-orphaned identity. The stream accept loop then stamps no per-pod
-/// scope (mesh-wide-only fallback, see `resolve_node_waypoint_stream_scope`);
-/// the HBONE accept loop drops the connection. (Pre-fix this surfaced as
+/// to a now-orphaned identity. Because a capture record exists, both the TCP
+/// stream accept loop (`resolve_node_waypoint_stream_identity`, issue #6800)
+/// and the HBONE accept loop refuse the connection. (Pre-fix this surfaced as
 /// "resolves but no scope", which slice-coupled enrollment made unreachable: a
 /// vouched workload always contributes both its hash and its scope.)
 #[test]

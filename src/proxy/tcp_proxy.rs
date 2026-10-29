@@ -144,27 +144,31 @@ impl NodeWaypointIdentityWarnLimiter {
 /// authorization scope, mirroring the HTTP/HBONE admit path in
 /// `src/proxy/mod.rs`.
 ///
-/// Returns `(policy_scope, peer_spiffe_id)`:
+/// Returns `(policy_scope, peer_spiffe_id, orig_dst, refused)`:
 /// - `policy_scope` is stamped onto `StreamConnectionContext.node_waypoint_policy_scope`
 ///   so `mesh_authz` enforces Namespace/WorkloadSelector-scoped policies for the
 ///   resolved source pod rather than treating every stream as mesh-wide.
 /// - `peer_spiffe_id` is the resolved pod's SPIFFE ID, stamped into stream
 ///   metadata as the authenticated source principal (parity with
 ///   `RequestContext.peer_spiffe_id`).
+/// - `orig_dst` is the eBPF-captured original destination.
+/// - `refused` is `Some(error)` when a capture record was found but the live
+///   slice does not vouch the identity; the accept loop refuses the stream.
 ///
 /// Behavior:
 /// - `resolver` is `None` outside `NodeWaypoint` topology and for non-mesh TCP
 ///   proxies → returns `(None, None, None)`; no per-pod scope is consulted
 ///   (unchanged pre-fix behavior).
-/// - When the connection's `SO_COOKIE` cannot be resolved to an enrolled pod
-///   (GAP-2M IPv6 / tuple miss, no node-agent enrollment yet, non-Linux,
-///   unknown cookie), or the identity resolves but its workload has left the
-///   live slice, returns `(None, None, None)` and stamps
-///   `mesh_authz.scope_missing`.
+/// - When the connection carries no capture record (GAP-2M tuple miss,
+///   non-Linux, unknown cookie, cookie unavailable), returns
+///   `(None, None, None, None)` and stamps `mesh_authz.scope_missing`.
 ///   `mesh_authz` then **fails closed** (rejects the stream, 403) when any
 ///   namespace/selector-scoped policy is configured, and falls through to
 ///   mesh-wide-only when the mesh has only mesh-wide policies — the same gate
 ///   the HTTP/HBONE path applies per request.
+/// - When a capture record exists but the slice does not vouch the identity
+///   (withdrawn, conflicted, unauthorized, not yet enrolled), returns the error
+///   as `refused` and the accept loop refuses the stream (issue #6800).
 ///
 /// **GAP-2M accept-side bridge (IPv4)**: the resolver's cookie records are
 /// populated by the connect-side `orig_dst_bridge`, but the accept path looks
@@ -12246,7 +12250,10 @@ mod node_waypoint_stream_scope_tests {
     //! accept-path helper that maps a connection to its source pod's
     //! per-pod authorization scope (parity with the HTTP/HBONE admit path).
 
-    use super::{NodeWaypointIdentityWarnLimiter, resolve_node_waypoint_stream_scope};
+    use super::{
+        NodeWaypointIdentityWarnLimiter, resolve_node_waypoint_stream_identity,
+        resolve_node_waypoint_stream_scope,
+    };
 
     /// Non-node-waypoint topologies (and non-mesh TCP proxies) pass no resolver,
     /// so the accept path stamps no per-pod scope — behavior is unchanged.
@@ -12385,6 +12392,80 @@ mod node_waypoint_stream_scope_tests {
                 destination_ip: orig_dst.map(|addr| addr.ip()),
                 ..Default::default()
             })
+        );
+    }
+
+    /// The accept loop refuses a captured stream whose identity the live slice
+    /// no longer vouches (issue #6800): the production resolver returns the
+    /// capture-evidence error as its fourth element for a stamped pod whose
+    /// workload left the slice, and `None` for a socket with no capture record
+    /// (which keeps the mesh-wide fallback). Linux-only (`SO_COOKIE`).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn captured_but_unvouched_stream_is_returned_for_refusal() {
+        use std::sync::Arc;
+
+        use ferrum_ebpf_common::OrigDst4;
+
+        use crate::identity::SpiffeId;
+        use crate::modes::mesh::node_waypoint::{
+            NodeWaypointIdentityError, NodeWaypointIdentityResolver, parse_pod_uid,
+            workload_spiffe_hash,
+        };
+
+        async fn accepted_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let connect = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+            let (accepted, _peer) = listener.accept().await.expect("accept");
+            let client = connect.await.expect("join").expect("connect");
+            (accepted, client)
+        }
+
+        // An empty slice generation: the pod's workload has been withdrawn.
+        let resolver = Arc::new(NodeWaypointIdentityResolver::new(0));
+        resolver.install_policy_scopes_from_workloads(std::iter::empty());
+        let pod = parse_pod_uid("11111111-1111-1111-1111-111111111111").unwrap();
+        let spiffe = SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger").unwrap();
+
+        let (captured, _captured_client) = accepted_pair().await;
+        let cookie = crate::socket_opts::socket_cookie(&captured).expect("SO_COOKIE");
+        resolver.record_orig_dst4(
+            cookie,
+            OrigDst4 {
+                addr: u32::from_ne_bytes([10, 0, 0, 1]),
+                port: 8080,
+                pod_uid: pod,
+                workload_spiffe_hash: workload_spiffe_hash(&spiffe),
+            },
+        );
+        let (scope, principal, orig_dst, refused) = resolve_node_waypoint_stream_identity(
+            Some(resolver.as_ref()),
+            &captured,
+            "proxy",
+            "127.0.0.1",
+            &NodeWaypointIdentityWarnLimiter::new(),
+        );
+        assert!(scope.is_none() && principal.is_none() && orig_dst.is_none());
+        assert_eq!(
+            refused,
+            Some(NodeWaypointIdentityError::UnknownPod(pod)),
+            "a stamped-but-unvouched stream must be handed to the accept loop for refusal"
+        );
+
+        let (uncaptured, _uncaptured_client) = accepted_pair().await;
+        let (_, _, _, refused) = resolve_node_waypoint_stream_identity(
+            Some(resolver.as_ref()),
+            &uncaptured,
+            "proxy",
+            "127.0.0.1",
+            &NodeWaypointIdentityWarnLimiter::new(),
+        );
+        assert!(
+            refused.is_none(),
+            "traffic with no capture record keeps the mesh-wide fallback"
         );
     }
 }
