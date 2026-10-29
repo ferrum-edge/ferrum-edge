@@ -930,10 +930,10 @@ fn node_waypoint_inbound_relay_mark_enabled() -> bool {
 /// admission fence's sweep counter as captured BEFORE that resolution (issue
 /// #5042 step 1).
 ///
-/// The authorize chain is protocol-scoped and the protocol is peer-selectable
-/// (`content-type: application/grpc` on the CONNECT classifies as gRPC), so a
-/// sweep must re-resolve the SAME view rather than assume plain HTTP. The
-/// counter is what turns a publication that raced this admission into a fresh
+/// The authorize chain is protocol-scoped. The request path refuses an HBONE
+/// CONNECT declaring a gRPC or gRPC-Web content type, so the view is plain HTTP
+/// in practice, but a sweep must re-resolve the SAME view the request path
+/// recorded rather than assume plain HTTP. The counter is what turns a publication that raced this admission into a fresh
 /// sweep; see [`super::hbone_admission_fence::HboneAdmissionFence::admit`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HboneAdmissionView {

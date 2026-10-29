@@ -268,7 +268,7 @@ HTTP/2, and HTTP/3:
 | Native gRPC (`application/grpc…`) | HTTP `200`, Trailers-Only `grpc-status` and `grpc-message`, no DATA |
 | gRPC-Web (`application/grpc-web…`) | HTTP `200` with the negotiated gRPC-Web `Content-Type`; `grpc-status` and `grpc-message` in the body trailer frame |
 | WebSocket Upgrade / Extended CONNECT | The HTTP status and JSON body, even when the handshake carries a gRPC or gRPC-Web `Content-Type` |
-| Any other CONNECT (plain CONNECT, CONNECT-UDP, or another `:protocol`) | The HTTP status and JSON body, whatever its `Content-Type`: a `2xx` answer to CONNECT means the tunnel is established (RFC 9110 §9.3.6), so a gRPC-framed HTTP `200` cannot refuse one |
+| Any other CONNECT (plain CONNECT, CONNECT-UDP, or another registered `:protocol`) | The HTTP status and JSON body, whatever its `Content-Type`: a `2xx` answer to CONNECT means the tunnel is established (RFC 9110 §9.3.6), so a gRPC-framed HTTP `200` cannot refuse one. On HTTP/3 an unregistered `:protocol` token never reaches the gateway: the HTTP/3 layer resets the stream with `H3_MESSAGE_ERROR` |
 
 | Refusal | `grpc-status` | `grpc-message` |
 |---------|---------------|----------------|

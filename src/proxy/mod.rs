@@ -35518,6 +35518,30 @@ async fn handle_proxy_request_inner(
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
     }
+    // An HBONE CONNECT that declares a native gRPC or gRPC-Web Content-Type is
+    // never admitted as a tunnel: gRPC requires POST, and every admitted
+    // tunnel must stand on the plain-HTTP plugin view the admission fence
+    // re-resolves. The refusal is plain HTTP, never gRPC-framed, because a 2xx
+    // answer to CONNECT means "tunnel established" (RFC 9110 §9.3.6).
+    if is_hbone_connect_any
+        && req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .is_some_and(|value| {
+                backend_dispatch::is_native_grpc_content_type(value.as_bytes())
+                    || value
+                        .to_str()
+                        .is_ok_and(crate::plugins::grpc_web::is_grpc_web_content_type)
+            })
+    {
+        warn!("Rejected HBONE CONNECT declaring a gRPC content type");
+        ctx.terminal_record.mark_counted();
+        record_request(&state, 400);
+        return Ok(build_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"gRPC requires POST method"}"#,
+        ));
+    }
     if is_hbone_connect {
         hbone_proxy::tag_request_metadata(&mut ctx);
     } else if is_udp_hbone_connect {

@@ -640,18 +640,12 @@ struct Tunnel {
 
 /// Send a plain HBONE CONNECT and, on a `200`, hand back both halves of the
 /// live tunnel. A non-`200` head is the admission refusal.
+///
+/// Deliberately plain: a CONNECT carrying a gRPC or gRPC-Web `content-type` is
+/// refused with a plain HTTP `400` before the HBONE branch is reached. Tests
+/// that want that shape use [`send_connect`] directly.
 async fn open_tunnel(sender: &mut h2::client::SendRequest<Bytes>) -> Result<Tunnel, StatusCode> {
-    open_tunnel_with_content_type(sender, None).await
-}
-
-/// [`open_tunnel`] for a CONNECT that also declares `content_type`. A CONNECT
-/// is never classified as gRPC or gRPC-Web, so a gateway refusal of one is an
-/// HTTP error status, never a trailers-only `200`.
-async fn open_tunnel_with_content_type(
-    sender: &mut h2::client::SendRequest<Bytes>,
-    content_type: Option<&str>,
-) -> Result<Tunnel, StatusCode> {
-    let (resp, request_body) = send_connect(sender, content_type).await;
+    let (resp, request_body) = send_connect(sender, None).await;
     if resp.status() != StatusCode::OK {
         return Err(resp.status());
     }
@@ -682,8 +676,8 @@ async fn send_connect(
     (resp, request_body)
 }
 
-/// The `grpc-status` a response head carries, if any. An admitted HBONE
-/// CONNECT's `200` carries none.
+/// The `grpc-status` a response head carries, if any. No answer to an HBONE
+/// CONNECT carries one.
 fn grpc_status_of(response: &hyper::Response<h2::RecvStream>) -> Option<String> {
     response
         .headers()
@@ -1608,21 +1602,22 @@ async fn a_loopback_pinned_inbound_relay_is_revoked_when_the_namespace_privilege
 }
 
 /// A peer cannot steer the fence onto a plugin view the tunnel was never
-/// admitted with by declaring a gRPC content type on its CONNECT.
+/// admitted with, because a CONNECT that declares a gRPC content type is not
+/// admitted at all.
 ///
-/// A CONNECT is never classified as gRPC or gRPC-Web, whatever its
-/// `content-type`: it asks for a tunnel, and a gRPC-framed `200` refusal would
-/// itself read as "tunnel established" (RFC 9110 §9.3.6). So a CONNECT carrying
-/// `application/grpc` or `application/grpc-web+proto` is admitted exactly like
-/// a plain one, on the plain-HTTP view, and the fence judges and revokes it
-/// against that view. The snapshot still records whichever view the request
-/// path actually used
+/// An HBONE CONNECT declaring a native gRPC or gRPC-Web `content-type` is
+/// refused before routing with a plain HTTP `400` (gRPC requires POST). The
+/// refusal is never gRPC-framed: a trailers-only `200` would itself read as
+/// "tunnel established" (RFC 9110 §9.3.6). Every
+/// admitted HBONE tunnel is therefore admitted on the plain-HTTP view, which is
+/// the view a sweep re-resolves. The snapshot still records whichever view the
+/// request path actually used
 /// (`HboneAdmissionSnapshot::request_protocol` / `grpc_web_request`, pinned by
 /// `the_fence_sweep_resolves_the_admitting_plugin_view`) instead of hardcoding
-/// plain HTTP, so the sweep cannot drift from the request path if that
-/// classification ever moves.
+/// plain HTTP, so the sweep cannot drift from the request path if that gate
+/// ever moves.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_grpc_content_type_connect_is_admitted_and_fenced_on_the_plain_view() {
+async fn a_grpc_classified_connect_is_refused_before_it_can_become_a_fenced_tunnel() {
     let certs = generate_hbone_mtls_certs(CLIENT_SPIFFE);
     let (backend_addr, backend_handle) = start_interactive_echo_backend().await;
     let state = build_state(prepared_config(
@@ -1634,28 +1629,38 @@ async fn a_grpc_content_type_connect_is_admitted_and_fenced_on_the_plain_view() 
     let (mut sender, conn_task) =
         connect_hbone_h2_mtls(gateway_addr, hbone_client_config(&certs)).await;
 
-    let mut tunnels = Vec::new();
+    // This generation ALLOWS the principal, so the refusal below is the
+    // protocol gate rather than authorization.
     for content_type in ["application/grpc", "application/grpc-web+proto"] {
-        let (response, request_body) = send_connect(&mut sender, Some(content_type)).await;
+        let (refused, _refused_request) = send_connect(&mut sender, Some(content_type)).await;
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "a CONNECT declaring {content_type} is admitted like a plain one"
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "a CONNECT declaring {content_type} must be refused with an HTTP status, \
+             never admitted as a tunnel or answered with a gRPC-framed 200"
         );
         assert_eq!(
-            grpc_status_of(&response),
+            grpc_status_of(&refused),
             None,
-            "a CONNECT declaring {content_type} must not be answered as gRPC"
+            "the refusal of a CONNECT declaring {content_type} is plain HTTP"
         );
-        let mut tunnel = Tunnel {
-            request_body,
-            response_body: response.into_body(),
-        };
-        echo_round_trip(&mut tunnel, b"admitting-view").await;
-        tunnels.push(tunnel);
+        let mut refused_body = refused.into_body();
+        assert_tunnel_closed(&mut refused_body).await;
+        assert_eq!(
+            state.hbone_admission_fence.live_tunnels(),
+            0,
+            "a refused CONNECT must not register a sweepable tunnel"
+        );
     }
-    assert_eq!(state.hbone_admission_fence.live_tunnels(), 2);
     assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    // The same peer's plain CONNECT IS admitted, on the plain-HTTP view, and
+    // the fence judges it against exactly that view.
+    let mut tunnel = open_tunnel(&mut sender)
+        .await
+        .expect("a plain CONNECT is admitted under the same generation");
+    echo_round_trip(&mut tunnel, b"admitting-view").await;
+    assert_eq!(state.hbone_admission_fence.live_tunnels(), 1);
     let reevaluations_before = state.hbone_admission_fence.reevaluations();
 
     let outcome = state.update_config(prepared_config(
@@ -1664,27 +1669,13 @@ async fn a_grpc_content_type_connect_is_admitted_and_fenced_on_the_plain_view() 
     ));
     assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
-    for tunnel in &mut tunnels {
-        assert_tunnel_closed(&mut tunnel.response_body).await;
-    }
+    assert_tunnel_closed(&mut tunnel.response_body).await;
     wait_for_no_live_tunnels(&state).await;
     assert!(
         state.hbone_admission_fence.reevaluations() > reevaluations_before,
         "the sweep must have resolved a non-empty authorize chain for the admitting view"
     );
-    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 2, 0, 0, 0, 0]);
-
-    // Under the denying generation a fresh CONNECT declaring a gRPC content
-    // type is refused at admission with an HTTP status, not a trailers-only
-    // `200`.
-    let denied = open_tunnel_with_content_type(&mut sender, Some("application/grpc"))
-        .await
-        .err();
-    assert_eq!(
-        denied,
-        Some(StatusCode::FORBIDDEN),
-        "a denied CONNECT declaring a gRPC content type must be an HTTP refusal"
-    );
+    assert_eq!(revocation_counts(&state), [0, 0, 0, 0, 1, 0, 0, 0, 0]);
 
     let _ = shutdown_tx.send(true);
     backend_handle.abort();
