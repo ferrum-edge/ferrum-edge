@@ -19,12 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     their `config`, `metrics`, each `tag_overrides` entry, and its `operation`.
   - `mesh_authz`: policy `scope` (including `kind: mesh_wide`), target-ref
     attachments, the `custom` action, the embedded `mesh_slice` root,
-    `ext_authz_providers` with their header and body objects, and
-    `node_waypoint_route_upstreams` entries and targets.
+    `ext_authz_providers` with their header and body objects,
+    `request_authentications` with their JWT rules, and
+    `node_waypoint_route_upstreams` entries and targets. Mesh inventory
+    objects (`workloads`, `services`) stay tolerant of unknown fields for
+    forward compatibility.
 
-  `mcp_gateway` no longer starts its session reaper in the constructor: the
-  reaper now starts in `commit_background_tasks`, so admin and CP validation
-  no longer spawn and abort two tasks per aggregate config.
+  Three plugins no longer start background tasks in their constructors; each
+  now starts them in `commit_background_tasks`, so admin and CP validation
+  no longer spawn and abort them: the `mcp_gateway` session reaper, the
+  `proxy_alerts` lifecycle ticker, and the `tcp_connection_throttle`
+  residual-entry sweep.
 - **Breaking for custom plugins:** every custom plugin must export
   `config_contract() -> crate::plugins::PluginConfigContract` with example
   configs plus any free-form maps or embedded documents. The sweep runs over

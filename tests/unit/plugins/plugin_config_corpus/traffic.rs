@@ -114,26 +114,11 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                         ],
                         "include_request_body_in_check": {"max_request_bytes": 64}
                     }],
-                    // Slice members mesh_authz reads for scope and refusal
-                    // decisions; each element type is closed.
-                    "workloads": [{
-                        "spiffe_id": "spiffe://cluster.local/ns/default/sa/api",
-                        "selector": {"labels": {"app": "api"}},
-                        "service_name": "api",
-                        "trust_domain": "cluster.local",
-                        "namespace": "default",
-                        "ports": [{"port": 8080}]
-                    }],
-                    "services": [{
-                        "name": "api",
-                        "namespace": "default",
-                        "ports": [{"port": 80}],
-                        "workloads": [{"spiffe_id": "spiffe://cluster.local/ns/default/sa/api"}]
-                    }],
-                    "node_waypoint_assertors": [{
-                        "spiffe_id": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
-                        "asserts": ["spiffe://cluster.local/ns/default/sa/api"]
-                    }],
+                    // Request authentications are policy grammar and closed.
+                    // Inventory members (`workloads`, `services`) are not in
+                    // the examples: they stay open on purpose so a newer
+                    // schema's fields are tolerated (see
+                    // `unknown_mesh_fields_are_tolerated`).
                     "request_authentications": [
                         {
                             "name": "api-jwt",
@@ -183,7 +168,6 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
             "mesh_slice.labels",
             "mesh_policies[].scope.selector.labels",
             "mesh_policies[].rules[].to[].headers",
-            "mesh_slice.workloads[].selector.labels",
             "mesh_slice.request_authentications[].scope.selector.labels",
         ]),
         "mesh_route_dispatch" => PluginConfigContract::closed(vec![

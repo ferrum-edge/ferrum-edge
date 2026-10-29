@@ -72,7 +72,6 @@ pub enum AppProtocol {
 /// (K8s labels, VM tags, or static), the `service_name` is the logical
 /// service it participates in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Workload {
     pub spiffe_id: SpiffeId,
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
@@ -180,7 +179,6 @@ impl Workload {
 /// An entry whose `asserts` set is empty authorizes NOTHING — the data plane
 /// fails closed rather than widening to the assertor's namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeWaypointAssertor {
     /// Exact SPIFFE ID of the asserting NodeWaypoint.
     pub spiffe_id: SpiffeId,
@@ -192,7 +190,6 @@ pub struct NodeWaypointAssertor {
 
 /// Destination NodeWaypoint transport endpoint for a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NodeWaypointEndpoint {
     /// IP or DNS name of the destination NodeWaypoint instance that owns the
     /// selected workload's node. This is the outer TCP/TLS dial target.
@@ -230,7 +227,6 @@ fn is_default_node_waypoint_hbone_port(port: &u16) -> bool {
 
 /// A port advertised by a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WorkloadPort {
     pub port: u16,
     #[serde(default)]
@@ -268,7 +264,6 @@ impl WorkloadSelector {
 
 /// A logical service. Workloads are referenced by SPIFFE ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MeshService {
     pub name: String,
     pub namespace: String,
@@ -324,7 +319,6 @@ pub struct MeshService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServicePort {
     pub port: u16,
     #[serde(default)]
@@ -370,7 +364,6 @@ pub(crate) fn resolve_target_port(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WorkloadRef {
     pub spiffe_id: SpiffeId,
 }
@@ -2466,6 +2459,11 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
 /// rejected. A valid JWT has its claims extracted and identity propagated.
 /// Enforcement (requiring a JWT) comes from `AuthorizationPolicy`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Closed with its JWT rule types (issue #6616), like the authorization
+/// grammar: a misspelled `refused` or `jwt_rules` member would otherwise drop
+/// a refusal or a token requirement. Inventory types (`Workload`,
+/// `MeshService`) deliberately stay open for forward compatibility
+/// (`unknown_mesh_fields_are_tolerated`).
 #[serde(deny_unknown_fields)]
 pub struct MeshRequestAuthentication {
     pub name: String,
