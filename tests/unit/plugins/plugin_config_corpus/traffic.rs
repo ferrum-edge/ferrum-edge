@@ -114,11 +114,32 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                         ],
                         "include_request_body_in_check": {"max_request_bytes": 64}
                     }],
-                    // Request authentications are policy grammar and closed.
-                    // Inventory members (`workloads`, `services`) are not in
-                    // the examples: they stay open on purpose so a newer
-                    // schema's fields are tolerated (see
+                    // Peer and request authentications are policy grammar and
+                    // closed. Inventory members (`workloads`, `services`) are
+                    // not in the examples: they stay open on purpose so a
+                    // newer schema's fields are tolerated (see
                     // `unknown_mesh_fields_are_tolerated`).
+                    "peer_authentications": [
+                        {
+                            "name": "default-strict",
+                            "namespace": "default",
+                            "mtls_mode": "strict"
+                        },
+                        {
+                            "name": "api-ports",
+                            "namespace": "default",
+                            "selector": {"labels": {"app": "api"}},
+                            "mtls_mode": "strict",
+                            // Keys are typed ports, so a probe key is refused.
+                            "port_overrides": {"8080": "permissive"}
+                        },
+                        {
+                            "name": "ns-permissive",
+                            "namespace": "default",
+                            "scope": {"kind": "namespace", "namespace": "default"},
+                            "mtls_mode": "permissive"
+                        }
+                    ],
                     "request_authentications": [
                         {
                             "name": "api-jwt",
@@ -169,6 +190,7 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
             "mesh_policies[].scope.selector.labels",
             "mesh_policies[].rules[].to[].headers",
             "mesh_slice.request_authentications[].scope.selector.labels",
+            "mesh_slice.peer_authentications[].selector.labels",
         ]),
         "mesh_route_dispatch" => PluginConfigContract::closed(vec![
             json!({

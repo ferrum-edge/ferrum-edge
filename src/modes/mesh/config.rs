@@ -3126,7 +3126,12 @@ pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
+/// Closed (`deny_unknown_fields`, issue #6616) like the authorization grammar
+/// and `MeshRequestAuthentication`: a misspelled `mtls_mode` would otherwise
+/// default the policy to `PERMISSIVE`, admitting plaintext the operator meant
+/// to refuse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerAuthentication {
     pub name: String,
     pub namespace: String,

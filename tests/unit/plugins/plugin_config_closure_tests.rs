@@ -23,6 +23,14 @@
 //!   constructor contract (`CUSTOM_PLUGINS.md`, the `Plugin` trait docs)
 //!   enforced by review.
 //!
+//! Both checks go through `validate_plugin_config`, the admission entry
+//! point. For the few plugins it validates shape-only (`geo_restriction`,
+//! `body_validator`, `ai_response_guard`, `ai_transcript_audit`,
+//! `udp_logging`, `oidc_relying_party`, `transaction_log_schema`,
+//! `serverless_function`) the sweep therefore proves the shape validator,
+//! which is what admission enforces; their full constructors are covered by
+//! each plugin's own tests.
+//!
 //! Built-in contracts live in [`super::plugin_config_corpus`]; custom plugins
 //! export `config_contract()` (see `custom_plugins/mod.rs`).
 
@@ -109,29 +117,14 @@ fn nested_objects(
     out: &mut Vec<(Vec<Segment>, bool)>,
     matched: &mut BTreeSet<&'static str>,
 ) {
-    if !path.is_empty()
-        && let Some(pattern) = contract
-            .opaque_documents
-            .iter()
-            .find(|pattern| matches(pattern, path))
-    {
-        matched.insert(*pattern);
+    if !path.is_empty() && mark_matching(contract.opaque_documents, path, matched) {
         return;
     }
     match value {
         Value::Object(object) => {
-            let free_form = if path.is_empty() {
-                None
-            } else {
-                contract
-                    .free_form_objects
-                    .iter()
-                    .find(|pattern| matches(pattern, path))
-            };
-            if let Some(pattern) = free_form {
-                matched.insert(*pattern);
-            }
-            out.push((path.clone(), free_form.is_some()));
+            let free_form =
+                !path.is_empty() && mark_matching(contract.free_form_objects, path, matched);
+            out.push((path.clone(), free_form));
             for (key, child) in object {
                 path.push(Segment::Key(key.clone()));
                 nested_objects(child, contract, path, out, matched);
@@ -147,6 +140,21 @@ fn nested_objects(
         }
         _ => {}
     }
+}
+
+/// Marks every declaration matching `path`, so overlapping patterns (`a.*`
+/// and `a.b`) never leave one reported stale. Returns whether any matched.
+fn mark_matching(
+    patterns: &'static [&'static str],
+    path: &[Segment],
+    matched: &mut BTreeSet<&'static str>,
+) -> bool {
+    let mut any = false;
+    for pattern in patterns.iter().filter(|pattern| matches(pattern, path)) {
+        matched.insert(*pattern);
+        any = true;
+    }
+    any
 }
 
 fn object_at<'a>(value: &'a mut Value, path: &[Segment]) -> &'a mut Map<String, Value> {
@@ -289,6 +297,8 @@ fn plugin_validation_needs_no_runtime_and_spawns_no_tasks() {
 
     for (name, contract) in swept_plugins() {
         for (index, example) in contract.examples.iter().enumerate() {
+            // Under a `panic = "abort"` test profile this aborts the binary
+            // instead of collecting the list below; still a failure.
             if catch_unwind(AssertUnwindSafe(|| validate(name, example))).is_err() {
                 panicked.push(format!("{name} example #{index}"));
                 continue;

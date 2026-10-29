@@ -20,10 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `mesh_authz`: policy `scope` (including `kind: mesh_wide`), target-ref
     attachments, the `custom` action, the embedded `mesh_slice` root,
     `ext_authz_providers` with their header and body objects,
-    `request_authentications` with their JWT rules, and
-    `node_waypoint_route_upstreams` entries and targets. Mesh inventory
-    objects (`workloads`, `services`) stay tolerant of unknown fields for
-    forward compatibility.
+    `request_authentications` with their JWT rules, `peer_authentications`,
+    and `node_waypoint_route_upstreams` entries and targets. The closed slice
+    root and `PeerAuthentication` apply wherever they are decoded from JSON
+    (native `MeshSubscribe`, Ferrum xDS carriers, file mesh documents, the
+    embedded `mesh_slice`). During a rolling upgrade, a data plane still
+    on an older build refuses slices from a newer control plane that adds a
+    closed member, and keeps serving its last-good slice until it is upgraded.
+    Mesh inventory objects (`workloads`, `services`) stay tolerant of unknown
+    fields for forward compatibility.
 
   Three plugins no longer start background tasks in their constructors; each
   now starts them in `commit_background_tasks`, so admin and CP validation
