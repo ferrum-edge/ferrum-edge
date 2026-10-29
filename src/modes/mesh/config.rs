@@ -72,6 +72,7 @@ pub enum AppProtocol {
 /// (K8s labels, VM tags, or static), the `service_name` is the logical
 /// service it participates in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Workload {
     pub spiffe_id: SpiffeId,
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
@@ -179,6 +180,7 @@ impl Workload {
 /// An entry whose `asserts` set is empty authorizes NOTHING — the data plane
 /// fails closed rather than widening to the assertor's namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeWaypointAssertor {
     /// Exact SPIFFE ID of the asserting NodeWaypoint.
     pub spiffe_id: SpiffeId,
@@ -190,6 +192,7 @@ pub struct NodeWaypointAssertor {
 
 /// Destination NodeWaypoint transport endpoint for a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeWaypointEndpoint {
     /// IP or DNS name of the destination NodeWaypoint instance that owns the
     /// selected workload's node. This is the outer TCP/TLS dial target.
@@ -227,6 +230,7 @@ fn is_default_node_waypoint_hbone_port(port: &u16) -> bool {
 
 /// A port advertised by a workload.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadPort {
     pub port: u16,
     #[serde(default)]
@@ -264,6 +268,7 @@ impl WorkloadSelector {
 
 /// A logical service. Workloads are referenced by SPIFFE ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshService {
     pub name: String,
     pub namespace: String,
@@ -319,6 +324,7 @@ pub struct MeshService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServicePort {
     pub port: u16,
     #[serde(default)]
@@ -364,6 +370,7 @@ pub(crate) fn resolve_target_port(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadRef {
     pub spiffe_id: SpiffeId,
 }
@@ -2459,6 +2466,7 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
 /// rejected. A valid JWT has its claims extracted and identity propagated.
 /// Enforcement (requiring a JWT) comes from `AuthorizationPolicy`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshRequestAuthentication {
     pub name: String,
     pub namespace: String,
@@ -2479,6 +2487,7 @@ pub struct MeshRequestAuthentication {
 
 /// A single JWT validation rule within a [`MeshRequestAuthentication`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshJwtRule {
     pub issuer: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2510,6 +2519,7 @@ pub struct MeshJwtRule {
 /// One `outputClaimToHeaders` entry: publish `claim` into request header
 /// `header` after successful JWT validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshJwtClaimHeader {
     /// Backend-visible request header name (normalized lowercase at
     /// translation; never a reserved/credential-bearing header).
@@ -2604,6 +2614,7 @@ pub fn validate_mesh_jwt_output_claim_headers(
 
 /// A header location from which to extract a JWT.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtHeader {
     pub name: String,
     /// Prefix stripped before validation (e.g., `"Bearer "`).
@@ -2759,6 +2770,11 @@ impl TelemetryTracingMode {
 /// shim on older DPs (serde will simply fail to deserialise an unknown
 /// variant and the slice update is rejected at slice-apply time, consistent
 /// with the rest of the mesh slice contract).
+///
+/// The direct `workload_metrics` plugin config closes this envelope and each
+/// variant's `config` with per-kind allowlists
+/// (`src/plugins/mesh/workload_metrics.rs`, `*_PROVIDER_CONFIG_KEYS`). Adding
+/// a variant field here means adding it there too.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "config")]
 pub enum TracingProvider {

@@ -299,9 +299,14 @@ The repository's plugin test sweep
 custom plugins alike:
 
 - every example must validate on its own;
-- validating an example must neither need a Tokio runtime nor spawn onto one;
-- an unknown key injected into any nested object of an example must be
-  rejected.
+- validating an example must neither need a Tokio runtime nor spawn a Tokio
+  task;
+- an unknown key injected into the root or any nested object of an example
+  must be rejected.
+
+The runtime check cannot see `spawn_blocking`, OS threads, synchronous dials,
+file writes, or process-global registration. The constructor rules above still
+forbid them; reviewers enforce that part.
 
 List examples that together reach every nested object your plugin reads (one
 per variant of a tagged union). Two declarations exempt parts of a config,

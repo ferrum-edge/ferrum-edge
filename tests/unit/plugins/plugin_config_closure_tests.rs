@@ -5,10 +5,10 @@
 //! object, and pins the validate-by-construction contract, for built-ins and
 //! compiled custom plugins alike:
 //!
-//! - **Nested closure (M-20).** For each plugin, every example in its
+//! - **Closure at every depth (M-20).** For each plugin, every example in its
 //!   [`PluginConfigContract`] must validate on its own. A probe key is then
-//!   injected into each nested object (object members and array elements, at
-//!   any depth) and validation must fail. Only objects the contract declares
+//!   injected into each object (the root, object members, and array elements,
+//!   at any depth) and validation must fail. Only objects the contract declares
 //!   free-form (operator-chosen key names) or opaque (embedded foreign
 //!   documents) are exempt, and every declaration must match a node in the
 //!   examples so a stale exemption cannot outlive the schema it described.
@@ -16,6 +16,12 @@
 //!   `ferrum-edge validate` construct the plugin and drop it. Construction
 //!   must therefore neither need a tokio runtime nor spawn onto one; runtime
 //!   work belongs in `start_background_tasks` / `commit_background_tasks`.
+//!   This pin is deliberately narrow: it observes tokio task spawns
+//!   (`num_alive_tasks`) and anything that panics without a runtime. It does
+//!   not observe `spawn_blocking`, OS threads, synchronous dials, file
+//!   writes, or process-global registration; those remain a documented
+//!   constructor contract (`CUSTOM_PLUGINS.md`, the `Plugin` trait docs)
+//!   enforced by review.
 //!
 //! Built-in contracts live in [`super::plugin_config_corpus`]; custom plugins
 //! export `config_contract()` (see `custom_plugins/mod.rs`).
@@ -92,8 +98,10 @@ fn matches(pattern: &str, path: &[Segment]) -> bool {
             .all(|(want, have)| want == have || (want == "*" && have != "[]"))
 }
 
-/// Every nested object node reachable from `value`, depth >= 1, excluding
-/// opaque subtrees. Returned with the free-form flag for the node itself.
+/// Every object node reachable from `value`, the root included, excluding
+/// opaque subtrees. Returned with the free-form flag for the node itself. The
+/// root is probed here too: `plugin_unknown_key_registry_tests.rs` covers
+/// built-in roots, but a custom plugin's root is only covered by this sweep.
 fn nested_objects(
     value: &Value,
     contract: &PluginConfigContract,
@@ -112,16 +120,18 @@ fn nested_objects(
     }
     match value {
         Value::Object(object) => {
-            if !path.is_empty() {
-                let free_form = contract
+            let free_form = if path.is_empty() {
+                None
+            } else {
+                contract
                     .free_form_objects
                     .iter()
-                    .find(|pattern| matches(pattern, path));
-                if let Some(pattern) = free_form {
-                    matched.insert(*pattern);
-                }
-                out.push((path.clone(), free_form.is_some()));
+                    .find(|pattern| matches(pattern, path))
+            };
+            if let Some(pattern) = free_form {
+                matched.insert(*pattern);
             }
+            out.push((path.clone(), free_form.is_some()));
             for (key, child) in object {
                 path.push(Segment::Key(key.clone()));
                 nested_objects(child, contract, path, out, matched);
@@ -211,10 +221,20 @@ fn every_plugin_rejects_unknown_nested_config_keys() {
                     continue;
                 }
                 let mut probed = example.clone();
-                object_at(&mut probed, &path).insert(PROBE_KEY.to_string(), Value::Bool(true));
+                let object = object_at(&mut probed, &path);
+                // Probe with a sibling-shaped value when there is one, so a
+                // rejection proves the KEY is refused rather than a
+                // value-type check on a map that never validates its keys.
+                let value = object.values().next().cloned().unwrap_or(Value::Bool(true));
+                object.insert(PROBE_KEY.to_string(), value);
                 probes += 1;
                 if validate(name, &probed).is_ok() {
-                    accepted_here.insert(render(&path));
+                    let rendered = render(&path);
+                    accepted_here.insert(if rendered.is_empty() {
+                        "<root>".to_string()
+                    } else {
+                        rendered
+                    });
                 }
             }
         }
@@ -250,7 +270,7 @@ fn every_plugin_rejects_unknown_nested_config_keys() {
         "free-form / opaque declarations that match no example node:\n  {}",
         stale.join("\n  ")
     );
-    assert!(probes > 0, "the nested sweep injected no probes");
+    assert!(probes > 0, "the closure sweep injected no probes");
 }
 
 /// Offline `ferrum-edge validate` constructs plugins before any tokio runtime

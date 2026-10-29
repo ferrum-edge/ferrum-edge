@@ -14,8 +14,11 @@
 //! plugin exports `config_contract()` returning this type. The plugin test
 //! sweep (`tests/unit/plugins/plugin_config_closure_tests.rs`) runs the same
 //! checks over custom plugins as over the built-ins: each example must
-//! validate, construction must not need or touch a tokio runtime, and an
-//! unknown key injected into any nested object must be rejected.
+//! validate, validation must neither need a tokio runtime nor spawn a tokio
+//! task, and an unknown key injected into the root or any nested object must
+//! be rejected. The runtime check cannot observe blocking-pool work, OS
+//! threads, dials, file writes, or global registration, so those stay a
+//! constructor contract that review enforces.
 //!
 //! Path patterns are dotted JSON paths relative to the config root. `[]`
 //! selects every array element and `*` matches any single object key, for

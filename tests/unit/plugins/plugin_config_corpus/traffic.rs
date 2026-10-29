@@ -72,6 +72,17 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                             ]
                         },
                         "rules": [{"to": [{"paths": ["/internal/*"]}], "action": "deny"}]
+                    },
+                    {
+                        // A GatewayClass attachment is cluster-scoped and lives
+                        // in the Istio root namespace.
+                        "name": "class-wide",
+                        "namespace": "istio-system",
+                        "scope": {
+                            "kind": "target_refs",
+                            "attachments": [{"kind": "gateway_class", "name": "istio-waypoint"}]
+                        },
+                        "rules": [{"to": [{"paths": ["/class/*"]}], "action": "deny"}]
                     }
                 ]
             }),
@@ -102,7 +113,49 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                             {"name": "x-check-source", "value": "mesh"}
                         ],
                         "include_request_body_in_check": {"max_request_bytes": 64}
-                    }]
+                    }],
+                    // Slice members mesh_authz reads for scope and refusal
+                    // decisions; each element type is closed.
+                    "workloads": [{
+                        "spiffe_id": "spiffe://cluster.local/ns/default/sa/api",
+                        "selector": {"labels": {"app": "api"}},
+                        "service_name": "api",
+                        "trust_domain": "cluster.local",
+                        "namespace": "default",
+                        "ports": [{"port": 8080}]
+                    }],
+                    "services": [{
+                        "name": "api",
+                        "namespace": "default",
+                        "ports": [{"port": 80}],
+                        "workloads": [{"spiffe_id": "spiffe://cluster.local/ns/default/sa/api"}]
+                    }],
+                    "node_waypoint_assertors": [{
+                        "spiffe_id": "spiffe://cluster.local/ns/istio-system/sa/ztunnel",
+                        "asserts": ["spiffe://cluster.local/ns/default/sa/api"]
+                    }],
+                    "request_authentications": [
+                        {
+                            "name": "api-jwt",
+                            "namespace": "default",
+                            "scope": {
+                                "kind": "workload_selector",
+                                "selector": {"labels": {"app": "api"}}
+                            },
+                            "jwt_rules": [{
+                                "issuer": "https://issuer.example.org",
+                                "jwks_uri": "https://issuer.example.org/jwks",
+                                "from_headers": [{"name": "authorization", "prefix": "Bearer "}],
+                                "output_claim_to_headers": [{"header": "x-jwt-sub", "claim": "sub"}]
+                            }]
+                        },
+                        {
+                            "name": "refused-jwt",
+                            "namespace": "default",
+                            "scope": {"kind": "namespace", "namespace": "default"},
+                            "refused": true
+                        }
+                    ]
                 }
             }),
             // NodeWaypoint per-pod form with route upstream metadata.
@@ -130,6 +183,8 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
             "mesh_slice.labels",
             "mesh_policies[].scope.selector.labels",
             "mesh_policies[].rules[].to[].headers",
+            "mesh_slice.workloads[].selector.labels",
+            "mesh_slice.request_authentications[].scope.selector.labels",
         ]),
         "mesh_route_dispatch" => PluginConfigContract::closed(vec![
             json!({

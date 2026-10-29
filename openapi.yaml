@@ -28552,7 +28552,7 @@ components:
                           properties:
                             type: {const: set_expr}
                         then:
-                          anyOf:
+                          oneOf:
                             - required: [expression]
                             - required: [cel]
                           not:
@@ -28605,8 +28605,8 @@ components:
                         type: string
                         maxLength: 512
                         description: |
-                          Bounded CEL source when `type` is `set_expr` and a
-                          compiled `expression` AST is not supplied. Limits:
+                          Bounded CEL source when `type` is `set_expr`. Set
+                          exactly one of `cel` and `expression`. Limits:
                           512 UTF-8 bytes including surrounding whitespace, 32
                           tokens, nesting depth 8, 24 AST nodes. Supported
                           forms: attribute reads,

@@ -482,6 +482,11 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         json!({"type": "rename", "new_name": "source_app", "value": "reviews"}),
         json!({"type": "set", "value": "reviews", "new_name": "source_app"}),
         json!({"type": "set_expr", "cel": "string(response.code)", "value": "reviews"}),
+        json!({
+            "type": "set_expr",
+            "cel": "string(response.code)",
+            "expression": {"op": "literal", "value": "reviews"}
+        }),
     ] {
         cases.push((metric_operation(operation), false));
     }

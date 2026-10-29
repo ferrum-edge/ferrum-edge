@@ -1937,6 +1937,11 @@ fn parse_tag_operation<'a>(
             Ok(ParsedTagOperation::Set(value))
         }
         Some("set_expr") => {
+            if operation.get("expression").is_some() && operation.get("cel").is_some() {
+                return Err(format!(
+                    "workload_metrics: `set_expr` metric tag {name:?} sets both `cel` and `expression`; set exactly one"
+                ));
+            }
             if let Some(expression) = operation.get("expression") {
                 let expression: MetricTagCelExpr = serde_json::from_value(expression.clone())
                     .map_err(|_| {
