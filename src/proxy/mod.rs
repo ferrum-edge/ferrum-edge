@@ -35293,29 +35293,28 @@ async fn handle_proxy_request_inner(
     // (RFC 9110 §9.3.6), so its refusals keep their HTTP status.
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
     let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
-    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
-        None
-    } else if req.method() == hyper::Method::CONNECT {
-        None
-    } else {
-        req.headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| {
-                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
-                    return None;
-                }
-                let negotiated =
-                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
-                        content_type,
-                        req.headers(),
-                        state.max_header_size_bytes,
-                    );
-                Some(negotiated.unwrap_or_else(|_| {
-                    crate::plugins::grpc_web::response_content_type(content_type)
-                }))
-            })
-    };
+    let grpc_web_response_content_type_owned =
+        if flavor == HttpFlavor::WebSocket || req.method() == hyper::Method::CONNECT {
+            None
+        } else {
+            req.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|content_type| {
+                    if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                        return None;
+                    }
+                    let negotiated =
+                        crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                            content_type,
+                            req.headers(),
+                            state.max_header_size_bytes,
+                        );
+                    Some(negotiated.unwrap_or_else(|_| {
+                        crate::plugins::grpc_web::response_content_type(content_type)
+                    }))
+                })
+        };
     let grpc_web_request = grpc_web_response_content_type_owned.is_some();
     let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
     // Retain the representation just classified, exactly as the H3 frontend
