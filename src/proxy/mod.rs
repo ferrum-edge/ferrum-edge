@@ -35288,30 +35288,33 @@ async fn handle_proxy_request_inner(
     // `Connection` confinement has run, so the inbound `Content-Type` read
     // here is the one the rest of the handler sees. WebSocket Upgrade /
     // Extended CONNECT wins over any hostile Content-Type, matching backend
-    // dispatch and the H3 frontend.
+    // dispatch and the H3 frontend. Any other CONNECT is never framed as gRPC
+    // or gRPC-Web either: a 2xx answer to CONNECT means "tunnel established"
+    // (RFC 9110 §9.3.6), so its refusals keep their HTTP status.
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
     let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
-    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
-        None
-    } else {
-        req.headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| {
-                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
-                    return None;
-                }
-                let negotiated =
-                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
-                        content_type,
-                        req.headers(),
-                        state.max_header_size_bytes,
-                    );
-                Some(negotiated.unwrap_or_else(|_| {
-                    crate::plugins::grpc_web::response_content_type(content_type)
-                }))
-            })
-    };
+    let grpc_web_response_content_type_owned =
+        if flavor == HttpFlavor::WebSocket || req.method() == hyper::Method::CONNECT {
+            None
+        } else {
+            req.headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|content_type| {
+                    if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                        return None;
+                    }
+                    let negotiated =
+                        crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                            content_type,
+                            req.headers(),
+                            state.max_header_size_bytes,
+                        );
+                    Some(negotiated.unwrap_or_else(|_| {
+                        crate::plugins::grpc_web::response_content_type(content_type)
+                    }))
+                })
+        };
     let grpc_web_request = grpc_web_response_content_type_owned.is_some();
     let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
     // Retain the representation just classified, exactly as the H3 frontend
@@ -35513,6 +35516,30 @@ async fn handle_proxy_request_inner(
             grpc_web_response_content_type,
             request_uses_grpc_content_type,
             r#"{"error":"CONNECT method is not allowed"}"#,
+        ));
+    }
+    // An HBONE CONNECT that declares a native gRPC or gRPC-Web Content-Type is
+    // never admitted as a tunnel: gRPC requires POST, and every admitted
+    // tunnel must stand on the plain-HTTP plugin view the admission fence
+    // re-resolves. The refusal is plain HTTP, never gRPC-framed, because a 2xx
+    // answer to CONNECT means "tunnel established" (RFC 9110 §9.3.6).
+    if is_hbone_connect_any
+        && req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .is_some_and(|value| {
+                backend_dispatch::is_native_grpc_content_type(value.as_bytes())
+                    || value
+                        .to_str()
+                        .is_ok_and(crate::plugins::grpc_web::is_grpc_web_content_type)
+            })
+    {
+        warn!("Rejected HBONE CONNECT declaring a gRPC content type");
+        ctx.terminal_record.mark_counted();
+        record_request(&state, 400);
+        return Ok(build_response(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"gRPC requires POST method"}"#,
         ));
     }
     if is_hbone_connect {

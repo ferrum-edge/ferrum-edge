@@ -1692,6 +1692,19 @@ async fn keep_alive_get(sender: &mut KeepAliveSender, host: &str) -> Option<u16>
         .expect("the keep-alive request neither answered nor closed within 5 s")
 }
 
+/// The status line and `(lowercase name, value)` header pairs of a raw
+/// HTTP/1.1 response.
+fn split_response_head(raw: &str) -> (&str, Vec<(String, String)>) {
+    let head = raw.split("\r\n\r\n").next().unwrap_or("");
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    (status_line, headers)
+}
+
 /// Issue #5921: a class flip whose replacement binds in the same reconcile
 /// serves the new class as soon as that one reconcile has published, not on
 /// the next retry tick up to 30 s later. A connection the old plaintext
@@ -1742,7 +1755,16 @@ async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_
             .write_all(b"GET /api/x HTTP/1.1\r\n")
             .await
             .expect("write the request line");
-        // Let the gateway read the request line and settle on HTTP/1.1.
+        // The same, for a native gRPC client: its refusal must keep gRPC
+        // framing and still close the connection (issue #6943).
+        let mut pending_grpc_connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect the pending gRPC client");
+        pending_grpc_connection
+            .write_all(b"POST /api/x HTTP/1.1\r\n")
+            .await
+            .expect("write the gRPC request line");
+        // Let the gateway read the request lines and settle on HTTP/1.1.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let outcome = harness.state.update_config(config_for(port, true));
@@ -1844,6 +1866,50 @@ async fn class_flip_serves_the_new_class_within_one_reconcile_and_never_the_old_
             raw.contains("\r\nconnection: close\r\n"),
             "a 421 must close the old connection: {raw:?}"
         );
+        // A native gRPC client gets the same refusal as a Trailers-Only
+        // `UNAVAILABLE`, which its runtime retries on a new connection, and
+        // the HTTP/1.1 connection still closes.
+        pending_grpc_connection
+            .write_all(
+                format!(
+                    "Host: {ANY_HOST}\r\nContent-Type: application/grpc\r\n\
+                     Content-Length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("finish the pending gRPC request");
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            pending_grpc_connection.read_to_end(&mut raw),
+        )
+        .await
+        .expect("the retired gRPC connection must answer and close within 5 s");
+        let raw = String::from_utf8_lossy(&raw);
+        let (status_line, headers) = split_response_head(&raw);
+        assert!(
+            status_line.starts_with("HTTP/1.1 200 "),
+            "a native gRPC refusal is Trailers-Only HTTP 200: {raw:?}"
+        );
+        for (name, expected) in [
+            ("content-type", "application/grpc"),
+            ("grpc-status", "14"),
+            (
+                "grpc-message",
+                "Gateway listener retired; retry on a new connection",
+            ),
+            ("connection", "close"),
+        ] {
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|(header, _)| header == name)
+                    .map(|(_, value)| value.as_str()),
+                Some(expected),
+                "{name} on the retired gRPC refusal: {raw:?}"
+            );
+        }
         // Retirement closes an idle keep-alive connection. A request that
         // reaches it before that close is answered 421. It is never served.
         for host in [HOST, ANY_HOST] {

@@ -736,9 +736,9 @@ pub struct HboneAdmissionSnapshot {
     /// synthesized relay proxies are absent from every generation by design.
     pub proxy_lifecycle_generation: Option<u64>,
     /// The protocol the request path resolved the admitting plugin view with.
-    /// The authorize chain is protocol-scoped and an HBONE CONNECT carrying
-    /// `content-type: application/grpc` classifies as gRPC, so the sweep must
-    /// re-resolve the SAME view rather than assume plain HTTP.
+    /// The authorize chain is protocol-scoped. The request path refuses an
+    /// HBONE CONNECT declaring a gRPC or gRPC-Web content type, but the sweep
+    /// still re-resolves the SAME view rather than assume plain HTTP.
     pub request_protocol: ProxyProtocol,
     /// Whether the admitting view came from `grpc_web_request_view` rather than
     /// `request_view`; see [`Self::request_protocol`].

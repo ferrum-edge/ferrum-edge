@@ -41,6 +41,10 @@ use crate::retry::ErrorClass;
 /// Called from the hot path for every HTTP-family request. Cost:
 /// - Fast-fails on the WebSocket upgrade / Extended CONNECT signals
 ///   (4 header lookups, short-circuit).
+/// - Any other CONNECT is `Plain`: it asks for a tunnel and is never a gRPC
+///   call, whatever its Content-Type. Its refusals must stay HTTP, because a
+///   2xx answer to CONNECT (a gRPC Trailers-Only or gRPC-Web status) means
+///   "tunnel established" (RFC 9110 §9.3.6).
 /// - Falls through to a single content-type lookup + 16-byte ASCII prefix match.
 /// - Total: ~80–100ns on a non-WebSocket, non-gRPC POST; well below noise.
 ///
@@ -57,6 +61,9 @@ pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
     // miss it.
     if is_extended_connect_websocket(req) || is_http1_websocket_upgrade(req) {
         return HttpFlavor::WebSocket;
+    }
+    if req.method() == hyper::Method::CONNECT {
+        return HttpFlavor::Plain;
     }
 
     if let Some(ct) = req.headers().get(hyper::header::CONTENT_TYPE)
