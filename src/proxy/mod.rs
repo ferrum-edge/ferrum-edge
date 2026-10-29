@@ -34615,15 +34615,9 @@ fn retired_gateway_listener_response(
             StatusCode::MISDIRECTED_REQUEST,
         ),
     );
-    if native_grpc {
-        return grpc_proxy::build_grpc_error_response(
-            grpc_proxy::grpc_status::UNAVAILABLE,
-            "Gateway listener retired; retry on a new connection",
-        );
-    }
     let mut response = pre_routing_refusal_response(
         grpc_web_response_content_type,
-        false,
+        native_grpc,
         StatusCode::MISDIRECTED_REQUEST,
         r#"{"error":"Misdirected Request"}"#,
         grpc_proxy::grpc_status::UNAVAILABLE,
