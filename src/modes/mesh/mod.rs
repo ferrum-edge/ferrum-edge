@@ -16058,8 +16058,7 @@ async fn arm_mesh_runtime_startup(
             env_config.pool_shard_amount,
         ));
         if let Some(initial_slice) = initial_applied_mesh_slice.as_ref() {
-            let snapshot =
-                resolver.build_policy_scope_snapshot_from_workloads(&initial_slice.workloads);
+            let snapshot = resolver.build_policy_scope_snapshot_from_slice(initial_slice);
             resolver.install_policy_scope_snapshot(snapshot);
         }
         if let Some(handle) = node_waypoint::spawn_cgroup_sweep_task(
@@ -21077,8 +21076,7 @@ async fn apply_mesh_slice_generation(
                     .map(|resolver| {
                         (
                             Arc::clone(resolver),
-                            resolver
-                                .build_policy_scope_snapshot_from_workloads(&base_slice.workloads),
+                            resolver.build_policy_scope_snapshot_from_slice(base_slice),
                         )
                     })
             } else {

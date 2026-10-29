@@ -99,6 +99,7 @@ use tracing::{debug, info, warn};
 use crate::identity::SpiffeId;
 use crate::modes::mesh::config::Workload;
 use crate::modes::mesh::runtime::PolicyScopeCache;
+use crate::modes::mesh::slice::MeshSlice;
 
 /// Address family stamp on a cookie record.
 ///
@@ -886,6 +887,31 @@ impl NodeWaypointIdentityResolver {
         self.install_policy_scope_snapshot(snapshot);
     }
 
+    /// Build the source-resolver slice generation for an accepted mesh slice
+    /// (issue #6800).
+    ///
+    /// A NodeWaypoint captures OUTBOUND traffic for every pod enrolled on it,
+    /// and those pods can live outside its subscription namespace. The
+    /// ordinary `workloads` view is narrowed to that namespace, so seeding from
+    /// it alone left an enrolled foreign-namespace source without an identity
+    /// (`UnknownPod`). The dedicated `node_waypoint_capture_destinations`
+    /// inventory is exactly the set of workloads whose trusted
+    /// `Workload.node_waypoint.spiffe_id` names THIS NodeWaypoint, already
+    /// bounded by CP scope and the bearer namespace claim, so it is also the
+    /// least-privilege source inventory. It is consulted only here: it never
+    /// widens `workloads` / routing visibility.
+    pub fn build_policy_scope_snapshot_from_slice(
+        &self,
+        slice: &MeshSlice,
+    ) -> NodeWaypointPolicyScopeSnapshot {
+        self.build_policy_scope_snapshot_from_workloads(
+            slice
+                .workloads
+                .iter()
+                .chain(slice.node_waypoint_capture_destinations.iter()),
+        )
+    }
+
     pub fn build_policy_scope_snapshot_from_workloads<'a, I>(
         &self,
         workloads: I,
@@ -893,6 +919,8 @@ impl NodeWaypointIdentityResolver {
     where
         I: IntoIterator<Item = &'a Workload>,
     {
+        use std::collections::hash_map::Entry;
+
         let workloads: Vec<&Workload> = workloads.into_iter().collect();
         // Per-pod scope: each workload carrying a pod UID gets its OWN scope
         // keyed by the exact `[u8; 16]` the eBPF stamps (parsed from
@@ -900,17 +928,43 @@ impl NodeWaypointIdentityResolver {
         // differing in labels are scoped against their own labels. A malformed
         // UID is skipped (the SPIFFE gate still vouches the identity; scope then
         // falls through to `None` → fail closed when scoped policies exist).
+        //
+        // The same pod may arrive twice (an enrolled pod in the subscription
+        // namespace is in both `workloads` and the capture inventory). An
+        // identical repeat is harmless; records that DISAGREE on the pod's
+        // identity or scope have no trustworthy answer, so the UID gets neither
+        // a scope nor a pod-UID identity (fail closed) instead of last-wins.
         let mut scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>> = HashMap::new();
         let mut spiffe_by_pod_uid: HashMap<[u8; 16], SpiffeId> = HashMap::new();
+        let mut conflicting_pod_uids: std::collections::HashSet<[u8; 16]> =
+            std::collections::HashSet::new();
         for workload in &workloads {
             let Some(raw_uid) = workload.pod_uid.as_deref() else {
                 continue;
             };
             match parse_pod_uid(raw_uid) {
                 Ok(uid) => {
-                    scopes_by_pod_uid
-                        .insert(uid, Arc::new(PolicyScopeCache::from_workload(workload)));
-                    spiffe_by_pod_uid.insert(uid, workload.spiffe_id.clone());
+                    if conflicting_pod_uids.contains(&uid) {
+                        continue;
+                    }
+                    let scope = PolicyScopeCache::from_workload(workload);
+                    match scopes_by_pod_uid.entry(uid) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(Arc::new(scope));
+                            spiffe_by_pod_uid.insert(uid, workload.spiffe_id.clone());
+                        }
+                        Entry::Occupied(entry) if **entry.get() == scope => {}
+                        Entry::Occupied(entry) => {
+                            warn!(
+                                pod_uid = %raw_uid,
+                                "Disabling node-waypoint per-pod scope for pod UID carried by \
+                                 conflicting workload records"
+                            );
+                            entry.remove();
+                            spiffe_by_pod_uid.remove(&uid);
+                            conflicting_pod_uids.insert(uid);
+                        }
+                    }
                 }
                 Err(error) => {
                     warn!(
