@@ -22,7 +22,7 @@
 # layer so the second invocation is fast.
 
 # ── Stage 1: shared build base ──────────────────────────────────────────
-# Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
+# Digest resolved 2026-10-26; the tag is kept for readability, the digest is authoritative.
 FROM rust:latest@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS base
 
 RUN apt-get update && apt-get install -y \

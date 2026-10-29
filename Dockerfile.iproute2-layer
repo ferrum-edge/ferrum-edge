@@ -4,7 +4,7 @@
 # its loader-resolved shared-object closure cross into the final image; no shell,
 # package manager, or iptables fallback tools are shipped.
 ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
-ARG IPROUTE2_BASE=debian:13-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+ARG IPROUTE2_BASE=debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 ARG IPROUTE2_VERSION=6.15.0-1
 FROM ${BASE_IMAGE} AS runtime-base
 FROM ${IPROUTE2_BASE} AS iproute2-runtime
