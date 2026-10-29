@@ -3,7 +3,7 @@
 //! # The gap this closes
 //!
 //! NodeWaypoint scopes a TCP stream's source pod through the socket-cookie
-//! bridge (`resolve_node_waypoint_stream_scope` in `super::tcp_proxy`), so
+//! bridge (`resolve_node_waypoint_stream_identity` in `super::tcp_proxy`), so
 //! namespace/selector-scoped `AuthorizationPolicy` enforces per source workload.
 //! UDP/DTLS had no equivalent: eBPF capture is `connect()`-hooked and TCP-only,
 //! and one UDP listener demuxes every client off a single shared frontend

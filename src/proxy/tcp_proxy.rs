@@ -2807,7 +2807,7 @@ async fn run_tcp_accept_loop(
                     // `StreamConnectionContext` below so `mesh_authz` enforces
                     // namespace/selector-scoped policies for the correct source
                     // pod instead of treating every stream as mesh-wide. See
-                    // [`resolve_node_waypoint_stream_scope`] for the fail-closed
+                    // [`resolve_node_waypoint_stream_identity`] for the fail-closed
                     // semantics.
                     let (
                         node_waypoint_policy_scope,
