@@ -2871,10 +2871,14 @@ visible workloads its routes reach and, on a NodeWaypoint, its capture
 destinations.
 
 - **NodeWaypoint Service routes (Layer 7).** Each HTTP route is resolved to its
-  destination workloads through the same index `mesh_authz` uses for
-  destination policy (keyed by namespace and upstream id, because generated
-  upstream ids are unique only within a namespace), including every `mesh_route_dispatch` destination
-  (associated or global) it may be rewritten to after authentication.
+  destination workloads, including every `mesh_route_dispatch` destination
+  (associated or global) it may be rewritten to after authentication. A
+  generated mesh Service upstream resolves to the workloads the waypoint can
+  actually dial for that Service port: local members with an address and a
+  resolved target port, enrolled in NodeWaypoint transport when it is secured.
+  Any other destination resolves through the index `mesh_authz` uses for
+  destination policy. Both lookups are keyed by namespace and upstream id,
+  because generated upstream ids are unique only within a namespace.
   - A route whose destination set differs from the waypoint's own set gets a
     proxy-group `jwks_auth` instance (`__mesh_request_auth_dst_*`) that replaces
     the global `__mesh_request_auth` on that route. JWT validation, token
