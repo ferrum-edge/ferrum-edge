@@ -97,12 +97,21 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
         ])
         // Keys are operator-chosen gRPC method paths (`/package.Service/Method`).
         .with_free_form_objects(&["grpc.methods"]),
-        "ai_rate_limiter" => PluginConfigContract::closed(vec![json!({
-            "token_limit": 100000,
-            "limit_by": "consumer",
-            "consumer_limits": {"alice": 200000},
-            "model_limits": {"gpt-4o": 50000}
-        })])
+        "ai_rate_limiter" => PluginConfigContract::closed(vec![
+            json!({
+                "token_limit": 100000,
+                "limit_by": "consumer",
+                "consumer_limits": {"alice": 200000},
+                "model_limits": {"gpt-4o": 50000}
+            }),
+            // Redis mode reaches `FailoverLimiter`, whose health observer must
+            // start at commit, not construction.
+            json!({
+                "token_limit": 100000,
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0"
+            }),
+        ])
         // Keys are operator-chosen consumer identities and model names.
         .with_free_form_objects(&["consumer_limits", "model_limits"]),
         "ai_token_metrics" => PluginConfigContract::closed(vec![json!({

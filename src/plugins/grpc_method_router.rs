@@ -813,6 +813,13 @@ fn grpc_json_error_body(message: String) -> String {
 
 #[async_trait]
 impl Plugin for GrpcMethodRouter {
+    /// Starts the Redis failover health observer only once this generation is
+    /// installed, so validation that builds and drops the plugin spawns
+    /// nothing (issue #6616).
+    fn commit_background_tasks(&self) {
+        self.limiter.commit_background_tasks();
+    }
+
     fn name(&self) -> &str {
         "grpc_method_router"
     }

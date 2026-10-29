@@ -3088,6 +3088,13 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
 
 #[async_trait]
 impl Plugin for AiRateLimiter {
+    /// Starts the Redis failover health observer only once this generation is
+    /// installed, so validation that builds and drops the plugin spawns
+    /// nothing (issue #6616).
+    fn commit_background_tasks(&self) {
+        self.limiter.commit_background_tasks();
+    }
+
     fn name(&self) -> &str {
         "ai_rate_limiter"
     }

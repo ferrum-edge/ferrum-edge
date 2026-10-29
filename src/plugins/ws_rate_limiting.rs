@@ -612,6 +612,13 @@ fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<
 
 #[async_trait]
 impl Plugin for WsRateLimiting {
+    /// Starts the Redis failover health observer only once this generation is
+    /// installed, so validation that builds and drops the plugin spawns
+    /// nothing (issue #6616).
+    fn commit_background_tasks(&self) {
+        self.limiter.commit_background_tasks();
+    }
+
     fn name(&self) -> &str {
         "ws_rate_limiting"
     }

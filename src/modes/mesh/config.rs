@@ -4134,7 +4134,13 @@ pub const MAX_MESH_REMOTE_CLUSTERS: usize = 256;
 /// This is intentionally control-plane neutral. Istio CRDs, Gateway API,
 /// native ConfigSync, xDS, file mode, and future CP-to-CP exchange all carry
 /// the same canonical shape instead of talking past Layer 2.
+///
+/// Closed with its `RemoteCluster` and `EastWestGateway` entries
+/// (`deny_unknown_fields`, issue #6616): this is operator-authored topology,
+/// not inventory. A misspelled `local_cluster` leaves it unset, which changes
+/// which endpoints destination policy scopes treat as local.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MultiClusterConfig {
     /// Operator-facing name for the local cluster. When set, must be a
     /// canonical identifier with no leading/trailing whitespace (same identity
@@ -4157,6 +4163,7 @@ pub struct MultiClusterConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteCluster {
     /// Canonical peer-cluster identity. Doubles as the remote-discovery JWT
     /// audience suffix (`ferrum-mesh-discovery:<name>`). Must not carry
@@ -4183,6 +4190,7 @@ pub struct RemoteCluster {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EastWestGateway {
     pub name: String,
     pub namespace: String,

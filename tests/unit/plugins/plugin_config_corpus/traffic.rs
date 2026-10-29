@@ -114,6 +114,29 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
                         ],
                         "include_request_body_in_check": {"max_request_bytes": 64}
                     }],
+                    // Operator-authored topology; destination policy scopes
+                    // read `local_cluster` to tell local from remote endpoints.
+                    "multi_cluster": {
+                        "local_cluster": "east",
+                        "federation_endpoint": "https://east.example.org/federation",
+                        "remote_clusters": [{
+                            "name": "west",
+                            "trust_domain": "west.example.org",
+                            "network": "net-west",
+                            "control_plane_url": "https://cp.west.example.org:50051",
+                            "federation_endpoint": "https://west.example.org/federation",
+                            "discovery_credential_ref": "west-discovery"
+                        }],
+                        "east_west_gateways": [{
+                            "name": "eastwest",
+                            "namespace": "istio-system",
+                            "host": "10.0.0.20",
+                            "port": 15443,
+                            "sni_hosts": ["reviews.default.svc.cluster.local"],
+                            "trust_domain": "west.example.org",
+                            "network": "net-west"
+                        }]
+                    },
                     // Peer and request authentications are policy grammar and
                     // closed. Inventory members (`workloads`, `services`) are
                     // not in the examples: they stay open on purpose so a
@@ -268,42 +291,89 @@ pub(super) fn contract(name: &str) -> Option<PluginConfigContract> {
             "rules[].match.without_headers",
             "rules[].match.query_params",
         ]),
-        "graphql" => PluginConfigContract::closed(vec![json!({
-            "max_depth": 10,
-            "max_complexity": 1000,
-            "max_aliases": 10,
-            "introspection_allowed": false,
-            "type_rate_limits": {
-                "query": {"max_requests": 100, "window_seconds": 60},
-                "mutation": {"max_requests": 10, "window_seconds": 60}
-            },
-            "operation_rate_limits": {
-                "GetUser": {"max_requests": 20, "window_seconds": 60}
-            }
-        })])
+        "graphql" => PluginConfigContract::closed(vec![
+            json!({
+                "max_depth": 10,
+                "max_complexity": 1000,
+                "max_aliases": 10,
+                "introspection_allowed": false,
+                "type_rate_limits": {
+                    "query": {"max_requests": 100, "window_seconds": 60},
+                    "mutation": {"max_requests": 10, "window_seconds": 60}
+                },
+                "operation_rate_limits": {
+                    "GetUser": {"max_requests": 20, "window_seconds": 60}
+                }
+            }),
+            // Redis mode reaches `FailoverLimiter`, whose health observer must
+            // start at commit, not construction.
+            json!({
+                "type_rate_limits": {"query": {"max_requests": 100, "window_seconds": 60}},
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0"
+            }),
+        ])
         // Keyed by operator-chosen GraphQL operation names.
         .with_free_form_objects(&["operation_rate_limits"]),
-        "grpc_method_router" => PluginConfigContract::closed(vec![json!({
-            "allow_methods": ["test.Svc/Method"],
-            "method_rate_limits": {
-                "test.Svc/Method": {"max_requests": 10, "window_seconds": 60}
-            },
-            "default_rate_limit": {"max_requests": 100, "window_seconds": 60}
-        })])
+        "grpc_method_router" => PluginConfigContract::closed(vec![
+            json!({
+                "allow_methods": ["test.Svc/Method"],
+                "method_rate_limits": {
+                    "test.Svc/Method": {"max_requests": 10, "window_seconds": 60}
+                },
+                "default_rate_limit": {"max_requests": 100, "window_seconds": 60}
+            }),
+            // Redis mode reaches `FailoverLimiter`, whose health observer must
+            // start at commit, not construction.
+            json!({
+                "method_rate_limits": {
+                    "/svc/M": {"max_requests": 5, "window_seconds": 60}
+                },
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0"
+            }),
+        ])
         // Keyed by operator-chosen gRPC method names.
         .with_free_form_objects(&["method_rate_limits"]),
-        "rate_limiting" => PluginConfigContract::closed(vec![json!({
-            "limit_by": "consumer",
-            "limits": [
-                {"scope": "default", "window_seconds": 60, "max_requests": 100},
-                {"scope": "consumers", "consumers": ["alice"], "requests_per_second": 5}
-            ],
-            "mcp_tool_calls": {
-                "endpoint_path": "/mcp",
-                "tools": ["search"],
-                "per_tool": true
-            }
-        })]),
+        "rate_limiting" => PluginConfigContract::closed(vec![
+            json!({
+                "limit_by": "consumer",
+                "limits": [
+                    {"scope": "default", "window_seconds": 60, "max_requests": 100},
+                    {"scope": "consumers", "consumers": ["alice"], "requests_per_second": 5}
+                ],
+                "mcp_tool_calls": {
+                    "endpoint_path": "/mcp",
+                    "tools": ["search"],
+                    "per_tool": true
+                }
+            }),
+            // Redis mode reaches `FailoverLimiter`, whose health observer must
+            // start at commit, not construction.
+            json!({
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}],
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0"
+            }),
+        ]),
+        "ws_rate_limiting" => PluginConfigContract::closed(vec![
+            // Redis mode reaches `FailoverLimiter`, whose health observer must
+            // start at commit, not construction.
+            json!({
+                "frames_per_second": 100,
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0"
+            }),
+        ]),
+        "udp_rate_limiting" => PluginConfigContract::closed(vec![
+            // Redis mode reaches `FailoverLimiter`, whose health observer must
+            // start at commit, not construction.
+            json!({
+                "datagrams_per_second": 1000,
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0"
+            }),
+        ]),
         "ws_message_size_limiting" => PluginConfigContract::closed(vec![json!({
             "max_frame_bytes": 65536,
             "client_to_backend": {"max_frame_bytes": 1024},
