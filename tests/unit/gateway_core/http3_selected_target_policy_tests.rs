@@ -599,8 +599,8 @@ fn h3_grpc_web_policy_flavor_is_separate_from_backend_transport() {
         .find("detected_http_flavor == HttpFlavor::WebSocket")
         .expect("H3 WebSocket classification must suppress gRPC-Web promotion");
     let connect_udp_precedence = source
-        .find("|| is_connect_udp_request")
-        .expect("H3 CONNECT-UDP classification must suppress gRPC-Web promotion");
+        .find("|| req.method() == http::Method::CONNECT")
+        .expect("H3 CONNECT (CONNECT-UDP included) must suppress gRPC-Web promotion");
     let effective = source
         .find("let http_flavor = if is_connect_udp_request")
         .expect("H3 CONNECT-UDP must force Plain before gRPC-Web promotion");

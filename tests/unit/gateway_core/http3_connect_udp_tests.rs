@@ -1005,10 +1005,9 @@ fn a_bare_connect_and_a_non_connect_request_are_not_extended_connect() {
 
 #[test]
 fn connect_udp_classification_ignores_spoofed_grpc_content_types() {
-    // The wire classifier keys native gRPC on Content-Type, so a hostile
-    // CONNECT-UDP can look like gRPC until the handler's Extended CONNECT
-    // override forces Plain. Classification itself must still be ConnectUdp
-    // so the RFC 9297 field refusal runs.
+    // The wire classifier never calls a CONNECT gRPC, so a hostile
+    // CONNECT-UDP Content-Type cannot select gRPC framing. Classification
+    // itself must still be ConnectUdp so the RFC 9297 field refusal runs.
     for content_type in ["application/grpc", "application/grpc-web+proto"] {
         let mut req = connect_request(Some(h3::ext::Protocol::CONNECT_UDP));
         req.headers_mut().insert(
@@ -1020,21 +1019,12 @@ fn connect_udp_classification_ignores_spoofed_grpc_content_types() {
             H3ExtendedConnect::ConnectUdp,
             "{content_type} must not hide connect-udp"
         );
-        if content_type == "application/grpc" {
-            assert_eq!(
-                detect_http_flavor(&req),
-                HttpFlavor::Grpc,
-                "the shared wire classifier still sees native gRPC Content-Type; \
-                 handle_h3_request must override that to Plain"
-            );
-        } else {
-            assert_eq!(
-                detect_http_flavor(&req),
-                HttpFlavor::Plain,
-                "gRPC-Web stays Plain in detect_http_flavor; the handler must \
-                 still suppress gRPC-Web response shaping"
-            );
-        }
+        assert_eq!(
+            detect_http_flavor(&req),
+            HttpFlavor::Plain,
+            "a CONNECT is Plain whatever its Content-Type; for gRPC-Web the \
+             handler must still suppress gRPC-Web response shaping"
+        );
     }
 }
 
@@ -2636,8 +2626,8 @@ fn handle_h3_request_forces_plain_connect_udp_flavor_over_content_type() {
     let handler = handle_h3_request_source();
     let squeezed = squeeze(handler);
     assert!(
-        squeezed.contains("letgrpc_web_response_content_type_owned=ifdetected_http_flavor==HttpFlavor::WebSocket||is_connect_udp_request{None}"),
-        "CONNECT-UDP must suppress gRPC-Web shaping the same way WebSocket does"
+        squeezed.contains("letgrpc_web_response_content_type_owned=ifdetected_http_flavor==HttpFlavor::WebSocket||req.method()==http::Method::CONNECT{None}"),
+        "every CONNECT, CONNECT-UDP included, must suppress gRPC-Web shaping the same way WebSocket does"
     );
     assert!(
         squeezed.contains("lethttp_flavor=ifis_connect_udp_request{HttpFlavor::Plain}elseifgrpc_web_response_content_type.is_some(){HttpFlavor::Grpc}"),

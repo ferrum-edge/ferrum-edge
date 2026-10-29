@@ -268,6 +268,7 @@ HTTP/2, and HTTP/3:
 | Native gRPC (`application/grpc…`) | HTTP `200`, Trailers-Only `grpc-status` and `grpc-message`, no DATA |
 | gRPC-Web (`application/grpc-web…`) | HTTP `200` with the negotiated gRPC-Web `Content-Type`; `grpc-status` and `grpc-message` in the body trailer frame |
 | WebSocket Upgrade / Extended CONNECT | The HTTP status and JSON body, even when the handshake carries a gRPC or gRPC-Web `Content-Type` |
+| Any other CONNECT (plain CONNECT, CONNECT-UDP, or another `:protocol`) | The HTTP status and JSON body, whatever its `Content-Type`: a `2xx` answer to CONNECT means the tunnel is established (RFC 9110 §9.3.6), so a gRPC-framed HTTP `200` cannot refuse one |
 
 | Refusal | `grpc-status` | `grpc-message` |
 |---------|---------------|----------------|
@@ -279,7 +280,8 @@ HTTP/2, and HTTP/3:
 | Protocol-header guard violation that reaches the handler (HTTP/1.1 parse-layer rejects keep their `400`; see [error classification](error_classification.md#http11-parse-layer-400-contract)) | `3` (`INVALID_ARGUMENT`) | `Protocol header violation` |
 | HTTP/2 / HTTP/3 Host and `:authority` disagreement | `3` (`INVALID_ARGUMENT`) | `Invalid :authority or Host` |
 | Malformed Host or `:authority` value (`400`) | `3` (`INVALID_ARGUMENT`) | `Malformed Host or authority` |
-| TRACE or unsupported CONNECT (`405`, with `Allow`) | `12` (`UNIMPLEMENTED`) | `TRACE method is not allowed` / `CONNECT method is not allowed` |
+| TRACE (`405`, with `Allow`; the gRPC and gRPC-Web answers keep `Allow`) | `12` (`UNIMPLEMENTED`) | `TRACE method is not allowed` |
+| Unsupported CONNECT | None: every client gets the JSON `405` `{"error":"CONNECT method is not allowed"}` with `Allow` | — |
 | Per-IP concurrent-request limit (`429`) | `8` (`RESOURCE_EXHAUSTED`) | `Too many concurrent requests from this IP` |
 | Method not allowed in 0-RTT early data (`425`) | `14` (`UNAVAILABLE`) | `Method not allowed in 0-RTT early data` |
 | Retired Gateway listener (`421`) | `14` (`UNAVAILABLE`) | `Gateway listener retired; retry on a new connection` |

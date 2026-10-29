@@ -3301,12 +3301,16 @@ async fn handle_h3_request(
 
     // Extended CONNECT classification takes precedence over Content-Type.
     // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
-    // rejection shaping so a spoofed header cannot turn a WS or CONNECT-UDP
-    // policy reject into a gRPC-Web response. CONNECT-UDP still refuses the
-    // spoofed Content-Type as an RFC 9297 §3.2 malformed message; this only
-    // stops that 400 from being rewritten as a gRPC-Web HTTP-200 body.
+    // rejection shaping so a spoofed header cannot turn a WS or CONNECT
+    // policy reject into a gRPC-Web response. Every CONNECT is covered —
+    // CONNECT-UDP, plain CONNECT, and any other `:protocol` — because a 2xx
+    // answer to CONNECT means "tunnel established" (RFC 9110 §9.3.6); native
+    // gRPC is already `Plain` for CONNECT in `detect_http_flavor`. CONNECT-UDP
+    // still refuses the spoofed Content-Type as an RFC 9297 §3.2 malformed
+    // message; this only stops that 400 from being rewritten as a gRPC-Web
+    // HTTP-200 body.
     let grpc_web_response_content_type_owned =
-        if detected_http_flavor == HttpFlavor::WebSocket || is_connect_udp_request {
+        if detected_http_flavor == HttpFlavor::WebSocket || req.method() == http::Method::CONNECT {
             None
         } else {
             req.headers()

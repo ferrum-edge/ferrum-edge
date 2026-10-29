@@ -53,6 +53,7 @@ paths:
 ## Protocol Validation
 
 - `check_protocol_headers()` runs on every inbound request. Preserve rejects for HTTP/1.0+TE, CL+TE smuggling, duplicate/mismatched/empty Content-Length, duplicate Host, HTTP/1.1 missing Host (RFC 9112 §3.2.2; empty Host is present-but-invalid and also 400; HTTP/1.0 and absolute-form URI authority are not rejected), bad H2/H3 TE, non-numeric Content-Length, TRACE, and unsupported CONNECT.
+- A CONNECT that is not a WebSocket Extended CONNECT is never gRPC: `detect_http_flavor` returns `Plain` for it and both frontends skip gRPC-Web negotiation for it, so every refusal of a CONNECT keeps its HTTP status. A gRPC Trailers-Only or gRPC-Web HTTP `200` is a `2xx` answer to CONNECT, which means "tunnel established" (RFC 9110 §9.3.6); hyper strips the body on H1 and turns the H2 stream into a tunnel or resets it.
 - The bounded proxy-frontend `h1_framing_guard` records CL+TE from raw HTTP/1 heads before Hyper can discard `Content-Length`; preserve its order-independent handoff and the RFC 9112 §6.1 connection close after a CL+TE rejection.
 - `check_host_authority_consistency()` rejects H2/H3 Host vs `:authority` disagreement before routing after default-port normalization, and rejects the both-absent case (RFC 9113 §8.3.1 / RFC 9114 §4.3.1). `:authority`-only (including RFC 8441 / RFC 9220 Extended CONNECT) and Host-only remain valid.
 - Host/authority normalization strips valid ports, preserves bracketed IPv6, rejects unbracketed IPv6, strips trailing dots, and lowercases ASCII.

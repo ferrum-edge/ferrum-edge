@@ -136,6 +136,33 @@ fn detect_http_flavor_classifies_native_grpc_across_http_versions() {
     }
 }
 
+/// A CONNECT asks for a tunnel and is never a gRPC call: its refusals must
+/// stay HTTP, because a gRPC-framed `200` would mean "tunnel established"
+/// (RFC 9110 §9.3.6).
+#[test]
+fn detect_http_flavor_keeps_connect_with_grpc_content_type_plain() {
+    for (name, version) in [
+        ("HTTP/1.1", hyper::Version::HTTP_11),
+        ("HTTP/2", hyper::Version::HTTP_2),
+        ("HTTP/3", hyper::Version::HTTP_3),
+    ] {
+        for content_type in ["application/grpc", "application/grpc+proto"] {
+            let req = Request::builder()
+                .method("CONNECT")
+                .version(version)
+                .uri("example.com:443")
+                .header("content-type", content_type)
+                .body(())
+                .unwrap();
+            assert_eq!(
+                detect_http_flavor(&req),
+                HttpFlavor::Plain,
+                "{name} CONNECT with {content_type} must classify as Plain"
+            );
+        }
+    }
+}
+
 #[test]
 fn detect_http_flavor_requires_complete_http1_websocket_handshake() {
     let mut missing_connection_upgrade = Request::builder()

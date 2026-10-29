@@ -11,6 +11,11 @@
 //! the gateway negotiates a gRPC-Web response media type from request headers,
 //! so gRPC-Web keeps the JSON answer there.
 //!
+//! A non-WebSocket CONNECT is never framed as gRPC, whatever its Content-Type
+//! and whichever refusal answers it: a 2xx answer to CONNECT means "tunnel
+//! established" (RFC 9110 §9.3.6), so a gRPC Trailers-Only or gRPC-Web HTTP
+//! `200` cannot refuse one. Every flavor gets the HTTP refusal.
+//!
 //! Every refused request must stop at the gateway: the backend records each
 //! path it serves, no refused path may appear there, and admitted controls on
 //! both frontends prove the recording is live.
@@ -86,7 +91,10 @@ struct Refusal {
     json_fragment: &'static str,
     grpc_status: u32,
     grpc_message: &'static str,
-    /// `false` only for the header limits (see the module docs).
+    /// `false` only for CONNECT (see the module docs): every flavor then gets
+    /// the HTTP refusal, and `grpc_status` / `grpc_message` are unused.
+    grpc_framed: bool,
+    /// `false` for the header limits and CONNECT (see the module docs).
     grpc_web_framed: bool,
     wires: &'static [Wire],
 }
@@ -102,6 +110,7 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "Request URL length",
             grpc_status: GRPC_RESOURCE_EXHAUSTED,
             grpc_message: "Request URL too long",
+            grpc_framed: true,
             grpc_web_framed: true,
             wires: &[Wire::H1, Wire::H2],
         },
@@ -114,6 +123,7 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "Query parameter count (3) exceeds maximum of 2",
             grpc_status: GRPC_INVALID_ARGUMENT,
             grpc_message: "Too many query parameters",
+            grpc_framed: true,
             grpc_web_framed: true,
             wires: &[Wire::H1, Wire::H2],
         },
@@ -129,6 +139,7 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "Request contains multiple Authorization headers",
             grpc_status: GRPC_INVALID_ARGUMENT,
             grpc_message: "Protocol header violation",
+            grpc_framed: true,
             grpc_web_framed: true,
             wires: &[Wire::H1, Wire::H2],
         },
@@ -143,6 +154,7 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "Host header and request authority disagree",
             grpc_status: GRPC_INVALID_ARGUMENT,
             grpc_message: "Invalid :authority or Host",
+            grpc_framed: true,
             grpc_web_framed: true,
             wires: &[Wire::H2],
         },
@@ -155,6 +167,7 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "exceeds maximum size of 4096 bytes",
             grpc_status: GRPC_RESOURCE_EXHAUSTED,
             grpc_message: "Request header exceeds maximum size",
+            grpc_framed: true,
             grpc_web_framed: false,
             wires: &[Wire::H1, Wire::H2],
         },
@@ -169,6 +182,7 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "exceeds maximum of 24",
             grpc_status: GRPC_RESOURCE_EXHAUSTED,
             grpc_message: "Request header count exceeds maximum",
+            grpc_framed: true,
             grpc_web_framed: false,
             wires: &[Wire::H1, Wire::H2],
         },
@@ -181,7 +195,57 @@ fn refusals() -> Vec<Refusal> {
             json_fragment: "TRACE method is not allowed",
             grpc_status: GRPC_UNIMPLEMENTED,
             grpc_message: "TRACE method is not allowed",
+            grpc_framed: true,
             grpc_web_framed: true,
+            wires: &[Wire::H1, Wire::H2],
+        },
+        Refusal {
+            // HTTP/1.1 authority-form; HTTP/2 with `:authority` alone, no
+            // `:protocol`. The WebSocket flavors are Extended CONNECT, which
+            // is admitted, so they are skipped.
+            name: "connect_method",
+            method: Some(Method::CONNECT),
+            target: "/refusal".to_string(),
+            headers: Vec::new(),
+            http_status: StatusCode::METHOD_NOT_ALLOWED,
+            json_fragment: "CONNECT method is not allowed",
+            grpc_status: GRPC_UNIMPLEMENTED,
+            grpc_message: "CONNECT method is not allowed",
+            grpc_framed: false,
+            grpc_web_framed: false,
+            wires: &[Wire::H1, Wire::H2],
+        },
+        // Refusals that run before the CONNECT gate keep a CONNECT's HTTP
+        // status too.
+        Refusal {
+            name: "connect_protocol_header_guard",
+            method: Some(Method::CONNECT),
+            target: "/refusal".to_string(),
+            headers: vec![
+                ("authorization", "Bearer first".to_string()),
+                ("authorization", "Bearer second".to_string()),
+            ],
+            http_status: StatusCode::BAD_REQUEST,
+            json_fragment: "Request contains multiple Authorization headers",
+            grpc_status: GRPC_INVALID_ARGUMENT,
+            grpc_message: "Protocol header violation",
+            grpc_framed: false,
+            grpc_web_framed: false,
+            wires: &[Wire::H1, Wire::H2],
+        },
+        Refusal {
+            name: "connect_header_count",
+            method: Some(Method::CONNECT),
+            target: "/refusal".to_string(),
+            headers: (0..MAX_HEADER_COUNT + 6)
+                .map(|_| ("x-count", "1".to_string()))
+                .collect(),
+            http_status: StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            json_fragment: "exceeds maximum of 24",
+            grpc_status: GRPC_RESOURCE_EXHAUSTED,
+            grpc_message: "Request header count exceeds maximum",
+            grpc_framed: false,
+            grpc_web_framed: false,
             wires: &[Wire::H1, Wire::H2],
         },
     ]
@@ -311,6 +375,13 @@ async fn send(
     };
     if let Some(method) = method {
         builder = builder.method(method.clone());
+        // A plain CONNECT names only an authority: the HTTP/1.1 authority-form
+        // request-target, and on HTTP/2 a request with `:authority` but no
+        // `:scheme`, `:path`, or `:protocol` (h2 omits both for a CONNECT
+        // without the `Protocol` extension).
+        if *method == Method::CONNECT {
+            builder = builder.uri(format!("127.0.0.1:{port}"));
+        }
     }
     builder = match flavor {
         Flavor::Plain => builder,
@@ -398,7 +469,7 @@ fn assert_refusal(case: &Refusal, wire: Wire, flavor: Flavor, response: &WireRes
     let body_text = String::from_utf8_lossy(&response.body);
     let expected_grpc_status = case.grpc_status.to_string();
     match flavor {
-        Flavor::Grpc => {
+        Flavor::Grpc if case.grpc_framed => {
             assert_eq!(response.status, StatusCode::OK, "{label}: Trailers-Only");
             assert_eq!(
                 response.header("content-type"),
@@ -443,7 +514,11 @@ fn assert_refusal(case: &Refusal, wire: Wire, flavor: Flavor, response: &WireRes
                 "{label}"
             );
         }
-        Flavor::Plain | Flavor::GrpcWeb | Flavor::WebSocket | Flavor::WebSocketGrpcWeb => {
+        Flavor::Plain
+        | Flavor::Grpc
+        | Flavor::GrpcWeb
+        | Flavor::WebSocket
+        | Flavor::WebSocketGrpcWeb => {
             assert_eq!(response.status, case.http_status, "{label}: {body_text}");
             assert!(
                 !response.headers.contains_key("grpc-status"),

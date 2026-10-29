@@ -35288,10 +35288,14 @@ async fn handle_proxy_request_inner(
     // `Connection` confinement has run, so the inbound `Content-Type` read
     // here is the one the rest of the handler sees. WebSocket Upgrade /
     // Extended CONNECT wins over any hostile Content-Type, matching backend
-    // dispatch and the H3 frontend.
+    // dispatch and the H3 frontend. Any other CONNECT is never framed as gRPC
+    // or gRPC-Web either: a 2xx answer to CONNECT means "tunnel established"
+    // (RFC 9110 §9.3.6), so its refusals keep their HTTP status.
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
     let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
     let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
+        None
+    } else if req.method() == hyper::Method::CONNECT {
         None
     } else {
         req.headers()
