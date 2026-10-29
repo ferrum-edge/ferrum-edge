@@ -157,7 +157,7 @@ impl NodeWaypointIdentityWarnLimiter {
 ///
 /// Behavior:
 /// - `resolver` is `None` outside `NodeWaypoint` topology and for non-mesh TCP
-///   proxies → returns `(None, None, None)`; no per-pod scope is consulted
+///   proxies → returns `(None, None, None, None)`; no per-pod scope is consulted
 ///   (unchanged pre-fix behavior).
 /// - When the connection carries no capture record (GAP-2M tuple miss,
 ///   non-Linux, unknown cookie, cookie unavailable), returns
