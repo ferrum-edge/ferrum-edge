@@ -34629,6 +34629,32 @@ fn retired_gateway_listener_response(
     response
 }
 
+/// A transport-level refusal decided before routing, in the client's wire
+/// representation: gRPC-Web gets its framed error (HTTP `200`, status in the
+/// body trailer frame), native gRPC a Trailers-Only status, and everything
+/// else — including a WebSocket handshake that carries a gRPC Content-Type —
+/// the JSON `http_body` with `http_status`. No plugin has run yet, so there is
+/// no initial-response header policy to apply. Mirrors the HTTP/3 frontend's
+/// `send_h3_error_flavor_aware`. Out of line so the request handler's state
+/// machine does not grow.
+#[inline(never)]
+fn pre_routing_refusal_response(
+    grpc_web_response_content_type: Option<&str>,
+    native_grpc: bool,
+    http_status: StatusCode,
+    http_body: &str,
+    grpc_status: u32,
+    grpc_message: &str,
+) -> Response<ProxyBody> {
+    if let Some(content_type) = grpc_web_response_content_type {
+        return build_grpc_web_error_response(content_type, grpc_status, grpc_message, &[]);
+    }
+    if native_grpc {
+        return grpc_proxy::build_grpc_error_response(grpc_status, grpc_message);
+    }
+    build_response(http_status, http_body)
+}
+
 /// The answer to a request refused by the proxy hop limit (issue #6109):
 /// `508 Loop Detected` with `X-Gateway-Error: loop_detected` when the received
 /// `X-Ferrum-Hops` count reached `FERRUM_MAX_PROXY_HOPS`, or `400` (no token)
@@ -35079,6 +35105,12 @@ async fn handle_proxy_request_inner(
     // HashMap<String, String> is only built when a plugin phase or backend
     // dispatch actually needs it (saving ~20-60 String allocations per request
     // on early-reject paths and deferring them past routing on the happy path).
+    //
+    // Native gRPC is refused with a Trailers-Only `RESOURCE_EXHAUSTED`, as on
+    // HTTP/3. gRPC-Web keeps the JSON answer here: its response media type is
+    // negotiated from request headers, and that parsing must not run before
+    // these limits have bounded them. The flavor is classified only on the
+    // refusal path, so admitted requests pay nothing extra.
     let mut total_header_size: usize = 0;
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
@@ -35092,12 +35124,16 @@ async fn handle_proxy_request_inner(
                 .unwrap_or_else(|_| "\"<invalid>\"".to_string());
             // escaped_name is a quoted JSON string like "\"foo\"", strip outer quotes for embedding
             let inner = &escaped_name[1..escaped_name.len() - 1];
-            return Ok(build_response(
+            return Ok(pre_routing_refusal_response(
+                None,
+                crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc,
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                 &format!(
                     r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
                     inner, state.max_single_header_size_bytes
                 ),
+                grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                "Request header exceeds maximum size",
             ));
         }
         total_header_size += header_size;
@@ -35105,21 +35141,29 @@ async fn handle_proxy_request_inner(
     if total_header_size > state.max_header_size_bytes {
         ctx.terminal_record.mark_counted();
         record_request(&state, 431);
-        return Ok(build_response(
+        return Ok(pre_routing_refusal_response(
+            None,
+            crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc,
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             r#"{"error":"Total request headers exceed maximum size"}"#,
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Total request headers exceed maximum size",
         ));
     }
     if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
         ctx.terminal_record.mark_counted();
         record_request(&state, 431);
-        return Ok(build_response(
+        return Ok(pre_routing_refusal_response(
+            None,
+            crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc,
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             &format!(
                 r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
                 req.headers().len(),
                 state.max_header_count
             ),
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+            "Request header count exceeds maximum",
         ));
     }
 
@@ -35159,83 +35203,15 @@ async fn handle_proxy_request_inner(
     ctx.set_raw_headers(req.headers().clone());
     stamp_original_request_metadata(&mut ctx);
 
-    // Validate URL length (path + query string)
-    if state.max_url_length_bytes > 0 {
-        let url_len = path.len()
-            + if query_string.is_empty() {
-                0
-            } else {
-                1 + query_string.len()
-            };
-        if url_len > state.max_url_length_bytes {
-            ctx.terminal_record.mark_counted();
-            record_request(&state, 414);
-            return Ok(build_response(
-                StatusCode::URI_TOO_LONG,
-                &format!(
-                    r#"{{"error":"Request URL length ({} bytes) exceeds maximum of {} bytes"}}"#,
-                    url_len, state.max_url_length_bytes
-                ),
-            ));
-        }
-    }
-
-    // Validate query parameter count (skip empty segments from consecutive '&').
-    if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = count_query_params(&query_string);
-        if param_count > state.max_query_params {
-            ctx.terminal_record.mark_counted();
-            record_request(&state, 400);
-            return Ok(build_response(
-                StatusCode::BAD_REQUEST,
-                &format!(
-                    r#"{{"error":"Query parameter count ({}) exceeds maximum of {}"}}"#,
-                    param_count, state.max_query_params
-                ),
-            ));
-        }
-    }
-
-    // Protocol-level header validation to prevent request smuggling and desync attacks.
-    // Must run before routing because these are transport-level violations that apply
-    // regardless of which backend the request would be forwarded to.
-    if let Some(error_body) = check_protocol_headers_with_wire_framing(
-        req.headers(),
-        req.version(),
-        req.uri(),
-        matches!(
-            http1_framing_result,
-            h1_framing_guard::H1FramingResult::Conflict
-        ),
-    ) {
-        warn!("Rejected request: {}", error_body);
-        ctx.terminal_record.mark_counted();
-        record_request(&state, 400);
-        // Even a pre-routing protocol refusal must use native gRPC framing.
-        // Classify the full request so WebSocket Extended CONNECT retains its
-        // HTTP handshake refusal when it carries a hostile gRPC Content-Type.
-        if crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc {
-            return Ok(grpc_proxy::build_grpc_error_response(
-                grpc_proxy::grpc_status::INVALID_ARGUMENT,
-                "Protocol header violation",
-            ));
-        }
-        return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
-    }
-
-    if let Some(error_body) =
-        check_host_authority_consistency(req.headers(), req.uri(), req.version())
-    {
-        warn!("Rejected request: {}", error_body);
-        ctx.terminal_record.mark_counted();
-        record_request(&state, 400);
-        return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
-    }
-
-    // Classify before the canonical-path boundary so a refusal uses the
-    // client's wire representation. WebSocket Upgrade / Extended CONNECT wins
-    // over any hostile Content-Type, matching backend dispatch and the H3
-    // frontend.
+    // Classify before the transport-level checks below so every pre-routing
+    // refusal from here on — URL length, query-parameter count, protocol
+    // headers, Host/`:authority`, and the canonical path — uses the client's
+    // wire representation, exactly as the H3 frontend does. The header limits
+    // above have already bounded the gRPC-Web media negotiation, and the
+    // `Connection` confinement has run, so the inbound `Content-Type` read
+    // here is the one the rest of the handler sees. WebSocket Upgrade /
+    // Extended CONNECT wins over any hostile Content-Type, matching backend
+    // dispatch and the H3 frontend.
     let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
     let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
     let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
@@ -35285,6 +35261,96 @@ async fn handle_proxy_request_inner(
         );
     }
 
+    // Validate URL length (path + query string)
+    if state.max_url_length_bytes > 0 {
+        let url_len = path.len()
+            + if query_string.is_empty() {
+                0
+            } else {
+                1 + query_string.len()
+            };
+        if url_len > state.max_url_length_bytes {
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 414);
+            return Ok(pre_routing_refusal_response(
+                grpc_web_response_content_type,
+                request_uses_grpc_content_type,
+                StatusCode::URI_TOO_LONG,
+                &format!(
+                    r#"{{"error":"Request URL length ({} bytes) exceeds maximum of {} bytes"}}"#,
+                    url_len, state.max_url_length_bytes
+                ),
+                grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                "Request URL too long",
+            ));
+        }
+    }
+
+    // Validate query parameter count (skip empty segments from consecutive '&').
+    if state.max_query_params > 0 && !query_string.is_empty() {
+        let param_count = count_query_params(&query_string);
+        if param_count > state.max_query_params {
+            ctx.terminal_record.mark_counted();
+            record_request(&state, 400);
+            return Ok(pre_routing_refusal_response(
+                grpc_web_response_content_type,
+                request_uses_grpc_content_type,
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    r#"{{"error":"Query parameter count ({}) exceeds maximum of {}"}}"#,
+                    param_count, state.max_query_params
+                ),
+                grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                "Too many query parameters",
+            ));
+        }
+    }
+
+    // Protocol-level header validation to prevent request smuggling and desync attacks.
+    // Must run before routing because these are transport-level violations that apply
+    // regardless of which backend the request would be forwarded to.
+    if let Some(error_body) = check_protocol_headers_with_wire_framing(
+        req.headers(),
+        req.version(),
+        req.uri(),
+        matches!(
+            http1_framing_result,
+            h1_framing_guard::H1FramingResult::Conflict
+        ),
+    ) {
+        warn!("Rejected request: {}", error_body);
+        ctx.terminal_record.mark_counted();
+        record_request(&state, 400);
+        // Every guard violation uses the client's framing. The flavor above
+        // was classified from the full request, so WebSocket Upgrade /
+        // Extended CONNECT retains its HTTP handshake refusal when it carries
+        // a hostile gRPC or gRPC-Web Content-Type.
+        return Ok(pre_routing_refusal_response(
+            grpc_web_response_content_type,
+            request_uses_grpc_content_type,
+            StatusCode::BAD_REQUEST,
+            error_body,
+            grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            "Protocol header violation",
+        ));
+    }
+
+    if let Some(error_body) =
+        check_host_authority_consistency(req.headers(), req.uri(), req.version())
+    {
+        warn!("Rejected request: {}", error_body);
+        ctx.terminal_record.mark_counted();
+        record_request(&state, 400);
+        return Ok(pre_routing_refusal_response(
+            grpc_web_response_content_type,
+            request_uses_grpc_content_type,
+            StatusCode::BAD_REQUEST,
+            error_body,
+            grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            "Invalid :authority or Host",
+        ));
+    }
+
     // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Runs after the
     // transport-level checks above — which bound the work by the operator's
     // URL-length limit and settle smuggling/authority questions first — and
@@ -35313,23 +35379,13 @@ async fn handle_proxy_request_inner(
             );
             ctx.terminal_record.mark_counted();
             record_request(&state, 400);
-            if let Some(content_type) = grpc_web_response_content_type {
-                return Ok(build_grpc_web_error_response(
-                    content_type,
-                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
-                    rejection.grpc_message(),
-                    &[],
-                ));
-            }
-            if request_uses_grpc_content_type {
-                return Ok(grpc_proxy::build_grpc_error_response(
-                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
-                    rejection.grpc_message(),
-                ));
-            }
-            return Ok(build_response(
+            return Ok(pre_routing_refusal_response(
+                grpc_web_response_content_type,
+                request_uses_grpc_content_type,
                 StatusCode::BAD_REQUEST,
                 rejection.client_error_body(),
+                grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
             ));
         }
     };

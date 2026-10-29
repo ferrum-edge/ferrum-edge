@@ -269,9 +269,11 @@ Other Hyper parse failures the scanner cannot identify (for example a
 non-numeric `Content-Length` that Hyper rejects at parse time, a truncated
 head, or other httparse failures) stay Hyper's empty-bodied `400`. That gap is
 intentional: a documented narrower miss is preferred over inspecting every
-outbound HTTP/1 response on the hot path. For non-gRPC-flavored requests,
-duplicate `Host` and combined `Content-Length` + `Transfer-Encoding` still
-reach the handler and keep their existing JSON bodies.
+outbound HTTP/1 response on the hot path. Duplicate `Host` and combined
+`Content-Length` + `Transfer-Encoding` still reach the handler. Ordinary HTTP
+requests and WebSocket handshakes keep their existing JSON bodies; native gRPC
+and gRPC-Web receive the handler's framed `INVALID_ARGUMENT` refusal instead
+(see [Size Limits: Error Responses](size_limits.md#error-responses)).
 
 The envelope is armed only for the connection's first request head and before
 its first response byte. It is written straight to the socket from the read
