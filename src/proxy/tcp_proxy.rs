@@ -12404,7 +12404,7 @@ mod node_waypoint_stream_scope_tests {
 
         use ferrum_ebpf_common::OrigDst4;
 
-        use super::super::resolve_node_waypoint_stream_identity;
+        use super::resolve_node_waypoint_stream_identity;
         use crate::identity::SpiffeId;
         use crate::modes::mesh::node_waypoint::{
             NodeWaypointIdentityError, NodeWaypointIdentityResolver, parse_pod_uid,
