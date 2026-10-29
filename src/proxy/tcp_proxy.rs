@@ -12250,10 +12250,7 @@ mod node_waypoint_stream_scope_tests {
     //! accept-path helper that maps a connection to its source pod's
     //! per-pod authorization scope (parity with the HTTP/HBONE admit path).
 
-    use super::{
-        NodeWaypointIdentityWarnLimiter, resolve_node_waypoint_stream_identity,
-        resolve_node_waypoint_stream_scope,
-    };
+    use super::{NodeWaypointIdentityWarnLimiter, resolve_node_waypoint_stream_scope};
 
     /// Non-node-waypoint topologies (and non-mesh TCP proxies) pass no resolver,
     /// so the accept path stamps no per-pod scope — behavior is unchanged.
@@ -12407,6 +12404,7 @@ mod node_waypoint_stream_scope_tests {
 
         use ferrum_ebpf_common::OrigDst4;
 
+        use super::super::resolve_node_waypoint_stream_identity;
         use crate::identity::SpiffeId;
         use crate::modes::mesh::node_waypoint::{
             NodeWaypointIdentityError, NodeWaypointIdentityResolver, parse_pod_uid,
