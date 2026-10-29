@@ -108,8 +108,10 @@ fn parse_mesh_direction_metadata(value: &str) -> Option<MeshTrafficDirection> {
 /// entries; operator-supplied direct configurations can also set it
 /// explicitly via the `direction_emit` JSON object. Default preserves the
 /// pre-GAP-3F behaviour where every workload_metrics instance emits SERVER
-/// spans only.
+/// spans only. Closed: a misspelled `client` must not silently keep the
+/// server-only default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DirectionEmit {
     #[serde(default = "DirectionEmit::default_server")]
     pub(crate) server: bool,
@@ -1795,10 +1797,70 @@ fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
     }
 }
 
+/// Closed direct provider envelope. [`TracingProvider`] is the adjacently
+/// tagged mesh-slice type, whose serde derive ignores unknown members, so the
+/// direct plugin config closes the envelope and each `config` here.
+const TRACING_PROVIDER_ENVELOPE_KEYS: &[&str] = &["kind", "config"];
+const ZIPKIN_PROVIDER_CONFIG_KEYS: &[&str] = &["url"];
+const DATADOG_PROVIDER_CONFIG_KEYS: &[&str] = &["agent_url", "service"];
+const LIGHTSTEP_PROVIDER_CONFIG_KEYS: &[&str] =
+    &["collector_url", "access_token_env", "accessTokenEnv"];
+const OPENTELEMETRY_PROVIDER_CONFIG_KEYS: &[&str] = &["endpoint"];
+
+fn tracing_provider_config_keys(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "zipkin" => Some(ZIPKIN_PROVIDER_CONFIG_KEYS),
+        "datadog" => Some(DATADOG_PROVIDER_CONFIG_KEYS),
+        "lightstep" => Some(LIGHTSTEP_PROVIDER_CONFIG_KEYS),
+        "opentelemetry" => Some(OPENTELEMETRY_PROVIDER_CONFIG_KEYS),
+        // An unknown `kind` is refused by the typed decode below.
+        _ => None,
+    }
+}
+
+/// Reject unknown members of one provider envelope and its `config`. Shape
+/// errors (non-object envelope or config, unknown `kind`) are left to the
+/// typed decode, which reports them with the provider path.
+fn reject_unknown_tracing_provider_keys(provider: &Value, path: &str) -> Result<(), String> {
+    let Some(envelope) = provider.as_object() else {
+        return Ok(());
+    };
+    crate::util::unknown_keys::reject_unknown_keys(
+        envelope,
+        path,
+        TRACING_PROVIDER_ENVELOPE_KEYS,
+        "workload_metrics: ",
+    )?;
+    let Some(allowed) = envelope
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(tracing_provider_config_keys)
+    else {
+        return Ok(());
+    };
+    if let Some(provider_config) = envelope.get("config").and_then(Value::as_object) {
+        crate::util::unknown_keys::reject_unknown_keys(
+            provider_config,
+            &format!("{path}.config"),
+            allowed,
+            "workload_metrics: ",
+        )?;
+    }
+    Ok(())
+}
+
 fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, String> {
     if let Some(value) = config.get("tracing_providers") {
         if value.is_null() {
             return Ok(Vec::new());
+        }
+        if let Some(providers) = value.as_array() {
+            for (idx, provider) in providers.iter().enumerate() {
+                reject_unknown_tracing_provider_keys(
+                    provider,
+                    &format!("tracing_providers[{idx}]"),
+                )?;
+            }
         }
         return super::diagnostics::from_value::<Vec<TracingProvider>>(
             value.clone(),
@@ -1809,13 +1871,16 @@ fn parse_tracing_providers(config: &Value) -> Result<Vec<TracingProvider>, Strin
 
     match config.get("tracing_provider") {
         None | Some(Value::Null) => Ok(Vec::new()),
-        Some(value) => Ok(vec![
-            super::diagnostics::from_value::<TracingProvider>(
-                value.clone(),
-                super::diagnostics::Schema::Provider,
-            )
-            .map_err(|e| format!("workload_metrics: invalid `tracing_provider` config: {e}"))?,
-        ]),
+        Some(value) => {
+            reject_unknown_tracing_provider_keys(value, "tracing_provider")?;
+            Ok(vec![
+                super::diagnostics::from_value::<TracingProvider>(
+                    value.clone(),
+                    super::diagnostics::Schema::Provider,
+                )
+                .map_err(|e| format!("workload_metrics: invalid `tracing_provider` config: {e}"))?,
+            ])
+        }
     }
 }
 
@@ -1989,6 +2054,29 @@ fn effective_metric_tag_cel_stamp_needs<MS: std::hash::BuildHasher>(
     effective
 }
 
+/// Closed `metrics` object and `metrics.tag_overrides[]` entry key sets.
+const METRICS_CONFIG_KEYS: &[&str] = &["disabled_metrics", "tag_overrides"];
+const METRIC_TAG_OVERRIDE_KEYS: &[&str] = &["metric", "name", "operation"];
+
+/// Closed `metrics.tag_overrides[].operation` key sets, per operation `type`,
+/// so a field another operation reads (`value` on a `rename`) is refused
+/// rather than silently ignored.
+const REMOVE_TAG_OPERATION_KEYS: &[&str] = &["type"];
+const RENAME_TAG_OPERATION_KEYS: &[&str] = &["type", "new_name"];
+const SET_TAG_OPERATION_KEYS: &[&str] = &["type", "value"];
+const SET_EXPR_TAG_OPERATION_KEYS: &[&str] = &["type", "cel", "expression"];
+
+fn tag_operation_keys(operation_type: &str) -> Option<&'static [&'static str]> {
+    match operation_type {
+        "remove" => Some(REMOVE_TAG_OPERATION_KEYS),
+        "rename" => Some(RENAME_TAG_OPERATION_KEYS),
+        "set" => Some(SET_TAG_OPERATION_KEYS),
+        "set_expr" => Some(SET_EXPR_TAG_OPERATION_KEYS),
+        // An unknown or missing `type` is refused by `parse_tag_operation`.
+        _ => None,
+    }
+}
+
 fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, String> {
     let Some(metrics) = value else {
         return Ok(ParsedMetricConfig {
@@ -1999,6 +2087,12 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
     let object = metrics
         .as_object()
         .ok_or_else(|| "workload_metrics: `metrics` must be an object".to_string())?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        "metrics",
+        METRICS_CONFIG_KEYS,
+        "workload_metrics: ",
+    )?;
     let mut disabled = BTreeSet::new();
     if let Some(value) = object.get("disabled_metrics") {
         let entries = value.as_array().ok_or_else(|| {
@@ -2039,6 +2133,14 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
             ));
         }
         for (idx, entry) in overrides.iter().enumerate() {
+            if let Some(entry_object) = entry.as_object() {
+                crate::util::unknown_keys::reject_unknown_keys(
+                    entry_object,
+                    &format!("metrics.tag_overrides[{idx}]"),
+                    METRIC_TAG_OVERRIDE_KEYS,
+                    "workload_metrics: ",
+                )?;
+            }
             let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| {
                 format!("workload_metrics: `metrics.tag_overrides[{idx}].name` is required")
             })?;
@@ -2050,6 +2152,18 @@ fn parse_metric_config(value: Option<&Value>) -> Result<ParsedMetricConfig, Stri
                         "workload_metrics: `metrics.tag_overrides[{idx}].operation` is required for metric tag {name:?}"
                     )
                 })?;
+            if let Some(allowed) = operation
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(tag_operation_keys)
+            {
+                crate::util::unknown_keys::reject_unknown_keys(
+                    operation,
+                    &format!("metrics.tag_overrides[{idx}].operation"),
+                    allowed,
+                    "workload_metrics: ",
+                )?;
+            }
             let operation = parse_tag_operation(name, operation)
                 .map_err(|error| format!("`metrics.tag_overrides[{idx}].operation`: {error}"))?;
             let selector = match entry.get("metric") {

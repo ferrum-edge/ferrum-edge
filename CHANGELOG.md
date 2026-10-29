@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Plugin configs are closed at every depth, and validation is pinned
+  side-effect-free** (issue #6616). A new framework sweep
+  (`tests/unit/plugins/plugin_config_closure_tests.rs`) validates example
+  configs for every built-in and compiled custom plugin. It injects an unknown
+  key into each nested object and requires rejection. It also fails if
+  validating a plugin needs a Tokio runtime or spawns a task. Nested objects
+  that used to ignore unknown keys now reject them:
+  - `workload_metrics`: `direction_emit`, `tracing_provider(s)` envelopes and
+    their `config`, `metrics`, each `tag_overrides` entry, and its `operation`.
+  - `mesh_authz`: policy `scope` (including `kind: mesh_wide`), target-ref
+    attachments, the `custom` action, the embedded `mesh_slice` root,
+    `ext_authz_providers` with their header and body objects, and
+    `node_waypoint_route_upstreams` entries and targets.
+
+  `mcp_gateway` no longer starts its session reaper in the constructor: the
+  reaper now starts in `commit_background_tasks`, so admin and CP validation
+  no longer spawn and abort two tasks per aggregate config.
+- **Breaking for custom plugins:** every custom plugin must export
+  `config_contract() -> crate::plugins::PluginConfigContract` with example
+  configs plus any free-form maps or embedded documents. The sweep runs over
+  these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
+
 ## [0.9.19] - 2026-10-27
 
 This replacement release carries forward the changes prepared for 0.9.18.

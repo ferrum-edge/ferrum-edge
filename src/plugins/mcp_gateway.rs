@@ -1644,9 +1644,12 @@ pub struct McpGateway {
     /// authoritative refresh of every configured server can return.
     max_tool_schema_baselines: usize,
     /// Background expiry sweep for this instance's sessions, aborted when the
-    /// instance is dropped (reload / update / delete). `None` outside a Tokio
-    /// runtime and for transparent or disabled instances.
-    _session_reaper: Option<McpSessionReaperGuard>,
+    /// instance is dropped (reload / update / delete). Started by
+    /// `commit_background_tasks`, never by the constructor: config validation
+    /// constructs and drops instances, so construction must not spawn (issue
+    /// #6616). Stays empty outside a Tokio runtime and for transparent or
+    /// disabled instances.
+    session_reaper: OnceLock<McpSessionReaperGuard>,
     /// Catalog parts of each OpenAPI bridge server's tools, by server id,
     /// built once at load and shared by every session's catalog.
     bridge_tools: HashMap<String, Arc<[ToolDefinitionParts]>>,
@@ -1926,22 +1929,6 @@ impl McpGateway {
             Arc::new(DashMap::with_shard_amount(session_shard_amount));
         let session_catalogs_by_hash: Arc<DashMap<String, Arc<RwLock<McpCatalog>>>> =
             Arc::new(DashMap::with_shard_amount(session_shard_amount));
-        // Only an enabled aggregate instance mints sessions, so only it needs
-        // the at-rest expiry sweep.
-        let session_reaper = (enabled && mode == McpGatewayMode::AggregateRouter)
-            .then(|| {
-                spawn_session_reaper(
-                    &session_store,
-                    &session_catalogs_by_hash,
-                    &sse_broker,
-                    sessions.session_ttl,
-                    servers.clone(),
-                    sessions.upstream_session_header.clone(),
-                    http_client.clone(),
-                )
-            })
-            .flatten();
-
         Ok(Self {
             instance_id: MCP_GATEWAY_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             enabled,
@@ -1964,7 +1951,7 @@ impl McpGateway {
             http_client,
             tool_schema_baselines: DashMap::with_shard_amount(session_shard_amount),
             max_tool_schema_baselines,
-            _session_reaper: session_reaper,
+            session_reaper: OnceLock::new(),
             bridge_tools,
             real_ip_header,
         })
@@ -7692,6 +7679,30 @@ impl Plugin for McpGateway {
         "mcp_gateway"
     }
 
+    /// Start the at-rest session expiry sweep once the generation that owns
+    /// this instance is installed. Only an enabled aggregate instance mints
+    /// sessions, so only it needs the sweep. Idempotent: a concurrent second
+    /// call drops its own guard, which aborts the duplicate tasks.
+    fn commit_background_tasks(&self) {
+        if !self.enabled
+            || self.mode != McpGatewayMode::AggregateRouter
+            || self.session_reaper.get().is_some()
+        {
+            return;
+        }
+        if let Some(reaper) = spawn_session_reaper(
+            &self.session_store,
+            &self.session_catalogs_by_hash,
+            &self.sse_broker,
+            self.sessions.session_ttl,
+            self.servers.clone(),
+            self.sessions.upstream_session_header.clone(),
+            self.http_client.clone(),
+        ) {
+            let _ = self.session_reaper.set(reaper);
+        }
+    }
+
     /// MCP session IDs are bearer-like: report the configured session header
     /// names so they are redacted and withheld from secondary egress.
     fn request_headers_to_redact(&self) -> &[String] {
@@ -8983,8 +8994,7 @@ impl Drop for McpSessionReaperGuard {
 /// finishes, and a full queue drops new records (teardown is best-effort). A
 /// slow upstream therefore delays only its own cleanup, never the next expiry
 /// sweep. These calls are not request-scoped
-/// and carry no hop count. `None` when no Tokio runtime is current (for
-/// example offline validation).
+/// and carry no hop count. `None` when no Tokio runtime is current.
 fn spawn_session_reaper(
     session_store: &Arc<DashMap<String, DownstreamMcpSession>>,
     session_catalogs_by_hash: &Arc<DashMap<String, Arc<RwLock<McpCatalog>>>>,

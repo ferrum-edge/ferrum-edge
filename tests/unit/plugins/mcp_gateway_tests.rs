@@ -18145,6 +18145,8 @@ async fn expired_sessions_are_reaped_at_rest_and_upstream_sessions_deleted() {
     let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
     config["sessions"] = json!({ "session_ttl_seconds": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    // The reaper starts with the installed generation, never at construction.
+    plugin.commit_background_tasks();
     let session_id = initialize(&plugin).await;
     let _ = aggregate_tool_names(&plugin, &session_id, 1030).await;
 
@@ -18536,6 +18538,8 @@ async fn slow_upstream_deletes_do_not_stall_later_expiry_waves() {
     config["servers"]["github"]["expose_resources"] = json!(false);
     config["servers"]["github"]["expose_prompts"] = json!(false);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    // The reaper starts with the installed generation, never at construction.
+    plugin.commit_background_tasks();
 
     let delete_arrivals = || async {
         server
@@ -18603,6 +18607,8 @@ async fn late_upstream_initialize_after_session_expiry_is_deleted() {
     config["servers"]["github"]["expose_resources"] = json!(false);
     config["servers"]["github"]["expose_prompts"] = json!(false);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    // The reaper starts with the installed generation, never at construction.
+    plugin.commit_background_tasks();
     let session_id = initialize(&plugin).await;
 
     // The first tools/list waits on the slow upstream initialize; the reaper

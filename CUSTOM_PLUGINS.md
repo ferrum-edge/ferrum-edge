@@ -139,7 +139,9 @@ and register but never run, would still apply any `plugin_migrations()`, and
 would appear twice in `available_plugins()`.
 
 Each plugin file must export a `create_plugin` factory function that returns
-`Result` and a `failure_policy` metadata function:
+`Result`, a `failure_policy` metadata function, and a `config_contract`
+function that lists example configs (see
+[Config contract](#config-contract)):
 
 ```rust
 // custom_plugins/my_header_injector.rs
@@ -247,6 +249,14 @@ pub fn create_plugin(
 pub fn failure_policy() -> PluginFailurePolicy {
     PluginFailurePolicy::KeepLastKnownGood
 }
+
+/// Required config contract — the plugin test sweep checks these examples.
+pub fn config_contract() -> crate::plugins::PluginConfigContract {
+    crate::plugins::PluginConfigContract::closed(vec![
+        serde_json::json!({}),
+        serde_json::json!({ "header_name": "X-Powered-By", "header_value": "my-company" }),
+    ])
+}
 ```
 
 ### Config Validation Rules
@@ -255,7 +265,7 @@ Your `new()` constructor must validate the plugin config and return `Err(String)
 
 - **Required fields are missing** — if the plugin cannot function without a field, return an error (don't silently default to a no-op).
 - **Values are invalid** — reject malformed regexes, unknown enum variants, out-of-range numbers, unparseable URLs.
-- **The config shape is unexpected** — reject non-object roots, unknown keys, and present values of the wrong JSON type. Apply an optional field's default only when that field is omitted.
+- **The config shape is unexpected** — reject non-object roots, unknown keys, and present values of the wrong JSON type. Apply an optional field's default only when that field is omitted. This applies at **every depth**: each nested object the plugin reads (a rule, a provider, a `tls` block, an array element) rejects keys it does not recognize, typically with `crate::util::unknown_keys::reject_unknown_keys` against a `*_KEYS` allowlist. A misspelled nested key that is silently ignored builds a plugin that enforces something other than what the operator wrote.
 - **A value crosses a typed protocol boundary** — parse header names/values, URLs, CIDRs, and similar values in the constructor and apply an explicit size bound before retaining them.
 - **The plugin would have no effect** — e.g., a rate limiter with no rate windows, a size limiter with `max_bytes=0`, a transformer with no rules.
 
@@ -278,6 +288,34 @@ generation is built, and the workers stay dormant until
 [Transaction log hook timing](#transaction-log-hook-timing)). Built-in plugins
 whose construction needs node-local files, credentials, or workers use a
 separate shape-only validator for the same reason.
+
+### Config contract
+
+Both rules above are invisible from outside the constructor, so every custom
+plugin exports `config_contract()` returning a
+`crate::plugins::PluginConfigContract`. A plugin without it does not compile.
+The repository's plugin test sweep
+(`tests/unit/plugins/plugin_config_closure_tests.rs`) runs over built-in and
+custom plugins alike:
+
+- every example must validate on its own;
+- validating an example must neither need a Tokio runtime nor spawn onto one;
+- an unknown key injected into any nested object of an example must be
+  rejected.
+
+List examples that together reach every nested object your plugin reads (one
+per variant of a tagged union). Two declarations exempt parts of a config,
+using dotted paths where `[]` selects array elements and `*` matches any key:
+
+- `with_free_form_objects(&["headers"])` for objects whose keys are
+  operator-chosen names, such as a header map. The sweep still walks their
+  values.
+- `with_opaque_documents(&["json_schema"])` for embedded foreign documents,
+  such as a JSON Schema or a sample payload. The sweep skips the subtree.
+
+Each declaration must match a node in the examples. Run
+`cargo test --test unit_plugins_b_tests plugin_config_closure` after adding or
+changing a custom plugin.
 
 The `failure_policy()` return value controls cache publication when construction
 or validation fails:
@@ -1753,8 +1791,10 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] Plugin `.rs` file created in `custom_plugins/`
 - [ ] `create_plugin()` factory function exported with signature `(config: &Value, http_client: PluginHttpClient) -> Result<Option<Arc<dyn Plugin>>, String>`
 - [ ] `failure_policy()` metadata function exported with the desired `PluginFailurePolicy`
+- [ ] `config_contract()` exported with examples reaching every nested object, and the `plugin_config_closure` sweep passes
 - [ ] `fn name()` returns the file name (without `.rs`)
-- [ ] Constructor rejects non-object roots, unknown keys, present wrong types, and invalid/oversized protocol values
+- [ ] Constructor rejects non-object roots, unknown keys at every depth, present wrong types, and invalid/oversized protocol values
+- [ ] Constructor has no side effects: no tasks, threads, dials, file writes, or process-global registration (stage them in `start_background_tasks()`)
 - [ ] `on_request_received()` logic does not assume it will observe unmatched 404 or matched 405 responses
 - [ ] Priority set appropriately for the execution phase
 - [ ] `supported_protocols()` returns the correct protocol set
