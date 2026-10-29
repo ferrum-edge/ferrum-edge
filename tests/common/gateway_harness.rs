@@ -2621,6 +2621,10 @@ mod port_allocation_tests {
 mod ownership_proof_tests {
     use super::*;
     use std::process::{Command, Stdio};
+    #[cfg(unix)]
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Clone)]
@@ -2631,9 +2635,47 @@ mod ownership_proof_tests {
         /// Full `/health` detail (CIDR grant) and a non-401 non-success
         /// `GET /proxies` — must not count as JWT ownership.
         CidrHealthProxiesNonSuccess,
-        /// Full `/health` detail after SIGKILL of `pid`, then 200 on `/proxies`.
+        /// The first `/health` request SIGKILLs `pid` and waits until it has
+        /// exited before answering with full detail; then 200 on `/proxies`.
         #[cfg(unix)]
-        KillChildThenHealth { pid: u32 },
+        KillChildThenHealth { pid: u32, killed: Arc<AtomicBool> },
+    }
+
+    /// SIGKILL `pid` and wait until it has exited, without reaping it.
+    ///
+    /// `kill` only queues the signal: the child becomes waitable once the
+    /// kernel schedules its exit, which on a loaded runner can lag behind the
+    /// fake `/health` response and the harness's post-health `try_wait`.
+    /// `waitid(WNOWAIT)` blocks until that exit but leaves the status for the
+    /// harness's own `Child::try_wait` to collect, so the response is sent
+    /// strictly after the child is dead.
+    #[cfg(unix)]
+    async fn kill_and_await_exit(pid: u32) {
+        tokio::task::spawn_blocking(move || {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if rc == 0 {
+                    return;
+                }
+                let err = std::io::Error::last_os_error();
+                assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted,
+                    "waitid on killed child {pid} failed: {err}"
+                );
+            }
+        })
+        .await
+        .expect("kill-and-wait task");
     }
 
     async fn spawn_fake_admin(behavior: FakeAdminBehavior) -> (u16, tokio::task::JoinHandle<()>) {
@@ -2665,9 +2707,11 @@ mod ownership_proof_tests {
                     let request = String::from_utf8_lossy(&request).into_owned();
                     let is_proxies = request.lines().next().unwrap_or("").contains(" /proxies");
                     #[cfg(unix)]
-                    if !is_proxies && let FakeAdminBehavior::KillChildThenHealth { pid } = &behavior
+                    if !is_proxies
+                        && let FakeAdminBehavior::KillChildThenHealth { pid, killed } = &behavior
+                        && !killed.swap(true, Ordering::SeqCst)
                     {
-                        let _ = unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+                        kill_and_await_exit(*pid).await;
                     }
                     let body = if is_proxies {
                         match &behavior {
@@ -2830,8 +2874,11 @@ mod ownership_proof_tests {
             .spawn()
             .expect("spawn live child");
         let pid = child.id();
-        let (port, listener) =
-            spawn_fake_admin(FakeAdminBehavior::KillChildThenHealth { pid }).await;
+        let (port, listener) = spawn_fake_admin(FakeAdminBehavior::KillChildThenHealth {
+            pid,
+            killed: Arc::new(AtomicBool::new(false)),
+        })
+        .await;
         let identity = SpawnedGatewayIdentity::mint("health-boundary");
 
         let err =
@@ -2840,7 +2887,8 @@ mod ownership_proof_tests {
                 .expect_err("child death at health success must fail ownership");
         let err = err.to_string();
         assert!(
-            err.contains("exited"),
+            err.contains("exited")
+                && err.contains("(last observation: authenticated /health ready)"),
             "post-health child check must reject, got: {err}"
         );
         assert!(
