@@ -2078,28 +2078,19 @@ mod node_waypoint_cross_namespace_source_resolution {
         );
 
         seed(&resolver, &withdrawn);
-        let cached = resolver.resolve_cookie(100).err().expect("withdrawn");
+        let cached = resolver.resolve_cookie(100).expect_err("withdrawn");
         assert!(
             cached.carries_capture_evidence(),
             "a captured-but-unvouched stream must be refused at accept, got {cached:?}"
         );
-        stamp(
-            &resolver,
-            101,
-            LEDGER_UID,
-            &spiffe_for("payments", "ledger"),
-        );
         let fresh = NodeWaypointIdentityResolver::new(0);
         seed(&fresh, &withdrawn);
         stamp(&fresh, 101, LEDGER_UID, &spiffe_for("payments", "ledger"));
-        let lazy = fresh
-            .resolve_cookie(101)
-            .err()
-            .expect("never enrolled here");
+        let lazy = fresh.resolve_cookie(101).expect_err("never enrolled here");
         assert!(lazy.carries_capture_evidence(), "got {lazy:?}");
 
         // No capture record at all: keep the documented mesh-wide fallback.
-        let uncaptured = resolver.resolve_cookie(999).err().expect("unknown cookie");
+        let uncaptured = resolver.resolve_cookie(999).expect_err("unknown cookie");
         assert_eq!(uncaptured, NodeWaypointIdentityError::UnknownCookie(999));
         assert!(!uncaptured.carries_capture_evidence());
     }
