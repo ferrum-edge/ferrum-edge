@@ -73,7 +73,8 @@ pub struct MeshSliceRequest {
     ///
     /// The inventory NEVER widens the ordinary routing views (`workloads`,
     /// `services`, `mesh_policies`, `peer_authentications`); it rides its own
-    /// slice fields consumed solely by the capture resolver.
+    /// slice fields consumed by the capture resolver and, for the destinations,
+    /// the NodeWaypoint source identity resolver (exact pod-UID binding only).
     pub node_waypoint_capture_scoping: bool,
 }
 
@@ -365,8 +366,11 @@ pub struct MeshSlice {
     /// and bearer-namespace constraints applied before it crosses the boundary.
     ///
     /// It is a CAPTURE-ONLY view: it never widens `workloads` / `services` /
-    /// routing visibility, and is read solely by
-    /// `crate::proxy::resolve_node_waypoint_capture_destination`. Empty means
+    /// routing visibility. It is read by
+    /// `crate::proxy::resolve_node_waypoint_capture_destination` and seeds the
+    /// NodeWaypoint source identity resolver
+    /// (`NodeWaypointIdentityResolver::build_policy_scope_snapshot_from_slice`,
+    /// exact pod-UID binding only). Empty means
     /// the capture path resolves NOTHING and fails closed — never a PERMISSIVE
     /// default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

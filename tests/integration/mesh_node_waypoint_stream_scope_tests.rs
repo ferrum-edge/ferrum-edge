@@ -269,9 +269,9 @@ fn unresolved_cookie_yields_no_scope() {
 /// identity outlives its workload only when the control plane removed it;
 /// `resolve_record` re-validates the cached identity against the live slice
 /// index (`workload_identities_by_hash`) and fails closed rather than resolving
-/// to a now-orphaned identity. The stream accept loop then stamps no per-pod
-/// scope (mesh-wide-only fallback, see `resolve_node_waypoint_stream_scope`);
-/// the HBONE accept loop drops the connection. (Pre-fix this surfaced as
+/// to a now-orphaned identity. Because a capture record exists, both the TCP
+/// stream accept loop (`resolve_node_waypoint_stream_identity`, issue #6800)
+/// and the HBONE accept loop refuse the connection. (Pre-fix this surfaced as
 /// "resolves but no scope", which slice-coupled enrollment made unreachable: a
 /// vouched workload always contributes both its hash and its scope.)
 #[test]
@@ -1356,5 +1356,742 @@ mod node_waypoint_capture_inventory {
         );
         assert_eq!(policy_names(&slice.mesh_policies), vec!["root-deny"]);
         assert!(slice.node_waypoint_capture_mesh_policies_resolved);
+    }
+}
+
+// ── Issue #6800: cross-namespace NodeWaypoint OUTBOUND source resolution ───
+//
+// A NodeWaypoint subscribed in `ferrum` captures outbound traffic for every pod
+// enrolled on it, including pods in other namespaces. The ordinary `workloads`
+// view is narrowed to `ferrum`, so the source resolver must be seeded from the
+// slice's dedicated capture inventory as well, through the same
+// `build_policy_scope_snapshot_from_slice` call mesh startup and reload staging
+// use. These cases build a real cross-namespace slice, seed the resolver from
+// it, and drive accept-level `resolve_cookie` with matching synthetic eBPF
+// records.
+mod node_waypoint_cross_namespace_source_resolution {
+    use std::collections::HashMap;
+
+    use ferrum_ebpf_common::OrigDst4;
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::identity::SpiffeId;
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{
+        AppProtocol, MeshConfig, MeshPolicy, MeshRule, NodeWaypointCaptureInventoryState,
+        NodeWaypointEndpoint, PolicyAction, PolicyScope, Workload, WorkloadPort, WorkloadSelector,
+    };
+    use ferrum_edge::modes::mesh::node_waypoint::{
+        NodeWaypointIdentityError, NodeWaypointIdentityResolver, parse_pod_uid,
+        workload_spiffe_hash,
+    };
+    use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+
+    const THIS_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+    const OTHER_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b";
+    const LEDGER_UID: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+    const REPORTS_UID: &str = "aaaaaaaa-0000-0000-0000-000000000002";
+    const LOCAL_UID: &str = "aaaaaaaa-0000-0000-0000-000000000003";
+    const UNENROLLED_UID: &str = "aaaaaaaa-0000-0000-0000-000000000004";
+
+    fn workload(
+        namespace: &str,
+        name: &str,
+        pod_uid: &str,
+        waypoint: Option<&str>,
+        address: &str,
+    ) -> Workload {
+        Workload {
+            spiffe_id: SpiffeId::new(format!("spiffe://cluster.local/ns/{namespace}/sa/{name}"))
+                .expect("workload SPIFFE ID"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), name.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+            service_name: name.to_string(),
+            service_namespace: None,
+            addresses: vec![address.to_string()],
+            ports: vec![WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: None,
+            }],
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: namespace.to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(name.to_string()),
+            pod_uid: Some(pod_uid.to_string()),
+            node_waypoint: waypoint.map(|waypoint| NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(waypoint).expect("node waypoint SPIFFE ID"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        }
+    }
+
+    /// `payments/ledger` is enrolled on THIS waypoint (cross-namespace source),
+    /// `payments/reports` on ANOTHER node's waypoint, `ferrum/local` on this
+    /// waypoint in the subscription namespace, and `payments/unenrolled` on no
+    /// waypoint at all.
+    fn document(ledger_waypoint: &str) -> GatewayConfig {
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    workload(
+                        "payments",
+                        "ledger",
+                        LEDGER_UID,
+                        Some(ledger_waypoint),
+                        "10.244.1.7",
+                    ),
+                    workload(
+                        "payments",
+                        "reports",
+                        REPORTS_UID,
+                        Some(OTHER_WAYPOINT),
+                        "10.244.1.8",
+                    ),
+                    workload(
+                        "ferrum",
+                        "local",
+                        LOCAL_UID,
+                        Some(THIS_WAYPOINT),
+                        "10.244.1.9",
+                    ),
+                    workload(
+                        "payments",
+                        "unenrolled",
+                        UNENROLLED_UID,
+                        None,
+                        "10.244.1.10",
+                    ),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        }
+    }
+
+    fn node_waypoint_request() -> MeshSliceRequest {
+        MeshSliceRequest {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: Some(THIS_WAYPOINT.to_string()),
+            node_waypoint_capture_scoping: true,
+            ..MeshSliceRequest::default()
+        }
+    }
+
+    fn spiffe_for(namespace: &str, name: &str) -> SpiffeId {
+        SpiffeId::new(format!("spiffe://cluster.local/ns/{namespace}/sa/{name}"))
+            .expect("workload SPIFFE ID")
+    }
+
+    /// Stamp a synthetic eBPF capture record for `pod_uid` carrying the
+    /// workload SPIFFE hash the kernel would stamp for `spiffe_id`.
+    fn stamp(
+        resolver: &NodeWaypointIdentityResolver,
+        cookie: u64,
+        pod_uid: &str,
+        spiffe_id: &SpiffeId,
+    ) {
+        resolver.record_orig_dst4(
+            cookie,
+            OrigDst4 {
+                addr: 0x0a00_0001,
+                port: 8080,
+                pod_uid: parse_pod_uid(pod_uid).expect("pod UID"),
+                workload_spiffe_hash: workload_spiffe_hash(spiffe_id),
+            },
+        );
+    }
+
+    fn seed(resolver: &NodeWaypointIdentityResolver, slice: &MeshSlice) {
+        let snapshot = resolver.build_policy_scope_snapshot_from_slice(slice);
+        resolver.install_policy_scope_snapshot(snapshot);
+    }
+
+    fn assert_unknown_pod(resolver: &NodeWaypointIdentityResolver, cookie: u64, pod_uid: &str) {
+        let pod_uid = parse_pod_uid(pod_uid).expect("pod UID");
+        assert_eq!(
+            resolver.resolve_cookie(cookie).err(),
+            Some(NodeWaypointIdentityError::UnknownPod(pod_uid))
+        );
+    }
+
+    #[test]
+    fn startup_seed_resolves_an_enrolled_cross_namespace_source_with_its_own_scope() {
+        let slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        // Routing visibility stays namespace-narrowed: the fix must not widen it.
+        assert!(
+            slice
+                .workloads
+                .iter()
+                .all(|workload| workload.namespace == "ferrum"),
+            "the source inventory must not widen the routing workload view"
+        );
+
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+
+        let ledger = spiffe_for("payments", "ledger");
+        stamp(&resolver, 1, LEDGER_UID, &ledger);
+        let (identity, scope) = resolver
+            .resolve_cookie(1)
+            .expect("an enrolled cross-namespace source must resolve");
+        assert_eq!(identity.pod_uid, parse_pod_uid(LEDGER_UID).unwrap());
+        assert_eq!(identity.spiffe_id, ledger);
+        let scope = scope.expect("the source resolves with its own per-pod scope");
+        assert_eq!(scope.spiffe_id, ledger);
+        assert_eq!(scope.namespace, "payments");
+        assert_eq!(scope.labels.get("app").map(String::as_str), Some("ledger"));
+
+        // The subscription-namespace enrolled pod (present in BOTH views)
+        // still resolves: the identical duplicate is not treated as a conflict.
+        let local = spiffe_for("ferrum", "local");
+        stamp(&resolver, 2, LOCAL_UID, &local);
+        let (identity, scope) = resolver.resolve_cookie(2).expect("local source resolves");
+        assert_eq!(identity.spiffe_id, local);
+        assert_eq!(scope.expect("local scope").namespace, "ferrum");
+    }
+
+    #[test]
+    fn foreign_sources_not_enrolled_on_this_waypoint_stay_unknown() {
+        let slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+
+        // Enrolled on ANOTHER node's waypoint.
+        stamp(
+            &resolver,
+            10,
+            REPORTS_UID,
+            &spiffe_for("payments", "reports"),
+        );
+        assert_unknown_pod(&resolver, 10, REPORTS_UID);
+        // Enrolled on no waypoint at all.
+        stamp(
+            &resolver,
+            11,
+            UNENROLLED_UID,
+            &spiffe_for("payments", "unenrolled"),
+        );
+        assert_unknown_pod(&resolver, 11, UNENROLLED_UID);
+        // A pod borrowing an enrolled pod's UID with another identity's hash
+        // never resolves as that pod.
+        stamp(
+            &resolver,
+            12,
+            LEDGER_UID,
+            &spiffe_for("payments", "reports"),
+        );
+        assert_unknown_pod(&resolver, 12, LEDGER_UID);
+    }
+
+    /// A CP-resolved inventory is authoritative: a foreign workload the CP
+    /// excluded (CP scope / bearer namespace bounds) is absent from it, so the
+    /// resolver never learns that identity even if the document still names it.
+    #[test]
+    fn cp_resolved_inventory_bounds_the_source_set() {
+        let mut config = document(THIS_WAYPOINT);
+        let mesh = config.mesh.as_mut().expect("mesh");
+        mesh.node_waypoint_capture_inventory_state = NodeWaypointCaptureInventoryState::Resolved;
+        // The CP authorized `ferrum` only: `payments/ledger` was excluded.
+        mesh.node_waypoint_capture_destinations = mesh
+            .workloads
+            .iter()
+            .filter(|workload| workload.namespace == "ferrum")
+            .cloned()
+            .collect();
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+
+        stamp(&resolver, 20, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        assert_unknown_pod(&resolver, 20, LEDGER_UID);
+        stamp(&resolver, 21, LOCAL_UID, &spiffe_for("ferrum", "local"));
+        assert!(resolver.resolve_cookie(21).is_ok());
+    }
+
+    /// Reload staging uses the same builder: withdrawing the enrollment (the
+    /// pod moves to another node's waypoint) fails the CACHED identity closed,
+    /// and re-enrollment re-validates it.
+    #[test]
+    fn reload_withdrawal_and_reenrollment_follow_the_capture_inventory() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let ledger = spiffe_for("payments", "ledger");
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request()),
+        );
+        stamp(&resolver, 30, LEDGER_UID, &ledger);
+        assert!(resolver.resolve_cookie(30).is_ok(), "enrolled at startup");
+
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(OTHER_WAYPOINT), node_waypoint_request()),
+        );
+        assert_unknown_pod(&resolver, 30, LEDGER_UID);
+
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request()),
+        );
+        let (identity, scope) = resolver
+            .resolve_cookie(30)
+            .expect("re-enrollment re-validates the cached identity");
+        assert_eq!(identity.spiffe_id, ledger);
+        assert_eq!(scope.expect("scope").namespace, "payments");
+    }
+
+    /// Two records for the same pod UID that disagree on its scope have no
+    /// trustworthy answer: the UID never resolves — not through the cookie
+    /// path (cached or lazy), not through the pod-UID index — instead of
+    /// keeping a hash-gated identity with no scope (where capture-only policy
+    /// is outside the source missing-scope census).
+    #[test]
+    fn conflicting_records_for_one_pod_uid_fail_closed() {
+        let mut slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        let mut relabeled = slice
+            .node_waypoint_capture_destinations
+            .iter()
+            .find(|workload| workload.service_name == "local")
+            .cloned()
+            .expect("local destination");
+        relabeled
+            .selector
+            .labels
+            .insert("app".to_string(), "impostor".to_string());
+        slice.node_waypoint_capture_destinations.push(relabeled);
+
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+        let local_uid = parse_pod_uid(LOCAL_UID).unwrap();
+        assert!(
+            resolver.resolve_expected_pod_identity(local_uid).is_err(),
+            "a conflicted pod UID must not resolve through the pod-UID index"
+        );
+        stamp(&resolver, 40, LOCAL_UID, &spiffe_for("ferrum", "local"));
+        assert_unknown_pod(&resolver, 40, LOCAL_UID);
+
+        // The unrelated cross-namespace source is unaffected.
+        stamp(&resolver, 41, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        assert!(resolver.resolve_cookie(41).expect("ledger").1.is_some());
+    }
+
+    /// A conflict that appears on RELOAD also revokes an identity cached at
+    /// startup.
+    #[test]
+    fn a_conflict_introduced_on_reload_revokes_the_cached_identity() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        seed(&resolver, &slice);
+        stamp(&resolver, 42, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let (identity, _) = resolver.resolve_cookie(42).expect("enrolled");
+
+        let mut conflicted = slice.clone();
+        let mut relabeled = conflicted
+            .node_waypoint_capture_destinations
+            .iter()
+            .find(|workload| workload.service_name == "ledger")
+            .cloned()
+            .expect("ledger destination");
+        relabeled
+            .selector
+            .labels
+            .insert("tier".to_string(), "other".to_string());
+        conflicted
+            .node_waypoint_capture_destinations
+            .push(relabeled);
+        seed(&resolver, &conflicted);
+
+        assert_unknown_pod(&resolver, 42, LEDGER_UID);
+        assert!(
+            resolver
+                .current_policy_scope_for_identity(&identity)
+                .is_err()
+        );
+    }
+
+    /// Two enrolled `payments` pods share one service account (one SPIFFE,
+    /// one hash). Withdrawing ONE must revoke exactly that pod: capture
+    /// sources are vouched by exact pod UID, never by the shared hash.
+    #[test]
+    fn withdrawing_one_of_two_same_service_account_pods_revokes_only_that_pod() {
+        const SIBLING_UID: &str = "aaaaaaaa-0000-0000-0000-000000000005";
+        let with_sibling = |sibling_waypoint: &str| {
+            let mut config = document(THIS_WAYPOINT);
+            let mut sibling = workload(
+                "payments",
+                "ledger",
+                SIBLING_UID,
+                Some(sibling_waypoint),
+                "10.244.1.11",
+            );
+            sibling
+                .selector
+                .labels
+                .insert("replica".to_string(), "b".to_string());
+            config.mesh.as_mut().expect("mesh").workloads.push(sibling);
+            MeshSlice::from_gateway_config(&config, node_waypoint_request())
+        };
+        let ledger = spiffe_for("payments", "ledger");
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &with_sibling(THIS_WAYPOINT));
+        stamp(&resolver, 50, LEDGER_UID, &ledger);
+        stamp(&resolver, 51, SIBLING_UID, &ledger);
+        let (sibling_identity, sibling_scope) = resolver.resolve_cookie(51).expect("sibling");
+        assert_eq!(
+            sibling_scope
+                .expect("sibling scope")
+                .labels
+                .get("replica")
+                .map(String::as_str),
+            Some("b"),
+            "same-SPIFFE pods are scoped by their own labels"
+        );
+        assert!(resolver.resolve_cookie(50).is_ok());
+
+        // The sibling moves to another node's waypoint.
+        seed(&resolver, &with_sibling(OTHER_WAYPOINT));
+        // Cached identity for the withdrawn pod: refused.
+        assert_unknown_pod(&resolver, 51, SIBLING_UID);
+        assert!(
+            resolver
+                .current_policy_scope_for_identity(&sibling_identity)
+                .is_err(),
+            "per-request liveness must refuse the withdrawn pod on an existing connection"
+        );
+        // Lazy enrollment for the withdrawn pod on a resolver that never cached
+        // it: refused too (the shared hash is not hash-joinable).
+        let fresh = NodeWaypointIdentityResolver::new(0);
+        seed(&fresh, &with_sibling(OTHER_WAYPOINT));
+        stamp(&fresh, 52, SIBLING_UID, &ledger);
+        assert_unknown_pod(&fresh, 52, SIBLING_UID);
+        stamp(&fresh, 53, LEDGER_UID, &ledger);
+        assert!(fresh.resolve_cookie(53).is_ok());
+        // The still-enrolled pod sharing the SPIFFE keeps resolving.
+        let (identity, scope) = resolver.resolve_cookie(50).expect("ledger stays enrolled");
+        assert_eq!(identity.spiffe_id, ledger);
+        assert!(scope.is_some());
+    }
+
+    /// Per-request liveness (the HTTP admit path re-checks every request):
+    /// an identity resolved at accept keeps its scope while enrolled, is
+    /// refused after withdrawal, and recovers on re-enrollment.
+    #[test]
+    fn per_request_liveness_follows_reload_withdrawal() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request()),
+        );
+        stamp(&resolver, 60, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let (identity, _) = resolver.resolve_cookie(60).expect("enrolled");
+        let scope = resolver
+            .current_policy_scope_for_identity(&identity)
+            .expect("live")
+            .expect("scope");
+        assert_eq!(scope.namespace, "payments");
+
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(OTHER_WAYPOINT), node_waypoint_request()),
+        );
+        assert_eq!(
+            resolver.current_policy_scope_for_identity(&identity).err(),
+            Some(NodeWaypointIdentityError::UnknownPod(identity.pod_uid))
+        );
+
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request()),
+        );
+        assert!(
+            resolver
+                .current_policy_scope_for_identity(&identity)
+                .expect("re-enrolled")
+                .is_some()
+        );
+    }
+
+    /// The pod-specific in-netns listener fallback (`resolve_expected_pod_identity`)
+    /// sees the cross-namespace source. The UDP/DTLS registry proof
+    /// (`policy_scope_for_pod_identity`) deliberately does NOT: that channel
+    /// keeps its pre-#6800 source set, so a later withdrawal or conflict can
+    /// never flip an attributed, scoped UDP session into an unattributed
+    /// mesh-wide-only one. A same-namespace enrolled pod keeps its UDP proof.
+    #[test]
+    fn pod_uid_consumers_see_the_cross_namespace_source_only_where_intended() {
+        let slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+        let ledger_uid = parse_pod_uid(LEDGER_UID).unwrap();
+        let ledger = spiffe_for("payments", "ledger");
+
+        let (identity, scope) = resolver
+            .resolve_expected_pod_identity(ledger_uid)
+            .expect("in-netns listener fallback resolves the enrolled source");
+        assert_eq!(identity.spiffe_id, ledger);
+        assert_eq!(scope.expect("scope").namespace, "payments");
+
+        assert!(
+            resolver
+                .policy_scope_for_pod_identity(&ledger_uid, &ledger)
+                .is_none(),
+            "cross-namespace capture sources stay outside UDP/DTLS attribution"
+        );
+        let local_uid = parse_pod_uid(LOCAL_UID).unwrap();
+        let local = spiffe_for("ferrum", "local");
+        assert_eq!(
+            resolver
+                .policy_scope_for_pod_identity(&local_uid, &local)
+                .expect("same-namespace UDP/DTLS principal proof")
+                .namespace,
+            "ferrum"
+        );
+        assert!(
+            resolver
+                .policy_scope_for_pod_identity(&local_uid, &spiffe_for("ferrum", "other"))
+                .is_none(),
+            "a registry principal that is not this pod's identity proves nothing"
+        );
+        assert!(
+            resolver
+                .resolve_expected_pod_identity(parse_pod_uid(REPORTS_UID).unwrap())
+                .is_err()
+        );
+    }
+
+    /// No least-privilege inventory → no cross-namespace source: an
+    /// identity-less NodeWaypoint request and a narrowed-but-unresolved
+    /// (`NotResolved`) document both leave the foreign pod unknown.
+    #[test]
+    fn identity_less_and_not_resolved_inventories_resolve_no_foreign_source() {
+        let ledger = spiffe_for("payments", "ledger");
+
+        let mut identity_less = node_waypoint_request();
+        identity_less.workload_spiffe_id = None;
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), identity_less),
+        );
+        stamp(&resolver, 70, LEDGER_UID, &ledger);
+        assert_unknown_pod(&resolver, 70, LEDGER_UID);
+
+        let mut config = document(THIS_WAYPOINT);
+        config
+            .mesh
+            .as_mut()
+            .expect("mesh")
+            .node_waypoint_capture_inventory_state = NodeWaypointCaptureInventoryState::NotResolved;
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&config, node_waypoint_request()),
+        );
+        stamp(&resolver, 71, LEDGER_UID, &ledger);
+        assert_unknown_pod(&resolver, 71, LEDGER_UID);
+    }
+
+    /// Same pod UID, different SPIFFE: conflicted, so neither identity resolves.
+    #[test]
+    fn same_pod_uid_with_differing_spiffe_ids_resolves_neither() {
+        let mut slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        let mut impostor = slice
+            .node_waypoint_capture_destinations
+            .iter()
+            .find(|workload| workload.service_name == "ledger")
+            .cloned()
+            .expect("ledger destination");
+        impostor.spiffe_id = spiffe_for("payments", "impostor");
+        slice.node_waypoint_capture_destinations.push(impostor);
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+
+        stamp(&resolver, 80, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        assert_unknown_pod(&resolver, 80, LEDGER_UID);
+        stamp(
+            &resolver,
+            81,
+            LEDGER_UID,
+            &spiffe_for("payments", "impostor"),
+        );
+        assert_unknown_pod(&resolver, 81, LEDGER_UID);
+    }
+
+    /// Pins the deliberate parity: a resolved cross-namespace source's scope
+    /// selects the policies that select IT — including its own-namespace policy
+    /// that reaches the NodeWaypoint only through the capture inventory — just
+    /// as a same-namespace enrolled pod's scope selects its ordinary policies.
+    /// It never selects a policy for another namespace or workload.
+    #[test]
+    fn cross_namespace_source_scope_selects_only_its_own_policies() {
+        fn policy(namespace: &str, name: &str, scope: PolicyScope) -> MeshPolicy {
+            MeshPolicy {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                scope,
+                rules: vec![MeshRule {
+                    from: Vec::new(),
+                    to: Vec::new(),
+                    when: Vec::new(),
+                    request_principals: Vec::new(),
+                    not_request_principals: Vec::new(),
+                    source_negation: Default::default(),
+                    never_matches: false,
+                    action: PolicyAction::Deny,
+                }],
+            }
+        }
+        fn app(namespace: &str, app: &str) -> PolicyScope {
+            PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), app.to_string())]),
+                    namespace: Some(namespace.to_string()),
+                },
+            }
+        }
+        let ledger_deny = policy("payments", "ledger-deny", app("payments", "ledger"));
+        let reports_deny = policy("payments", "reports-deny", app("payments", "reports"));
+        let ferrum_deny = policy(
+            "ferrum",
+            "ferrum-deny",
+            PolicyScope::Namespace {
+                namespace: "ferrum".to_string(),
+            },
+        );
+        let mut config = document(THIS_WAYPOINT);
+        config.mesh.as_mut().expect("mesh").mesh_policies = vec![
+            ledger_deny.clone(),
+            reports_deny.clone(),
+            ferrum_deny.clone(),
+        ];
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+        assert!(
+            slice
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "ledger-deny"),
+            "the source's own-namespace policy rides the capture inventory"
+        );
+        assert!(
+            slice
+                .mesh_policies
+                .iter()
+                .all(|policy| policy.namespace == "ferrum"),
+            "the foreign policy must not widen the ordinary policy view"
+        );
+
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &slice);
+        stamp(&resolver, 90, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let scope = resolver
+            .resolve_cookie(90)
+            .expect("ledger")
+            .1
+            .expect("scope");
+        assert!(scope.policy_applies(&ledger_deny));
+        assert!(!scope.policy_applies(&reports_deny));
+        assert!(!scope.policy_applies(&ferrum_deny));
+    }
+
+    /// Withdrawing the LAST pod a capture-only scoped DENY selects also drops
+    /// that DENY from the capture inventory, so no missing-scope census can
+    /// still see it. The TCP accept path therefore refuses any stream whose
+    /// capture record exists but whose identity no longer resolves
+    /// (`carries_capture_evidence`), instead of falling back to mesh-wide-only
+    /// evaluation. Traffic with no capture record keeps that fallback.
+    #[test]
+    fn withdrawn_last_selected_source_is_refused_at_accept_not_downgraded() {
+        let deny = MeshPolicy {
+            name: "ledger-deny".to_string(),
+            namespace: "payments".to_string(),
+            scope: PolicyScope::WorkloadSelector {
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                    namespace: Some("payments".to_string()),
+                },
+            },
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: Vec::new(),
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Deny,
+            }],
+        };
+        let slice_for = |ledger_waypoint: &str| {
+            let mut config = document(ledger_waypoint);
+            config.mesh.as_mut().expect("mesh").mesh_policies = vec![deny.clone()];
+            MeshSlice::from_gateway_config(&config, node_waypoint_request())
+        };
+        let enrolled = slice_for(THIS_WAYPOINT);
+        let withdrawn = slice_for(OTHER_WAYPOINT);
+        assert!(
+            enrolled
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "ledger-deny")
+        );
+        assert!(
+            withdrawn
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .all(|policy| policy.name != "ledger-deny"),
+            "the DENY leaves the inventory with its last selected destination"
+        );
+
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &enrolled);
+        stamp(
+            &resolver,
+            100,
+            LEDGER_UID,
+            &spiffe_for("payments", "ledger"),
+        );
+        let scope = resolver
+            .resolve_cookie(100)
+            .expect("enrolled")
+            .1
+            .expect("scope");
+        assert!(
+            scope.policy_applies(&deny),
+            "the DENY applies while enrolled"
+        );
+
+        seed(&resolver, &withdrawn);
+        let cached = resolver.resolve_cookie(100).expect_err("withdrawn");
+        assert!(
+            cached.carries_capture_evidence(),
+            "a captured-but-unvouched stream must be refused at accept, got {cached:?}"
+        );
+        let fresh = NodeWaypointIdentityResolver::new(0);
+        seed(&fresh, &withdrawn);
+        stamp(&fresh, 101, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let lazy = fresh.resolve_cookie(101).expect_err("never enrolled here");
+        assert!(lazy.carries_capture_evidence(), "got {lazy:?}");
+
+        // No capture record at all: keep the documented mesh-wide fallback.
+        let uncaptured = resolver.resolve_cookie(999).expect_err("unknown cookie");
+        assert_eq!(uncaptured, NodeWaypointIdentityError::UnknownCookie(999));
+        assert!(!uncaptured.carries_capture_evidence());
     }
 }
