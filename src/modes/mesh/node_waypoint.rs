@@ -79,7 +79,7 @@
 //! still rejected before traffic enters the plugin chain.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -255,6 +255,12 @@ struct NodeWaypointSlice {
     /// selector-scoped policy is evaluated against the source pod's own labels
     /// — never a cross-pod label merge.
     scopes_by_pod_uid: std::collections::HashMap<[u8; 16], std::sync::Arc<PolicyScopeCache>>,
+    /// Exact pod UID -> `(SPIFFE, workload SPIFFE hash)` for sources enrolled
+    /// through the dedicated capture inventory (issue #6800). These are vouched
+    /// ONLY by exact UID (plus the stamped hash), never by the hash join.
+    capture_sources_by_pod_uid: std::collections::HashMap<[u8; 16], (SpiffeId, u64)>,
+    /// Pod UIDs carried by disagreeing workload records: never resolved.
+    conflicted_pod_uids: std::collections::HashSet<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,6 +296,115 @@ fn insert_identity_gate_entry(
     }
 }
 
+/// Build one resolver slice generation from the ordinary `workloads` view and
+/// the dedicated capture inventory (see
+/// [`NodeWaypointIdentityResolver::build_policy_scope_snapshot_from_slice`]).
+fn build_node_waypoint_slice<'a, 'b>(
+    ordinary: impl IntoIterator<Item = &'a Workload>,
+    capture: impl IntoIterator<Item = &'b Workload>,
+) -> NodeWaypointPolicyScopeSnapshot {
+    use std::collections::hash_map::Entry;
+
+    let ordinary: Vec<&Workload> = ordinary.into_iter().collect();
+    let capture: Vec<&Workload> = capture.into_iter().collect();
+    // Per-pod scope: each workload carrying a pod UID gets its OWN scope keyed
+    // by the exact `[u8; 16]` the eBPF stamps (parsed from `metadata.uid`). No
+    // cross-pod merge, so pods sharing a SPIFFE but differing in labels are
+    // scoped against their own labels. A malformed UID is skipped (the SPIFFE
+    // gate still vouches an ordinary identity; scope then falls through to
+    // `None` → fail closed when scoped policies exist).
+    //
+    // The same pod may arrive twice (an enrolled pod in the subscription
+    // namespace is in both `workloads` and the capture inventory). An identical
+    // repeat is harmless; records that DISAGREE on the pod's identity or scope
+    // have no trustworthy answer, so the UID is marked conflicted and never
+    // resolves (fail closed) instead of last-wins.
+    let mut scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>> = HashMap::new();
+    let mut spiffe_by_pod_uid: HashMap<[u8; 16], SpiffeId> = HashMap::new();
+    let mut conflicted_pod_uids: HashSet<[u8; 16]> = HashSet::new();
+    let mut capture_uids: Vec<[u8; 16]> = Vec::new();
+    for (workload, from_capture) in ordinary
+        .iter()
+        .map(|workload| (*workload, false))
+        .chain(capture.iter().map(|workload| (*workload, true)))
+    {
+        let Some(raw_uid) = workload.pod_uid.as_deref() else {
+            continue;
+        };
+        let uid = match parse_pod_uid(raw_uid) {
+            Ok(uid) => uid,
+            Err(error) => {
+                warn!(
+                    pod_uid = %raw_uid,
+                    %error,
+                    "Skipping node-waypoint per-pod scope for workload with invalid pod UID"
+                );
+                continue;
+            }
+        };
+        if from_capture {
+            capture_uids.push(uid);
+        }
+        if conflicted_pod_uids.contains(&uid) {
+            continue;
+        }
+        let scope = PolicyScopeCache::from_workload(workload);
+        match scopes_by_pod_uid.entry(uid) {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(scope));
+                spiffe_by_pod_uid.insert(uid, workload.spiffe_id.clone());
+            }
+            Entry::Occupied(entry) if **entry.get() == scope => {}
+            Entry::Occupied(entry) => {
+                warn!(
+                    pod_uid = %raw_uid,
+                    "Refusing node-waypoint identity for pod UID carried by conflicting \
+                     workload records"
+                );
+                entry.remove();
+                spiffe_by_pod_uid.remove(&uid);
+                conflicted_pod_uids.insert(uid);
+            }
+        }
+    }
+    // Capture-inventory sources resolve ONLY through their exact pod UID.
+    let mut capture_sources_by_pod_uid: HashMap<[u8; 16], (SpiffeId, u64)> = HashMap::new();
+    for uid in capture_uids {
+        if let Some(spiffe_id) = spiffe_by_pod_uid.get(&uid) {
+            capture_sources_by_pod_uid
+                .insert(uid, (spiffe_id.clone(), workload_spiffe_hash(spiffe_id)));
+        }
+    }
+    // The hash gate covers every ORDINARY workload (every pod needs an identity
+    // for authz, not only those carrying scoped policies). Capture-inventory
+    // identities are not hash-joinable, but one that collides with an ordinary
+    // hash still disables that entry so the collision can never pick a side.
+    let mut identities_by_hash: HashMap<u64, NodeWaypointIdentityGateEntry> = HashMap::new();
+    for workload in &ordinary {
+        insert_identity_gate_entry(
+            &mut identities_by_hash,
+            workload_spiffe_hash(&workload.spiffe_id),
+            &workload.spiffe_id,
+        );
+    }
+    for workload in &capture {
+        let hash = workload_spiffe_hash(&workload.spiffe_id);
+        if identities_by_hash.contains_key(&hash) {
+            insert_identity_gate_entry(&mut identities_by_hash, hash, &workload.spiffe_id);
+        }
+    }
+    NodeWaypointPolicyScopeSnapshot {
+        slice: NodeWaypointSlice {
+            generation: 0,
+            identities_by_hash,
+            spiffe_by_pod_uid,
+            scopes_by_pod_uid,
+            capture_sources_by_pod_uid,
+            conflicted_pod_uids,
+        },
+    }
+}
+
 impl NodeWaypointSlice {
     fn spiffe_for_hash(&self, workload_spiffe_hash: u64) -> Option<&SpiffeId> {
         match self.identities_by_hash.get(&workload_spiffe_hash)? {
@@ -300,6 +415,21 @@ impl NodeWaypointSlice {
 
     fn spiffe_for_pod_uid(&self, pod_uid: &[u8; 16]) -> Option<&SpiffeId> {
         self.spiffe_by_pod_uid.get(pod_uid)
+    }
+
+    /// The SPIFFE this generation vouches for an eBPF-stamped
+    /// `(pod_uid, workload_spiffe_hash)` record. A conflicted UID never
+    /// resolves; a capture-inventory source resolves only through its exact UID
+    /// binding with a matching hash; everything else keeps the ordinary
+    /// hash-join gate.
+    fn vouched_spiffe(&self, pod_uid: &[u8; 16], workload_spiffe_hash: u64) -> Option<&SpiffeId> {
+        if self.conflicted_pod_uids.contains(pod_uid) {
+            return None;
+        }
+        if let Some((spiffe_id, hash)) = self.capture_sources_by_pod_uid.get(pod_uid) {
+            return (*hash == workload_spiffe_hash).then_some(spiffe_id);
+        }
+        self.spiffe_for_hash(workload_spiffe_hash)
     }
 
     /// Resolve a captured pod's policy scope from this one generation, keyed by
@@ -827,6 +957,30 @@ impl NodeWaypointIdentityResolver {
             .map(Arc::clone)
     }
 
+    /// Per-request liveness for an identity resolved at accept (issue #6800).
+    ///
+    /// Returns the pod's scope from the current generation only while that
+    /// SAME generation still vouches the identity — through the gate
+    /// `resolve_record` uses, or the exact pod-UID binding pod-specific
+    /// listeners use. A withdrawn or conflicted pod is `UnknownPod`, so a
+    /// long-lived HTTP connection stops being served instead of silently
+    /// falling back to mesh-wide-only evaluation without its scope.
+    pub fn current_policy_scope_for_identity(
+        &self,
+        identity: &NodeWaypointIdentity,
+    ) -> Result<Option<Arc<PolicyScopeCache>>, NodeWaypointIdentityError> {
+        let slice = self.slice.load();
+        let pod_uid = identity.pod_uid;
+        let vouched = slice.vouched_spiffe(&pod_uid, identity.workload_spiffe_hash)
+            == Some(&identity.spiffe_id)
+            || (!slice.conflicted_pod_uids.contains(&pod_uid)
+                && slice.spiffe_for_pod_uid(&pod_uid) == Some(&identity.spiffe_id));
+        if !vouched {
+            return Err(NodeWaypointIdentityError::UnknownPod(pod_uid));
+        }
+        Ok(slice.scope_for(&pod_uid))
+    }
+
     /// Resolve a pod's scope only when the same live slice generation still
     /// binds that pod UID to `expected_spiffe_id`.
     ///
@@ -900,15 +1054,17 @@ impl NodeWaypointIdentityResolver {
     /// bounded by CP scope and the bearer namespace claim, so it is also the
     /// least-privilege source inventory. It is consulted only here: it never
     /// widens `workloads` / routing visibility.
+    ///
+    /// Capture-inventory sources are vouched by their EXACT pod UID, never by
+    /// the SPIFFE-hash join: a withdrawn pod that shares a service account with
+    /// a still-enrolled one must not keep resolving through the shared hash.
     pub fn build_policy_scope_snapshot_from_slice(
         &self,
         slice: &MeshSlice,
     ) -> NodeWaypointPolicyScopeSnapshot {
-        self.build_policy_scope_snapshot_from_workloads(
-            slice
-                .workloads
-                .iter()
-                .chain(slice.node_waypoint_capture_destinations.iter()),
+        build_node_waypoint_slice(
+            slice.workloads.iter(),
+            slice.node_waypoint_capture_destinations.iter(),
         )
     }
 
@@ -919,80 +1075,7 @@ impl NodeWaypointIdentityResolver {
     where
         I: IntoIterator<Item = &'a Workload>,
     {
-        use std::collections::hash_map::Entry;
-
-        let workloads: Vec<&Workload> = workloads.into_iter().collect();
-        // Per-pod scope: each workload carrying a pod UID gets its OWN scope
-        // keyed by the exact `[u8; 16]` the eBPF stamps (parsed from
-        // `metadata.uid`). No cross-pod merge, so pods sharing a SPIFFE but
-        // differing in labels are scoped against their own labels. A malformed
-        // UID is skipped (the SPIFFE gate still vouches the identity; scope then
-        // falls through to `None` → fail closed when scoped policies exist).
-        //
-        // The same pod may arrive twice (an enrolled pod in the subscription
-        // namespace is in both `workloads` and the capture inventory). An
-        // identical repeat is harmless; records that DISAGREE on the pod's
-        // identity or scope have no trustworthy answer, so the UID gets neither
-        // a scope nor a pod-UID identity (fail closed) instead of last-wins.
-        let mut scopes_by_pod_uid: HashMap<[u8; 16], Arc<PolicyScopeCache>> = HashMap::new();
-        let mut spiffe_by_pod_uid: HashMap<[u8; 16], SpiffeId> = HashMap::new();
-        let mut conflicting_pod_uids: std::collections::HashSet<[u8; 16]> =
-            std::collections::HashSet::new();
-        for workload in &workloads {
-            let Some(raw_uid) = workload.pod_uid.as_deref() else {
-                continue;
-            };
-            match parse_pod_uid(raw_uid) {
-                Ok(uid) => {
-                    if conflicting_pod_uids.contains(&uid) {
-                        continue;
-                    }
-                    let scope = PolicyScopeCache::from_workload(workload);
-                    match scopes_by_pod_uid.entry(uid) {
-                        Entry::Vacant(entry) => {
-                            entry.insert(Arc::new(scope));
-                            spiffe_by_pod_uid.insert(uid, workload.spiffe_id.clone());
-                        }
-                        Entry::Occupied(entry) if **entry.get() == scope => {}
-                        Entry::Occupied(entry) => {
-                            warn!(
-                                pod_uid = %raw_uid,
-                                "Disabling node-waypoint per-pod scope for pod UID carried by \
-                                 conflicting workload records"
-                            );
-                            entry.remove();
-                            spiffe_by_pod_uid.remove(&uid);
-                            conflicting_pod_uids.insert(uid);
-                        }
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        pod_uid = %raw_uid,
-                        %error,
-                        "Skipping node-waypoint per-pod scope for workload with invalid pod UID"
-                    );
-                }
-            }
-        }
-        // The identity gate covers ALL workloads (every pod needs an identity
-        // for authz, not only those carrying scoped policies).
-        let mut identities_by_hash: HashMap<u64, NodeWaypointIdentityGateEntry> = HashMap::new();
-        for workload in &workloads {
-            insert_identity_gate_entry(
-                &mut identities_by_hash,
-                workload_spiffe_hash(&workload.spiffe_id),
-                &workload.spiffe_id,
-            );
-        }
-        NodeWaypointPolicyScopeSnapshot {
-            slice: NodeWaypointSlice {
-                generation: 0,
-                identities_by_hash,
-                spiffe_by_pod_uid,
-                scopes_by_pod_uid,
-            },
-        }
+        build_node_waypoint_slice(workloads, std::iter::empty())
     }
 
     /// Publish the whole slice atomically as one generation: a single
@@ -1286,7 +1369,7 @@ impl NodeWaypointIdentityResolver {
             // in-slice `Collision`), so a bare presence check would keep resolving
             // the stale A identity and defeat the cross-reload collision guard.
             // `Collision` entries already yield `None` here and fail closed.
-            match slice.spiffe_for_hash(expected_hash) {
+            match slice.vouched_spiffe(&pod_uid, expected_hash) {
                 Some(current_spiffe) if *current_spiffe == identity.spiffe_id => {}
                 _ => return Err(NodeWaypointIdentityError::UnknownPod(pod_uid)),
             }
@@ -1308,7 +1391,7 @@ impl NodeWaypointIdentityResolver {
         // enrolled identity's hash equals `expected_hash` by construction, so no
         // re-check is needed. Identity AND scope both come from this single
         // `slice` load.
-        if let Some(spiffe_id) = slice.spiffe_for_hash(expected_hash).cloned() {
+        if let Some(spiffe_id) = slice.vouched_spiffe(&pod_uid, expected_hash).cloned() {
             let scope = slice.scope_for(&pod_uid);
             let identity = self.upsert_identity(NodeWaypointIdentity::new(pod_uid, spiffe_id));
             return Ok(NodeWaypointResolvedConnection {
@@ -2890,6 +2973,7 @@ mod tests {
                 identities_by_hash,
                 spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
+                ..NodeWaypointSlice::default()
             },
         });
         resolver.record_orig_dst4(7, orig_dst4(pod_uid, collision_hash));
@@ -2952,6 +3036,7 @@ mod tests {
                 identities_by_hash: gate_a,
                 spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
+                ..NodeWaypointSlice::default()
             },
         });
         let (identity, _) = resolver
@@ -2968,6 +3053,7 @@ mod tests {
                 identities_by_hash: gate_b,
                 spiffe_by_pod_uid: HashMap::new(),
                 scopes_by_pod_uid: HashMap::new(),
+                ..NodeWaypointSlice::default()
             },
         });
         assert_eq!(

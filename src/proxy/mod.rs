@@ -35066,8 +35066,24 @@ async fn handle_proxy_request_inner(
         // workload removed mid-connection stops being served under scoped authz.
         // When mesh_authz is not configured the stamped field is unused and
         // propagates harmlessly.
+        //
+        // The same generation must still VOUCH the identity (issue #6800): a
+        // pod withdrawn mid-connection (or one whose records now conflict) is
+        // refused exactly as accept would refuse it, rather than served with
+        // no scope, where capture-only policy is outside the source
+        // missing-scope census.
         if let Some(resolver) = state.node_waypoint_identity_resolver.as_ref() {
-            ctx.node_waypoint_policy_scope = resolver.policy_scope_for_pod(&identity.pod_uid);
+            match resolver.current_policy_scope_for_identity(&identity) {
+                Ok(scope) => ctx.node_waypoint_policy_scope = scope,
+                Err(_) => {
+                    ctx.terminal_record.mark_counted();
+                    record_request(&state, 403);
+                    return Ok(build_response(
+                        StatusCode::FORBIDDEN,
+                        r#"{"error":"node-waypoint source identity is no longer enrolled"}"#,
+                    ));
+                }
+            }
         }
     }
     // Store raw query string on ctx for lazy parsing. The local `query_string`

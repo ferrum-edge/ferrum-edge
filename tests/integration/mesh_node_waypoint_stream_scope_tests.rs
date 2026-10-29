@@ -1654,11 +1654,12 @@ mod node_waypoint_cross_namespace_source_resolution {
     }
 
     /// Two records for the same pod UID that disagree on its scope have no
-    /// trustworthy answer: the pod keeps its SPIFFE-gated identity but gets no
-    /// per-pod scope (so `mesh_authz` fails closed when scoped policies exist)
-    /// and no pod-UID identity for pod-specific listeners.
+    /// trustworthy answer: the UID never resolves — not through the cookie
+    /// path (cached or lazy), not through the pod-UID index — instead of
+    /// keeping a hash-gated identity with no scope (where capture-only policy
+    /// is outside the source missing-scope census).
     #[test]
-    fn conflicting_records_for_one_pod_uid_fail_scope_closed() {
+    fn conflicting_records_for_one_pod_uid_fail_closed() {
         let mut slice =
             MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
         let mut relabeled = slice
@@ -1676,18 +1677,147 @@ mod node_waypoint_cross_namespace_source_resolution {
         let resolver = NodeWaypointIdentityResolver::new(0);
         seed(&resolver, &slice);
         let local_uid = parse_pod_uid(LOCAL_UID).unwrap();
-        let local = spiffe_for("ferrum", "local");
         assert!(
             resolver.resolve_expected_pod_identity(local_uid).is_err(),
             "a conflicted pod UID must not resolve through the pod-UID index"
         );
-        stamp(&resolver, 40, LOCAL_UID, &local);
-        let (identity, scope) = resolver.resolve_cookie(40).expect("SPIFFE gate vouches");
-        assert_eq!(identity.spiffe_id, local);
-        assert!(scope.is_none(), "a conflicted pod UID must carry no scope");
+        stamp(&resolver, 40, LOCAL_UID, &spiffe_for("ferrum", "local"));
+        assert_unknown_pod(&resolver, 40, LOCAL_UID);
 
         // The unrelated cross-namespace source is unaffected.
         stamp(&resolver, 41, LEDGER_UID, &spiffe_for("payments", "ledger"));
         assert!(resolver.resolve_cookie(41).expect("ledger").1.is_some());
+    }
+
+    /// A conflict that appears on RELOAD also revokes an identity cached at
+    /// startup.
+    #[test]
+    fn a_conflict_introduced_on_reload_revokes_the_cached_identity() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        let slice =
+            MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request());
+        seed(&resolver, &slice);
+        stamp(&resolver, 42, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let (identity, _) = resolver.resolve_cookie(42).expect("enrolled");
+
+        let mut conflicted = slice.clone();
+        let mut relabeled = conflicted
+            .node_waypoint_capture_destinations
+            .iter()
+            .find(|workload| workload.service_name == "ledger")
+            .cloned()
+            .expect("ledger destination");
+        relabeled
+            .selector
+            .labels
+            .insert("tier".to_string(), "other".to_string());
+        conflicted
+            .node_waypoint_capture_destinations
+            .push(relabeled);
+        seed(&resolver, &conflicted);
+
+        assert_unknown_pod(&resolver, 42, LEDGER_UID);
+        assert!(
+            resolver
+                .current_policy_scope_for_identity(&identity)
+                .is_err()
+        );
+    }
+
+    /// Two enrolled `payments` pods share one service account (one SPIFFE,
+    /// one hash). Withdrawing ONE must revoke exactly that pod: capture
+    /// sources are vouched by exact pod UID, never by the shared hash.
+    #[test]
+    fn withdrawing_one_of_two_same_service_account_pods_revokes_only_that_pod() {
+        const SIBLING_UID: &str = "aaaaaaaa-0000-0000-0000-000000000005";
+        let with_sibling = |sibling_waypoint: &str| {
+            let mut config = document(THIS_WAYPOINT);
+            let mut sibling = workload(
+                "payments",
+                "ledger",
+                SIBLING_UID,
+                Some(sibling_waypoint),
+                "10.244.1.11",
+            );
+            sibling
+                .selector
+                .labels
+                .insert("replica".to_string(), "b".to_string());
+            config.mesh.as_mut().expect("mesh").workloads.push(sibling);
+            MeshSlice::from_gateway_config(&config, node_waypoint_request())
+        };
+        let ledger = spiffe_for("payments", "ledger");
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(&resolver, &with_sibling(THIS_WAYPOINT));
+        stamp(&resolver, 50, LEDGER_UID, &ledger);
+        stamp(&resolver, 51, SIBLING_UID, &ledger);
+        let (sibling_identity, sibling_scope) = resolver.resolve_cookie(51).expect("sibling");
+        assert_eq!(
+            sibling_scope
+                .expect("sibling scope")
+                .labels
+                .get("replica")
+                .map(String::as_str),
+            Some("b"),
+            "same-SPIFFE pods are scoped by their own labels"
+        );
+        assert!(resolver.resolve_cookie(50).is_ok());
+
+        // The sibling moves to another node's waypoint.
+        seed(&resolver, &with_sibling(OTHER_WAYPOINT));
+        // Cached identity for the withdrawn pod: refused.
+        assert_unknown_pod(&resolver, 51, SIBLING_UID);
+        assert!(
+            resolver
+                .current_policy_scope_for_identity(&sibling_identity)
+                .is_err(),
+            "per-request liveness must refuse the withdrawn pod on an existing connection"
+        );
+        // A fresh (lazy) record for the withdrawn pod: refused too.
+        stamp(&resolver, 52, SIBLING_UID, &ledger);
+        assert_unknown_pod(&resolver, 52, SIBLING_UID);
+        // The still-enrolled pod sharing the SPIFFE keeps resolving.
+        let (identity, scope) = resolver.resolve_cookie(50).expect("ledger stays enrolled");
+        assert_eq!(identity.spiffe_id, ledger);
+        assert!(scope.is_some());
+    }
+
+    /// Per-request liveness (the HTTP admit path re-checks every request):
+    /// an identity resolved at accept keeps its scope while enrolled, is
+    /// refused after withdrawal, and recovers on re-enrollment.
+    #[test]
+    fn per_request_liveness_follows_reload_withdrawal() {
+        let resolver = NodeWaypointIdentityResolver::new(0);
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request()),
+        );
+        stamp(&resolver, 60, LEDGER_UID, &spiffe_for("payments", "ledger"));
+        let (identity, _) = resolver.resolve_cookie(60).expect("enrolled");
+        let scope = resolver
+            .current_policy_scope_for_identity(&identity)
+            .expect("live")
+            .expect("scope");
+        assert_eq!(scope.namespace, "payments");
+
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(OTHER_WAYPOINT), node_waypoint_request()),
+        );
+        assert_eq!(
+            resolver.current_policy_scope_for_identity(&identity).err(),
+            Some(NodeWaypointIdentityError::UnknownPod(identity.pod_uid))
+        );
+
+        seed(
+            &resolver,
+            &MeshSlice::from_gateway_config(&document(THIS_WAYPOINT), node_waypoint_request()),
+        );
+        assert!(
+            resolver
+                .current_policy_scope_for_identity(&identity)
+                .expect("re-enrolled")
+                .is_some()
+        );
     }
 }
