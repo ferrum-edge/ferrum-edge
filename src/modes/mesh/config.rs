@@ -2623,7 +2623,17 @@ pub struct JwtHeader {
 // ── Telemetry ─────────────────────────────────────────────────────────────
 
 /// Raw Telemetry resource from Istio CRD translation (before workload merge).
+///
+/// The whole Telemetry document is closed (`deny_unknown_fields`, issue
+/// #6616): the resource, its `config`, the tracing / metrics / access-logging
+/// sections, each tracing provider envelope and `config`, each tag override
+/// and its operation, and the access-log filter. It is operator-authored
+/// policy, not inventory, and a misspelled key would otherwise silently drop
+/// the setting it names (`tag_overides` removes every override,
+/// `filtr` logs every request). Direct `workload_metrics` plugin config
+/// reaches the same objects through its own allowlists.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTelemetryResource {
     pub name: String,
     pub namespace: String,
@@ -2633,8 +2643,10 @@ pub struct MeshTelemetryResource {
     pub config: MeshTelemetryConfig,
 }
 
-/// Merged telemetry configuration for a workload.
+/// Merged telemetry configuration for a workload. Closed; see
+/// [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MeshTelemetryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_optional_object")]
@@ -2769,12 +2781,18 @@ impl TelemetryTracingMode {
 /// variant and the slice update is rejected at slice-apply time, consistent
 /// with the rest of the mesh slice contract).
 ///
-/// The direct `workload_metrics` plugin config closes this envelope and each
-/// variant's `config` with per-kind allowlists
-/// (`src/plugins/mesh/workload_metrics.rs`, `*_PROVIDER_CONFIG_KEYS`). Adding
-/// a variant field here means adding it there too.
+/// Closed (`deny_unknown_fields`): the envelope admits only `kind` and
+/// `config`, and each variant's `config` only its own fields. The direct
+/// `workload_metrics` plugin config also checks both with per-kind allowlists
+/// (`src/plugins/mesh/workload_metrics.rs`, `*_PROVIDER_CONFIG_KEYS`) for its
+/// own diagnostics. Adding a variant field here means adding it there too.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "config")]
+#[serde(
+    rename_all = "snake_case",
+    tag = "kind",
+    content = "config",
+    deny_unknown_fields
+)]
 pub enum TracingProvider {
     Zipkin {
         url: String,
@@ -2820,7 +2838,9 @@ impl fmt::Debug for TracingProvider {
     }
 }
 
+/// Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshMetricsConfig {
     /// Tag overrides: rename, remove, or set custom values for metric tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2831,7 +2851,9 @@ pub struct MeshMetricsConfig {
     pub disabled_metrics: Vec<String>,
 }
 
+/// Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricTagOverride {
     /// Metric family this override targets. `None` applies to every supported
     /// mesh metric for direct/native configurations.
@@ -2841,9 +2863,13 @@ pub struct MetricTagOverride {
     pub operation: TagOverrideOperation,
 }
 
+/// Closed like [`PolicyScope`]: each `type` admits only its own members, and
+/// the unit `remove` variant uses [`deserialize_closed_unit_variant`] because
+/// serde's internally tagged unit variants otherwise ignore extra members.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
+#[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
 pub enum TagOverrideOperation {
+    #[serde(deserialize_with = "deserialize_closed_unit_variant")]
     Remove,
     Rename {
         new_name: String,
@@ -2858,7 +2884,9 @@ pub enum TagOverrideOperation {
     },
 }
 
+/// Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshAccessLoggingConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -2875,8 +2903,9 @@ fn default_true() -> bool {
 ///
 /// Pure conjunctions of supported predicates are stored in the flat fields.
 /// Expressions containing `||` compile to the optional [`AccessLogFilterExpr`]
-/// tree instead.
+/// tree instead. Closed; see [`MeshTelemetryResource`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessLogFilter {
     /// Only log responses with status code >= this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]

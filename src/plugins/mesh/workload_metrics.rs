@@ -1797,9 +1797,9 @@ fn parse_direction_emit(config: &Value) -> Result<DirectionEmit, String> {
     }
 }
 
-/// Closed direct provider envelope. [`TracingProvider`] is the adjacently
-/// tagged mesh-slice type, whose serde derive ignores unknown members, so the
-/// direct plugin config closes the envelope and each `config` here.
+/// Closed direct provider envelope. [`TracingProvider`] is itself closed
+/// (`deny_unknown_fields`); these allowlists run first so the direct plugin
+/// config reports an unknown member with a `workload_metrics:` diagnostic.
 const TRACING_PROVIDER_ENVELOPE_KEYS: &[&str] = &["kind", "config"];
 const ZIPKIN_PROVIDER_CONFIG_KEYS: &[&str] = &["url"];
 const DATADOG_PROVIDER_CONFIG_KEYS: &[&str] = &["agent_url", "service"];

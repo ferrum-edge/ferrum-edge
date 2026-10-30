@@ -70,7 +70,17 @@ fn render(path: &[Segment]) -> String {
     out
 }
 
-fn pattern_tokens(pattern: &str) -> Vec<String> {
+/// One parsed pattern token. Kept typed (rather than rendered back to text)
+/// so an object key literally named `[]` is never mistaken for an array
+/// element, nor an array element for such a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatternToken<'a> {
+    Key(&'a str),
+    AnyKey,
+    Element,
+}
+
+fn pattern_tokens(pattern: &str) -> Vec<PatternToken<'_>> {
     let mut tokens = Vec::new();
     for part in pattern.split('.') {
         let mut base = part;
@@ -79,31 +89,28 @@ fn pattern_tokens(pattern: &str) -> Vec<String> {
             base = stripped;
             elements += 1;
         }
-        if !base.is_empty() {
-            tokens.push(base.to_string());
+        match base {
+            "" => {}
+            "*" => tokens.push(PatternToken::AnyKey),
+            key => tokens.push(PatternToken::Key(key)),
         }
-        tokens.extend(std::iter::repeat_n("[]".to_string(), elements));
+        tokens.extend(std::iter::repeat_n(PatternToken::Element, elements));
     }
     tokens
 }
 
-fn path_tokens(path: &[Segment]) -> Vec<String> {
-    path.iter()
-        .map(|segment| match segment {
-            Segment::Key(key) => key.clone(),
-            Segment::Index(_) => "[]".to_string(),
-        })
-        .collect()
-}
-
 fn matches(pattern: &str, path: &[Segment]) -> bool {
     let pattern = pattern_tokens(pattern);
-    let path = path_tokens(path);
     pattern.len() == path.len()
         && pattern
             .iter()
-            .zip(&path)
-            .all(|(want, have)| want == have || (want == "*" && have != "[]"))
+            .zip(path)
+            .all(|(want, have)| match (want, have) {
+                (PatternToken::Key(want), Segment::Key(have)) => *want == have.as_str(),
+                (PatternToken::AnyKey, Segment::Key(_)) => true,
+                (PatternToken::Element, Segment::Index(_)) => true,
+                _ => false,
+            })
 }
 
 /// Every object node reachable from `value`, the root included, excluding
@@ -354,4 +361,20 @@ fn path_patterns_match_array_elements_and_wildcards() {
         Segment::Index(1),
     ];
     assert!(matches("matrix[][]", &nested));
+
+    // An object key literally named `[]` is a key, not an array element.
+    let literal = [
+        Segment::Key("entries".to_string()),
+        Segment::Key("[]".to_string()),
+        Segment::Key("payload".to_string()),
+    ];
+    assert!(matches("entries.*.payload", &literal));
+    assert!(!matches("entries[].payload", &literal));
+    let element = [
+        Segment::Key("entries".to_string()),
+        Segment::Index(0),
+        Segment::Key("payload".to_string()),
+    ];
+    assert!(matches("entries[].payload", &element));
+    assert!(!matches("entries.*.payload", &element));
 }
