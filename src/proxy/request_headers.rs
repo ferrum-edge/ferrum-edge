@@ -321,8 +321,8 @@ impl<'a> RequestHeaders<'a> {
 
     /// The materialized map: borrowed as-is, or rebuilt from a passthrough
     /// view for a consumer that has not been taught the view.
-    pub(crate) fn to_map(&self) -> Cow<'a, HashMap<String, String>> {
-        match *self {
+    pub(crate) fn to_map(self) -> Cow<'a, HashMap<String, String>> {
+        match self {
             Self::Materialized(map) => Cow::Borrowed(map),
             Self::Passthrough(view) => Cow::Owned(view.to_map()),
         }
