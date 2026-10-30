@@ -1769,11 +1769,18 @@ where
     let dispatch = auth.compose(protocol_at);
     let bound = crate::proxy::compose_backend_handoff_bound(None, dispatch);
     match crate::proxy::await_backend_dispatch_bound(bound, work).await {
-        Ok(result) => result,
-        Err(_) if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at => {
+        // The bound is checked before every poll, but a poll that began in time
+        // can still complete with a failure after it. That failure settles as
+        // the bound, exactly as the expiry arm below (issue #6976); an error
+        // the work already typed as a lifetime expiry keeps its own terminal.
+        Ok(Err(error)) if error.lifetime_expired() || bound.elapsed().is_none() => Err(error),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) | Err(_)
+            if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at =>
+        {
             Err(h3_authorization_error(dispatch, auth, handed_to_backend))
         }
-        Err(_) => Err(H3PoolError::read_timeout(anyhow::anyhow!(
+        Ok(Err(_)) | Err(_) => Err(H3PoolError::read_timeout(anyhow::anyhow!(
             "recv_response read timeout"
         ))),
     }
@@ -1804,11 +1811,17 @@ where
             .map_err(|error| H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {error}")))
     };
     match crate::proxy::await_backend_dispatch_bound(bound, work).await {
-        Ok(result) => result,
-        Err(_) if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at => {
+        // A write poll that began in time can still fail after the bound; that
+        // failure settles as the bound, exactly as the expiry arms below (issue
+        // #6976).
+        Ok(Err(error)) if bound.elapsed().is_none() => Err(error),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) | Err(_)
+            if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at =>
+        {
             Err(h3_authorization_error(dispatch, auth, true))
         }
-        Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
+        Ok(Err(_)) | Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
             "backend request body write timeout after {timeout_ms}ms"
         ))),
     }

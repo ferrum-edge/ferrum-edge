@@ -69,8 +69,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CANCEL`, still counts as a backend failure. A buffered collect that fails
   after an operator read bound or authorization lifetime settles as that bound
   in the same way, and the inline body adapter applies the cutoff to a route
-  request deadline (already a health-neutral route cut). The remaining paths
-  are tracked in #6976.
+  request deadline (already a health-neutral route cut).
+- **The deadline cutoff now covers every gRPC dispatch path, and the earlier
+  of two racing bounds always owns the outcome** (issue #6976). A native
+  HTTP/3 backend head failure observed after the dispatch bound settles exactly
+  as that bound's timer arm (no H3 capability downgrade), and any native H3
+  dispatch phase that fails after its bound settles as that bound. The
+  HTTP/3-frontend gRPC-Web bridge settles a late send failure as its gRPC-Web
+  deadline, authorization lifetime, or header bound. Native buffered gRPC
+  settles a late failure after an earlier operator read bound as that bound's
+  `BackendTimeout`, and the direct HTTP/2, sidecar-mTLS / Unix HTTP/2, HBONE
+  HTTP/1.1 and Unix HTTP/1.1 header waits settle a late send failure through
+  their own timer arm for every bound source, authorization included. The reqwest header waits no longer let the operator's
+  response-header timer, which wraps the client RPC deadline, claim an expiry
+  the strictly earlier client deadline or authorization lifetime owns after a
+  late wake (it was charged as `ReadWriteTimeout`), nor let a late reset or an
+  inner expiry ignore an earlier operator bound. Where two bounds race, the
+  response-header bound wins an exact tie, as the direct HTTP/1.1 pool already
+  attributed it. Gateway-owned terminals (an oversized upload, a
+  `maxConnections` refusal, a write watermark) keep precedence.
 
 ## [0.9.19] - 2026-10-27
 

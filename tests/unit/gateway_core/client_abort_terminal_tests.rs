@@ -664,10 +664,10 @@ fn native_h3_watches_the_response_direction_until_the_head_arrives() {
         "letresponse_stopped=crate::http3::stream_util::peer_response_stopped(&send_half);"
     ));
     let head = grpc
-        .find("head=crate::http3::client::recv_h3_backend_response_head(&mutbackend_recv)=>{Ok(head)}")
+        .find("head=crate::http3::client::recv_h3_backend_response_head(&mutbackend_recv)=>{")
         .expect("backend head arm");
     let cancel = grpc
-        .find("peer_stop_sending=response_stopped=>Ok(Err(h3_response_cancelled_pool_error(")
+        .find("peer_stop_sending=response_stopped=>Some(Ok(Err(h3_response_cancelled_pool_error(")
         .expect("the native gRPC header wait watches the client too");
     assert!(head < cancel, "a ready backend head keeps precedence");
     let open = compact(region(

@@ -2609,6 +2609,18 @@ pub mod _test_support {
         crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
     }
 
+    /// The shared owner rule for two racing bounds (issue #6976): `Some(true)`
+    /// for the dispatch bound, `Some(false)` for the response-header bound,
+    /// `None` while neither has elapsed.
+    pub fn elapsed_owning_bound_for_test(
+        dispatch_at: Option<tokio::time::Instant>,
+        header_at: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> Option<bool> {
+        crate::proxy::elapsed_owning_bound(dispatch_at, header_at, now)
+            .map(|bound| bound == crate::proxy::OwningBound::Dispatch)
+    }
+
     pub fn client_deadline_owns_failure_for_test(
         deadline: Option<tokio::time::Instant>,
         now: tokio::time::Instant,
@@ -11084,6 +11096,21 @@ pub mod _test_support {
 
     pub fn clone_log_metadata(ctx: &crate::plugins::RequestContext) -> HashMap<String, String> {
         crate::proxy::clone_log_metadata(ctx).into_iter().collect()
+    }
+
+    /// The streaming terminal logger's projection: moves `ctx.metadata` out
+    /// instead of cloning it (issue #6793).
+    pub fn take_log_metadata(ctx: &mut crate::plugins::RequestContext) -> HashMap<String, String> {
+        crate::proxy::take_log_metadata(ctx).into_iter().collect()
+    }
+
+    /// Latch a credential-expiry termination on the request's shared
+    /// authorization latch, as a body adapter does when the lifetime elapses.
+    pub fn latch_credential_expired_termination_for_test(ctx: &crate::plugins::RequestContext) {
+        ctx.authorization_termination_latch().record_once(
+            crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+        );
     }
 
     /// Whether this request has materialized the boxed per-plugin working state
