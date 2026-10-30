@@ -5897,6 +5897,21 @@ where
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
+                // An upstream failure observed at/after this adapter's own
+                // deadline is settled as that deadline, exactly as the check
+                // above does once the timer wheel has fired the sleep (issue
+                // #6022): the outcome must not depend on timer scheduling. In
+                // the client `grpc-timeout` regime that keeps a backend
+                // enforcing the forwarded deadline with `CANCEL` uncharged; in
+                // the route request regime it is the route's health-neutral
+                // cut. One clock read, on the error path only.
+                if this
+                    .deadline
+                    .as_ref()
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.deadline())
+                {
+                    return this.emit_deadline_terminal();
+                }
                 this.done = true;
                 this.deadline = None;
                 this.inner.take();

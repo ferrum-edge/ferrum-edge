@@ -6964,3 +6964,333 @@ async fn dropping_the_client_facing_body_still_cancels_the_rpc_close() {
         "hyper dropping the client-facing body proves settlement and must cancel the close"
     );
 }
+
+/// A backend body that fails on its first poll, as a backend `RST_STREAM`
+/// surfaces through hyper.
+fn backend_reset_response_body() -> ferrum_edge::proxy::ProxyBody {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::proxy_body_streaming_for_test;
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let reset: ProxyBodyError = Box::new(std::io::Error::other("backend RST_STREAM(CANCEL)"));
+    let inner = StreamBody::new(stream::iter(vec![Err::<Frame<Bytes>, _>(reset)]));
+    proxy_body_streaming_for_test(Box::pin(inner))
+}
+
+/// Issue #6022: a backend failure that arrives after the client RPC deadline,
+/// before the timer wheel has fired the deadline's sleep, is that deadline.
+/// The gateway forwards only the remaining `grpc-timeout`, so a backend that
+/// enforces it (grpc-java resets with `CANCEL`) can only win this race under
+/// scheduler lag; it must not be reported, or charged, as a backend failure.
+#[tokio::test]
+async fn a_backend_failure_after_an_unfired_client_deadline_is_the_deadline() {
+    use ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let mut body = proxy_body_with_client_grpc_deadline_for_test(
+        backend_reset_response_body(),
+        deadline,
+        None,
+    );
+    // Block the runtime's only thread past the deadline without yielding, so
+    // the time driver cannot turn: the sleep is registered on the first poll
+    // below and is still unfired, which is the scheduler-lag window.
+    std::thread::sleep(Duration::from_millis(30));
+
+    let frame = body
+        .frame()
+        .await
+        .expect("the deadline must produce a terminal")
+        .expect("before response DATA the deadline terminal is native trailers");
+    let trailers = frame
+        .into_trailers()
+        .expect("the client deadline ends the RPC with gRPC trailers");
+    assert_eq!(
+        trailers.get("grpc-status").map(|value| value.as_bytes()),
+        Some(&b"4"[..]),
+        "a backend failure at/after the client deadline must end as DEADLINE_EXCEEDED"
+    );
+}
+
+/// The other half of the #6022 policy: a backend failure BEFORE the client
+/// deadline is unexplained and must still surface as the backend's failure.
+#[tokio::test]
+async fn a_backend_failure_before_the_client_deadline_stays_a_backend_failure() {
+    use ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut body = proxy_body_with_client_grpc_deadline_for_test(
+        backend_reset_response_body(),
+        deadline,
+        None,
+    );
+
+    let error = body
+        .frame()
+        .await
+        .expect("the backend failure must surface")
+        .expect_err("a failure before the deadline is not the deadline terminal");
+    assert!(
+        error.to_string().contains("backend RST_STREAM(CANCEL)"),
+        "the backend's own failure must reach accounting unchanged, got: {error}"
+    );
+}
+
+#[test]
+fn the_client_deadline_owns_only_failures_at_or_after_it() {
+    use ferrum_edge::_test_support::client_deadline_owns_failure_for_test as owns;
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now();
+    let before = deadline
+        .checked_sub(Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+    let after = deadline + Duration::from_millis(1);
+
+    assert!(
+        !owns(None, after),
+        "no client deadline never claims a failure"
+    );
+    assert!(
+        !owns(Some(deadline), before),
+        "a failure before the deadline is the backend's"
+    );
+    assert!(
+        owns(Some(deadline), deadline),
+        "a failure at the deadline is the deadline"
+    );
+    assert!(
+        owns(Some(deadline), after),
+        "a failure after the deadline is the deadline"
+    );
+}
+
+/// Slice the body of the function whose signature starts at `signature`.
+fn source_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} not found"));
+    let tail = &src[start..];
+    &tail[..tail.find("\n}\n").expect("end of function body")]
+}
+
+/// The text between `from` and the next `until` after it, so a check cannot be
+/// satisfied by an unrelated later occurrence in the same function.
+fn bounded<'a>(body: &'a str, from: &str, until: &str) -> &'a str {
+    let start = body
+        .find(from)
+        .unwrap_or_else(|| panic!("{from:?} not found"));
+    let tail = &body[start..];
+    let end = tail[from.len()..]
+        .find(until)
+        .map_or(tail.len(), |offset| from.len() + offset);
+    &tail[..end]
+}
+
+/// Every gRPC dispatch path applies the #6022 cutoff: a backend failure
+/// observed at/after the client deadline is that deadline. Structural: the unit
+/// harness cannot stall the timer wheel inside a live dispatch.
+#[test]
+fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
+    let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+
+    let buffered = source_fn_body(grpc, "pub(crate) async fn proxy_grpc_request_core(");
+    assert!(
+        buffered.contains("response_deadline_at.filter(|_| response_deadline_is_client)"),
+        "only the client's deadline may claim a failure; an operator read timeout keeps \
+         BackendTimeout accounting"
+    );
+    let header = bounded(
+        buffered,
+        "client_deadline_owns_failure(\n                client_response_deadline_at,",
+        "error!(",
+    );
+    assert!(
+        header.contains("GrpcDeadlinePhase::ResponseHeaders"),
+        "a late header-wait failure must be the ResponseHeaders deadline"
+    );
+    let body = bounded(
+        buffered,
+        "client_deadline_owns_failure(\n                        client_response_deadline_at,",
+        "warn_sampled!(",
+    );
+    assert!(
+        body.contains("GrpcDeadlinePhase::ResponseBody"),
+        "a late body-collection failure must be the ResponseBody deadline"
+    );
+    let body_check = buffered
+        .find("client_deadline_owns_failure(\n                        client_response_deadline_at,")
+        .expect("body-collection deadline check");
+    let body_error_log = buffered
+        .find("gRPC: error reading backend response frame")
+        .expect("body collection error arm");
+    assert!(
+        body_check < body_error_log,
+        "the deadline check must precede the backend failure in the body error arm"
+    );
+
+    let streaming = source_fn_body(grpc, "async fn proxy_grpc_streaming_dispatch(");
+    assert!(
+        streaming.contains(
+            "client_deadline_owns_failure(grpc_deadline_at, tokio::time::Instant::now())"
+        ),
+        "the streaming header wait must keep the same rule"
+    );
+
+    // Every buffered collect (reqwest, direct H1/H2, sidecar mTLS, HBONE, Unix,
+    // H3 drain) is bounded through one wrapper, which settles a late FAILED
+    // collect as its composed bound and keeps a completed one.
+    let wrapper = source_fn_body(
+        proxy,
+        "pub(crate) async fn collect_response_under_authorization<F>(",
+    );
+    let late = bounded(
+        wrapper,
+        "if output.is_failure()",
+        "Ok(output) => Ok(output),",
+    );
+    assert!(
+        late.contains("tokio::time::Instant::now() >= at") && late.contains("Err(settle())"),
+        "a collect failure at/after the composed bound must settle as that bound"
+    );
+    assert!(
+        proxy.contains("impl<T, E> CollectOutcome for Result<T, E> {")
+            && proxy.contains("impl CollectOutcome for retry::BackendResponse {"),
+        "both collect outcome shapes must report failure to the cutoff"
+    );
+
+    let h1_claim = bounded(
+        proxy,
+        "if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader\n                    && handoff_bound",
+        "let never_sent = try_err.take_message().is_some();",
+    );
+    assert!(
+        h1_claim.contains("direct_h1_handoff_bound_expired("),
+        "a late direct-H1 send failure must settle as its client or authorization bound"
+    );
+
+    let direct = source_fn_body(proxy, "async fn proxy_to_backend_http2(");
+    let direct_send = bounded(
+        direct,
+        "Ok(Ok(Ok(resp))) => Some(resp),",
+        "=> return map_h2_err(e)",
+    );
+    assert!(
+        direct_send.contains("ResponseHeaderDeadlineSource::Client")
+            && direct_send.contains("client_deadline_owns_failure(")
+            && direct_send.contains("client_grpc_deadline_exceeded_response_for_optional_request("),
+        "the direct-H2 header wait must settle a late send failure as the client deadline"
+    );
+
+    for signature in [
+        "async fn proxy_to_backend(",
+        "pub(crate) async fn proxy_to_backend_retry(",
+    ] {
+        let reqwest = source_fn_body(proxy, signature);
+        let before_classify = bounded(
+            reqwest,
+            "reqwest_send_failure_is_client_deadline(",
+            "retry::classify_reqwest_error(&e)",
+        );
+        assert!(
+            before_classify.contains("client_grpc_deadline_exceeded_response_for_request("),
+            "{signature} must settle a late send failure before reqwest classification"
+        );
+    }
+
+    let relay = source_fn_body(h3, "async fn dispatch_grpc_native_h3(");
+    assert_eq!(
+        relay.matches("settle_client_grpc_deadline!();").count(),
+        3,
+        "the native H3 relay's deadline arm and late body and trailer errors must share one \
+         terminal"
+    );
+    let late_body = bounded(
+        relay,
+        "} else if grpc_deadline_active\n",
+        "mark_h3_unsupported",
+    );
+    assert!(
+        late_body.contains("expired_authorization().is_none()")
+            && late_body.contains("settle_client_grpc_deadline!();"),
+        "a late H3 body failure must settle as the client deadline before any capability \
+         downgrade, and only when the authorization lifetime did not win"
+    );
+    let late_trailers = bounded(
+        relay,
+        "Err(_)\n                    if grpc_deadline_active",
+        "mark_h3_unsupported",
+    );
+    assert!(
+        late_trailers.contains("settle_client_grpc_deadline!();"),
+        "a late H3 trailer failure must settle as the client deadline before any capability \
+         downgrade"
+    );
+}
+
+/// Issue #6022, buffered collects: a collect that FAILS after the client
+/// deadline, while the bound's sleep is still unfired, is settled as that
+/// deadline. The collect blocks the runtime's only thread past the deadline, so
+/// the time driver cannot turn before the failure is observed.
+#[tokio::test]
+async fn a_buffered_collect_failing_after_an_unfired_client_deadline_is_the_deadline() {
+    use ferrum_edge::_test_support::{
+        ResponseCollectBoundForTest, fallible_collect_response_under_authorization_for_test,
+    };
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let outcome = fallible_collect_response_under_authorization_for_test(
+        async {
+            std::thread::sleep(Duration::from_millis(30));
+            Err(())
+        },
+        Some(deadline),
+        None,
+    )
+    .await;
+    assert_eq!(outcome, ResponseCollectBoundForTest::RpcDeadline);
+}
+
+/// The cutoff keeps a collect that COMPLETED, however late it is observed, and
+/// keeps a failure observed before the deadline as the backend's.
+#[tokio::test]
+async fn a_buffered_collect_keeps_late_success_and_early_failure() {
+    use ferrum_edge::_test_support::{
+        ResponseCollectBoundForTest, fallible_collect_response_under_authorization_for_test,
+    };
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let late_success = fallible_collect_response_under_authorization_for_test(
+        async {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(())
+        },
+        Some(deadline),
+        None,
+    )
+    .await;
+    assert_eq!(late_success, ResponseCollectBoundForTest::Completed);
+
+    let early_failure = fallible_collect_response_under_authorization_for_test(
+        async { Err(()) },
+        Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        early_failure,
+        ResponseCollectBoundForTest::Completed,
+        "a failure before the deadline reaches the caller as the collect's own error"
+    );
+}

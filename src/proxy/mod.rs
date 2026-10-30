@@ -48704,6 +48704,17 @@ pub(crate) async fn proxy_to_backend_retry(
                     buffered_trailers: None,
                 };
             }
+            if reqwest_send_failure_is_client_deadline(
+                send_bound,
+                request_ctx.grpc_deadline_at(),
+                header_deadline_at,
+            ) {
+                return client_grpc_deadline_exceeded_response_for_request(
+                    request_ctx,
+                    headers,
+                    resolved_ip,
+                );
+            }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::TlsError {
                 crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
@@ -53094,6 +53105,21 @@ async fn proxy_to_backend(
                     backend_admission_permits,
                 );
             }
+            if reqwest_send_failure_is_client_deadline(
+                send_bound,
+                request_ctx.grpc_deadline_at(),
+                header_deadline_at,
+            ) {
+                return backend_dispatch_response(
+                    client_grpc_deadline_exceeded_response_for_request(
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                    ),
+                    retained_body,
+                    backend_admission_permits,
+                );
+            }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::TlsError {
                 crate::diagnostic_ref::note_backend_tls_failure(request_ctx.diagnostic_slot(), &e);
@@ -54162,6 +54188,29 @@ async fn proxy_to_backend_direct_h1(
                     // the same as a reused reqwest connection, which publishes
                     // no socket at all.
                     continue;
+                }
+                // A send failure observed at/after the client RPC deadline or
+                // authorization bound is that bound, exactly as the timer arm
+                // above settles it (issue #6022).
+                if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader
+                    && handoff_bound
+                        .at
+                        .is_some_and(|at| tokio::time::Instant::now() >= at)
+                {
+                    if let Some(pump) = upload_pump.as_mut() {
+                        pump.cancel();
+                    }
+                    return direct_h1_handoff_bound_expired(
+                        proxy,
+                        handoff_bound.source,
+                        send_bound,
+                        send_auth_deadline.as_ref(),
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                        retained_body,
+                        backend_admission_permits,
+                    );
                 }
                 let never_sent = try_err.take_message().is_some();
                 let err = try_err.into_error();
@@ -58637,6 +58686,13 @@ pub(crate) enum ResponseCollectBound {
 /// Attribution comes from the COMPOSED bound, never from re-reading the clock
 /// after the fact, so a collect that was simply not polled until after both
 /// instants had passed still reports the bound that actually ended it.
+///
+/// A collect that FAILS at or after the composed bound is settled as that
+/// bound, exactly as if its timer had fired first (issue #6022): otherwise a
+/// backend enforcing the forwarded `grpc-timeout` with `CANCEL` is charged
+/// whenever the timer wheel lags the reset. The clock decides only whether the
+/// bound applies; which bound it is still comes from the composition. A
+/// collect that completed keeps its result however late it is observed.
 pub(crate) async fn collect_response_under_authorization<F>(
     grpc_deadline_at: Option<tokio::time::Instant>,
     auth: Option<&RequestAuthLifetimePlan>,
@@ -58644,15 +58700,60 @@ pub(crate) async fn collect_response_under_authorization<F>(
 ) -> Result<F::Output, ResponseCollectBound>
 where
     F: std::future::Future,
+    F::Output: CollectOutcome,
 {
     let bound = compose_dispatch_phase_auth_bound(grpc_deadline_at, auth);
+    let settle = || match dispatch_phase_authorization_expiry(bound, auth) {
+        Some(_) => ResponseCollectBound::AuthorizationExpired,
+        None => ResponseCollectBound::RpcDeadline,
+    };
     match crate::plugins::await_deadline_first(bound.at, collect).await {
+        Ok(output)
+            if output.is_failure()
+                && bound.at.is_some_and(|at| tokio::time::Instant::now() >= at) =>
+        {
+            Err(settle())
+        }
         Ok(output) => Ok(output),
-        Err(()) => match dispatch_phase_authorization_expiry(bound, auth) {
-            Some(_) => Err(ResponseCollectBound::AuthorizationExpired),
-            None => Err(ResponseCollectBound::RpcDeadline),
-        },
+        Err(()) => Err(settle()),
     }
+}
+
+/// Whether a buffered collect ended in failure, for the late-failure cutoff in
+/// [`collect_response_under_authorization`] (issue #6022).
+pub(crate) trait CollectOutcome {
+    fn is_failure(&self) -> bool;
+}
+
+impl<T, E> CollectOutcome for Result<T, E> {
+    fn is_failure(&self) -> bool {
+        self.is_err()
+    }
+}
+
+impl CollectOutcome for retry::BackendResponse {
+    fn is_failure(&self) -> bool {
+        self.error_class.is_some()
+    }
+}
+
+/// Whether a reqwest `send()` failure observed now belongs to the client RPC
+/// deadline that composed `bound` (issue #6022): the client deadline, not the
+/// authorization lifetime, owns the bound, no earlier operator response-header
+/// bound applies, and the deadline has passed. Settled as that deadline, as if
+/// the bound's timer had fired first.
+fn reqwest_send_failure_is_client_deadline(
+    bound: DispatchPhaseBound,
+    client_deadline_at: Option<tokio::time::Instant>,
+    header_deadline_at: Option<tokio::time::Instant>,
+) -> bool {
+    !bound.authorization_wins
+        && client_deadline_at
+            .is_some_and(|client| header_deadline_at.is_none_or(|header| client <= header))
+        && crate::proxy::grpc_proxy::client_deadline_owns_failure(
+            client_deadline_at,
+            tokio::time::Instant::now(),
+        )
 }
 
 /// Attribute an already-fired composed dispatch-phase bound (issue #3815).
@@ -64422,6 +64523,29 @@ async fn proxy_to_backend_http2(
         .await;
         match bounded {
             Ok(Ok(Ok(resp))) => Some(resp),
+            // A send failure observed at/after the client deadline, before its
+            // timer fired, is that deadline (issue #6022). The gateway-owned
+            // size and write-watermark terminals keep precedence.
+            Ok(Ok(Err(_)))
+                if deadline_source == ResponseHeaderDeadlineSource::Client
+                    && !body_size_exceeded.load(std::sync::atomic::Ordering::Acquire)
+                    && !passthrough_write_timeout
+                        .as_ref()
+                        .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
+                    && crate::proxy::grpc_proxy::client_deadline_owns_failure(
+                        Some(deadline),
+                        tokio::time::Instant::now(),
+                    ) =>
+            {
+                return (
+                    client_grpc_deadline_exceeded_response_for_optional_request(
+                        ctx,
+                        headers,
+                        resolved_ip,
+                    ),
+                    None,
+                );
+            }
             Ok(Ok(Err(e))) => return map_h2_err(e),
             Err(()) => {
                 header_write_watermark_expired = true;

@@ -2609,6 +2609,13 @@ pub mod _test_support {
         crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
     }
 
+    pub fn client_deadline_owns_failure_for_test(
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        crate::proxy::grpc_proxy::client_deadline_owns_failure(deadline, now)
+    }
+
     pub fn direct_h2_send_request_error_response_for_class_for_test(
         error_class: crate::retry::ErrorClass,
         resolved_ip: Option<String>,
@@ -11800,9 +11807,38 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        match crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
-            .await
-        {
+        // An infallible collect: only the bound itself can end it.
+        let collect = async move { Ok::<_, std::convert::Infallible>(collect.await) };
+        response_collect_bound_for_test(
+            crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+                .await,
+        )
+    }
+
+    /// [`collect_response_under_authorization_for_test`] for a collect that can
+    /// FAIL, so a test can drive the late-failure cutoff (issue #6022).
+    pub async fn fallible_collect_response_under_authorization_for_test<F>(
+        collect: F,
+        grpc_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> ResponseCollectBoundForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        response_collect_bound_for_test(
+            crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+                .await,
+        )
+    }
+
+    fn response_collect_bound_for_test<T>(
+        outcome: Result<T, crate::proxy::ResponseCollectBound>,
+    ) -> ResponseCollectBoundForTest {
+        match outcome {
             Ok(_) => ResponseCollectBoundForTest::Completed,
             Err(crate::proxy::ResponseCollectBound::RpcDeadline) => {
                 ResponseCollectBoundForTest::RpcDeadline
