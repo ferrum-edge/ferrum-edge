@@ -157,47 +157,8 @@ export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/client-ca-bundl
 - Only clients with certificates from trusted CAs can connect to HTTPS port
 - HTTP port remains unencrypted (can be blocked by firewall if needed)
 
-## Architecture Benefits
+### 4. TLS Only (No Plaintext)
 
-### Separate Listeners vs Single Port
-
-HTTP and HTTPS are served on separate listeners (defaults: HTTP `8000`, HTTPS
-`8443`, both configurable) rather than one port with protocol detection:
-
-- Each listener handles one protocol, so plaintext clients never hit a TLS
-  handshake failure.
-- The plaintext port can be disabled (`0`) or firewalled in production.
-- Load balancers and clients get a distinct endpoint per protocol.
-
-### Listener Management
-
-```bash
-# Startup logs show clear listener status:
-Starting HTTP proxy listener on 0.0.0.0:8000
-Starting HTTPS proxy listener on 0.0.0.0:8443
-# OR
-TLS not configured - HTTPS listener disabled
-```
-
-### Deployment Flexibility
-
-**Development:**
-```bash
-# HTTP only for easy development
-./ferrum-edge run
-# Access: http://localhost:8000
-```
-
-**Staging:**
-```bash
-# Both HTTP and HTTPS for testing
-export FERRUM_FRONTEND_TLS_CERT_PATH="./staging.crt"
-export FERRUM_FRONTEND_TLS_KEY_PATH="./staging.key"
-./ferrum-edge run
-# Access: http://localhost:8000 AND https://localhost:8443
-```
-
-**Production (TLS-only, no plaintext):**
 ```bash
 # Disable all plaintext listeners at the gateway level
 export FERRUM_PROXY_HTTP_PORT=0      # Disable plaintext proxy
@@ -221,23 +182,15 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
 > **Tip**: Setting port to `0` prevents the listener from binding at all, which is more secure than relying on a firewall to block the port. The gateway logs `FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled` and `FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled` at startup to confirm.
 > The same disable behavior applies to `FERRUM_PROXY_HTTPS_PORT=0` and `FERRUM_ADMIN_HTTPS_PORT=0` in every serving mode (database, file, CP, DP, and mesh) when TLS material is configured. See the `FERRUM_ADMIN_HTTPS_PORT` row in [configuration.md](configuration.md) for the full port-0 contract, including the config-level scope and the file-mode `ServeOptions` pre-bound exception.
 
-## Use Cases
+### Separate Listeners
 
-### HTTP Mode
-- **Development environments** where encryption isn't needed
-- **Internal networks** with trusted network segments
-- **Testing and debugging** scenarios
+HTTP and HTTPS are served on separate listeners (defaults: HTTP `8000`, HTTPS
+`8443`, both configurable) rather than one port with protocol detection:
 
-### HTTPS Mode
-- **Public-facing APIs** requiring encryption
-- **Production environments** with security requirements
-- **Compliance** with data protection regulations
-
-### mTLS Mode
-- **Enterprise APIs** with strict security requirements
-- **Microservices** communication within trusted networks
-- **Zero-trust architectures** where all connections must be authenticated
-- **Financial services** and healthcare applications
+- Each listener handles one protocol, so plaintext clients never hit a TLS
+  handshake failure.
+- The plaintext port can be disabled (`0`) or firewalled in production.
+- Load balancers and clients get a distinct endpoint per protocol.
 
 ## Certificate Requirements
 
@@ -317,50 +270,19 @@ export FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret"
 
 ### Admin API Configuration Scenarios
 
-#### **1. Admin HTTP Only (Default)**
-```bash
-./ferrum-edge run
-# Admin HTTP: http://localhost:9000
-# No Admin HTTPS
-```
+The admin listeners follow the proxy scenarios above: with no admin TLS material only
+admin HTTP (`9000`) is served; setting `FERRUM_ADMIN_TLS_CERT_PATH` /
+`FERRUM_ADMIN_TLS_KEY_PATH` adds admin HTTPS (`9443`); adding
+`FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` requires client certificates on it; and
+`FERRUM_ADMIN_HTTP_PORT=0` leaves admin HTTPS as the only admin listener:
 
-#### **2. Admin HTTP + HTTPS**
-```bash
-export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
-export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
-./ferrum-edge run
-# Admin HTTP: http://localhost:9000
-# Admin HTTPS: https://localhost:9443
-```
-
-#### **3. Admin HTTP + mTLS**
-```bash
-export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
-export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
-export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pem"
-./ferrum-edge run
-# Admin HTTP: http://localhost:9000
-# Admin HTTPS/mTLS: https://localhost:9443 (client certs required)
-```
-
-#### **4. Admin HTTPS Only (No Plaintext)**
 ```bash
 export FERRUM_ADMIN_HTTP_PORT=0  # Disable plaintext admin
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
+export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pem"
 ./ferrum-edge run
-# Admin HTTPS only: https://localhost:9443
-# No HTTP listener — plaintext admin requests are impossible
-```
-
-#### **5. Admin HTTPS with No-Verify (Testing)**
-```bash
-export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
-export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
-export FERRUM_ADMIN_TLS_NO_VERIFY="true"
-./ferrum-edge run
-# Admin HTTP: http://localhost:9000
-# Admin HTTPS: https://localhost:9443 (no cert verification)
+# Admin HTTPS/mTLS only: https://localhost:9443 (client certs required)
 ```
 
 ### Admin API Security Notes
@@ -368,8 +290,8 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 - **mTLS Support**: The admin HTTPS listener can require and verify client certificates
 - **Custom CA Bundle**: Can use internal/private CAs for admin client verification
 - **No-Verify Mode**: Available for testing (NEVER use in production)
-- **JWT Required**: All admin endpoints require JWT authentication
-- **Same Security**: HTTP and HTTPS endpoints have identical security requirements
+- **JWT Required for Management Routes**: Management routes require an admin JWT on both the HTTP and HTTPS listeners
+- **Tiered Observability**: `/live` and the minimal `/health`, `/status`, and `/overload` tiers are unauthenticated. Detail and `/metrics` need a non-namespace-bounded admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP in `FERRUM_METRICS_ALLOWED_CIDRS`; a namespace-bounded JWT gets the tenant tier and is refused (`403`) on `/metrics`. See [Hardening → Observability endpoints](hardening.md#2-observability-endpoints)
 - **Operating Modes**: The Admin API is read-write in database and CP modes and read-only in file and DP modes
 
 ### No-Verify Mode (Testing Only)
@@ -381,19 +303,6 @@ The no-verify mode is designed for development, testing, and isolated environmen
 - **Security Risk**: Disables ALL certificate verification
 - **Man-in-the-Middle**: Vulnerable to certificate spoofing attacks
 - **Production Warning**: NEVER use in production environments — mesh production mode and FIPS enforce fail closed rather than warning
-
-#### **Use Cases**
-```bash
-# Development with self-signed certificates
-export FERRUM_ADMIN_TLS_NO_VERIFY="true"
-export FERRUM_TLS_NO_VERIFY="true"
-
-# Internal testing with custom CAs
-export FERRUM_ADMIN_TLS_NO_VERIFY="true"
-
-# Staging with temporary certificates
-export FERRUM_ADMIN_TLS_NO_VERIFY="true"
-```
 
 #### **Warnings**
 The gateway logs warnings at startup when no-verify is enabled, for example:
@@ -673,7 +582,7 @@ A response is admitted only when all of the following hold.
 |---|---|
 | Size | The DER exceeds 64 KiB. The bound is enforced before parsing. |
 | Envelope | `responseStatus` is not `successful(0)`, or `responseType` is not `id-pkix-ocsp-basic`. |
-| Encoding | The `BasicOCSPResponse`, `ResponseData`, `SingleResponse`, or `CertID` is malformed, carries trailing bytes, uses non-minimal DER length octets at an OCSP grammar boundary, explicitly encodes the `ResponseData.version` DEFAULT `v1` (DER omits a `DEFAULT` value) or declares any other version, contains no `SingleResponse`, or contains more than 64 `SingleResponse` entries. `ResponseData` and `SingleResponse` are consumed to their last byte: every `GeneralizedTime` (including `producedAt` and `revocationTime`) must use DER's exact `YYYYMMDDHHMMSSZ` form and decode successfully; timezone-less, explicit-offset, and fractional-second forms are refused. `nextUpdate [0]` and `singleExtensions [1]` may each appear at most once and only in that order, `responseExtensions [1]` at most once after `responses`, and any unknown, duplicate, misordered, or trailing element is refused. The `certStatus` CHOICE is checked as an encoding, not just a tag: `good [0]` and `unknown [2]` must be primitive and empty, and `revoked [1]` must be a well-formed `RevokedInfo`. Every field boundary is checked for ASN.1 class and primitive/constructed form as well as tag number, so a context-specific element reusing a universal tag number, a primitive `SEQUENCE`, or a constructed `OCTET STRING` is refused rather than decoded as the field it imitates. Primitive contents are then checked against their type-specific DER rules: OBJECT IDENTIFIER values (including ignored extension OIDs) must be a complete canonical encoding (nonempty, terminated base-128, no redundant leading `0x80` group); INTEGER and ENUMERATED values must be nonempty and minimal (one sign-protection `0x00` only when the next byte has its high bit set); a CertID serial must be nonnegative; `successful(0)` is the single content octet `0x00`; the signature BIT STRING must be octet-aligned (`unused_bits == 0`) and nonempty; and `AlgorithmIdentifier` parameters follow a field- and algorithm-specific profile. `CertID.hashAlgorithm` accepts absent or canonical NULL for digest identifiers (the two encodings RFC 4055 / RFC 5754 require receivers to handle), including unknown hash OIDs at the certificate-independent admin boundary — full certificate-bound validation still refuses an unsupported hash. `BasicOCSPResponse.signatureAlgorithm` applies the verifier-supported family instead of that digest rule: `ecdsa-with-SHA256` / `ecdsa-with-SHA384` and Ed25519 require absent parameters (RFC 5758 / RFC 8410), so a NULL that `x509_parser::verify_signature` would ignore is refused; RSA PKCS#1 (`sha*WithRSAEncryption`) requires the canonical NULL RFC 3279 and RFC 5754 specify when generating, so this strict-stapling policy rejects an omitted NULL that some receivers still accept; `rsassa-pss` requires present parameters parseable on the verification path (SHA-256/384/512, MGF1 with the same hash, saltLength equal to the hash output length, trailerField omitted, no trailing fields). This is not a complete RFC 4055 strictness claim. An unknown signature OID is refused at this grammar so it cannot be stored or served. |
+| Encoding | The response violates the strict DER grammar in [OCSP encoding rules](#ocsp-encoding-rules), including more than 64 `SingleResponse` entries. |
 | Extensions | An `Extensions` container is not a non-empty `SEQUENCE` of at most 32 well-formed `Extension`s (DER omits `critical` when `FALSE`), it repeats one extension OID (X.509 forbids a duplicate extension type, and Ferrum ignores supported non-critical extensions), or it carries a **critical** extension. Ferrum implements no OCSP response extension, so RFC 6960 §4.4 does not let it ignore a critical one; non-critical extensions are ignored after that strict parse. |
 | Certificate binding | No `SingleResponse` `CertID` matches the served leaf's serial number together with the `issuerNameHash` and `issuerKeyHash` of the configured issuer, recomputed under the `CertID` hash algorithm (SHA-1, SHA-256, SHA-384, or SHA-512); a serial-matching entry uses an unsupported hash algorithm (the whole response fails closed even when another entry would match); or **more than one** entry matches, including duplicates that use different supported hash algorithms, because the status a strict client would select is then ambiguous. |
 | Issuer availability | No certificate in the served chain is proven to have signed the leaf. A matching subject name is not enough: same-name candidates are scanned until one verifies the leaf's signature, and a self-issued leaf is accepted as its own issuer only when it is genuinely self-signed. |
@@ -806,6 +715,25 @@ the window — so the signal is not load-time only — and is exported as
 structural reason. They never contain certificate bytes, response bytes, private
 material, or a secret source reference.
 
+#### OCSP encoding rules
+
+A response is refused at the encoding check when any of the following holds:
+
+- The `BasicOCSPResponse`, `ResponseData`, `SingleResponse`, or `CertID` is malformed, carries trailing bytes, or uses non-minimal DER length octets at an OCSP grammar boundary.
+- `ResponseData.version` explicitly encodes the DEFAULT `v1` (DER omits a `DEFAULT` value) or declares any other version.
+- It contains no `SingleResponse`, or more than 64 `SingleResponse` entries.
+- `ResponseData` and `SingleResponse` are not consumed to their last byte, or a `GeneralizedTime` (including `producedAt` and `revocationTime`) does not use DER's exact `YYYYMMDDHHMMSSZ` form or fails to decode; timezone-less, explicit-offset, and fractional-second forms are refused.
+- `nextUpdate [0]` or `singleExtensions [1]` appears more than once or out of that order, `responseExtensions [1]` appears more than once or before `responses`, or any unknown, duplicate, misordered, or trailing element is present.
+- The `certStatus` CHOICE is malformed as an encoding, not just a tag: `good [0]` and `unknown [2]` must be primitive and empty, and `revoked [1]` must be a well-formed `RevokedInfo`.
+- A field boundary has the wrong ASN.1 class or primitive/constructed form as well as tag number, so a context-specific element reusing a universal tag number, a primitive `SEQUENCE`, or a constructed `OCTET STRING` is refused rather than decoded as the field it imitates.
+- A primitive value breaks its type-specific DER rule: OBJECT IDENTIFIER values (including ignored extension OIDs) must be a complete canonical encoding (nonempty, terminated base-128, no redundant leading `0x80` group); INTEGER and ENUMERATED values must be nonempty and minimal (one sign-protection `0x00` only when the next byte has its high bit set); a CertID serial must be nonnegative; `successful(0)` is the single content octet `0x00`; the signature BIT STRING must be octet-aligned (`unused_bits == 0`) and nonempty.
+- `AlgorithmIdentifier` parameters break their field- and algorithm-specific profile:
+  - `CertID.hashAlgorithm` accepts absent or canonical NULL for digest identifiers (the two encodings RFC 4055 / RFC 5754 require receivers to handle), including unknown hash OIDs at the certificate-independent admin boundary — full certificate-bound validation still refuses an unsupported hash.
+  - `BasicOCSPResponse.signatureAlgorithm` applies the verifier-supported family instead of that digest rule: `ecdsa-with-SHA256` / `ecdsa-with-SHA384` and Ed25519 require absent parameters (RFC 5758 / RFC 8410), so a NULL that `x509_parser::verify_signature` would ignore is refused; RSA PKCS#1 (`sha*WithRSAEncryption`) requires the canonical NULL RFC 3279 and RFC 5754 specify when generating, so this strict-stapling policy rejects an omitted NULL that some receivers still accept; `rsassa-pss` requires present parameters parseable on the verification path (SHA-256/384/512, MGF1 with the same hash, saltLength equal to the hash output length, trailerField omitted, no trailing fields).
+  - An unknown signature OID is refused at this grammar so it cannot be stored or served.
+
+This is not a complete RFC 4055 strictness claim.
+
 ### Client-Trust Generations and Established-Transport Retirement
 
 Live-reloading a CRL or a client-CA bundle rebuilds the verifier used for **new**
@@ -862,28 +790,20 @@ config the endpoint was built with, not of a later re-read of the same sources.
 In DP mode the control plane owns the active **server certificate** when it has
 delivered Gateway TLS material, and the operator still owns **client trust**
 (the client-CA bundle and CRL). An accepted operator CRL or client-CA reload
-must not substitute the operator server certificate into the H1/H2/TCP slot
-while that CP material is present. CP-delivered H1/H2/TCP (and TCP+TLS stream)
-configs therefore keep the CP server certificate/resolver and bind
-`ClientTrustScope::ProxyFrontend`'s live handshake wrapper, so a new connection
-after the accepted reload uses only the new operator verifier — including an
-additive CA overlap or a CRL unrevocation, which post-handshake revalidation
-cannot admit on its own. The wrapper's CertificateRequest CA-name hints are
-generation-neutral (empty): rustls then omits or does not constrain the
-`certificate_authorities` hint, so a client that honors those names can still
-present a certificate issued by a CA added after that CP `ServerConfig` was
-built. The presented chain is verified only by the currently published
-fail-closed operator verifier; empty hints do not broaden trust. HTTP/3 still
-has to install the new trust through its asynchronous endpoint apply: the DP
-publishes one accepted candidate that pairs the live CP server config with the
-same accepted operator verifier and semantic identity, then wakes the QUIC
-listener so `ProxyH3` installs that pair through its one rustls transaction
-(live verifier → `Endpoint::set_server_config` → generation/fence). A refused
-operator candidate never enters that slot and never replaces the live verifier,
-so every family keeps its last-good verifier, config, generation, and sessions.
-Clearing CP material restores the latest accepted operator candidate — not a
-startup snapshot captured when CP material first arrived. This does not add
-CP-delivered client-CA support.
+never substitutes the operator server certificate into the H1/H2/TCP slot while
+that CP material is present. CP-delivered H1/H2/TCP (and TCP+TLS stream) configs
+keep the CP server certificate and bind `ClientTrustScope::ProxyFrontend`'s live
+handshake verifier ([`src/tls/client_trust.rs`](../src/tls/client_trust.rs)), so
+a new connection after the accepted reload uses only the new operator verifier —
+including an additive CA overlap or a CRL unrevocation. That verifier's
+CertificateRequest carries no CA-name hints; empty hints do not broaden trust,
+because the presented chain is verified only by the published fail-closed
+operator verifier. HTTP/3 installs the same accepted verifier paired with the
+live CP server config through its asynchronous endpoint apply. A refused
+operator candidate never replaces the live verifier, so every family keeps its
+last-good verifier, config, generation, and sessions. Clearing CP material
+restores the latest accepted operator candidate, not a startup snapshot. This
+does not add CP-delivered client-CA support.
 
 A data plane may have **no operator server certificate at all**: with
 `FERRUM_PROXY_HTTPS_PORT` enabled and no `FERRUM_FRONTEND_TLS_CERT_PATH` /
@@ -1077,58 +997,26 @@ only in deployments that enabled frontend TLS live reload.
 
 #### Race behaviour
 
-On rustls surfaces (proxy HTTPS / HTTP-2 / TCP+TLS, admin HTTPS, HTTP/3), each
-listener family owns exactly one client-trust scope. An accepted candidate is
-published as **one rustls transaction for that singular scope**, and only after
-every fallible rebuild has succeeded. That transaction holds the scope
-publication lock continuously across: install the live handshake verifier,
-execute the already-validated infallible config exposure/adoption (slot swap /
-`Endpoint::set_server_config`), then publish that same candidate's material,
-generation, fence, and session sweep. Installing a stricter verifier slightly
-before its config is conservative — a stale config refuses withdrawn
-credentials. Holding the lock across those steps is what keeps concurrent V2/V3
-publications from serving verifier V3 with config/material V2 (or the converse).
-A refused candidate never enters the transaction and never replaces the live
-verifier. HTTP/3 remains independently owned and published by its own `ProxyH3`
-scope; the HTTPS/H2 reload task never publishes H3's generation.
+Each accepted candidate is published as one transaction per scope, and only
+after every fallible rebuild has succeeded. On rustls surfaces the live
+handshake verifier, the config swap (or `Endpoint::set_server_config` for
+HTTP/3), and the candidate's material, generation, fence, and session sweep are
+applied under one publication lock, so a listener never serves one candidate's
+verifier with another's config. A refused candidate never replaces the live
+verifier. HTTP/3 publishes only its own `ProxyH3` scope; its reload wakeups can
+coalesce, but the endpoint always installs and reports one whole candidate.
 
-DTLS has no rustls live verifier. It keeps the distinct config-before-generation
-order: the DTLS generation is published into every active `DtlsServer` first,
-then the trust generation advances.
+DTLS has no rustls live verifier: it publishes the new config into every active
+`DtlsServer` before advancing the generation. A DTLS session handed to the proxy
+before the driver drains its final flight is still bound by the fence its
+accepted connection carries, and a refused peer never receives that flight.
 
-The DTLS driver also commits its internal accept handoff *before* draining the
-server's queued final flight, so there is a short interval in which the proxy
-handler exists while the peer has not yet seen the flight. That interval is
-covered by the fence the accepted connection carries rather than by the
-handoff's own race: a withdrawal landing inside it retires the session, the
-handler starts no hook and no backend stage, and the driver still discards every
-queued packet on a trust withdrawal. The existing client-certificate refusal
-path — which returns *before* the flight is emitted, so a refused peer never
-receives it — is unchanged.
-
-Admission is the mirror image: a listener captures the generation first and
-loads the configuration second. A connection can therefore capture a generation
-that is *older* than the material it actually handshakes with — the conservative
-direction, costing at most one unnecessary retirement for a connection
-handshaking exactly across a withdrawal — but never a newer one, so none can
-escape the fence. The TCP+TLS accept path is the exception to the ordering
-itself — it snapshots the TLS configuration for a connection before reading the
-generation, so it can hold a post-withdrawal generation beside a pre-withdrawal
-configuration. Its outcome is unchanged, because every rustls surface also
-re-verifies the presented chain against the live published verifier once the
-handshake completes, and that verifier is installed before the generation
-advances: a connection observing generation G meets a verifier at or newer than
-G, so a credential withdrawn at or before G is refused there and one withdrawn
-after G is caught by the fence. A connection being registered while a
-publication sweeps is caught by a post-registration re-check against the same
-fence, so it can neither escape nor repopulate the registry after the sweep.
-
-The HTTP/3 revision channel is a wakeup, not a queue: several accepted
-candidates can coalesce into one notification, and the sources can rotate again
-between the wakeup and the rebuild. Neither can desynchronize what that endpoint
-enforces from what it reports, because the candidate is taken as one value —
-whichever candidate is installed is the candidate whose identity is published,
-and one that arrives afterwards simply wakes the listener again.
+Admission captures the generation before loading the configuration, and every
+rustls surface re-verifies the presented chain against the live verifier once
+the handshake completes, so a connection racing a withdrawal can at worst be
+retired unnecessarily, never escape the fence. A connection registered while a
+publication sweeps is caught by a post-registration re-check. Implementation:
+[`src/tls/client_trust.rs`](../src/tls/client_trust.rs).
 
 #### Observability
 
@@ -1212,19 +1100,7 @@ for the per-protocol details.
 
 ## Security Best Practices
 
-### Production Environments
-1. **Use certificates from trusted CAs** for server certificates
-2. **Implement proper certificate lifecycle management** (renewal, revocation)
-3. **Use strong cryptographic algorithms** (RSA 2048+, ECDSA)
-4. **Protect private keys** with appropriate file permissions
-5. **Enable certificate revocation checking** when using CRLs or OCSP
-
-### mTLS Considerations
-1. **Limit client CA scope** to only necessary certificates
-2. **Implement certificate expiration monitoring**
-3. **Consider certificate short lifetimes** for enhanced security
-4. **Document certificate issuance procedures**
-5. **Plan for certificate compromise scenarios**
+For production frontend TLS settings, see [Hardening → Frontend TLS](hardening.md#3-frontend-tls).
 
 ### Client-Certificate Authorization Lifetime
 
@@ -1296,7 +1172,7 @@ protocol-neutral contract. That single value is what bounds:
   `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS`), on H1 Upgrade, H2 Extended CONNECT,
   and H3 Extended CONNECT;
 - generic HTTP/SSE, native gRPC, and gRPC-Web streaming bodies (see
-  [Authorization Lifetime of an Admitted Stream](response_body_streaming.md#authorization-lifetime-of-an-admitted-stream));
+  [Authorization Lifetime of an Admitted Stream](stream_authorization_lifetime.md));
 - TCP+TLS and UDP+DTLS stream sessions, whose `on_stream_connect` admission runs
   exactly once and would otherwise leave a continuously active relay unbounded.
 
@@ -1471,7 +1347,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | `FERRUM_TLS_MAX_VERSION` | `1.3` | Maximum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
 | `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated cipher suites (inbound + outbound) |
 | `FERRUM_TLS_KEY_EXCHANGE_GROUPS` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound). `FERRUM_TLS_CURVES` is accepted as an alias |
-| `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher preference for TLS 1.2 (inbound only) |
+| `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher-suite preference (inbound only; TLS 1.2 and 1.3) |
 | `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Inbound stateful session cache for TLS 1.2 session IDs and HTTP/3 server 0-RTT sessions |
 
 ### Protocol Version Examples
@@ -1550,7 +1426,7 @@ export FERRUM_TLS_KEY_EXCHANGE_GROUPS="X25519,secp256r1,secp384r1"
 
 ### Server Cipher Order
 
-When `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` is `true` (the default), the server's cipher suite preference takes priority over the client's during TLS 1.2 negotiation. This ensures the gateway's configured preference is selected regardless of client ordering. TLS 1.3 does not use this setting (server always selects).
+When `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` is `true` (the default), the gateway's configured suite order wins over the client's for both TLS 1.2 and TLS 1.3; when `false`, the client's order wins.
 
 ```bash
 # Let server choose (recommended, default)
@@ -1589,12 +1465,9 @@ When using load balancers:
 2. **TLS Pass-Through**: Configure HTTPS/mTLS mode on gateway
 3. **Health Checks**: Ensure health checks work with your TLS configuration
 
-## Performance Considerations
+## Session Resumption
 
-- **TLS Handshake Overhead**: Initial connections have higher latency
-- **Session Resumption**: Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption (TLS 1.3 tickets, TLS 1.2 tickets and the TLS 1.2 session-ID cache) is disabled on an mTLS listener whose client verifier enforces a CRL, so every handshake reaches the CRL `nextUpdate` check, and on an mTLS listener whose client-trust scope can advance under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, so a session cannot outlive an accepted client-CA or CRL withdrawal. Static mTLS listeners without a CRL retain normal resumption. Resumption otherwise saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
-- **Hardware Acceleration**: Consider for high-throughput scenarios
-- **Certificate Size**: Smaller certificates improve performance
+Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption (TLS 1.3 tickets, TLS 1.2 tickets and the TLS 1.2 session-ID cache) is disabled on an mTLS listener whose client verifier enforces a CRL, so every handshake reaches the CRL `nextUpdate` check, and on an mTLS listener whose client-trust scope can advance under `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, so a session cannot outlive an accepted client-CA or CRL withdrawal. Static mTLS listeners without a CRL retain normal resumption. Resumption otherwise saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
 
 ## Migration Guide
 

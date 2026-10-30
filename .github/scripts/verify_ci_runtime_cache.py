@@ -77,7 +77,6 @@ SETUP_RUST = REPO_ROOT / ".github" / "actions" / "setup-rust-ci" / "action.yml"
 SETUP_SCCACHE = REPO_ROOT / ".github" / "actions" / "setup-sccache" / "action.yml"
 SETUP_FAST_LINKER = REPO_ROOT / ".github" / "actions" / "setup-fast-linker" / "action.yml"
 CI_CD_DOC = REPO_ROOT / "docs" / "ci_cd.md"
-FIPS_DOC = REPO_ROOT / "docs" / "fips.md"
 COVERAGE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "coverage.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 PERFORMANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "performance-regression.yml"
@@ -5029,7 +5028,6 @@ def check_shared_actions(failures: list[str]) -> None:
 
 def check_docs_and_coverage(failures: list[str]) -> None:
     ci_cd = read_pinned(CI_CD_DOC)
-    fips_doc = read_pinned(FIPS_DOC)
     coverage = read_pinned(COVERAGE_WORKFLOW)
     require(
         "`fips-build.yml`" in ci_cd or "fips-build.yml" in ci_cd,
@@ -5222,59 +5220,59 @@ def check_docs_and_coverage(failures: list[str]) -> None:
         failures,
     )
     require(
-        "trusted" in fips_doc.lower() and "cache" in fips_doc.lower(),
-        "docs/fips.md must describe the FIPS CI cache trust boundary",
+        "trusted" in ci_cd.lower() and "cache" in ci_cd.lower(),
+        "docs/ci_cd.md must describe the FIPS CI cache trust boundary",
         failures,
     )
     require(
-        "save-if" in fips_doc,
-        "docs/fips.md must document rust-cache save-if so fork PRs cannot save",
+        "save-if" in ci_cd,
+        "docs/ci_cd.md must document rust-cache save-if so fork PRs cannot save",
         failures,
     )
     require(
-        "fips-producer" in fips_doc
-        and "github.sha" in fips_doc
-        and "run_attempt" in fips_doc,
-        "docs/fips.md must document the exact producer cache key",
+        "fips-producer" in ci_cd
+        and "github.sha" in ci_cd
+        and "run_attempt" in ci_cd,
+        "docs/ci_cd.md must document the exact producer cache key",
         failures,
     )
     require(
-        "fips-producer-handoff" in fips_doc
-        and "inter-run" in fips_doc.lower()
-        and "artifact" in fips_doc.lower()
-        and "evict" in fips_doc.lower()
-        and "deletes" in fips_doc.lower()
-        and "zstd" in fips_doc.lower()
-        and "executable modes" in fips_doc.lower(),
-        "docs/fips.md must document the immutable FIPS inter-run artifact, "
+        "fips-producer-handoff" in ci_cd
+        and "inter-run" in ci_cd.lower()
+        and "artifact" in ci_cd.lower()
+        and "evict" in ci_cd.lower()
+        and "deletes" in ci_cd.lower()
+        and "zstd" in ci_cd.lower()
+        and "executable modes" in ci_cd.lower(),
+        "docs/ci_cd.md must document the immutable FIPS inter-run artifact, "
         "mode-preserving payload, cache eviction, and rerun deletion boundary",
         failures,
     )
     require(
-        "fips-test-build" in fips_doc,
-        "docs/fips.md must document the FIPS test-binary producer job",
+        "fips-test-build" in ci_cd,
+        "docs/ci_cd.md must document the FIPS test-binary producer job",
         failures,
     )
     require(
-        "fips-test-binaries-<run_id>-*" in fips_doc
-        and "newest attempt" in fips_doc.lower()
-        and "failed-job rerun" in fips_doc.lower()
-        and "flattens" in fips_doc.lower()
-        and "fips-producer-identity" in fips_doc
-        and "fips-test-identity" in fips_doc,
-        "docs/fips.md must document attempt-wildcard FIPS test-artifact "
+        "fips-test-binaries-<run_id>-*" in ci_cd
+        and "newest attempt" in ci_cd.lower()
+        and "failed-job rerun" in ci_cd.lower()
+        and "flattens" in ci_cd.lower()
+        and "fips-producer-identity" in ci_cd
+        and "fips-test-identity" in ci_cd,
+        "docs/ci_cd.md must document attempt-wildcard FIPS test-artifact "
         "selection for failed-job reruns, one-match flattening, and internal "
         "attempt identity",
         failures,
     )
     require(
-        "mozilla-actions/sccache-action" in fips_doc,
-        "docs/fips.md must name the rejected sccache installer",
+        "mozilla-actions/sccache-action" in ci_cd,
+        "docs/ci_cd.md must name the rejected sccache installer",
         failures,
     )
     require(
-        "shared-key" in fips_doc and "ignored" in fips_doc.lower(),
-        "docs/fips.md must document pinned rust-cache shared-key vs ignored key",
+        "shared-key" in ci_cd and "ignored" in ci_cd.lower(),
+        "docs/ci_cd.md must document pinned rust-cache shared-key vs ignored key",
         failures,
     )
     require(

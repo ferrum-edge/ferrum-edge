@@ -3112,7 +3112,7 @@ pub enum PluginScope {
 ///
 /// HTTP-family proxies route on `hosts` + `listen_path`. At least one of the two
 /// must be set; if both are empty/absent the config is rejected. Stream-family
-/// proxies (`tcp`/`tcp_tls`/`udp`/`dtls`) route on `listen_port` and MUST NOT
+/// proxies (`tcp`/`tcps`/`udp`/`dtls`) route on `listen_port` and MUST NOT
 /// set `listen_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3403,7 +3403,7 @@ pub struct Proxy {
     /// When true, forward encrypted client bytes directly to the backend without
     /// terminating TLS (TCP) or DTLS (UDP). The proxy peeks at the TLS/DTLS
     /// ClientHello to extract SNI for routing and logging but never decrypts
-    /// application data. Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
+    /// application data. Only valid for stream proxies (tcp, tcps, udp, dtls).
     /// Mutually exclusive with `frontend_tls`.
     #[serde(default)]
     pub passthrough: bool,
@@ -3440,7 +3440,7 @@ pub struct Proxy {
     /// Enable inbound PROXY protocol on this stream proxy listener. The
     /// framing depends on the scheme:
     ///
-    /// - `tcp` / `tcp_tls`: PROXY protocol v1 text or v2 binary (auto-detected),
+    /// - `tcp` / `tcps`: PROXY protocol v1 text or v2 binary (auto-detected),
     ///   read once at the head of each accepted connection. A connection that
     ///   does not begin with a valid header is closed immediately (fail closed).
     /// - `udp` / `dtls`: the PROXY protocol v2 DGRAM envelope, present on
@@ -3472,7 +3472,7 @@ pub struct Proxy {
     /// still the raw socket peer (the LB's own IP). This mirrors how
     /// `FERRUM_TRUSTED_PROXIES` + XFF work on the HTTP path.
     ///
-    /// Only valid for `tcp` / `tcp_tls` / `udp` / `dtls` stream proxies.
+    /// Only valid for `tcp` / `tcps` / `udp` / `dtls` stream proxies.
     /// Setting it on an HTTP-family proxy produces a validation error (use
     /// X-Forwarded-For there).
     ///
@@ -6329,7 +6329,7 @@ impl GatewayConfig {
             }
             // `stream_proxy_protocol` is valid on every stream family, with two
             // different framings: the connection-borne PROXY header on
-            // tcp/tcp_tls, and the per-datagram PROXY v2 DGRAM envelope on
+            // tcp/tcps, and the per-datagram PROXY v2 DGRAM envelope on
             // udp/dtls (issue #3289). HTTP-family proxies share the global
             // HTTP/HTTPS listeners, so one proxy cannot decide how a listener
             // reads its first bytes: inbound PROXY protocol for those is the
@@ -6338,7 +6338,7 @@ impl GatewayConfig {
             if proxy.stream_proxy_protocol == Some(true) && !proxy.dispatch_kind.is_stream() {
                 errors.push(format!(
                     "Proxy {:?} (scheme {}) sets stream_proxy_protocol but that field is only \
-                     valid for tcp/tcp_tls/udp/dtls stream proxies — for HTTP-family proxies \
+                     valid for tcp/tcps/udp/dtls stream proxies — for HTTP-family proxies \
                      enable inbound PROXY protocol on the listener with \
                      FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS",
                     proxy.id,

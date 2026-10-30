@@ -4,11 +4,11 @@
 hosted regression fixtures. It does not change coalescing, Content-Length, body limits,
 timeouts, retries, offered load, TLS verification, release optimization settings,
 or forwarding policy. #5600's client frame/chunk/TLS observations and `/proc/io`
-remain distinct sources. #5602 (merged as
-`61c68cb0e73504f389a2fdf065bf5297d6baf3ba`) is not a dependency; preserve its
-error campaign. There are no new performance results here. The prior
-cutoff campaign demonstrated no gain; its failed 5 MiB observations remain valid
-failure evidence and are not replaced by this foundation.
+remain distinct sources. This is instrumentation only: it reports no performance
+result, repairs no 5 MiB drain failure, and does not close issue #5588. Campaign
+results, merge checkpoints, and the earlier failed 5 MiB observations (which remain
+valid failure evidence) are recorded in
+[issue #5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588).
 
 The feature introduces no dependency or crypto-provider edge. `fips,bench-h1-profile`
 is explicitly included in the FIPS optional-profile inventory, so the existing
@@ -295,10 +295,10 @@ sampler timings, not analytically subtracted.
 
 ## Bounded H1 request-drain diagnostic
 
-The retained three 5 MiB drain failures and slow 1 MiB tails still have **no
-proven cause or repair**. Process write accounting near 79 kB/s does not identify
-socket throughput, TCP pacing, a TLS flush, or an HTTP body boundary. This mode
-adds evidence at the client boundary; a clean run alone cannot resolve those
+The retained 5 MiB drain failures and slow 1 MiB tails (issue #5588) have **no
+proven cause or repair**. Process write accounting does not identify socket
+throughput, TCP pacing, a TLS flush, or an HTTP body boundary. This mode adds
+evidence at the client boundary; a clean run alone cannot resolve those
 failures. No production `src/`, allocator, body/counter, H3 observer or global
 clock implementation is changed by this diagnostic addition. Backend upload EOF,
 upstream identity joins, syscall and CPU traces remain later observations; no
@@ -463,11 +463,9 @@ calls use literal executable/script argument lists; variable paths, deadlines
 and owned identities are data in the environment. The immutable-base CI policy
 checker remains the hosted authority.
 
-Manual run **35419342312** is pinned to old head
-`ac7ff645f766597b9e4f38aa9e18272c0b3c249d`. It remains raw prior-revision evidence
-and does not validate the later diagnostic repairs; new hosted checks and any
-manual slice must run on a revision that contains them. No
-passing result, 5 MiB stall repair, performance gain or issue closure is asserted.
+Earlier manual diagnostic runs (issue #5588) are raw prior-revision evidence and
+do not validate later diagnostic repairs; new hosted checks and any manual slice
+must run on a revision that contains them.
 
 Hosted registration: `metrics_tests::h1_diagnostic_tests` exercises actual plain
 and rustls H1 worker paths, opt-in/off useful-work parity, clean responses,
@@ -562,28 +560,20 @@ The live cadence/safety gates above must pass on the exact reviewed head before
 any later aggregation/adapter optimization. They cover only their declared
 contracts, not H1 trailers, all policy modes, full native memory/copy coverage,
 syscalls, sampled CPU, backpressure saturation or performance. Syscall/CPU
-tracing uses the merged H3 foundation in the opt-in follow-up below; hosted
-results and measurement interpretation remain outstanding.
+tracing uses the opt-in follow-up below.
 Review allocator safety/publication, the nondefault feature's hosted results,
 calibration, partial-profile residuals, all-size traffic failures and source
-coverage before interpreting measurements. #5588 is not closed by instrumentation.
+coverage before interpreting measurements. Instrumentation alone does not close #5588.
 
 ## Hosted syscall and CPU follow-up (issue #5588)
 
-The authoritative historical dependency record is
-`h1_profile_manifest.json` → `external_trace.dependency_provenance`; generated
-capabilities and trace manifests read that same record. These are three distinct
-historical checkpoints, **not** three competing definitions of the current head:
-
-| Role | H1 | H3 |
-| --- | --- | --- |
-| Initial bases | `a798c0bac68151fbe860e3cb48843cbd434c0f84` | `d19abaa3c4fbb40af6136cb577a1ed7e82bf8529` |
-| Integration checkpoints | `2491d44b1149bf33dece351595244351d2dbc322` | `e00f0a91cb5ae2b0686392f504471283e6f52b4c` |
-| Reviewed checkpoints | `ac7ff645f766597b9e4f38aa9e18272c0b3c249d` | `45dbde8ccc9575b225890afb450579213d62cb21` |
-
-Subsequent normal integrations are described by Git ancestry. Each capture's
-runner revision and exact source/object/tool hashes identify its actual code;
-the historical pairs do not claim to enumerate all integrated parents. This
+The authoritative historical dependency record (initial, integration, and
+reviewed H1/H3 checkpoints) is `h1_profile_manifest.json` →
+`external_trace.dependency_provenance`; generated capabilities and trace
+manifests read that same record. Those checkpoints are history, not definitions
+of the current head: subsequent integrations are described by Git ancestry, and
+each capture's runner revision and exact source/object/tool hashes identify its
+actual code. This
 follow-up adds no production
 forwarding change, Cargo dependency, tuning, competitor arm, pool/UDP profiling,
 frame-pointer rebuild or measurement claim. The H3 probes, fixture commands,

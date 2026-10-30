@@ -98,164 +98,15 @@ always audits the resolved feature graph. `FIPS Build & Test` compiles the
 locked `fips` binary, every claimed feature combination, clippy `-D warnings`,
 and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 
-`FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445).
-It is one of the nine contexts branch protection and ruleset `20208307` require
-on `main`, so a red FIPS gate blocks the pull request and the merge queue, and
-it is an entry in `.github/required-publication-checks.json`, so every
-immutable `v*` tag artifact fails closed unless it succeeded for the exact
-product SHA. The `latest` / `main-<sha>` development images are gated on the
-`CI` workflow's push run only, not on this inventory (see
-[ci_cd.md → Main latest image](ci_cd.md#main-latest-image)).
-The workflow runs unconditionally on every push to `main` with no `paths:`
-filter, and on that event `fips-plan` force-runs the full gate, so each product
-commit carries its own exact-SHA evidence. See `docs/ci_cd.md` ->
-"Required checks and merge queue" and "Publish-blocking required checks".
-Its relevance job validates the trusted-base planner blob's mode, size, path,
-and object ID, materializes those bytes at the literal checked-out planner
-path, and invokes only that statically inspectable path. It never executes a
-variable-named temporary program.
-
-Compile artifacts use one cache layer plus one immutable run-artifact handoff
-through the local checksum-pinned `setup-sccache` action,
-`Swatinem/rust-cache`, and `actions/upload-artifact`; the repository
-`actions/cache` is deliberately not part of the producer channel.
-rust-cache's `shared-key` is `ci-fips-contract-${{ hashFiles(...) }}` over
-`Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`, the root `build.rs`, the
-FIPS workflow, the claimed-profile/FIPS feature-policy checker, `src/fips/**`,
-and `vendor/**`. That input is the one the pinned action actually uses; a
-sibling `key:` value is ignored whenever `shared-key` is set and is not
-wired. Automatic toolchain/environment/manifest/lock hashing stays enabled,
-and this layer is not SHA-scoped, so dependency/compiler work remains a warm
-inter-commit fallback. The stable layer does not trust AWS-LC's runner-local
-CMake incremental tree across runners: after every non-cold rust-cache restore
-attempt, `fips-compile` validates any restored `target/` root and removes matching
-`*/build/aws-lc-fips-sys-*/out/build` directories before Cargo can rerun the
-upstream build script. Installed AWS-LC libraries and Rust outputs stay warm,
-while any required CMake work starts clean instead of reparsing a restored
-`libbcm_c_generated_asm.a` archive. An explicitly requested exact handoff is
-promoted after this quarantine and replaces the stable target tree.
-
-That compile job is build-only: complete FIPS
-`unit_tests` and
-`integration_tests` executables are compiled by the parallel `fips-test-build`
-consumer so claimed-profile shards and clippy do not wait on test-binary
-precompile. `fips-test-build` publishes digest-bound copies through an
-immutable artifact scoped to that workflow run and attempt. After a successful
-locked `fips` profile build, the
-build-only producer packages its exact `target/` + `.cache/sccache` tree, the
-checkout's Git tree identity, and a `fips-producer-identity` member as a
-zstd tar, preserving executable modes that artifact ZIP extraction would
-normalize, and publishes it as the one-day immutable artifact
-`fips-producer-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`.
-The fallback expression deliberately uses the pull-request head SHA instead of
-the synthetic pull-request merge SHA, so a later manual run of that head can
-name the same source artifact; non-PR events continue to use `github.sha`.
-This artifact is both the same-run compile-to-consumer channel and the
-inter-run warm source. It is deliberately not a repository cache:
-concurrent CI writers empirically evicted a 4.15 GB late cache handoff within
-three minutes, and the former run-attempt-scoped `actions/cache` producer key
-was repeatedly LRU-evicted out of the shared repository quota between the
-producer's save and the consumers' restores, while a failed-job rerun looked
-for an attempt-scoped key the skipped producer had never saved. The filtered
-test consumer rejects unexpected names, symlinks, path escapes, and SHA-256
-mismatches before executing those binaries directly. It does not ask Cargo to
-revalidate fresh-checkout source mtimes and repeat test-only compile/link work.
-GitHub deletes a workflow run's artifacts when that run is fully rerun, so warm
-evidence chains separate `workflow_dispatch` runs. Each dispatch names an exact
-source run ID and attempt, and the pinned download action requests only the
-same-SHA artifact from that run in the current repository. A promoted handoff,
-same-run or explicitly requested,
-must contain a real tar payload and pass extracted-directory validation or the
-consuming job fails closed. The archive also carries the producer checkout's
-Git tree
-identity. Promotion requires that identity to equal the current checkout tree
-and requires both checkouts to remain clean, so a pull-request synthetic merge
-cannot be reused as its branch head after the base tree changes. Checkout
-assigns fresh mtimes even when its source bytes match the archived tree, so
-Cargo would otherwise treat exact restored outputs as stale and relink them.
-Only after the tree identity, real target directory, and nonsymlink executable
-are validated does the promoting job refresh regular files under `target/`.
-All files receive one reference timestamp so Cargo cannot see one restored
-dependency as newer than a dependent merely because separate `touch` batches
-ran in a different order.
-
-Cargo hashes the resolved `RUSTC_WRAPPER` identity into compiled artifacts.
-The checksum-pinned sccache action uses a fresh runner-private install path, so
-every FIPS Cargo job stops that wrapper and clears its two Cargo environment
-variables before cache restore or compilation. The exact target handoff, not a
-runner-unique compiler wrapper, is the FIPS compiler cache. Cold, fork,
-mismatched-tree, untrusted-prefix, and unstable-wrapper paths cannot claim an
-exact warm restore.
-Telemetry records explicit inter-run hits and ordinary runs as no-source
-misses; it does not fabricate a hit.
-The three ordinal `fips-claimed-checks` shards, `fips-clippy`, and
-`fips-test-build` download the producer handoff with the attempt-independent
-pattern `fips-producer-handoff-<sha>-<run_id>-*` and `merge-multiple: false`.
-The pinned download action flattens a single matching artifact's payload
-directly into the channel directory and, when two or more attempts exist,
-extracts each into an artifact-named child directory. Promotion admits both
-layouts, binds the attempt from the `fips-producer-identity` member packaged
-inside the tar (never from the consumer's `github.run_attempt`), requires
-child directory names and payload identity to agree, and never publishes that
-channel — a failed-job rerun therefore
-reuses the artifact the skipped producer published at an earlier attempt.
-Each
-claimed shard selects profiles from the policy checker's single inventory by
-ordinal modulo three and fails closed if it selects none. The ten claimed
-combinations therefore remain checker-owned while running in parallel with
-clippy and test-binary compile after the shorter build-only producer.
-Non-cold consumers, fork runs included, fail closed if no producer handoff
-for their source SHA/run_id was published. `fips-test` consumes only immutable
-test artifacts from its workflow run and never restores a build cache. It
-downloads `fips-test-binaries-<run_id>-*` with the same one-match flattened /
-multi-match child-directory layout, binds the attempt from `fips-test-identity`
-inside the bundle, and selects the newest attempt before validating the
-bundle, so a failed-job rerun can reuse the successful test-build
-prerequisite's earlier artifact. The required `FIPS Build & Test` aggregate depends on
-`fips-test-build` and fails closed if that producer does not succeed. It runs
-with `if: always()`, so it reports `success` or `failure` on every pull
-request, merge-group, `main` push, and manual run and can never be skipped into
-success; `.github/scripts/verify_required_ci.py` pins its complete `needs` set
-and every fail-closed step.
-The pinned cache and artifact actions hold their GitHub Actions service
-credentials inside the action process;
-PR-controlled `run:` steps never receive those credentials. `setup-sccache`
-installs sccache from a checksum-pinned GitHub release and never invokes
-`mozilla-actions/sccache-action` (which would export `ACTIONS_RUNTIME_TOKEN`
-into `GITHUB_ENV`). It activates only the checksum-verified executable by
-exact path (`FERRUM_SCCACHE_BIN` / `RUSTC_WRAPPER`) and persists
-`SCCACHE_GHA_ENABLED` empty. rust-cache `save-if`
-is false when `github.event.pull_request.head.repo.fork` is true on the
-compile producer, and always false on claimed checks, clippy, and
-`fips-test-build`, so fork pull requests restore and cannot save shared caches.
-Run-scoped immutable artifacts remain available to fork runs, so the producer
-handoff gives fork pull requests the same exact compile-to-consumer reuse
-without letting them populate another ref's cache.
-Trusted compile runs keep `cache-on-failure`
-so ordinary failing jobs can publish stable dependency work when post-job
-cleanup still runs. The successful compile producer publishes before claimed
-checks, clippy, and test-binary compile start, so a downstream runner-loss retry
-can reuse it; abrupt loss of the producer cannot publish that producer's
-unsaved artifact state. A `workflow_dispatch` input
-`force_cold_cache` skips shared-cache restore/save and the producer-handoff
-download, packaging, and upload so a hosted cold-cache run still proves every
-live assertion. Its `fips-test-build` job still publishes exact test binaries
-under its attempt-scoped artifact name; the test job selects the newest bundle
-for that workflow run. That same-run transport
-does not warm or publish a shared cache. Path planning is fail-closed: a missing or unknown trusted
-planner runs the compile gate rather than skipping it. Path planning reads a
-NUL-delimited `git diff --name-only --no-renames -z` listing so a hostile
-filename cannot evade a sensitive prefix. Every compiled `tests/` input is
-sensitive (`cargo clippy --lib --tests` and the handshake binaries). Paths
-that are neither sensitive nor on the explicit non-sensitive allowlist
-force-run; empty, truncated, or unavailable diffs run or fail closed rather
-than skipping. Job summaries record rust-cache hit/miss as stable fallback,
-the same-run producer handoff as an evidence-backed hit (a missing handoff
-fails the consumer instead of recording a fabricated miss), and the explicit
-inter-run
-handoff artifact as hit/miss. Measured restored bytes are the sccache-directory
-subset for rust-cache and the on-disk `target/` directory for the promoted
-producer handoff. Total rust-cache archive bytes are not exposed.
+`FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445): it
+is a required check on `main` and in `.github/required-publication-checks.json`,
+so every immutable `v*` tag artifact fails closed unless it succeeded for the
+exact product SHA. It runs on every push to `main` with no `paths:` filter. The
+`latest` / `main-<sha>` development images are gated on the `CI` workflow's push
+run only (see [ci_cd.md → Main latest image](ci_cd.md#main-latest-image)). Compile
+caches, the immutable producer and test-binary handoffs, and the cache trust
+boundary are documented in
+[ci_cd.md → CI runtime caching](ci_cd.md#ci-runtime-caching-production-images-and-fips).
 
 ## Current capability
 
@@ -357,9 +208,9 @@ reload, which rebuilds through the same constructor.
   an approved FIPS 186-5 scheme, but the `jsonwebtoken/aws_lc_rs` backend this
   profile selects exposes no P-521 JWS path at all, so admitting it would be an
   allow-list entry that fails at first use rather than at admission.
-- `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_CP_DP_GRPC_JWT_SECRET`,
-  `FERRUM_BASIC_AUTH_HMAC_SECRET`, and `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET`
-  must be at least 32 bytes (SP 800-107 HMAC key strength). A shorter
+- `FERRUM_ADMIN_JWT_SECRET`, `FERRUM_ADMIN_JWT_VIEWER_SECRET`,
+  `FERRUM_CP_DP_GRPC_JWT_SECRET`, `FERRUM_BASIC_AUTH_HMAC_SECRET`, and
+  `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` must be at least 32 bytes (SP 800-107 HMAC key strength). A shorter
   `FERRUM_DATAGRAM_PROXY_PROTOCOL_SECRET` fails `ferrum-edge validate` and
   startup; the diagnostic names the variable and does not report the value or
   its length. An unset or empty value is not a FIPS key-length failure: it
