@@ -150,6 +150,31 @@ jobs:
             sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
               python3 tests/performance/multi_protocol/h1_trace.py prepare-artifacts --output h2-cpu-evidence
           fi
+      - name: Symbolize Envoy CPU stacks offline from its build-ID-matched debug twin
+        if: ${{ !cancelled() }}
+        # The campaign measured the stripped release binary. Fetch only the
+        # debug image layer that holds the same executable with .symtab, by
+        # content digest; the profiler verifies its hash and build ID again.
+        env:
+          ENVOY_SYMBOL_LAYER: sha256:abf36d5364d09e89c2a086c4a2362a60729c0356c299cf98a87dc6ee01b3a00e
+        run: |
+          set -euo pipefail
+          if ! compgen -G 'h2-cpu-evidence/cpu/pairs/pair_*/traces/envoy_*/trace-manifest.json' > /dev/null; then
+            echo 'No retained Envoy CPU capture to symbolize.'
+            exit 0
+          fi
+          symbols="$RUNNER_TEMP/envoy-symbols"
+          mkdir -p "$symbols/layer"
+          token=$(curl -fsS --retry 3 \
+            'https://auth.docker.io/token?service=registry.docker.io&scope=repository:envoyproxy/envoy:pull' |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')
+          curl -fsSL --retry 3 -H "Authorization: Bearer $token" -o "$symbols/layer.tar.gz" \
+            "https://registry-1.docker.io/v2/envoyproxy/envoy/blobs/$ENVOY_SYMBOL_LAYER"
+          echo "${ENVOY_SYMBOL_LAYER#sha256:}  $symbols/layer.tar.gz" | sha256sum -c -
+          tar -xzf "$symbols/layer.tar.gz" -C "$symbols/layer" --no-same-owner usr/local/bin/envoy
+          rm "$symbols/layer.tar.gz"
+          python3 tests/performance/multi_protocol/h2_cpu_profile.py symbolize-envoy h2-cpu-evidence \
+            --debug-elf "$symbols/layer/usr/local/bin/envoy" --scratch "$symbols/decode"
       - name: Retain a report even when a campaign stops early
         if: always()
         run: |

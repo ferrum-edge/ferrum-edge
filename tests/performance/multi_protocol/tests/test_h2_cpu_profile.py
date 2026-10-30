@@ -1,5 +1,6 @@
 import hashlib
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -7,7 +8,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_validity import sample_issues
-from h2_cpu_profile import ENVIRONMENT, fixture, report, stamp, validate_runtime
+from h2_cpu_profile import (ENVIRONMENT, ENVOY_EXECUTABLE, ENVOY_SYMBOLS, elf_identity, fixture,
+                            report, stamp, symbolize_envoy, validate_runtime)
+
+
+def tiny_elf(build_id, *, symtab=True, notes=1):
+    """Minimal ELF64 with PT_NOTE GNU build-ID notes and optional .symtab."""
+    note = struct.pack('<III', 4, len(build_id), 3) + b'GNU\0' + build_id
+    body = note * notes
+    phoff, notes_at = 64, 64 + 56
+    shoff = notes_at + len(body)
+    header = (b'\x7fELF\x02\x01\x01' + bytes(9) + struct.pack('<HHIQQQIHHHHHH',
+              2, 62, 1, 0, phoff, shoff, 0, 64, 56, 1, 64, 2, 0))
+    program = struct.pack('<IIQQQQQQ', 4, 4, notes_at, 0, 0, len(body), len(body), 4)
+    sections = bytes(64) + struct.pack('<IIQQQQIIQQ', 1, 2 if symtab else 3, 0, 0, 0, 24, 0, 0, 8, 24)
+    return header + program + body + sections
 
 
 class H2CPUAdmissionTests(unittest.TestCase):
@@ -174,6 +189,130 @@ class H2CPUAdmissionTests(unittest.TestCase):
                         write_binding(str(root), **dict(data, **{key: value}), h2_protocol=protocol)
                 write_binding(str(root), **data, h2_protocol=protocol)
                 self.assertEqual(json.loads((root / 'bind.json').read_text()), dict(data, h2_protocol=protocol))
+
+
+    def test_elf_identity_reads_one_gnu_build_id_and_symtab(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'envoy'
+            path.write_bytes(tiny_elf(bytes.fromhex('ab' * 20)))
+            self.assertEqual(elf_identity(path), dict(build_id='ab' * 20, symtab=True))
+            path.write_bytes(tiny_elf(bytes.fromhex('ab' * 20), symtab=False))
+            self.assertEqual(elf_identity(path), dict(build_id='ab' * 20, symtab=False))
+            for data in (tiny_elf(bytes.fromhex('ab' * 20), notes=2), b'\x7fELF\x01\x01' + bytes(58), b'#!/bin/sh\n'):
+                path.write_bytes(data)
+                with self.assertRaises(ValueError):
+                    elf_identity(path)
+
+    def test_workflow_fetches_exactly_the_pinned_symbol_layer(self):
+        workflow = (Path(__file__).resolve().parents[4] / '.github/workflows/h2-cpu-profile.yml').read_text()
+        self.assertIn('ENVOY_SYMBOL_LAYER: ' + ENVOY_SYMBOLS['layer'] + '\n', workflow)
+        self.assertIn('envoyproxy/envoy:v1.39.1\n', workflow)
+        self.assertEqual(ENVOY_SYMBOLS['release_image'], 'envoyproxy/envoy:v1.39.1')
+
+    STRIPPED = ('envoy 7/8 10.000000000: cpu-clock:uS:\n'
+                '\t    5000 [unknown] (/usr/local/bin/envoy)\n'
+                '\t    6000 __libc_start_main+0x80 (/usr/lib/x86_64-linux-gnu/libc.so.6)\n\n'
+                'envoy 7/9 11.000000000: cpu-clock:uS:\n'
+                '\t    5100 [unknown] (/usr/local/bin/envoy)\n'
+                '\t    6000 __libc_start_main+0x80 (/usr/lib/x86_64-linux-gnu/libc.so.6)\n\n'
+                'envoy 7/9 30.000000000: cpu-clock:uS:\n'
+                '\t    5200 [unknown] (/usr/local/bin/envoy)\n'
+                '\t    6000 __libc_start_main+0x80 (/usr/lib/x86_64-linux-gnu/libc.so.6)\n\n')
+
+    def envoy_symbols(self, directory, fault=None):
+        """Retained Envoy CPU captures plus a build-ID twin; returns symbolize_envoy's inputs."""
+        from h1_trace_contract import decode_cpu
+        root = Path(directory) / 'evidence'
+        root.mkdir()
+        self.campaign(root)
+        build_id = bytes.fromhex('cd' * 20)
+        release = tiny_elf(build_id, symtab=False)
+        libc = b'\x7fELF libc'
+        debug = Path(directory) / 'debug-envoy'
+        debug.write_bytes(tiny_elf(bytes.fromhex('ee' * 20)) if fault == 'debug-build-id' else tiny_elf(build_id))
+        pins = dict(ENVOY_SYMBOLS, release_sha256=hashlib.sha256(release).hexdigest(),
+                    sha256=hashlib.sha256(debug.read_bytes()).hexdigest(), bytes=debug.stat().st_size,
+                    build_id=build_id.hex())
+        package = root / 'builds/envoy/symfs'
+        (package / 'usr/local/bin').mkdir(parents=True)
+        (package / 'usr/lib/x86_64-linux-gnu').mkdir(parents=True)
+        (package / 'usr/local/bin/envoy').write_bytes(release)
+        (package / 'usr/lib/x86_64-linux-gnu/libc.so.6').write_bytes(b'tampered' if fault == 'retained-dso' else libc)
+        for pair in (1, 2):
+            trace = root / f'cpu/pairs/pair_{pair:03d}/traces/envoy_10240'
+            perf_data = b'raw perf %d' % pair
+            (trace / 'perf.data').write_bytes(perf_data)
+            (trace / 'stacks.txt').write_text(self.STRIPPED)
+            recorded = 'ff' * 20 if fault == 'recorded-build-id' else build_id.hex()
+            (trace / 'perf-buildids.txt').write_text(f'{recorded} {ENVOY_EXECUTABLE}\n')
+            (trace / 'build-mappings.json').write_text(json.dumps(dict(complete=True, dsos=[
+                dict(path=ENVOY_EXECUTABLE, sha256=hashlib.sha256(release).hexdigest(),
+                     build_id_lines=['Build ID: ' + build_id.hex()]),
+                dict(path='/usr/lib/x86_64-linux-gnu/libc.so.6', sha256=hashlib.sha256(libc).hexdigest(),
+                     build_id_lines=['Build ID: ' + '12' * 20])])))
+            manifest = json.loads((trace / 'trace-manifest.json').read_text())
+            manifest.update(identity=dict(pid=7), symbol_package=str(package.resolve()),
+                artifacts={'perf.data': dict(sha256=hashlib.sha256(
+                    b'other' if fault == 'perf-data' else perf_data).hexdigest())},
+                boundaries=dict(measurement=dict(valid=True, start_bounds_ns=[9_000_000_000, 9_500_000_000],
+                                                 end_bounds_ns=[20_000_000_000, 20_500_000_000])))
+            (trace / 'trace-manifest.json').write_text(json.dumps(manifest))
+        calls = []
+
+        def decode(out, owners, dsos, *, symfs):
+            self.assertEqual(owners, {7})
+            self.assertEqual((symfs / ENVOY_EXECUTABLE.lstrip('/')).resolve(), debug.resolve())
+            self.assertEqual((symfs / 'usr/lib/x86_64-linux-gnu/libc.so.6').read_bytes(), libc)
+            text = self.STRIPPED.replace('5000 [unknown]', 'abcd [unknown]' if fault == 'leaf-pc' else
+                                         '5000 Envoy::Http::CodecHelper::dispatch+0x10')
+            text = text.replace('5100 [unknown]', '5100 Envoy::Http::CodecHelper::dispatch+0x20')
+            decoded = decode_cpu(text, '', owners)
+            (out / 'cpu-coverage.json').write_text('{}')
+            (out / 'stacks.folded').write_text('folded 1\n')
+            calls.append(out)
+            return dict(decoded, issues=['partial unwinding/unresolved samples'], inline_expansion=False,
+                        decoder_status=dict(returncode=0))
+        return root, debug, Path(directory) / 'scratch', pins, decode, calls
+
+    def test_envoy_symbols_rename_only_the_retained_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, debug, scratch, pins, decode, calls = self.envoy_symbols(directory)
+            self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 0)
+            self.assertEqual(len(calls), 2)
+            result = json.loads((root / 'envoy-symbols.json').read_text())
+            self.assertTrue(result['complete'])
+            for row in result['captures']:
+                self.assertEqual(row['issues'], [])
+                self.assertTrue(row['identical_unwound_pcs'])
+                # Only in-window samples count; the 30 s sample is outside.
+                self.assertEqual(row['stripped']['window_samples'], 2)
+                self.assertEqual(row['stripped']['known_leaf_samples'], 0)
+                self.assertEqual(row['symbolized']['known_leaf_samples'], 2)
+                self.assertEqual(row['symbolized']['top_leaves'],
+                                 [dict(symbol='Envoy::Http::CodecHelper::dispatch', samples=2, fraction=1.0)])
+            self.assertTrue((root / 'cpu/pairs/pair_001/traces/envoy_10240/envoy-symbols/summary.json').is_file())
+            self.assertFalse(any((root / 'cpu').rglob('perf.data.symfs')))
+            self.assertEqual(report(root), 0)
+            self.assertTrue(json.loads((root / 'h2-cpu-report.json').read_text())['envoy_symbols']['complete'])
+
+    def test_unmatched_envoy_symbols_are_reported_without_hiding_the_capture(self):
+        for fault in ('debug-build-id', 'recorded-build-id', 'retained-dso', 'perf-data', 'leaf-pc'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root, debug, scratch, pins, decode, _ = self.envoy_symbols(directory, fault)
+                self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 1)
+                result = json.loads((root / 'envoy-symbols.json').read_text())
+                self.assertFalse(result['complete'])
+                self.assertTrue(result['issues'] or any(row['issues'] for row in result['captures']))
+                # Capture evidence and calibration stay as they were.
+                self.assertEqual(report(root), 0)
+                self.assertFalse(json.loads((root / 'h2-cpu-report.json').read_text())['envoy_symbols']['complete'])
+
+    def test_report_marks_missing_envoy_symbols_without_failing_the_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.campaign(directory)
+            self.assertEqual(report(directory), 0)
+            symbols = json.loads((Path(directory) / 'h2-cpu-report.json').read_text())['envoy_symbols']
+            self.assertEqual(symbols, dict(complete=False, issues=['Envoy symbolization not run']))
 
 
 if __name__ == '__main__':
