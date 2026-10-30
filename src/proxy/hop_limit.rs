@@ -149,6 +149,11 @@ const PROXY_HOPS_LITERALS: [&str; 256] = [
     "254", "255",
 ];
 
+/// The canonical `X-Ferrum-Hops` literal for `hops`.
+pub(crate) fn proxy_hops_literal(hops: u8) -> &'static str {
+    PROXY_HOPS_LITERALS[usize::from(hops)]
+}
+
 /// Pre-built values `0..=255` backed by the static literals above, so stamping
 /// a hop count clones a `HeaderValue` whose bytes are `'static`: no per-request
 /// formatting and no shared reference count touched by every worker.

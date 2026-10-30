@@ -29,6 +29,7 @@ use crate::plugins::{
 };
 use crate::proxy::ProxyState;
 use crate::proxy::is_valid_websocket_key;
+use crate::proxy::request_headers::RequestHeaderLookup;
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
@@ -275,12 +276,12 @@ pub(crate) fn h3_bridge_transport_refusal(target: Option<&UpstreamTarget>) -> Op
 /// returns a no-op selection with `lb_hash_key: None` — the key is never
 /// read without an upstream.
 ///
-pub(crate) fn select_upstream_target(
+pub(crate) fn select_upstream_target<H: RequestHeaderLookup + ?Sized>(
     proxy: &Proxy,
     state: &ProxyState,
     epoch: &RequestEpoch,
     client_ip: &str,
-    proxy_headers: &HashMap<String, String>,
+    proxy_headers: &H,
     orig_dst: Option<SocketAddr>,
 ) -> UpstreamSelection {
     let Some(upstream_id) = proxy.upstream_id.as_deref() else {
@@ -1495,16 +1496,19 @@ pub(crate) fn passive_health_for_target<'a>(
 }
 
 /// Resolve the hash key for consistent-hashing or sticky-session load balancing.
-pub(crate) fn resolve_hash_key(
+pub(crate) fn resolve_hash_key<H: RequestHeaderLookup + ?Sized>(
     strategy: &HashOnStrategy,
     client_ip: &str,
-    headers: &HashMap<String, String>,
+    headers: &H,
 ) -> (String, bool) {
     match strategy {
         HashOnStrategy::Ip => (client_ip.to_owned(), false),
         HashOnStrategy::Header(name) => {
             // Header names in ctx.headers are stored as-is from hyper (lowercased)
-            let value = headers.get(name.as_str()).cloned().unwrap_or_default();
+            let value = headers
+                .request_header(name.as_str())
+                .map(str::to_owned)
+                .unwrap_or_default();
             if value.is_empty() {
                 (client_ip.to_owned(), false)
             } else {
@@ -1513,7 +1517,7 @@ pub(crate) fn resolve_hash_key(
         }
         HashOnStrategy::Cookie(name) => {
             // Parse the Cookie header to find the named cookie
-            if let Some(cookie_header) = headers.get("cookie") {
+            if let Some(cookie_header) = headers.request_header("cookie") {
                 for part in cookie_header.split(';') {
                     let part = part.trim();
                     if let Some((k, v)) = part.split_once('=')
@@ -1537,7 +1541,7 @@ pub(crate) fn resolve_hash_key(
 pub(crate) struct RetryTargetRequest<'a> {
     pub(crate) base_hash_key: &'a str,
     pub(crate) client_ip: &'a str,
-    pub(crate) proxy_headers: &'a HashMap<String, String>,
+    pub(crate) proxy_headers: &'a dyn RequestHeaderLookup,
     pub(crate) request_authority: Option<&'a str>,
 }
 

@@ -11098,7 +11098,9 @@ async fn handle_h3_request(
                         selected_base_proxy.as_ref(),
                         &current_url,
                         &method,
-                        attempt_headers,
+                        crate::proxy::request_headers::RequestHeaders::Materialized(
+                            attempt_headers,
+                        ),
                         current_target.as_deref(),
                         Some(&body_data[..]),
                         false,

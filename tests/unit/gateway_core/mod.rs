@@ -200,6 +200,7 @@ mod replay_prune_allocation_tests;
 mod request_buffer_budget_tests;
 mod request_context_tests;
 mod request_header_case_variants_tests;
+mod request_header_passthrough_tests;
 mod request_representation_tests;
 mod request_trailer_boundary_tests;
 mod reqwest_response_trailer_tests;

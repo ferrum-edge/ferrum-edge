@@ -620,14 +620,22 @@ pub fn confine_connection_nominated_request_headers(
 pub fn parse_connection_listed_from_str_map(
     headers: &std::collections::HashMap<String, String>,
 ) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
     // The materialised request map folds repeated non-cookie headers with
     // `, ` (see the request handler). Walk every case variant defensively
     // so a plugin-added `Connection` does not bypass listed-header stripping.
-    for value in headers.iter().filter_map(|(name, value)| {
+    parse_connection_listed_from_str_values(headers.iter().filter_map(|(name, value)| {
         name.eq_ignore_ascii_case("connection")
             .then_some(value.as_str())
-    }) {
+    }))
+}
+
+/// [`parse_connection_listed_from_str_map`] over already-selected
+/// `Connection` field values.
+pub fn parse_connection_listed_from_str_values<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
         for token in value.split(',') {
             let trimmed = token.trim();
             if trimmed.is_empty() {

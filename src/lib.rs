@@ -2922,7 +2922,7 @@ pub mod _test_support {
             proxy,
             backend_url,
             "GET",
-            &HashMap::new(),
+            crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
             None,
             None,
             true,
@@ -17921,6 +17921,106 @@ pub mod _test_support {
     /// standards-valid repeated identical values and refusing ambiguity.
     pub fn canonical_header_content_length_for_test(headers: &http::HeaderMap) -> Option<u64> {
         crate::proxy::canonical_header_content_length(headers)
+    }
+
+    /// One wire request-header block observed through both request-header
+    /// representations (issue #6671).
+    pub struct RequestHeaderPassthroughProbe {
+        /// The map the eager routed path builds: materialization, the `Host`
+        /// backfill from the request authority, then the hop re-assertion.
+        pub eager: std::collections::HashMap<String, String>,
+        /// The passthrough view rebuilt as a map.
+        pub view_map: std::collections::HashMap<String, String>,
+        /// The map a passthrough request holds after leaving the lane.
+        pub rematerialized: std::collections::HashMap<String, String>,
+        /// Every eager key and probe name reads the same through the view, the
+        /// lookup trait, and the context accessor as through the eager map.
+        pub lookups_match: bool,
+        /// The view's length and entry count both equal the eager map's length.
+        pub len_matches: bool,
+        /// The view's `Connection`-listed names equal the eager map parse.
+        pub connection_listed_matches: bool,
+        /// Outbound headers built from the eager map, as sorted name/bytes pairs.
+        pub eager_outbound: Vec<(String, Vec<u8>)>,
+        /// Outbound headers built from the passthrough view.
+        pub view_outbound: Vec<(String, Vec<u8>)>,
+    }
+
+    /// Drive `raw` through the eager routed materialization and through the
+    /// passthrough lane, with `authority` as the request URI authority and
+    /// `proxy_hops` as the re-asserted `X-Ferrum-Hops` count. `None` when the
+    /// block is not passthrough-eligible.
+    pub fn request_header_passthrough_probe_for_test(
+        raw: http::HeaderMap,
+        authority: Option<&str>,
+        proxy_hops: Option<u8>,
+        probe_names: &[&str],
+    ) -> Option<RequestHeaderPassthroughProbe> {
+        use crate::proxy::request_headers::{RequestHeaderLookup, RequestHeaders};
+
+        fn new_ctx() -> crate::plugins::RequestContext {
+            crate::plugins::RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/".to_string(),
+            )
+        }
+        fn sorted(map: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = map
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            out.sort();
+            out
+        }
+
+        let mut eager_ctx = new_ctx();
+        eager_ctx.set_raw_headers(raw.clone());
+        eager_ctx.materialize_headers();
+        let mut eager = std::mem::take(&mut eager_ctx.headers);
+        if !eager.contains_key("host")
+            && let Some(authority) = authority
+        {
+            eager.insert("host".to_string(), authority.to_string());
+        }
+        crate::proxy::hop_limit::reassert_outbound_proxy_hops_in_map(proxy_hops, &mut eager);
+
+        let mut ctx = new_ctx();
+        ctx.set_raw_headers(raw);
+        if !ctx.try_begin_request_header_passthrough(authority) {
+            return None;
+        }
+        ctx.set_request_header_passthrough_proxy_hops(proxy_hops);
+        let view = ctx.request_headers_view(None);
+        let view_map = view.to_map().into_owned();
+        let lookups_match = eager
+            .keys()
+            .map(String::as_str)
+            .chain(probe_names.iter().copied())
+            .all(|name| {
+                let expected = eager.get(name).map(String::as_str);
+                view.get(name) == expected
+                    && view.request_header(name) == expected
+                    && ctx.effective_request_header(name) == expected
+            });
+        let len_matches = view.len() == eager.len() && view.entries().count() == eager.len();
+        let connection_listed_matches = view.connection_listed()
+            == crate::proxy::headers::parse_connection_listed_from_str_map(&eager);
+        let eager_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(
+            RequestHeaders::Materialized(&eager),
+        ));
+        let view_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(view));
+        ctx.end_request_header_passthrough();
+        Some(RequestHeaderPassthroughProbe {
+            eager,
+            view_map,
+            rematerialized: ctx.headers.clone(),
+            lookups_match,
+            len_matches,
+            connection_listed_matches,
+            eager_outbound,
+            view_outbound,
+        })
     }
 
     /// Canonical declared `Content-Length` from a comma-folded header map.
