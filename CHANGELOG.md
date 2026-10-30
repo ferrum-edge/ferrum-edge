@@ -79,7 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/3-frontend gRPC-Web bridge settles a late send failure as its gRPC-Web
   deadline, authorization lifetime, or header bound. Native buffered gRPC
   settles a late failure after an earlier operator read bound as that bound's
-  `BackendTimeout`. The reqwest header waits no longer let the operator's
+  `BackendTimeout`, and the direct HTTP/2, sidecar-mTLS / Unix HTTP/2, HBONE
+  HTTP/1.1 and Unix HTTP/1.1 header waits settle a late send failure through
+  their own timer arm for every bound source, authorization included. The reqwest header waits no longer let the operator's
   response-header timer, which wraps the client RPC deadline, claim an expiry
   the strictly earlier client deadline or authorization lifetime owns after a
   late wake (it was charged as `ReadWriteTimeout`), nor let a late reset or an

@@ -4520,7 +4520,10 @@ where
                                 | Ok(H3BackendOrPeer::Ready(Err(_)))
                                 | Ok(H3BackendOrPeer::Deadline),
                             ) if late_owner == Some(crate::proxy::OwningBound::ResponseHeader)
-                                && route.attempt_budget_expired(route_attempt_deadline) =>
+                                && route.attempt_budget_owns(
+                                    route_attempt_deadline,
+                                    operator_header_deadline_at,
+                                ) =>
                             {
                                 if let Some(pump) = plain_upload_pump.as_mut() {
                                     pump.cancel();
@@ -5764,6 +5767,11 @@ where
                                 break None;
                             }
                             result = &mut send_future => {
+                                // The instant `send()` was observed, before the
+                                // reader drain/halt below can await: a failure
+                                // ready before a bound stays the backend's
+                                // (issue #6976).
+                                let observed_at = tokio::time::Instant::now();
                                 send_done = true;
                                 drop(pending_slot.take());
                                 if !reader_done {
@@ -5780,8 +5788,14 @@ where
                                     if !reader_done {
                                         halt_notify.notify_one();
                                         let halt_deadline = Duration::from_millis(100);
-                                        let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
-                                            .await;
+                                        // A completed reader must never be polled
+                                        // again by the post-loop halt.
+                                        if tokio::time::timeout(halt_deadline, &mut reader_future)
+                                            .await
+                                            .is_ok()
+                                        {
+                                            reader_done = true;
+                                        }
                                     }
                                 }
                                 // Biased select checks send_future before
@@ -5814,7 +5828,7 @@ where
                                     match crate::proxy::elapsed_owning_bound(
                                         upload_deadline_at,
                                         header_wait_at,
-                                        tokio::time::Instant::now(),
+                                        observed_at,
                                     ) {
                                         Some(crate::proxy::OwningBound::Dispatch) => {
                                             upload_auth_expired =
@@ -5823,9 +5837,9 @@ where
                                             abort_backend_upload = true;
                                             break None;
                                         }
+                                        // The reader was already halted above.
                                         Some(crate::proxy::OwningBound::ResponseHeader) => {
                                             header_wait_expired = true;
-                                            halt_reader_after_loop = true;
                                             abort_backend_upload = true;
                                             break None;
                                         }

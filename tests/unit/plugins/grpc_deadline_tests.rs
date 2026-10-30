@@ -7180,18 +7180,37 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
         "a late direct-H1 send failure must settle as its client or authorization bound"
     );
 
+    // Direct H2, sidecar mTLS / Unix H2, HBONE H1 and Unix H1 route a late
+    // send failure into their own timer arm, whichever source owns the bound
+    // (#6976).
     let direct = source_fn_body(proxy, "async fn proxy_to_backend_http2(");
-    let direct_send = bounded(
-        direct,
-        "Ok(Ok(Ok(resp))) => Some(resp),",
-        "=> return map_h2_err(e)",
-    );
+    let direct_late = bounded(direct, "let bounded = match bounded {", "match bounded {");
     assert!(
-        direct_send.contains("ResponseHeaderDeadlineSource::Client")
-            && direct_send.contains("client_deadline_owns_failure(")
-            && direct_send.contains("client_grpc_deadline_exceeded_response_for_optional_request("),
-        "the direct-H2 header wait must settle a late send failure as the client deadline"
+        direct_late.contains("Ok(Ok(Err(_)))")
+            && direct_late.contains("tokio::time::Instant::now() >= deadline")
+            && direct_late.contains("body_size_exceeded")
+            && direct_late.contains("Http2BodyWriteTimeout::expired")
+            && direct_late.contains("Ok(Err(()))"),
+        "a late direct-H2 send failure must take the timer arm after the gateway terminals"
     );
+    let sidecar = source_fn_body(proxy, "async fn proxy_to_backend_mesh_mtls_after_ready(");
+    let sidecar_late = bounded(sidecar, "let bounded = match bounded {", "match bounded {");
+    assert!(
+        sidecar_late
+            .contains("Ok(Ok(Err(_))) if tokio::time::Instant::now() >= deadline => Ok(Err(())),"),
+        "a late sidecar-mTLS send failure must take the timer arm"
+    );
+    for signature in [
+        "async fn proxy_to_backend_hbone_after_ready(",
+        "#[cfg(unix)]\nasync fn proxy_to_backend_unix(",
+    ] {
+        let h1 = source_fn_body(proxy, signature);
+        let late = bounded(h1, "let bounded = match bounded {", "match bounded {");
+        assert!(
+            late.contains("Ok(Ok((Err(_), _))) if tokio::time::Instant::now() >= send_deadline"),
+            "{signature}: a late send failure must take the timer arm"
+        );
+    }
 
     // Both reqwest header waits settle every timeout-shaped outcome and late
     // failure through one owner rule (#6976), checked in the #6976 test below.
@@ -7368,6 +7387,29 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
             && streamed_send.contains("Some(crate::proxy::OwningBound::ResponseHeader) =>")
             && streamed_send.contains("!oversized.load(Ordering::Relaxed)"),
         "a late streamed-bridge send failure must settle as its owning bound"
+    );
+    assert!(
+        !streamed_send.contains("halt_reader_after_loop = true;"),
+        "the send arm already halted the reader; a second halt would poll it after completion"
+    );
+    let send_arm = bounded(
+        bridge,
+        "result = &mut send_future => {\n",
+        "if reader_peer_reset.load(Ordering::Acquire) {",
+    );
+    assert!(
+        send_arm.contains("let observed_at = tokio::time::Instant::now();")
+            && send_arm.contains(".is_ok()\n                                        {\n                                            reader_done = true;"),
+        "the send arm must capture its observation instant and record a halted reader"
+    );
+    assert!(
+        streamed_send.contains("observed_at,"),
+        "the late-failure owner must use the instant send() was observed"
+    );
+    assert!(
+        bridge.contains("route.attempt_budget_owns(")
+            && !bridge.contains("&& route.attempt_budget_expired(route_attempt_deadline) =>"),
+        "the prebuffered attempt budget must be attributed from captured instants"
     );
     let streamed_timer = bounded(
         bridge,

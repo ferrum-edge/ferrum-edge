@@ -60555,6 +60555,15 @@ async fn proxy_to_backend_hbone_after_ready(
                     upload_pump.as_mut(),
                 )
                 .await;
+                // A send failure observed at/after the composed bound, before its
+                // timer fired, settles exactly as that timer's arm below (issue
+                // #6976); the failed lease drops without check-in, as there.
+                let bounded = match bounded {
+                    Ok(Ok((Err(_), _))) if tokio::time::Instant::now() >= send_deadline => {
+                        Ok(Err(()))
+                    }
+                    other => other,
+                };
                 match bounded {
                     Ok(Ok(result)) => Some(result),
                     Ok(Err(_)) => {
@@ -61672,6 +61681,15 @@ async fn proxy_to_backend_unix(
                     upload_pump.as_mut(),
                 )
                 .await;
+                // A send failure observed at/after the composed bound, before its
+                // timer fired, settles exactly as that timer's arm below (issue
+                // #6976); the failed lease drops without check-in, as there.
+                let bounded = match bounded {
+                    Ok(Ok((Err(_), _))) if tokio::time::Instant::now() >= send_deadline => {
+                        Ok(Err(()))
+                    }
+                    other => other,
+                };
                 match bounded {
                     Ok(Ok(result)) => Some(result),
                     Ok(Err(_)) => {
@@ -63401,6 +63419,14 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             upload_pump.as_mut(),
         )
         .await;
+        // A send failure observed at/after the composed bound, before its timer
+        // fired, settles exactly as that timer's arm below: the request-size
+        // terminal first, then the authorization lifetime, then the client or
+        // operator deadline (issue #6976).
+        let bounded = match bounded {
+            Ok(Ok(Err(_))) if tokio::time::Instant::now() >= deadline => Ok(Err(())),
+            other => other,
+        };
         match bounded {
             Ok(Ok(result)) => Some(result),
             Ok(Err(_)) => {
@@ -64569,31 +64595,25 @@ async fn proxy_to_backend_http2(
             upload_pump.as_mut(),
         )
         .await;
-        match bounded {
-            Ok(Ok(Ok(resp))) => Some(resp),
-            // A send failure observed at/after the client deadline, before its
-            // timer fired, is that deadline (issue #6022). The gateway-owned
-            // size and write-watermark terminals keep precedence.
+        // A send failure observed at/after the header bound, before its timer
+        // fired, settles exactly as that timer's arm below, whichever source
+        // owns the bound: the client deadline, the authorization lifetime, or
+        // the operator read bound (issues #6022, #6976). The gateway-owned size
+        // and write-watermark terminals keep precedence.
+        let bounded = match bounded {
             Ok(Ok(Err(_)))
-                if deadline_source == ResponseHeaderDeadlineSource::Client
-                    && !body_size_exceeded.load(std::sync::atomic::Ordering::Acquire)
+                if !body_size_exceeded.load(std::sync::atomic::Ordering::Acquire)
                     && !passthrough_write_timeout
                         .as_ref()
                         .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
-                    && crate::proxy::grpc_proxy::client_deadline_owns_failure(
-                        Some(deadline),
-                        tokio::time::Instant::now(),
-                    ) =>
+                    && tokio::time::Instant::now() >= deadline =>
             {
-                return (
-                    client_grpc_deadline_exceeded_response_for_optional_request(
-                        ctx,
-                        headers,
-                        resolved_ip,
-                    ),
-                    None,
-                );
+                Ok(Err(()))
             }
+            other => other,
+        };
+        match bounded {
+            Ok(Ok(Ok(resp))) => Some(resp),
             Ok(Ok(Err(e))) => return map_h2_err(e),
             Err(()) => {
                 header_write_watermark_expired = true;
