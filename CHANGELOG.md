@@ -46,17 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **A backend failure that lands after a gRPC client deadline is settled as
   that deadline** (issue #6022). The gateway forwards only the remaining
-  `grpc-timeout`, so a backend that enforces it (grpc-java resets the stream
-  with `CANCEL`) can beat the gateway's own deadline terminal only when the
-  gateway's timer fires late, for example under load. Such a failure was
-  answered as `UNAVAILABLE` and charged to circuit breakers, passive health,
-  and (native HTTP/3) the backend's H3 capability. Every gRPC dispatch path now
-  reads the clock at the failure, as the streaming header wait already did: a
-  failure observed at or after the client deadline ends as `DEADLINE_EXCEEDED`
-  and is health-neutral. This is a cutoff, not proof of cause. A failure
-  observed before the deadline, including a backend `CANCEL`, still counts as a
-  backend failure. The inline body adapter applies the same cutoff to a route
-  request deadline, which is already a health-neutral route cut.
+  `grpc-timeout`, so for budgets that fit the millisecond encoding a backend
+  that enforces it (grpc-java resets the stream with `CANCEL`) can beat the
+  gateway's own deadline terminal only when the gateway's timer fires late,
+  for example under load. Such a failure was answered as `UNAVAILABLE` and
+  charged to circuit breakers, passive health, and (native HTTP/3) the
+  backend's H3 capability. The native gRPC header waits and body collection,
+  the direct HTTP/1.1 and HTTP/2 and reqwest header waits, the native HTTP/3
+  relay, and every buffered response collect now read the clock at the
+  failure: a failure observed at or after the client deadline ends as
+  `DEADLINE_EXCEEDED` and is health-neutral. This is a cutoff, not proof of
+  cause. A failure observed before the deadline, including a backend
+  `CANCEL`, still counts as a backend failure. A buffered collect that fails
+  after an operator read bound or authorization lifetime settles as that bound
+  in the same way, and the inline body adapter applies the cutoff to a route
+  request deadline (already a health-neutral route cut). The remaining paths
+  are tracked in #6976.
 
 ## [0.9.19] - 2026-10-27
 

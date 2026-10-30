@@ -17827,11 +17827,9 @@ async fn dispatch_grpc_native_h3(
                         ) =>
                 {
                     // A trailer-read failure observed at/after the client
-                    // deadline is that deadline (issue #6022), exactly as the
-                    // `DeadlineExceeded` finish above: no capability downgrade.
-                    crate::http3::stream_util::abort_response_stream(&mut send_half);
-                    client_deadline_expired = true;
-                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    // deadline is that deadline (issue #6022): the same terminal
+                    // as the deadline arm, and no capability downgrade.
+                    settle_client_grpc_deadline!();
                 }
                 Err(err) => {
                     error!(

@@ -7146,17 +7146,36 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
         "the streaming header wait must keep the same rule"
     );
 
-    let mesh = source_fn_body(proxy, "async fn proxy_to_backend_mesh_mtls_after_ready(");
-    let mesh_read = bounded(
-        mesh,
-        "Err(HyperBodyCollectError::Read(err)) => {",
-        "mesh_grpc_unavailable_response(",
+    // Every buffered collect (reqwest, direct H1/H2, sidecar mTLS, HBONE, Unix,
+    // H3 drain) is bounded through one wrapper, which settles a late FAILED
+    // collect as its composed bound and keeps a completed one.
+    let wrapper = source_fn_body(
+        proxy,
+        "pub(crate) async fn collect_response_under_authorization<F>(",
+    );
+    let late = bounded(
+        wrapper,
+        "if output.is_failure()",
+        "Ok(output) => Ok(output),",
     );
     assert!(
-        mesh_read.contains("buffered_grpc_shared_deadline_is_client")
-            && mesh_read.contains("client_deadline_owns_failure(")
-            && mesh_read.contains("client_grpc_deadline_exceeded_response_for_request("),
-        "the sidecar-mTLS buffered collect must settle a late read failure as the client deadline"
+        late.contains("tokio::time::Instant::now() >= at") && late.contains("Err(settle())"),
+        "a collect failure at/after the composed bound must settle as that bound"
+    );
+    assert!(
+        proxy.contains("impl<T, E> CollectOutcome for Result<T, E> {")
+            && proxy.contains("impl CollectOutcome for retry::BackendResponse {"),
+        "both collect outcome shapes must report failure to the cutoff"
+    );
+
+    let h1_claim = bounded(
+        proxy,
+        "if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader\n                    && handoff_bound",
+        "let never_sent = try_err.take_message().is_some();",
+    );
+    assert!(
+        h1_claim.contains("direct_h1_handoff_bound_expired("),
+        "a late direct-H1 send failure must settle as its client or authorization bound"
     );
 
     let direct = source_fn_body(proxy, "async fn proxy_to_backend_http2(");
@@ -7191,8 +7210,9 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
     let relay = source_fn_body(h3, "async fn dispatch_grpc_native_h3(");
     assert_eq!(
         relay.matches("settle_client_grpc_deadline!();").count(),
-        2,
-        "the native H3 relay's deadline arm and late body-error arm must share one terminal"
+        3,
+        "the native H3 relay's deadline arm and late body and trailer errors must share one \
+         terminal"
     );
     let late_body = bounded(
         relay,
@@ -7211,7 +7231,7 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
         "mark_h3_unsupported",
     );
     assert!(
-        late_trailers.contains("client_deadline_expired = true;"),
+        late_trailers.contains("settle_client_grpc_deadline!();"),
         "a late H3 trailer failure must settle as the client deadline before any capability \
          downgrade"
     );

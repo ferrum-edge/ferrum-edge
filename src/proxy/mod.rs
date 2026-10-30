@@ -54189,6 +54189,29 @@ async fn proxy_to_backend_direct_h1(
                     // no socket at all.
                     continue;
                 }
+                // A send failure observed at/after the client RPC deadline or
+                // authorization bound is that bound, exactly as the timer arm
+                // above settles it (issue #6022).
+                if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader
+                    && handoff_bound
+                        .at
+                        .is_some_and(|at| tokio::time::Instant::now() >= at)
+                {
+                    if let Some(pump) = upload_pump.as_mut() {
+                        pump.cancel();
+                    }
+                    return direct_h1_handoff_bound_expired(
+                        proxy,
+                        handoff_bound.source,
+                        send_bound,
+                        send_auth_deadline.as_ref(),
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                        retained_body,
+                        backend_admission_permits,
+                    );
+                }
                 let never_sent = try_err.take_message().is_some();
                 let err = try_err.into_error();
                 // A request hyper handed back unsent never reached the wire.
@@ -58663,6 +58686,13 @@ pub(crate) enum ResponseCollectBound {
 /// Attribution comes from the COMPOSED bound, never from re-reading the clock
 /// after the fact, so a collect that was simply not polled until after both
 /// instants had passed still reports the bound that actually ended it.
+///
+/// A collect that FAILS at or after the composed bound is settled as that
+/// bound, exactly as if its timer had fired first (issue #6022): otherwise a
+/// backend enforcing the forwarded `grpc-timeout` with `CANCEL` is charged
+/// whenever the timer wheel lags the reset. The clock decides only whether the
+/// bound applies; which bound it is still comes from the composition. A
+/// collect that completed keeps its result however late it is observed.
 pub(crate) async fn collect_response_under_authorization<F>(
     grpc_deadline_at: Option<tokio::time::Instant>,
     auth: Option<&RequestAuthLifetimePlan>,
@@ -58670,31 +58700,43 @@ pub(crate) async fn collect_response_under_authorization<F>(
 ) -> Result<F::Output, ResponseCollectBound>
 where
     F: std::future::Future,
+    F::Output: CollectOutcome,
 {
     let bound = compose_dispatch_phase_auth_bound(grpc_deadline_at, auth);
+    let settle = || match dispatch_phase_authorization_expiry(bound, auth) {
+        Some(_) => ResponseCollectBound::AuthorizationExpired,
+        None => ResponseCollectBound::RpcDeadline,
+    };
     match crate::plugins::await_deadline_first(bound.at, collect).await {
+        Ok(output)
+            if output.is_failure()
+                && bound.at.is_some_and(|at| tokio::time::Instant::now() >= at) =>
+        {
+            Err(settle())
+        }
         Ok(output) => Ok(output),
-        Err(()) => match dispatch_phase_authorization_expiry(bound, auth) {
-            Some(_) => Err(ResponseCollectBound::AuthorizationExpired),
-            None => Err(ResponseCollectBound::RpcDeadline),
-        },
+        Err(()) => Err(settle()),
     }
 }
 
-/// Attribute an already-fired composed dispatch-phase bound (issue #3815).
-///
-/// `Some` when the authorization deadline is the bound that elapsed, in which
-/// case the bounded class is latched for the request — first writer wins, so an
-/// upload adapter that already fired keeps its classification and the
-/// fixed-cardinality counter is still incremented exactly once. `None` when the
-/// phase's own client/operator bound is what bounded it, which keeps its
-/// existing terminal.
-///
-/// The decision comes from the COMPOSED BOUND, not from re-reading the clock:
-/// an earlier protocol bound stays attributed to the protocol even when the
-/// task was not scheduled until after the later authorization deadline had also
-/// elapsed. The clock is still consulted for the authorization case, so a
-/// composed bound that fired for some other reason cannot fabricate an expiry.
+/// Whether a buffered collect ended in failure, for the late-failure cutoff in
+/// [`collect_response_under_authorization`] (issue #6022).
+pub(crate) trait CollectOutcome {
+    fn is_failure(&self) -> bool;
+}
+
+impl<T, E> CollectOutcome for Result<T, E> {
+    fn is_failure(&self) -> bool {
+        self.is_err()
+    }
+}
+
+impl CollectOutcome for retry::BackendResponse {
+    fn is_failure(&self) -> bool {
+        self.error_class.is_some()
+    }
+}
+
 /// Whether a reqwest `send()` failure observed now belongs to the client RPC
 /// deadline that composed `bound` (issue #6022): the client deadline, not the
 /// authorization lifetime, owns the bound, no earlier operator response-header
@@ -58714,6 +58756,20 @@ fn reqwest_send_failure_is_client_deadline(
         )
 }
 
+/// Attribute an already-fired composed dispatch-phase bound (issue #3815).
+///
+/// `Some` when the authorization deadline is the bound that elapsed, in which
+/// case the bounded class is latched for the request — first writer wins, so an
+/// upload adapter that already fired keeps its classification and the
+/// fixed-cardinality counter is still incremented exactly once. `None` when the
+/// phase's own client/operator bound is what bounded it, which keeps its
+/// existing terminal.
+///
+/// The decision comes from the COMPOSED BOUND, not from re-reading the clock:
+/// an earlier protocol bound stays attributed to the protocol even when the
+/// task was not scheduled until after the later authorization deadline had also
+/// elapsed. The clock is still consulted for the authorization case, so a
+/// composed bound that fired for some other reason cannot fabricate an expiry.
 pub(crate) fn dispatch_phase_authorization_expiry(
     bound: DispatchPhaseBound,
     auth: Option<&RequestAuthLifetimePlan>,
@@ -63723,25 +63779,6 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                             resolved_ip,
                             is_grpc_flavored,
                             request_body_limit,
-                        ),
-                        None,
-                        None,
-                    );
-                }
-                // A read failure observed at/after the client deadline, before
-                // the collection bound fired, is that deadline (issue #6022).
-                if is_grpc_flavored
-                    && buffered_grpc_shared_deadline_is_client
-                    && crate::proxy::grpc_proxy::client_deadline_owns_failure(
-                        buffered_grpc_shared_deadline,
-                        tokio::time::Instant::now(),
-                    )
-                {
-                    return (
-                        client_grpc_deadline_exceeded_response_for_request(
-                            request_ctx,
-                            headers,
-                            resolved_ip,
                         ),
                         None,
                         None,
