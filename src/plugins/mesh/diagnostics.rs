@@ -250,7 +250,7 @@ const EXT_AUTHZ: &str = "name service port tls path_prefix timeout_ms fail_open 
     include_request_body_in_check headers_to_upstream_on_allow headers_to_downstream_on_deny \
     headers_to_downstream_on_allow";
 const PEER_AUTH: &str = "name namespace scope selector mtls_mode port_overrides";
-const REQUEST_AUTH: &str = "name namespace scope jwt_rules";
+const REQUEST_AUTH: &str = "name namespace scope jwt_rules refused";
 const JWT_RULE: &str = "issuer audiences jwks_uri jwks from_headers from_params \
     forward_original_token output_claim_to_headers";
 const TELEMETRY: &str = "name namespace scope config";

@@ -859,8 +859,11 @@ where
     /// refusals. The mirror is now purely a logging latch.
     observed_available: Arc<AtomicBool>,
     fallback_warned: Arc<AtomicBool>,
-    /// Abort handle for the failover health observer; aborted on Drop.
-    health_observer_abort: Option<tokio::task::AbortHandle>,
+    /// Abort handle for the failover health observer; aborted on Drop. Set
+    /// once by [`Self::start_health_observer`] from the owning plugin's
+    /// `commit_background_tasks`, never by construction (issue #6616), so
+    /// admin / CP validation that builds and drops a limiter spawns nothing.
+    health_observer_abort: OnceLock<tokio::task::AbortHandle>,
 }
 
 impl<K, A> FailoverLimiter<K, A>
@@ -877,17 +880,15 @@ where
         let observed_available = Arc::new(AtomicBool::new(true));
         let fallback_warned = Arc::new(AtomicBool::new(false));
 
-        let mut limiter = Self {
+        Self {
             plugin_name,
             primary,
             fallback,
             failure_policy,
             observed_available,
             fallback_warned,
-            health_observer_abort: None,
-        };
-        limiter.spawn_health_observer();
-        limiter
+            health_observer_abort: OnceLock::new(),
+        }
     }
 
     /// Log the degradation once per outage and report whether admission may
@@ -1053,7 +1054,7 @@ where
     /// Abort handle for the failover observer, when started (tests).
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn health_observer_abort_for_test(&self) -> Option<tokio::task::AbortHandle> {
-        self.health_observer_abort.clone()
+        self.health_observer_abort.get().cloned()
     }
 
     /// Log-only observer: reports the availability edge once per outage.
@@ -1063,7 +1064,13 @@ where
     /// this task has not observed yet is already eligible for centralized
     /// enforcement; the task exists so operators still get one "recovered" line
     /// per outage even for a policy that sees no traffic in between.
-    fn spawn_health_observer(&mut self) {
+    ///
+    /// Idempotent: a second call (or a racing one) keeps the first observer
+    /// and aborts its own.
+    pub fn start_health_observer(&self) {
+        if self.health_observer_abort.get().is_some() {
+            return;
+        }
         let plugin_name = self.plugin_name;
         let observed_available = Arc::clone(&self.observed_available);
         let fallback_warned = Arc::clone(&self.fallback_warned);
@@ -1094,7 +1101,9 @@ where
                 }
             }
         });
-        self.health_observer_abort = Some(join.abort_handle());
+        if let Err(duplicate) = self.health_observer_abort.set(join.abort_handle()) {
+            duplicate.abort();
+        }
     }
 }
 
@@ -1894,6 +1903,15 @@ where
         match self {
             Self::Local(_) => None,
             Self::Failover(failover) => Some(failover.redis_client_arc_for_test()),
+        }
+    }
+
+    /// Start the Redis failover health observer, if this backend has one.
+    /// Owning plugins call it from `Plugin::commit_background_tasks`, so only
+    /// an installed generation runs it (issue #6616). Idempotent.
+    pub fn commit_background_tasks(&self) {
+        if let Self::Failover(failover) = self {
+            failover.start_health_observer();
         }
     }
 

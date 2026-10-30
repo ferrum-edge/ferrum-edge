@@ -23,11 +23,22 @@
 //! pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
 //!     crate::plugins::PluginFailurePolicy::KeepLastKnownGood
 //! }
+//!
+//! pub fn config_contract() -> crate::plugins::PluginConfigContract {
+//!     crate::plugins::PluginConfigContract::closed(vec![serde_json::json!({})])
+//! }
 //! ```
 //!
 //! The `new()` constructor must return `Result<Self, String>` and validate the
-//! plugin config — return `Err` for missing required fields, invalid values, or
-//! configs that would make the plugin a no-op.
+//! plugin config — return `Err` for missing required fields, invalid values,
+//! unknown keys at any depth, or configs that would make the plugin a no-op.
+//! It must also be free of side effects (no tasks, dials, file writes, or
+//! process-global registration): config validation constructs and drops it.
+//!
+//! `config_contract()` lists example configs (plus any free-form maps or
+//! embedded foreign documents). The plugin test sweep validates each example,
+//! checks that construction neither needs nor spawns onto a tokio runtime, and
+//! injects an unknown key into every nested object to prove it is rejected.
 //!
 //! The file name (without `.rs`) becomes the plugin name used in
 //! gateway configuration. For example, `my_rate_limiter.rs` registers

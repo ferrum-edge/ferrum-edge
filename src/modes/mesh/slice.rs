@@ -204,7 +204,18 @@ impl MeshSliceRequest {
 
 /// Canonical per-node mesh view. This is the common source for both xDS
 /// translators and native ConfigSync mesh subscribers.
+///
+/// Root members are closed (`deny_unknown_fields`, issue #6616): within one
+/// build every producer serializes this same type, so an unrecognized member
+/// is a misspelled or foreign key, and `mesh_authz` must not build an
+/// authorization generation from a slice whose members it silently dropped.
+/// Across builds it is an upgrade constraint: `MeshSubscribe` admits a
+/// control plane at the same major.minor, so while a rolling upgrade runs a
+/// newer CP that adds a root member, older data planes refuse its slices
+/// (`invalid_slice_json`) and keep serving their last-good slice until they
+/// are upgraded too (`docs/mesh.md`, "Response binding").
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshSlice {
     pub node_id: String,
     pub namespace: String,

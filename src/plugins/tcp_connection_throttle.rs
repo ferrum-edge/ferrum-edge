@@ -194,8 +194,10 @@ impl TcpConnectionThrottle {
         pool_shard_amount: usize,
     ) -> Result<Self, String> {
         let parsed = parse_config(config)?;
+        // The residual-entry sweep starts in `commit_background_tasks` (or
+        // from the plugin cache's shared-state commit), never here: config
+        // validation constructs and drops instances (issue #6616).
         let state = TcpConnectionThrottleState::new(pool_shard_amount);
-        state.set_cleanup_interval(parsed.cleanup_interval_seconds);
         Ok(Self {
             max_connections_per_key: parsed.max_connections_per_key,
             cleanup_interval_seconds: parsed.cleanup_interval_seconds,
@@ -344,6 +346,15 @@ fn parse_optional_u64(
 impl Plugin for TcpConnectionThrottle {
     fn name(&self) -> &str {
         "tcp_connection_throttle"
+    }
+
+    /// Arm the residual-entry sweep for the installed generation. Idempotent:
+    /// `set_cleanup_interval` keeps a running task at an unchanged interval.
+    /// The plugin cache also re-applies intervals for its shared states after
+    /// installation; this covers instances that own a private state.
+    fn commit_background_tasks(&self) {
+        self.state
+            .set_cleanup_interval(self.cleanup_interval_seconds);
     }
 
     fn priority(&self) -> u16 {

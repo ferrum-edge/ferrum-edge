@@ -3526,6 +3526,12 @@ async fn lifecycle_task_does_not_keep_a_dropped_instance_alive() {
     let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
     assert_eq!(
         plugin.lifecycle_task_finished_for_test(),
+        None,
+        "construction never starts the lifecycle task"
+    );
+    ferrum_edge::plugins::Plugin::commit_background_tasks(&plugin);
+    assert_eq!(
+        plugin.lifecycle_task_finished_for_test(),
         Some(false),
         "a runtime instance owns a background lifecycle task"
     );

@@ -21,6 +21,9 @@ mod unit {
         #[allow(dead_code)]
         pub(crate) mod plugin_utils;
 
+        // Built-in config contracts for the nested-closure / purity sweep.
+        pub(crate) mod plugin_config_corpus;
+
         // The one place a fake Redis peer's `TIME` reply is defined. Shared
         // with the integration and functional targets, which reach the same
         // file through `tests/common`.
@@ -61,6 +64,7 @@ mod unit {
         mod otel_tracing_review_tests;
         mod otel_tracing_tests;
         mod plugin_cache_tests;
+        mod plugin_config_closure_tests;
         mod plugin_doc_parity_tests;
         mod plugin_http_client_tests;
         mod plugin_integration_tests;

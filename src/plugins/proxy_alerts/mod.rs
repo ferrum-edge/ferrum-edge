@@ -86,7 +86,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -146,11 +146,13 @@ static NEXT_DISPATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct ProxyAlerts {
     core: Arc<AlertCore>,
-    /// Background lifecycle task (re-evaluation + eviction) for runtime plugin
-    /// instances. `None` when the plugin was instantiated by an offline
-    /// validation path without a Tokio runtime. Holds only a `Weak` core and
-    /// is aborted on `Drop`.
-    lifecycle_task: Option<tokio::task::JoinHandle<()>>,
+    /// Background lifecycle task (re-evaluation + eviction). Started by
+    /// `commit_background_tasks` once the owning generation is installed,
+    /// never by the constructor: config validation constructs and drops
+    /// instances, and the task can send resolve notifications (issue #6616).
+    /// Empty outside a Tokio runtime. Holds only a `Weak` core and is aborted
+    /// on `Drop`.
+    lifecycle_task: OnceLock<tokio::task::JoinHandle<()>>,
 }
 
 /// Shared plugin state. Owned by [`ProxyAlerts`]; the background lifecycle
@@ -304,10 +306,9 @@ impl ProxyAlerts {
             lifecycle_keep_ms,
             policy_id: Arc::from(policy_id),
         });
-        let lifecycle_task = start_lifecycle_task(Arc::downgrade(&core));
         Ok(Self {
             core,
-            lifecycle_task,
+            lifecycle_task: OnceLock::new(),
         })
     }
 
@@ -447,18 +448,18 @@ impl ProxyAlerts {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn stop_lifecycle_task_for_test(&self) {
-        if let Some(task) = self.lifecycle_task.as_ref() {
+        if let Some(task) = self.lifecycle_task.get() {
             task.abort();
         }
     }
 
-    /// Whether the background lifecycle task is still running (`None` when the
-    /// instance was built without a Tokio runtime).
+    /// Whether the background lifecycle task is still running (`None` until
+    /// `commit_background_tasks` started it on a Tokio runtime).
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn lifecycle_task_finished_for_test(&self) -> Option<bool> {
         self.lifecycle_task
-            .as_ref()
+            .get()
             .map(tokio::task::JoinHandle::is_finished)
     }
 
@@ -1276,7 +1277,7 @@ impl Drop for ProxyAlerts {
         // abandoned; the global observability registry still owns hard-abort
         // on process-shutdown deadline expiry.
         self.core.dispatch_generation.cancel();
-        if let Some(task) = self.lifecycle_task.take() {
+        if let Some(task) = self.lifecycle_task.get() {
             task.abort();
         }
     }
@@ -1353,6 +1354,19 @@ fn non_event_outcome_needs_commit(
 impl Plugin for ProxyAlerts {
     fn name(&self) -> &str {
         "proxy_alerts"
+    }
+
+    /// Start the idle re-evaluation / eviction ticker for the installed
+    /// generation. Idempotent: a concurrent second call aborts its own task.
+    fn commit_background_tasks(&self) {
+        if self.lifecycle_task.get().is_some() {
+            return;
+        }
+        if let Some(task) = start_lifecycle_task(Arc::downgrade(&self.core))
+            && let Err(duplicate) = self.lifecycle_task.set(task)
+        {
+            duplicate.abort();
+        }
     }
 
     fn priority(&self) -> u16 {

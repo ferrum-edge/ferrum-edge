@@ -69,6 +69,7 @@ pub mod builtin_parity;
 pub mod chargeback;
 pub(crate) mod charged_decode;
 pub mod compression;
+pub mod config_contract;
 pub mod correlation_id;
 pub mod cors;
 #[doc(hidden)]
@@ -139,6 +140,7 @@ pub use builtin_parity::{
     BUILTIN_PLUGIN_PARITY_META, BUILTIN_WEBSOCKET_FRAMING_PLUGINS, BuiltinPluginClassification,
     BuiltinPluginParityMeta, builtin_plugin_parity_meta,
 };
+pub use config_contract::PluginConfigContract;
 pub use utils::PluginHttpClient;
 
 use async_trait::async_trait;

@@ -688,7 +688,11 @@ pub(crate) fn node_waypoint_destination_scope_index(
     ))
 }
 
+/// One `node_waypoint_route_upstreams` entry. Closed with its `targets`
+/// (issue #6616): a misspelled `service_name` / `service_port` would silently
+/// resolve the route target to a different destination policy scope.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NodeWaypointRouteUpstreamConfig {
     id: String,
     namespace: String,
@@ -698,6 +702,7 @@ struct NodeWaypointRouteUpstreamConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NodeWaypointRouteTargetConfig {
     host: String,
     port: u16,

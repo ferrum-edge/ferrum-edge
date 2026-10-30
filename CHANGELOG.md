@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Plugin configs are closed at every depth, and validation is pinned
+  side-effect-free** (issue #6616). A new framework sweep
+  (`tests/unit/plugins/plugin_config_closure_tests.rs`) validates example
+  configs for every built-in and compiled custom plugin. It injects an unknown
+  key into each nested object and requires rejection. It also fails if
+  validating a plugin needs a Tokio runtime or spawns a task. Nested objects
+  that used to ignore unknown keys now reject them:
+  - `workload_metrics`: `direction_emit`, `tracing_provider(s)` envelopes and
+    their `config`, `metrics`, each `tag_overrides` entry, and its `operation`.
+  - `mesh_authz`: policy `scope` (including `kind: mesh_wide`), target-ref
+    attachments, the `custom` action, the embedded `mesh_slice` root,
+    `ext_authz_providers` with their header and body objects,
+    `request_authentications` with their JWT rules, `peer_authentications`,
+    `multi_cluster` with its remote-cluster and east-west-gateway entries,
+    and `node_waypoint_route_upstreams` entries and targets. The closed slice
+    root and `PeerAuthentication` apply wherever they are decoded from JSON
+    (native `MeshSubscribe`, Ferrum xDS carriers, file mesh documents, the
+    embedded `mesh_slice`). During a rolling upgrade, a data plane still
+    on an older build refuses slices from a newer control plane that adds a
+    closed member, and keeps serving its last-good slice until it is upgraded.
+    Mesh inventory objects (`workloads`, `services`) stay tolerant of unknown
+    fields for forward compatibility.
+
+  These no longer start background tasks in their constructors; each now
+  starts them in `commit_background_tasks`, so admin and CP validation no
+  longer spawn and abort them: the `mcp_gateway` session reaper, the
+  `proxy_alerts` lifecycle ticker, the `tcp_connection_throttle`
+  residual-entry sweep, and the Redis failover health observer of
+  `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
+  `ws_rate_limiting`, and `udp_rate_limiting` in `sync_mode: redis`.
+- **Breaking for custom plugins:** every custom plugin must export
+  `config_contract() -> crate::plugins::PluginConfigContract` with example
+  configs plus any free-form maps or embedded documents. The sweep runs over
+  these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
+
 ## [0.9.19] - 2026-10-27
 
 This replacement release carries forward the changes prepared for 0.9.18.

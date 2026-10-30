@@ -345,3 +345,22 @@ pub fn create_plugin(
 pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
     crate::plugins::PluginFailurePolicy::KeepLastKnownGood
 }
+
+/// Config contract — required export. The plugin test sweep validates every
+/// example, checks that construction neither needs nor spawns onto a tokio
+/// runtime, and injects an unknown key into every nested object (this
+/// plugin's config is flat, so only the root key set applies). List examples
+/// that reach every nested object your plugin reads.
+pub fn config_contract() -> crate::plugins::PluginConfigContract {
+    crate::plugins::PluginConfigContract::closed(vec![
+        serde_json::json!({}),
+        serde_json::json!({
+            "header_value": "my-gateway",
+            "request_body_prefix": "prefix:",
+            "correlation_header_name": "x-example-correlation",
+            "protocol": "http",
+            "egresses_request_body_before_finalization": false
+        }),
+        serde_json::json!({"protocol": "tcp"}),
+    ])
+}

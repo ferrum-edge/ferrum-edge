@@ -5789,6 +5789,11 @@ async fn failover_observer_drop_releases_client_and_stops_task() {
             DynamicHttpRateLimitAlgorithm::new(),
         )
         .expect("failover backend");
+    // Construction (what admin / CP validation does) starts no observer; the
+    // installed generation's commit does (issue #6616).
+    assert!(backend.health_observer_abort_for_test().is_none());
+    backend.commit_background_tasks();
+    backend.commit_background_tasks();
 
     let client = backend
         .redis_client_arc_for_test()
@@ -5855,6 +5860,7 @@ async fn repeated_failover_replacement_leaves_only_active_observer() {
                 algorithm,
             )
             .expect("failover backend");
+        next.commit_background_tasks();
         let next_abort = next
             .health_observer_abort_for_test()
             .expect("active observer");

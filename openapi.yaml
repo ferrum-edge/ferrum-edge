@@ -26485,10 +26485,10 @@ components:
         listener serves many pods and the filter runs per request against the
         pod-scoped cache.
 
-        Unlike the rest of the grammar this object does not reject unknown
-        members: the runtime deserializes it as an internally tagged enum whose
-        variant fields are all required, so an unrecognized sibling key cannot
-        remove a constraint. The nested `selector` IS closed.
+        Closed like the rest of the grammar: each `kind` admits only its own
+        members, so an unrecognized sibling key (including one beside
+        `kind: mesh_wide`) is rejected at admission. The nested `selector` and
+        every `attachments` entry are closed too.
       required: [kind]
       properties:
         kind:
@@ -26496,11 +26496,13 @@ components:
           enum: [mesh_wide, namespace, workload_selector, target_refs]
       oneOf:
         - title: mesh_wide
+          additionalProperties: false
           properties:
             kind:
               const: mesh_wide
         - title: namespace
           required: [kind, namespace]
+          additionalProperties: false
           properties:
             kind:
               const: namespace
@@ -26509,6 +26511,7 @@ components:
               description: Applies to workloads in exactly this namespace.
         - title: workload_selector
           required: [kind, selector]
+          additionalProperties: false
           properties:
             kind:
               const: workload_selector
@@ -26529,6 +26532,7 @@ components:
                   type: [string, "null"]
         - title: target_refs
           required: [kind, attachments]
+          additionalProperties: false
           properties:
             kind:
               const: target_refs
@@ -26543,6 +26547,16 @@ components:
               items:
                 type: object
                 required: [kind]
+                additionalProperties: false
+                allOf:
+                  - if:
+                      required: [kind]
+                      properties:
+                        kind:
+                          const: gateway_class
+                    then:
+                      not:
+                        required: [namespace]
                 properties:
                   kind:
                     type: string
@@ -26921,11 +26935,14 @@ components:
             it would drift into rejecting valid injected configuration. It is
             admitted by the runtime deserializer instead, which fails the whole
             plugin generation on a malformed slice so the previous valid
-            generation keeps serving. Its `mesh_policies` member follows the
-            same closed policy grammar modelled below, including the
-            never-match matcher refusals.
+            generation keeps serving. Its root members are closed (an
+            unrecognized top-level slice member is rejected), and its
+            `mesh_policies` member follows the same closed policy grammar
+            modelled below, including the never-match matcher refusals.
 
-            Its `ext_authz_providers` entries may declare
+            Its `ext_authz_providers` entries are closed (with their
+            `include_additional_headers_in_check` and
+            `include_request_body_in_check` objects) and may declare
             `headers_to_upstream_on_allow` (provider response headers that
             replace the backend request's same-named headers on an allowed
             CUSTOM check, applied in this plugin's `before_proxy`; client copies
@@ -27028,10 +27045,12 @@ components:
           readOnly: true
           description: >-
             Mesh-generated route upstream metadata used to precompute
-            destination policy scopes for node-waypoint dispatch.
+            destination policy scopes for node-waypoint dispatch. Each entry
+            and each target is closed: an unrecognized member is rejected.
           items:
             type: object
             required: [id, namespace]
+            additionalProperties: false
             properties:
               id:
                 type: string
@@ -27042,6 +27061,7 @@ components:
                 items:
                   type: object
                   required: [host, port]
+                  additionalProperties: false
                   properties:
                     host:
                       type: string
@@ -28456,15 +28476,19 @@ components:
             Diagnostics name the entry index only.
         metrics:
           type: object
+          additionalProperties: false
           description: |
             Istio Telemetry-CRD-style metrics customization. Both fields are
-            optional and additive; unknown fields are ignored.
+            optional and additive. The object, each `tag_overrides` entry, and
+            each `operation` are closed: unknown fields, and fields belonging
+            to a different operation `type`, are rejected at construction.
           properties:
             tag_overrides:
               type: array
               maxItems: 128
               items:
                 type: object
+                additionalProperties: false
                 required: [name, operation]
                 properties:
                   metric:
@@ -28491,25 +28515,50 @@ components:
                       decimal spelling shares that status's series.
                   operation:
                     type: object
+                    additionalProperties: false
                     required: [type]
                     allOf:
+                      - if:
+                          properties:
+                            type: {const: remove}
+                        then:
+                          not:
+                            anyOf:
+                              - required: [new_name]
+                              - required: [value]
+                              - required: [cel]
+                              - required: [expression]
                       - if:
                           properties:
                             type: {const: rename}
                         then:
                           required: [new_name]
+                          not:
+                            anyOf:
+                              - required: [value]
+                              - required: [cel]
+                              - required: [expression]
                       - if:
                           properties:
                             type: {const: set}
                         then:
                           required: [value]
+                          not:
+                            anyOf:
+                              - required: [new_name]
+                              - required: [cel]
+                              - required: [expression]
                       - if:
                           properties:
                             type: {const: set_expr}
                         then:
-                          anyOf:
+                          oneOf:
                             - required: [expression]
                             - required: [cel]
+                          not:
+                            anyOf:
+                              - required: [new_name]
+                              - required: [value]
                     description: |
                       One of `{"type": "remove"}`,
                       `{"type": "rename", "new_name": "..."}`,
@@ -28556,8 +28605,8 @@ components:
                         type: string
                         maxLength: 512
                         description: |
-                          Bounded CEL source when `type` is `set_expr` and a
-                          compiled `expression` AST is not supplied. Limits:
+                          Bounded CEL source when `type` is `set_expr`. Set
+                          exactly one of `cel` and `expression`. Limits:
                           512 UTF-8 bytes including surrounding whitespace, 32
                           tokens, nesting depth 8, 24 AST nodes. Supported
                           forms: attribute reads,
@@ -28694,6 +28743,7 @@ components:
             snake_case spelling is present.
         direction_emit:
           type: [object, "null"]
+          additionalProperties: false
           properties:
             server:
               type: boolean
@@ -28704,7 +28754,7 @@ components:
           description: |
             Which traffic directions emit telemetry, translated from
             `Telemetry.tracing[].match.mode`. Omitted/null defaults to
-            server-only. Unknown nested fields are ignored.
+            server-only. Unknown nested fields are rejected.
         _effective_mesh_authz_baggage_gates:
           type: array
           minItems: 1
@@ -28736,6 +28786,10 @@ components:
         provider:
           type: object
           required: [kind, config]
+          additionalProperties: false
+          properties:
+            kind: {type: string}
+            config: {type: object}
           discriminator:
             propertyName: kind
           oneOf:
@@ -28743,6 +28797,7 @@ components:
                 kind: {const: opentelemetry}
                 config:
                   type: object
+                  additionalProperties: false
                   required: [endpoint]
                   properties:
                     endpoint: {type: string}
@@ -28750,6 +28805,7 @@ components:
                 kind: {const: zipkin}
                 config:
                   type: object
+                  additionalProperties: false
                   required: [url]
                   properties:
                     url: {type: string}
@@ -28757,6 +28813,7 @@ components:
                 kind: {const: datadog}
                 config:
                   type: object
+                  additionalProperties: false
                   required: [agent_url]
                   properties:
                     agent_url: {type: string}
@@ -28765,6 +28822,7 @@ components:
                 kind: {const: lightstep}
                 config:
                   type: object
+                  additionalProperties: false
                   anyOf:
                     - required: [collector_url, access_token_env]
                     - required: [collector_url, accessTokenEnv]
@@ -28781,7 +28839,8 @@ components:
                       pattern: '^(?!.*_(?:FILE|VAULT|AWS|AZURE|GCP)$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*$'
           description: |
             Direct provider envelope; name-only references belong to Istio
-            translation. Unknown fields are ignored by serde. Active exporters
+            translation. The envelope and each `config` are closed: unknown
+            fields are rejected at construction. Active exporters
             require an absolute HTTP(S) endpoint with a host and no embedded
             credentials. Lightstep reads its bearer token from the named local
             environment variable at construction; the name must be

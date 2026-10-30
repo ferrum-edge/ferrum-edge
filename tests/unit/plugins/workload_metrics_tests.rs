@@ -394,7 +394,11 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
             false,
         ),
         (json!({"direction_emit": null}), true),
-        (json!({"direction_emit": {"unused": true}}), true),
+        (json!({"direction_emit": {"unused": true}}), false),
+        (
+            json!({"direction_emit": {"server": true, "clinet": true}}),
+            false,
+        ),
         (json!({"direction_emit": {"server": null}}), false),
         (
             json!({"tracing_provider": null, "tracing_providers": null}),
@@ -407,6 +411,28 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         (json!({"tracing_provider": {}}), false),
         (json!({"tracing_provider": provider}), true),
         (json!({"tracing_providers": [provider]}), true),
+        (
+            json!({"tracing_provider": {
+                "kind": "opentelemetry",
+                "config": {"endpoint": "http://127.0.0.1:4318/v1/traces"},
+                "extra": true
+            }}),
+            false,
+        ),
+        (
+            json!({"tracing_providers": [{
+                "kind": "opentelemetry",
+                "config": {"endpoint": "http://127.0.0.1:4318/v1/traces", "endpont": "x"}
+            }]}),
+            false,
+        ),
+        (json!({"metrics": {"tag_overides": []}}), false),
+        (
+            json!({"metrics": {"tag_overrides": [{
+                "name": "source_workload", "operation": {"type": "remove"}, "metirc": "REQUEST_COUNT"
+            }]}}),
+            false,
+        ),
         (
             json!({"tracing_provider": {"kind": "zipkin", "config": {}}}),
             false,
@@ -449,6 +475,18 @@ fn provider_operation_and_default_schema_matches_constructor_admission() {
         json!({"type": "set_expr", "expression": {}}),
         json!({"type": "set_expr", "expression": {"op": "attribute", "name": "response_code"}}),
         json!({"type": "set_expr", "expression": {"op": "literal", "value": "x", "extra": 1}}),
+        // Operations are closed per `type`: unknown keys and keys another
+        // operation reads are both refused rather than silently ignored.
+        json!({"type": "remove", "typo": true}),
+        json!({"type": "remove", "value": "reviews"}),
+        json!({"type": "rename", "new_name": "source_app", "value": "reviews"}),
+        json!({"type": "set", "value": "reviews", "new_name": "source_app"}),
+        json!({"type": "set_expr", "cel": "string(response.code)", "value": "reviews"}),
+        json!({
+            "type": "set_expr",
+            "cel": "string(response.code)",
+            "expression": {"op": "literal", "value": "reviews"}
+        }),
     ] {
         cases.push((metric_operation(operation), false));
     }

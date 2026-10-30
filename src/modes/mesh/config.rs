@@ -392,8 +392,13 @@ pub struct MeshPolicy {
     pub rules: Vec<MeshRule>,
 }
 
+/// Closed like the rest of the grammar (issue #6616): `deny_unknown_fields`
+/// rejects an unrecognized member beside a struct variant's fields, and the
+/// field-less `mesh_wide` variant rejects any member besides `kind` through
+/// `deserialize_closed_unit_variant` (serde's internally tagged unit
+/// variants otherwise drain and ignore every remaining member).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyScope {
     WorkloadSelector {
         #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
@@ -422,7 +427,45 @@ pub enum PolicyScope {
         attachments: Vec<PolicyTargetAttachment>,
     },
     #[default]
+    #[serde(deserialize_with = "deserialize_closed_unit_variant")]
     MeshWide,
+}
+
+/// Deserialize the members an internally tagged unit variant carries besides
+/// its tag, refusing any. Serde hands the variant the object with `kind`
+/// already removed, so an empty object is the only accepted shape.
+fn deserialize_closed_unit_variant<'de, D>(deserializer: D) -> Result<(), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ClosedUnitVariant;
+
+    impl<'de> serde::de::Visitor<'de> for ClosedUnitVariant {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an object with no members besides `kind`")
+        }
+
+        fn visit_unit<E>(self) -> Result<(), E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(())
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            match map.next_key::<String>()? {
+                Some(key) => Err(serde::de::Error::unknown_field(&key, &[])),
+                None => Ok(()),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(ClosedUnitVariant)
 }
 
 /// Upper bound on `AuthorizationPolicy` / `MeshPolicy` `targetRefs` attachments
@@ -456,7 +499,7 @@ pub const MAX_POLICY_TARGET_REF_NAMESPACE_LEN: usize = crate::config::types::MAX
 /// waypoint association model, and an accepted-but-inert security policy is
 /// worse than a rejected one. See `docs/mesh.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyTargetAttachment {
     /// `group: ""` / `core`, `kind: Service` — waypoint destination attachment.
     /// Same namespace as the owning policy (Istio contract).
@@ -542,7 +585,7 @@ pub(crate) fn is_zero_usize(value: &usize) -> bool {
 /// can never be separated by a partial clone. Evaluation helpers therefore
 /// take `&PolicyAction`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyAction {
     #[default]
     Allow,
@@ -625,7 +668,13 @@ pub const MESH_EXT_AUTHZ_PROCESS_CONCURRENT_CALLS: usize = 128;
 /// Every field here is already validated and bounded; the runtime precomputes
 /// its client state from this value at config publication and performs no
 /// per-request parsing or formatting of provider identity.
+///
+/// Closed (`deny_unknown_fields`, issue #6616) with its nested header and body
+/// objects: a misspelled `headers_to_upstream_on_allow` or
+/// `include_request_body_in_check` would otherwise build a delegation that
+/// forwards or enforces something other than what the provider declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtAuthzProvider {
     /// `extensionProviders[].name` — the value an `AuthorizationPolicy`
     /// `spec.provider.name` must equal.
@@ -683,6 +732,7 @@ pub struct MeshExtAuthzProvider {
 
 /// A fixed operator-authored header added to every check request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtAuthzHeader {
     pub name: String,
     pub value: String,
@@ -690,6 +740,7 @@ pub struct MeshExtAuthzHeader {
 
 /// Istio `includeRequestBodyInCheck`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshExtAuthzBodyCheck {
     /// Maximum number of request body bytes forwarded to the provider.
     pub max_request_bytes: usize,
@@ -2408,6 +2459,12 @@ pub fn workload_selector_matches<L: WorkloadLabels + ?Sized>(
 /// rejected. A valid JWT has its claims extracted and identity propagated.
 /// Enforcement (requiring a JWT) comes from `AuthorizationPolicy`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Closed with its JWT rule types (issue #6616), like the authorization
+/// grammar: a misspelled `refused` or `jwt_rules` member would otherwise drop
+/// a refusal or a token requirement. Inventory types (`Workload`,
+/// `MeshService`) deliberately stay open for forward compatibility
+/// (`unknown_mesh_fields_are_tolerated`).
+#[serde(deny_unknown_fields)]
 pub struct MeshRequestAuthentication {
     pub name: String,
     pub namespace: String,
@@ -2428,6 +2485,7 @@ pub struct MeshRequestAuthentication {
 
 /// A single JWT validation rule within a [`MeshRequestAuthentication`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshJwtRule {
     pub issuer: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2459,6 +2517,7 @@ pub struct MeshJwtRule {
 /// One `outputClaimToHeaders` entry: publish `claim` into request header
 /// `header` after successful JWT validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshJwtClaimHeader {
     /// Backend-visible request header name (normalized lowercase at
     /// translation; never a reserved/credential-bearing header).
@@ -2553,6 +2612,7 @@ pub fn validate_mesh_jwt_output_claim_headers(
 
 /// A header location from which to extract a JWT.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JwtHeader {
     pub name: String,
     /// Prefix stripped before validation (e.g., `"Bearer "`).
@@ -2708,6 +2768,11 @@ impl TelemetryTracingMode {
 /// shim on older DPs (serde will simply fail to deserialise an unknown
 /// variant and the slice update is rejected at slice-apply time, consistent
 /// with the rest of the mesh slice contract).
+///
+/// The direct `workload_metrics` plugin config closes this envelope and each
+/// variant's `config` with per-kind allowlists
+/// (`src/plugins/mesh/workload_metrics.rs`, `*_PROVIDER_CONFIG_KEYS`). Adding
+/// a variant field here means adding it there too.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "config")]
 pub enum TracingProvider {
@@ -3061,7 +3126,12 @@ pub fn service_entry_applies_to_workload<L: WorkloadLabels + ?Sized>(
 
 // ── PeerAuthentication ────────────────────────────────────────────────────
 
+/// Closed (`deny_unknown_fields`, issue #6616) like the authorization grammar
+/// and `MeshRequestAuthentication`: a misspelled `mtls_mode` would otherwise
+/// default the policy to `PERMISSIVE`, admitting plaintext the operator meant
+/// to refuse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerAuthentication {
     pub name: String,
     pub namespace: String,
@@ -4064,7 +4134,13 @@ pub const MAX_MESH_REMOTE_CLUSTERS: usize = 256;
 /// This is intentionally control-plane neutral. Istio CRDs, Gateway API,
 /// native ConfigSync, xDS, file mode, and future CP-to-CP exchange all carry
 /// the same canonical shape instead of talking past Layer 2.
+///
+/// Closed with its `RemoteCluster` and `EastWestGateway` entries
+/// (`deny_unknown_fields`, issue #6616): this is operator-authored topology,
+/// not inventory. A misspelled `local_cluster` leaves it unset, which changes
+/// which endpoints destination policy scopes treat as local.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MultiClusterConfig {
     /// Operator-facing name for the local cluster. When set, must be a
     /// canonical identifier with no leading/trailing whitespace (same identity
@@ -4087,6 +4163,7 @@ pub struct MultiClusterConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteCluster {
     /// Canonical peer-cluster identity. Doubles as the remote-discovery JWT
     /// audience suffix (`ferrum-mesh-discovery:<name>`). Must not carry
@@ -4113,6 +4190,7 @@ pub struct RemoteCluster {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EastWestGateway {
     pub name: String,
     pub namespace: String,

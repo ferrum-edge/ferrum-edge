@@ -927,6 +927,26 @@ pub fn failure_policy() -> crate::plugins::PluginFailurePolicy {
     crate::plugins::PluginFailurePolicy::OptionalFailOpen
 }
 
+/// Config contract — required export. The plugin test sweep validates every
+/// example and checks that construction neither needs nor spawns onto a tokio
+/// runtime: the batching logger and retention task start only in
+/// `start_background_tasks`. The config is flat, so nested closure is vacuous.
+pub fn config_contract() -> crate::plugins::PluginConfigContract {
+    crate::plugins::PluginConfigContract::closed(vec![
+        serde_json::json!({}),
+        serde_json::json!({
+            "log_request_headers": true,
+            "retention_days": 30,
+            "queue_capacity": 1000,
+            "batch_size": 10,
+            "flush_interval_ms": 500,
+            "max_retries": 2,
+            "retry_delay_ms": 100
+        }),
+        serde_json::json!({"buffer_capacity": 500}),
+    ])
+}
+
 /// Database migrations for this plugin.
 ///
 /// Discovered by the build script when this example is opted in via
