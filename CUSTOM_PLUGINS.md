@@ -422,14 +422,14 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `validate_client_request_body_contract(&mut ctx, &headers, &body)` | Pre-`before_proxy` client contract (phase 3c) | Yes | Decide a client-facing request-body contract over the **original** client body after gateway-owned normalization and before any `before_proxy` or `transform_request_body` hook. Read-only: admit or reject, never rewrite. Requires `validates_client_request_body_contract()` **and** `requires_request_body_before_before_proxy()`; declaring the first without the second is a **startup-fatal** plugin-cache rejection because the phase would never run. See [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
 | `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs. **Read request headers from `headers`, not `ctx.headers`** (see note below) |
 | `on_backend_path_resolved(&mut ctx, backend_path)` | After path assembly (phase 5a) | Yes | Run once with the backend-effective path pinned and the selected target fixed. Use for route-sensitive policy such as `grpc_method_router`. Deferred external/synthetic `before_proxy` work (phases 5b–5c) runs later — see [plugin execution order](docs/plugin_execution_order.md#lifecycle-phases). |
-| `transform_request_body(&body, content_type)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
+| `transform_request_body(&body, content_type, &request_headers)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
 | `dispatch_finalized_request_egress(&mut ctx, &headers, &body, &mut backend_header_overlay)` | Finalized request egress (phase 5e) | Yes | Irreversible outbound request egress after request transforms and every final request-body policy hook accept the exact backend-visible bytes. Write backend header overlays into `backend_header_overlay`, not the immutable snapshot. Built-in participants include `serverless_function`, `request_mirror`, and `ai_federation`. |
 | `try_backend_admission(&ctx, &admission)` | Target-aware backend admission (phase 6) | Yes* | Called after load balancing selects a target and before dial/dispatch. Opt in with `is_backend_admission_plugin()`. Returns `BackendAdmissionDecision::Continue` or a rejection permit decision — not `PluginResult`. |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | Yes | Transform response headers, reject responses |
 | `apply_websocket_handshake_response_headers(&ctx, status, &mut headers)` | Successful WebSocket handshake (H1 `101`; H2/H3 `200`) | No | Synchronously decorate successful handshake response headers in configured order. After this non-rejecting hook returns, proxy core scrubs transport-owned handshake/framing fields and reconstructs them authoritatively. |
 | `on_final_response_headers(&mut ctx, status, &headers)` | Post-`after_proxy` (phase 7b) | No | Header-only effects for the selected response on both buffered and streaming paths. Non-rejecting; streamed responses stop body hooks after this phase. Pair with `on_final_response_body()` only when both must be idempotent. |
-| `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
+| `on_response_body(&mut ctx, status, &mut headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
 | `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client. Runs in the semantic stage (phase 10) and may run again in the transport-encoding stage (phase 10c) for plugins such as `compression`. |
 | `on_response_body_transformed(&mut ctx, &mut response_headers)` | Immediately after this plugin replaces the buffered body | No | Synchronous metadata refresh after this plugin's `transform_response_body` returns replacement bytes. Receives only mutable request context and response headers; not called when the transform returns `None`. |
 | `finalize_client_visible_response_body(&mut ctx, status, &headers, &body)` | After semantic rewrites, before transport encoding (phase 10b) | Yes | Authoritative, rejecting policy over the final semantic representation. Opt in with `enforces_final_client_visible_response_body()`. Header policy belongs in `finalize_client_visible_response_headers()` (phase 7c). |
@@ -526,7 +526,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn modified_request_header_names(&self) -> Option<Vec<String>>` | `None` | The lower-case names of every request header the plugin may change, when that set is fixed at construction. `None` means any header. Consulted only when `modifies_request_headers()` is `true`. |
 | `fn modifies_request_query(&self) -> bool` | `false` | Set to `true` if your plugin may rewrite the forwarded query in any pre-proxy phase. |
 | `fn modifies_request_destination(&self) -> bool` | `false` | Set to `true` if your plugin may rewrite the path, backend, upstream, or authority (including publishing route overrides) in any pre-proxy phase. |
-| `fn declares_request_input_mutations(&self) -> bool` | `false` | Return `true` once the four declarations above cover **every** header, query, path, or destination change the plugin makes in any pre-proxy phase. Until it does, the gateway treats the plugin as able to rewrite any request input in any phase, whatever its priority: a body collected before `before_proxy` then gets no early route-total bound from a `mesh_route_dispatch` rule (issue #6008), and the gateway logs that once per proxy chain at `info` on startup and reload. See [plugins.md → Route request deadline](docs/plugins.md#route-request-deadline). |
+| `fn declares_request_input_mutations(&self) -> bool` | `false` | Return `true` once the four declarations above cover **every** header, query, path, or destination change the plugin makes in any pre-proxy phase. Until it does, the gateway treats the plugin as able to rewrite any request input in any phase, whatever its priority: a body collected before `before_proxy` then gets no early route-total bound from a `mesh_route_dispatch` rule (issue #6008), and the gateway logs that once per proxy chain at `info` on startup and reload. See [mesh_route_dispatch → Route request deadline](docs/plugins/mesh_route_dispatch.md#route-request-deadline). |
 | `fn modifies_request_body(&self) -> bool` | `false` | Set to `true` if your plugin transforms the request body via `transform_request_body`. |
 | `fn egresses_request_body_before_finalization(&self) -> bool` | `false` | Set to `true` if `before_proxy` sends the buffered request body to an external service before request transforms/final hooks. Candidate admission and runtime cache construction then reject same-protocol body-transform compositions and same HTTP/gRPC-protocol final request-body policy plugins (`enforces_finalized_request_policy()`). |
 | `fn requires_prior_request_deduplication(&self) -> bool` | `false` | Set to `true` if `before_proxy` can execute an external side effect and return a terminal response. Any attached same-protocol `request_deduplication` instance must then have a strictly lower effective priority. |
@@ -540,7 +540,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn observes_mesh_label_metadata(&self) -> bool` | `true` | Whether the plugin can observe the `mesh.source.*` / `mesh.destination.*` workload labels that `workload_metrics` writes into `ctx.metadata` and `TransactionSummary.metadata` (issue #6793). Leave the default: while any plugin in a request's chain answers `true` — every custom plugin does — those keys are written for every plugin in that chain exactly as before. Only when every plugin in the chain answers `false` does `workload_metrics` keep the labels in typed request state instead of the metadata maps. Override to `false` only if the plugin never reads those keys from either map, never iterates, clones, serializes or forwards a whole metadata map, and never writes them. |
 | `fn enforces_final_client_visible_response_body(&self, &ctx) -> bool` | `false` | Per-request opt-in for `finalize_client_visible_response_body()` (phase 10b). |
 | `fn enforces_final_client_visible_response_headers(&self, &ctx) -> bool` | `false` | Per-request opt-in for `finalize_client_visible_response_headers()` (phase 7c). |
-| `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()` or `requires_request_body_before_before_proxy()`. Override for custom logic. |
+| `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()`, `requires_request_body_before_before_proxy()`, `requires_request_body_before_authenticate()`, or `requires_request_body_before_authorize()`. Override for custom logic. |
 | `fn should_buffer_request_body(&self, &ctx) -> bool` | Delegates | Per-request decision on whether to buffer. Defaults to `requires_request_body_buffering()`. Override for conditional buffering (e.g., only for certain content types). |
 | `fn requires_response_body_buffering(&self) -> bool` | `false` | Config-time upper bound. Set to `true` if the plugin may need the complete response body. |
 | `fn should_buffer_response_body(&self, &ctx) -> bool` | Delegates | Per-request refinement. Defaults to `requires_response_body_buffering()` and may skip buffering for irrelevant requests. |
@@ -597,7 +597,7 @@ Plugins execute in priority order (lowest number first) within each lifecycle ph
 | **Custom Default** | **5000** | **Default for custom plugins** | — |
 | Logging | 9000–9999 | Logging and metrics | stdout_logging (9000), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
 
-The complete built-in list is in [docs/plugin_execution_order.md](docs/plugin_execution_order.md#priority-bands).
+The complete built-in list is in [Plugin Execution Order → Complete Execution Order](docs/plugin_execution_order.md#complete-execution-order).
 
 To set a priority, override the `priority()` method:
 
@@ -644,9 +644,10 @@ impl Plugin for MyCustomAuth {
         // Look up the consumer by credential. This linear scan is for
         // illustration; ConsumerIndex also offers O(1) lookups such as
         // find_by_api_key() and find_by_username().
+        // Credentials are configured as `custom_token: [{token: "..."}]`.
         for consumer in consumer_index.consumers().iter() {
-            if let Some(cred) = consumer.credentials.get("custom_token") {
-                if cred.as_str() == Some(token.as_str()) {
+            for entry in consumer.credential_entries("custom_token") {
+                if entry.get("token").and_then(|v| v.as_str()) == Some(token.as_str()) {
                     ctx.identified_consumer = Some(consumer.clone());
                     return PluginResult::Continue;
                 }
@@ -734,6 +735,7 @@ impl Plugin for MyBodyTransformer {
         &self,
         body: &[u8],
         content_type: Option<&str>,
+        _request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Return Some(new_body) to replace, None to leave unchanged
         if content_type == Some("application/json") {
@@ -797,7 +799,7 @@ impl Plugin for MyJsonResponseInspector {
         &self,
         _ctx: &mut RequestContext,
         _response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        _response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         // Inspect the normalized body before ordinary response transforms.
@@ -1113,9 +1115,9 @@ impl Plugin for MyLogger {
 }
 ```
 
-`SummaryLogEntryView` and `SummaryLogEntryBatchView` are available for
-the batched / multi-variant case (mirroring `http_logging`, `tcp_logging`
-etc.). Metadata redaction is preserved on every code path. See
+Built-in loggers serialize through `SchemaView` (see
+`src/plugins/utils/summary_log_budget.rs`); batching custom loggers should wrap
+each summary the same way. Metadata redaction is preserved on every code path. See
 [docs/log_schema.md](docs/log_schema.md) for the operator-facing
 schema reference.
 

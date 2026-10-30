@@ -8242,7 +8242,7 @@ fn waf_stream_metadata_ownership_documentation_matches_stream_support() {
     // documented ownership contract aligned with the conditional stream
     // support so logging/schema authors do not treat stream `waf.*` values as
     // unavailable or non-authoritative.
-    let docs = include_str!("../../../docs/plugins.md");
+    let docs = include_str!("../../../docs/waf.md");
     let note = docs
         .split("Reserved log-metadata namespace")
         .nth(1)
@@ -8293,8 +8293,8 @@ fn waf_custom_rule_path_regex_docs_match_unanchored_runtime() {
     // `global_exemptions.paths`. Runtime, docs/waf.md, and OpenAPI keep rule
     // conditions operator-authored and unanchored. Pin the three surfaces so
     // the plugin guide cannot drift back to the exemption grammar.
-    let plugin_docs = include_str!("../../../docs/plugins.md");
     let waf_guide = include_str!("../../../docs/waf.md");
+    let plugin_docs = waf_guide;
     let openapi = include_str!("../../../openapi.yaml");
 
     let custom_rule_table = plugin_docs
@@ -10375,15 +10375,11 @@ fn request_and_response_size_only_claims_agree() {
 
 // ── Issue #5120: the main plugin reference states the real lifecycle ────────
 
-/// The `waf` section of `docs/plugins.md`, bounded at the next `###` heading so
-/// a neighbouring plugin's rows can never satisfy an assertion about this one.
+/// The canonical WAF reference, `docs/waf.md`. `docs/plugins.md` keeps only a
+/// summary that links here, so the summary block and parameter table pinned
+/// below live in this page.
 fn waf_plugins_doc_section() -> &'static str {
-    const PLUGINS_DOC: &str = include_str!("../../../docs/plugins.md");
-    let section = PLUGINS_DOC
-        .split("\n### `waf`\n")
-        .nth(1)
-        .expect("waf reference section");
-    section.split("\n### ").next().unwrap_or(section)
+    include_str!("../../../docs/waf.md")
 }
 
 /// `docs/plugins.md` is the reference most operators read first; its WAF

@@ -3328,7 +3328,20 @@ const REDIS_URL_DATABASE_SELECTOR_PATTERN: &str = concat!(
     r"2147483[0-5][0-9]{2}|21474836[0-3][0-9]|214748364[0-7])?)?(?:\?[^\s#]*)?(?![\s\S])",
 );
 
+/// Plugins whose full reference lives on its own page under `docs/plugins/`;
+/// `docs/plugins.md` keeps only a summary and a link for these.
+const PLUGIN_GUIDE_PAGES: &[(&str, &str)] = &[(
+    "ai_rate_limiter",
+    include_str!("../../docs/plugins/ai_rate_limiter.md"),
+)];
+
 fn plugin_docs_section<'a>(plugin_docs: &'a str, plugin_name: &str) -> &'a str {
+    if let Some((_, page)) = PLUGIN_GUIDE_PAGES
+        .iter()
+        .find(|(name, _)| *name == plugin_name)
+    {
+        return page;
+    }
     plugin_docs
         .split(&format!("### `{plugin_name}`"))
         .nth(1)
@@ -5350,7 +5363,7 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         "schema description still advertises an inert fallback_attempts counter"
     );
 
-    let guide = include_str!("../../docs/plugins.md");
+    let guide = include_str!("../../docs/plugins/ai_stream_router.md");
     assert!(guide.contains("**Strict configuration admission.**"));
     assert!(guide.contains("config.enabeld"));
     assert!(guide.contains("FailClosed"));
@@ -17535,12 +17548,7 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
         );
     }
 
-    let guide = include_str!("../../docs/plugins.md");
-    let section = guide
-        .split("### `ai_semantic_cache`")
-        .nth(1)
-        .and_then(|rest| rest.split("\n### `").next())
-        .expect("ai_semantic_cache docs section");
+    let section = include_str!("../../docs/plugins/ai_semantic_cache.md");
     for key in AI_SEMANTIC_CACHE_CONFIG_KEYS {
         assert!(
             section.contains(&format!("`{key}`")),
@@ -17652,12 +17660,7 @@ fn ai_semantic_cache_openapi_redis_key_prefix_matches_runtime_namespace_default(
         "omitted redis_key_prefix must use the namespace-derived default"
     );
 
-    let guide = include_str!("../../docs/plugins.md");
-    let section = guide
-        .split("### `ai_semantic_cache`")
-        .nth(1)
-        .and_then(|rest| rest.split("\n### `").next())
-        .expect("ai_semantic_cache docs section");
+    let section = include_str!("../../docs/plugins/ai_semantic_cache.md");
     assert!(
         section.contains("`\"{FERRUM_NAMESPACE}:ai_cache\"`")
             || section.contains("`{FERRUM_NAMESPACE}:ai_cache`"),
@@ -17770,12 +17773,7 @@ fn ai_rate_limiter_token_limit_required_without_default_contract() {
     AiRateLimiter::new(&json!({"token_limit": 100000}), PluginHttpClient::default())
         .expect("explicit token_limit must construct");
 
-    let guide = include_str!("../../docs/plugins.md");
-    let section = guide
-        .split("### `ai_rate_limiter`")
-        .nth(1)
-        .and_then(|rest| rest.split("\n### `").next())
-        .expect("ai_rate_limiter docs section");
+    let section = include_str!("../../docs/plugins/ai_rate_limiter.md");
     assert!(
         section.contains("| `token_limit` | Integer | *(required)* |"),
         "docs must label token_limit as required"
@@ -17812,12 +17810,7 @@ fn ai_rate_limiter_advertises_http_only_protocol_contract() {
         "OpenAPI must retract the inert native-gRPC support claim: {description}"
     );
 
-    let guide = include_str!("../../docs/plugins.md");
-    let section = guide
-        .split("### `ai_rate_limiter`")
-        .nth(1)
-        .and_then(|rest| rest.split("\n### `").next())
-        .expect("ai_rate_limiter docs section");
+    let section = include_str!("../../docs/plugins/ai_rate_limiter.md");
     assert!(
         section.contains("**This plugin is HTTP-only.**"),
         "docs must declare the HTTP-only protocol scope"
@@ -17917,12 +17910,7 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
         );
     }
 
-    let guide = include_str!("../../docs/plugins.md");
-    let section = guide
-        .split("### `ai_rate_limiter`")
-        .nth(1)
-        .and_then(|rest| rest.split("\n### `").next())
-        .expect("ai_rate_limiter docs section");
+    let section = include_str!("../../docs/plugins/ai_rate_limiter.md");
     assert!(
         section.contains("`google`"),
         "docs must clarify Gemini/Vertex payloads use google"
@@ -18655,7 +18643,7 @@ fn mesh_bpf_metrics_schema_matches_constructor_admission() {
         .expect("__mesh_bpf_metrics docs section");
     for needle in [
         "| `prefix` | String | `ferrum_mesh_bpf` |",
-        "`str::trim`",
+        "Unicode `White_Space`",
         "[A-Za-z_][A-Za-z0-9_]*",
         "OptionalFailOpen",
         "scope: global",
@@ -18941,11 +18929,11 @@ fn ai_semantic_firewall_extraction_paths_match_openapi_and_docs() {
         );
     }
 
-    let plugin_docs = include_str!("../../docs/plugins.md");
+    let plugin_docs = include_str!("../../docs/plugins/ai_semantic_firewall.md");
     for path in request_paths.iter().chain(response_paths.iter()) {
         assert!(
             plugin_docs.contains(&format!("`{path}`")),
-            "docs/plugins.md must document the supported extraction path {path}"
+            "docs/plugins/ai_semantic_firewall.md must document the supported extraction path {path}"
         );
     }
 }

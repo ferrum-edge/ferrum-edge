@@ -4317,7 +4317,7 @@ fn agent_card_diagnostic_literals(source: &str) -> Vec<&str> {
     found
 }
 
-/// The gRPC Agent Card diagnostic enumeration in `docs/plugins.md` is a
+/// The gRPC Agent Card diagnostic enumeration in `docs/plugins/a2a_gateway.md` is a
 /// *complete* list of client-visible codes, not a sample.
 ///
 /// It is published as an operator-facing contract, so an omission is worse than
@@ -4327,17 +4327,13 @@ fn agent_card_diagnostic_literals(source: &str) -> Vec<&str> {
 /// and every diagnostic in the table exists in the source.
 #[test]
 fn grpc_agent_card_diagnostics_are_completely_documented() {
-    const GUIDE: &str = include_str!("../../../docs/plugins.md");
+    const GUIDE: &str = include_str!("../../../docs/plugins/a2a_gateway.md");
     // Internal sentinel for "the output pass refused a write". Callers translate
     // it into `agent_card_grpc_frame_too_large` or the shared capacity terminal,
     // so it must never be documented as a client-visible diagnostic.
     const INTERNAL_ONLY: &str = "agent_card_protobuf_emit_refused";
 
-    let section = GUIDE
-        .split("### `a2a_gateway`")
-        .nth(1)
-        .and_then(|rest| rest.split("\n### `").next())
-        .expect("a2a_gateway docs section");
+    let section = GUIDE;
     let literals = agent_card_diagnostic_literals(A2A_GATEWAY_SOURCE);
     assert!(
         literals.len() > 1,
@@ -4356,7 +4352,7 @@ fn grpc_agent_card_diagnostics_are_completely_documented() {
         }
         assert!(
             section.contains(&format!("| `{diagnostic}` |")),
-            "docs/plugins.md must list the client-visible diagnostic {diagnostic} \
+            "docs/plugins/a2a_gateway.md must list the client-visible diagnostic {diagnostic} \
              in the a2a_gateway gRPC Agent Card table"
         );
         documented += 1;
@@ -4391,7 +4387,7 @@ fn grpc_agent_card_diagnostics_are_completely_documented() {
         let name = name.trim().trim_matches('`');
         assert!(
             literals.contains(&name),
-            "docs/plugins.md documents {name}, which the plugin source cannot produce"
+            "docs/plugins/a2a_gateway.md documents {name}, which the plugin source cannot produce"
         );
     }
 }

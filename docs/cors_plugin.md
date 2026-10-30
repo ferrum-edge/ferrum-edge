@@ -16,7 +16,7 @@ Denials use a JSON object with a fixed `error` message (`CORS origin not allowed
 
 ## Configuration
 
-The CORS plugin is configured via the `plugin_configs` section in your YAML configuration file, or through the admin API when running in control-plane mode.
+The CORS plugin is configured via the `plugin_configs` section in your YAML configuration file, or through the Admin API in `database` or `cp` mode.
 
 ### Configuration Fields
 
@@ -376,89 +376,37 @@ The same rules apply when gRPC-Web requests use the gRPC request-policy chain.
 
 ## Request Flow
 
-### Preflight Request (OPTIONS)
+Allowed preflight and actual requests:
 
 ```
 Browser                    Gateway (CORS Plugin)                Backend
   |                              |                                |
   |-- OPTIONS /api/users ------->|                                |
-  |   Origin: https://app.com   |                                |
-  |   Access-Control-Request-    |                                |
+  |   Origin: https://app.com    |-- origin + method allowed       |
+  |   Access-Control-Request-    |   (request never hits backend)  |
   |     Method: DELETE           |                                |
-  |                              |-- Check origin: allowed? ---   |
-  |                              |-- Check method: allowed? ---   |
-  |                              |                                |
-  |<---- 204 No Content --------|   (request never hits backend)  |
-  |   Access-Control-Allow-      |                                |
-  |     Origin: https://app.com |                                |
-  |   Access-Control-Allow-      |                                |
-  |     Methods: GET, POST, ...  |                                |
-  |   Access-Control-Max-Age:    |                                |
-  |     86400                    |                                |
-```
-
-### Preflight Rejected (Disallowed Origin)
-
-```
-Browser                    Gateway (CORS Plugin)
-  |                              |
-  |-- OPTIONS /api/users ------->|
-  |   Origin: https://evil.com  |
-  |   Access-Control-Request-    |
-  |     Method: GET              |
-  |                              |-- Check origin: NOT allowed ---
-  |                              |
-  |<---- 403 Forbidden ---------|
-  |   {"error":"CORS origin     |
-  |      not allowed"}           |
-```
-
-### Preflight Rejected (Disallowed Method)
-
-```
-Browser                    Gateway (CORS Plugin)
-  |                              |
-  |-- OPTIONS /api/users ------->|
-  |   Origin: https://app.com   |
-  |   Access-Control-Request-    |
-  |     Method: TRACE            |
-  |                              |-- Check origin: allowed ------
-  |                              |-- Check method: NOT allowed --
-  |                              |
-  |<---- 403 Forbidden ---------|
-  |   {"error":"CORS method     |
-  |      not allowed"}           |
-```
-
-### Actual Cross-Origin Request (Allowed)
-
-```
-Browser                    Gateway (CORS Plugin)                Backend
+  |<---- 204 No Content ---------|                                |
+  |   Access-Control-Allow-*     |                                |
+  |   Access-Control-Max-Age     |                                |
   |                              |                                |
   |-- GET /api/users ----------->|                                |
-  |   Origin: https://app.com   |-- origin allowed, stash ----   |
-  |                              |-- proxy to backend ----------->|
-  |                              |                                |
-  |                              |<--- 200 OK + body ------------|
-  |                              |-- inject CORS headers ------   |
-  |<---- 200 OK + body ---------|                                |
+  |   Origin: https://app.com    |-- origin allowed -------------->|
+  |                              |<--- 200 OK + body --------------|
+  |<---- 200 OK + body ----------|-- inject CORS headers           |
   |   Access-Control-Allow-      |                                |
-  |     Origin: https://app.com |                                |
-  |   Vary: Origin              |                                |
+  |     Origin: https://app.com  |                                |
+  |   Vary: Origin               |                                |
 ```
 
-### Actual Cross-Origin Request (Disallowed Origin)
+Rejections by a native direct policy with `preflight_continue: false`:
 
-```
-Browser                    Gateway (CORS Plugin)
-  |                              |
-  |-- GET /api/users ----------->|
-  |   Origin: https://evil.com  |-- origin NOT allowed ----------
-  |                              |
-  |<---- 403 Forbidden ---------|
-  |   {"error":"CORS origin     |
-  |      not allowed"}           |
-```
+| Case | Status | Body |
+|---|---|---|
+| Preflight from a disallowed origin | `403` | `{"error":"CORS origin not allowed"}` |
+| Preflight requesting a disallowed method | `403` | `{"error":"CORS method not allowed"}` |
+| Actual request from a disallowed origin | `403` | `{"error":"CORS origin not allowed"}` |
+
+Other configurations behave differently. With `preflight_continue: true`, allowed preflights are forwarded and keep the backend's status and body (see [Example 6](#example-6-backend-handles-options)). An Istio-translated policy forwards an unmatched actual request without CORS authorization fields (see [Istio translation semantics](#istio-translation-semantics)). Composed policies can also refuse a requested header with `403 CORS header not allowed` (see [Multiple instances](#multiple-instances)).
 
 ## Response Headers Reference
 
