@@ -210,11 +210,17 @@ a rotated order, then runs the probe. Each cell is 100 concurrent calls for
 - **Deadline termination and release.** The probe makes 20 sequential
   `ServerStream` calls with `grpc-timeout: 250m` and `x-bench-stall`. The
   backend sends headers, then holds the stream open until its peer drops it.
-  The client arms no timer of its own, so only the gateway's deadline can end
-  each call. Every call must end `DEADLINE_EXCEEDED` between 225 ms and
-  1,250 ms, and every stalled backend stream must be released within 5 s.
-  A candidate probe failure fails the run. A reference failure is recorded
-  as informational.
+  tonic's client applies `grpc-timeout` only to the response headers, which
+  arrive at once (and would end as `CANCELLED`), and tonic's server only to
+  the handler future, so only the gateway's deadline can end each call. Every
+  call must end `DEADLINE_EXCEEDED` between 225 ms and 1,250 ms. After each
+  call, with the probe's client connection still open, the backend must report
+  that stalled stream released within 5 s, so a gateway that frees backend
+  streams only when the client disconnects fails. The probe stops at the first
+  call nothing ended or the first stream still held, so a failing revision
+  yields evidence quickly. A candidate probe failure fails the run. A
+  reference failure, including a probe that did not complete, is recorded as
+  informational and keeps the comparison.
 - **Primary estimate.** The deadline-free cells run no RPC-deadline code in
   either revision, so they are the null control. Per (shape, auth), the
   round-paired difference between the deadline cell's log candidate/reference

@@ -74,8 +74,10 @@ enum Protocol {
     /// Calls `ServerStream` with `x-bench-stall` so the backend answers with
     /// headers and then holds the stream open forever. Only a gateway that
     /// enforces the forwarded `grpc-timeout` can end each call, so every call
-    /// must return `DEADLINE_EXCEEDED` near the deadline. The client sets no
-    /// timer of its own beyond a 10 s safety bound.
+    /// must return `DEADLINE_EXCEEDED` near the deadline. tonic's client
+    /// bounds only the response headers (which the backend sends at once) and
+    /// would report `CANCELLED`; past them the client waits up to a 10 s
+    /// safety bound.
     GrpcDeadlineProbe(ProbeArgs),
 }
 
@@ -113,6 +115,13 @@ struct ProbeArgs {
     /// Extra request metadata, `key=value` (repeatable), e.g. an API key
     #[arg(long)]
     grpc_metadata: Vec<String>,
+
+    /// `proto_backend` health listener (`host:port`) serving `/bench-stats`.
+    /// When set, after each call and while this client's connection stays
+    /// open, wait up to 5 s for the backend to report every stalled stream
+    /// released, so client teardown cannot be what released them.
+    #[arg(long)]
+    backend_stats: Option<String>,
 }
 
 /// The HTTP/2 and gRPC clients' historical fixed stream window: 8 MiB.
@@ -178,8 +187,8 @@ struct BenchArgs {
     grpc_rpc: GrpcRpc,
 
     /// gRPC only: send `grpc-timeout` with this many milliseconds on every
-    /// call (0 = none). The client arms no local timer, so the value only
-    /// tells the gateway and backend the RPC deadline.
+    /// call (0 = none). tonic's client applies it only to the wait for
+    /// response headers (ending as `CANCELLED`), never to the response stream.
     #[arg(long, default_value = "0")]
     grpc_timeout_ms: u64,
 
@@ -1759,8 +1768,11 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
 }
 
 /// Sequential stalled `ServerStream` calls that only a deadline-enforcing
-/// gateway can end (#6904). Prints one JSON report; the harness judges it
-/// together with the backend's stalled-stream release counters.
+/// gateway can end (#6904). Prints one JSON report. With `--backend-stats`,
+/// each call's backend stream must be released while this client's connection
+/// is still open. The probe stops at the first call nothing ended and at the
+/// first stream the backend still holds, so a failing gateway yields its
+/// evidence quickly instead of exhausting a caller's time budget.
 async fn run_grpc_deadline_probe(args: &ProbeArgs) -> anyhow::Result<()> {
     use bench_proto::EchoRequest;
     use bench_proto::bench_service_client::BenchServiceClient;
@@ -1787,16 +1799,26 @@ async fn run_grpc_deadline_probe(args: &ProbeArgs) -> anyhow::Result<()> {
     };
     // Generous next to the probe deadline; reaching it means nothing ended the call.
     let safety = Duration::from_secs(10);
+    let release_bound = Duration::from_secs(5);
+    let baseline = match &args.backend_stats {
+        Some(addr) => Some(read_stalled_counters(addr).await?),
+        None => None,
+    };
 
+    let mut calls_made = 0u32;
     let mut deadline_exceeded = 0u32;
     let mut unexpected_messages = 0u32;
     let mut client_safety_timeouts = 0u32;
+    let mut release_failures = 0u32;
+    let mut max_release_wait_ms = 0.0f64;
+    let mut stalled = (0u64, 0u64);
     let mut other_statuses: std::collections::BTreeMap<String, u32> = Default::default();
     let mut elapsed_ms = Vec::with_capacity(args.calls as usize);
     for _ in 0..args.calls {
         let request = options.request(EchoRequest {
             payload: b"stall".to_vec(),
         });
+        calls_made += 1;
         let start = Instant::now();
         let call = async {
             let mut stream = client.server_stream(request).await?.into_inner();
@@ -1815,7 +1837,10 @@ async fn run_grpc_deadline_probe(args: &ProbeArgs) -> anyhow::Result<()> {
             unexpected_messages += *messages;
         }
         match outcome {
-            Err(_) => client_safety_timeouts += 1,
+            Err(_) => {
+                client_safety_timeouts += 1;
+                break;
+            }
             Ok(Err(status)) | Ok(Ok((_, Some(status))))
                 if status.code() == tonic::Code::DeadlineExceeded =>
             {
@@ -1832,6 +1857,25 @@ async fn run_grpc_deadline_probe(args: &ProbeArgs) -> anyhow::Result<()> {
                     .or_default() += 1;
             }
         }
+        if let (Some(addr), Some((started0, released0))) = (&args.backend_stats, baseline) {
+            let wait = Instant::now();
+            loop {
+                let (started, released) = read_stalled_counters(addr).await?;
+                stalled = (started - started0, released - released0);
+                if stalled.0 >= u64::from(calls_made) && stalled.1 >= stalled.0 {
+                    break;
+                }
+                if wait.elapsed() >= release_bound {
+                    release_failures += 1;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            max_release_wait_ms = max_release_wait_ms.max(wait.elapsed().as_secs_f64() * 1000.0);
+            if release_failures > 0 {
+                break;
+            }
+        }
     }
     let mut sorted = elapsed_ms.clone();
     sorted.sort_by(f64::total_cmp);
@@ -1839,6 +1883,7 @@ async fn run_grpc_deadline_probe(args: &ProbeArgs) -> anyhow::Result<()> {
         "probe": "grpc_deadline",
         "target": args.target,
         "calls": args.calls,
+        "calls_made": calls_made,
         "grpc_timeout_ms": args.grpc_timeout_ms,
         "deadline_exceeded": deadline_exceeded,
         "other_statuses": other_statuses,
@@ -1849,9 +1894,51 @@ async fn run_grpc_deadline_probe(args: &ProbeArgs) -> anyhow::Result<()> {
             "median": sorted.get(sorted.len() / 2).copied().unwrap_or(0.0),
             "max": sorted.last().copied().unwrap_or(0.0),
         },
+        "release_checked": baseline.is_some(),
+        "release_failures": release_failures,
+        "max_release_wait_ms": max_release_wait_ms,
+        "backend_stalled_started": stalled.0,
+        "backend_stalled_released": stalled.1,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+/// Read `proto_backend`'s cumulative stalled-stream counters with one
+/// HTTP/1.0 `GET /bench-stats`, independent of the gRPC connection under test.
+async fn read_stalled_counters(addr: &str) -> anyhow::Result<(u64, u64)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream
+            .write_all(b"GET /bench-stats HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    };
+    let response = tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .map_err(|_| anyhow::anyhow!("GET /bench-stats from {addr} timed out"))?
+        .with_context(|| format!("GET /bench-stats from {addr}"))?;
+    let body = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|head| &response[head + 4..])
+        .ok_or_else(|| anyhow::anyhow!("/bench-stats response has no header terminator"))?;
+    let stats: serde_json::Value =
+        serde_json::from_slice(body).context("/bench-stats is not JSON")?;
+    let counter = |key: &str| {
+        stats
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("/bench-stats has no {key}; rebuild proto_backend"))
+    };
+    Ok((
+        counter("grpc_stalled_started")?,
+        counter("grpc_stalled_released")?,
+    ))
 }
 
 // ── TCP ──────────────────────────────────────────────────────────────────────

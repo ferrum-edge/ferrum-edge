@@ -312,12 +312,13 @@ def run_bench(kind: str, dest: Path, env: dict) -> dict:
     elif kind == "probe-open":
         result = subprocess.run(
             ["proto_bench", "grpc-deadline-probe", "--target", "http://127.0.0.1:18080", "--calls", "20",
-             "--grpc-timeout-ms", "250"], env=env, cwd=dest.parent,
+             "--grpc-timeout-ms", "250", "--backend-stats", "127.0.0.1:3010"], env=env, cwd=dest.parent,
             capture_output=True, text=True, timeout=180)
     elif kind == "probe-auth":
         result = subprocess.run(
             ["proto_bench", "grpc-deadline-probe", "--target", "http://127.0.0.1:18080", "--calls", "20",
-             "--grpc-timeout-ms", "250", "--grpc-metadata", "x-api-key=grpc-deadline-bench-key-0001"], env=env, cwd=dest.parent,
+             "--grpc-timeout-ms", "250", "--grpc-metadata", "x-api-key=grpc-deadline-bench-key-0001",
+             "--backend-stats", "127.0.0.1:3010"], env=env, cwd=dest.parent,
             capture_output=True, text=True, timeout=180)
     else:
         raise HarnessError(f"{dest.name}: no literal proto_bench command for {kind!r}")
@@ -356,25 +357,27 @@ def measure_cell(scenario: str, dest: Path, env: dict, gateway_pid: int) -> dict
 
 
 def run_probe(auth: str, dest: Path, env: dict) -> dict:
+    """Run the stalled-stream probe and return its evidence.
+
+    The probe itself checks backend release after every call while its own
+    connection is still open, so client teardown cannot release the streams.
+    A probe that fails to run or times out is recorded as evidence, not raised:
+    a failing reference must not discard the candidate's measurements.
+    """
     stats_before = backend_stats()
-    report = run_bench(f"probe-{auth}", dest, env)
+    try:
+        report = run_bench(f"probe-{auth}", dest, env)
+        error = None
+    except (HarnessError, subprocess.TimeoutExpired) as exc:
+        report, error = {}, f"probe did not complete: {exc}"
     started = counter_delta(stats_before, backend_stats(), "grpc_stalled_started")
-    # Release is asynchronous to the client's status: poll briefly.
-    wait_start = time.monotonic()
-    released = 0
-    while time.monotonic() - wait_start < 5.0:
-        released = counter_delta(stats_before, backend_stats(), "grpc_stalled_released")
-        if released >= started:
-            break
-        time.sleep(0.05)
-    return {
-        "auth": auth, "calls": report.get("calls"), "deadline_exceeded": report.get("deadline_exceeded"),
-        "other_statuses": report.get("other_statuses", {}), "unexpected_messages": report.get("unexpected_messages"),
-        "client_safety_timeouts": report.get("client_safety_timeouts"), "elapsed_ms": report.get("elapsed_ms", {}),
-        "grpc_timeout_ms": report.get("grpc_timeout_ms"),
-        "backend_stalled_started": started, "backend_stalled_released": released,
-        "release_wait_ms": (time.monotonic() - wait_start) * 1000.0,
-    }
+    fields = ("calls", "calls_made", "deadline_exceeded", "unexpected_messages", "client_safety_timeouts",
+              "grpc_timeout_ms", "release_checked", "release_failures", "max_release_wait_ms",
+              "backend_stalled_started", "backend_stalled_released")
+    probe = {"auth": auth, "error": error, "backend_started_crosscheck": started,
+             "other_statuses": report.get("other_statuses", {}), "elapsed_ms": report.get("elapsed_ms", {})}
+    probe.update({field: report.get(field) for field in fields})
+    return probe
 
 
 def rotated(values: tuple, offset: int) -> tuple:
@@ -534,14 +537,17 @@ def sample_integrity(row: dict) -> list[str]:
     return problems
 
 
-def probe_problems(probe: dict, timeout_ms: int) -> list[str]:
+def probe_problems(probe: dict, timeout_ms: int, expected_calls: int) -> list[str]:
     where = f"{probe['role']} round {probe['round']} {probe['auth']} probe"
+    if probe.get("error"):
+        return [f"{where}: {probe['error']}"]
     problems = []
-    calls = probe.get("calls") or 0
-    if not calls:
-        problems.append(f"{where}: made no calls")
-    if probe.get("deadline_exceeded") != calls:
-        problems.append(f"{where}: {probe.get('deadline_exceeded')} of {calls} calls ended DEADLINE_EXCEEDED "
+    made = probe.get("calls_made") or 0
+    if probe.get("calls") != expected_calls or made != expected_calls:
+        problems.append(f"{where}: made {made} of {expected_calls} calls (it stops at the first call nothing ended "
+                        "or the first stream the backend still held)")
+    if probe.get("deadline_exceeded") != expected_calls:
+        problems.append(f"{where}: {probe.get('deadline_exceeded')} of {expected_calls} calls ended DEADLINE_EXCEEDED "
                         f"(others {probe.get('other_statuses')}, safety timeouts {probe.get('client_safety_timeouts')})")
     if probe.get("unexpected_messages"):
         problems.append(f"{where}: received {probe['unexpected_messages']} messages from a stalled stream")
@@ -550,11 +556,17 @@ def probe_problems(probe: dict, timeout_ms: int) -> list[str]:
         problems.append(f"{where}: a call ended after {elapsed.get('min', 0):.0f} ms, before the {timeout_ms} ms deadline")
     if elapsed.get("max", float("inf")) > timeout_ms + 1000:
         problems.append(f"{where}: a call took {elapsed.get('max', 0):.0f} ms against a {timeout_ms} ms deadline")
-    if probe.get("backend_stalled_started") != calls:
-        problems.append(f"{where}: backend opened {probe.get('backend_stalled_started')} stalled streams for {calls} calls")
-    if probe.get("backend_stalled_released") != probe.get("backend_stalled_started"):
-        problems.append(f"{where}: backend still held {probe.get('backend_stalled_started', 0) - probe.get('backend_stalled_released', 0)} "
-                        "stalled streams 5 s after the probe")
+    if probe.get("release_checked") is not True:
+        problems.append(f"{where}: backend release was not checked while the client connection was open")
+    if probe.get("release_failures"):
+        problems.append(f"{where}: the backend still held a stalled stream 5 s after its call ended, "
+                        "with the client connection still open")
+    if probe.get("backend_stalled_started") != made or probe.get("backend_stalled_released") != made:
+        problems.append(f"{where}: backend opened {probe.get('backend_stalled_started')} and released "
+                        f"{probe.get('backend_stalled_released')} stalled streams for {made} calls")
+    if probe.get("backend_started_crosscheck") != made:
+        problems.append(f"{where}: backend counted {probe.get('backend_started_crosscheck')} stalled streams across "
+                        f"the probe for {made} calls")
     return problems
 
 
@@ -594,6 +606,7 @@ def evaluate(contract: dict, rows: list[dict], probes: list[dict]) -> dict:
         failures.extend(sample_integrity(row))
     computable = all(isinstance(row.get(field), (int, float)) and row[field] > 0 for row in rows for _, field in METRICS)
     timeout_ms = contract["workload"]["probe_grpc_timeout_ms"]
+    probe_calls = contract["workload"]["probe_calls"]
     probe_seen = {(p["role"], p["auth"], p["round"]) for p in probes}
     for role in ROLES:
         for auth in CONFIGS:
@@ -601,7 +614,7 @@ def evaluate(contract: dict, rows: list[dict], probes: list[dict]) -> dict:
                 if (role, auth, r) not in probe_seen:
                     failures.append(f"{role} round {r} {auth} probe is missing")
     for probe in probes:
-        problems = probe_problems(probe, timeout_ms)
+        problems = probe_problems(probe, timeout_ms, probe_calls)
         if probe["role"] == "candidate":
             failures.extend(problems)
         else:
@@ -762,10 +775,11 @@ def _rows(rounds: int = 4, cand_deadline_factor: float = 1.0, drift: float = 1.0
 
 
 def _probes(rounds: int = 4) -> list[dict]:
-    return [{"role": role, "auth": auth, "round": r, "calls": 20, "deadline_exceeded": 20, "other_statuses": {},
-             "unexpected_messages": 0, "client_safety_timeouts": 0,
+    return [{"role": role, "auth": auth, "round": r, "error": None, "calls": 20, "calls_made": 20,
+             "deadline_exceeded": 20, "other_statuses": {}, "unexpected_messages": 0, "client_safety_timeouts": 0,
              "elapsed_ms": {"min": 251.0, "median": 253.0, "max": 260.0}, "grpc_timeout_ms": 250,
-             "backend_stalled_started": 20, "backend_stalled_released": 20, "release_wait_ms": 5.0}
+             "release_checked": True, "release_failures": 0, "max_release_wait_ms": 4.0,
+             "backend_stalled_started": 20, "backend_stalled_released": 20, "backend_started_crosscheck": 20}
             for role in ROLES for auth in CONFIGS for r in range(1, rounds + 1)]
 
 
@@ -818,6 +832,18 @@ def self_test() -> int:
     probes = _probes()
     next(p for p in probes if p["role"] == "candidate")["backend_stalled_released"] = 19
     assert evaluate(c, _rows(), probes)["status"] == "fail"
+    # Release must be proven while the client connection was open, and a probe
+    # that stopped early (nothing ended a call) or never ran fails the candidate.
+    for field, value in (("release_checked", False), ("release_failures", 1), ("calls_made", 3),
+                         ("error", "probe did not complete: timeout")):
+        probes = _probes()
+        next(p for p in probes if p["role"] == "candidate")[field] = value
+        assert evaluate(c, _rows(), probes)["status"] == "fail", field
+    # The same failure on the reference is informational and keeps the comparison.
+    probes = _probes()
+    next(p for p in probes if p["role"] == "reference")["error"] = "probe did not complete: timeout"
+    report = evaluate(c, _rows(), probes)
+    assert report["status"] == "pass" and any("probe did not complete" in n for n in report["notes"]), report["notes"]
     probes = _probes()
     next(p for p in probes if p["role"] == "reference")["deadline_exceeded"] = 0
     report = evaluate(c, _rows(), probes)

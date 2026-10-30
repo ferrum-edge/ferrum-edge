@@ -175,13 +175,15 @@ Options:
                           grpc only: method per call (default unary); server-stream
                           reads all ten echoed messages and counts one call
   --grpc-timeout-ms <MS>  grpc only: send grpc-timeout on every call (0 = none);
-                          the client arms no local timer
+                          tonic's client bounds only the response headers by it
   --grpc-metadata <K=V>   grpc only: extra request metadata (repeatable)
 
 proto_bench grpc-deadline-probe --target <URL> [--calls N] [--grpc-timeout-ms MS]
-                          [--grpc-metadata K=V]
+                          [--grpc-metadata K=V] [--backend-stats HOST:PORT]
                           sequential stalled ServerStream calls that only a
-                          deadline-enforcing gateway can end; prints JSON
+                          deadline-enforcing gateway can end; with
+                          --backend-stats, checks each backend stream is
+                          released while the client connection is open; prints JSON
 ```
 
 The measurement controls above are refused rather than silently dropped when set for a protocol that would ignore them: a non-default `--h2-stream-window` is rejected outside HTTP/2/gRPC, and `--connection-per-request` and the `--grpc-*` options are rejected outside gRPC (`--connection-per-request` also requires `--grpc-rpc unary`). `proto_backend` counts gRPC calls that arrive with `grpc-timeout` (`grpc_deadline_requests` in `GET /bench-stats`), and stalled `ServerStream` probes it opened and saw released (`grpc_stalled_started` / `grpc_stalled_released`). The gRPC deadline A/B lane ([protocol_perf_regression.md](../../../docs/protocol_perf_regression.md#grpc-rpc-deadline-ab-6904)) relies on these counters. Other shared options are not all validated this way — for example `--ca-cert` is documented in `--help` as ignored by HTTP/1, HTTP/3, and WebSocket runs — so check each option's help text before assuming it took effect.
