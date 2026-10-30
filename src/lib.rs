@@ -11079,6 +11079,12 @@ pub mod _test_support {
         crate::proxy::clone_log_metadata(ctx).into_iter().collect()
     }
 
+    /// The streaming terminal logger's projection: moves `ctx.metadata` out
+    /// instead of cloning it (issue #6793).
+    pub fn take_log_metadata(ctx: &mut crate::plugins::RequestContext) -> HashMap<String, String> {
+        crate::proxy::take_log_metadata(ctx).into_iter().collect()
+    }
+
     /// Whether this request has materialized the boxed per-plugin working state
     /// (issue #5537).
     ///

@@ -548,6 +548,73 @@ fn detached_terminal_delivery_reads_only_what_its_slim_context_carries() {
     }
 }
 
+/// The streaming terminal logger moves the context's metadata into the summary
+/// instead of cloning it (issue #6793): the projected map must be exactly the
+/// one `clone_log_metadata` produces, redaction and stripping included.
+#[test]
+fn taking_log_metadata_projects_exactly_what_cloning_it_does() {
+    let mut ctx = make_ctx();
+    for (key, value) in [
+        ("trace_id", "trace-visible"),
+        ("mesh.source.workload", "client"),
+        ("mesh.metrics.request_count.tag_overrides", "plan"),
+        ("request_body", "raw-body-sentinel"),
+        ("_dedup_key", "dedup-sentinel"),
+        ("waf.score", "plugin-written"),
+    ] {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+    let cloned = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    let taken = ferrum_edge::_test_support::take_log_metadata(&mut ctx);
+
+    assert_eq!(taken, cloned);
+    assert!(ctx.metadata.is_empty(), "the map is moved, not copied");
+    assert_eq!(
+        taken.get("trace_id").map(String::as_str),
+        Some("trace-visible")
+    );
+    for stripped in ["request_body", "_dedup_key", "waf.score"] {
+        assert!(
+            !taken.contains_key(stripped),
+            "{stripped} must be projected out"
+        );
+    }
+}
+
+/// Moving the map is sound only while nothing after the move reads
+/// `ctx.metadata`: the projection itself and the rest of the deferred delivery
+/// task. Terminal delivery is pinned separately by
+/// `detached_terminal_delivery_reads_only_what_its_slim_context_carries`.
+#[test]
+fn nothing_reads_context_metadata_after_the_streaming_terminal_takes_it() {
+    let proxy = include_str!("../../src/proxy/mod.rs");
+    let start = "fn project_log_metadata(";
+    let projection = &proxy[proxy.find(start).expect("log metadata projection")..];
+    let projection = &projection[..projection.find("\n}\n").expect("end of projection")];
+    assert!(
+        !projection.contains("ctx.metadata"),
+        "the log metadata projection must not read the map it may have been handed"
+    );
+
+    let deferred = include_str!("../../src/proxy/deferred_log.rs");
+    let take = "summary.metadata = crate::proxy::take_log_metadata(&mut ctx);";
+    let after = &deferred[deferred
+        .find(take)
+        .expect("streaming terminal takes the metadata")
+        + take.len()..];
+    let task_end = after
+        .find("log_with_mirror(plugins.as_slice(), &summary, &ctx).await;")
+        .expect("deferred delivery funnel");
+    assert!(
+        !after[..task_end].contains("ctx.metadata"),
+        "the deferred task must not read ctx.metadata after taking it"
+    );
+    assert!(
+        !deferred.contains("clone_log_metadata("),
+        "the streaming terminal must move, not clone, its log metadata"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn buffered_logging_without_deadline_awaits_plugins_sequentially() {
     let events = Arc::new(Mutex::new(Vec::new()));

@@ -639,7 +639,10 @@ impl DeferredTransactionLogger {
             if summary.timestamp_received.is_empty() {
                 summary.timestamp_received = ctx.timestamp_received.to_rfc3339();
             }
-            summary.metadata = crate::proxy::clone_log_metadata(&ctx);
+            // This task owns the context and drops it after delivery, which
+            // reads only typed context state, so the map is moved rather than
+            // cloned (issue #6793). Nothing below may read `ctx.metadata`.
+            summary.metadata = crate::proxy::take_log_metadata(&mut ctx);
             // The typed AI usage snapshot is finalized the same way: a stream
             // observer publishes its usage from a terminal hook, after the
             // header-commit skeleton captured the (then empty) snapshot. The
