@@ -395,9 +395,15 @@ def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
     # supplies .symtab. The equivalence checks below hold perf to that.
     package = (root / 'builds' / 'envoy' / 'symfs').resolve()
     out = scratch / relative
+    # Scratch and a hidden partial publish are unpublished by construction;
+    # a retry after an interrupted attempt starts them over.
+    shutil.rmtree(out, ignore_errors=True)
+    shutil.rmtree(folder / '.envoy-symbols.partial', ignore_errors=True)
     overlay = out / 'symfs'
     overlay.mkdir(parents=True)
     for dso in mappings['dsos']:
+        if not dso['path'].startswith('/') or '..' in Path(dso['path']).parts:
+            raise ValueError('unsafe mapped DSO path: ' + dso['path'])
         retained = (package / dso['path'].lstrip('/')).resolve()
         if not retained.is_relative_to(package) or file_sha256(retained) != dso['sha256']:
             raise ValueError('retained DSO does not match its acquisition record: ' + dso['path'])
@@ -424,7 +430,9 @@ def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
     before = leaf_summary(original['callchains'], window)
     after = leaf_summary(decoded['callchains'], window, top=40)
     # A decode that silently ignored the twin would reproduce the stripped names.
-    if (before['executable_known_leaf_samples'] < before['executable_leaf_samples']
+    if not before['executable_leaf_samples']:
+        row['issues'].append('no Envoy executable leaves in the measurement window')
+    elif (before['executable_known_leaf_samples'] < before['executable_leaf_samples']
             and after['executable_known_leaf_samples'] <= before['executable_known_leaf_samples']):
         row['issues'].append('debug twin resolved no additional Envoy executable leaves')
     row.update(pair=manifest.get('binding', {}).get('pair'), samples=decoded['samples'],
@@ -433,12 +441,20 @@ def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
     # Assemble beside the capture and publish whole, never a partial directory.
     partial = folder / '.envoy-symbols.partial'
     partial.mkdir()
-    for name in ('cpu-coverage.json', 'stacks.folded', 'stacks.txt.stderr', 'stacks.txt.status.json'):
+    for name in ('cpu-coverage.json', 'stacks.folded'):
+        shutil.copyfile(out / name, partial / name)
+    for name in ('stacks.txt.stderr', 'stacks.txt.status.json'):
         if (out / name).is_file():
             shutil.copyfile(out / name, partial / name)
     (partial / 'summary.json').write_text(json.dumps(row, indent=2) + '\n')
     partial.rename(destination)
     return row
+
+
+def write_symbols(root, result):
+    result['complete'] = (not result['issues'] and bool(result['captures'])
+                          and all(not row['issues'] for row in result['captures']))
+    (root / 'envoy-symbols.json').write_text(json.dumps(result, indent=2) + '\n')
 
 
 def symbolize_envoy(root, debug_elf, scratch, *, pins=ENVOY_SYMBOLS, decode=None):
@@ -465,14 +481,20 @@ def symbolize_envoy(root, debug_elf, scratch, *, pins=ENVOY_SYMBOLS, decode=None
         for path in manifests:
             try:
                 result['captures'].append(symbolize_capture(root, path, debug_elf, scratch, pins, decode))
-            except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError,
-                    subprocess.TimeoutExpired) as error:
-                # A decoder that outlives its reap bound must not lose the record.
+            except subprocess.TimeoutExpired as error:
+                # perf outlived its post-kill reap bound. Record it and start no
+                # further decode beside a possibly lingering process.
                 result['captures'].append(dict(path=str(path.parent.relative_to(root)),
                                                issues=[f'{type(error).__name__}: {error}']))
-    result['complete'] = (not result['issues'] and bool(result['captures'])
-                          and all(not row['issues'] for row in result['captures']))
-    (root / 'envoy-symbols.json').write_text(json.dumps(result, indent=2) + '\n')
+                result['issues'].append('stopped after an unreaped decoder')
+                break
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError) as error:
+                result['captures'].append(dict(path=str(path.parent.relative_to(root)),
+                                               issues=[f'{type(error).__name__}: {error}']))
+            finally:
+                # Keep a record of finished captures even if the step is cut short.
+                write_symbols(root, result)
+    write_symbols(root, result)
     return 0 if result['complete'] else 1
 
 

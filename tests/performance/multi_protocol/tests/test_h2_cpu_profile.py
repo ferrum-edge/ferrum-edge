@@ -269,13 +269,15 @@ class H2CPUAdmissionTests(unittest.TestCase):
             trace = root / f'cpu/pairs/pair_{pair:03d}/traces/envoy_10240'
             perf_data = b'raw perf %d' % pair
             (trace / 'perf.data').write_bytes(perf_data)
-            (trace / 'stacks.txt').write_text(self.STRIPPED)
+            (trace / 'stacks.txt').write_text(self.STRIPPED.replace('(/usr/local/bin/envoy)', '(/usr/lib/other.so)')
+                                              if fault == 'no-executable-leaves' else self.STRIPPED)
             recorded = 'ff' * 20 if fault == 'recorded-build-id' else build_id.hex()
             (trace / 'perf-buildids.txt').write_text(f'{recorded} {ENVOY_EXECUTABLE}\n')
             (trace / 'build-mappings.json').write_text(json.dumps(dict(complete=True, dsos=[
                 dict(path=ENVOY_EXECUTABLE, sha256=hashlib.sha256(release).hexdigest(),
                      build_id_lines=['Build ID: ' + build_id.hex()]),
-                dict(path='/usr/lib/x86_64-linux-gnu/libc.so.6', sha256=hashlib.sha256(libc).hexdigest(),
+                dict(path='/usr/lib/x86_64-linux-gnu/../../../etc/libc.so.6' if fault == 'unsafe-dso-path'
+                     else '/usr/lib/x86_64-linux-gnu/libc.so.6', sha256=hashlib.sha256(libc).hexdigest(),
                      build_id_lines=['Build ID: ' + '12' * 20])])))
             manifest = json.loads((trace / 'trace-manifest.json').read_text())
             receipts = {name: dict(sha256=hashlib.sha256((trace / name).read_bytes()).hexdigest(),
@@ -305,8 +307,10 @@ class H2CPUAdmissionTests(unittest.TestCase):
             if fault == 'caller-pc':
                 text = text.replace('6000 __libc_start_main', '6001 __libc_start_main', 1)
             text = text.replace('5100 [unknown]', '5100 Envoy::Http::CodecHelper::dispatch+0x20')
-            if fault == 'no-op':
+            if fault in ('no-op', 'no-executable-leaves'):
                 text = self.STRIPPED
+                if fault == 'no-executable-leaves':
+                    text = text.replace('(/usr/local/bin/envoy)', '(/usr/lib/other.so)')
             decoded = decode_cpu(text, '', owners)
             (out / 'cpu-coverage.json').write_text('{}')
             (out / 'stacks.folded').write_text('folded 1\n')
@@ -368,6 +372,8 @@ class H2CPUAdmissionTests(unittest.TestCase):
             'caller-pc': 'caller PCs differ',
             'no-op': 'resolved no additional Envoy executable leaves',
             'decoder-timeout': 'TimeoutExpired',
+            'no-executable-leaves': 'no Envoy executable leaves in the measurement window',
+            'unsafe-dso-path': 'unsafe mapped DSO path',
             'blocking-decoder': 'decoder: lost or throttled samples',
             'symbol-package': 'does not use the retained Envoy symbol package',
             'window': "KeyError: 'measurement'",
@@ -378,11 +384,11 @@ class H2CPUAdmissionTests(unittest.TestCase):
                 self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 1)
                 result = json.loads((root / 'envoy-symbols.json').read_text())
                 self.assertFalse(result['complete'])
-                issues = result['issues'] + [i for row in result['captures'] for i in row['issues']]
+                issues = [i for row in result['captures'] for i in row['issues']] or result['issues']
                 self.assertTrue(issues and all(issue in i for i in issues), issues)
                 # Post-decode mismatches publish their diagnostics; earlier refusals publish nothing.
                 self.assertFalse(list(root.rglob('envoy-symbols')) and fault not in (
-                    'leaf-pc', 'caller-pc', 'no-op', 'blocking-decoder'))
+                    'leaf-pc', 'caller-pc', 'no-op', 'blocking-decoder', 'no-executable-leaves'))
                 # Capture evidence and calibration stay as they were.
                 self.assertEqual(report(root), 0)
                 self.assertFalse(json.loads((root / 'h2-cpu-report.json').read_text())['envoy_symbols']['complete'])
@@ -395,8 +401,25 @@ class H2CPUAdmissionTests(unittest.TestCase):
             first, second = result['captures']
             self.assertEqual(first['issues'], [])
             self.assertTrue(second['issues'][0].startswith('TimeoutExpired'))
+            self.assertEqual(result['issues'], ['stopped after an unreaped decoder'])
             self.assertTrue((root / 'cpu/pairs/pair_001/traces/envoy_10240/envoy-symbols/summary.json').is_file())
             self.assertFalse((root / 'cpu/pairs/pair_002/traces/envoy_10240/envoy-symbols').exists())
+
+    def test_an_unreaped_decoder_stops_later_captures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, debug, scratch, pins, decode, calls = self.envoy_symbols(directory, 'decoder-timeout')
+            self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 1)
+            result = json.loads((root / 'envoy-symbols.json').read_text())
+            self.assertEqual(len(result['captures']), 1)
+
+    def test_retry_clears_stale_partial_and_scratch_from_an_interrupted_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, debug, scratch, pins, decode, _ = self.envoy_symbols(directory)
+            for pair in (1, 2):
+                (root / f'cpu/pairs/pair_{pair:03d}/traces/envoy_10240/.envoy-symbols.partial').mkdir()
+                (scratch / f'cpu/pairs/pair_{pair:03d}/traces/envoy_10240/symfs').mkdir(parents=True)
+            self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 0)
+            self.assertFalse(list(root.rglob('.envoy-symbols.partial')))
 
     def test_report_withholds_a_malformed_symbolization_record(self):
         for text, issue in (('[]', 'malformed Envoy symbolization'), ('{', 'unreadable Envoy symbolization')):
