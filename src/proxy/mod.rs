@@ -63448,7 +63448,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                         .as_ref()
                         .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
                     && !crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
-                        err,
+                        &err,
                     ) =>
             {
                 Ok(Err(()))
