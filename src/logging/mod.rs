@@ -129,15 +129,49 @@ fn allows_non_credential_dumping_record(metadata: &tracing::Metadata<'_>) -> boo
 
 /// Per-layer filter that drops [`is_credential_dumping_log_record`] records.
 ///
-/// The binary composes it with `.with_filter(...)` *outside* the reloadable
-/// `EnvFilter` on every output layer, so the two filters are AND-ed. No
-/// directive can re-enable these records: not a target, span-scoped, or
-/// field-scoped one (`tungstenite::handshake::client[{message}]=trace`), and
-/// not an RTDS reload, which replaces only the inner `EnvFilter`.
+/// Compose it through [`filter_output_layer`], never on its own: the two
+/// per-layer filters there are AND-ed, so no directive can re-enable these
+/// records: not a target, span-scoped, or field-scoped one
+/// (`tungstenite::handshake::client[{message}]=trace`), and not an RTDS
+/// reload, which replaces only the level filter.
 pub fn credential_dumping_log_filter() -> tracing_subscriber::filter::FilterFn {
     tracing_subscriber::filter::filter_fn(
         allows_non_credential_dumping_record as fn(&tracing::Metadata<'_>) -> bool,
     )
+}
+
+/// Filters a gateway output layer by `level_filter` (the reloadable
+/// `EnvFilter`) AND [`credential_dumping_log_filter`].
+///
+/// The level filter must stay the outermost per-layer filter. The outermost
+/// filter alone supplies the layer's max-level hint, and that hint becomes the
+/// process-wide `LevelFilter::current()` that every `tracing` macro checks
+/// before anything else. Nesting also merges callsite interests: an outer
+/// `always` over an inner `never` becomes `sometimes`. With the hint-less
+/// credential filter outside, every TRACE/DEBUG callsite in hyper, h2, and
+/// tokio was evaluated dynamically on every hit even at `FERRUM_LOG_LEVEL=error`,
+/// roughly doubling gateway CPU per gRPC call (#6852). With the level filter
+/// outside, a callsite it disables registers `never` and is skipped by the
+/// static max-level check, while the credential filter still vetoes the
+/// records the level filter enables.
+pub fn filter_output_layer<L, F, S>(
+    layer: L,
+    level_filter: F,
+) -> tracing_subscriber::filter::Filtered<
+    tracing_subscriber::filter::Filtered<L, tracing_subscriber::filter::FilterFn, S>,
+    F,
+    S,
+>
+where
+    L: tracing_subscriber::Layer<S>,
+    F: tracing_subscriber::layer::Filter<S> + 'static,
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + 'static,
+{
+    use tracing_subscriber::Layer as _;
+
+    layer
+        .with_filter(credential_dumping_log_filter())
+        .with_filter(level_filter)
 }
 
 /// Process-global, non-blocking sink for transaction access logs.

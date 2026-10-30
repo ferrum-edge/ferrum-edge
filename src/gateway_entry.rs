@@ -347,16 +347,18 @@ fn init_logging() -> Result<LoggingGuards, String> {
         let (fmt_reload_layer, fmt_handle) = reload::Layer::new(fmt_filter);
         let log_counter_level_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(SeverityWriter {
-                stdout: stdout_writer.clone(),
-                stderr: stderr_writer.clone(),
-            })
-            .with_filter(fmt_reload_layer)
-            // AND-ed with the reloadable filter: credential-dumping dependency
-            // records stay off whatever directive or RTDS reload is applied.
-            .with_filter(logging::credential_dumping_log_filter());
+        // The reloadable level filter stays outermost so it keeps the static
+        // max-level hint; credential-dumping records stay off whatever
+        // directive or RTDS reload is applied.
+        let fmt_layer = logging::filter_output_layer(
+            tracing_subscriber::fmt::layer()
+                .json()
+                    .with_writer(SeverityWriter {
+                    stdout: stdout_writer.clone(),
+                    stderr: stderr_writer.clone(),
+                }),
+            fmt_reload_layer,
+        );
         let log_counter_filter = filter_fn(|metadata| {
             crate::runtime_metrics_tracing_layer::should_count_target(metadata.target())
         });
@@ -383,16 +385,18 @@ fn init_logging() -> Result<LoggingGuards, String> {
         let env_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
         let (reload_layer, fallback_handle) = reload::Layer::new(env_filter);
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(SeverityWriter {
-                stdout: stdout_writer,
-                stderr: stderr_writer,
-            })
-            .with_filter(reload_layer)
-            // AND-ed with the reloadable filter: credential-dumping dependency
-            // records stay off whatever directive or RTDS reload is applied.
-            .with_filter(logging::credential_dumping_log_filter());
+        // The reloadable level filter stays outermost so it keeps the static
+        // max-level hint; credential-dumping records stay off whatever
+        // directive or RTDS reload is applied.
+        let fmt_layer = logging::filter_output_layer(
+            tracing_subscriber::fmt::layer()
+                .json()
+                    .with_writer(SeverityWriter {
+                    stdout: stdout_writer,
+                    stderr: stderr_writer,
+                }),
+            reload_layer,
+        );
         if tracing_subscriber::registry()
             .with(fmt_layer)
             .try_init()
