@@ -7193,6 +7193,9 @@ struct SlowDropRpcBackendBody {
     terminal: Option<SlowTerminal>,
     drop_delay: std::time::Duration,
     entered: Arc<std::sync::atomic::AtomicBool>,
+    /// When teardown BEGAN: the completion claim precedes it, so a start
+    /// before the deadline proves the claim was on time.
+    teardown_started: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
     dropped: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -7218,6 +7221,7 @@ impl http_body::Body for SlowDropRpcBackendBody {
 
 impl Drop for SlowDropRpcBackendBody {
     fn drop(&mut self) {
+        *self.teardown_started.lock().expect("teardown lock") = Some(tokio::time::Instant::now());
         std::thread::sleep(self.drop_delay);
         self.dropped
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -7244,11 +7248,13 @@ async fn slow_backend_teardown_cannot_turn_an_on_time_terminal_into_an_expiry() 
         let mut margin = Duration::from_millis(100);
         loop {
             let entered = Arc::new(AtomicBool::new(false));
+            let teardown_started = Arc::new(std::sync::Mutex::new(None));
             let dropped = Arc::new(AtomicBool::new(false));
             let backend = proxy_body_streaming_for_test(Box::pin(SlowDropRpcBackendBody {
                 terminal: Some(terminal),
                 drop_delay: margin * 3,
                 entered: Arc::clone(&entered),
+                teardown_started: Arc::clone(&teardown_started),
                 dropped: Arc::clone(&dropped),
             }));
             let deadline = tokio::time::Instant::now() + margin;
@@ -7258,10 +7264,18 @@ async fn slow_backend_teardown_cannot_turn_an_on_time_terminal_into_an_expiry() 
                 None,
                 AuthorizationConnectionCloser::new(),
             );
-            if !entered.load(Ordering::SeqCst) {
+            // The case needs the terminal read AND teardown begun before the
+            // deadline (so the claim, which precedes teardown, was on time),
+            // with teardown then crossing it. Retry a missed setup window; never
+            // retry because a guard exists, which would hide the regression.
+            let teardown_on_time = teardown_started
+                .lock()
+                .expect("teardown lock")
+                .is_some_and(|started| started < deadline);
+            if !entered.load(Ordering::SeqCst) || !teardown_on_time {
                 assert!(
                     margin < Duration::from_secs(5),
-                    "{terminal:?}: the read-ahead never started before the deadline"
+                    "{terminal:?}: never reached backend teardown before the deadline"
                 );
                 margin *= 2;
                 continue;
