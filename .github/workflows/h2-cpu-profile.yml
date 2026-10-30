@@ -152,6 +152,7 @@ jobs:
           fi
       - name: Symbolize Envoy CPU stacks offline from its build-ID-matched debug twin
         if: ${{ !cancelled() }}
+        timeout-minutes: 45
         # The campaign measured the stripped release binary. Fetch only the
         # debug image layer that holds the same executable with .symtab, by
         # content digest; the profiler verifies its hash and build ID again.
@@ -165,11 +166,13 @@ jobs:
           fi
           symbols="$RUNNER_TEMP/envoy-symbols"
           mkdir -p "$symbols/layer"
-          token=$(curl -fsS --retry 3 \
+          token=$(curl -fsS --proto =https --retry 3 --connect-timeout 20 --max-time 60 \
             'https://auth.docker.io/token?service=registry.docker.io&scope=repository:envoyproxy/envoy:pull' |
             python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')
-          curl -fsSL --retry 3 -H "Authorization: Bearer $token" -o "$symbols/layer.tar.gz" \
-            "https://registry-1.docker.io/v2/envoyproxy/envoy/blobs/$ENVOY_SYMBOL_LAYER"
+          # Keep the anonymous pull token off argv; redirects stay HTTPS.
+          printf 'header = "Authorization: Bearer %s"\n' "$token" |
+            curl -fsSL -K - --proto =https --proto-redir =https --retry 3 --connect-timeout 20 --max-time 900 \
+              -o "$symbols/layer.tar.gz" "https://registry-1.docker.io/v2/envoyproxy/envoy/blobs/$ENVOY_SYMBOL_LAYER"
           echo "${ENVOY_SYMBOL_LAYER#sha256:}  $symbols/layer.tar.gz" | sha256sum -c -
           tar -xzf "$symbols/layer.tar.gz" -C "$symbols/layer" --no-same-owner usr/local/bin/envoy
           rm "$symbols/layer.tar.gz"

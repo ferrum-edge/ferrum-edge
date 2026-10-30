@@ -1,21 +1,23 @@
 import hashlib
 import json
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmark_validity import sample_issues
-from h2_cpu_profile import (ENVIRONMENT, ENVOY_EXECUTABLE, ENVOY_SYMBOLS, elf_identity, fixture,
-                            report, stamp, symbolize_envoy, validate_runtime)
+from h2_cpu_profile import (ENVIRONMENT, ENVOY_DECODE_BYTES, ENVOY_DECODE_SECONDS, ENVOY_EXECUTABLE,
+                            ENVOY_SYMBOLS, elf_identity, fixture, report, stamp, symbolize_envoy,
+                            validate_runtime)
 
 
-def tiny_elf(build_id, *, symtab=True, notes=1):
+def tiny_elf(build_id, *, symtab=True, extra=()):
     """Minimal ELF64 with PT_NOTE GNU build-ID notes and optional .symtab."""
-    note = struct.pack('<III', 4, len(build_id), 3) + b'GNU\0' + build_id
-    body = note * notes
+    body = b''.join(struct.pack('<III', 4, len(i), 3) + b'GNU\0' + i for i in (build_id, *extra))
     phoff, notes_at = 64, 64 + 56
     shoff = notes_at + len(body)
     header = (b'\x7fELF\x02\x01\x01' + bytes(9) + struct.pack('<HHIQQQIHHHHHH',
@@ -198,7 +200,17 @@ class H2CPUAdmissionTests(unittest.TestCase):
             self.assertEqual(elf_identity(path), dict(build_id='ab' * 20, symtab=True))
             path.write_bytes(tiny_elf(bytes.fromhex('ab' * 20), symtab=False))
             self.assertEqual(elf_identity(path), dict(build_id='ab' * 20, symtab=False))
-            for data in (tiny_elf(bytes.fromhex('ab' * 20), notes=2), b'\x7fELF\x01\x01' + bytes(58), b'#!/bin/sh\n'):
+            good = tiny_elf(bytes.fromhex('ab' * 20))
+            short_note = bytearray(good)
+            struct.pack_into('<I', short_note, 120 + 4, 64)
+            far_symtab = bytearray(good)
+            struct.pack_into('<Q', far_symtab, len(good) - 64 + 24, len(good))
+            # An identical repeated build-ID note is the same identity.
+            path.write_bytes(tiny_elf(bytes.fromhex('ab' * 20), extra=[bytes.fromhex('ab' * 20)]))
+            self.assertEqual(elf_identity(path)['build_id'], 'ab' * 20)
+            for data in (tiny_elf(bytes.fromhex('ab' * 20), extra=[bytes.fromhex('cd' * 20)]),
+                         b'\x7fELF\x01\x01' + bytes(58),
+                         b'#!/bin/sh\n', good[:100], good[:-10], bytes(short_note), bytes(far_symtab)):
                 path.write_bytes(data)
                 with self.assertRaises(ValueError):
                     elf_identity(path)
@@ -207,6 +219,8 @@ class H2CPUAdmissionTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[4] / '.github/workflows/h2-cpu-profile.yml').read_text()
         self.assertIn('ENVOY_SYMBOL_LAYER: ' + ENVOY_SYMBOLS['layer'] + '\n', workflow)
         self.assertIn('envoyproxy/envoy:v1.39.1\n', workflow)
+        self.assertIn('"$symbols/layer" --no-same-owner ' + ENVOY_SYMBOLS['member'] + '\n', workflow)
+        self.assertIn('--debug-elf "$symbols/layer/' + ENVOY_SYMBOLS['member'] + '"', workflow)
         self.assertEqual(ENVOY_SYMBOLS['release_image'], 'envoyproxy/envoy:v1.39.1')
 
     STRIPPED = ('envoy 7/8 10.000000000: cpu-clock:uS:\n'
@@ -230,9 +244,10 @@ class H2CPUAdmissionTests(unittest.TestCase):
         libc = b'\x7fELF libc'
         debug = Path(directory) / 'debug-envoy'
         debug.write_bytes(tiny_elf(bytes.fromhex('ee' * 20)) if fault == 'debug-build-id' else tiny_elf(build_id))
-        pins = dict(ENVOY_SYMBOLS, release_sha256=hashlib.sha256(release).hexdigest(),
-                    sha256=hashlib.sha256(debug.read_bytes()).hexdigest(), bytes=debug.stat().st_size,
-                    build_id=build_id.hex())
+        pins = dict(ENVOY_SYMBOLS, release_sha256=hashlib.sha256(
+                        b'other' if fault == 'release-sha' else release).hexdigest(),
+                    sha256=hashlib.sha256(b'other' if fault == 'debug-sha' else debug.read_bytes()).hexdigest(),
+                    bytes=debug.stat().st_size, build_id=build_id.hex())
         package = root / 'builds/envoy/symfs'
         (package / 'usr/local/bin').mkdir(parents=True)
         (package / 'usr/lib/x86_64-linux-gnu').mkdir(parents=True)
@@ -251,9 +266,16 @@ class H2CPUAdmissionTests(unittest.TestCase):
                 dict(path='/usr/lib/x86_64-linux-gnu/libc.so.6', sha256=hashlib.sha256(libc).hexdigest(),
                      build_id_lines=['Build ID: ' + '12' * 20])])))
             manifest = json.loads((trace / 'trace-manifest.json').read_text())
-            manifest.update(identity=dict(pid=7), symbol_package=str(package.resolve()),
-                artifacts={'perf.data': dict(sha256=hashlib.sha256(
-                    b'other' if fault == 'perf-data' else perf_data).hexdigest())},
+            receipts = {name: dict(sha256=hashlib.sha256((trace / name).read_bytes()).hexdigest(),
+                                   bytes=(trace / name).stat().st_size)
+                        for name in ('perf.data', 'stacks.txt', 'perf-buildids.txt', 'build-mappings.json')}
+            if fault == 'perf-data':
+                receipts['perf.data']['sha256'] = hashlib.sha256(b'other').hexdigest()
+            if fault == 'stacks-receipt':
+                (trace / 'stacks.txt').write_text(self.STRIPPED.replace('5000', '5001'))
+            manifest['cpu']['decoder_status'] = dict(incomplete='deadline_or_output_cap' if fault == 'truncated-original'
+                                                     else None)
+            manifest.update(identity=dict(pid=7), symbol_package=str(package.resolve()), artifacts=receipts,
                 boundaries=dict(measurement=dict(valid=True, start_bounds_ns=[9_000_000_000, 9_500_000_000],
                                                  end_bounds_ns=[20_000_000_000, 20_500_000_000])))
             (trace / 'trace-manifest.json').write_text(json.dumps(manifest))
@@ -263,9 +285,15 @@ class H2CPUAdmissionTests(unittest.TestCase):
             self.assertEqual(owners, {7})
             self.assertEqual((symfs / ENVOY_EXECUTABLE.lstrip('/')).resolve(), debug.resolve())
             self.assertEqual((symfs / 'usr/lib/x86_64-linux-gnu/libc.so.6').read_bytes(), libc)
+            if fault == 'decoder-timeout':
+                raise subprocess.TimeoutExpired('perf-script', 3)
             text = self.STRIPPED.replace('5000 [unknown]', 'abcd [unknown]' if fault == 'leaf-pc' else
                                          '5000 Envoy::Http::CodecHelper::dispatch+0x10')
+            if fault == 'caller-pc':
+                text = text.replace('6000 __libc_start_main', '6001 __libc_start_main', 1)
             text = text.replace('5100 [unknown]', '5100 Envoy::Http::CodecHelper::dispatch+0x20')
+            if fault == 'no-op':
+                text = self.STRIPPED
             decoded = decode_cpu(text, '', owners)
             (out / 'cpu-coverage.json').write_text('{}')
             (out / 'stacks.folded').write_text('folded 1\n')
@@ -283,29 +311,75 @@ class H2CPUAdmissionTests(unittest.TestCase):
             self.assertTrue(result['complete'])
             for row in result['captures']:
                 self.assertEqual(row['issues'], [])
-                self.assertTrue(row['identical_unwound_pcs'])
                 # Only in-window samples count; the 30 s sample is outside.
                 self.assertEqual(row['stripped']['window_samples'], 2)
                 self.assertEqual(row['stripped']['known_leaf_samples'], 0)
                 self.assertEqual(row['symbolized']['known_leaf_samples'], 2)
                 self.assertEqual(row['symbolized']['top_leaves'],
-                                 [dict(symbol='Envoy::Http::CodecHelper::dispatch', samples=2, fraction=1.0)])
-            self.assertTrue((root / 'cpu/pairs/pair_001/traces/envoy_10240/envoy-symbols/summary.json').is_file())
-            self.assertFalse(any((root / 'cpu').rglob('perf.data.symfs')))
+                                 [dict(symbol='Envoy::Http::CodecHelper::dispatch', dso=ENVOY_EXECUTABLE,
+                                       samples=2, fraction=1.0)])
+                self.assertEqual(row['symbolized']['executable_known_leaf_samples'], 2)
+            for pair in (1, 2):
+                published = root / f'cpu/pairs/pair_{pair:03d}/traces/envoy_10240/envoy-symbols'
+                self.assertEqual(sorted(p.name for p in published.iterdir()),
+                                 ['cpu-coverage.json', 'stacks.folded', 'summary.json'])
+            # The symbol twin and overlay stay in scratch, never in evidence.
+            debug_bytes = debug.read_bytes()
+            self.assertFalse([p for p in root.rglob('*') if p.is_symlink() or
+                              (p.is_file() and p.read_bytes() == debug_bytes)])
+            self.assertFalse(list(root.rglob('.envoy-symbols.partial')))
             self.assertEqual(report(root), 0)
             self.assertTrue(json.loads((root / 'h2-cpu-report.json').read_text())['envoy_symbols']['complete'])
+            # A rerun on symbolized evidence refuses rather than overwriting.
+            self.assertEqual(symbolize_envoy(root, debug, Path(directory) / 'again', pins=pins, decode=decode), 1)
+            rerun = json.loads((root / 'envoy-symbols.json').read_text())
+            self.assertTrue(all('already has Envoy symbols' in row['issues'][0] for row in rerun['captures']))
 
     def test_unmatched_envoy_symbols_are_reported_without_hiding_the_capture(self):
-        for fault in ('debug-build-id', 'recorded-build-id', 'retained-dso', 'perf-data', 'leaf-pc'):
+        expected = {
+            'debug-build-id': 'lacks the pinned build ID',
+            'debug-sha': 'does not match the pinned image layer member',
+            'release-sha': 'not the pinned release build',
+            'recorded-build-id': 'recorded Envoy build ID does not match',
+            'retained-dso': 'retained DSO does not match',
+            'perf-data': 'perf.data does not match its manifest receipt hash',
+            'stacks-receipt': 'stacks.txt does not match its manifest receipt hash',
+            'truncated-original': 'original decode was incomplete',
+            'leaf-pc': 'leaf PCs differ',
+            'caller-pc': 'caller PCs differ',
+            'no-op': 'resolved no additional Envoy executable leaves',
+            'decoder-timeout': 'TimeoutExpired',
+        }
+        for fault, issue in expected.items():
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
                 root, debug, scratch, pins, decode, _ = self.envoy_symbols(directory, fault)
                 self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 1)
                 result = json.loads((root / 'envoy-symbols.json').read_text())
                 self.assertFalse(result['complete'])
-                self.assertTrue(result['issues'] or any(row['issues'] for row in result['captures']))
+                issues = result['issues'] + [i for row in result['captures'] for i in row['issues']]
+                self.assertTrue(issues and all(issue in i for i in issues), issues)
+                self.assertFalse(list(root.rglob('envoy-symbols')) and fault not in (
+                    'leaf-pc', 'caller-pc', 'no-op'))
                 # Capture evidence and calibration stay as they were.
                 self.assertEqual(report(root), 0)
                 self.assertFalse(json.loads((root / 'h2-cpu-report.json').read_text())['envoy_symbols']['complete'])
+
+    def test_default_decoder_uses_the_offline_bounds_within_the_launch_ceiling(self):
+        from h1_trace_contract import BOUNDS
+        self.assertLessEqual(ENVOY_DECODE_BYTES, BOUNDS['raw_perf_bytes'])
+        with tempfile.TemporaryDirectory() as directory:
+            root, debug, scratch, pins, decode, _ = self.envoy_symbols(directory)
+            seen = []
+
+            def cpu_decode(out, owners, dsos, **bounds):
+                seen.append(bounds)
+                return decode(out, owners, dsos, symfs=bounds['symfs'])
+            with mock.patch('h1_trace.cpu_decode', cpu_decode):
+                self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins), 0)
+            self.assertEqual(len(seen), 2)
+            for bounds in seen:
+                self.assertEqual((bounds['script_timeout'], bounds['script_limit']),
+                                 (ENVOY_DECODE_SECONDS, ENVOY_DECODE_BYTES))
 
     def test_report_marks_missing_envoy_symbols_without_failing_the_capture(self):
         with tempfile.TemporaryDirectory() as directory:

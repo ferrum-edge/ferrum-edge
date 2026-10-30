@@ -31,20 +31,37 @@ Envoy's release image ships a stripped executable, so its stacks alone resolve
 only a few percent of leaves. After capture, the job symbolizes each Envoy CPU
 capture offline. It fetches one layer of `envoyproxy/envoy:debug-v1.39.1` by
 its pinned content digest. That layer holds `/usr/local/bin/envoy` with
-`.symtab` and the **same GNU build ID** as the measured `v1.39.1` binary. The
-profiler checks the layer member's pinned SHA-256, size and build ID. It also
-checks the capture's recorded build ID, the retained release ELF and every
-retained DSO hash. Then it re-decodes a copy of the unchanged `perf.data`
-through the same bounded decoder, with wider offline bounds (600 seconds,
-64 MiB). In the overlay `--symfs`, only the executable is swapped for its debug
-twin, and perf itself rejects a symbol file with a different build ID. The
-re-decode must reproduce every sample and sampled PC of the original decode;
-only names may change. Each capture gains `envoy-symbols/` with folded stacks,
-decoder coverage and a summary. The summary gives measurement-window leaf
-coverage before and after symbols, and the top leaf functions. The run also
-writes `envoy-symbols.json`, which `h2-cpu-report.json` includes. The 881 MB
-debug executable is never added to the artifact. A missing or mismatched symbol
-twin fails that step but leaves the capture evidence and calibration unchanged.
+`.symtab` and the **same GNU build ID** as the measured `v1.39.1` binary.
+
+The profiler checks:
+
+- the layer member's pinned SHA-256, size and build ID;
+- the capture's recorded build ID;
+- the retained release ELF and every retained DSO hash;
+- that `perf.data`, `stacks.txt`, `perf-buildids.txt` and
+  `build-mappings.json` match their trace-manifest receipts.
+
+It then re-decodes a copy of the unchanged `perf.data` through the same bounded
+decoder. Only the `perf script` call gets wider offline bounds (600 seconds,
+64 MiB); the other decoder calls keep their 30-second bounds. In the overlay
+`--symfs`, only the executable is swapped for its debug twin.
+
+The re-decode must reproduce every sample and every unwound PC of the original
+decode, so only names may change. A capture is reported as unmatched if:
+
+- the twin's extra sections changed unwinding;
+- the original decode was incomplete;
+- the twin resolved no additional Envoy executable leaves.
+
+Each capture gains `envoy-symbols/`. It holds folded stacks, decoder coverage,
+the decoder's stderr and status, and a summary. The directory is published
+whole and never overwritten. The summary gives measurement-window leaf coverage
+before and after symbols, and the top leaf functions with their DSOs. The run
+also writes `envoy-symbols.json`, which `h2-cpu-report.json` includes.
+
+The 881 MB debug executable is never added to the artifact. A missing or
+mismatched symbol twin fails that step but leaves the capture evidence and
+calibration unchanged.
 
 `process_usage.measurement` adds `user_cpu_seconds` and `system_cpu_seconds` from
 Linux `/proc/PID/stat`. With scheduler sampling enabled, gateway/backend
