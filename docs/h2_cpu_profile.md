@@ -90,6 +90,16 @@ Most Envoy samples have no frame to name, so unwinding, not symbols, is the
 dominant remaining coverage gap. A function-level comparison needs the sampled
 PC even when DWARF unwinding fails, which the flat decode above now supplies.
 
+The flat decode closes that gap. In hosted run 41136450150 (HTTP/2, 10 KiB), both
+Envoy captures matched every flat check. Flat leaves named 91.8% and 92.0% of
+window samples, against 2.9% and 19.8% from the symbolized stacks. Apart from
+`[vdso]` samples (23 and 26), every window sample that kept no unwound frame
+(1,861 and 1,596) had its sampled PC in the Envoy executable. Those PCs spread
+across Envoy's functions much like all of its samples do, so the unwind failure
+is not confined to a few functions. The remaining unnamed leaves are libc and
+`[vdso]` addresses. Envoy's self time is broad: no function exceeds 4% of
+window samples, and AES-GCM, tcmalloc and nghttp2 lead.
+
 `process_usage.measurement` adds `user_cpu_seconds` and `system_cpu_seconds` from
 Linux `/proc/PID/stat`. With scheduler sampling enabled, gateway/backend
 `context_switches` contains `voluntary_ctxt_switches` and
