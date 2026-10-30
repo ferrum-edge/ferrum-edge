@@ -432,8 +432,9 @@ pub enum PolicyScope {
 }
 
 /// Deserialize the members an internally tagged unit variant carries besides
-/// its tag, refusing any. Serde hands the variant the object with `kind`
-/// already removed, so an empty object is the only accepted shape.
+/// its tag, refusing any. Serde hands the variant the object with its tag
+/// (`kind` for `PolicyScope`, `type` for `TagOverrideOperation`) already
+/// removed, so an empty object is the only accepted shape.
 fn deserialize_closed_unit_variant<'de, D>(deserializer: D) -> Result<(), D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -444,7 +445,7 @@ where
         type Value = ();
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("an object with no members besides `kind`")
+            formatter.write_str("an object with no members besides its tag")
         }
 
         fn visit_unit<E>(self) -> Result<(), E>

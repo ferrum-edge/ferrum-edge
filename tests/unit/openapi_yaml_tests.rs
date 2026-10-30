@@ -19904,6 +19904,12 @@ fn mesh_authz_component_matches_runtime_admission() {
     let no_action = json!([{"to": [{"paths": ["/admin/*"]}]}]);
     let rule_typo = json!([{"action": "deny", "not_path": ["/a"]}]);
     let match_typo = json!([{"action": "deny", "to": [{"not_path": ["/a"]}]}]);
+    let target_refs = |attachments: serde_json::Value| {
+        json!({"mesh_policies": [{
+            "name": "attached", "namespace": "default",
+            "scope": {"kind": "target_refs", "attachments": attachments},
+        }]})
+    };
 
     for valid in [
         // An omitted `config:` block deserializes to null for every plugin.
@@ -19931,6 +19937,12 @@ fn mesh_authz_component_matches_runtime_admission() {
         json!({"node_waypoint_route_upstreams": [
             {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 8080}]}
         ]}),
+        // `targetRefs` attachments mirror `PolicyTargetAttachment`.
+        target_refs(json!([
+            {"kind": "service", "namespace": "default", "name": "reviews"},
+            {"kind": "gateway", "namespace": "default", "name": "waypoint"}
+        ])),
+        target_refs(json!([{"kind": "gateway_class", "name": "istio-waypoint"}])),
     ] {
         assert_component_validity(&spec, "MeshAuthzConfig", &valid, true);
     }
@@ -19969,6 +19981,15 @@ fn mesh_authz_component_matches_runtime_admission() {
         json!({"node_waypoint_route_upstreams": [
             {"id": "u", "namespace": "default", "targets": [{"host": "h", "port": 65536}]}
         ]}),
+        // Every attachment names its target; namespaced kinds carry their
+        // namespace, and the cluster-scoped GatewayClass carries none.
+        target_refs(json!([{"kind": "service", "namespace": "default"}])),
+        target_refs(json!([{"kind": "service", "name": "reviews"}])),
+        target_refs(json!([{"kind": "gateway", "name": "waypoint"}])),
+        target_refs(json!([{"kind": "gateway_class"}])),
+        target_refs(json!([
+            {"kind": "gateway_class", "namespace": "istio-system", "name": "istio-waypoint"}
+        ])),
     ] {
         assert_component_validity(&spec, "MeshAuthzConfig", &invalid, false);
     }
