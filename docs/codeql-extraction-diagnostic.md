@@ -36,9 +36,12 @@ of silently omitting the proof. No database or build artifacts are uploaded;
 the runner discards them after the job.
 
 Debug output can be large. That mode retains the complete log only on the
-ephemeral runner and prints a bounded view: initial configuration, the eight
-lines preceding each warning/error (up to 2,000 contexts), and completion/timing
-records. The job summary still counts warnings from the complete log.
+ephemeral runner and prints initial configuration, every severity/loader error
+record, and completion/timing records. Extra context is bounded: the eight
+preceding lines for up to 2,000 severity records and 100 loader records. Loader
+noise cannot consume the severity budget, and exhausting a context budget never
+drops the warning/error record itself. The job summary still counts warnings
+from the complete log.
 It also enables the Rust analyzer's Cargo/proc-macro loader diagnostic targets.
 CodeQL's own verbosity option alone does not expose those internal errors.
 

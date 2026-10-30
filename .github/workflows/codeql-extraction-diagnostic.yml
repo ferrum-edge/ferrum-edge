@@ -105,18 +105,29 @@ jobs:
             awk -v detail="$DIAGNOSTIC_LOG_LEVEL" '
               { previous[NR % 9] = $0 }
               detail != "debug" || NR <= 60 { print; next }
-              /WARN|ERROR|[Ee]rrors occurred while|[Ff]ailed to|[Cc]annot create expander|[[:space:]]error:/ {
-                if (++contexts <= 2000) {
-                  print "--- extractor diagnostic context ---"
+              /WARN|ERROR/ {
+                if (++severity_contexts <= 2000) {
+                  print "--- extractor severity context ---"
                   start = NR > 8 ? NR - 8 : 1
-                  for (i = start; i <= NR; i++) print previous[i % 9]
+                  for (i = start; i < NR; i++) print previous[i % 9]
                 }
+                print
+                next
+              }
+              /[Ee]rrors occurred while|[Ff]ailed to (run|load|fetch|query)|[Cc]annot create expander|[[:space:]]error:/ {
+                if (++loader_contexts <= 100) {
+                  print "--- extractor loader context ---"
+                  start = NR > 8 ? NR - 8 : 1
+                  for (i = start; i < NR; i++) print previous[i % 9]
+                }
+                print
                 next
               }
               /total duration|Finalizing database|TRAP import|Successfully created database/ { print }
               END {
                 if (detail == "debug") {
-                  printf "Debug log: %d lines; %d diagnostic contexts (up to 2000 printed).\n", NR, contexts
+                  printf "Debug log: %d lines; %d severity records; %d loader records.\n", NR, severity_contexts, loader_contexts
+                  print "All severity/loader records printed; context windows limited to 2000 severity and 100 loader records."
                 }
               }
             '
