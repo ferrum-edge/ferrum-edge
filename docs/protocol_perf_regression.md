@@ -201,12 +201,25 @@ messages), authentication (`configs/grpc_deadline_open.yaml`,
 (none, `grpc-timeout: 30000m`, which never fires). Every round starts each
 revision's gateway once per route, warms it up, runs that route's four cells in
 a rotated order, then runs the probe. Each cell is 100 concurrent calls for
-15 s over plaintext HTTP/2, with `FERRUM_WORKER_THREADS=2`.
+15 s over plaintext HTTP/2. The contract runs a multiple of four rounds (eight
+by default): role order alternates every round, route order every two rounds,
+and the cell rotation has period four, so only then is every position balanced.
+
+The gateway runs the benchmark regime of `run_protocol_test.sh`:
+`FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` and
+`FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0`, which select the direct streaming gRPC
+response branch rather than the default size-limited coalescing one, with
+`FERRUM_WORKER_THREADS=2`. Both branches install the same deadline treatment,
+so the A/B is internally valid. In the coalescing branch, however, the pump
+carries coalesced frames, so the measured per-frame cost does not transfer
+one-to-one to a default-configured gateway.
 
 - **Integrity, from the backend.** `proto_backend` counts calls that arrived
   with `grpc-timeout`. Every call in a deadline cell must carry it and no call
   in a deadline-free cell may. The client must report zero errors, and the
-  backend must see at least the calls the client measured.
+  backend must see at least the calls the client measured. Each `key_auth`
+  gateway lifetime also makes a keyless call. It must be refused before it
+  reaches the backend, which proves the auth cells are authenticated.
 - **Deadline termination and release.** The probe makes 20 sequential
   `ServerStream` calls with `grpc-timeout: 250m` and `x-bench-stall`. The
   backend sends headers, then holds the stream open until its peer drops it.
@@ -228,11 +241,13 @@ a rotated order, then runs the probe. Each cell is 100 concurrent calls for
   revision change outside the deadline path. It is reported for throughput,
   gateway CPU per call (from `/proc/<pid>/stat` across the cell) and p99, with
   a two-sided Student-t 95% interval.
-- **Verdict per (shape, auth).** The verdict is `regression` when the
-  throughput interval lies entirely below `1 − margins.throughput`, or the
-  CPU-per-call interval lies entirely above `1 + margins.cpu_per_call`. It is
-  `no material regression` when both intervals lie inside those margins, and
-  `inconclusive` otherwise. A verdict is reported, never gated. The job fails
+- **Verdict per (shape, auth).** The verdict is `regression` when any of
+  these intervals lies entirely beyond its margin: throughput below
+  `1 − margins.throughput`, CPU per call above `1 + margins.cpu_per_call`, or
+  p99 above `1 + margins.p99`. p99 is a secondary endpoint, so its noise alone
+  never withholds the next verdict. The verdict is `no material regression`
+  when the throughput and CPU-per-call intervals both lie inside their
+  margins, and `inconclusive` otherwise. A verdict is reported, never gated. The job fails
   only on integrity, probe or missing-evidence failures.
 - **Same-binary cost.** The summary also reports each revision's own deadline
   cost: the deadline cell against its deadline-free sibling, inside one gateway
@@ -240,8 +255,9 @@ a rotated order, then runs the probe. Each cell is 100 concurrent calls for
 
 The artifact `grpc-deadline-comparison-<run id>` keeps every sample
 (`samples/*.json`), gateway and backend logs, `rows.json`, `probes.json`,
-`provenance.json` (revision SHAs, binary and harness digests, toolchain, host,
-scheduler jitter) and `report.json`.
+`provenance.json` (revision SHAs, binary and harness digests, host, scheduler
+jitter), `rustc-version.txt` / `cargo-version.txt` (the one toolchain both
+revisions were built with) and `report.json`.
 
 The stalled-client case that motivated #6870 (a client that withholds HTTP/2
 response credit) is not exercised here. Its behaviour is pinned by the unit

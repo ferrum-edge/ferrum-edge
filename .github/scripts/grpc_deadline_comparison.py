@@ -146,8 +146,9 @@ def validate_contract(contract: dict, where: str = "contract") -> dict:
     for key in ("rounds", "worker_threads"):
         if not isinstance(workload.get(key), int) or workload[key] <= 0:
             raise HarnessError(f"{where}: workload.{key} must be a positive integer")
-    if workload["rounds"] < 4 or workload["rounds"] % 2:
-        raise HarnessError(f"{where}: workload.rounds must be even and at least 4 so role order balances")
+    if workload["rounds"] % 4:
+        raise HarnessError(f"{where}: workload.rounds must be a positive multiple of 4: role order has period 2, "
+                           "route order and cell rotation period 4, so only then is every position balanced")
     margins = contract.get("margins", {})
     for key in ("throughput", "cpu_per_call", "p99"):
         if not isinstance(margins.get(key), (int, float)) or not 0 < margins[key] < 1:
@@ -309,6 +310,13 @@ def run_bench(kind: str, dest: Path, env: dict) -> dict:
              "--concurrency", "100", "--duration", "15", "--grpc-rpc", "server-stream",
              "--grpc-timeout-ms", "30000", "--grpc-metadata", "x-api-key=grpc-deadline-bench-key-0001", "--json"], env=env, cwd=dest.parent,
             capture_output=True, text=True, timeout=180)
+    elif kind == "auth-refusal":
+        # Negative control on the key_auth route: the same unary call without
+        # the API key must be refused before it reaches the backend.
+        result = subprocess.run(
+            ["proto_bench", "grpc", "--target", "http://127.0.0.1:18080", "--payload-size", "1024",
+             "--concurrency", "1", "--duration", "1", "--grpc-rpc", "unary", "--json"], env=env, cwd=dest.parent,
+            capture_output=True, text=True, timeout=180)
     elif kind == "probe-open":
         result = subprocess.run(
             ["proto_bench", "grpc-deadline-probe", "--target", "http://127.0.0.1:18080", "--calls", "20",
@@ -380,6 +388,15 @@ def run_probe(auth: str, dest: Path, env: dict) -> dict:
     return probe
 
 
+def run_auth_refusal(dest: Path, env: dict) -> dict:
+    """Prove the key_auth route authenticates: a keyless call never reaches the backend."""
+    stats_before = backend_stats()
+    report = run_bench("auth-refusal", dest, env)
+    stats_after = backend_stats()
+    return {"total_requests": report.get("total_requests"), "total_errors": report.get("total_errors"),
+            "backend_calls": counter_delta(stats_before, stats_after, BACKEND_COUNTER["unary"])}
+
+
 def rotated(values: tuple, offset: int) -> tuple:
     offset %= len(values)
     return values[offset:] + values[:offset]
@@ -408,6 +425,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         if port_open(port):
             raise HarnessError(f"port {port} is already in use; the runner is not clean")
 
+    if sha256_file(binaries["reference"]) == sha256_file(binaries["candidate"]):
+        raise HarnessError("reference and candidate gateway binaries are identical; the comparison would measure nothing")
     base_env = clean_env()
     base_env["PATH"] = f"{harness_bin}{os.pathsep}{base_env.get('PATH', '')}"
     provenance = {
@@ -472,6 +491,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                             (out / "rows.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
                         probe = run_probe(auth, samples_dir / f"{tag}-probe.json", base_env)
                         probe.update({"role": role, "round": round_no})
+                        if auth == "auth":
+                            probe["auth_refusal"] = run_auth_refusal(samples_dir / f"{tag}-auth-refusal.json", base_env)
                         probes.append(probe)
                         print(json.dumps(probe), flush=True)
                         (out / "probes.json").write_text(json.dumps(probes, indent=2) + "\n", encoding="utf-8")
@@ -537,6 +558,21 @@ def sample_integrity(row: dict) -> list[str]:
     return problems
 
 
+def auth_refusal_problems(probe: dict) -> list[str]:
+    """The key_auth route must refuse a keyless call, in both revisions."""
+    if probe["auth"] != "auth":
+        return []
+    where = f"{probe['role']} round {probe['round']} key_auth negative control"
+    refusal = probe.get("auth_refusal")
+    if not isinstance(refusal, dict):
+        return [f"{where}: missing"]
+    if refusal.get("total_requests") or not refusal.get("total_errors") or refusal.get("backend_calls"):
+        return [f"{where}: a call without the API key was not refused before the backend "
+                f"({refusal.get('total_requests')} succeeded, {refusal.get('total_errors')} errors, "
+                f"{refusal.get('backend_calls')} reached the backend); the auth cells may not be authenticated"]
+    return []
+
+
 def probe_problems(probe: dict, timeout_ms: int, expected_calls: int) -> list[str]:
     where = f"{probe['role']} round {probe['round']} {probe['auth']} probe"
     if probe.get("error"):
@@ -588,8 +624,12 @@ METRICS = (("throughput", "rps"), ("cpu_per_call", "gateway_cpu_us_per_call"), (
 
 
 def verdict(interval_by_metric: dict, margins: dict) -> str:
-    rps, cpu = interval_by_metric["throughput"], interval_by_metric["cpu_per_call"]
-    if rps["high"] < 1 - margins["throughput"] or cpu["low"] > 1 + margins["cpu_per_call"]:
+    """Throughput and CPU per call are primary. p99 is secondary: an interval
+    wholly above its margin marks a regression, but p99 noise alone never
+    prevents a `no material regression` verdict."""
+    rps, cpu, p99 = (interval_by_metric[m] for m in ("throughput", "cpu_per_call", "p99"))
+    if (rps["high"] < 1 - margins["throughput"] or cpu["low"] > 1 + margins["cpu_per_call"]
+            or p99["low"] > 1 + margins["p99"]):
         return "regression"
     if rps["low"] >= 1 - margins["throughput"] and cpu["high"] <= 1 + margins["cpu_per_call"]:
         return "no material regression"
@@ -614,6 +654,7 @@ def evaluate(contract: dict, rows: list[dict], probes: list[dict]) -> dict:
                 if (role, auth, r) not in probe_seen:
                     failures.append(f"{role} round {r} {auth} probe is missing")
     for probe in probes:
+        failures.extend(auth_refusal_problems(probe))
         problems = probe_problems(probe, timeout_ms, probe_calls)
         if probe["role"] == "candidate":
             failures.extend(problems)
@@ -684,7 +725,8 @@ def summary_markdown(report: dict, provenance: dict) -> str:
         info = provenance.get(role, {})
         lines.append(f"- {role.capitalize()}: `{info.get('sha', '?')}` ({info.get('label', '')})")
     lines.append(f"- Rounds: {report['rounds']} (alternating role order); margins: throughput "
-                 f"{report['margins']['throughput']:.0%}, CPU/call {report['margins']['cpu_per_call']:.0%}")
+                 f"{report['margins']['throughput']:.0%}, CPU/call {report['margins']['cpu_per_call']:.0%}, "
+                 f"p99 {report['margins']['p99']:.0%} (regression-only)")
     lines.append(f"- Status: **{report['status']}**")
     lines += ["", "### Deadline-path effect (difference-in-differences, candidate vs reference, 95% CI)", "",
               "| Cell | Throughput | Gateway CPU / call | p99 | Verdict |", "|---|---|---|---|---|"]
@@ -779,13 +821,17 @@ def _probes(rounds: int = 4) -> list[dict]:
              "deadline_exceeded": 20, "other_statuses": {}, "unexpected_messages": 0, "client_safety_timeouts": 0,
              "elapsed_ms": {"min": 251.0, "median": 253.0, "max": 260.0}, "grpc_timeout_ms": 250,
              "release_checked": True, "release_failures": 0, "max_release_wait_ms": 4.0,
-             "backend_stalled_started": 20, "backend_stalled_released": 20, "backend_started_crosscheck": 20}
+             "backend_stalled_started": 20, "backend_stalled_released": 20, "backend_started_crosscheck": 20,
+             **({"auth_refusal": {"total_requests": 0, "total_errors": 1, "backend_calls": 0}} if auth == "auth" else {})}
             for role in ROLES for auth in CONFIGS for r in range(1, rounds + 1)]
 
 
 def self_test() -> int:
     c = _contract()
     validate_contract(c)
+    eight = json.loads(json.dumps(c))
+    eight["workload"]["rounds"] = 8
+    validate_contract(eight)
     # Identical revisions: every deadline effect is within margins.
     report = evaluate(c, _rows(), _probes())
     assert report["status"] == "pass", report["status"]
@@ -839,6 +885,20 @@ def self_test() -> int:
         probes = _probes()
         next(p for p in probes if p["role"] == "candidate")[field] = value
         assert evaluate(c, _rows(), probes)["status"] == "fail", field
+    # A key_auth route that let a keyless call through fails either role.
+    for role in ROLES:
+        probes = _probes()
+        next(p for p in probes if p["role"] == role and p["auth"] == "auth")["auth_refusal"]["backend_calls"] = 1
+        assert evaluate(c, _rows(), probes)["status"] == "fail", role
+    probes = _probes()
+    del next(p for p in probes if p["auth"] == "auth")["auth_refusal"]
+    assert evaluate(c, _rows(), probes)["status"] == "fail"
+    # p99 alone can mark a regression when it is wholly beyond its margin.
+    rows = _rows()
+    for row in rows:
+        if row["role"] == "candidate" and row["deadline"] == "deadline":
+            row["p99_us"] *= 1.5
+    assert evaluate(c, rows, _probes())["status"] == "regression"
     # The same failure on the reference is informational and keeps the comparison.
     probes = _probes()
     next(p for p in probes if p["role"] == "reference")["error"] = "probe did not complete: timeout"
@@ -853,7 +913,7 @@ def self_test() -> int:
     assert evaluate(c, _rows(), probes)["status"] == "fail"
     assert evaluate(c, _rows(), _probes()[1:])["status"] == "fail"
     # The contract cannot drift from the literal commands or unbalance role order.
-    for key, value in (("duration_secs", 5), ("rounds", 5), ("rounds", 2)):
+    for key, value in (("duration_secs", 5), ("rounds", 5), ("rounds", 2), ("rounds", 6)):
         bad = json.loads(json.dumps(c))
         bad["workload"][key] = value
         try:
