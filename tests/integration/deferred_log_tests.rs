@@ -553,7 +553,57 @@ fn detached_terminal_delivery_reads_only_what_its_slim_context_carries() {
 /// one `clone_log_metadata` produces, redaction and stripping included.
 #[test]
 fn taking_log_metadata_projects_exactly_what_cloning_it_does() {
+    let mut ctx = seeded_log_metadata_ctx();
+    let cloned = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    let taken = ferrum_edge::_test_support::take_log_metadata(&mut ctx);
+
+    assert_eq!(taken, cloned);
+    assert!(ctx.metadata.is_empty(), "the map is moved, not copied");
+    assert_eq!(
+        taken.get("trace_id").map(String::as_str),
+        Some("trace-visible")
+    );
+    assert_eq!(
+        taken.get("waf.action").map(String::as_str),
+        Some("block"),
+        "the WAF-owned field is re-applied from typed state"
+    );
+    for stripped in ["request_body", "_dedup_key", "waf.score"] {
+        assert!(
+            !taken.contains_key(stripped),
+            "{stripped} must be projected out"
+        );
+    }
+}
+
+/// End to end: a streamed terminal delivers exactly the projection
+/// `clone_log_metadata` gives for the same context, whatever reads the
+/// projection or the rest of the delivery task performs.
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_terminal_delivers_the_cloned_projection_after_moving_it() {
+    let ctx = seeded_log_metadata_ctx();
+    let expected = ferrum_edge::_test_support::clone_log_metadata(&ctx);
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let logger = DeferredTransactionLogger::new(make_summary_with_status(200), plugins, ctx);
+
+    logger.fire(BodyOutcome::success(64));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let delivered: HashMap<String, String> = captures[0]
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    assert_eq!(delivered, expected);
+}
+
+/// A context whose log projection exercises retention, stripping, redaction,
+/// and WAF-owned re-application.
+fn seeded_log_metadata_ctx() -> RequestContext {
     let mut ctx = make_ctx();
+    ferrum_edge::_test_support::set_waf_metadata_for_test(&mut ctx, "waf.action", "block");
     for (key, value) in [
         ("trace_id", "trace-visible"),
         ("mesh.source.workload", "client"),
@@ -564,21 +614,7 @@ fn taking_log_metadata_projects_exactly_what_cloning_it_does() {
     ] {
         ctx.metadata.insert(key.to_string(), value.to_string());
     }
-    let cloned = ferrum_edge::_test_support::clone_log_metadata(&ctx);
-    let taken = ferrum_edge::_test_support::take_log_metadata(&mut ctx);
-
-    assert_eq!(taken, cloned);
-    assert!(ctx.metadata.is_empty(), "the map is moved, not copied");
-    assert_eq!(
-        taken.get("trace_id").map(String::as_str),
-        Some("trace-visible")
-    );
-    for stripped in ["request_body", "_dedup_key", "waf.score"] {
-        assert!(
-            !taken.contains_key(stripped),
-            "{stripped} must be projected out"
-        );
-    }
+    ctx
 }
 
 /// Moving the map is sound only while nothing after the move reads
@@ -602,9 +638,13 @@ fn nothing_reads_context_metadata_after_the_streaming_terminal_takes_it() {
         .find(take)
         .expect("streaming terminal takes the metadata")
         + take.len()..];
+    let funnel = "log_with_mirror(plugins.as_slice(), &summary, &ctx).await;";
+    assert!(after.contains(funnel), "deferred delivery funnel");
+    // The whole remainder of the delivery task, not just up to the funnel.
     let task_end = after
-        .find("log_with_mirror(plugins.as_slice(), &summary, &ctx).await;")
-        .expect("deferred delivery funnel");
+        .find("\n        };\n")
+        .expect("end of the delivery task");
+    assert!(after[..task_end].contains(funnel));
     assert!(
         !after[..task_end].contains("ctx.metadata"),
         "the deferred task must not read ctx.metadata after taking it"
