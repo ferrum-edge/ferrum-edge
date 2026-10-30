@@ -1993,6 +1993,10 @@ impl Plugin for AiPromptCompressor {
         super::priority::AI_PROMPT_COMPRESSOR
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // JSON prompt bodies are an HTTP concern; native gRPC wire frames are
         // not compressed.

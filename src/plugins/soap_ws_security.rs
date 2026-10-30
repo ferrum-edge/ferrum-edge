@@ -6037,6 +6037,10 @@ impl Plugin for SoapWsSecurity {
         super::priority::SOAP_WS_SECURITY
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
     }

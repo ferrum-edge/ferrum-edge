@@ -35,7 +35,16 @@ WebSocket connections optionally enter a frame phase after the HTTP upgrade
 completes. Successful H1/H2/H3 WebSocket handshakes run a synchronous,
 non-rejecting response-header decoration boundary in configured priority order
 before transport-owned handshake fields are restored. Plugins only run in the
-phases they implement:
+phases they implement. For `on_request_received`, `before_proxy`, `after_proxy`,
+and `log`, which have no other participation predicate, dispatchers consult
+each plugin's `lifecycle_hooks()` declaration and skip a hook it does not
+implement instead of awaiting the trait's no-op default (issue #6615). Skipping
+changes no ordering or result: a skipped hook yields the default's `Continue`
+at its position in the chain, chain-level work tied to that position (route
+header finalization, per-plugin header snapshots) still runs, and a skipped
+`after_proxy` still refuses an elapsed pre-commitment deadline as the no-op
+did. Custom plugins default to every hook, and an instance with an execution
+trigger keeps every hook dispatched:
 
 ```
 Request In

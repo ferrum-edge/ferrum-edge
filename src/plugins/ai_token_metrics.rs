@@ -750,6 +750,10 @@ impl Plugin for AiTokenMetrics {
         super::priority::AI_TOKEN_METRICS
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
     }

@@ -1578,6 +1578,10 @@ impl Plugin for OpenapiValidator {
         super::priority::OPENAPI_VALIDATOR
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     /// The request contract is normally decided in
     /// `validate_client_request_body_contract`, over the original client
     /// representation (`GHSA-896v-jx23-9g6p`). This declaration is about the

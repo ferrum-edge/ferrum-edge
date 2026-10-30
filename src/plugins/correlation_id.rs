@@ -295,6 +295,12 @@ impl Plugin for CorrelationId {
         super::priority::CORRELATION_ID
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
     }

@@ -3103,6 +3103,10 @@ impl Plugin for AiRateLimiter {
         super::priority::AI_RATE_LIMITER
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // HTTP only. Native gRPC protobuf frames have no supported usage
         // schema here, so every hook of the accounting lifecycle would be

@@ -866,6 +866,10 @@ impl Plugin for WsFrameLogging {
         super::priority::WS_FRAME_LOGGING
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         WS_ONLY_PROTOCOLS
     }

@@ -1430,6 +1430,13 @@ impl Plugin for WorkloadMetrics {
         priority::WORKLOAD_METRICS
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+            | crate::plugins::PluginHooks::LOG
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         ALL_PROTOCOLS
     }

@@ -367,4 +367,8 @@ auth_flow::impl_auth_plugin!(
         }
         crate::plugins::PluginResult::Continue
     }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
 );

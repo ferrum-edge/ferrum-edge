@@ -2154,6 +2154,10 @@ impl Plugin for CompressionPlugin {
         super::priority::COMPRESSION
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
     }

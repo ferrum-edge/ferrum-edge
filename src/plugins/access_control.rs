@@ -616,6 +616,10 @@ impl Plugin for AccessControl {
         super::priority::ACCESS_CONTROL
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_FAMILY_AND_STREAM_PROTOCOLS
     }

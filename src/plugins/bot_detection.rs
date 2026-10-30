@@ -347,6 +347,10 @@ impl Plugin for BotDetection {
         BOT_DETECTION_PRIORITY
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_FAMILY_PROTOCOLS
     }

@@ -451,4 +451,8 @@ auth_flow::impl_auth_plugin!(
             .iter()
             .any(|location| matches!(location, KeyLocation::Query { .. }))
     }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
 );

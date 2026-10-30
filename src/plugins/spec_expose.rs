@@ -919,6 +919,10 @@ impl Plugin for SpecExpose {
         super::priority::SPEC_EXPOSE
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
     }

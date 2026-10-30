@@ -828,6 +828,10 @@ impl Plugin for GrpcMethodRouter {
         super::priority::GRPC_METHOD_ROUTER
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         GRPC_ONLY_PROTOCOLS
     }

@@ -2604,6 +2604,10 @@ impl Plugin for AiSemanticFirewall {
         super::priority::AI_SEMANTIC_FIREWALL
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         HTTP_ONLY_PROTOCOLS
     }

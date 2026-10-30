@@ -7445,6 +7445,10 @@ impl Plugin for PrometheusMetrics {
         super::priority::PROMETHEUS_METRICS
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::LOG
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
     }

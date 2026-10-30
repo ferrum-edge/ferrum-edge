@@ -582,6 +582,10 @@ impl Plugin for UdpRateLimiting {
         super::priority::UDP_RATE_LIMITING
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         UDP_ONLY_PROTOCOLS
     }

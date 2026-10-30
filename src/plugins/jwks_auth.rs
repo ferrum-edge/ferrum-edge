@@ -2077,6 +2077,10 @@ impl super::Plugin for JwksAuth {
         super::priority::JWKS_AUTH
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn authentication_challenge(&self) -> Option<&'static str> {
         Some(self.advertised_challenge)
     }

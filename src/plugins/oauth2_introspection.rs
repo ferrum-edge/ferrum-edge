@@ -1666,6 +1666,10 @@ impl super::Plugin for Oauth2Introspection {
         super::priority::OAUTH2_INTROSPECTION
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         crate::plugins::HTTP_FAMILY_PROTOCOLS
     }

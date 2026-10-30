@@ -4937,6 +4937,12 @@ impl Plugin for AiTranscriptAudit {
         super::priority::AI_TRANSCRIPT_AUDIT
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+            | crate::plugins::PluginHooks::LOG
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         // Native gRPC is in scope only through the explicit `grpc` enrollment
         // block. Without it the plugin stays HTTP-only rather than advertising

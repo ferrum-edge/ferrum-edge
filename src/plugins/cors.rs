@@ -1394,6 +1394,10 @@ impl Plugin for CorsPlugin {
         super::priority::CORS
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // HTTP and gRPC (including gRPC-Web) only. WebSocket upgrades are
         // classified as `HttpFlavor::WebSocket` and do not run this plugin;
@@ -1579,6 +1583,10 @@ impl Plugin for CorsFinalizer {
 
     fn priority(&self) -> u16 {
         self.priority
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::AFTER_PROXY
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

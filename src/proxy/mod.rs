@@ -28257,11 +28257,20 @@ pub(crate) async fn run_after_proxy_hooks(
             }
         } else {
             let bound = ctx.precommit_response_phase_bound();
-            crate::plugins::await_precommit_response_phase(
-                bound,
-                plugin.after_proxy(ctx, response_status, response_headers),
-            )
-            .await
+            if plugin
+                .lifecycle_hooks()
+                .contains(crate::plugins::PluginHooks::AFTER_PROXY)
+            {
+                crate::plugins::await_precommit_response_phase(
+                    bound,
+                    plugin.after_proxy(ctx, response_status, response_headers),
+                )
+                .await
+            } else {
+                // Keep the elapsed-bound refusal the skipped no-op would have
+                // hit, and the per-plugin bookkeeping below.
+                crate::plugins::skipped_precommit_response_phase(bound, PluginResult::Continue)
+            }
             .into_plugin_result(ctx)
         };
         match result {
@@ -33445,14 +33454,25 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
         if !should_run {
             continue;
         }
-        let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline_with_provenance(
-            deadline,
-            plugin.before_proxy(ctx, headers),
-        )
-        .await
-        .into_plugin_result(ctx)
+        // A plugin that does not implement `before_proxy` would return
+        // `Continue` from the default; `timeout_at` polls that ready no-op
+        // before its timer, so skipping it cannot change deadline handling.
+        // The route-header finalization below still runs at its index.
+        let result = if plugin
+            .lifecycle_hooks()
+            .contains(crate::plugins::PluginHooks::BEFORE_PROXY)
         {
+            let deadline = ctx.grpc_deadline_at();
+            crate::plugins::await_request_plugin_deadline_with_provenance(
+                deadline,
+                plugin.before_proxy(ctx, headers),
+            )
+            .await
+            .into_plugin_result(ctx)
+        } else {
+            PluginResult::Continue
+        };
+        match result {
             PluginResult::Continue => {
                 // After the last eligible request_transformer static-rule pass,
                 // apply matched route request-header transforms exactly once so
@@ -36790,6 +36810,13 @@ async fn handle_proxy_request_inner(
     if !plugins.is_empty() {
         let phase_start = Instant::now();
         for plugin in plugins.iter() {
+            // Skipped hooks are the default `Continue`; see `PluginHooks`.
+            if !plugin
+                .lifecycle_hooks()
+                .contains(crate::plugins::PluginHooks::ON_REQUEST_RECEIVED)
+            {
+                continue;
+            }
             let deadline = ctx.grpc_deadline_at();
             match crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,

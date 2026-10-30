@@ -1499,6 +1499,18 @@ impl Plugin for PluginInstanceWrapper {
     fn priority(&self) -> u16 {
         self.priority
     }
+    /// A priority-only wrapper forwards every one of these hooks unchanged,
+    /// so it implements exactly what the wrapped plugin does. A trigger gate
+    /// takes and memoizes its decision from inside these hooks (normally
+    /// `on_request_received`, which the inner plugin need not implement), so a
+    /// triggered instance keeps every hook dispatched (issue #6615).
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        if self.trigger.is_some() {
+            crate::plugins::PluginHooks::ALL
+        } else {
+            self.inner.lifecycle_hooks()
+        }
+    }
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
         if !self.runs(ctx, TriggerPhase::PreAuth) {
             return PluginResult::Continue;

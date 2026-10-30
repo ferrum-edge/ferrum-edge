@@ -2674,6 +2674,10 @@ auth_flow::impl_auth_plugin!(
             authority.activate();
         }
     }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
 );
 
 fn parse_u64_field(value: Option<&Value>, field: &str, default_value: u64) -> Result<u64, String> {

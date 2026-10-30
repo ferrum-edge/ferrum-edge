@@ -361,6 +361,10 @@ impl Plugin for TcpConnectionThrottle {
         super::priority::TCP_CONNECTION_THROTTLE
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::TCP_ONLY_PROTOCOLS
     }

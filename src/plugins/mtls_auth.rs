@@ -1236,4 +1236,8 @@ auth_flow::impl_auth_plugin!(
             },
         }
     }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
 );

@@ -3446,6 +3446,10 @@ impl Plugin for AiToolGovernor {
         super::priority::AI_TOOL_GOVERNOR
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_ONLY_PROTOCOLS
     }

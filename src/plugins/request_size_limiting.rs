@@ -237,6 +237,10 @@ impl Plugin for RequestSizeLimiting {
         super::priority::REQUEST_SIZE_LIMITING
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     /// This plugin's enforcement decision is taken in the final request-body
     /// phase, over the exact backend-visible representation. Composition
     /// admission refuses to pair it with a plugin that egresses the request

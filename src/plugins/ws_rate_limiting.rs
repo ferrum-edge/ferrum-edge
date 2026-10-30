@@ -627,6 +627,10 @@ impl Plugin for WsRateLimiting {
         super::priority::WS_RATE_LIMITING
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         WS_ONLY_PROTOCOLS
     }
@@ -736,6 +740,10 @@ impl Plugin for WsRateLimitingSession {
 
     fn priority(&self) -> u16 {
         super::priority::WS_RATE_LIMITING
+    }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
     }
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {

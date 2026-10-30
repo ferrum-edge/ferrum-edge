@@ -938,6 +938,10 @@ impl Plugin for Opa {
         super::priority::OPA
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         HTTP_FAMILY_PROTOCOLS
     }
