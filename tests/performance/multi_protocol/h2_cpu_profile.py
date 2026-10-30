@@ -299,7 +299,8 @@ def _elf_identity(path):
             while cursor + 12 <= len(notes):
                 name_size, desc_size, note_type = struct.unpack_from('<III', notes, cursor)
                 name = notes[cursor + 12:cursor + 12 + name_size]
-                desc = cursor + 12 + -(-name_size // align) * align
+                # The descriptor follows the header plus name, aligned together.
+                desc = cursor + -(-(12 + name_size) // align) * align
                 if desc + desc_size > len(notes):
                     raise ValueError('truncated ELF note')
                 if note_type == 3 and name == b'GNU\0':
