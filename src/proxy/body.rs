@@ -6114,6 +6114,23 @@ struct ReadAheadBody<B> {
     frames: VecDeque<Frame<Bytes>>,
     terminal_error: Option<BoxError>,
     inner: Option<B>,
+    /// Set once a terminal has been delivered (see `is_end_stream`).
+    finished: bool,
+}
+
+impl<B> ReadAheadBody<B> {
+    fn new(
+        frames: VecDeque<Frame<Bytes>>,
+        terminal_error: Option<BoxError>,
+        inner: Option<B>,
+    ) -> Self {
+        Self {
+            frames,
+            terminal_error,
+            inner,
+            finished: false,
+        }
+    }
 }
 
 impl<B> http_body::Body for ReadAheadBody<B>
@@ -6129,25 +6146,39 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
         if let Some(frame) = this.frames.pop_front() {
+            if frame.is_trailers() && this.inner.is_none() {
+                this.finished = true;
+            }
             return Poll::Ready(Some(Ok(frame)));
         }
         if let Some(error) = this.terminal_error.take() {
+            this.finished = true;
             return Poll::Ready(Some(Err(error)));
         }
-        match this.inner.as_mut() {
+        let polled = match this.inner.as_mut() {
             Some(inner) => Pin::new(inner).poll_frame(cx).map_err(Into::into),
             None => Poll::Ready(None),
+        };
+        if match &polled {
+            Poll::Ready(Some(Ok(frame))) => frame.is_trailers(),
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => true,
+            Poll::Pending => false,
+        } {
+            this.finished = true;
         }
+        polled
     }
 
+    /// Only a DELIVERED terminal ends this stream, exactly as the pump reports
+    /// it. Reporting end of stream for a body whose terminal is merely queued
+    /// would let hyper finish the response on its HEADERS frame without
+    /// polling, skipping any terminal an outer adapter adds at end of stream.
     fn is_end_stream(&self) -> bool {
-        self.frames.is_empty()
-            && self.terminal_error.is_none()
-            && self
-                .inner
-                .as_ref()
-                .is_none_or(http_body::Body::is_end_stream)
+        self.finished
     }
 
     /// Unknown, exactly as the pump reports it: hyper must not derive a
@@ -6219,11 +6250,7 @@ where
                 // The upstream's own terminal was read before the deadline:
                 // release the backend now and serve the finished response.
                 drop(body);
-                let complete = ReadAheadBody {
-                    frames,
-                    terminal_error,
-                    inner: None,
-                };
+                let complete = ReadAheadBody::new(frames, terminal_error, None);
                 let timed = TotalDeadlineBody::with_deadline_frame(
                     http_body_util::Either::Left(http_body_util::Either::Right(complete)),
                     // No timer: a response that completed before its deadline
@@ -6234,11 +6261,7 @@ where
                 );
                 return (timed, None);
             }
-            let owned = ReadAheadBody {
-                frames,
-                terminal_error: None,
-                inner: Some(body),
-            };
+            let owned = ReadAheadBody::new(frames, None, Some(body));
             let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
                 owned,
                 at,

@@ -6937,6 +6937,67 @@ async fn a_response_complete_at_construction_releases_the_backend_without_a_pump
     assert!(!closer.close_requested());
 }
 
+/// A backend whose body ends at once with no frame and no trailers, but does
+/// not advertise end of stream up front.
+struct EmptyRpcBackendBody {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for EmptyRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(None)
+    }
+}
+
+impl Drop for EmptyRpcBackendBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_ahead_response_ends_its_stream_only_once_polled_to_the_end() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body::Body;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = proxy_body_streaming_for_test(Box::pin(EmptyRpcBackendBody {
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        AuthorizationConnectionCloser::new(),
+    );
+
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!proxy_body_holds_client_grpc_deadline_pump_for_test(&body));
+    // Framing parity with the pump: a terminal that is only queued is not an
+    // end of stream, or hyper would finish the response on its HEADERS frame
+    // without polling, skipping any terminal an outer adapter adds at the end.
+    assert!(
+        !body.is_end_stream(),
+        "a read-ahead terminal must be delivered before the stream reports its end"
+    );
+    assert!(body.frame().await.is_none());
+    assert!(body.is_end_stream());
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_backend_error_read_ahead_is_delivered_after_the_frames_before_it() {
     use ferrum_edge::_test_support::{
