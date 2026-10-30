@@ -144,16 +144,18 @@ pub fn credential_dumping_log_filter() -> tracing_subscriber::filter::FilterFn {
 /// `EnvFilter`) AND [`credential_dumping_log_filter`].
 ///
 /// The level filter must stay the outermost per-layer filter. The outermost
-/// filter alone supplies the layer's max-level hint, and that hint becomes the
-/// process-wide `LevelFilter::current()` that every `tracing` macro checks
-/// before anything else. Nesting also merges callsite interests: an outer
-/// `always` over an inner `never` becomes `sometimes`. With the hint-less
-/// credential filter outside, every TRACE/DEBUG callsite in hyper, h2, and
-/// tokio was evaluated dynamically on every hit even at `FERRUM_LOG_LEVEL=error`,
-/// roughly doubling gateway CPU per gRPC call (#6852). With the level filter
-/// outside, a callsite it disables registers `never` and is skipped by the
-/// static max-level check, while the credential filter still vetoes the
-/// records the level filter enables.
+/// filter alone supplies the layer's max-level hint, which feeds the
+/// process-wide `LevelFilter::current()` (the maximum over every output and
+/// counting layer) that each `tracing` macro checks before anything else.
+/// Nesting also merges callsite interests: an outer `always` over an inner
+/// `never` becomes `sometimes`. With the hint-less credential filter outside
+/// (#6852), every TRACE/DEBUG callsite in hyper, h2, and tokio was evaluated
+/// dynamically on every hit even at `FERRUM_LOG_LEVEL=error`. With the level
+/// filter outside, a callsite that a static (target/level) directive disables
+/// registers `never` and is skipped by the max-level check. Span- and
+/// field-scoped directives still evaluate dynamically, by `EnvFilter`'s
+/// design, as they did before #6852. The credential filter still vetoes
+/// every record the level filter enables.
 pub fn filter_output_layer<L, F, S>(
     layer: L,
     level_filter: F,

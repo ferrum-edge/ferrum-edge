@@ -510,6 +510,10 @@ fn credential_dumping_records_stay_off_under_every_directive_shape() {
         // target directive; the AND-composed filter must still drop them.
         "warn,tungstenite::handshake::client[{message}]=trace,tungstenite::protocol[{message}]=trace",
         "warn,tungstenite::handshake::client[ws_connect]=trace,tungstenite::protocol[ws_connect]=trace",
+        // A target-less span directive really enters the `ws_connect` scope
+        // (the span's target is this test module), so span tracking runs in
+        // the outer level filter while the credential filter still vetoes.
+        "warn,[ws_connect]=trace",
     ] {
         let output = render_under_gateway_filter(directives);
         for canary in [
@@ -537,6 +541,10 @@ fn credential_dumping_records_stay_off_under_every_directive_shape() {
     let output =
         render_under_gateway_filter("warn,tungstenite::handshake::server[{message}]=trace");
     assert!(output.contains("sibling-target-visible"), "{output}");
+    // ...and so does the target-less span-scoped shape.
+    let output = render_under_gateway_filter("warn,[ws_connect]=trace");
+    assert!(output.contains("sibling-target-visible"), "{output}");
+    assert!(output.contains("close-frame-debug-visible"), "{output}");
 }
 
 #[test]
@@ -555,6 +563,8 @@ fn credential_dumping_filter_never_raises_verbosity() {
 /// `filter_output_layer`: a layer without the credential filter would let any
 /// directive or RTDS reload re-enable the records, and a layer that nests the
 /// filters the other way round loses the level filter's static hint.
+/// `init_logging` in `src/gateway_entry.rs` is the only sanctioned place that
+/// installs output layers; this scan covers that file only.
 #[test]
 fn every_gateway_output_layer_composes_the_credential_dumping_filter() {
     let source = include_str!("../../src/gateway_entry.rs");
@@ -599,22 +609,48 @@ static H2_TRACE_PROBE: tracing::Metadata<'static> = tracing::Metadata::new(
 );
 
 /// The credential filter must not cost the hot path anything at the
-/// configured level. The outermost per-layer filter alone supplies the
-/// subscriber's max-level hint (the process-wide `LevelFilter::current()`),
-/// and nesting an outer `always` over an inner `never` caches `sometimes`.
-/// With the hint-less credential filter outside the level filter (#6852),
-/// every TRACE/DEBUG callsite in hyper and h2 was evaluated on each hit at
-/// `FERRUM_LOG_LEVEL=error`, roughly doubling gateway CPU per gRPC call.
+/// configured level. The outermost per-layer filter alone supplies a layer's
+/// max-level hint (feeding the process-wide `LevelFilter::current()`), and
+/// nesting an outer `always` over an inner `never` caches `sometimes`. With
+/// the hint-less credential filter outside the level filter (#6852), every
+/// TRACE/DEBUG callsite in hyper and h2 was evaluated on each hit at
+/// `FERRUM_LOG_LEVEL=error`. Both `init_logging` stacks are rebuilt here with
+/// the production filter type (`reload::Layer<EnvFilter>`); the counting
+/// variant adds the real `CountingLayer` with its own filters, as installed.
 #[test]
 fn gateway_output_filter_keeps_the_level_filters_static_hint_and_interest() {
     use tracing::Subscriber as _;
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
-    let filtered = |directives: &str| {
-        tracing_subscriber::registry().with(ferrum_edge::logging::filter_output_layer(
+    fn output_layer<S>(directives: &str) -> impl tracing_subscriber::Layer<S> + use<S>
+    where
+        S: tracing::Subscriber
+            + for<'span> tracing_subscriber::registry::LookupSpan<'span>
+            + 'static,
+    {
+        let (level_filter, _handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new(directives));
+        ferrum_edge::logging::filter_output_layer(
             tracing_subscriber::fmt::layer().with_writer(io::sink),
-            tracing_subscriber::EnvFilter::new(directives),
-        ))
+            level_filter,
+        )
+    }
+    let fallback = |directives: &str| tracing_subscriber::registry().with(output_layer(directives));
+    let counting = |directives: &str| {
+        tracing_subscriber::registry()
+            .with(output_layer(directives))
+            .with(
+                ferrum_edge::runtime_metrics_tracing_layer::CountingLayer::new(
+                    std::sync::Arc::new(ferrum_edge::runtime_metrics::RuntimeMetrics::new()),
+                )
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    ferrum_edge::runtime_metrics_tracing_layer::should_count_target(
+                        metadata.target(),
+                    )
+                }))
+                .with_filter(tracing_subscriber::EnvFilter::new(directives)),
+            )
     };
 
     for (directives, level) in [
@@ -623,22 +659,38 @@ fn gateway_output_filter_keeps_the_level_filters_static_hint_and_interest() {
         ("info,h2=debug", tracing::level_filters::LevelFilter::DEBUG),
     ] {
         assert_eq!(
-            filtered(directives).max_level_hint(),
+            fallback(directives).max_level_hint(),
             Some(level),
             "{directives}: the level filter's hint must reach the subscriber"
         );
+        assert_eq!(
+            counting(directives).max_level_hint(),
+            Some(level),
+            "{directives}: the hint must survive the counting layer's merge"
+        );
         assert!(
-            filtered(directives)
+            fallback(directives)
                 .register_callsite(&H2_TRACE_PROBE)
                 .is_never(),
             "{directives}: a TRACE callsite the level filter disables must stay `never`"
+        );
+        assert!(
+            counting(directives)
+                .register_callsite(&H2_TRACE_PROBE)
+                .is_never(),
+            "{directives}: the counting stack must keep the disabled callsite `never`"
         );
     }
 
     // The probe is a real callsite: a level filter that enables it still
     // registers interest, so the `never` above is not vacuous.
     assert!(
-        !filtered("trace")
+        !fallback("trace")
+            .register_callsite(&H2_TRACE_PROBE)
+            .is_never()
+    );
+    assert!(
+        !counting("trace")
             .register_callsite(&H2_TRACE_PROBE)
             .is_never()
     );
