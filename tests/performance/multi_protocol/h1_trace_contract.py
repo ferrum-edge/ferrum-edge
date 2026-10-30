@@ -263,7 +263,9 @@ def decode_cpu(text, raw_text, target_pids):
     samples, chains, current = [], [], None
     # perf's default sample header after the explicit -F fields. Threads print pid/tid.
     header = re.compile(r'^\s*.+?\s+(\d+)/(\d+)\s+(\d+\.\d+):\s+cpu-clock(?::[ukhS]+)?:')
-    frame = re.compile(r'^\s*([0-9a-fA-F]+)\s+(.+?)\s+\((.*?)\)\s*$')
+    # The DSO is the LAST parenthesized group: demangled C++ symbols such as
+    # `Slice::drain(unsigned long)` contain their own parentheses.
+    frame = re.compile(r'^\s*([0-9a-fA-F]+)\s+(.+)\s+\(([^()]*)\)\s*$')
     for line in text.splitlines() + ['']:
         match = header.match(line)
         if match:

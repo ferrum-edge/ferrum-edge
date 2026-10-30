@@ -27,8 +27,8 @@ Ferrum must match the retained symbolized binary. Envoy's actual mapped ELF and
 build IDs are retained; stripped or unresolved frames stay explicit in coverage.
 The collector does not sample the whole host or collect kernel stacks.
 
-Envoy's release image ships a stripped executable, so its own frames have no
-function names. After capture, the job symbolizes each Envoy CPU capture
+Envoy's release image ships a stripped executable, so almost none of its own
+frames have function names. After capture, the job symbolizes each Envoy CPU capture
 offline. It fetches one layer of `envoyproxy/envoy:debug-v1.39.1` by
 its pinned content digest. That layer holds `/usr/local/bin/envoy` with
 `.symtab` and the **same GNU build ID** as the measured `v1.39.1` binary.
@@ -69,14 +69,16 @@ The 881 MB debug executable is never added to the artifact. A missing or
 mismatched symbol twin fails that step but leaves the capture evidence and
 calibration unchanged.
 
-Symbols do not fix Envoy's unwinding. In hosted run 40999505084 (HTTP/2,
-10 KiB), the twin named every Envoy executable leaf: 56 of 56 and 41 of 41,
-up from 2 and 0. Even so, in pair 1, 2,073 of 2,319 Envoy samples carried no
-unwound frame at all, against 12 of 2,393 for Ferrum. Total Envoy known-leaf coverage
-therefore rose only from 1.4–1.9% to about 4%. Samples that begin in Envoy's
-own code unwind to nothing, so Envoy's low coverage is an unwinding gap, not a
-symbol gap. A function-level comparison needs the sampled PC even when DWARF
-unwinding fails, for example a flat leaf decode of the same `perf.data`.
+Symbols do not fix Envoy's unwinding. Hosted run 40999505084 (HTTP/2, 10 KiB)
+had two Envoy captures. The twin named every Envoy executable leaf in the
+measurement window: 62 of 62 and 46 of 46, up from 2 and 0. Even so, in pair 1,
+2,073 of all 2,319 Envoy samples carried no unwound frame, against 12 of all
+2,393 Ferrum samples, and symbolization left those counts unchanged. Total Envoy
+known-leaf coverage in the window therefore rose only from 1.4–1.9% to about 4%.
+Most Envoy samples have no frame to name, so unwinding, not symbols, is the
+dominant remaining coverage gap. A function-level comparison needs the sampled
+PC even when DWARF unwinding fails, for example a flat leaf decode of the same
+`perf.data`.
 
 `process_usage.measurement` adds `user_cpu_seconds` and `system_cpu_seconds` from
 Linux `/proc/PID/stat`. With scheduler sampling enabled, gateway/backend
