@@ -551,29 +551,15 @@ fn detached_terminal_delivery_reads_only_what_its_slim_context_carries() {
 /// The streaming terminal logger moves the context's metadata into the summary
 /// instead of cloning it (issue #6793): the projected map must be exactly the
 /// one `clone_log_metadata` produces, redaction and stripping included.
-#[test]
-fn taking_log_metadata_projects_exactly_what_cloning_it_does() {
-    let mut ctx = seeded_log_metadata_ctx();
+#[tokio::test]
+async fn taking_log_metadata_projects_exactly_what_cloning_it_does() {
+    let (mut ctx, request_id) = seeded_log_metadata_ctx().await;
     let cloned = ferrum_edge::_test_support::clone_log_metadata(&ctx);
     let taken = ferrum_edge::_test_support::take_log_metadata(&mut ctx);
 
     assert_eq!(taken, cloned);
     assert!(ctx.metadata.is_empty(), "the map is moved, not copied");
-    assert_eq!(
-        taken.get("trace_id").map(String::as_str),
-        Some("trace-visible")
-    );
-    assert_eq!(
-        taken.get("waf.action").map(String::as_str),
-        Some("block"),
-        "the WAF-owned field is re-applied from typed state"
-    );
-    for stripped in ["request_body", "_dedup_key", "waf.score"] {
-        assert!(
-            !taken.contains_key(stripped),
-            "{stripped} must be projected out"
-        );
-    }
+    assert_seeded_projection(&taken, &request_id);
 }
 
 /// End to end: a streamed terminal delivers exactly the projection
@@ -581,7 +567,7 @@ fn taking_log_metadata_projects_exactly_what_cloning_it_does() {
 /// projection or the rest of the delivery task performs.
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_terminal_delivers_the_cloned_projection_after_moving_it() {
-    let ctx = seeded_log_metadata_ctx();
+    let (ctx, request_id) = seeded_log_metadata_ctx().await;
     let expected = ferrum_edge::_test_support::clone_log_metadata(&ctx);
     let (plugin, captured) = CapturingPlugin::new();
     let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
@@ -597,14 +583,31 @@ async fn streamed_terminal_delivers_the_cloned_projection_after_moving_it() {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     assert_eq!(delivered, expected);
+    assert_seeded_projection(&delivered, &request_id);
 }
 
-/// A context whose log projection exercises retention, stripping, redaction,
-/// and WAF-owned re-application.
-fn seeded_log_metadata_ctx() -> RequestContext {
+/// A context whose log projection exercises every step: retention, stripping
+/// and redaction of the map, plus re-application of each typed source (the
+/// authorization-termination latch, the canonical correlation id, and
+/// WAF-owned fields). The public copies of the typed values are overwritten,
+/// so only the typed sources can produce the projected values. Returns the
+/// canonical request id.
+async fn seeded_log_metadata_ctx() -> (RequestContext, String) {
     let mut ctx = make_ctx();
+    let correlation =
+        ferrum_edge::plugins::correlation_id::CorrelationId::new(&serde_json::json!({}))
+            .expect("valid correlation config");
+    let _ = correlation.on_request_received(&mut ctx).await;
+    let request_id = ctx
+        .metadata
+        .get(ferrum_edge::plugins::REQUEST_ID_METADATA_KEY)
+        .expect("canonical request id published")
+        .clone();
+    ferrum_edge::_test_support::latch_credential_expired_termination_for_test(&ctx);
     ferrum_edge::_test_support::set_waf_metadata_for_test(&mut ctx, "waf.action", "block");
     for (key, value) in [
+        (ferrum_edge::plugins::REQUEST_ID_METADATA_KEY, "forged"),
+        ("authorization.termination_reason", "forged"),
         ("trace_id", "trace-visible"),
         ("mesh.source.workload", "client"),
         ("mesh.metrics.request_count.tag_overrides", "plan"),
@@ -614,7 +617,28 @@ fn seeded_log_metadata_ctx() -> RequestContext {
     ] {
         ctx.metadata.insert(key.to_string(), value.to_string());
     }
-    ctx
+    (ctx, request_id)
+}
+
+fn assert_seeded_projection(projected: &HashMap<String, String>, request_id: &str) {
+    for (key, value) in [
+        ("trace_id", "trace-visible"),
+        (ferrum_edge::plugins::REQUEST_ID_METADATA_KEY, request_id),
+        ("authorization.termination_reason", "credential_expired"),
+        ("waf.action", "block"),
+    ] {
+        assert_eq!(
+            projected.get(key).map(String::as_str),
+            Some(value),
+            "{key} must come from its authoritative source"
+        );
+    }
+    for stripped in ["request_body", "_dedup_key", "waf.score"] {
+        assert!(
+            !projected.contains_key(stripped),
+            "{stripped} must be projected out"
+        );
+    }
 }
 
 /// Moving the map is sound only while nothing after the move reads
