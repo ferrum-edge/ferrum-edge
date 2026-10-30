@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Mesh Telemetry documents are closed** (issue #6616 follow-up). On native,
+  file, and Ferrum xDS mesh slices, a Telemetry resource now rejects unknown
+  members at every level: the resource and its `config`, the `tracing`,
+  `metrics`, and `access_logging` sections, each tracing provider envelope and
+  its `config`, each `tag_overrides` entry and its `operation` (including
+  `type: remove`), and the access-log `filter`. Direct `workload_metrics`
+  plugin config already rejected them. The OpenAPI schema for policy
+  `targetRefs` attachments now requires `name` on every attachment and
+  `namespace` on `service` / `gateway`, matching runtime admission.
 - **Plugin configs are closed at every depth, and validation is pinned
   side-effect-free** (issue #6616). A new framework sweep
   (`tests/unit/plugins/plugin_config_closure_tests.rs`) validates example

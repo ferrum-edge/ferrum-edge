@@ -97,7 +97,7 @@ impl Schema {
             (Self::Fields(JWT_RULE), "output_claim_to_headers") => Self::Fields("header claim"),
             (Self::Fields(TELEMETRY), "config") => Self::Fields("tracing metrics access_logging"),
             (Self::Fields("tracing metrics access_logging"), "tracing") => Self::Fields(TRACING),
-            (Self::Fields(TRACING), "providers" | "provider") => Self::Provider,
+            (Self::Fields(TRACING), "providers") => Self::Provider,
             (Self::Fields("tracing metrics access_logging"), "metrics") => {
                 Self::Fields("tag_overrides disabled_metrics")
             }
@@ -255,7 +255,7 @@ const JWT_RULE: &str = "issuer audiences jwks_uri jwks from_headers from_params 
     forward_original_token output_claim_to_headers";
 const TELEMETRY: &str = "name namespace scope config";
 const TRACING: &str = "mode sampling_percentage disable_span_reporting disableSpanReporting custom_tags \
-    custom_header_tags custom_env_tags safe_tag_sources providers provider";
+    custom_header_tags custom_env_tags safe_tag_sources providers";
 const CEL: &str = "op value name attribute then_expr else_expr";
 const ACCESS_FILTER: &str = "status_code_min status_code_max min_latency_ms errors_only expression";
 const PROXY_CONFIG: &str = "name namespace scope concurrency image environment tracing_sampling";

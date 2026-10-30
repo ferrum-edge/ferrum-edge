@@ -811,3 +811,77 @@ fn mesh_config_with_request_authentications_round_trips() {
     assert_eq!(mesh.request_authentications[0].name, "test-ra");
     assert_eq!(mesh.request_authentications[0].jwt_rules.len(), 1);
 }
+
+// ── Telemetry closure (issue #6616) ──────────────────────────────────────
+
+fn telemetry_resource_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "name": "mesh-telemetry",
+        "namespace": "default",
+        "scope": {"kind": "namespace", "namespace": "default"},
+        "config": {
+            "tracing": {
+                "mode": "client_and_server",
+                "sampling_percentage": 10.0,
+                "providers": [
+                    {"kind": "zipkin", "config": {"url": "http://zipkin:9411/api/v2/spans"}}
+                ]
+            },
+            "metrics": {
+                "tag_overrides": [
+                    {"name": "request_protocol", "operation": {"type": "remove"}},
+                    {
+                        "metric": "REQUEST_COUNT",
+                        "name": "team",
+                        "operation": {"type": "set", "value": "payments"}
+                    }
+                ],
+                "disabled_metrics": ["REQUEST_SIZE"]
+            },
+            "access_logging": {"enabled": true, "filter": {"status_code_min": 500}}
+        }
+    })
+}
+
+#[test]
+fn telemetry_resource_round_trips_through_its_closed_schema() {
+    use ferrum_edge::modes::mesh::config::MeshTelemetryResource;
+
+    let parsed: MeshTelemetryResource =
+        serde_json::from_value(telemetry_resource_fixture()).expect("fixture is valid");
+    let reparsed: MeshTelemetryResource =
+        serde_json::from_value(serde_json::to_value(&parsed).expect("serializes"))
+            .expect("serialized form is accepted by the closed schema");
+    assert_eq!(parsed, reparsed);
+}
+
+#[test]
+fn telemetry_resource_rejects_unknown_members_at_every_level() {
+    use ferrum_edge::modes::mesh::config::MeshTelemetryResource;
+
+    for pointer in [
+        "",
+        "/config",
+        "/config/tracing",
+        "/config/tracing/providers/0",
+        "/config/tracing/providers/0/config",
+        "/config/metrics",
+        "/config/metrics/tag_overrides/0",
+        "/config/metrics/tag_overrides/0/operation",
+        "/config/metrics/tag_overrides/1/operation",
+        "/config/access_logging",
+        "/config/access_logging/filter",
+    ] {
+        let mut document = telemetry_resource_fixture();
+        document
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| panic!("fixture has an object at {pointer:?}"))
+            .insert("misspelled_member".to_string(), serde_json::json!(true));
+        let result = serde_json::from_value::<MeshTelemetryResource>(document);
+        assert!(
+            result.is_err(),
+            "unknown member at {pointer:?} must be rejected"
+        );
+    }
+}

@@ -26546,9 +26546,16 @@ components:
                 its own authoritative evidence. Waypoint-only.
               items:
                 type: object
-                required: [kind]
+                required: [kind, name]
                 additionalProperties: false
                 allOf:
+                  - if:
+                      required: [kind]
+                      properties:
+                        kind:
+                          enum: [service, gateway]
+                    then:
+                      required: [namespace]
                   - if:
                       required: [kind]
                       properties:
