@@ -39,6 +39,8 @@ Debug output can be large. That mode retains the complete log only on the
 ephemeral runner and prints a bounded view: initial configuration, the eight
 lines preceding each warning/error (up to 2,000 contexts), and completion/timing
 records. The job summary still counts warnings from the complete log.
+It also enables the Rust analyzer's Cargo/proc-macro loader diagnostic targets.
+CodeQL's own verbosity option alone does not expose those internal errors.
 
 In particular, check Tokio `select!` expansion, SPIFFE Workload API
 bindings, and the custom plugin registry. The raw WARN-line count is a

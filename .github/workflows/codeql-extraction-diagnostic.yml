@@ -92,6 +92,10 @@ jobs:
           for feature in "${features[@]}"; do
             options+=(--extractor-option "rust.cargo_features=$feature")
           done
+          if test "$DIAGNOSTIC_LOG_LEVEL" = debug; then
+            # Include Cargo/proc-macro loader errors hidden by CodeQL's own filter.
+            export RUST_LOG='single_arch_extractor=debug,codeql_extractor=debug,ra_ap_load_cargo=debug,ra_ap_hir_expand=debug,ra_ap_proc_macro_api=debug,ra_ap_proc_macro_srv_cli=debug'
+          fi
           "$DIAGNOSTIC_DIR/tools/codeql/codeql" database create \
             "$DIAGNOSTIC_DIR/database" \
             --language=rust --build-mode=none --threads=2 --no-cleanup \
@@ -101,7 +105,7 @@ jobs:
             awk -v detail="$DIAGNOSTIC_LOG_LEVEL" '
               { previous[NR % 9] = $0 }
               detail != "debug" || NR <= 60 { print; next }
-              /WARN|ERROR/ {
+              /WARN|ERROR|[Ee]rrors occurred while|[Ff]ailed to|[Cc]annot create expander|[[:space:]]error:/ {
                 if (++contexts <= 2000) {
                   print "--- extractor diagnostic context ---"
                   start = NR > 8 ? NR - 8 : 1
