@@ -327,8 +327,9 @@ pub(crate) fn attach_grpc_upload_deadline(
     }
 }
 
-/// Arm [`GrpcBody::Streaming`]'s client RPC deadline. One timer per
-/// deadline-bearing streaming upload; it is dropped with the body as soon as
+/// Arm [`GrpcBody::Streaming`]'s client RPC deadline. Its timer is created only
+/// if the upload has to wait (see `UploadRpcDeadline`), so an upload consumed
+/// in ready polls registers none; any timer is dropped with the body as soon as
 /// the upload completes.
 pub(crate) fn streaming_upload_rpc_deadline(
     deadline: Option<tokio::time::Instant>,

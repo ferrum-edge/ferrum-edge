@@ -144,17 +144,19 @@
 //! guard the response body holds for as long as the client likes.
 //! [`AuthorizationCancellableBody::for_client_rpc_deadline`] therefore moves
 //! the upstream into the same gateway-scheduled pump, armed from the RPC
-//! deadline instead of the credential's lifetime. A response whose upstream
-//! terminal is already ready when the response is built never reaches the
-//! pump (issue #6904): its backend is released at once, its frames are served
-//! from memory under the same terminal owner and completion rule, and
-//! [`rpc_deadline_settled_watchdog`] keeps only the expiry and close-grace
-//! half (`proxy::body::client_grpc_deadline_body`). It differs only in what is
-//! counted: an RPC deadline is a client-chosen bound, not an authorization
-//! decision, so it records no authorization-lifetime termination, and the
-//! protocol adapter outside it emits `DEADLINE_EXCEEDED` (status 4) rather
-//! than `UNAUTHENTICATED`. Release at the deadline and the bounded-grace
-//! transport close are identical.
+//! deadline instead of the credential's lifetime. The RPC pump differs only in
+//! what is counted: an RPC deadline is a client-chosen bound, not an
+//! authorization decision, so it records no authorization-lifetime
+//! termination, and the protocol adapter outside it emits `DEADLINE_EXCEEDED`
+//! (status 4) rather than `UNAUTHENTICATED`. Release at the deadline and the
+//! bounded-grace transport close are identical.
+//!
+//! A response whose upstream terminal is already ready when the response is
+//! built never reaches the pump (issue #6904): its backend is released at
+//! once, its frames are served from memory under the same terminal owner and
+//! completion rule, and [`rpc_deadline_settled_watchdog`] keeps only the
+//! expiry and close-grace half — one task and one sleep, with no channel and no
+//! per-frame hop (`proxy::body::client_grpc_deadline_body`).
 //!
 //! # Redaction
 //!

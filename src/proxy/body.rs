@@ -1369,10 +1369,12 @@ impl ProxyBody {
     /// because a complete gRPC message boundary cannot be proven.
     ///
     /// `closer` is the client connection's close signal (`Some` on hyper-driven
-    /// HTTP/1.1 and HTTP/2 frontends). With it the upstream is moved into the
-    /// gateway-owned response pump, so the deadline releases the backend and,
-    /// after a bounded grace, the client connection even while the transport
-    /// polls nothing — see [`ClientGrpcResponseDeadline`].
+    /// HTTP/1.1 and HTTP/2 frontends). With it the deadline releases the
+    /// backend and, after a bounded grace, the client connection even while the
+    /// transport polls nothing: an upstream whose terminal is already ready is
+    /// released at once and settled from memory under a close-only watchdog,
+    /// anything else moves into the gateway-owned response pump — see
+    /// [`ClientGrpcResponseDeadline`] and [`client_grpc_deadline_body`].
     pub(crate) fn with_client_grpc_deadline(
         mut self,
         deadline: tokio::time::Instant,
@@ -2690,9 +2692,10 @@ impl UploadAuthDeadline {
 /// authorization accounting. An expired bound ends the upload in an error, so
 /// hyper resets the backend stream.
 ///
-/// The timer is armed lazily (issue #6904). Every poll compares the clock with
-/// the bound, so an upload polled at or after it ends in the error exactly as
-/// before; the boxed `Sleep` is created only when the upload is about to WAIT
+/// The timer is armed lazily (issue #6904). Until it is armed, every poll
+/// compares the clock with the bound, so an upload polled at or after it ends
+/// in the error exactly as before; once armed, polls check the latched timer.
+/// The boxed `Sleep` is created only when the upload is about to WAIT
 /// ([`Self::arm`] on `Pending`), the one case in which something must wake the
 /// body at the deadline. A unary upload that hyper consumes in ready polls
 /// therefore allocates and registers no timer at all.
@@ -6015,7 +6018,11 @@ where
 /// for_client_rpc_deadline`), which releases the backend response AT the
 /// deadline and, after a bounded grace in which the client may still drain the
 /// `DEADLINE_EXCEEDED` terminal, closes the client connection so the request
-/// accounting held by `ProxyBody` is released too. The pump task is owned by
+/// accounting held by `ProxyBody` is released too. An upstream whose terminal
+/// is already ready when the response is built is instead released at once
+/// and settled from memory, with only the pump's expiry and close-grace half
+/// kept by `response_watchdog::rpc_deadline_settled_watchdog` (issue #6904,
+/// see [`client_grpc_deadline_body`]). The pump or watchdog task is owned by
 /// the client-facing `ProxyBody` (see `ProxyBody::client_grpc_deadline_pump`),
 /// so an outer adapter or authorization pump consuming the terminal cannot
 /// cancel that grace. `None` keeps the inline body-side timer: frontends
@@ -6277,8 +6284,14 @@ where
 /// cross-task hop per frame, which measured as a 17–21% throughput loss on
 /// deadline-bearing unary gRPC.
 ///
-/// The returned [`ResponsePumpGuard`] (present only when a pump was installed)
-/// must be stored on the client-facing `ProxyBody`.
+/// "Taken by the client" in the completion rule means consumed by the next
+/// reader of this body, which can be an outer authorization pump rather than
+/// the network client, exactly as for the pump's one-frame channel.
+///
+/// The returned [`ResponsePumpGuard`] (the pump, or the close-only watchdog of
+/// a response settled from memory; absent for the inline path and for a
+/// settled response that claimed its completion at construction) must be
+/// stored on the client-facing `ProxyBody`.
 fn client_grpc_deadline_body<B>(
     body: B,
     deadline: ClientGrpcResponseDeadline,
@@ -6306,14 +6319,16 @@ where
                 let owned = ReadAheadBody::new(frames, None, Some(body));
                 return pumped_client_grpc_deadline_body(owned, at, closer, deadline_frame, fired);
             };
-            // The upstream reached its own terminal: release the backend now,
-            // whatever the clock says, and settle the response from memory
-            // under the pump's terminal owner and completion rule. The owner's
-            // clock check also settles a terminal the read-ahead observed AFTER
-            // the deadline as the deadline, exactly as the pump refuses it.
-            drop(body);
+            // The upstream reached its own terminal: settle the response from
+            // memory under the pump's terminal owner and completion rule. The
+            // owner's clock check also settles a terminal the read-ahead
+            // observed AFTER the deadline as the deadline, exactly as the pump
+            // refuses it. Claim BEFORE releasing the backend, as the pump does:
+            // backend teardown (an H2 stream drop takes the connection lock)
+            // must not be able to turn an on-time terminal into an expiry.
             let owner = AuthorizationTerminalOwner::new(at);
             let settled = ReadAheadBody::settled(frames, terminal_error, owner.clone());
+            drop(body);
             let watchdog = (!settled.completion_claimed()).then(|| {
                 crate::proxy::response_watchdog::rpc_deadline_settled_watchdog(
                     owner.clone(),
