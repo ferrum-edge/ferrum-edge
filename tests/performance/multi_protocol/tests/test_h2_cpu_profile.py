@@ -241,9 +241,16 @@ class H2CPUAdmissionTests(unittest.TestCase):
                 'envoy 7/9 11.000000000: cpu-clock:uS:\n'
                 '\t    5100 [unknown] (/usr/local/bin/envoy)\n'
                 '\t    6000 __libc_start_main+0x80 (/usr/lib/x86_64-linux-gnu/libc.so.6)\n\n'
+                # An in-window sample whose DWARF unwind kept no frame.
+                'envoy 7/9 12.000000000: cpu-clock:uS:\n\n'
                 'envoy 7/9 30.000000000: cpu-clock:uS:\n'
                 '\t    5200 [unknown] (/usr/local/bin/envoy)\n'
                 '\t    6000 __libc_start_main+0x80 (/usr/lib/x86_64-linux-gnu/libc.so.6)\n\n')
+    # perf script -G: one line per sample, its sampled PC on the header.
+    FLAT = ('envoy 7/8 10.000000000: cpu-clock:uS:     5000 Envoy::Http::CodecHelper::dispatch+0x10 (/usr/local/bin/envoy)\n'
+            'envoy 7/9 11.000000000: cpu-clock:uS:     5100 Envoy::Http::CodecHelper::dispatch+0x20 (/usr/local/bin/envoy)\n'
+            'envoy 7/9 12.000000000: cpu-clock:uS:     5300 Envoy::Buffer::OwnedImpl::move(Envoy::Buffer::Instance&)+0x8 (/usr/local/bin/envoy)\n'
+            'envoy 7/9 30.000000000: cpu-clock:uS:     5200 Envoy::Http::CodecHelper::dispatch+0x30 (/usr/local/bin/envoy)\n')
 
     def envoy_symbols(self, directory, fault=None):
         """Retained Envoy CPU captures plus a build-ID twin; returns symbolize_envoy's inputs."""
@@ -317,11 +324,23 @@ class H2CPUAdmissionTests(unittest.TestCase):
             (out / 'stacks.folded').write_text('folded 1\n')
             (out / 'stacks.txt.stderr').write_text('perf diagnostics\n')
             (out / 'stacks.txt.status.json').write_text('{"returncode": 0}\n')
+            flat = self.FLAT
+            if fault == 'flat-samples':
+                flat = flat.replace('envoy 7/9 12.000000000', 'envoy 7/9 12.500000000')
+            elif fault == 'flat-missing-pc':
+                flat = flat.replace('     5300 Envoy::Buffer::OwnedImpl::move(Envoy::Buffer::Instance&)+0x8 (/usr/local/bin/envoy)', '')
+            elif fault == 'flat-pc':
+                flat = flat.replace('5100 Envoy', '5101 Envoy')
+            (out / 'flat.txt').write_text(flat)
+            (out / 'flat.txt.stderr').write_text('')
+            (out / 'flat.txt.status.json').write_text('{"returncode": 0}\n')
             calls.append(out)
             issues = ['partial unwinding/unresolved samples']
             if fault == 'blocking-decoder':
                 issues.append('lost or throttled samples')
-            return dict(decoded, issues=issues, inline_expansion=False, decoder_status=dict(returncode=0))
+            return dict(decoded, issues=issues, inline_expansion=False, decoder_status=dict(returncode=0),
+                        flat_status=dict(returncode=1 if fault == 'flat-failed' else 0,
+                                         incomplete='deadline_or_output_cap' if fault == 'flat-incomplete' else None))
         return root, debug, Path(directory) / 'scratch', pins, decode, calls
 
     def test_envoy_symbols_rename_only_the_retained_samples(self):
@@ -334,18 +353,30 @@ class H2CPUAdmissionTests(unittest.TestCase):
             for row in result['captures']:
                 self.assertEqual(row['issues'], [])
                 # Only in-window samples count; the 30 s sample is outside.
-                self.assertEqual(row['stripped']['window_samples'], 2)
+                self.assertEqual(row['stripped']['window_samples'], 3)
                 self.assertEqual(row['stripped']['known_leaf_samples'], 0)
                 self.assertEqual(row['symbolized']['known_leaf_samples'], 2)
                 self.assertEqual(row['symbolized']['top_leaves'],
                                  [dict(symbol='Envoy::Http::CodecHelper::dispatch', dso=ENVOY_EXECUTABLE,
-                                       samples=2, fraction=1.0)])
+                                       samples=2, fraction=2 / 3)])
                 self.assertEqual(row['symbolized']['executable_known_leaf_samples'], 2)
+                self.assertEqual(row['symbolized']['leaf_dsos'], {ENVOY_EXECUTABLE: 2, '[none]': 1})
+                # The flat decode names the sampled PC of every window sample,
+                # including the one whose unwind kept no frame.
+                self.assertEqual((row['flat']['window_samples'], row['flat']['known_leaf_samples'],
+                                  row['flat']['executable_known_leaf_samples']), (3, 3, 3))
+                self.assertEqual(row['flat']['leaf_dsos'], {ENVOY_EXECUTABLE: 3})
+                self.assertEqual(row['flat_no_unwound_frame']['window_samples'], 1)
+                self.assertEqual(row['flat_no_unwound_frame']['top_leaves'],
+                                 [dict(symbol='Envoy::Buffer::OwnedImpl::move(Envoy::Buffer::Instance&)',
+                                       dso=ENVOY_EXECUTABLE, samples=1, fraction=1.0)])
+                self.assertEqual(row['flat_status']['returncode'], 0)
             for pair in (1, 2):
                 published = root / f'cpu/pairs/pair_{pair:03d}/traces/envoy_10240/envoy-symbols'
                 self.assertEqual(sorted(p.name for p in published.iterdir()),
-                                 ['cpu-coverage.json', 'stacks.folded', 'stacks.txt.status.json',
-                                  'stacks.txt.stderr', 'summary.json'])
+                                 ['cpu-coverage.json', 'flat.txt', 'flat.txt.status.json', 'flat.txt.stderr',
+                                  'stacks.folded', 'stacks.txt.status.json', 'stacks.txt.stderr', 'summary.json'])
+                self.assertEqual((published / 'flat.txt').read_text(), self.FLAT)
                 self.assertEqual((published / 'stacks.txt.stderr').read_text(), 'perf diagnostics\n')
             # The symbol twin and overlay stay in scratch, never in evidence.
             debug_bytes = debug.read_bytes()
@@ -378,6 +409,11 @@ class H2CPUAdmissionTests(unittest.TestCase):
             'blocking-decoder': 'decoder: lost or throttled samples',
             'symbol-package': 'does not use the retained Envoy symbol package',
             'window': "KeyError: 'measurement'",
+            'flat-failed': 'flat sampled-PC decode failed or was incomplete',
+            'flat-incomplete': 'flat sampled-PC decode failed or was incomplete',
+            'flat-samples': 'flat decode samples differ from the original decode',
+            'flat-missing-pc': 'flat decode lacks exactly one sampled PC per sample',
+            'flat-pc': 'flat sampled PCs differ from unwound leaf PCs',
         }
         for fault, issue in expected.items():
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
@@ -389,7 +425,8 @@ class H2CPUAdmissionTests(unittest.TestCase):
                 self.assertTrue(issues and all(issue in i for i in issues), issues)
                 # Post-decode mismatches publish their diagnostics; earlier refusals publish nothing.
                 self.assertFalse(list(root.rglob('envoy-symbols')) and fault not in (
-                    'leaf-pc', 'caller-pc', 'no-op', 'blocking-decoder', 'no-executable-leaves'))
+                    'leaf-pc', 'caller-pc', 'no-op', 'blocking-decoder', 'no-executable-leaves',
+                    'flat-failed', 'flat-incomplete', 'flat-samples', 'flat-missing-pc', 'flat-pc'))
                 # Capture evidence and calibration stay as they were.
                 self.assertEqual(report(root), 0)
                 self.assertFalse(json.loads((root / 'h2-cpu-report.json').read_text())['envoy_symbols']['complete'])
@@ -486,15 +523,39 @@ class H2CPUAdmissionTests(unittest.TestCase):
             root, debug, scratch, pins, decode, _ = self.envoy_symbols(directory)
             seen = []
 
+            flats = []
+
             def cpu_decode(out, owners, dsos, **bounds):
                 seen.append(bounds)
-                return decode(out, owners, dsos, symfs=bounds['symfs'])
-            with mock.patch('h1_trace.cpu_decode', cpu_decode):
+                return {k: v for k, v in decode(out, owners, dsos, symfs=bounds['symfs']).items()
+                        if k != 'flat_status'}
+
+            def command(action, destination, **data):
+                flats.append((action, destination, data))
+                return dict(returncode=0, incomplete=None)
+            with mock.patch('h1_trace.cpu_decode', cpu_decode), mock.patch('h1_trace.command', command):
                 self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins), 0)
             self.assertEqual(len(seen), 2)
             for bounds in seen:
                 self.assertEqual((bounds['script_timeout'], bounds['script_limit']),
                                  (ENVOY_DECODE_SECONDS, ENVOY_DECODE_BYTES))
+            # The flat decode reads the same overlay under the same offline bounds.
+            self.assertEqual(len(flats), 2)
+            for (action, destination, data), bounds in zip(flats, seen):
+                self.assertEqual(action, 'perf-script-flat')
+                self.assertEqual(destination, data['out'] / 'flat.txt')
+                self.assertEqual(data, dict(limit=ENVOY_DECODE_BYTES, timeout=ENVOY_DECODE_SECONDS,
+                                            out=data['out'], symfs=bounds['symfs']))
+
+    def test_flat_decoder_shares_the_stack_decoder_inputs_without_unwinding(self):
+        from h1_trace import planned_argv
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            stacks = planned_argv('perf-script', out=out, symfs=out / 'symfs')
+            flat = planned_argv('perf-script-flat', out=out, symfs=out / 'symfs')
+        self.assertEqual(flat[:6], stacks[:6])
+        self.assertEqual(flat[6:], ['--no-inline', '--ns', '-G', '-F', 'comm,pid,tid,time,event,ip,sym,dso'])
+        self.assertEqual(flat[-2:], stacks[-2:])
 
     def test_report_marks_missing_envoy_symbols_without_failing_the_capture(self):
         with tempfile.TemporaryDirectory() as directory:

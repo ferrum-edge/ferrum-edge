@@ -256,7 +256,8 @@ def report(root):
                         'Symbolized physical DWARF frames only; inline source frames are not expanded.',
                         'Unresolved/optimized-away/async frames remain explicit in CPU coverage.',
                         'Thread churn makes scheduler deltas unavailable instead of zero.',
-                        'Envoy names come from an offline build-ID-matched debug twin of the measured stripped binary.']
+                        'Envoy names come from an offline build-ID-matched debug twin of the measured stripped binary.',
+                        'Flat Envoy leaves are sampled PCs only: self time by function, without callers.']
     (root / 'h2-cpu-report.json').write_text(json.dumps(result, indent=2) + '\n')
     return 0 if result['complete'] else 1
 
@@ -435,15 +436,40 @@ def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
     elif (before['executable_known_leaf_samples'] < before['executable_leaf_samples']
             and after['executable_known_leaf_samples'] <= before['executable_known_leaf_samples']):
         row['issues'].append('debug twin resolved no additional Envoy executable leaves')
+    # The sampled PC of every sample, decoded through the same overlay without
+    # unwinding: it names the leaf of samples whose DWARF unwind kept no frame.
+    # It must cover exactly the original samples and agree with every leaf
+    # the original unwinder did produce.
+    flat_status, flat = decoded.get('flat_status') or {}, None
+    if flat_status.get('returncode') != 0 or flat_status.get('incomplete'):
+        row['issues'].append('flat sampled-PC decode failed or was incomplete')
+    else:
+        flat = decode_cpu((out / 'flat.txt').read_text(errors='replace'), '', {pid})['callchains']
+        def samples(chains):
+            return [(s['pid'], s['tid'], s['time_secs']) for s in chains]
+        if samples(flat) != samples(original['callchains']):
+            row['issues'].append('flat decode samples differ from the original decode')
+            flat = None
+        elif any(len(s['frames']) != 1 for s in flat):
+            row['issues'].append('flat decode lacks exactly one sampled PC per sample')
+            flat = None
+        elif any(u['frames'] and u['frames'][0]['ip'] != f['frames'][0]['ip']
+                 for u, f in zip(original['callchains'], flat)):
+            row['issues'].append('flat sampled PCs differ from unwound leaf PCs')
+            flat = None
     row.update(pair=manifest.get('binding', {}).get('pair'), samples=decoded['samples'],
                decoder_issues=decoded['issues'], inline_expansion=decoded.get('inline_expansion'),
-               decoder_status=decoded.get('decoder_status'), stripped=before, symbolized=after)
+               decoder_status=decoded.get('decoder_status'), stripped=before, symbolized=after,
+               flat_status=flat_status,
+               flat=None if flat is None else leaf_summary(flat, window, top=40),
+               flat_no_unwound_frame=None if flat is None else leaf_summary(
+                   [f for u, f in zip(original['callchains'], flat) if not u['frames']], window, top=20))
     # Assemble beside the capture and publish whole, never a partial directory.
     partial = folder / '.envoy-symbols.partial'
     partial.mkdir()
     for name in ('cpu-coverage.json', 'stacks.folded'):
         shutil.copyfile(out / name, partial / name)
-    for name in ('stacks.txt.stderr', 'stacks.txt.status.json'):
+    for name in ('stacks.txt.stderr', 'stacks.txt.status.json', 'flat.txt', 'flat.txt.stderr', 'flat.txt.status.json'):
         if (out / name).is_file():
             shutil.copyfile(out / name, partial / name)
     (partial / 'summary.json').write_text(json.dumps(row, indent=2) + '\n')
@@ -467,10 +493,13 @@ def symbolize_envoy(root, debug_elf, scratch, *, pins=ENVOY_SYMBOLS, decode=None
     """Re-decode each retained Envoy CPU capture against the debug twin."""
     root, scratch, debug_elf = Path(root).resolve(), Path(scratch).resolve(), Path(debug_elf).resolve()
     if decode is None:
-        from h1_trace import cpu_decode
+        from h1_trace import command, cpu_decode
         def decode(out, owners, dsos, *, symfs):
-            return cpu_decode(out, owners, dsos, symfs=symfs,
-                              script_timeout=ENVOY_DECODE_SECONDS, script_limit=ENVOY_DECODE_BYTES)
+            decoded = cpu_decode(out, owners, dsos, symfs=symfs,
+                                 script_timeout=ENVOY_DECODE_SECONDS, script_limit=ENVOY_DECODE_BYTES)
+            flat = command('perf-script-flat', out / 'flat.txt', limit=ENVOY_DECODE_BYTES,
+                           timeout=ENVOY_DECODE_SECONDS, out=out, symfs=symfs)
+            return dict(decoded, flat_status=flat)
     result = dict(schema=1, diagnostic_only=True, complete=False, source=dict(pins), captures=[], issues=[],
                   expected_captures=None)
     try:

@@ -55,12 +55,22 @@ decode, so only names may change. A capture is reported as unmatched if:
 - some Envoy executable leaves were unresolved and the twin resolved no more of
   them.
 
+The same overlay then decodes each sample's sampled PC with `perf script -G`,
+which skips DWARF unwinding. That names the leaf of samples whose unwind kept
+no frame. This flat decode has the same 600-second, 64 MiB bounds. It must
+reproduce every original sample (PID, TID and time), with exactly one PC each.
+Each PC must equal the leaf of every sample that the original decode did
+unwind. Otherwise the capture is unmatched. A flat leaf is self time only; it
+has no callers.
+
 Each capture that reaches the publish step gains `envoy-symbols/`; every other
 capture appears only in `envoy-symbols.json`. The directory holds folded stacks,
-decoder coverage, the decoder's stderr and status, and a summary. It is
-published whole and never overwritten. The summary gives measurement-window
-leaf coverage before and after symbols, and the top leaf functions with their
-DSOs. The run also writes `envoy-symbols.json` after every capture, which
+decoder coverage, the flat decode (`flat.txt`), each decoder's stderr and
+status, and a summary. It is published whole and never overwritten. The summary
+gives measurement-window leaf coverage before and after symbols, and the top
+leaf functions with their DSOs. `flat` gives the same summary for every sampled
+PC; `flat_no_unwound_frame` restricts it to samples whose unwind kept no frame.
+The run also writes `envoy-symbols.json` after every capture, which
 `h2-cpu-report.json` includes. Only the closing write, with a row for every
 capture, can be complete. A decoder that outlives its post-kill reap bound
 stops the pass.
@@ -77,8 +87,7 @@ measurement window: 62 of 62 and 46 of 46, up from 2 and 0. Even so, in pair 1,
 known-leaf coverage in the window therefore rose only from 1.4–1.9% to about 4%.
 Most Envoy samples have no frame to name, so unwinding, not symbols, is the
 dominant remaining coverage gap. A function-level comparison needs the sampled
-PC even when DWARF unwinding fails, for example a flat leaf decode of the same
-`perf.data`.
+PC even when DWARF unwinding fails, which the flat decode above now supplies.
 
 `process_usage.measurement` adds `user_cpu_seconds` and `system_cpu_seconds` from
 Linux `/proc/PID/stat`. With scheduler sampling enabled, gateway/backend
