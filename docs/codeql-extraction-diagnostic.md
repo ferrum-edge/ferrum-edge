@@ -85,23 +85,33 @@ runners. A concrete candidate is:
 | --- | --- | --- |
 | Linux ordinary release | `ubuntu-26.04` | `default,cloud-secrets` |
 | Linux FIPS release | `ubuntu-26.04` | `fips,cloud-secrets` |
-| Linux ordinary optional security features | `ubuntu-26.04` | `default,cloud-secrets,acme,pkcs11,ebpf` |
-| Linux FIPS optional security features | `ubuntu-26.04` | `fips,cloud-secrets,acme,pkcs11,ebpf` |
+| Linux ordinary compatible features | `ubuntu-26.04` | `default,cloud-secrets,acme,pkcs11,ebpf,fuzzing,bench-pool-profile,bench-udp-profile` |
+| Linux FIPS compatible features | `ubuntu-26.04` | `fips,cloud-secrets,acme,pkcs11,ebpf,fuzzing,bench-pool-profile,bench-udp-profile` |
 | Windows ordinary release | `windows-2025` | `default,cloud-secrets` |
 | macOS ordinary release | `macos-15` | `default,cloud-secrets` |
 
-Run the two Linux release profiles on the existing default/protected-branch
-push/PR triggers and weekly schedule. Run the additional optional/platform
-profiles weekly and on manual dispatch initially; keep heavy Rust jobs
-sequential. Preserve the three non-Rust analyses and their current triggers.
+Run the two Linux compatible-feature profiles on the existing default/protected
+branch push/PR triggers and weekly schedule. These retain the feature union of
+the current wildcard scan while separating the incompatible crypto backends;
+`bench-pool-profile` also enables `bench-h1-profile`. Keep benchmark/fuzz feature
+coverage in this proposal rather than silently dropping it. Add the release-exact
+Linux and native Windows/macOS profiles on weekly/manual triggers initially.
+Keep heavy Rust jobs sequential. Preserve the three non-Rust analyses and their
+current triggers.
 Validate extraction and generated bindings for every proposed row before
 switching setup mode. Query results and processed uploads must then succeed
 before declaring those profiles covered. New categories may change alert
 grouping; this proposal does not authorize dismissing existing alerts.
 
-Benchmark/fuzz feature configurations remain explicitly outside this production
-proposal. Source/branch changes and overlapping conditional code require review;
-even this matrix would not prove every feature combination or macro path.
+CodeQL and standard hosted compute are free while the repository remains public.
+No larger runners, new artifact uploads, paid products or trials are proposed.
+The PR/push lane would have two Rust analyses instead of one, and a weekly run
+would have six. Rust analysis can take hours, so serialized jobs increase CI
+latency even though the proposed compute has no charge. The current wildcard
+Rust invocation would be retired only after the replacement rows are verified
+and the migration is explicitly approved. Source/branch changes and overlapping
+conditional code require review; this matrix still would not prove every
+feature combination or macro path.
 
 These two profiles are a diagnostic comparison. They do not cover every optional
 feature or platform, and must not replace the current scans without a separate

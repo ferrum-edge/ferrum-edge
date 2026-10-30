@@ -99,20 +99,17 @@ jobs:
             --extractor-option "rust.logging.verbosity=$DIAGNOSTIC_LOG_LEVEL" \
             "${options[@]}" 2>&1 | tee "$DIAGNOSTIC_DIR/extraction.log" | \
             awk -v detail="$DIAGNOSTIC_LOG_LEVEL" '
-              {
-                previous[NR % 9] = $0
-                if (detail != "debug" || NR <= 60) {
-                  print
-                } else if ($0 ~ /[[:space:]](WARN|ERROR)[[:space:]]/) {
-                  if (++contexts <= 2000) {
-                    print "--- extractor diagnostic context ---"
-                    start = NR > 8 ? NR - 8 : 1
-                    for (i = start; i <= NR; i++) print previous[i % 9]
-                  }
-                } else if ($0 ~ /total duration|Finalizing database|TRAP import|Successfully created database/) {
-                  print
+              { previous[NR % 9] = $0 }
+              detail != "debug" || NR <= 60 { print; next }
+              /WARN|ERROR/ {
+                if (++contexts <= 2000) {
+                  print "--- extractor diagnostic context ---"
+                  start = NR > 8 ? NR - 8 : 1
+                  for (i = start; i <= NR; i++) print previous[i % 9]
                 }
+                next
               }
+              /total duration|Finalizing database|TRAP import|Successfully created database/ { print }
               END {
                 if (detail == "debug") {
                   printf "Debug log: %d lines; %d diagnostic contexts (up to 2000 printed).\n", NR, contexts
