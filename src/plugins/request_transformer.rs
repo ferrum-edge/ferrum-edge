@@ -1135,6 +1135,10 @@ impl Plugin for RequestTransformer {
         super::priority::REQUEST_TRANSFORMER
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // WebSocket handshakes carry headers and a query like any request;
         // the proxy never buffers a handshake body, so body rules stay inert

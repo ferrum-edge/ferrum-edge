@@ -649,6 +649,10 @@ impl Plugin for OutboundRegistry {
         priority::MESH_OUTBOUND_REGISTRY
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         // Host-header gating only applies to HTTP-family traffic. Raw
         // TCP/UDP stream proxies have no Host header; mesh-level egress

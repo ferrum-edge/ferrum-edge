@@ -741,6 +741,10 @@ impl Plugin for RequestTermination {
         super::priority::REQUEST_TERMINATION
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_FAMILY_PROTOCOLS
     }

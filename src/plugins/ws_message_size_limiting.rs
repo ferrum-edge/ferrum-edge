@@ -246,6 +246,10 @@ impl Plugin for WsMessageSizeLimiting {
         super::priority::WS_MESSAGE_SIZE_LIMITING
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         WS_ONLY_PROTOCOLS
     }

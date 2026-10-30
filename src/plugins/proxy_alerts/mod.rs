@@ -1373,6 +1373,10 @@ impl Plugin for ProxyAlerts {
         super::priority::PROXY_ALERTS
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
+    }
+
     fn retain_active_proxy_state(&self, active_proxy_generations: &HashMap<&str, u64>) {
         self.retain_proxies(active_proxy_generations);
     }

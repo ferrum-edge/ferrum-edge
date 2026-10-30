@@ -383,6 +383,10 @@ impl Plugin for GrpcDeadline {
         super::priority::GRPC_DEADLINE
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         GRPC_ONLY_PROTOCOLS
     }

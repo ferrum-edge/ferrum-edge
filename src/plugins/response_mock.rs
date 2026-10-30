@@ -761,6 +761,10 @@ impl Plugin for ResponseMock {
         super::priority::RESPONSE_MOCK
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         RESPONSE_MOCK_PROTOCOLS
     }

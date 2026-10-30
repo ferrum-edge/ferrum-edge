@@ -7717,6 +7717,10 @@ impl Plugin for McpGateway {
         super::priority::MCP_GATEWAY
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         HTTP_ONLY_PROTOCOLS
     }

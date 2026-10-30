@@ -1574,6 +1574,10 @@ impl Plugin for GraphqlPlugin {
         super::priority::GRAPHQL
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         GRAPHQL_PROTOCOLS
     }

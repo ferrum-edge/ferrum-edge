@@ -394,6 +394,10 @@ impl Plugin for MeshBpfMetrics {
         priority::MESH_BPF_METRICS
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         // Touches no per-request state; safe across every protocol the
         // chain supports so an operator config that targets this plugin

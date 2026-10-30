@@ -1779,6 +1779,10 @@ impl Plugin for Waf {
         super::priority::WAF
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     /// WAF body rules decide in the final request-body phase, over the exact
     /// backend-visible representation. Composition admission refuses to pair
     /// this with a plugin that egresses the request before finalization on an

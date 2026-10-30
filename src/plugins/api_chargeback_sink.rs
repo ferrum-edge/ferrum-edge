@@ -3757,6 +3757,10 @@ impl Plugin for ApiChargebackSink {
         super::priority::API_CHARGEBACK_SINK
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
     }

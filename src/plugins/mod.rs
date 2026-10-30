@@ -7975,6 +7975,26 @@ where
     }
 }
 
+/// The result [`await_precommit_response_phase`] would give a hook that a
+/// dispatcher skipped because the plugin does not implement it
+/// ([`Plugin::lifecycle_hooks`], issue #6615), computed without a boxed future
+/// or a timer.
+///
+/// The skipped default completes immediately with `value`, but
+/// [`await_deadline_first`] refuses an elapsed bound before polling, so an
+/// undeclared hook still observes expiry exactly as calling the no-op did.
+pub(crate) fn skipped_precommit_response_phase<T>(
+    bound: PrecommitResponsePhaseBound,
+    value: T,
+) -> PrecommitPhaseResult<T> {
+    match bound.deadline() {
+        Some(deadline) if tokio::time::Instant::now() >= deadline => {
+            PrecommitPhaseResult::Expired(bound.expired_authorization())
+        }
+        _ => PrecommitPhaseResult::Completed(value),
+    }
+}
+
 impl PrecommitPhaseResult<PluginResult> {
     /// Resolve an awaited plugin phase into the result the caller must act on.
     ///
@@ -9986,7 +10006,9 @@ async fn log_with_mirror_inner(
         // outcome is final. A client RPC deadline must bound request handling,
         // but it must not suppress the audit/transaction record for the
         // deadline outcome itself.
-        plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
+        if plugin.lifecycle_hooks().contains(PluginHooks::LOG) {
+            plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
+        }
     }
     delivery.armed = false;
     finish_terminal_delivery(plugins, summary, ctx, precompute_mesh_key);
@@ -10029,6 +10051,9 @@ fn finish_terminal_delivery(
                 None
             };
             for plugin in plugins.iter() {
+                if !plugin.lifecycle_hooks().contains(PluginHooks::LOG) {
+                    continue;
+                }
                 plugin
                     .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                     .await;
@@ -10075,7 +10100,9 @@ impl Drop for TerminalDeliveryGuard<'_> {
                 None
             };
             for plugin in plugins.iter().skip(next) {
-                plugin.log_with_mesh_key(&summary, mesh_key.as_ref()).await;
+                if plugin.lifecycle_hooks().contains(PluginHooks::LOG) {
+                    plugin.log_with_mesh_key(&summary, mesh_key.as_ref()).await;
+                }
             }
             finish_terminal_delivery(&plugins, &summary, &ctx, precompute_mesh_key);
         });
@@ -11072,6 +11099,62 @@ pub enum BackendAdmissionDecision {
     },
 }
 
+/// The always-dispatched request lifecycle hooks a plugin implements, returned
+/// by [`Plugin::lifecycle_hooks`] (issue #6615).
+///
+/// These four hooks have no other participation predicate, so without this
+/// declaration every request awaits a boxed `async_trait` no-op for every
+/// plugin in each phase. A dispatcher skips the call for a plugin whose
+/// declaration omits the hook and substitutes the result the skipped default
+/// would have produced (`Continue`, or nothing for `log`).
+///
+/// Skipping is sound only because an omitted hook is the trait's default
+/// no-op. Declaring a hook the plugin does not override costs one wasted
+/// call; omitting one it does override silently disables it, which for
+/// `before_proxy` / `after_proxy` can be a security hook. The default is
+/// therefore [`PluginHooks::ALL`], and
+/// `tests/unit/plugins/plugin_lifecycle_hooks_tests.rs` requires every
+/// built-in `impl Plugin` block to declare exactly the hooks it overrides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PluginHooks(u8);
+
+impl PluginHooks {
+    /// No always-dispatched hook.
+    pub const NONE: Self = Self(0);
+    /// [`Plugin::on_request_received`].
+    pub const ON_REQUEST_RECEIVED: Self = Self(1 << 0);
+    /// [`Plugin::before_proxy`].
+    pub const BEFORE_PROXY: Self = Self(1 << 1);
+    /// [`Plugin::after_proxy`].
+    pub const AFTER_PROXY: Self = Self(1 << 2);
+    /// [`Plugin::log`] or [`Plugin::log_with_mesh_key`] (whose default calls
+    /// `log`).
+    pub const LOG: Self = Self(1 << 3);
+    /// Every hook: the default for custom and undeclared plugins.
+    pub const ALL: Self = Self(
+        Self::ON_REQUEST_RECEIVED.0 | Self::BEFORE_PROXY.0 | Self::AFTER_PROXY.0 | Self::LOG.0,
+    );
+
+    /// The union of two declarations, usable in `const` context.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether every hook in `hooks` is declared.
+    #[inline]
+    pub const fn contains(self, hooks: Self) -> bool {
+        self.0 & hooks.0 == hooks.0
+    }
+}
+
+impl std::ops::BitOr for PluginHooks {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
+}
+
 /// Plugin lifecycle hooks.
 ///
 /// `Any` is a supertrait so built-in trust can be keyed on the concrete type a
@@ -11220,6 +11303,19 @@ pub trait Plugin: Any + Send + Sync {
     /// See [`priority`] module for standard bands and assignments.
     fn priority(&self) -> u16 {
         priority::DEFAULT
+    }
+
+    /// The always-dispatched lifecycle hooks this plugin overrides
+    /// (`on_request_received`, `before_proxy`, `after_proxy`, `log` /
+    /// `log_with_mesh_key`). Dispatchers skip the hooks it omits (issue #6615).
+    ///
+    /// The default, [`PluginHooks::ALL`], keeps every hook running, so a custom
+    /// plugin does not need to override this. A plugin that does override it
+    /// must include every one of those hooks it implements: an omitted hook is
+    /// never called. Wrappers must report the hooks their own implementation
+    /// needs, not only the wrapped plugin's.
+    fn lifecycle_hooks(&self) -> PluginHooks {
+        PluginHooks::ALL
     }
 
     /// Apply a request-receipt gRPC deadline policy synchronously, before any

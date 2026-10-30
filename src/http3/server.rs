@@ -4700,6 +4700,13 @@ async fn handle_h3_request(
     // Execute on_request_received hooks
     let phase_start = std::time::Instant::now();
     for plugin in plugins.iter() {
+        // Skipped hooks are the default `Continue`; see `PluginHooks`.
+        if !plugin
+            .lifecycle_hooks()
+            .contains(crate::plugins::PluginHooks::ON_REQUEST_RECEIVED)
+        {
+            continue;
+        }
         let deadline = ctx.grpc_deadline_at();
         match crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,

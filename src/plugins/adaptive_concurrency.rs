@@ -86,6 +86,10 @@ impl Plugin for AdaptiveConcurrency {
         super::priority::ADAPTIVE_CONCURRENCY
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         HTTP_FAMILY_PROTOCOLS
     }

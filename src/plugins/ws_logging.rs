@@ -1419,6 +1419,10 @@ impl Plugin for WsLogging {
         super::priority::WS_LOGGING
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         ALL_PROTOCOLS
     }

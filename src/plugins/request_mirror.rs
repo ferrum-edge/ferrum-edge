@@ -2929,6 +2929,10 @@ impl Plugin for RequestMirror {
         super::priority::REQUEST_MIRROR
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_GRPC_PROTOCOLS
     }

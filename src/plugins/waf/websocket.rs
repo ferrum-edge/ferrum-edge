@@ -519,6 +519,10 @@ impl Plugin for WafWsSession {
         self.waf.priority()
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         self.waf.supported_protocols()
     }

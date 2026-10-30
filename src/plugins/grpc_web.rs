@@ -4501,6 +4501,12 @@ impl Plugin for GrpcWebPlugin {
         super::priority::GRPC_WEB
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         HTTP_GRPC_PROTOCOLS
     }

@@ -4095,6 +4095,10 @@ impl Plugin for ServerlessFunction {
         super::priority::SERVERLESS_FUNCTION
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_GRPC_PROTOCOLS
     }

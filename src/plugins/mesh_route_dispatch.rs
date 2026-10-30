@@ -2477,6 +2477,10 @@ impl Plugin for MeshRouteDispatch {
         priority::MESH_ROUTE_DISPATCH
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         // Istio `VirtualService.http[]` covers HTTP, gRPC, and WebSocket
         // upgrade requests. The dispatch shadow runs on all three before

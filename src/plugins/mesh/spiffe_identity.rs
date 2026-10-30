@@ -559,6 +559,10 @@ impl Plugin for SpiffeIdentity {
         priority::SPIFFE_IDENTITY
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED | crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         HTTP_FAMILY_AND_STREAM_PROTOCOLS
     }

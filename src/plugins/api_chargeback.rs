@@ -3873,6 +3873,10 @@ impl Plugin for ApiChargeback {
         super::priority::API_CHARGEBACK
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::LOG
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // Stream protocols (TCP/UDP/DTLS) are now supported via on_stream_disconnect.
         super::ALL_PROTOCOLS

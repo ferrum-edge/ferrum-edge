@@ -1266,6 +1266,12 @@ impl Plugin for RateLimiting {
         super::priority::RATE_LIMITING
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // `tools/call` is an HTTP JSON-RPC exchange; a tool-call limiter has
         // nothing to count on a stream, WebSocket, or gRPC request.

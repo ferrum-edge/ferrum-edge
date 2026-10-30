@@ -378,6 +378,10 @@ impl Plugin for SecurityHeaders {
         super::priority::SECURITY_HEADERS
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         HTTP_FAMILY_PROTOCOLS
     }

@@ -3218,6 +3218,11 @@ impl super::Plugin for OidcRelyingParty {
     fn priority(&self) -> u16 {
         super::priority::OIDC_RELYING_PARTY
     }
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::ON_REQUEST_RECEIVED
+            | crate::plugins::PluginHooks::BEFORE_PROXY
+            | crate::plugins::PluginHooks::AFTER_PROXY
+    }
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         crate::plugins::HTTP_FAMILY_PROTOCOLS
     }

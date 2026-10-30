@@ -928,6 +928,10 @@ impl Plugin for ResponseTransformer {
         super::priority::RESPONSE_TRANSFORMER
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_GRPC_PROTOCOLS
     }

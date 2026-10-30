@@ -300,6 +300,10 @@ impl Plugin for TransactionLogSchema {
     fn priority(&self) -> u16 {
         super::priority::TRANSACTION_LOG_SCHEMA
     }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::NONE
+    }
 }
 
 #[cfg(test)]

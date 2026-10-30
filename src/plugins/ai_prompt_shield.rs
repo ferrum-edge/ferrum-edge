@@ -2342,6 +2342,10 @@ impl Plugin for AiPromptShield {
         super::priority::AI_PROMPT_SHIELD
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // Native gRPC protobuf/framed messages have no supported prompt-schema
         // contract here. Advertise HTTP only so operators cannot attach this

@@ -487,6 +487,10 @@ auth_flow::impl_auth_plugin!(
     fn requires_decoded_query_params(&self) -> bool {
         matches!(self.token_lookup, TokenLookup::Query(_))
     }
+
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::BEFORE_PROXY
+    }
 );
 
 /// Parse `token_lookup` into an extraction location, refusing any location a

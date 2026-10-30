@@ -4299,6 +4299,10 @@ impl Plugin for AiResponseGuard {
         super::priority::AI_RESPONSE_GUARD
     }
 
+    fn lifecycle_hooks(&self) -> crate::plugins::PluginHooks {
+        crate::plugins::PluginHooks::AFTER_PROXY
+    }
+
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // Native gRPC is in scope only through the explicit `grpc` enrollment
         // block. Without it the plugin stays HTTP-only rather than advertising
