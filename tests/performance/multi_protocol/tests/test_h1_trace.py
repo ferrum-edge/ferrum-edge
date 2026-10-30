@@ -801,6 +801,18 @@ fixture 99/99 12.100000000: cpu-clock:u:
         self.assertEqual(result['lost_records'], 1)
         self.assertFalse(result['complete'])
 
+    def test_demangled_symbols_with_parentheses_keep_the_trailing_dso(self):
+        text = ('envoy 7/8 12.000000000: cpu-clock:uS:\n'
+                '        5000 Envoy::Buffer::Slice::drain(unsigned long) (/usr/local/bin/envoy)\n'
+                '        5100 std::__1::__function::__func<void (Envoy::Http::HeaderEntry const&)>::operator()() '
+                '(/usr/local/bin/envoy)\n'
+                '        6000 [unknown] ([unknown])\n\n')
+        frames = decode_cpu(text, '', {7})['callchains'][0]['frames']
+        self.assertEqual([f['dso'] for f in frames], ['/usr/local/bin/envoy', '/usr/local/bin/envoy', '[unknown]'])
+        self.assertEqual(frames[0]['symbol'], 'Envoy::Buffer::Slice::drain(unsigned long)')
+        self.assertEqual(frames[1]['symbol'],
+                         'std::__1::__function::__func<void (Envoy::Http::HeaderEntry const&)>::operator()()')
+
     def test_fixture_nested_proof_rejects_three_flat_samples_and_wrong_order(self):
         def decoded(groups):
             text = ''.join(f'fixture 7/{8 + i} 12.000000000: cpu-clock:u:\n' +

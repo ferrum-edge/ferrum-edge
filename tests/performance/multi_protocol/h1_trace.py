@@ -1114,14 +1114,16 @@ def build_id_gaps(build_ids, retained_ids, records):
     return missing, virtual
 
 
-def cpu_decode(out, owners, dsos, *, symfs=None):
+def cpu_decode(out, owners, dsos, *, symfs=None, script_timeout=30, script_limit=16 * 1024**2):
+    # Live captures keep the default bounds. Offline re-decoding of a retained
+    # capture against a larger symbol table may pass wider, still finite, bounds.
     symfs = out / "symfs" if symfs is None else symfs
     # Derive inline-frame metadata from the decoder argv the inventory execs.
     try:
         decoder_argv, decoder_argv_error = planned_argv('perf-script', out=out, symfs=symfs), None
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         decoder_argv, decoder_argv_error = None, str(error)
-    decoded = command('perf-script', out / 'stacks.txt', limit=16 * 1024**2, timeout=30,
+    decoded = command('perf-script', out / 'stacks.txt', limit=script_limit, timeout=script_timeout,
                       out=out, symfs=symfs)
     attributes = command('perf-attributes', out / 'perf-attributes.txt', out=out)
     header = command('perf-header', out / 'perf-header.txt', out=out)

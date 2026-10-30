@@ -4,11 +4,16 @@ Only the workload admission differs. PID-generation, clock, collector lifetime,
 software-event validation and bounded ELF retention are shared with H1.
 """
 import argparse
+import collections
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
 import statistics
+import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,6 +28,27 @@ ENVIRONMENT = ('FERRUM_MODE', 'FERRUM_PROXY_HTTPS_PORT',
                'FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES', 'FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW',
                'FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE',
                'FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE')
+
+
+# Envoy's release image ships a stripped executable, so its CPU stacks resolve
+# almost no functions. The debug image of the same release carries the same
+# link output (identical GNU build ID) with .symtab. Captures still measure the
+# pinned release binary; only the offline decoder reads this symbol twin. The
+# layer is content-addressed and the workflow fetches it by this digest.
+ENVOY_EXECUTABLE = '/usr/local/bin/envoy'
+ENVOY_SYMBOLS = dict(
+    release_image='envoyproxy/envoy:v1.39.1',
+    release_sha256='002c6e1c69ed0fa0ea381887247cadadfaec9481375fa8d8d2b1731eeabf40b8',
+    image='envoyproxy/envoy:debug-v1.39.1',
+    layer='sha256:abf36d5364d09e89c2a086c4a2362a60729c0356c299cf98a87dc6ee01b3a00e',
+    member='usr/local/bin/envoy',
+    sha256='171445f45fc3bd6f9e7ba5c308399c1da35645efecdac6bd208feaffefd9ee04',
+    bytes=881314688,
+    build_id='b579d07d3ad7ee11d32b105e91a5a39ad24718d7')
+# Offline decoding of an 881 MB symbol table needs wider, still finite, bounds
+# than the live 30-second decoder; the output cap stays within the raw cap.
+ENVOY_DECODE_SECONDS = 600
+ENVOY_DECODE_BYTES = 64 * 1024**2
 
 
 def fixture(protocol, gateway):
@@ -215,12 +241,271 @@ def report(root):
                 comparable=not result['issues'] and len(values) == 2 and all(abs(v['control_drift_percent']) <= 5 for v in values),
                 median_rps_overhead_percent=statistics.median(v['rps_overhead_percent'] for v in values) if values else None))
     result['complete'] = not result['issues'] and all(not row['issues'] for row in result['observations'])
+    # Offline Envoy symbols add names to retained stacks; they never change
+    # capture completeness or calibration.
+    try:
+        symbols = json.loads((root / 'envoy-symbols.json').read_text())
+        result['envoy_symbols'] = (symbols if isinstance(symbols, dict) else
+                                   dict(complete=False, issues=['malformed Envoy symbolization']))
+    except FileNotFoundError:
+        result['envoy_symbols'] = dict(complete=False, issues=['Envoy symbolization not run'])
+    except (OSError, ValueError):
+        result['envoy_symbols'] = dict(complete=False, issues=['unreadable Envoy symbolization'])
     result['limits'] = ['Shared-runner calibration; two pairs are diagnostic, not a throughput claim.',
                         'User stacks only; kernel cost comes from process CPU counters.',
                         'Symbolized physical DWARF frames only; inline source frames are not expanded.',
                         'Unresolved/optimized-away/async frames remain explicit in CPU coverage.',
-                        'Thread churn makes scheduler deltas unavailable instead of zero.']
+                        'Thread churn makes scheduler deltas unavailable instead of zero.',
+                        'Envoy names come from an offline build-ID-matched debug twin of the measured stripped binary.']
     (root / 'h2-cpu-report.json').write_text(json.dumps(result, indent=2) + '\n')
+    return 0 if result['complete'] else 1
+
+
+def elf_identity(path):
+    """GNU build ID and .symtab presence of a little-endian ELF64 file."""
+    try:
+        return _elf_identity(path)
+    except (struct.error, OverflowError) as error:
+        raise ValueError('malformed ELF64 tables or notes') from error
+
+
+def _read_range(stream, size, offset, length):
+    if offset + length > size:
+        raise ValueError('ELF range beyond end of file')
+    stream.seek(offset)
+    return stream.read(length)
+
+
+def _elf_identity(path):
+    with open(path, 'rb') as stream:
+        size = os.fstat(stream.fileno()).st_size
+        header = stream.read(64)
+        if len(header) != 64 or header[:4] != b'\x7fELF' or header[4:6] != b'\x02\x01':
+            raise ValueError('not a little-endian ELF64 file')
+        phoff, shoff = struct.unpack_from('<QQ', header, 0x20)
+        phentsize, phnum, shentsize, shnum = struct.unpack_from('<HHHH', header, 0x36)
+        if phentsize != 56 or (shnum and shentsize != 64):
+            raise ValueError('unexpected ELF64 header table entry size')
+        build_ids = []
+        headers = _read_range(stream, size, phoff, phentsize * phnum)
+        for index in range(phnum):
+            kind, _, offset, _, _, note_size, _, align = struct.unpack_from('<IIQQQQQQ', headers, index * phentsize)
+            if kind != 4:
+                continue
+            if note_size > 1024**2:
+                raise ValueError('oversize ELF note segment')
+            align = 8 if align == 8 else 4
+            notes, cursor = _read_range(stream, size, offset, note_size), 0
+            while cursor + 12 <= len(notes):
+                name_size, desc_size, note_type = struct.unpack_from('<III', notes, cursor)
+                name = notes[cursor + 12:cursor + 12 + name_size]
+                # The descriptor follows the header plus name, aligned together.
+                desc = cursor + -(-(12 + name_size) // align) * align
+                if desc + desc_size > len(notes):
+                    raise ValueError('truncated ELF note')
+                if note_type == 3 and name == b'GNU\0':
+                    build_ids.append(notes[desc:desc + desc_size].hex())
+                cursor = desc + -(-desc_size // align) * align
+        sections = _read_range(stream, size, shoff, shentsize * shnum)
+        symtab = False
+        for index in range(shnum):
+            kind, = struct.unpack_from('<I', sections, index * shentsize + 4)
+            offset, length = struct.unpack_from('<QQ', sections, index * shentsize + 24)
+            if kind == 2 and length > 0:
+                if offset + length > size:
+                    raise ValueError('.symtab beyond end of file')
+                symtab = True
+    if len(set(build_ids)) != 1:
+        raise ValueError('ELF must carry exactly one GNU build ID')
+    return dict(build_id=build_ids[0], symtab=symtab)
+
+
+def file_sha256(path):
+    with open(path, 'rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def known_leaf(sample):
+    frames = sample['frames']
+    return bool(frames) and frames[0]['symbol'] not in ('[unknown]', '0x0') and frames[0]['dso'] != '[unknown]'
+
+
+def leaf_summary(chains, window, *, top=0):
+    """Measurement-window leaf coverage of admitted samples."""
+    from h1_trace_contract import cpu_phases
+    inside = [s for s in chains if cpu_phases([s], window)['samples'].get('measurement')]
+    known = [s for s in inside if known_leaf(s)]
+    executable = [s for s in inside if s['frames'] and s['frames'][0]['dso'] == ENVOY_EXECUTABLE]
+    result = dict(window_samples=len(inside), known_leaf_samples=len(known),
+                  known_leaf_fraction=len(known) / len(inside) if inside else None,
+                  executable_leaf_samples=len(executable),
+                  executable_known_leaf_samples=sum(known_leaf(s) for s in executable),
+                  leaf_dsos=dict(collections.Counter(s['frames'][0]['dso'] if s['frames'] else '[none]'
+                                                     for s in inside)))
+    if top:
+        leaves = collections.Counter((re.sub(r'\+0x[0-9a-fA-F]+$', '', s['frames'][0]['symbol']),
+                                      s['frames'][0]['dso']) for s in known)
+        result['top_leaves'] = [dict(symbol=name, dso=dso, samples=count, fraction=count / len(inside))
+                                for (name, dso), count in leaves.most_common(top)]
+    return result
+
+
+def retained_bytes(folder, manifest, name, limit):
+    """A capture file, only as its manifest receipt recorded it."""
+    receipt = manifest['artifacts'][name]
+    path = folder / name
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != receipt['bytes'] or receipt['bytes'] > limit:
+        raise ValueError(f'retained {name} does not match its manifest receipt size or bound')
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != receipt['sha256']:
+        raise ValueError(f'retained {name} does not match its manifest receipt hash')
+    return data
+
+
+def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
+    from h1_trace_contract import BOUNDS, decode_cpu
+    folder = manifest_path.parent
+    relative = folder.relative_to(root)
+    row = dict(path=str(relative), issues=[])
+    destination = folder / 'envoy-symbols'
+    if destination.exists():
+        raise ValueError('capture already has Envoy symbols; symbolize a fresh evidence copy')
+    manifest = json.loads(manifest_path.read_text())
+    if not isinstance(manifest.get('symbol_package'), str) or not manifest['symbol_package'].endswith('/builds/envoy/symfs'):
+        raise ValueError('capture does not use the retained Envoy symbol package')
+    if manifest['cpu']['decoder_status'].get('incomplete'):
+        raise ValueError('original decode was incomplete, so its samples cannot anchor equivalence')
+    pid = manifest['identity']['pid']
+    mappings = json.loads(retained_bytes(folder, manifest, 'build-mappings.json', 16 * 1024**2))
+    stripped = retained_bytes(folder, manifest, 'stacks.txt', BOUNDS['raw_perf_bytes']).decode(errors='replace')
+    buildids = retained_bytes(folder, manifest, 'perf-buildids.txt', 2 * 1024**2).decode(errors='replace')
+    executables = [d for d in mappings.get('dsos', []) if d.get('path') == ENVOY_EXECUTABLE]
+    if (len(executables) != 1 or executables[0].get('sha256') != pins['release_sha256']
+            or not any(line.lower().endswith(pins['build_id']) for line in executables[0].get('build_id_lines', []))):
+        raise ValueError('mapped Envoy executable is not the pinned release build')
+    recorded = {}
+    for line in buildids.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            recorded[parts[1].strip()] = parts[0].lower()
+    if recorded.get(ENVOY_EXECUTABLE) != pins['build_id']:
+        raise ValueError('recorded Envoy build ID does not match the symbol twin')
+    # Overlay of the retained package: every mapped DSO is the verified
+    # retained copy, except the release executable, whose build-ID twin
+    # supplies .symtab. The equivalence checks below hold perf to that.
+    package = (root / 'builds' / 'envoy' / 'symfs').resolve()
+    out = scratch / relative
+    # Scratch and a hidden partial publish are unpublished by construction;
+    # a retry after an interrupted attempt starts them over.
+    shutil.rmtree(out, ignore_errors=True)
+    shutil.rmtree(folder / '.envoy-symbols.partial', ignore_errors=True)
+    overlay = out / 'symfs'
+    overlay.mkdir(parents=True)
+    for dso in mappings['dsos']:
+        if not dso['path'].startswith('/') or '..' in Path(dso['path']).parts:
+            raise ValueError('unsafe mapped DSO path: ' + dso['path'])
+        retained = (package / dso['path'].lstrip('/')).resolve()
+        if not retained.is_relative_to(package) or file_sha256(retained) != dso['sha256']:
+            raise ValueError('retained DSO does not match its acquisition record: ' + dso['path'])
+        target = overlay / dso['path'].lstrip('/')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(debug_elf if dso['path'] == ENVOY_EXECUTABLE else retained)
+    (out / 'perf.data').write_bytes(retained_bytes(folder, manifest, 'perf.data', BOUNDS['raw_perf_bytes']))
+    decoded = decode(out, {pid}, mappings, symfs=overlay)
+    original = decode_cpu(stripped, '', {pid})
+    # Same raw samples and the same unwound PCs: only names may differ. The
+    # twin's extra sections must not change what the folded stacks attribute.
+    def leaves(chains):
+        return [(s['pid'], s['tid'], s['time_secs'], s['frames'][0]['ip'] if s['frames'] else None) for s in chains]
+    def stacks(chains):
+        return [[f['ip'] for f in s['frames']] for s in chains]
+    if leaves(decoded['callchains']) != leaves(original['callchains']):
+        row['issues'].append('symbolized samples or leaf PCs differ from the original decode')
+    elif stacks(decoded['callchains']) != stacks(original['callchains']):
+        row['issues'].append('symbolized caller PCs differ from the original decode')
+    blocking = [i for i in decoded['issues'] if i not in (
+        'missing matching ELF/build IDs/CFI', 'partial unwinding/unresolved samples')]
+    row['issues'].extend('decoder: ' + issue for issue in blocking)
+    window = manifest['boundaries']['measurement']
+    before = leaf_summary(original['callchains'], window)
+    after = leaf_summary(decoded['callchains'], window, top=40)
+    # A decode that silently ignored the twin would reproduce the stripped names.
+    if not before['executable_leaf_samples']:
+        row['issues'].append('no Envoy executable leaves in the measurement window')
+    elif (before['executable_known_leaf_samples'] < before['executable_leaf_samples']
+            and after['executable_known_leaf_samples'] <= before['executable_known_leaf_samples']):
+        row['issues'].append('debug twin resolved no additional Envoy executable leaves')
+    row.update(pair=manifest.get('binding', {}).get('pair'), samples=decoded['samples'],
+               decoder_issues=decoded['issues'], inline_expansion=decoded.get('inline_expansion'),
+               decoder_status=decoded.get('decoder_status'), stripped=before, symbolized=after)
+    # Assemble beside the capture and publish whole, never a partial directory.
+    partial = folder / '.envoy-symbols.partial'
+    partial.mkdir()
+    for name in ('cpu-coverage.json', 'stacks.folded'):
+        shutil.copyfile(out / name, partial / name)
+    for name in ('stacks.txt.stderr', 'stacks.txt.status.json'):
+        if (out / name).is_file():
+            shutil.copyfile(out / name, partial / name)
+    (partial / 'summary.json').write_text(json.dumps(row, indent=2) + '\n')
+    partial.rename(destination)
+    return row
+
+
+def write_symbols(root, result, *, final):
+    # Only the closing write may claim completeness, and only once every
+    # retained capture has a row; a pass cut short stays incomplete.
+    result['complete'] = (final and not result['issues'] and bool(result['captures'])
+                          and len(result['captures']) == result['expected_captures']
+                          and all(not row['issues'] for row in result['captures']))
+    # Replace whole, so an interruption leaves the previous record readable.
+    partial = root / '.envoy-symbols.json.partial'
+    partial.write_text(json.dumps(result, indent=2) + '\n')
+    partial.replace(root / 'envoy-symbols.json')
+
+
+def symbolize_envoy(root, debug_elf, scratch, *, pins=ENVOY_SYMBOLS, decode=None):
+    """Re-decode each retained Envoy CPU capture against the debug twin."""
+    root, scratch, debug_elf = Path(root).resolve(), Path(scratch).resolve(), Path(debug_elf).resolve()
+    if decode is None:
+        from h1_trace import cpu_decode
+        def decode(out, owners, dsos, *, symfs):
+            return cpu_decode(out, owners, dsos, symfs=symfs,
+                              script_timeout=ENVOY_DECODE_SECONDS, script_limit=ENVOY_DECODE_BYTES)
+    result = dict(schema=1, diagnostic_only=True, complete=False, source=dict(pins), captures=[], issues=[],
+                  expected_captures=None)
+    try:
+        # Scratch is cleared per capture, so it must never overlap evidence.
+        if scratch.is_relative_to(root) or root.is_relative_to(scratch):
+            raise ValueError('scratch directory overlaps the evidence root')
+        if debug_elf.stat().st_size != pins['bytes'] or file_sha256(debug_elf) != pins['sha256']:
+            raise ValueError('debug executable does not match the pinned image layer member')
+        identity = elf_identity(debug_elf)
+        if identity != dict(build_id=pins['build_id'], symtab=True):
+            raise ValueError('debug executable lacks the pinned build ID or .symtab')
+    except (OSError, ValueError) as error:
+        result['issues'].append(f'{type(error).__name__}: {error}')
+    else:
+        manifests = sorted((root / 'cpu' / 'pairs').glob('pair_*/traces/envoy_*/trace-manifest.json'))
+        result['expected_captures'] = len(manifests)
+        if not manifests:
+            result['issues'].append('no retained Envoy CPU captures')
+        for path in manifests:
+            try:
+                result['captures'].append(symbolize_capture(root, path, debug_elf, scratch, pins, decode))
+            except subprocess.TimeoutExpired as error:
+                # perf outlived its post-kill reap bound. Record it and start no
+                # further decode beside a possibly lingering process.
+                result['captures'].append(dict(path=str(path.parent.relative_to(root)),
+                                               issues=[f'{type(error).__name__}: {error}']))
+                result['issues'].append('stopped after an unreaped decoder')
+                break
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError) as error:
+                result['captures'].append(dict(path=str(path.parent.relative_to(root)),
+                                               issues=[f'{type(error).__name__}: {error}']))
+            finally:
+                # Keep a record of finished captures even if the step is cut short.
+                write_symbols(root, result, final=False)
+    write_symbols(root, result, final=True)
     return 0 if result['complete'] else 1
 
 
@@ -238,11 +523,17 @@ def main():
     mark.add_argument('mode', choices=('off', 'counters', 'cpu'))
     summary = sub.add_parser('report')
     summary.add_argument('root')
+    symbols = sub.add_parser('symbolize-envoy')
+    symbols.add_argument('root')
+    symbols.add_argument('--debug-elf', required=True)
+    symbols.add_argument('--scratch', required=True)
     args = parser.parse_args()
     if args.action == 'runtime':
         retain_runtime(args, json.load(sys.stdin))
     elif args.action == 'stamp':
         stamp(args.path, args.mode)
+    elif args.action == 'symbolize-envoy':
+        return symbolize_envoy(args.root, args.debug_elf, args.scratch)
     else:
         return report(args.root)
     return 0
