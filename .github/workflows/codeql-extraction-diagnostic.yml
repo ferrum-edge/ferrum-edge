@@ -4,6 +4,14 @@ name: CodeQL Rust Extraction Diagnostic
 # workflow never evaluates queries or uploads SARIF, and is not a merge gate.
 on:
   workflow_dispatch:
+    inputs:
+      extractor_log_level:
+        description: Rust extractor detail for investigating macro expansion
+        type: choice
+        default: info
+        options:
+          - info
+          - debug
 
 permissions:
   contents: read
@@ -37,6 +45,7 @@ jobs:
       CODEQL_SHA256: 845075a2fa2fdf72629adc6cbde6264691b698d1f294bd27f10c6b579cd750a4
       DIAGNOSTIC_PROFILE: ${{ matrix.profile }}
       DIAGNOSTIC_FEATURES: ${{ matrix.features }}
+      DIAGNOSTIC_LOG_LEVEL: ${{ inputs.extractor_log_level || 'info' }}
       CARGO_TERM_COLOR: never
       CARGO_BUILD_JOBS: '2'
     steps:
@@ -83,11 +92,45 @@ jobs:
           for feature in "${features[@]}"; do
             options+=(--extractor-option "rust.cargo_features=$feature")
           done
+          if test "$DIAGNOSTIC_LOG_LEVEL" = debug; then
+            # Include Cargo/proc-macro loader errors hidden by CodeQL's own filter.
+            export RUST_LOG='single_arch_extractor=debug,codeql_extractor=debug,ra_ap_load_cargo=debug,ra_ap_hir_expand=debug,ra_ap_proc_macro_api=debug,ra_ap_proc_macro_srv_cli=debug'
+          fi
           "$DIAGNOSTIC_DIR/tools/codeql/codeql" database create \
             "$DIAGNOSTIC_DIR/database" \
-            --language=rust --build-mode=none --threads=2 \
+            --language=rust --build-mode=none --threads=2 --no-cleanup \
             --source-root="$GITHUB_WORKSPACE" \
-            "${options[@]}" 2>&1 | tee "$DIAGNOSTIC_DIR/extraction.log"
+            --extractor-option "rust.logging.verbosity=$DIAGNOSTIC_LOG_LEVEL" \
+            "${options[@]}" 2>&1 | tee "$DIAGNOSTIC_DIR/extraction.log" | \
+            awk -v detail="$DIAGNOSTIC_LOG_LEVEL" '
+              { previous[NR % 9] = $0 }
+              detail != "debug" || NR <= 60 { print; next }
+              /WARN|ERROR/ {
+                if (++severity_contexts <= 2000) {
+                  print "--- extractor severity context ---"
+                  start = NR > 8 ? NR - 8 : 1
+                  for (i = start; i < NR; i++) print previous[i % 9]
+                }
+                print
+                next
+              }
+              /[Ee]rrors occurred while|[Ff]ailed to (run|load|fetch|query)|[Cc]annot create expander|[[:space:]]error:/ {
+                if (++loader_contexts <= 100) {
+                  print "--- extractor loader context ---"
+                  start = NR > 8 ? NR - 8 : 1
+                  for (i = start; i < NR; i++) print previous[i % 9]
+                }
+                print
+                next
+              }
+              /total duration|Finalizing database|TRAP import|Successfully created database/ { print }
+              END {
+                if (detail == "debug") {
+                  printf "Debug log: %d lines; %d severity records; %d loader records.\n", NR, severity_contexts, loader_contexts
+                  print "All severity/loader records printed; context windows limited to 2000 severity and 100 loader records."
+                }
+              }
+            '
           git diff --exit-code
 
       - name: Record extraction evidence
@@ -101,6 +144,7 @@ jobs:
             printf -- '- Source commit: %s\n' "$GITHUB_SHA"
             printf -- '- CodeQL CLI: %s\n' "$CODEQL_VERSION"
             printf -- '- Features: %s\n' "$DIAGNOSTIC_FEATURES"
+            printf -- '- Extractor log level: %s\n' "$DIAGNOSTIC_LOG_LEVEL"
             printf -- '- Extraction step: %s\n' "$EXTRACTION_OUTCOME"
             if test -f "$DIAGNOSTIC_DIR/status"; then
               printf -- '- Exit status: %s\n' "$(cat "$DIAGNOSTIC_DIR/status")"
@@ -113,9 +157,16 @@ jobs:
             printf '\nCounts are diagnostics, not vulnerabilities or a coverage percentage. '
             printf 'No queries or SARIF upload run here; current default scans continue.\n'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          if test -d "$DIAGNOSTIC_DIR/database/working"; then
-            echo 'Generated bindings found in the database build workspace (existence only):'
-            find "$DIAGNOSTIC_DIR/database/working" -type f \
-              \( -name custom_plugin_mods.rs -o -name custom_plugin_registry.rs -o -name _.rs \) \
-              -printf '%P\n'
+          working="$DIAGNOSTIC_DIR/database/working"
+          inventory="$DIAGNOSTIC_DIR/generated-bindings.sha256"
+          if test -d "$working"; then
+            find "$working" -type f -path '*/build/ferrum-edge-*/out/*.rs' \
+              -exec sha256sum {} + | LC_ALL=C sort > "$inventory"
+          fi
+          if test -s "$inventory"; then
+            echo 'Generated application bindings retained (SHA-256 and path; existence only):'
+            cat "$inventory"
+          else
+            echo 'Generated application binding inventory is missing; coverage remains unverified.' >&2
+            exit 1
           fi
