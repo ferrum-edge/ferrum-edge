@@ -27,9 +27,9 @@ Ferrum must match the retained symbolized binary. Envoy's actual mapped ELF and
 build IDs are retained; stripped or unresolved frames stay explicit in coverage.
 The collector does not sample the whole host or collect kernel stacks.
 
-Envoy's release image ships a stripped executable, so its stacks alone resolve
-only a few percent of leaves. After capture, the job symbolizes each Envoy CPU
-capture offline. It fetches one layer of `envoyproxy/envoy:debug-v1.39.1` by
+Envoy's release image ships a stripped executable, so its own frames have no
+function names. After capture, the job symbolizes each Envoy CPU capture
+offline. It fetches one layer of `envoyproxy/envoy:debug-v1.39.1` by
 its pinned content digest. That layer holds `/usr/local/bin/envoy` with
 `.symtab` and the **same GNU build ID** as the measured `v1.39.1` binary.
 
@@ -56,16 +56,27 @@ decode, so only names may change. A capture is reported as unmatched if:
   them.
 
 Each capture that reaches the publish step gains `envoy-symbols/`; every other
-capture appears only in `envoy-symbols.json`. The directory holds folded stacks, decoder coverage,
-the decoder's stderr and status, and a summary. The directory is published
-whole and never overwritten. The summary gives measurement-window leaf coverage
-before and after symbols, and the top leaf functions with their DSOs. The run
-also writes `envoy-symbols.json` after every capture, which `h2-cpu-report.json`
-includes. Only the closing write, with a row for every capture, can be complete. A decoder that outlives its post-kill reap bound stops the pass.
+capture appears only in `envoy-symbols.json`. The directory holds folded stacks,
+decoder coverage, the decoder's stderr and status, and a summary. It is
+published whole and never overwritten. The summary gives measurement-window
+leaf coverage before and after symbols, and the top leaf functions with their
+DSOs. The run also writes `envoy-symbols.json` after every capture, which
+`h2-cpu-report.json` includes. Only the closing write, with a row for every
+capture, can be complete. A decoder that outlives its post-kill reap bound
+stops the pass.
 
 The 881 MB debug executable is never added to the artifact. A missing or
 mismatched symbol twin fails that step but leaves the capture evidence and
 calibration unchanged.
+
+Symbols do not fix Envoy's unwinding. In hosted run 40999505084 (HTTP/2,
+10 KiB), the twin named every Envoy executable leaf: 56 of 56 and 41 of 41,
+up from 2 and 0. Even so, in pair 1, 2,073 of 2,319 Envoy samples carried no
+unwound frame at all, against 12 of 2,393 for Ferrum. Total Envoy known-leaf coverage
+therefore rose only from 1.4–1.9% to about 4%. Samples that begin in Envoy's
+own code unwind to nothing, so Envoy's low coverage is an unwinding gap, not a
+symbol gap. A function-level comparison needs the sampled PC even when DWARF
+unwinding fails, for example a flat leaf decode of the same `perf.data`.
 
 `process_usage.measurement` adds `user_cpu_seconds` and `system_cpu_seconds` from
 Linux `/proc/PID/stat`. With scheduler sampling enabled, gateway/backend
