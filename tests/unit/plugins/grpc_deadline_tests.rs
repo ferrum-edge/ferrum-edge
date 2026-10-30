@@ -7196,9 +7196,11 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
     let sidecar = source_fn_body(proxy, "async fn proxy_to_backend_mesh_mtls_after_ready(");
     let sidecar_late = bounded(sidecar, "let bounded = match bounded {", "match bounded {");
     assert!(
-        sidecar_late
-            .contains("Ok(Ok(Err(_))) if tokio::time::Instant::now() >= deadline => Ok(Err(())),"),
-        "a late sidecar-mTLS send failure must take the timer arm"
+        sidecar_late.contains("tokio::time::Instant::now() >= deadline")
+            && sidecar_late.contains("Http2BodyWriteTimeout::expired")
+            && sidecar_late.contains("hyper_send_error_ended_by_gateway_upload(")
+            && sidecar_late.contains("Ok(Err(()))"),
+        "a late sidecar-mTLS transport failure must take the timer arm, gateway terminals excluded"
     );
     for signature in [
         "async fn proxy_to_backend_hbone_after_ready(",
@@ -7207,8 +7209,11 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
         let h1 = source_fn_body(proxy, signature);
         let late = bounded(h1, "let bounded = match bounded {", "match bounded {");
         assert!(
-            late.contains("Ok(Ok((Err(_), _))) if tokio::time::Instant::now() >= send_deadline"),
-            "{signature}: a late send failure must take the timer arm"
+            late.contains("Ok(Ok((Err(try_err), _)))")
+                && late.contains("tokio::time::Instant::now() >= send_deadline")
+                && late.contains("hyper_send_error_ended_by_gateway_upload(")
+                && late.contains("Ok(Err(()))"),
+            "{signature}: a late transport failure must take the timer arm, gateway uploads excluded"
         );
     }
 
@@ -7456,6 +7461,15 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
     );
 
     let pool = include_str!("../../../src/http3/client.rs");
+    let write = source_fn_body(
+        pool,
+        "async fn await_h3_write_under_authorization<F, T, E>(",
+    );
+    assert!(
+        write.contains("Ok(Err(error)) if bound.elapsed().is_none() => Err(error),")
+            && write.contains("Ok(Err(_)) | Err(_)"),
+        "an H3 write failure completing after its bound must settle as that bound"
+    );
     let dispatch = source_fn_body(pool, "pub(crate) async fn await_h3_dispatch<F, T>(");
     assert!(
         dispatch

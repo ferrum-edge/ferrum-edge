@@ -1811,11 +1811,17 @@ where
             .map_err(|error| H3PoolError::post_wire(anyhow::anyhow!("{op} failed: {error}")))
     };
     match crate::proxy::await_backend_dispatch_bound(bound, work).await {
-        Ok(result) => result,
-        Err(_) if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at => {
+        // A write poll that began in time can still fail after the bound; that
+        // failure settles as the bound, exactly as the expiry arms below (issue
+        // #6976).
+        Ok(Err(error)) if bound.elapsed().is_none() => Err(error),
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) | Err(_)
+            if dispatch.authorization_wins || dispatch.at == auth.client_deadline_at =>
+        {
             Err(h3_authorization_error(dispatch, auth, true))
         }
-        Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
+        Ok(Err(_)) | Err(_) => Err(H3PoolError::write_timeout(anyhow::anyhow!(
             "backend request body write timeout after {timeout_ms}ms"
         ))),
     }

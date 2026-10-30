@@ -60557,9 +60557,16 @@ async fn proxy_to_backend_hbone_after_ready(
                 .await;
                 // A send failure observed at/after the composed bound, before its
                 // timer fired, settles exactly as that timer's arm below (issue
-                // #6976); the failed lease drops without check-in, as there.
+                // #6976); the failed lease drops without check-in, as there. A
+                // gateway-caused upload error (issue #6776) keeps its typed
+                // terminal in the error arm below.
                 let bounded = match bounded {
-                    Ok(Ok((Err(_), _))) if tokio::time::Instant::now() >= send_deadline => {
+                    Ok(Ok((Err(try_err), _)))
+                        if tokio::time::Instant::now() >= send_deadline
+                            && !crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                                try_err.error(),
+                            ) =>
+                    {
                         Ok(Err(()))
                     }
                     other => other,
@@ -61683,9 +61690,16 @@ async fn proxy_to_backend_unix(
                 .await;
                 // A send failure observed at/after the composed bound, before its
                 // timer fired, settles exactly as that timer's arm below (issue
-                // #6976); the failed lease drops without check-in, as there.
+                // #6976); the failed lease drops without check-in, as there. A
+                // gateway-caused upload error (issue #6776) keeps its typed
+                // terminal in the error arm below.
                 let bounded = match bounded {
-                    Ok(Ok((Err(_), _))) if tokio::time::Instant::now() >= send_deadline => {
+                    Ok(Ok((Err(try_err), _)))
+                        if tokio::time::Instant::now() >= send_deadline
+                            && !crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                                try_err.error(),
+                            ) =>
+                    {
                         Ok(Err(()))
                     }
                     other => other,
@@ -63423,8 +63437,21 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         // fired, settles exactly as that timer's arm below: the request-size
         // terminal first, then the authorization lifetime, then the client or
         // operator deadline (issue #6976).
+        // Gateway-caused upload errors (a client abort or malformed upload,
+        // issue #6776) and the pipe write watermark keep their typed terminals
+        // in the error arm below.
         let bounded = match bounded {
-            Ok(Ok(Err(_))) if tokio::time::Instant::now() >= deadline => Ok(Err(())),
+            Ok(Ok(Err(err)))
+                if tokio::time::Instant::now() >= deadline
+                    && !pipe_write_timeout
+                        .as_ref()
+                        .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
+                    && !crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                        err,
+                    ) =>
+            {
+                Ok(Err(()))
+            }
             other => other,
         };
         match bounded {
