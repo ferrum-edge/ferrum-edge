@@ -175,6 +175,81 @@ python3 .github/scripts/h1_tls_post_comparison.py self-test
 bash -n .github/scripts/run_h1_tls_post_comparison.sh
 ```
 
+## gRPC RPC-deadline A/B (#6904)
+
+`.github/workflows/grpc-deadline-ab-benchmark.yml` (manual, plus push to a
+`perf/grpc-deadline-ab/**` branch) measures what the gRPC RPC-deadline response
+path costs. [#6870](https://github.com/ferrum-edge/ferrum-edge/pull/6870)
+moved deadline enforcement on HTTP/1.1 and HTTP/2 frontends from an inline
+timer, which fired only when hyper polled the response body, to a
+gateway-scheduled response pump: one spawned task and one capacity-1 channel
+per deadline-bearing streaming response, and one channel hop per frame. The
+first measurement (2026-10-26) compared separate hosted VMs during CI
+saturation, and its gRPC load sent no `grpc-timeout`, so the pump never ran.
+
+The lane reuses the H1 TLS POST method: **two revisions on one runner**, one
+toolchain, the `ci-release` profile, one `proto_backend`, one `proto_bench`,
+alternating role order per round. The revisions default to
+`tests/performance/multi_protocol/grpc_deadline_reference.json`: the
+first-parent predecessor of #6870 and the #6870 merge, so nothing but #6870
+differs. A manual dispatch may pass `reference_sha` / `candidate_sha` to compare
+any two revisions with the same workload.
+
+Eight cells cross the RPC shape (`UnaryEcho`, `ServerStream` with ten 1 KiB
+messages), authentication (`configs/grpc_deadline_open.yaml`,
+`configs/grpc_deadline_auth.yaml` with `key_auth`) and the client deadline
+(none, `grpc-timeout: 30000m`, which never fires). Every round starts each
+revision's gateway once per route, warms it up, runs that route's four cells in
+a rotated order, then runs the probe. Each cell is 100 concurrent calls for
+15 s over plaintext HTTP/2, with `FERRUM_WORKER_THREADS=2`.
+
+- **Integrity, from the backend.** `proto_backend` counts calls that arrived
+  with `grpc-timeout`. Every call in a deadline cell must carry it and no call
+  in a deadline-free cell may. The client must report zero errors, and the
+  backend must see at least the calls the client measured.
+- **Deadline termination and release.** The probe makes 20 sequential
+  `ServerStream` calls with `grpc-timeout: 250m` and `x-bench-stall`. The
+  backend sends headers, then holds the stream open until its peer drops it.
+  The client arms no timer of its own, so only the gateway's deadline can end
+  each call. Every call must end `DEADLINE_EXCEEDED` between 225 ms and
+  1,250 ms, and every stalled backend stream must be released within 5 s.
+  A candidate probe failure fails the run. A reference failure is recorded
+  as informational.
+- **Primary estimate.** The deadline-free cells run no RPC-deadline code in
+  either revision, so they are the null control. Per (shape, auth), the
+  round-paired difference between the deadline cell's log candidate/reference
+  ratio and its deadline-free sibling's cancels runner drift and every
+  revision change outside the deadline path. It is reported for throughput,
+  gateway CPU per call (from `/proc/<pid>/stat` across the cell) and p99, with
+  a two-sided Student-t 95% interval.
+- **Verdict per (shape, auth).** The verdict is `regression` when the
+  throughput interval lies entirely below `1 − margins.throughput`, or the
+  CPU-per-call interval lies entirely above `1 + margins.cpu_per_call`. It is
+  `no material regression` when both intervals lie inside those margins, and
+  `inconclusive` otherwise. A verdict is reported, never gated. The job fails
+  only on integrity, probe or missing-evidence failures.
+- **Same-binary cost.** The summary also reports each revision's own deadline
+  cost: the deadline cell against its deadline-free sibling, inside one gateway
+  lifetime.
+
+The artifact `grpc-deadline-comparison-<run id>` keeps every sample
+(`samples/*.json`), gateway and backend logs, `rows.json`, `probes.json`,
+`provenance.json` (revision SHAs, binary and harness digests, toolchain, host,
+scheduler jitter) and `report.json`.
+
+The stalled-client case that motivated #6870 (a client that withholds HTTP/2
+response credit) is not exercised here. Its behaviour is pinned by the unit
+tests in `tests/unit/plugins/grpc_deadline_tests.rs`. This lane measures the
+cost of the path on well-behaved traffic, and checks that the path still
+terminates and releases.
+
+Local static checks:
+
+```bash
+python3 -I .github/scripts/grpc_deadline_comparison.py self-test
+bash -n .github/scripts/run_grpc_deadline_comparison.sh
+```
+
 ## Request-upload hand-off on the H1 TLS POST path
 
 Issue [#5537](https://github.com/ferrum-edge/ferrum-edge/issues/5537) item 4

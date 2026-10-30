@@ -1,0 +1,102 @@
+# Same-runner A/B of the gRPC RPC-deadline response path (issue #6904).
+#
+# #6870 moved client RPC-deadline enforcement on HTTP/1.1 and HTTP/2 frontends
+# to a gateway-scheduled response pump. The first remote measurement compared
+# separate hosted VMs while CI was saturated and sent no `grpc-timeout`, so it
+# never exercised the pump. This lane builds the reference and candidate
+# revisions pinned in tests/performance/multi_protocol/grpc_deadline_reference.json
+# (or the dispatched overrides) with one toolchain and the ci-release profile,
+# then measures unary and server-streaming gRPC, open and key_auth, with and
+# without `grpc-timeout`, on ONE runner in alternating rounds. It proves from
+# the backend that deadline cells carried `grpc-timeout` and probes that the
+# gateway's deadline ends a stalled stream and releases the backend.
+#
+# Manual only, never a required check. Branches under `perf/grpc-deadline-ab/`
+# also run it on push, so a revision pair can be measured from a branch before
+# the lane is on the default branch.
+
+name: gRPC Deadline A/B Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      reference_sha:
+        description: "Optional reference commit SHA (40 hex); defaults to the contract's pinned reference"
+        required: false
+        default: ""
+        type: string
+      candidate_sha:
+        description: "Optional candidate commit SHA (40 hex); defaults to the contract's pinned candidate"
+        required: false
+        default: ""
+        type: string
+  push:
+    branches:
+      - "perf/grpc-deadline-ab/**"
+
+concurrency:
+  group: grpc-deadline-ab-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  grpc-deadline-ab:
+    name: gRPC deadline reference vs candidate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify comparison harness (static)
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/grpc_deadline_comparison.py self-test
+          bash -n .github/scripts/run_grpc_deadline_comparison.sh
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-grpc-deadline-ab"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libcurl4-openssl-dev
+
+      - name: Runner health check (pre-benchmark)
+        run: |
+          set -euo pipefail
+          nproc
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|MHz|Hypervisor' || true
+          vmstat 1 6 | tee "$RUNNER_TEMP/vmstat_pre.txt"
+          AVG_STEAL=$(tail -n 5 "$RUNNER_TEMP/vmstat_pre.txt" | awk '{sum += $17; n++} END {printf "%.1f", (n ? sum/n : 0)}')
+          echo "Average CPU steal over 5s: ${AVG_STEAL}%"
+          if awk -v s="$AVG_STEAL" 'BEGIN { exit !(s > 5.0) }'; then
+            echo "::warning::CPU steal is ${AVG_STEAL}% — noisy neighbour detected; widen the rounds before drawing a conclusion."
+          fi
+
+      - name: Build both revisions and run the paired comparison
+        timeout-minutes: 165
+        env:
+          GRPC_AB_REFERENCE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.reference_sha || '' }}
+          GRPC_AB_CANDIDATE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || '' }}
+        run: bash .github/scripts/run_grpc_deadline_comparison.sh
+
+      - name: Upload comparison evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: grpc-deadline-comparison-${{ github.run_id }}
+          path: tests/performance/ci_results/grpc-deadline-comparison/
+          retention-days: 90
+          if-no-files-found: warn

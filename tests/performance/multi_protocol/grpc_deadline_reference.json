@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "contract_version": "2026-10-29.v1",
+  "description": "Same-runner A/B for the gRPC RPC-deadline response path (issue #6904). One hosted runner builds the reference and candidate revisions with the same toolchain and ci-release profile, then measures both in alternating rounds against one proto_backend and one proto_bench. Eight cells cross the RPC shape (unary, server-streaming), authentication (none, key_auth), and the client deadline (none, grpc-timeout). The deadline-free cells exercise no RPC-deadline code in either revision and are the null control; the primary estimate is the difference-in-differences of the candidate/reference ratio between a deadline cell and its deadline-free sibling, which cancels runner drift and every revision change outside the deadline path. Every deadline cell must prove the backend received grpc-timeout on every call, and each gateway lifetime runs a stalled-stream probe that only the gateway's deadline can end.",
+  "reference": {
+    "sha": "de67b235ae3589bd26090c29180b667f5e2f54c3",
+    "label": "first-parent predecessor of #6870 (client deadline enforced inline when the response body is polled)"
+  },
+  "candidate": {
+    "sha": "3fe50f8dc6473a734141e8f9b8710f611ef80172",
+    "label": "#6870 merge (gateway-scheduled RPC-deadline response pump)"
+  },
+  "workload": {
+    "target": "http://127.0.0.1:18080",
+    "payload_bytes": 1024,
+    "concurrency": 100,
+    "duration_secs": 15,
+    "warmup_secs": 3,
+    "grpc_timeout_ms": 30000,
+    "rounds": 6,
+    "worker_threads": 2,
+    "probe_calls": 20,
+    "probe_grpc_timeout_ms": 250
+  },
+  "margins": {
+    "throughput": 0.03,
+    "cpu_per_call": 0.05,
+    "p99": 0.10
+  }
+}
