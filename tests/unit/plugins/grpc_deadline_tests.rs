@@ -7054,10 +7054,22 @@ fn the_client_deadline_owns_only_failures_at_or_after_it() {
         .expect("one millisecond before now is representable");
     let after = deadline + Duration::from_millis(1);
 
-    assert!(!owns(None, after), "no client deadline never claims a failure");
-    assert!(!owns(Some(deadline), before), "a failure before the deadline is the backend's");
-    assert!(owns(Some(deadline), deadline), "a failure at the deadline is the deadline");
-    assert!(owns(Some(deadline), after), "a failure after the deadline is the deadline");
+    assert!(
+        !owns(None, after),
+        "no client deadline never claims a failure"
+    );
+    assert!(
+        !owns(Some(deadline), before),
+        "a failure before the deadline is the backend's"
+    );
+    assert!(
+        owns(Some(deadline), deadline),
+        "a failure at the deadline is the deadline"
+    );
+    assert!(
+        owns(Some(deadline), after),
+        "a failure after the deadline is the deadline"
+    );
 }
 
 /// The buffered native-gRPC dispatch applies the #6022 rule in both response
