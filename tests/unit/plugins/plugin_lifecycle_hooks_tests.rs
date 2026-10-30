@@ -49,6 +49,9 @@ const BUILTINS_IMPLEMENTING_EVERY_GATED_HOOK: &[&str] =
 struct PluginImplBlock {
     label: String,
     body: String,
+    /// Built-ins must declare. Cache-internal composition plugins may keep the
+    /// `ALL` default, but a declaration they do make must be exact.
+    requires_declaration: bool,
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -63,16 +66,19 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every column-zero `impl Plugin for` block and every `impl_auth_plugin!`
-/// invocation under `src/plugins/`. Only column-zero blocks are production
-/// implementations; test modules indent theirs.
-fn builtin_plugin_impl_blocks() -> Vec<PluginImplBlock> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+/// invocation under `src/plugins/`, plus the cache-internal composition
+/// plugins and instance wrapper in `src/plugin_cache.rs`. Only column-zero
+/// blocks are production implementations; test modules indent theirs.
+fn production_plugin_impl_blocks() -> Vec<PluginImplBlock> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    rust_sources(&root, &mut files);
+    rust_sources(&manifest.join("src/plugins"), &mut files);
     files.sort();
+    let mut sources: Vec<(PathBuf, bool)> = files.into_iter().map(|file| (file, true)).collect();
+    sources.push((manifest.join("src/plugin_cache.rs"), false));
 
     let mut blocks = Vec::new();
-    for file in files {
+    for (file, requires_declaration) in sources {
         let source = std::fs::read_to_string(&file).expect("plugin source is readable");
         let relative = file
             .strip_prefix(env!("CARGO_MANIFEST_DIR"))
@@ -99,6 +105,7 @@ fn builtin_plugin_impl_blocks() -> Vec<PluginImplBlock> {
                 blocks.push(PluginImplBlock {
                     label: format!("{relative}: {header}"),
                     body: source[header_end..body_end].to_string(),
+                    requires_declaration,
                 });
             }
         }
@@ -111,6 +118,7 @@ fn builtin_plugin_impl_blocks() -> Vec<PluginImplBlock> {
             blocks.push(PluginImplBlock {
                 label: format!("{relative}: impl_auth_plugin!"),
                 body: source[body_start..body_end].to_string(),
+                requires_declaration,
             });
         }
     }
@@ -167,11 +175,16 @@ fn declared_flags(block: &PluginImplBlock) -> Option<BTreeSet<String>> {
 
 #[test]
 fn every_builtin_plugin_impl_declares_exactly_the_lifecycle_hooks_it_overrides() {
-    let blocks = builtin_plugin_impl_blocks();
+    let blocks = production_plugin_impl_blocks();
+    let builtin_blocks = blocks
+        .iter()
+        .filter(|block| block.requires_declaration)
+        .count();
     assert!(
-        blocks.len() >= 80,
-        "the source scan found only {} built-in plugin impls; it no longer sees the plugin tree",
-        blocks.len()
+        builtin_blocks >= 80 && blocks.len() > builtin_blocks,
+        "the source scan found {builtin_blocks} built-in and {} cache-internal plugin impls; it \
+         no longer sees the plugin tree",
+        blocks.len() - builtin_blocks
     );
 
     for block in &blocks {
@@ -202,13 +215,17 @@ fn every_builtin_plugin_impl_declares_exactly_the_lifecycle_hooks_it_overrides()
             .filter(|(hook, _)| methods.contains(*hook))
             .map(|(_, flag)| (*flag).to_string())
             .collect();
-        let declared = declared_flags(block).unwrap_or_else(|| {
-            panic!(
+        let Some(declared) = declared_flags(block) else {
+            // The `ALL` default runs every hook, so an undeclared
+            // cache-internal plugin is safe (merely unoptimized).
+            assert!(
+                !block.requires_declaration,
                 "{}: built-in plugins must override `lifecycle_hooks` so dispatchers skip the \
                  hooks they do not implement; it overrides {overridden:?}",
                 block.label
-            )
-        });
+            );
+            continue;
+        };
         assert_eq!(
             declared, overridden,
             "{}: `lifecycle_hooks` must name exactly the gated hooks this impl overrides. A \
@@ -223,7 +240,9 @@ async fn every_registered_builtin_reports_a_narrow_declaration_at_runtime() {
     // Covers built-ins whose `impl Plugin` lives in a shape the source scan
     // does not read: an undeclared one still runs every hook (safe), but
     // silently forgoes the skipped boxed calls.
+    // Same guards (and lock order) as the doc-parity registration sweeps.
     let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
+    let _registry = super::plugin_utils::log_schema_registry_guard();
     for registration in BUILTIN_PLUGIN_REGISTRATIONS {
         let name = registration.name;
         let mut config = minimal_plugin_config(name);

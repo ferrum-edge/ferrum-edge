@@ -11311,9 +11311,12 @@ pub trait Plugin: Any + Send + Sync {
     ///
     /// The default, [`PluginHooks::ALL`], keeps every hook running, so a custom
     /// plugin does not need to override this. A plugin that does override it
-    /// must include every one of those hooks it implements: an omitted hook is
-    /// never called. Wrappers must report the hooks their own implementation
-    /// needs, not only the wrapped plugin's.
+    /// must include every one of those hooks it implements: the ordinary
+    /// request dispatchers never call an omitted hook. (The rarer rejection,
+    /// charged-terminal, and cache-replay `after_proxy` passes still call
+    /// every eligible plugin, so an omission there is inconsistent, not
+    /// safe.) Wrappers must report the hooks their own implementation needs,
+    /// not only the wrapped plugin's.
     fn lifecycle_hooks(&self) -> PluginHooks {
         PluginHooks::ALL
     }
