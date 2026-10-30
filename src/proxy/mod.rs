@@ -5443,6 +5443,23 @@ fn warn_invalid_backend_method(proxy_id: &str, backend_path: &'static str, metho
     );
 }
 
+/// BENCH PROBE (#6671): rebuild an outbound `HeaderMap` from the materialized
+/// map and discard it, so the alloc-lane delta equals the per-request cost of
+/// the string-to-`HeaderValue` outbound conversion a raw passthrough avoids.
+#[inline(never)]
+fn probe_outbound_header_cost(headers: &HashMap<String, String>) {
+    let mut out = hyper::HeaderMap::with_capacity(headers.len() + 4);
+    for (k, v) in headers {
+        if let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            out.append(name, value);
+        }
+    }
+    std::hint::black_box(out);
+}
+
 fn insert_outbound_header_or_warn(
     headers: &mut hyper::HeaderMap,
     proxy_id: &str,
@@ -53618,6 +53635,7 @@ async fn proxy_to_backend_direct_h1(
     }
 
     // ── Request head: same rewrite rules as the reqwest path ──────────────
+    probe_outbound_header_cost(headers);
     let mut out_headers = hyper::HeaderMap::with_capacity(headers.len() + 4);
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
@@ -64151,6 +64169,7 @@ async fn proxy_to_backend_http2(
     };
 
     // Clear and rebuild headers from the plugin-processed headers map
+    probe_outbound_header_cost(headers);
     parts.headers.clear();
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);

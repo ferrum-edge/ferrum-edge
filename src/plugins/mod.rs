@@ -7347,6 +7347,26 @@ impl RequestContext {
             }
         }
         crate::proxy::headers::canonicalize_request_header_map(&mut self.headers);
+        // BENCH PROBE (#6671): repeat the materialization into a discarded map
+        // so the alloc-lane delta vs. baseline is exactly its allocator cost.
+        let mut probe: HashMap<String, String> = HashMap::with_capacity(raw.keys_len());
+        for (name, value) in raw.iter() {
+            if let Ok(v) = std::str::from_utf8(value.as_bytes()) {
+                let key = name.as_str();
+                if Self::is_reserved_gateway_assertion_header(key) {
+                    continue;
+                }
+                let separator = repeated_request_header_separator(key);
+                probe
+                    .entry(key.to_owned())
+                    .and_modify(|existing| {
+                        existing.push_str(separator);
+                        existing.push_str(v);
+                    })
+                    .or_insert_with(|| v.to_owned());
+            }
+        }
+        std::hint::black_box(probe);
     }
 
     // -- Lazy query param materialization ------------------------------------
