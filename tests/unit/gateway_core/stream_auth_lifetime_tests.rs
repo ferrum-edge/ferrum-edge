@@ -2337,7 +2337,7 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
         ("async fn proxy_to_backend_retry(", 1, 1, 3, 0),
         ("async fn proxy_to_backend(", 1, 1, 0, 6),
         ("async fn proxy_to_backend_direct_h1(", 1, 0, 0, 1),
-        ("fn direct_h1_handoff_bound_expired(", 0, 1, 0, 1),
+        ("fn direct_h1_handoff_bound_expired<", 0, 1, 0, 1),
         ("async fn proxy_to_backend_hbone(", 1, 0, 0, 0),
         ("async fn proxy_to_backend_hbone_after_ready(", 2, 1, 2, 0),
         ("async fn proxy_to_backend_unix(", 2, 1, 2, 0),
@@ -2360,8 +2360,8 @@ fn every_h1h2_response_header_wait_composes_the_authorization_lifetime() {
             0,
         ),
         ("fn direct_h2_handoff_refusal(", 1, 0, 0, 0),
-        ("fn direct_h2_sender_bound_expired(", 1, 1, 0, 1),
-        ("fn direct_h2_handoff_bound_expired(", 0, 1, 1, 0),
+        ("fn direct_h2_sender_bound_expired<", 1, 1, 0, 1),
+        ("fn direct_h2_handoff_bound_expired<", 0, 1, 1, 0),
         ("fn mesh_h1_handoff_bound_expired(", 0, 1, 1, 0),
         (
             "async fn collect_response_under_authorization<F>(",
@@ -2606,7 +2606,7 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     );
     let bounded_checkout = compact_code(source_region(
         PROXY_SOURCE,
-        "async fn direct_h1_bounded_checkout(",
+        "async fn direct_h1_bounded_checkout<",
         "\n/// Dispatch an HTTP/1.1 backend request on the direct hyper pool",
     ));
     let bounded_wait = concat!(
@@ -2623,7 +2623,7 @@ fn backend_checkout_and_handoff_are_bounded_by_the_authorization_lifetime() {
     );
     let settle = compact_code(source_region(
         PROXY_SOURCE,
-        "fn direct_h1_handoff_bound_expired(",
+        "fn direct_h1_handoff_bound_expired<",
         "\n}\n",
     ));
     let authorization_arm = source_region(
