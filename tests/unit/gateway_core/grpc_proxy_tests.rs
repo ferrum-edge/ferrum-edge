@@ -3808,8 +3808,9 @@ fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
     );
 
     // Every terminal state publishes: clean EOF, transport error, overflow
-    // abort, authorization expiry, client RPC deadline, and Drop (cancelled /
-    // never-polled uploads).
+    // abort, authorization expiry, client RPC deadline (checked before each
+    // poll, and again when its lazily armed timer is set before waiting, issue
+    // #6904), and Drop (cancelled / never-polled uploads).
     let poll_arm = src
         .split("impl http_body::Body for GrpcBody")
         .nth(1)
@@ -3822,7 +3823,7 @@ fn grpc_streaming_upload_publishes_forwarded_request_bytes() {
         .expect("bounded streaming poll arm");
     let publishes = poll_arm.matches("accounting.publish(").count();
     assert_eq!(
-        publishes, 5,
+        publishes, 6,
         "each terminal state of the streamed upload must publish its byte tally"
     );
     let tally = poll_arm

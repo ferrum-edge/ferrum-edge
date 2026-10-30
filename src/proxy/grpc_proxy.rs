@@ -501,7 +501,19 @@ impl http_body::Body for GrpcBody {
                         // Clean source EOF: h2 may still hold queued upload DATA.
                         Poll::Ready(None)
                     }
-                    Poll::Pending => Poll::Pending,
+                    Poll::Pending => {
+                        // The upload is about to wait: only now does the RPC
+                        // deadline need a timer to wake it (armed lazily).
+                        if let Some(deadline) = rpc_deadline.as_mut()
+                            && deadline.arm(cx)
+                        {
+                            if let Some(accounting) = request_bytes.as_mut() {
+                                accounting.publish(*bytes_seen as u64);
+                            }
+                            return Poll::Ready(Some(Err(GRPC_UPLOAD_RPC_DEADLINE_MESSAGE.into())));
+                        }
+                        Poll::Pending
+                    }
                 }
             }
             GrpcBody::Channel {

@@ -144,7 +144,11 @@
 //! guard the response body holds for as long as the client likes.
 //! [`AuthorizationCancellableBody::for_client_rpc_deadline`] therefore moves
 //! the upstream into the same gateway-scheduled pump, armed from the RPC
-//! deadline instead of the credential's lifetime. It differs only in what is
+//! deadline instead of the credential's lifetime. A response whose upstream
+//! terminal is already ready when the response is built never reaches the
+//! pump (issue #6904): its body is released at once and the finished frames
+//! are served from memory (`proxy::body::client_grpc_deadline_body`), which is
+//! the pump's own outcome for a response completed before its deadline. It differs only in what is
 //! counted: an RPC deadline is a client-chosen bound, not an authorization
 //! decision, so it records no authorization-lifetime termination, and the
 //! protocol adapter outside it emits `DEADLINE_EXCEEDED` (status 4) rather
