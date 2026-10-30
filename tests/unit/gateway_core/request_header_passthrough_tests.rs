@@ -185,6 +185,22 @@ fn blocks_the_eager_path_reshapes_stay_materialized() {
             block(&[("x-path-param-id", b"7")]),
         ),
         (
+            "GeoIP assertion is scrubbed",
+            block(&[("x-geo-country", b"US")]),
+        ),
+        (
+            "underscore GeoIP assertion is scrubbed",
+            block(&[("x_geo_country", b"US")]),
+        ),
+        (
+            "authenticated-identity assertion is scrubbed",
+            block(&[("x-authenticated-identity", b"spiffe://evil")]),
+        ),
+        (
+            "underscore authenticated-identity assertion is scrubbed",
+            block(&[("x_authenticated_identity", b"spiffe://evil")]),
+        ),
+        (
             "backend-equivalent hop-count spelling is scrubbed",
             block(&[("x_ferrum_hops", b"0")]),
         ),
@@ -267,5 +283,13 @@ fn handler_gate_keeps_every_lane_exclusion() {
     assert!(
         gate_end < first_reject,
         "the decision precedes every route-level reject that can log headers"
+    );
+}
+
+#[test]
+fn authority_that_cannot_be_a_header_value_stays_materialized() {
+    assert!(
+        probe(block(&[("accept", b"*/*")]), Some("bad\u{7f}host"), Some(1)).is_none(),
+        "a Host backfill the outbound builders would drop must not enter the lane"
     );
 }
