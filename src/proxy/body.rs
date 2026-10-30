@@ -11,6 +11,7 @@ use http_body::Frame;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1368,10 +1369,12 @@ impl ProxyBody {
     /// because a complete gRPC message boundary cannot be proven.
     ///
     /// `closer` is the client connection's close signal (`Some` on hyper-driven
-    /// HTTP/1.1 and HTTP/2 frontends). With it the upstream is moved into the
-    /// gateway-owned response pump, so the deadline releases the backend and,
-    /// after a bounded grace, the client connection even while the transport
-    /// polls nothing — see [`ClientGrpcResponseDeadline`].
+    /// HTTP/1.1 and HTTP/2 frontends). With it the deadline releases the
+    /// backend and, after a bounded grace, the client connection even while the
+    /// transport polls nothing: an upstream whose terminal is already ready is
+    /// released at once and settled from memory under a close-only watchdog,
+    /// anything else moves into the gateway-owned response pump — see
+    /// [`ClientGrpcResponseDeadline`] and [`client_grpc_deadline_body`].
     pub(crate) fn with_client_grpc_deadline(
         mut self,
         deadline: tokio::time::Instant,
@@ -1407,6 +1410,21 @@ impl ProxyBody {
         self.client_grpc_deadline_fired = Some(fired);
         self.retain_client_grpc_deadline_pump(pump);
         self
+    }
+
+    /// Whether a frame-relaying client RPC deadline response pump is held on
+    /// this body. A response settled from memory by the construction-time
+    /// read-ahead holds at most a close-only watchdog.
+    pub(crate) fn holds_client_grpc_deadline_pump(&self) -> bool {
+        self.client_grpc_deadline_pump
+            .as_ref()
+            .is_some_and(ResponsePumpGuard::relays_frames)
+    }
+
+    /// Whether any client RPC deadline guard (a pump, or the close-only
+    /// watchdog of a response settled from memory) is held on this body.
+    pub(crate) fn holds_client_grpc_deadline_guard(&self) -> bool {
+        self.client_grpc_deadline_pump.is_some()
     }
 
     /// Hold a client RPC deadline pump on this (client-facing) body. An
@@ -2673,30 +2691,57 @@ impl UploadAuthDeadline {
 /// once, latched upload bound as [`UploadAuthDeadline`], without
 /// authorization accounting. An expired bound ends the upload in an error, so
 /// hyper resets the backend stream.
+///
+/// The timer is armed lazily (issue #6904). Until it is armed, every poll
+/// compares the clock with the bound, so an upload polled at or after it ends
+/// in the error exactly as before; once armed, polls check the latched timer.
+/// The boxed `Sleep` is created only when the upload is about to WAIT
+/// ([`Self::arm`] on `Pending`), the one case in which something must wake the
+/// body at the deadline. A unary upload that hyper consumes in ready polls
+/// therefore allocates and registers no timer at all.
 #[doc(hidden)]
 pub struct UploadRpcDeadline {
-    sleep: Pin<Box<tokio::time::Sleep>>,
+    at: tokio::time::Instant,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     fired: bool,
 }
 
 impl UploadRpcDeadline {
     pub(crate) fn new(at: tokio::time::Instant) -> Self {
         Self {
-            sleep: Box::pin(tokio::time::sleep_until(at)),
+            at,
+            sleep: None,
             fired: false,
         }
     }
 
-    /// Poll the absolute bound. `true` once it has elapsed; latched.
+    /// Check the absolute bound before a poll. `true` once it has elapsed;
+    /// latched. Registers `cx` with the timer only if one is already armed.
     pub(crate) fn expired(&mut self, cx: &mut Context<'_>) -> bool {
         if self.fired {
             return true;
         }
-        if std::future::Future::poll(self.sleep.as_mut(), cx).is_pending() {
-            return false;
+        let elapsed = match self.sleep.as_mut() {
+            Some(sleep) => std::future::Future::poll(sleep.as_mut(), cx).is_ready(),
+            None => tokio::time::Instant::now() >= self.at,
+        };
+        self.fired = elapsed;
+        elapsed
+    }
+
+    /// The upload is about to return `Pending`: make sure the deadline wakes
+    /// `cx`. Arms the timer on first use. `true` if the bound has already
+    /// elapsed, in which case the caller ends the upload instead of waiting.
+    pub(crate) fn arm(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.fired {
+            return true;
         }
-        self.fired = true;
-        true
+        let at = self.at;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+        self.fired = std::future::Future::poll(sleep.as_mut(), cx).is_ready();
+        self.fired
     }
 }
 
@@ -5973,7 +6018,11 @@ where
 /// for_client_rpc_deadline`), which releases the backend response AT the
 /// deadline and, after a bounded grace in which the client may still drain the
 /// `DEADLINE_EXCEEDED` terminal, closes the client connection so the request
-/// accounting held by `ProxyBody` is released too. The pump task is owned by
+/// accounting held by `ProxyBody` is released too. An upstream whose terminal
+/// is already ready when the response is built is instead released at once
+/// and settled from memory, with only the pump's expiry and close-grace half
+/// kept by `response_watchdog::rpc_deadline_settled_watchdog` (issue #6904,
+/// see [`client_grpc_deadline_body`]). The pump or watchdog task is owned by
 /// the client-facing `ProxyBody` (see `ProxyBody::client_grpc_deadline_pump`),
 /// so an outer adapter or authorization pump consuming the terminal cannot
 /// cancel that grace. `None` keeps the inline body-side timer: frontends
@@ -6002,9 +6051,200 @@ impl ClientGrpcResponseDeadline {
     }
 }
 
-/// The body under a client RPC deadline: polled inline, or owned by the
-/// gateway-scheduled response pump. See [`ClientGrpcResponseDeadline`].
-type ClientGrpcDeadlineSource<B> = http_body_util::Either<B, AuthorizationCancellableBody>;
+/// The body under a client RPC deadline: polled inline (left), already complete
+/// and served from the frames read ahead at construction (middle), or owned by
+/// the gateway-scheduled response pump (right). See
+/// [`ClientGrpcResponseDeadline`] and [`client_grpc_deadline_body`].
+type ClientGrpcDeadlineSource<B> = http_body_util::Either<
+    http_body_util::Either<B, ReadAheadBody<B>>,
+    AuthorizationCancellableBody,
+>;
+
+/// Most frames a deadline-bearing gRPC response reads ahead at construction
+/// (issue #6904). Ready frames past this bound stay with the upstream.
+const CLIENT_RPC_READ_AHEAD_MAX_FRAMES: usize = 16;
+
+/// Most DATA bytes a deadline-bearing gRPC response reads ahead at
+/// construction. The read-ahead may cross it by at most one frame; past it the
+/// response goes to the pump, whose one-frame channel restores backpressure.
+const CLIENT_RPC_READ_AHEAD_MAX_BYTES: usize = 64 * 1024;
+
+/// How a construction-time read-ahead ended.
+enum ReadAheadEnd {
+    /// The upstream reached its own terminal: a trailers frame, a clean end
+    /// of stream, or the error carried here.
+    Complete(Option<BoxError>),
+    /// The upstream is still open: it returned `Pending`, or a bound was hit.
+    Open,
+}
+
+/// Take every frame `body` has ready NOW, without waiting, up to the read-ahead
+/// bounds, and report whether its terminal was among them.
+///
+/// Polled with a no-op waker: a `Pending` result registers nothing that must
+/// fire. Whoever polls the body next — the pump, or nobody once the terminal
+/// has been read — registers its own waker on that poll, as every `Body`
+/// contract requires.
+fn read_ahead_ready_frames<B>(body: &mut B) -> (VecDeque<Frame<Bytes>>, ReadAheadEnd)
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let mut frames = VecDeque::new();
+    let mut bytes = 0usize;
+    loop {
+        if frames.len() >= CLIENT_RPC_READ_AHEAD_MAX_FRAMES
+            || bytes >= CLIENT_RPC_READ_AHEAD_MAX_BYTES
+        {
+            return (frames, ReadAheadEnd::Open);
+        }
+        match Pin::new(&mut *body).poll_frame(&mut cx) {
+            Poll::Pending => return (frames, ReadAheadEnd::Open),
+            Poll::Ready(None) => return (frames, ReadAheadEnd::Complete(None)),
+            Poll::Ready(Some(Err(error))) => {
+                return (frames, ReadAheadEnd::Complete(Some(error.into())));
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                // Trailers are the body's LAST frame (the `http-body`
+                // contract), so they are the upstream's own terminal — the
+                // same rule the pump applies.
+                let terminal = frame.is_trailers();
+                if let Some(data) = frame.data_ref() {
+                    bytes = bytes.saturating_add(data.len());
+                }
+                frames.push_back(frame);
+                if terminal {
+                    return (frames, ReadAheadEnd::Complete(None));
+                }
+            }
+        }
+    }
+}
+
+/// A deadline-bearing gRPC response whose leading frames were read ahead at
+/// construction: those frames first, then the upstream's read-ahead terminal
+/// error, then whatever remains of the upstream (`None` once its terminal was
+/// read ahead, in which case the backend was already released).
+struct ReadAheadBody<B> {
+    frames: VecDeque<Frame<Bytes>>,
+    terminal_error: Option<BoxError>,
+    inner: Option<B>,
+    /// Set once a terminal has been delivered (see `is_end_stream`).
+    finished: bool,
+    /// Settled from memory only: the shared terminal owner, until this body
+    /// has decided its completion claim (see [`Self::claim_completion_when_due`]).
+    completion: Option<AuthorizationTerminalOwner>,
+    /// Whether this body won the completion claim.
+    completion_claimed: bool,
+}
+
+impl<B> ReadAheadBody<B> {
+    fn new(
+        frames: VecDeque<Frame<Bytes>>,
+        terminal_error: Option<BoxError>,
+        inner: Option<B>,
+    ) -> Self {
+        Self {
+            frames,
+            terminal_error,
+            inner,
+            finished: false,
+            completion: None,
+            completion_claimed: false,
+        }
+    }
+
+    /// A response whose upstream terminal was read ahead (the backend already
+    /// released), served from memory under the pump's completion rule.
+    fn settled(
+        frames: VecDeque<Frame<Bytes>>,
+        terminal_error: Option<BoxError>,
+        owner: AuthorizationTerminalOwner,
+    ) -> Self {
+        let mut body = Self::new(frames, terminal_error, None);
+        body.completion = Some(owner);
+        body.claim_completion_when_due();
+        body
+    }
+
+    /// Whether this settled response has already claimed its own completion.
+    fn completion_claimed(&self) -> bool {
+        self.completion_claimed
+    }
+
+    /// The pump's completion rule: it reads the upstream's terminal only once
+    /// the client has taken every frame before it (its channel holds one
+    /// frame), and claims completion there, refused at/after the deadline. A
+    /// settled body claims at the same point: when only the terminal remains.
+    fn claim_completion_when_due(&mut self) {
+        let Some(owner) = self.completion.as_ref() else {
+            return;
+        };
+        let terminal_frames = usize::from(self.frames.back().is_some_and(Frame::is_trailers));
+        if self.frames.len() > terminal_frames {
+            return;
+        }
+        self.completion_claimed = owner.claim_inner_completion();
+        self.completion = None;
+    }
+}
+
+impl<B> http_body::Body for ReadAheadBody<B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if let Some(frame) = this.frames.pop_front() {
+            if frame.is_trailers() && this.inner.is_none() {
+                this.finished = true;
+            }
+            this.claim_completion_when_due();
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        if let Some(error) = this.terminal_error.take() {
+            this.finished = true;
+            return Poll::Ready(Some(Err(error)));
+        }
+        let polled = match this.inner.as_mut() {
+            Some(inner) => Pin::new(inner).poll_frame(cx).map_err(Into::into),
+            None => Poll::Ready(None),
+        };
+        if match &polled {
+            Poll::Ready(Some(Ok(frame))) => frame.is_trailers(),
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => true,
+            Poll::Pending => false,
+        } {
+            this.finished = true;
+        }
+        polled
+    }
+
+    /// Only a DELIVERED terminal ends this stream, exactly as the pump reports
+    /// it. Reporting end of stream for a body whose terminal is merely queued
+    /// would let hyper finish the response on its HEADERS frame without
+    /// polling, skipping any terminal an outer adapter adds at end of stream.
+    fn is_end_stream(&self) -> bool {
+        self.finished
+    }
+
+    /// Unknown, exactly as the pump reports it: hyper must not derive a
+    /// `Content-Length` for a gRPC response from bytes read ahead.
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::default()
+    }
+}
 
 /// Wrap `body` in the client RPC deadline terminal adapter (`DEADLINE_EXCEEDED`
 /// trailers / the bounded gRPC-Web frame before response DATA, a reset after
@@ -6025,8 +6265,33 @@ type ClientGrpcDeadlineSource<B> = http_body_util::Either<B, AuthorizationCancel
 /// delivers a terminal, which would change the response's framing, and there
 /// is no remaining frame to bound.
 ///
-/// The returned [`ResponsePumpGuard`] (present only when a pump was installed)
-/// must be stored on the client-facing `ProxyBody`.
+/// Before installing the pump, the frames the upstream already has ready are
+/// read ahead without waiting (issue #6904), stopping at
+/// [`CLIENT_RPC_READ_AHEAD_MAX_FRAMES`] or once
+/// [`CLIENT_RPC_READ_AHEAD_MAX_BYTES`] is reached. A unary response's DATA and
+/// trailers usually arrive with its headers. When the upstream's terminal is
+/// among them, the backend body is dropped at once, so the backend is released
+/// before any client could stall, and the response is served from memory with
+/// no channel and no per-frame hop. It still settles through the pump's shared
+/// terminal owner and completion rule: it claims completion only once the
+/// client has taken every frame before the terminal (refused at/after the
+/// deadline, which also settles a terminal observed late as the deadline).
+/// Until then [`crate::proxy::response_watchdog::rpc_deadline_settled_watchdog`]
+/// keeps the pump's expiry half: status 4 or a reset for a client that has
+/// not drained by the deadline, and a connection close after the grace. A
+/// response still open after the read-ahead goes to the pump with the frames
+/// already read delivered first. The pump costs one task, one channel and a
+/// cross-task hop per frame, which measured as a 17–21% throughput loss on
+/// deadline-bearing unary gRPC.
+///
+/// "Taken by the client" in the completion rule means consumed by the next
+/// reader of this body, which can be an outer authorization pump rather than
+/// the network client, exactly as for the pump's one-frame channel.
+///
+/// The returned [`ResponsePumpGuard`] (the pump, or the close-only watchdog of
+/// a response settled from memory; absent for the inline path and for a
+/// settled response that claimed its completion at construction) must be
+/// stored on the client-facing `ProxyBody`.
 fn client_grpc_deadline_body<B>(
     body: B,
     deadline: ClientGrpcResponseDeadline,
@@ -6040,32 +6305,50 @@ where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Into<BoxError>,
 {
-    use http_body_util::BodyExt;
-
     let ClientGrpcResponseDeadline { at, closer } = deadline;
     match closer {
         Some(closer) if !http_body::Body::is_end_stream(&body) => {
-            let owned = body.map_err(|error| -> BoxError { error.into() });
-            let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
-                owned,
-                at,
-                Arc::clone(&fired),
-                Some(closer),
-            );
-            let owner = pumped.terminal_owner();
+            let mut body = body;
+            // An elapsed deadline is never bypassed: the pump settles it at once.
+            let (frames, end) = if tokio::time::Instant::now() < at {
+                read_ahead_ready_frames(&mut body)
+            } else {
+                (VecDeque::new(), ReadAheadEnd::Open)
+            };
+            let ReadAheadEnd::Complete(terminal_error) = end else {
+                let owned = ReadAheadBody::new(frames, None, Some(body));
+                return pumped_client_grpc_deadline_body(owned, at, closer, deadline_frame, fired);
+            };
+            // The upstream reached its own terminal: settle the response from
+            // memory under the pump's terminal owner and completion rule. The
+            // owner's clock check also settles a terminal the read-ahead
+            // observed AFTER the deadline as the deadline, exactly as the pump
+            // refuses it. Claim BEFORE releasing the backend, as the pump does:
+            // backend teardown (an H2 stream drop takes the connection lock)
+            // must not be able to turn an on-time terminal into an expiry.
+            let owner = AuthorizationTerminalOwner::new(at);
+            let settled = ReadAheadBody::settled(frames, terminal_error, owner.clone());
+            drop(body);
+            let watchdog = (!settled.completion_claimed()).then(|| {
+                crate::proxy::response_watchdog::rpc_deadline_settled_watchdog(
+                    owner.clone(),
+                    Arc::clone(&fired),
+                    closer,
+                )
+            });
             let timed = TotalDeadlineBody::with_deadline_frame(
-                http_body_util::Either::Right(pumped),
-                // No timer here: the pump's shared terminal owner settles it.
+                http_body_util::Either::Left(http_body_util::Either::Right(settled)),
+                // No timer here: the shared terminal owner settles the bound.
                 None,
                 deadline_frame,
                 fired,
             )
             .with_authorization_terminal_owner(owner);
-            (timed, Some(pump))
+            (timed, watchdog)
         }
         _ => (
             TotalDeadlineBody::with_deadline_frame(
-                http_body_util::Either::Left(body),
+                http_body_util::Either::Left(http_body_util::Either::Left(body)),
                 Some(at),
                 deadline_frame,
                 fired,
@@ -6073,6 +6356,40 @@ where
             None,
         ),
     }
+}
+
+/// Move a deadline-bearing response that is still open into the
+/// gateway-owned response pump. See [`client_grpc_deadline_body`].
+fn pumped_client_grpc_deadline_body<B>(
+    owned: ReadAheadBody<B>,
+    at: tokio::time::Instant,
+    closer: AuthorizationConnectionCloser,
+    deadline_frame: Option<Frame<Bytes>>,
+    fired: Arc<AtomicBool>,
+) -> (
+    TotalDeadlineBody<ClientGrpcDeadlineSource<B>>,
+    Option<ResponsePumpGuard>,
+)
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<BoxError>,
+{
+    let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
+        owned,
+        at,
+        Arc::clone(&fired),
+        Some(closer),
+    );
+    let owner = pumped.terminal_owner();
+    let timed = TotalDeadlineBody::with_deadline_frame(
+        http_body_util::Either::Right(pumped),
+        // No timer here: the pump's shared terminal owner settles it.
+        None,
+        deadline_frame,
+        fired,
+    )
+    .with_authorization_terminal_owner(owner);
+    (timed, Some(pump))
 }
 
 struct DirectH3Body<S = crate::http3::client::H3RequestStream> {
@@ -7233,7 +7550,6 @@ mod tests {
     use futures_util::Stream;
     use futures_util::task::noop_waker;
     use http_body::Body;
-    use std::collections::VecDeque;
 
     enum MockStep {
         Frame(Result<Frame<Bytes>, BoxError>),

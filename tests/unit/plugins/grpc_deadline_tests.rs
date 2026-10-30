@@ -6736,6 +6736,9 @@ async fn assert_trailers_read_before_the_deadline_survive_a_late_drain(
     );
 }
 
+// The backend's frames are ready at construction, so since issue #6904 this
+// takes the read-ahead path; `a_pumped_rpc_that_completes_before_its_deadline_
+// keeps_its_trailers_and_connection` covers the same outcome inside the pump.
 #[tokio::test(start_paused = true)]
 async fn an_rpc_that_completes_before_its_deadline_keeps_its_trailers_and_its_connection() {
     assert_trailers_read_before_the_deadline_survive_a_late_drain(|backend, closer| {
@@ -6835,6 +6838,900 @@ async fn an_outer_authorization_pump_cannot_cancel_the_rpc_deadline_transport_cl
          per-IP, admission, and load-balancer accounting is held indefinitely"
     );
     drop(body);
+}
+
+/// A backend whose frames are all ready at once and which then fails, recording
+/// whether the gateway released it.
+struct FailingRpcBackendBody {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for FailingRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match self.frames.pop_front() {
+            Some(frame) => std::task::Poll::Ready(Some(Ok(frame))),
+            None => std::task::Poll::Ready(Some(Err("backend reset".into()))),
+        }
+    }
+}
+
+impl Drop for FailingRpcBackendBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Counts the frames a flooding backend hands out.
+struct CountingFloodRpcBackendBody {
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl http_body::Body for CountingFloodRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+            GRPC_MESSAGE,
+        )))))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_settled_response_releases_the_backend_at_once_and_still_reaps_a_stalled_client() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_holds_client_grpc_deadline_guard_for_test,
+        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::trailers(grpc_ok_trailers()),
+        ]),
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        closer.clone(),
+    );
+
+    // Issue #6904: the DATA and trailers were ready with the response head, so
+    // the backend is released at construction and no frame-relaying pump is
+    // installed — only the close-only watchdog.
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "a backend whose terminal is already read must be released at once"
+    );
+    assert!(!proxy_body_holds_client_grpc_deadline_pump_for_test(&body));
+    assert!(proxy_body_holds_client_grpc_deadline_guard_for_test(&body));
+
+    // The client withholds credit from the start, so hyper polls nothing. The
+    // pump's outcome must hold: no close within the grace...
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(!closer.close_requested());
+    // ...then the connection is closed, releasing the request, per-IP,
+    // admission, and load-balancer accounting the response body holds.
+    tokio::time::sleep(authorization_transport_close_grace() + Duration::from_secs(1)).await;
+    assert!(
+        closer.close_requested(),
+        "a client that never drains a response settled from memory must be reaped exactly as \
+         the pump reaps it"
+    );
+    // A late drain sees the deadline, not the response: none of it was taken
+    // before the deadline.
+    let frame = body
+        .frame()
+        .await
+        .expect("the elapsed deadline produces a terminal")
+        .expect("no DATA reached the client, so the terminal is trailers");
+    assert_eq!(grpc_status_of(&frame).as_deref(), Some("4"));
+    assert!(body.frame().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_settled_response_with_only_its_terminal_left_needs_no_watchdog() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_holds_client_grpc_deadline_guard_for_test,
+        proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([http_body::Frame::trailers(grpc_ok_trailers())]),
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        closer.clone(),
+    );
+
+    // Only the terminal remains, so the response claims its completion at
+    // once, as the pump would on its first read, and needs no watchdog.
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!proxy_body_holds_client_grpc_deadline_guard_for_test(&body));
+    tokio::time::sleep(Duration::from_secs(2) + authorization_transport_close_grace() * 2).await;
+    let terminal = body.frame().await.expect("trailers").expect("trailers ok");
+    assert_eq!(grpc_status_of(&terminal).as_deref(), Some("0"));
+    assert!(body.frame().await.is_none());
+    assert!(!closer.close_requested());
+}
+
+/// A backend whose body ends at once with no frame and no trailers, but does
+/// not advertise end of stream up front.
+struct EmptyRpcBackendBody {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for EmptyRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(None)
+    }
+}
+
+impl Drop for EmptyRpcBackendBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_ahead_response_ends_its_stream_only_once_polled_to_the_end() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_guard_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body::Body;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = proxy_body_streaming_for_test(Box::pin(EmptyRpcBackendBody {
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        AuthorizationConnectionCloser::new(),
+    );
+
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!proxy_body_holds_client_grpc_deadline_guard_for_test(&body));
+    // Framing parity with the pump: a terminal that is only queued is not an
+    // end of stream, or hyper would finish the response on its HEADERS frame
+    // without polling, skipping any terminal an outer adapter adds at the end.
+    assert!(
+        !body.is_end_stream(),
+        "a read-ahead terminal must be delivered before the stream reports its end"
+    );
+    assert!(body.frame().await.is_none());
+    assert!(body.is_end_stream());
+}
+
+/// How [`SlowTerminalRpcBackendBody`] ends once its queued frames are read.
+#[derive(Clone, Copy, Debug)]
+enum SlowTerminal {
+    Trailers,
+    EndOfStream,
+    Error,
+}
+
+/// A backend whose queued frames are ready at once but whose terminal is
+/// produced only after `delay` of synchronous work inside the poll, so a
+/// construction-time read-ahead crosses the RPC deadline before seeing it.
+struct SlowTerminalRpcBackendBody {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    terminal: Option<SlowTerminal>,
+    delay: std::time::Duration,
+    /// Set by the first poll: proves the construction-time read-ahead ran,
+    /// which it does only when it starts before the deadline.
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for SlowTerminalRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(frame) = self.frames.pop_front() {
+            return std::task::Poll::Ready(Some(Ok(frame)));
+        }
+        let Some(terminal) = self.terminal.take() else {
+            return std::task::Poll::Ready(None);
+        };
+        std::thread::sleep(self.delay);
+        std::task::Poll::Ready(match terminal {
+            SlowTerminal::Trailers => Some(Ok(http_body::Frame::trailers(grpc_ok_trailers()))),
+            SlowTerminal::EndOfStream => None,
+            SlowTerminal::Error => Some(Err("backend reset".into())),
+        })
+    }
+}
+
+impl Drop for SlowTerminalRpcBackendBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// Real time on purpose: the deadline must pass DURING the synchronous
+// read-ahead, which a paused clock cannot express.
+#[tokio::test]
+async fn a_terminal_read_ahead_after_the_deadline_is_settled_as_the_deadline() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_guard_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    for (terminal, with_data) in [
+        (SlowTerminal::Trailers, true),
+        (SlowTerminal::EndOfStream, true),
+        (SlowTerminal::Error, true),
+        (SlowTerminal::Trailers, false),
+        (SlowTerminal::EndOfStream, false),
+        (SlowTerminal::Error, false),
+    ] {
+        // The read-ahead must START before the deadline for this to test the
+        // crossing. A loaded runner can deschedule the setup past a short
+        // window, so verify entry and retry with a wider one.
+        let mut margin = Duration::from_millis(100);
+        loop {
+            let entered = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let frames = if with_data {
+                std::collections::VecDeque::from([http_body::Frame::data(
+                    bytes::Bytes::from_static(GRPC_MESSAGE),
+                )])
+            } else {
+                // Terminal only: the construction-time completion claim itself
+                // is refused and settles the deadline.
+                std::collections::VecDeque::new()
+            };
+            let backend = proxy_body_streaming_for_test(Box::pin(SlowTerminalRpcBackendBody {
+                frames,
+                terminal: Some(terminal),
+                delay: margin * 3,
+                entered: Arc::clone(&entered),
+                dropped: Arc::clone(&dropped),
+            }));
+            let deadline = tokio::time::Instant::now() + margin;
+            let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+                backend,
+                deadline,
+                None,
+                AuthorizationConnectionCloser::new(),
+            );
+            if !entered.load(Ordering::SeqCst) {
+                assert!(
+                    margin < Duration::from_secs(5),
+                    "{terminal:?}: the read-ahead never started before the deadline"
+                );
+                margin *= 2;
+                continue;
+            }
+            assert!(
+                tokio::time::Instant::now() >= deadline,
+                "{terminal:?} (data: {with_data}): the terminal must be observed after the deadline"
+            );
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "{terminal:?}: the finished backend is released either way"
+            );
+            assert!(
+                proxy_body_holds_client_grpc_deadline_guard_for_test(&body),
+                "{terminal:?}: a terminal observed after the deadline is not a completion, so \
+                 its expiry watchdog stays armed"
+            );
+            let frame = body
+                .frame()
+                .await
+                .expect("the elapsed deadline produces a terminal")
+                .expect("no DATA reached the client, so the terminal is trailers");
+            assert_eq!(
+                grpc_status_of(&frame).as_deref(),
+                Some("4"),
+                "{terminal:?}: a late terminal must be settled as DEADLINE_EXCEEDED"
+            );
+            assert!(body.frame().await.is_none());
+            break;
+        }
+    }
+}
+
+/// A backend whose terminal is ready at once, with no frame before it, but
+/// whose teardown is slow: its `Drop` crosses the RPC deadline.
+struct SlowDropRpcBackendBody {
+    terminal: Option<SlowTerminal>,
+    drop_delay: std::time::Duration,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    /// When teardown BEGAN: the completion claim precedes it, so a start
+    /// before the deadline proves the claim was on time.
+    teardown_started: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for SlowDropRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(match self.terminal.take() {
+            Some(SlowTerminal::Trailers) => {
+                Some(Ok(http_body::Frame::trailers(grpc_ok_trailers())))
+            }
+            Some(SlowTerminal::Error) => Some(Err("backend reset".into())),
+            Some(SlowTerminal::EndOfStream) | None => None,
+        })
+    }
+}
+
+impl Drop for SlowDropRpcBackendBody {
+    fn drop(&mut self) {
+        *self.teardown_started.lock().expect("teardown lock") = Some(tokio::time::Instant::now());
+        std::thread::sleep(self.drop_delay);
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// Real time on purpose: the deadline must pass DURING backend teardown.
+#[tokio::test]
+async fn slow_backend_teardown_cannot_turn_an_on_time_terminal_into_an_expiry() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_guard_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    for terminal in [
+        SlowTerminal::Trailers,
+        SlowTerminal::EndOfStream,
+        SlowTerminal::Error,
+    ] {
+        let mut margin = Duration::from_millis(100);
+        loop {
+            let entered = Arc::new(AtomicBool::new(false));
+            let teardown_started = Arc::new(std::sync::Mutex::new(None));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let backend = proxy_body_streaming_for_test(Box::pin(SlowDropRpcBackendBody {
+                terminal: Some(terminal),
+                drop_delay: margin * 3,
+                entered: Arc::clone(&entered),
+                teardown_started: Arc::clone(&teardown_started),
+                dropped: Arc::clone(&dropped),
+            }));
+            let deadline = tokio::time::Instant::now() + margin;
+            let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+                backend,
+                deadline,
+                None,
+                AuthorizationConnectionCloser::new(),
+            );
+            // The case needs the terminal read AND teardown begun before the
+            // deadline (so the claim, which precedes teardown, was on time),
+            // with teardown then crossing it. Retry a missed setup window; never
+            // retry because a guard exists, which would hide the regression.
+            let teardown_on_time = teardown_started
+                .lock()
+                .expect("teardown lock")
+                .is_some_and(|started| started < deadline);
+            if !entered.load(Ordering::SeqCst) || !teardown_on_time {
+                assert!(
+                    margin < Duration::from_secs(5),
+                    "{terminal:?}: never reached backend teardown before the deadline"
+                );
+                margin *= 2;
+                continue;
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(
+                tokio::time::Instant::now() >= deadline,
+                "{terminal:?}: backend teardown must have crossed the deadline"
+            );
+            assert!(
+                !proxy_body_holds_client_grpc_deadline_guard_for_test(&body),
+                "{terminal:?}: the terminal was read on time, so completion is claimed before \
+                 the backend is released and no watchdog is armed"
+            );
+            match terminal {
+                SlowTerminal::Trailers => {
+                    let frame = body.frame().await.expect("trailers").expect("trailers ok");
+                    assert_eq!(grpc_status_of(&frame).as_deref(), Some("0"));
+                    assert!(body.frame().await.is_none());
+                }
+                SlowTerminal::EndOfStream => assert!(body.frame().await.is_none()),
+                SlowTerminal::Error => {
+                    assert!(body.frame().await.expect("error terminal").is_err());
+                }
+            }
+            break;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_settled_response_partly_drained_before_its_deadline_is_reset_and_reaped() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::trailers(grpc_ok_trailers()),
+        ]),
+        dropped: Arc::new(AtomicBool::new(false)),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        closer.clone(),
+    );
+
+    // One DATA frame reaches the client; a frame before the terminal remains,
+    // so completion is not yet due.
+    body.frame().await.expect("data frame").expect("data ok");
+    tokio::time::sleep(Duration::from_millis(1_500) + authorization_transport_close_grace()).await;
+    assert!(
+        closer.close_requested(),
+        "a partly drained settled response is reaped like a partly drained pumped one"
+    );
+    assert!(
+        body.frame().await.expect("terminal").is_err(),
+        "after client-visible DATA the deadline terminal is a reset, never trailers"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_settled_eof_or_error_claimed_before_its_deadline_survives_a_late_drain() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    for terminal in [SlowTerminal::EndOfStream, SlowTerminal::Error] {
+        let closer = AuthorizationConnectionCloser::new();
+        let backend = proxy_body_streaming_for_test(Box::pin(SlowTerminalRpcBackendBody {
+            frames: std::collections::VecDeque::from([http_body::Frame::data(
+                bytes::Bytes::from_static(GRPC_MESSAGE),
+            )]),
+            terminal: Some(terminal),
+            delay: Duration::ZERO,
+            entered: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        }));
+        let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+            backend,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            None,
+            closer.clone(),
+        );
+
+        // Taking the last DATA frame before the deadline claims completion.
+        body.frame().await.expect("data frame").expect("data ok");
+        tokio::time::sleep(Duration::from_secs(2) + authorization_transport_close_grace() * 2)
+            .await;
+        match terminal {
+            SlowTerminal::EndOfStream => assert!(body.frame().await.is_none()),
+            _ => {
+                let error = body
+                    .frame()
+                    .await
+                    .expect("error terminal")
+                    .expect_err("the backend's own error survives a late drain");
+                assert_eq!(
+                    error.to_string(),
+                    "backend reset",
+                    "the original error, not a deadline terminal"
+                );
+            }
+        }
+        assert!(
+            !closer.close_requested(),
+            "{terminal:?}: a completion claimed before the deadline keeps its connection"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_earlier_authorization_bound_still_cuts_a_settled_rpc_response() {
+    use ferrum_edge::_test_support::{
+        proxy_body_streaming_for_test, proxy_body_with_authorization_deadline_and_closer_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::{
+        AuthorizationConnectionCloser, StreamAuthDeadline, StreamAuthProtocolFamily,
+        StreamAuthTermination, StreamAuthTerminationLatch,
+    };
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::trailers(grpc_ok_trailers()),
+        ]),
+        dropped: Arc::new(AtomicBool::new(false)),
+    }));
+    // Production stacking: the RPC deadline inside (settled from memory), a
+    // much earlier authorization lifetime outside.
+    let body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        None,
+        closer.clone(),
+    );
+    let mut body = proxy_body_with_authorization_deadline_and_closer_for_test(
+        body,
+        StreamAuthDeadline {
+            at: tokio::time::Instant::now() + Duration::from_secs(1),
+            termination: StreamAuthTermination::CredentialExpired,
+        },
+        StreamAuthProtocolFamily::Grpc,
+        Some(StreamAuthTerminationLatch::default()),
+        closer.clone(),
+    );
+
+    // The client reads nothing before the authorization lifetime ends.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let frame = body
+        .frame()
+        .await
+        .expect("the elapsed authorization lifetime produces a terminal")
+        .expect("no DATA reached the client, so the terminal is trailers");
+    assert_eq!(
+        grpc_status_of(&frame).as_deref(),
+        Some("16"),
+        "frames settled from memory must not outlive an earlier authorization bound"
+    );
+}
+
+/// A backend that stays `Pending` until the test releases its frames and wakes
+/// whoever polled it last — the pump, never the construction-time read-ahead.
+struct GatedRpcBackendBody {
+    gate: Arc<std::sync::Mutex<RpcGate>>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Default)]
+struct RpcGate {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    waker: Option<std::task::Waker>,
+}
+
+impl http_body::Body for GatedRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let mut gate = self.gate.lock().expect("gate lock");
+        match gate.frames.pop_front() {
+            Some(frame) => std::task::Poll::Ready(Some(Ok(frame))),
+            None => {
+                gate.waker = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl Drop for GatedRpcBackendBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pumped_rpc_that_completes_before_its_deadline_keeps_its_trailers_and_connection() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_holds_client_grpc_deadline_pump_for_test,
+        proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(std::sync::Mutex::new(RpcGate::default()));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(GatedRpcBackendBody {
+        gate: Arc::clone(&gate),
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        None,
+        closer.clone(),
+    );
+    assert!(
+        proxy_body_holds_client_grpc_deadline_pump_for_test(&body),
+        "nothing was ready at construction, so the pump owns the response"
+    );
+
+    // Let the pump poll (and register its waker), then release the response.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    {
+        let mut gate = gate.lock().expect("gate lock");
+        gate.frames.extend([
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::trailers(grpc_ok_trailers()),
+        ]);
+        gate.waker
+            .take()
+            .expect("the pump polled the backend")
+            .wake();
+    }
+
+    let data = body.frame().await.expect("data frame").expect("data ok");
+    assert_eq!(data.data_ref().map(|bytes| &bytes[..]), Some(GRPC_MESSAGE));
+    // The pump reads the trailers before the deadline and releases the
+    // backend, while the client reads nothing more.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+
+    tokio::time::sleep(Duration::from_secs(5) + authorization_transport_close_grace() * 2).await;
+    let terminal = body.frame().await.expect("trailers").expect("trailers ok");
+    assert_eq!(grpc_status_of(&terminal).as_deref(), Some("0"));
+    assert!(body.frame().await.is_none());
+    assert!(!closer.close_requested());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_backend_error_read_ahead_is_delivered_after_the_frames_before_it() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = proxy_body_streaming_for_test(Box::pin(FailingRpcBackendBody {
+        frames: std::collections::VecDeque::from([http_body::Frame::data(
+            bytes::Bytes::from_static(GRPC_MESSAGE),
+        )]),
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        AuthorizationConnectionCloser::new(),
+    );
+
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!proxy_body_holds_client_grpc_deadline_pump_for_test(&body));
+    let data = body.frame().await.expect("data frame").expect("data ok");
+    assert_eq!(data.data_ref().map(|bytes| &bytes[..]), Some(GRPC_MESSAGE));
+    assert!(
+        body.frame().await.expect("terminal").is_err(),
+        "an upstream error stays an error: it must never become a clean end of stream"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_response_still_open_after_read_ahead_keeps_its_frames_and_its_pump() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    const SECOND_MESSAGE: &[u8] = b"\x00\x00\x00\x00\x01y";
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::data(bytes::Bytes::from_static(SECOND_MESSAGE)),
+        ]),
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        AuthorizationConnectionCloser::new(),
+    );
+
+    assert!(
+        proxy_body_holds_client_grpc_deadline_pump_for_test(&body),
+        "a response still open after the read-ahead must keep the pump's guarantee"
+    );
+    assert!(!dropped.load(Ordering::SeqCst));
+    for expected in [GRPC_MESSAGE, SECOND_MESSAGE] {
+        let frame = body.frame().await.expect("data frame").expect("data ok");
+        assert_eq!(
+            frame.data_ref().map(|bytes| &bytes[..]),
+            Some(expected),
+            "frames read ahead are delivered first, in order"
+        );
+    }
+    // The client now stops reading: the pump still releases the backend at
+    // the deadline, and response DATA already went out, so the terminal is a
+    // reset rather than status-4 trailers.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(body.frame().await.expect("terminal").is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_elapsed_deadline_is_never_bypassed_by_the_read_ahead() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([
+            http_body::Frame::data(bytes::Bytes::from_static(GRPC_MESSAGE)),
+            http_body::Frame::trailers(grpc_ok_trailers()),
+        ]),
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now(),
+        None,
+        AuthorizationConnectionCloser::new(),
+    );
+
+    assert!(
+        proxy_body_holds_client_grpc_deadline_pump_for_test(&body),
+        "a deadline already elapsed at construction is settled by the pump, not read past"
+    );
+    let frame = body
+        .frame()
+        .await
+        .expect("the elapsed deadline produces a terminal")
+        .expect("no DATA reached the client, so the terminal is trailers");
+    assert_eq!(
+        grpc_status_of(&frame).as_deref(),
+        Some("4"),
+        "ready backend frames must not outrun an elapsed RPC deadline"
+    );
+    assert!(body.frame().await.is_none());
+    // Let the pump task run its (already expired) deadline arm.
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_read_ahead_is_bounded_for_a_backend_that_keeps_producing() {
+    use ferrum_edge::_test_support::{
+        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let backend = proxy_body_streaming_for_test(Box::pin(CountingFloodRpcBackendBody {
+        reads: Arc::clone(&reads),
+    }));
+    let body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        AuthorizationConnectionCloser::new(),
+    );
+
+    // Read synchronously at construction, before the pump task can run.
+    let read_ahead = reads.load(Ordering::SeqCst);
+    assert!(
+        (1..=16).contains(&read_ahead),
+        "the construction-time read-ahead must stay bounded (read {read_ahead} frames)"
+    );
+    assert!(proxy_body_holds_client_grpc_deadline_pump_for_test(&body));
+    drop(body);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_polled_after_its_rpc_deadline_ends_without_waiting() {
+    let started = tokio::time::Instant::now();
+    let first =
+        ferrum_edge::_test_support::grpc_streaming_upload_first_item_under_rpc_deadline_for_test(
+            Some(started),
+        )
+        .await;
+    match first {
+        Some(Err(message)) => assert!(
+            message.contains("RPC deadline exceeded"),
+            "unexpected upload terminal: {message}"
+        ),
+        other => panic!("an upload polled at its elapsed RPC deadline must end, got {other:?}"),
+    }
+    assert_eq!(
+        started.elapsed(),
+        std::time::Duration::ZERO,
+        "the lazily armed upload deadline is still checked on every poll"
+    );
 }
 
 #[tokio::test(start_paused = true)]

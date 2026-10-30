@@ -144,12 +144,19 @@
 //! guard the response body holds for as long as the client likes.
 //! [`AuthorizationCancellableBody::for_client_rpc_deadline`] therefore moves
 //! the upstream into the same gateway-scheduled pump, armed from the RPC
-//! deadline instead of the credential's lifetime. It differs only in what is
-//! counted: an RPC deadline is a client-chosen bound, not an authorization
-//! decision, so it records no authorization-lifetime termination, and the
-//! protocol adapter outside it emits `DEADLINE_EXCEEDED` (status 4) rather
-//! than `UNAUTHENTICATED`. Release at the deadline and the bounded-grace
-//! transport close are identical.
+//! deadline instead of the credential's lifetime. The RPC pump differs only in
+//! what is counted: an RPC deadline is a client-chosen bound, not an
+//! authorization decision, so it records no authorization-lifetime
+//! termination, and the protocol adapter outside it emits `DEADLINE_EXCEEDED`
+//! (status 4) rather than `UNAUTHENTICATED`. Release at the deadline and the
+//! bounded-grace transport close are identical.
+//!
+//! A response whose upstream terminal is already ready when the response is
+//! built never reaches the pump (issue #6904): its backend is released at
+//! once, its frames are served from memory under the same terminal owner and
+//! completion rule, and [`rpc_deadline_settled_watchdog`] keeps only the
+//! expiry and close-grace half — one task and one sleep, with no channel and no
+//! per-frame hop (`proxy::body::client_grpc_deadline_body`).
 //!
 //! # Redaction
 //!
@@ -393,15 +400,67 @@ impl Drop for AbortPumpOnDrop {
 /// receiver goes away (`Sender::closed`).
 pub(crate) struct ResponsePumpGuard {
     _pump: AbortPumpOnDrop,
+    /// `true` for a frame-relaying pump; `false` for the close-only watchdog
+    /// of a response settled from memory ([`rpc_deadline_settled_watchdog`]).
+    relays_frames: bool,
     /// An earlier RPC pump on the same body, kept alive with this one.
-    _earlier: Option<Box<ResponsePumpGuard>>,
+    earlier: Option<Box<ResponsePumpGuard>>,
 }
 
 impl ResponsePumpGuard {
     /// Keep `earlier` alive for as long as this guard.
     pub(crate) fn retaining(mut self, earlier: Option<ResponsePumpGuard>) -> Self {
-        self._earlier = earlier.map(Box::new);
+        self.earlier = earlier.map(Box::new);
         self
+    }
+
+    /// Whether this guard, or one it retains, owns a frame-relaying pump.
+    pub(crate) fn relays_frames(&self) -> bool {
+        self.relays_frames
+            || self
+                .earlier
+                .as_ref()
+                .is_some_and(|earlier| earlier.relays_frames())
+    }
+}
+
+/// The close-only watchdog for a client-RPC-deadline response whose upstream
+/// reached its terminal before the response was built, so its frames are
+/// served from memory instead of through the pump (issue #6904).
+///
+/// The backend is already released, so this keeps only the pump's EXPIRY
+/// half, with no channel and no per-frame hop: at the deadline it claims the
+/// expiry on `owner` unless the response has already claimed its own
+/// completion (the client took every frame before the terminal), sets `fired`,
+/// and after [`TRANSPORT_CLOSE_GRACE`] closes the client connection. That is
+/// the pump's outcome for a client that stops reading, so request, per-IP,
+/// admission and load-balancer accounting cannot outlive the deadline at the
+/// client's discretion. Held by the client-facing body like the pump's guard:
+/// hyper dropping that body aborts it.
+pub(crate) fn rpc_deadline_settled_watchdog(
+    owner: AuthorizationTerminalOwner,
+    fired: Arc<AtomicBool>,
+    closer: AuthorizationConnectionCloser,
+) -> ResponsePumpGuard {
+    let deadline_at = owner.0.deadline_at;
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep_until(deadline_at).await;
+        if owner.claim_authorization_expiry() != AuthorizationTerminalOwnership::AuthorizationExpiry
+        {
+            // The response claimed its own completion first: it keeps its
+            // terminal and its connection, however late the client drains it.
+            return;
+        }
+        fired.store(true, Ordering::Release);
+        tokio::time::sleep(TRANSPORT_CLOSE_GRACE).await;
+        // Reaching this line proves the client has not drained the terminal:
+        // hyper dropping the client-facing body would have aborted this task.
+        closer.request_close();
+    });
+    ResponsePumpGuard {
+        _pump: AbortPumpOnDrop(handle),
+        relays_frames: false,
+        earlier: None,
     }
 }
 
@@ -690,7 +749,8 @@ impl AuthorizationCancellableBody {
             body,
             ResponsePumpGuard {
                 _pump: pump,
-                _earlier: None,
+                relays_frames: true,
+                earlier: None,
             },
         )
     }
