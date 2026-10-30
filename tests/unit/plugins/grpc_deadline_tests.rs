@@ -6890,10 +6890,11 @@ impl http_body::Body for CountingFloodRpcBackendBody {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_response_complete_at_construction_releases_the_backend_without_a_pump() {
+async fn a_settled_response_releases_the_backend_at_once_and_still_reaps_a_stalled_client() {
     use ferrum_edge::_test_support::{
-        authorization_transport_close_grace, proxy_body_holds_client_grpc_deadline_pump_for_test,
-        proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_and_closer_for_test,
+        authorization_transport_close_grace, proxy_body_holds_client_grpc_deadline_guard_for_test,
+        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
     };
     use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
     use http_body_util::BodyExt;
@@ -6917,23 +6918,67 @@ async fn a_response_complete_at_construction_releases_the_backend_without_a_pump
     );
 
     // Issue #6904: the DATA and trailers were ready with the response head, so
-    // the backend is released at construction — before any client could stall
-    // — and no pump (task, channel, timer) is installed for it.
+    // the backend is released at construction and no frame-relaying pump is
+    // installed — only the close-only watchdog.
     assert!(
         dropped.load(Ordering::SeqCst),
         "a backend whose terminal is already read must be released at once"
     );
+    assert!(!proxy_body_holds_client_grpc_deadline_pump_for_test(&body));
+    assert!(proxy_body_holds_client_grpc_deadline_guard_for_test(&body));
+
+    // The client withholds credit from the start, so hyper polls nothing. The
+    // pump's outcome must hold: no close within the grace...
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(!closer.close_requested());
+    // ...then the connection is closed, releasing the request, per-IP,
+    // admission, and load-balancer accounting the response body holds.
+    tokio::time::sleep(authorization_transport_close_grace() + Duration::from_secs(1)).await;
     assert!(
-        !proxy_body_holds_client_grpc_deadline_pump_for_test(&body),
-        "a response completed by the read-ahead needs no response pump"
+        closer.close_requested(),
+        "a client that never drains a response settled from memory must be reaped exactly as \
+         the pump reaps it"
+    );
+    // A late drain sees the deadline, not the response: none of it was taken
+    // before the deadline.
+    let frame = body
+        .frame()
+        .await
+        .expect("the elapsed deadline produces a terminal")
+        .expect("no DATA reached the client, so the terminal is trailers");
+    assert_eq!(grpc_status_of(&frame).as_deref(), Some("4"));
+    assert!(body.frame().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_settled_response_with_only_its_terminal_left_needs_no_watchdog() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_holds_client_grpc_deadline_guard_for_test,
+        proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([http_body::Frame::trailers(grpc_ok_trailers())]),
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        closer.clone(),
     );
 
-    // The client drains only after the deadline and the close grace: the
-    // finished response keeps its own terminal and its connection, exactly as
-    // a pump that read the trailers before the deadline settles it.
+    // Only the terminal remains, so the response claims its completion at
+    // once, as the pump would on its first read, and needs no watchdog.
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!proxy_body_holds_client_grpc_deadline_guard_for_test(&body));
     tokio::time::sleep(Duration::from_secs(2) + authorization_transport_close_grace() * 2).await;
-    let data = body.frame().await.expect("data frame").expect("data ok");
-    assert_eq!(data.data_ref().map(|bytes| &bytes[..]), Some(GRPC_MESSAGE));
     let terminal = body.frame().await.expect("trailers").expect("trailers ok");
     assert_eq!(grpc_status_of(&terminal).as_deref(), Some("0"));
     assert!(body.frame().await.is_none());
@@ -6968,7 +7013,7 @@ impl Drop for EmptyRpcBackendBody {
 #[tokio::test(start_paused = true)]
 async fn a_read_ahead_response_ends_its_stream_only_once_polled_to_the_end() {
     use ferrum_edge::_test_support::{
-        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_holds_client_grpc_deadline_guard_for_test, proxy_body_streaming_for_test,
         proxy_body_with_client_grpc_deadline_and_closer_for_test,
     };
     use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
@@ -6989,7 +7034,7 @@ async fn a_read_ahead_response_ends_its_stream_only_once_polled_to_the_end() {
     );
 
     assert!(dropped.load(Ordering::SeqCst));
-    assert!(!proxy_body_holds_client_grpc_deadline_pump_for_test(&body));
+    assert!(!proxy_body_holds_client_grpc_deadline_guard_for_test(&body));
     // Framing parity with the pump: a terminal that is only queued is not an
     // end of stream, or hyper would finish the response on its HEADERS frame
     // without polling, skipping any terminal an outer adapter adds at the end.
@@ -7054,7 +7099,7 @@ impl Drop for SlowTerminalRpcBackendBody {
 #[tokio::test]
 async fn a_terminal_read_ahead_after_the_deadline_is_settled_as_the_deadline() {
     use ferrum_edge::_test_support::{
-        proxy_body_holds_client_grpc_deadline_pump_for_test, proxy_body_streaming_for_test,
+        proxy_body_holds_client_grpc_deadline_guard_for_test, proxy_body_streaming_for_test,
         proxy_body_with_client_grpc_deadline_and_closer_for_test,
     };
     use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
@@ -7088,8 +7133,9 @@ async fn a_terminal_read_ahead_after_the_deadline_is_settled_as_the_deadline() {
             "{terminal:?}: the finished backend is released either way"
         );
         assert!(
-            proxy_body_holds_client_grpc_deadline_pump_for_test(&body),
-            "{terminal:?}: a terminal observed after the deadline is not a completion"
+            proxy_body_holds_client_grpc_deadline_guard_for_test(&body),
+            "{terminal:?}: a terminal observed after the deadline is not a completion, so its \
+             expiry watchdog stays armed"
         );
         let frame = body
             .frame()

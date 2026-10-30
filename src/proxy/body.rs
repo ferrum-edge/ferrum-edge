@@ -1410,9 +1410,18 @@ impl ProxyBody {
         self
     }
 
-    /// Whether a client RPC deadline response pump is held on this body. A
-    /// response completed by the construction-time read-ahead holds none.
+    /// Whether a frame-relaying client RPC deadline response pump is held on
+    /// this body. A response settled from memory by the construction-time
+    /// read-ahead holds at most a close-only watchdog.
     pub(crate) fn holds_client_grpc_deadline_pump(&self) -> bool {
+        self.client_grpc_deadline_pump
+            .as_ref()
+            .is_some_and(ResponsePumpGuard::relays_frames)
+    }
+
+    /// Whether any client RPC deadline guard (a pump, or the close-only
+    /// watchdog of a response settled from memory) is held on this body.
+    pub(crate) fn holds_client_grpc_deadline_guard(&self) -> bool {
         self.client_grpc_deadline_pump.is_some()
     }
 
@@ -6116,6 +6125,11 @@ struct ReadAheadBody<B> {
     inner: Option<B>,
     /// Set once a terminal has been delivered (see `is_end_stream`).
     finished: bool,
+    /// Settled from memory only: the shared terminal owner, until this body
+    /// has decided its completion claim (see [`Self::claim_completion_when_due`]).
+    completion: Option<AuthorizationTerminalOwner>,
+    /// Whether this body won the completion claim.
+    completion_claimed: bool,
 }
 
 impl<B> ReadAheadBody<B> {
@@ -6129,7 +6143,43 @@ impl<B> ReadAheadBody<B> {
             terminal_error,
             inner,
             finished: false,
+            completion: None,
+            completion_claimed: false,
         }
+    }
+
+    /// A response whose upstream terminal was read ahead (the backend already
+    /// released), served from memory under the pump's completion rule.
+    fn settled(
+        frames: VecDeque<Frame<Bytes>>,
+        terminal_error: Option<BoxError>,
+        owner: AuthorizationTerminalOwner,
+    ) -> Self {
+        let mut body = Self::new(frames, terminal_error, None);
+        body.completion = Some(owner);
+        body.claim_completion_when_due();
+        body
+    }
+
+    /// Whether this settled response has already claimed its own completion.
+    fn completion_claimed(&self) -> bool {
+        self.completion_claimed
+    }
+
+    /// The pump's completion rule: it reads the upstream's terminal only once
+    /// the client has taken every frame before it (its channel holds one
+    /// frame), and claims completion there, refused at/after the deadline. A
+    /// settled body claims at the same point: when only the terminal remains.
+    fn claim_completion_when_due(&mut self) {
+        let Some(owner) = self.completion.as_ref() else {
+            return;
+        };
+        let terminal_frames = usize::from(self.frames.back().is_some_and(Frame::is_trailers));
+        if self.frames.len() > terminal_frames {
+            return;
+        }
+        self.completion_claimed = owner.claim_inner_completion();
+        self.completion = None;
     }
 }
 
@@ -6153,6 +6203,7 @@ where
             if frame.is_trailers() && this.inner.is_none() {
                 this.finished = true;
             }
+            this.claim_completion_when_due();
             return Poll::Ready(Some(Ok(frame)));
         }
         if let Some(error) = this.terminal_error.take() {
@@ -6208,18 +6259,23 @@ where
 /// is no remaining frame to bound.
 ///
 /// Before installing the pump, the frames the upstream already has ready are
-/// read ahead without waiting (issue #6904), within
-/// [`CLIENT_RPC_READ_AHEAD_MAX_FRAMES`] / [`CLIENT_RPC_READ_AHEAD_MAX_BYTES`].
-/// A unary response's DATA and trailers usually arrive with its headers. When
-/// the upstream's terminal is among them and the deadline had not elapsed when
-/// it was read, the backend body is dropped at once, so the backend is released before any
-/// client could stall, and the finished frames are served from memory with no
-/// pump, task, or timer. That is the pump's own rule for a response that
-/// reached its terminal before the deadline: it keeps that terminal however
-/// late the client drains it, and its connection. A response still open after
-/// the read-ahead goes to the pump with the frames already read delivered
-/// first. The pump costs one task, one channel and a cross-task hop per frame,
-/// which measured as a 17–21% throughput loss on deadline-bearing unary gRPC.
+/// read ahead without waiting (issue #6904), stopping at
+/// [`CLIENT_RPC_READ_AHEAD_MAX_FRAMES`] or once
+/// [`CLIENT_RPC_READ_AHEAD_MAX_BYTES`] is reached. A unary response's DATA and
+/// trailers usually arrive with its headers. When the upstream's terminal is
+/// among them, the backend body is dropped at once, so the backend is released
+/// before any client could stall, and the response is served from memory with
+/// no channel and no per-frame hop. It still settles through the pump's shared
+/// terminal owner and completion rule: it claims completion only once the
+/// client has taken every frame before the terminal (refused at/after the
+/// deadline, which also settles a terminal observed late as the deadline).
+/// Until then [`crate::proxy::response_watchdog::rpc_deadline_settled_watchdog`]
+/// keeps the pump's expiry half: status 4 or a reset for a client that has
+/// not drained by the deadline, and a connection close after the grace. A
+/// response still open after the read-ahead goes to the pump with the frames
+/// already read delivered first. The pump costs one task, one channel and a
+/// cross-task hop per frame, which measured as a 17–21% throughput loss on
+/// deadline-bearing unary gRPC.
 ///
 /// The returned [`ResponsePumpGuard`] (present only when a pump was installed)
 /// must be stored on the client-facing `ProxyBody`.
@@ -6246,52 +6302,34 @@ where
             } else {
                 (VecDeque::new(), ReadAheadEnd::Open)
             };
-            let owned = match end {
-                ReadAheadEnd::Complete(terminal_error) => {
-                    // The upstream reached its own terminal: release the
-                    // backend now, whatever the clock says.
-                    drop(body);
-                    let complete = ReadAheadBody::new(frames, terminal_error, None);
-                    // Re-read the clock where the terminal was OBSERVED: a
-                    // read-ahead that crossed the deadline must not settle a
-                    // late terminal as a completion (the pump's
-                    // `claim_inner_completion` refuses the same race).
-                    if tokio::time::Instant::now() < at {
-                        let timed = TotalDeadlineBody::with_deadline_frame(
-                            http_body_util::Either::Left(http_body_util::Either::Right(complete)),
-                            // No timer: a response that completed before its
-                            // deadline keeps its own terminal, as it does under
-                            // the pump.
-                            None,
-                            deadline_frame,
-                            fired,
-                        );
-                        return (timed, None);
-                    }
-                    // Past the deadline: the pump's deadline-first select
-                    // settles the finished body as an expiry (status 4 or a
-                    // reset, `fired`, and the close grace) without polling the
-                    // released backend again.
-                    complete
-                }
-                ReadAheadEnd::Open => ReadAheadBody::new(frames, None, Some(body)),
+            let ReadAheadEnd::Complete(terminal_error) = end else {
+                let owned = ReadAheadBody::new(frames, None, Some(body));
+                return pumped_client_grpc_deadline_body(owned, at, closer, deadline_frame, fired);
             };
-            let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
-                owned,
-                at,
-                Arc::clone(&fired),
-                Some(closer),
-            );
-            let owner = pumped.terminal_owner();
+            // The upstream reached its own terminal: release the backend now,
+            // whatever the clock says, and settle the response from memory
+            // under the pump's terminal owner and completion rule. The owner's
+            // clock check also settles a terminal the read-ahead observed AFTER
+            // the deadline as the deadline, exactly as the pump refuses it.
+            drop(body);
+            let owner = AuthorizationTerminalOwner::new(at);
+            let settled = ReadAheadBody::settled(frames, terminal_error, owner.clone());
+            let watchdog = (!settled.completion_claimed()).then(|| {
+                crate::proxy::response_watchdog::rpc_deadline_settled_watchdog(
+                    owner.clone(),
+                    Arc::clone(&fired),
+                    closer,
+                )
+            });
             let timed = TotalDeadlineBody::with_deadline_frame(
-                http_body_util::Either::Right(pumped),
-                // No timer here: the pump's shared terminal owner settles it.
+                http_body_util::Either::Left(http_body_util::Either::Right(settled)),
+                // No timer here: the shared terminal owner settles the bound.
                 None,
                 deadline_frame,
                 fired,
             )
             .with_authorization_terminal_owner(owner);
-            (timed, Some(pump))
+            (timed, watchdog)
         }
         _ => (
             TotalDeadlineBody::with_deadline_frame(
@@ -6303,6 +6341,40 @@ where
             None,
         ),
     }
+}
+
+/// Move a deadline-bearing response that is still open into the
+/// gateway-owned response pump. See [`client_grpc_deadline_body`].
+fn pumped_client_grpc_deadline_body<B>(
+    owned: ReadAheadBody<B>,
+    at: tokio::time::Instant,
+    closer: AuthorizationConnectionCloser,
+    deadline_frame: Option<Frame<Bytes>>,
+    fired: Arc<AtomicBool>,
+) -> (
+    TotalDeadlineBody<ClientGrpcDeadlineSource<B>>,
+    Option<ResponsePumpGuard>,
+)
+where
+    B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<BoxError>,
+{
+    let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
+        owned,
+        at,
+        Arc::clone(&fired),
+        Some(closer),
+    );
+    let owner = pumped.terminal_owner();
+    let timed = TotalDeadlineBody::with_deadline_frame(
+        http_body_util::Either::Right(pumped),
+        // No timer here: the pump's shared terminal owner settles it.
+        None,
+        deadline_frame,
+        fired,
+    )
+    .with_authorization_terminal_owner(owner);
+    (timed, Some(pump))
 }
 
 struct DirectH3Body<S = crate::http3::client::H3RequestStream> {

@@ -14992,12 +14992,21 @@ pub mod _test_support {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, Some(closer))
     }
 
-    /// Whether `body` holds a client RPC deadline response pump (issue #6904):
-    /// a response whose terminal was read ahead at construction holds none.
+    /// Whether `body` holds a frame-relaying client RPC deadline response pump
+    /// (issue #6904): a response whose terminal was read ahead at construction
+    /// holds none.
     pub fn proxy_body_holds_client_grpc_deadline_pump_for_test(
         body: &crate::proxy::ProxyBody,
     ) -> bool {
         body.holds_client_grpc_deadline_pump()
+    }
+
+    /// Whether `body` holds any client RPC deadline guard: a pump, or the
+    /// close-only watchdog of a response settled from memory.
+    pub fn proxy_body_holds_client_grpc_deadline_guard_for_test(
+        body: &crate::proxy::ProxyBody,
+    ) -> bool {
+        body.holds_client_grpc_deadline_guard()
     }
 
     /// Poll a native-gRPC streaming upload (`GrpcBody::Streaming`, the body
