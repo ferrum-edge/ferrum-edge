@@ -881,7 +881,22 @@ fn native_h3_client_deadlines_remain_health_neutral() {
         "_ = &mut grpc_deadline_sleep, if grpc_deadline_active && !stream_done =>",
         "fault = &mut upload_fault_wait =>",
     );
-    assert_h3_arm_health_neutral(body_deadline, 3, "native H3 gRPC body-deadline arm");
+    assert!(
+        body_deadline.contains("settle_client_grpc_deadline!();"),
+        "the body-deadline arm must settle through the shared client-deadline terminal"
+    );
+    // That terminal is shared with a backend failure observed at/after the
+    // deadline before its sleep fired (issue #6022), so its classifications are
+    // asserted once, on the macro body.
+    let deadline_terminal = native_h3_grpc_select_arm(
+        "macro_rules! settle_client_grpc_deadline {",
+        "'outer: loop {",
+    );
+    assert_h3_arm_health_neutral(
+        deadline_terminal,
+        3,
+        "native H3 gRPC client-deadline terminal",
+    );
 
     // The terminating request-upload fault arm is client-caused too (client
     // abort, malformed trailing metadata, oversized upload), so it obeys the

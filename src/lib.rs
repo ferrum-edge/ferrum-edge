@@ -11807,9 +11807,38 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        match crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
-            .await
-        {
+        // An infallible collect: only the bound itself can end it.
+        let collect = async move { Ok::<_, std::convert::Infallible>(collect.await) };
+        response_collect_bound_for_test(
+            crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+                .await,
+        )
+    }
+
+    /// [`collect_response_under_authorization_for_test`] for a collect that can
+    /// FAIL, so a test can drive the late-failure cutoff (issue #6022).
+    pub async fn fallible_collect_response_under_authorization_for_test<F>(
+        collect: F,
+        grpc_deadline_at: Option<tokio::time::Instant>,
+        auth: Option<&(
+            crate::proxy::auth_lifetime::StreamAuthDeadline,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily,
+            crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+        )>,
+    ) -> ResponseCollectBoundForTest
+    where
+        F: std::future::Future<Output = Result<(), ()>>,
+    {
+        response_collect_bound_for_test(
+            crate::proxy::collect_response_under_authorization(grpc_deadline_at, auth, collect)
+                .await,
+        )
+    }
+
+    fn response_collect_bound_for_test<T>(
+        outcome: Result<T, crate::proxy::ResponseCollectBound>,
+    ) -> ResponseCollectBoundForTest {
+        match outcome {
             Ok(_) => ResponseCollectBoundForTest::Completed,
             Err(crate::proxy::ResponseCollectBound::RpcDeadline) => {
                 ResponseCollectBoundForTest::RpcDeadline

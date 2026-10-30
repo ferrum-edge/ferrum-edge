@@ -7236,3 +7236,61 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
          downgrade"
     );
 }
+
+/// Issue #6022, buffered collects: a collect that FAILS after the client
+/// deadline, while the bound's sleep is still unfired, is settled as that
+/// deadline. The collect blocks the runtime's only thread past the deadline, so
+/// the time driver cannot turn before the failure is observed.
+#[tokio::test]
+async fn a_buffered_collect_failing_after_an_unfired_client_deadline_is_the_deadline() {
+    use ferrum_edge::_test_support::{
+        ResponseCollectBoundForTest, fallible_collect_response_under_authorization_for_test,
+    };
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let outcome = fallible_collect_response_under_authorization_for_test(
+        async {
+            std::thread::sleep(Duration::from_millis(30));
+            Err(())
+        },
+        Some(deadline),
+        None,
+    )
+    .await;
+    assert_eq!(outcome, ResponseCollectBoundForTest::RpcDeadline);
+}
+
+/// The cutoff keeps a collect that COMPLETED, however late it is observed, and
+/// keeps a failure observed before the deadline as the backend's.
+#[tokio::test]
+async fn a_buffered_collect_keeps_late_success_and_early_failure() {
+    use ferrum_edge::_test_support::{
+        ResponseCollectBoundForTest, fallible_collect_response_under_authorization_for_test,
+    };
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let late_success = fallible_collect_response_under_authorization_for_test(
+        async {
+            std::thread::sleep(Duration::from_millis(30));
+            Ok(())
+        },
+        Some(deadline),
+        None,
+    )
+    .await;
+    assert_eq!(late_success, ResponseCollectBoundForTest::Completed);
+
+    let early_failure = fallible_collect_response_under_authorization_for_test(
+        async { Err(()) },
+        Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        early_failure,
+        ResponseCollectBoundForTest::Completed,
+        "a failure before the deadline reaches the caller as the collect's own error"
+    );
+}
