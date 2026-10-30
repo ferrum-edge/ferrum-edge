@@ -11098,6 +11098,21 @@ pub mod _test_support {
         crate::proxy::clone_log_metadata(ctx).into_iter().collect()
     }
 
+    /// The streaming terminal logger's projection: moves `ctx.metadata` out
+    /// instead of cloning it (issue #6793).
+    pub fn take_log_metadata(ctx: &mut crate::plugins::RequestContext) -> HashMap<String, String> {
+        crate::proxy::take_log_metadata(ctx).into_iter().collect()
+    }
+
+    /// Latch a credential-expiry termination on the request's shared
+    /// authorization latch, as a body adapter does when the lifetime elapses.
+    pub fn latch_credential_expired_termination_for_test(ctx: &crate::plugins::RequestContext) {
+        ctx.authorization_termination_latch().record_once(
+            crate::proxy::auth_lifetime::StreamAuthTermination::CredentialExpired,
+            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+        );
+    }
+
     /// Whether this request has materialized the boxed per-plugin working state
     /// (issue #5537).
     ///

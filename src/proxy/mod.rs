@@ -5405,7 +5405,29 @@ pub(crate) fn redact_request_body_from_log_metadata<MS: std::hash::BuildHasher>(
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> crate::plugins::MetadataMap {
-    let mut metadata = ctx.metadata.clone();
+    project_log_metadata(ctx, ctx.metadata.clone())
+}
+
+/// [`clone_log_metadata`] for a context whose own metadata map nothing reads
+/// again: the map is MOVED into the projection instead of cloning every key
+/// and value, and `ctx.metadata` is left empty.
+///
+/// The streaming terminal logger's delivery task owns its context and drops it
+/// once delivery returns, and terminal delivery reads only typed context state
+/// (`detached_terminal_delivery_reads_only_what_its_slim_context_carries`), so
+/// the clone there bought nothing but a second copy of the map to free (issue
+/// #6793). The projected map is identical to [`clone_log_metadata`]'s.
+pub(crate) fn take_log_metadata(ctx: &mut RequestContext) -> crate::plugins::MetadataMap {
+    let metadata = std::mem::take(&mut ctx.metadata);
+    project_log_metadata(ctx, metadata)
+}
+
+/// The transaction-log projection of `metadata`, a copy of (or the moved)
+/// `ctx.metadata`. Reads only typed context state, never `ctx.metadata`.
+fn project_log_metadata(
+    ctx: &RequestContext,
+    mut metadata: crate::plugins::MetadataMap,
+) -> crate::plugins::MetadataMap {
     // Detached uploads publish through the shared latch. Import its bounded
     // class even when no response relay copied it into the request context.
     if let Some(termination) = ctx.authorization_termination_latch().observed() {
