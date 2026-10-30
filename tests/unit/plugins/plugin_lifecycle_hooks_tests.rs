@@ -223,6 +223,7 @@ async fn every_registered_builtin_reports_a_narrow_declaration_at_runtime() {
     // Covers built-ins whose `impl Plugin` lives in a shape the source scan
     // does not read: an undeclared one still runs every hook (safe), but
     // silently forgoes the skipped boxed calls.
+    let _basic_auth_secret = super::plugin_utils::basic_auth_test_secret_guard();
     for registration in BUILTIN_PLUGIN_REGISTRATIONS {
         let name = registration.name;
         let mut config = minimal_plugin_config(name);
