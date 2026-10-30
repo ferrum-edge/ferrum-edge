@@ -216,7 +216,8 @@ The container includes a built-in `HEALTHCHECK` that runs the `ferrum-edge healt
 docker ps
 # Shows health status (healthy/starting/unhealthy)
 
-# Test from the host
+# Test from the host (only when admin is bound non-loopback and its port is
+# published, as in Basic Usage above; admin binds loopback by default)
 curl -f http://localhost:9000/health
 ```
 
@@ -227,7 +228,7 @@ When the plaintext admin listener is disabled (`FERRUM_ADMIN_HTTP_PORT=0`), the 
 HEALTHCHECK CMD ["/app/ferrum-edge", "health", "--tls", "--tls-no-verify"]
 ```
 
-> **Note**: The distroless images have no shell or curl. Use `curl` from the host or configure orchestrator-level health checks (for example, Kubernetes `httpGet` probes).
+> **Note**: The distroless images have no shell or curl. Use the built-in `ferrum-edge health` exec check. Kubernetes `httpGet` probes work only when admin is bound to a reachable non-loopback address; see [Kubernetes probe guidance](kubernetes_deployment.md#default-probe-strategy).
 
 ## Running with Docker Compose
 
@@ -531,7 +532,9 @@ docker run \
 
 **Prometheus Metrics**:
 ```bash
-# Metrics available at Admin API (requires observability auth)
+# Metrics available at Admin API (requires observability auth; from the host only
+# when admin is bound non-loopback and its port is published — admin binds
+# loopback by default, see the admin-exposure note in docker-compose.yml)
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/metrics
 ```
 

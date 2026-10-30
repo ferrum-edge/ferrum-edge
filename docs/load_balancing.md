@@ -239,7 +239,7 @@ With weights 5:1 and 60 requests, `large-server` receives 50 requests and `small
 
 The smooth WRR algorithm ensures the distribution is interleaved. For example, with weights 5:1, the sequence is approximately: `L, L, L, L, S, L, L, L, L, L, S, L, ...` rather than `L, L, L, L, L, S, L, L, L, L, L, S, ...`.
 
-**Concurrency model:** Each WRR lane (parent upstream, subset, or port override) keeps a **bounded multi-fingerprint cache** of precomputed smooth-WRR orders behind `ArcSwap` slots (8 slots). Every cached healthy set owns an independent set of 16 cache-line-padded `AtomicU64` selection-counter shards, preventing alternating per-proxy health or retry fingerprints from aliasing onto one counter parity and preventing small healthy sets from bouncing a single shared cache line under concurrency. Threads are assigned across a fixed 16-shard bound, so high worker counts may share shards without growing per-lane memory. Steady-state picks are wait-free across Tokio workers (slot scan + sharded atomic counter). Each shard walks the same precomputed smooth-WRR order, so uncapped cached periods match configured weights without a per-request blocking mutex; workers intentionally do **not** share one global interleaving. On a cache miss, a publisher uses `try_lock` to fill empty slots immediately and to rate-sample replacements once the cache is full; contending missers and unsampled misses never build an ephemeral smooth schedule — they take an allocation-free O(candidate) weighted lottery (or all-zero round-robin) over eligible positive-weight targets. That miss fallback preserves reachability and unhealthy/excluded-target safety but does **not** claim exact smooth-WRR interleaving. Smooth schedule construction is additionally bounded by an explicit work budget (`schedule_steps × positive_candidates`, capped at 8192 × 128): when a pathological candidate × period product would exceed that budget, the publisher stores an exact-key lottery-only sentinel so the same fingerprint does not repeatedly attempt the quadratic NGINX build; matching hits then reuse the allocation-free lottery / all-zero RR path. Schedules are a pure function of exact healthy-set membership and immutable target weights on the current `LoadBalancer` generation (config reload swaps the balancer `Arc`), so no invalidate flag is required and the >128-target path cannot reuse a schedule after a hash collision. Each shard counter wraps with `% order.len()` and does not bias ratios. Exact normalized periods up to 8192 entries are retained; larger periods are proportionally apportioned into 8192 entries while reserving at least one entry for every positive-weight target, then smoothed over that complete bounded period when the work budget allows. Those capped schedules are bounded approximations of pathological exact periods (they retain every positive-weight target but do not claim exact configured ratios when the uncapped period would exceed 8192). At most a fixed number of healthy-set schedules are retained per lane.
+**Concurrency model:** Each WRR lane (parent upstream, subset, or port override) caches precomputed smooth-WRR orders for a bounded number of healthy sets, and steady-state picks are lock-free (an `ArcSwap` slot scan plus sharded atomic counters). Each worker shard walks the same order, so uncapped periods match configured weights, but workers intentionally do **not** share one global interleaving. A cache miss, contended publish, or schedule whose construction would exceed the work budget falls back to an allocation-free weighted lottery (or all-zero round-robin) over eligible targets; that fallback preserves reachability and unhealthy/excluded-target safety but not exact smooth interleaving. Exact periods up to 8192 entries are retained; larger periods are apportioned into 8192 entries that keep every positive-weight target, so extreme schedules approximate rather than exactly match configured ratios.
 
 Subset and port WRR lanes remain isolated from each other and from the parent lane.
 
@@ -809,42 +809,14 @@ HTTP/1.1 200 OK
 
 ## Retry Logic
 
-When a request to a backend target fails, the retry system can automatically retry to a **different** target in the upstream. This provides automatic failover without client-side retry logic.
-
-> For comprehensive retry documentation including configuration reference, backoff strategies, protocol support, and examples, see [Retry Logic](retry.md).
-
-```yaml
-proxies:
-  - id: "my-api"
-    listen_path: "/api"
-    backend_scheme: http
-    backend_host: "10.0.1.1"
-    backend_port: 8080
-    upstream_id: "api-servers"
-    retry:
-      max_retries: 3
-      retryable_status_codes: [502, 503, 504]
-      retry_on_connect_failure: true
-      backoff: !exponential
-        base_ms: 100
-        max_ms: 5000
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_retries` | integer | `3` | Maximum number of retry attempts |
-| `retryable_status_codes` | array | `[]` (empty) | HTTP status codes that trigger a retry — empty by default (connection-failure-only) |
-| `retryable_methods` | array | `["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]` | HTTP methods eligible for status-code retries (connection failure retries ignore this) |
-| `retry_on_connect_failure` | boolean | `true` | Retry on TCP/connection failures (refused, timeout, DNS, TLS) |
-| `backoff` | tagged enum | `!fixed { delay_ms: 100 }` | Backoff strategy between retries |
+When a request to a backend target fails, the retry system can automatically retry to a **different** target in the upstream. This provides automatic failover without client-side retry logic. Configuration fields, defaults, backoff strategies, and examples live in [Retry Logic](retry.md).
 
 ### Key Behaviors
 
-- **Connection failures** (TCP refused, DNS, TLS, timeout) are retried for **all HTTP methods** — the request never reached the backend so idempotency is not a concern.
-- **HTTP status-code failures** (e.g., 502, 503) are only retried for methods in `retryable_methods` — `POST` and `PATCH` are excluded by default.
-- **Status-code retries are opt-in** — `retryable_status_codes` defaults to empty. Set it explicitly to enable (e.g., `[502, 503, 504]`).
+- **Connection failures** (TCP refused, DNS, TLS, timeout) are retried for **all HTTP methods**; **status-code retries** are opt-in (`retryable_status_codes` is empty by default) and apply only to `retryable_methods` (`POST` and `PATCH` are excluded by default).
 - **A backend `508 Loop Detected` is never retried**, even when listed in `retryable_status_codes`: it is the deterministic [proxy hop limit](routing.md#proxy-hop-limit) refusal of a downstream Ferrum gateway, and retrying it at every hop of a chain would amplify traffic geometrically.
-- When combined with an upstream, retries **exclude the previously tried target** so each attempt goes to a different backend. HTTP/H3 exclusion uses the full configured routing/policy identity (`host`, `port`, declared Service port / policy lane, tags, locality, path) — not merely `host:port` — so two `backendRefs` that share a network endpoint but differ by Service, subset, or path stay distinct. For wildcard-hosted targets the shared retry helper reconciles the just-tried dial clone back to that configured identity, then returns the next candidate already re-concretized with the request's validated authority (failing closed if that authority is missing or unmatched). TCP/stream connect-retry retains only the live `(host, dial port, policy lane)` tuple, so it uses a separate endpoint-lane exclude contract: every configured entry on that effective lane is dropped (including ordinary targets whose `service_port_policy_key` is `None` but whose `dispatch_policy_port()` equals the dial port), and ambiguous same-lane identity siblings are not reselected.
+- When combined with an upstream, retries **prefer a different healthy target**. HTTP/H3 exclusion uses the full configured routing/policy identity (`host`, `port`, declared Service port / policy lane, tags, locality, path) — not merely `host:port` — so two `backendRefs` that share a network endpoint but differ by Service, subset, or path stay distinct; wildcard-hosted targets are re-concretized with the request's validated authority (failing closed if it is missing or unmatched). When no healthy alternate exists, HTTP-family retries re-attempt the previously tried target.
+- TCP/stream connect-retry uses a separate **endpoint-lane** exclude contract: every configured entry on the failed `(host, dial port, policy lane)` is dropped, and ambiguous same-lane identity siblings are not reselected.
 - Retries apply to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket protocols. TCP stream proxies rotate to an alternate target only for connection-phase failures when `retry_on_connect_failure` is enabled; UDP stream proxies do not use retry logic.
 
 ## Circuit Breaker

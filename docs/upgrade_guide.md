@@ -26,6 +26,11 @@ over production traffic.** File mode has no database; its config format is
 `version: "1"` with no shipped config transforms, so breaking field changes are
 applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
+Per-release sections below are written when a release is cut. Changes already
+on `main` but not yet released, including breaking ones, are listed under
+`[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
+deploying a build from `main`.
+
 ## Upgrading to 0.9.19
 
 0.9.19 was published on 2026-10-27 UTC from commit
@@ -3412,6 +3417,10 @@ for limits, PUT semantics, and `X-Ferrum-Provisioned-By` behavior.
   Older data planes reject any namespace snapshot containing non-empty labels.
 - **File mode and companion clients:** upgrade gateways and file validators
   before clients begin emitting labels, including `labels.provisioned-by`.
+  Companion clients that inject `labels.provisioned-by` require matching
+  gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218),
+  Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and
+  Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
   Existing unlabeled resources remain valid and are not automatically attributed.
 
 ## Breaking changes in 0.9.0

@@ -163,7 +163,7 @@ Per-gateway comparison of HTTP vs HTTPS vs E2E TLS performance. Shows the RPS dr
 
 ## Findings (All-Docker, April 2026)
 
-The following results were collected on macOS (Apple Silicon M3 Max) with 8 threads, 100 connections, and 30-second measured runs, all gateways in Docker. They predate the current ~10 KB `POST /api/echo` workload: they used `GET` requests to `/health` (instant backend response) and `/api/users` (100 µs simulated backend delay), with key-auth on `/api/users-auth`. A new run produces a different table.
+The following results were collected on macOS (Apple Silicon M3 Max) with 8 threads, 100 connections, and 30-second measured runs, all gateways in Docker. They predate the current ~10 KB `POST /api/echo` workload: they used `GET` requests to `/health` (instant backend response) and `/api/users` (100 µs simulated backend delay), with key-auth on `/api/users-auth`. The gateway versions recorded below (Envoy 1.37, Kong 3.14, Tyk v5.12) are older than the current `run_comparison.sh` defaults. A new run produces a different table.
 
 ### Raw Proxy Performance
 
@@ -176,8 +176,6 @@ The following results were collected on macOS (Apple Silicon M3 Max) with 8 thre
 | **Tyk** | 24,884 | 24,414 | 24,800 | 23,466 | 22,957 | 21,902 |
 | **KrakenD** | 21,995 | 20,497 | 20,682 | 20,178 | 19,941 | 21,737 |
 
-**Ferrum leads or ties in 5 of 6 proxy scenarios.** Ferrum's HTTPS /health (30,975 req/s) is the highest single result, and E2E TLS /api/users (27,902 req/s) beats every other gateway by 10-28% on the most production-representative test (double-TLS with realistic backend latency). Envoy takes HTTPS /api/users by 2% which is likely just networking variance.
-
 ### Key-Auth Results (HTTP, /api/users-auth)
 
 Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. KrakenD is excluded (key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation.
@@ -188,41 +186,6 @@ Each gateway proxies `/api/users-auth` → backend `/api/users` with API key aut
 | **Envoy 1.37** (Docker, Lua) | 26,252 | 3.97 ms |
 | **Kong 3.14** (Docker) | 22,307 | 4.55 ms |
 | **Tyk v5.12** (Docker) | 20,529 | 4.72 ms |
-
-**Key findings:**
-- **Ferrum is the fastest gateway on authenticated requests** — 26,756 req/s, beating Envoy by 2%, Kong by 20%, and Tyk by 30%.
-- **Ferrum's key-auth has effectively zero overhead** — authenticated requests (26,756 req/s) match unauthenticated HTTP /api/users (28,206 req/s) within 5%. The pre-computed `ConsumerIndex` with `Arc<Consumer>` means authentication adds only an atomic refcount bump (~5ns) and a HashMap lookup (~50ns) to the request path — no deep cloning, no string allocation.
-- **Kong's key-auth** — 22,307 req/s puts Kong within 20% of Ferrum and ahead of Tyk.
-
-### Ferrum vs Envoy (All-Docker Comparison)
-
-Both gateways run in Docker with identical conditions.
-
-| Test | Ferrum | Envoy | Advantage |
-|------|--------|-------|-----------|
-| HTTP /health | **29,153 req/s** | 28,558 req/s | **Ferrum 2% faster** |
-| HTTP /api/users | **28,206 req/s** | 27,896 req/s | **Ferrum 1% faster** |
-| HTTPS /health | **30,975 req/s** | 28,983 req/s | **Ferrum 7% faster** |
-| HTTPS /api/users | 26,481 req/s | **27,001 req/s** | Envoy 2% faster |
-| E2E TLS /health | **29,131 req/s** | 27,014 req/s | **Ferrum 8% faster** |
-| **E2E TLS /api/users** | **27,902 req/s** | 23,784 req/s | **Ferrum 17% faster** |
-| **Key-Auth /api/users-auth** | **26,756 req/s** | 26,252 req/s | **Ferrum 2% faster** |
-
-**Key findings:**
-- **Ferrum wins 6 of 7 tests against Envoy** — from 1% on HTTP plaintext to 17% on E2E TLS with backend latency. Envoy's only lead is HTTPS /api/users by 2%.
-- **Ferrum dominates E2E TLS** — 27,902 vs 23,784 req/s (17% advantage). Full double-TLS encryption with realistic backend latency is where Ferrum's rustls and connection pooling excel. This is the most production-representative scenario.
-- **Ferrum wins on authenticated workloads** — when auth plugins enter the picture, Ferrum's compiled Rust plugin with zero-copy `Arc<Consumer>` lookup beats Envoy's Lua VM filter. Real-world deployments always have plugins (auth, rate limiting, logging), making this the more relevant comparison.
-
-### Why Ferrum Wins on Authentication
-
-Ferrum's authentication architecture is designed for zero per-request allocation:
-
-1. **Pre-computed ConsumerIndex** — credentials are indexed into per-type HashMaps at config load time (not per-request)
-2. **Arc\<Consumer\> zero-copy** — the `ConsumerIndex` returns `Arc<Consumer>` and the auth plugin stores it directly in the request context without cloning the Consumer struct
-3. **Pre-computed header names** — the `KeyAuth` plugin lowercases the header name once at config load time, not on every request
-4. **Lock-free reads** — `ArcSwap::load()` for the credential index is a single atomic load with no mutex or spinlock
-
-By contrast, Envoy's Lua filter runs interpreted Lua code on every request, and Kong's plugin chain involves multiple Lua function calls with table lookups per authenticated request.
 
 ## Docker Networking
 

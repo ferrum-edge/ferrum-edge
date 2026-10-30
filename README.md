@@ -99,8 +99,6 @@ Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/relea
 
 Pin an explicit release tag in download URLs. Binaries are published only for version tags; main does not publish a moving `latest` binary release. GitHub's `/releases/latest` endpoint skips prereleases. Use `/releases/download/<tag>/…` or `gh release download <tag>` instead. Pick the current immutable `vX.Y.Z` semver tag from the [Releases](https://github.com/ferrum-edge/ferrum-edge/releases) page, and pin deployments to that version.
 
-Feature availability by release: resource labels (`labels` / `ResourceLabels` on Proxy, Consumer, Upstream, and PluginConfig, [#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483)) require **v0.9.5 or later**; artifacts through v0.9.4 reject `labels` with ``unknown field `labels` ``. See the [upgrade guidance](docs/upgrade_guide.md#upgrading-to-095) for database and CP/DP rollout requirements. Companion clients that inject `labels.provisioned-by` require matching gateway builds: Git Forge Ops ≥ [#218](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/pull/218), Nexus ≥ [#245](https://github.com/ferrum-edge/ferrum-nexus/pull/245), and Foundry ≥ [#340](https://github.com/ferrum-edge/ferrum-foundry/pull/340).
-
 ```bash
 # Example: Linux x86_64
 set -euo pipefail
@@ -114,7 +112,7 @@ sudo install -m 0755 ferrum-edge-linux-x86_64 /usr/local/bin/ferrum-edge
 ferrum-edge version
 ```
 
-Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). The x86_64 GNU binaries are built in a digest-pinned **AlmaLinux 8.10** sysroot (glibc 2.28) by the same job that checksums and uploads them, and that job ABI-scans and smoke-tests the exact staged bytes before publishing them, so the released artifact is the artifact that was verified. ARM64 GNU artifacts come from the isolated Cross build, already target an older glibc, and are re-checked as published. Beyond glibc, the remaining dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`. Any GNU artifact whose GLIBC version-need records exceed 2.34, whose `DT_NEEDED` set is outside that allowlist, whose `e_machine` does not match the advertised `*-x86_64` / `*-aarch64` architecture, or that embeds a `DT_RPATH` / `DT_RUNPATH`, fails the release.
+Published Linux GNU artifacts (`ferrum-edge-linux-x86_64`, `ferrum-cni-linux-x86_64`, and the ARM64 pair) are dynamically linked against glibc. The declared runtime floor is **GLIBC_2.34** (RHEL 9 / Rocky Linux 9 / AlmaLinux 9, which also covers Ubuntu 22.04 and Debian 12). Beyond glibc, the remaining dynamic libraries are `libgcc_s.so.1` and, when the Kafka stack does not static-link zlib, `libz.so.1`. The x86_64 GNU binaries are built in an **AlmaLinux 8.10** sysroot; see [docs/ci_cd.md](docs/ci_cd.md) for the release producer and ABI verification gates.
 
 ### Docker
 
@@ -441,7 +439,7 @@ See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for TCP/UDP/DTLS proxy config
 
 ## Load Balancing & Resilience
 
-- **Six algorithms**: Round Robin, Weighted Round Robin, Least Connections, Least Latency, Consistent Hashing, Random
+- **Seven algorithms**: Round Robin, Weighted Round Robin, Least Connections, Least Latency, Consistent Hashing, Random, and Passthrough (mesh original-destination; falls back to Round Robin elsewhere)
 - **Health checks**: Active probes (HTTP, TCP connect, UDP, gRPC health) and passive monitoring
 - **Circuit breaker**: Three-state pattern (Closed/Open/Half-Open)
 - **Retry**: Connection and HTTP-level retries with fixed/exponential backoff
@@ -478,23 +476,6 @@ In-memory async DNS cache with startup warmup, stale-while-revalidate, per-proxy
 
 ## Performance
 
-Historical small-payload multi-protocol benchmark results from
-`tests/performance/multi_protocol/` (local macOS Apple Silicon run, 200
-concurrent, 10s, 64-byte payload; run date not recorded in this summary):
-
-| Protocol | Gateway RPS | Gw P50 | Gw P99 | Direct RPS | Direct P50 | Direct P99 | Overhead |
-|----------|------------|--------|--------|------------|------------|------------|----------|
-| HTTP/1.1 | 102,183 | 1.89ms | 3.85ms | 209,910 | 939μs | 1.81ms | ~51% |
-| HTTP/1.1+TLS | 101,317 | 1.90ms | 3.84ms | 209,361 | 941μs | 1.81ms | ~52% |
-| HTTP/2 | 108,138 | 1.67ms | 6.38ms | 355,544 | 486μs | 1.53ms | ~70% |
-| HTTP/3 (QUIC) | 53,085 | 3.51ms | 5.87ms | 83,592 | 2.38ms | 2.80ms | ~37% |
-| gRPC | 68,352 | 2.53ms | 12.02ms | 205,927 | 821μs | 3.15ms | ~67% |
-| WebSocket | 103,830 | 1.88ms | 3.15ms | 207,507 | 952μs | 1.72ms | ~50% |
-| TCP | 108,841 | 1.83ms | 2.59ms | 214,113 | 928μs | 1.65ms | ~49% |
-| TCP+TLS | 107,340 | 1.84ms | 2.68ms | 207,103 | 949μs | 1.78ms | ~48% |
-| UDP | 82,042 | 2.46ms | 2.93ms | 276,526 | 682μs | 1.27ms | ~70% |
-| UDP+DTLS | 76,107 | 2.61ms | 3.69ms | 101,839 | 1.96ms | 2.47ms | ~25% |
-
 **Adaptive buffer sizing** (enabled by default) dynamically tunes TCP/WebSocket tunnel copy buffers and UDP batch limits per proxy based on observed traffic patterns. Small-message proxies get smaller buffers (saves memory), bulk transfer proxies get larger buffers (reduces syscalls). See `FERRUM_ADAPTIVE_BUFFER_*` env vars for tuning.
 
 **Linux socket tuning**: (`TCP_FASTOPEN`, `IP_BIND_ADDRESS_NO_PORT`), thread-local Date header caching, lazy timeout initialization, frequency-aware router cache eviction (Count-Min Sketch), RED-style adaptive load shedding, and a cacheability predictor for the response cache plugin. See [FEATURES.md](FEATURES.md) for details.
@@ -521,19 +502,7 @@ When the effective soft cap after startup is below 65,536, Ferrum Edge emits one
 
 ### Gateway Comparison
 
-Historical local comparison summary (macOS Apple Silicon, 100 concurrent, 30s;
-run date not recorded in this summary):
-
-All gateways run in Docker containers for apples-to-apples comparison:
-
-| Gateway | Key-Auth req/s | Key-Auth Latency | vs Ferrum |
-|---------|---------------|-----------------|-----------|
-| **Ferrum Edge** | **27,979** | **3.44 ms** | — |
-| Envoy 1.37 (Lua filter) | 26,787 | 3.64 ms | Ferrum 4% faster |
-| Kong 3.14 | 25,009 | 3.91 ms | Ferrum 12% faster |
-| Tyk v5.12 | 19,186 | 5.08 ms | Ferrum 46% faster |
-
-Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the highest throughput of any gateway in any scenario, beating Envoy by 13%. Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See [`comparison/README.md`](comparison/README.md) and [`comparison/run_comparison.sh`](comparison/run_comparison.sh) for the reproducible Docker gateway comparison harness, which checks for port and Docker name conflicts and cleans up only resources it creates, and [`tests/performance/README.md`](tests/performance/README.md) for the benchmark provenance checklist.
+See [`comparison/README.md`](comparison/README.md) and [`comparison/run_comparison.sh`](comparison/run_comparison.sh) for the reproducible Docker gateway comparison harness, which checks for port and Docker name conflicts and cleans up only resources it creates, and [`tests/performance/README.md`](tests/performance/README.md) for the benchmark provenance checklist.
 
 ## Troubleshooting
 

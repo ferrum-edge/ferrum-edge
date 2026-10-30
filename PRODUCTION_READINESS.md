@@ -180,22 +180,17 @@ re-opened from the issue body alone.
 
 ## Current residual map
 
-**Last narrative reconciliation:** 2026-08-18 (issue #3893). PR #4010 removed the
+**Last narrative reconciliation:** 2026-10-30 (previously 2026-08-18, issue #3893). PR #4010 removed the
 launch-readiness workflows, verifiers, policy inventory, and the
 `validate-launch-readiness` release job. There is no live gate and no
-open-inventory artifact. This table is a human-maintained leftover ledger from
-the 2026-07-12 epic (plus the still-open 2026-08-15 CI tracker), not an automated
-go/no-go signal and not an inventory of every open GitHub issue.
+open-inventory artifact. This map is a human-maintained leftover ledger from
+the 2026-07-12 epic, not an automated go/no-go signal and not an inventory of
+every open GitHub issue.
 
-Rows below cite only issues that were OPEN when this reconcile ran (`gh issue
-view --json number,state,title`). Closed former residuals are recorded under
-Implemented since the epic. Ordinary post-launch bugs and CI trackers live on
-their dedicated issues.
-
-| Residual | Issue(s) | Notes |
-|----------|----------|-------|
-| Provenance-complete mesh/HBONE/DNS perf baselines | #3332 | OPEN — harnesses exist; hosted collection PRs have landed; checked-in `baseline.md` tables still `_TBD_`. No closing PR. |
-| Scheduled Scaling Regression red (JWT expiry / 503 retry) | #3892 | OPEN — 2026-08-15 CI tracker; PR #3895 in flight. Not claimed resolved. |
+The residual map is currently **empty**: the last two rows (#3332 and #3892)
+closed on 2026-08-21 and are recorded below. Closed former residuals are
+recorded under Implemented since the epic. Ordinary post-launch bugs and CI
+trackers live on their dedicated issues.
 
 **Implemented since the epic (do not re-open from stale checklists):** remote-discovery
 JWT audience binding (#2475); Ambient UDP capture producer + live source-capture e2e
@@ -215,8 +210,9 @@ evidence including live kind install/uninstall recovery (#3609). Admin CRUD
 refactor remainder from retired `REFACTORING_PLAN.md` is discretionary historical
 text in the #2110 register; #2110 itself is CLOSED and is not a live tracker.
 
-Moved off the residual map in the 2026-08-18 reconcile (all CLOSED / COMPLETED;
-closing PR from `closedByPullRequestsReferences`):
+Moved off the residual map in the 2026-08-18 reconcile (the last two rows in the
+2026-10-30 reconcile; all CLOSED / COMPLETED; closing PR from
+`closedByPullRequestsReferences`):
 
 | Residual | Closed | Closing PR |
 |----------|--------|------------|
@@ -238,3 +234,5 @@ closing PR from `closedByPullRequestsReferences`):
 | Env-only reads ignoring `ferrum.conf` | #3624 (2026-08-08) | #3644 |
 | Gateway SVID auto-refresh (external/inline) | #3625 (2026-08-09) | #3669 |
 | `stable_file` delete/recreate churn flake | #3891 (2026-08-17) | #3894 (2026-08-15 CI addition; not an epic residual) |
+| Provenance-complete mesh/HBONE/DNS perf baselines | #3332 (2026-08-21) | #4088 |
+| Scheduled Scaling Regression red (JWT expiry / 503 retry) | #3892 (2026-08-21) | #3895 |

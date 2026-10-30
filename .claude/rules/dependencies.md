@@ -26,8 +26,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.4`,
   `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
   `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`,
-  `hyper 1.10.0` (patches 001–005), and `h2 0.4.20` (coalescing and
-  assigned-send-capacity patches).
+  `hyper 1.10.0` (patches 001–007), and `h2 0.4.20` (coalescing,
+  assigned-send-capacity, and reset-origin patches).
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the
@@ -81,161 +81,60 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
-- The trusted publication boundary freezes
-  `.github/scripts/verify_publication_gate.py` and
-  `.github/required-publication-checks.json` by whole-file digest, plus the
-  manual release dispatcher and input validator, plus the complete `main-publication-required-checks` job body in
-  `gateway-api-conformance.yml`. The trusted verifier compares those proposal
-  surfaces before inspecting candidate automation, and never executes the
-  candidate publication verifier. Changing these protected
-  surfaces requires a reviewed policy update; `verify_required_ci.py` remains a
-  PR-mutable parity check, not the admission authority. See `docs/ci_cd.md` →
-  "Publish-blocking required checks".
-- A required live gate must decide its own relevance from a pinned trusted-base
-  copy of `live_suite_path_filter.py`, never from the pull request's checkout.
-  `verify_cross_build_policy.py` freezes that block byte-for-byte
-  (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for every
-  `LIVE_SUITE_RELEVANCE_CONTRACTS` workflow — `ambient-host-udp-live.yml`,
-  `mesh-e2e-sidecar-live.yml`, `multicluster-federation-live.yml`, and
-  `multicluster-poller-partition-live.yml` — together with each live job's
-  `needs`/`if` binding. That block is protected: no pull request may edit
-  `verify_cross_build_policy.py`, so extending the contract set is a
-  direct-to-`main` change.
-- Governed live workflows carry NO workflow-level `paths:` trigger filter
-  (issue #3908): a filter in the pull request's own checkout can exclude the
-  change that broke the surface. `node-waypoint-ebpf-live.yml`,
-  `istio-status-cas-live.yml`, and `cni-lifecycle-live.yml` now trigger on
-  `pull_request`, `merge_group (checks_requested)`, `push: main`, and
-  `workflow_dispatch`, decide relevance from a trusted-base classifier
-  (`ci_runtime_plan.py` for NodeWaypoint, `live_suite_path_filter.py` for the
-  other two), and report through an `if: always()` aggregate. Their aggregates
-  (`NodeWaypoint eBPF Live`, `Istio Status CAS Live`, `CNI Lifecycle Live`) are
-  NOT branch-protection-required and must not be added to
-  `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS` — freezing an
-  optional gate's shape is not the same as making it required. Issue #3908 is
-  now durably complete on all three: `cni-lifecycle-live.yml` and
-  `istio-status-cas-live.yml` are entries in `LIVE_SUITE_RELEVANCE_CONTRACTS`,
-  and NodeWaypoint has its own additive contract
-  (`NODE_WAYPOINT_RELEVANCE_CONTRACT` + `NODE_WAYPOINT_FROZEN_JOBS`, enforced by
-  `node_waypoint_relevance_errors` from both `validate_workflow_collection` and
-  `compare_pr_workflow_collection`) because its planner job is
-  `production-dockerfile-plan`, runs `ci_runtime_plan.py`, emits two verdicts,
-  and binds fail-closed as `always() && … != 'false'` — none of which the shared
-  template can express. That contract freezes `production-dockerfile-plan`,
-  `production-dockerfile-smoke`, and `node-waypoint-ebpf-live-gate` whole, and
-  freezes `needs`/`if` only on `production-dockerfile-smoke-default`,
-  `production-dockerfile-smoke-ebpf`, and `node-waypoint-ebpf-live`; deleting
-  the workflow is rejected. Editing any of this is a direct-to-`main` change:
-  no pull request may modify `verify_cross_build_policy.py`. The contract
-  freezes the planner job, not the path list: the `node-waypoint-ebpf-live`
-  patterns live in `ci_runtime_plan.py` `SUITE_PATTERNS`, change by ordinary PR,
-  and take effect once on the trusted base. On a PR that suite is scoped to
-  NodeWaypoint-owned paths only (`ebpf/`, `src/ebpf/`, `src/capture/`,
-  `src/proxy/node_waypoint_*`, `tests/k8s/node_waypoint_ebpf_live/`, the
-  workflow and its Dockerfiles/local actions). Broad mesh trees
-  (`src/modes/mesh/`, `src/plugins/mesh/`, `src/k8s_controller/`,
-  `charts/ferrum-mesh/`, HBONE/mesh TCP proxy files, `node_agent.rs`,
-  `tests/k8s/lib/`) are PR-gated by the required mesh live suites and
-  validated by NodeWaypoint on push to `main`. Do not widen it back without a
-  replay (`ci_runtime_plan.decide_relevance` over merged PRs). The temporary
-  `--list-suites` bootstrap handshake is deleted from
-  `live_suite_path_filter.py`. The classifier refuses to classify
-  any change-set record that is not a normal repository-relative pathname and
-  forces the suite to run instead. See `docs/ci_cd.md` → "Trusted-base
-  relevance for required live gates" and "NodeWaypoint relevance contract".
-- The fuzz/property lane is admitted only as two byte-frozen shapes:
-  `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
-  `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be
-  absent before initial adoption; once present on the trusted base, pull
-  requests may neither remove nor alter it. Adoption additionally admits exactly
-  three byte-exact, anchored lines wiring `fuzz-smoke` into the required `test`
-  aggregate (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`: the `needs` entry, the
-  `add_row "Fuzz Smoke"` row, and the `require_success "Fuzz Smoke"` assertion,
-  each immediately after its `lint` counterpart); the rest of the aggregate is
-  still compared byte for byte, and the wiring cannot be removed once adopted. A
-  committed `.cargo/config[.toml]` below the repository root is rejected
-  outright.
-- The `fuzz-smoke` job's admitted texts live in `CI_FUZZ_SMOKE_JOB_GENERATIONS`
-  (oldest first; the newest must be `CI_FUZZ_SMOKE_JOB`). Every earlier
-  transition is spent, so it holds one generation: main's shape (property
-  smoke as the required PR/merge_group gate, bounded libFuzzer budget on push
-  to `main` / dispatch only, `contents: read`, no remote compiler cache). A
-  change to the job appends its successor as `CI_FUZZ_SMOKE_JOB` and keeps the
-  current text as the retired end until the successor is on `main`; the
-  transition is exact on both ends and one-way — withholding is symmetric, so
-  `admitted_fuzz_smoke_removal_errors` is what refuses a revert.
-  `CI_FUZZ_SMOKE_BOUNDED_BUDGET`, `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` and
-  `CI_FUZZ_SMOKE_PARSER_BUDGET` must each appear exactly once in every
-  generation, so a generation can never move or extend the lane and relax its
-  bounds at the same time. `FUZZ_WORKFLOW` carries the same targets in the
-  scheduled matrix and the literal shell allowlist. See `docs/ci_cd.md` →
-  "Admitted `fuzz-smoke` generations".
-- `release.yml` is admitted in exactly two shapes
-  (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
-  plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`
-  job, tools build/export/upload steps in `docker-ebpf`, sole ownership of the
-  `docker-ebpf-tools-digest-` wildcard, extended `create-release`
-  `needs`/rationale-comment/notes,
-  and three-family resolve/compare/SBOM/provenance/sign/verify coverage in
-  `attest-release-images`). The credentialed eBPF producer and tools manifest
-  have closed job-field sets and complete `steps:` contracts, so extra execution
-  controls or context-rewrite steps are rejected. A revision is held to the
-  complete contract of the shape it claims; the trusted base decides the
-  transition. While the base is
-  two-family a PR may leave the workflow byte-identical or adopt the whole
-  three-family shape, and once the base is three-family a revert is refused. See
-  `docs/ci_cd.md` → "Admitted release image-family adoption".
 - `Helm Chart` proves `.github/actions/setup-kubernetes-tools` against the
   trusted revision before `uses:`; the admitted checker generation is bound
   inside `verify_trusted_local_action.py`, never supplied by the candidate.
-- The published x86_64 GNU producers — `ci.yml`'s `build-binaries` and
-  `release.yml`'s `build-release-binaries` — build their ONE x86_64 GNU matrix
-  cell in the digest-pinned AlmaLinux 8.10 sysroot rather than natively on a
-  moving `ubuntu-latest`, and gate the staged, checksummed `release-assets/`
-  files on an ABI/oldest-baseline scan before uploading them (issue #4301).
-  One producer, one artifact identity: the scanned bytes ARE the published
-  bytes, so `create-release`, the `.sha256` sidecars, the `latest` prerelease,
-  and the container image inputs cannot describe a binary that was never
-  verified. Their #4301 `CI_JOB_GENERATION_TRANSITIONS` pairs are RETIRED
-  (both destinations are on `main`, and issue #4423 moved both jobs again
-  direct-to-`main`); the standing control is the absolute check
-  `linux_gnu_producer_contract_errors`, which binds as soon as the repository
-  references `.github/scripts/build_linux_gnu_sysroot.sh` and rejects a
-  producer that native-compiles x86_64 GNU, scans a
-  `target/x86_64-unknown-linux-gnu/...` rebuild, gates after the upload,
-  shares the canonical artifact name with a second uploader, omits the
-  job-level identity pins, or checks out with `persist-credentials` left on.
-  The ARM64 Cross producer, its command/environment/image freeze, and every
-  publication `needs` graph are untouched; ARM64 is scanned as published by
-  `verify-linux-gnu-abi-aarch64` / `verify-latest-linux-gnu-abi-aarch64` and
-  joined by the existing retraction gates, which is the only shape available
-  while both its producer and its consumers are frozen. See `docs/ci_cd.md` →
+- A committed `.cargo/config[.toml]` below the repository root is rejected
+  outright.
+
+The trusted Cross policy (`verify_cross_build_policy.py`) also freezes these CI
+shapes. Changes must satisfy its trusted-base contracts, including explicitly
+admitted pin rotations and one-way generations; changing the verifier or adding
+an unadmitted shape is reviewed direct-to-`main` policy work, since no pull
+request may edit the verifier. Mechanics live in the named `docs/ci_cd.md`
+sections:
+
+- Publication boundary: `verify_publication_gate.py`,
+  `.github/required-publication-checks.json`, and the release dispatcher and
+  input validator are frozen; changing them needs a reviewed policy update (`verify_required_ci.py` is only a
+  PR-mutable parity check). → "Publish-blocking required checks".
+- Live-suite relevance (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`,
+  `LIVE_SUITE_RELEVANCE_CONTRACTS`): required live gates decide relevance from a
+  pinned trusted-base `live_suite_path_filter.py`, and governed live workflows
+  carry no workflow-level `paths:` filter. Extending the contract set is
+  direct-to-`main`. `NodeWaypoint eBPF Live`, `Istio Status CAS Live`, and
+  `CNI Lifecycle Live` are not branch-protection-required; never add them to
+  `REQUIRED_MERGE_GROUP_WORKFLOWS` or `DEDICATED_REQUIRED_CHECKS`. →
+  "Trusted-base relevance for required live gates".
+- NodeWaypoint (`NODE_WAYPOINT_RELEVANCE_CONTRACT`, `NODE_WAYPOINT_FROZEN_JOBS`):
+  the planner, smoke, and gate jobs are frozen (direct-to-`main` only); the PR
+  path list is `ci_runtime_plan.py` `SUITE_PATTERNS`, changed by ordinary PR and
+  scoped to NodeWaypoint-owned paths. Do not widen it without a replay
+  (`ci_runtime_plan.decide_relevance` over merged PRs). → "NodeWaypoint
+  relevance contract".
+- Fuzz lane (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, `FUZZ_WORKFLOW`,
+  `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`): both shapes are byte-frozen once
+  adopted; a `fuzz-smoke` change appends a one-way successor generation that
+  carries each `CI_FUZZ_SMOKE_*_BUDGET` text exactly once. → "Admitted
+  `fuzz-smoke` generations".
+- Release image families (`RELEASE_IMAGE_FAMILY_GENERATIONS`): `release.yml` is
+  either the two-family shape or the complete three-family `-ebpf-tools`
+  contract; the trusted base decides, and a three-family base refuses a revert.
+  → "Admitted release image-family adoption".
+- GNU producer (`LINUX_GNU_X86_PRODUCERS`, `linux_gnu_producer_contract_errors`):
+  the published x86_64 GNU binaries are built only by `release.yml`'s
+  `build-release-binaries` in the digest-pinned AlmaLinux 8.10 sysroot and are
+  ABI-scanned before upload, so the scanned bytes are the published bytes. →
   "Published x86_64 GNU producer contract (standing)".
-- The GNU sysroot BUILD IMAGE and the protoc archive are pinned by IDENTITY,
-  not just by form (issue #4423). `.github/linux-gnu-abi.toml` is
-  PR-editable and `verify_linux_gnu_abi.py` runs from the pull request's own
-  checkout, so the TOML cannot be the control. Both producer jobs pin
-  `LINUX_GNU_SYSROOT_IMAGE`, `LINUX_GNU_PROTOC_SHA256`,
-  `LINUX_GNU_SMOKE_FLOOR_IMAGE`, and `LINUX_GNU_SMOKE_UBUNTU2204_IMAGE` in
-  their job-level `env:` — the shell scripts refuse to run when those
-  disagree with the TOML — and `verify_cross_build_policy.py` hardcodes the
-  expected image references, the protoc digest, and the required
-  `https://github.com/protocolbuffers/protobuf/releases/download/` URL
-  prefix. `linux_gnu_producer_contract_errors` holds the `env:` literals to
-  those constants absolutely, and `linux_gnu_contract_pin_errors` re-validates
-  the TOML from the trusted base checkout (`--linux-gnu-contract`, whose
-  default is deliberately not supplied by `cross-build-policy.yml`). A
-  deliberate image or protoc bump therefore moves the constants, both `env:`
-  blocks, and the TOML in one direct-to-`main` commit. See `docs/ci_cd.md` →
-  "GNU sysroot identity pins".
-- Frozen `ci.yml` jobs, local actions (`setup-rust-ci`), and non-protected
-  workflow jobs (`WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`) may carry
-  temporary SHA-256 generation pairs. Each pair is exact, path-bound, and
-  one-way (the reverse pair is refused); on the admitted pair only that job's
-  `job:<name>:*` surfaces are withheld. The live pairs, their digests, and
-  their retirement conditions are whatever `verify_cross_build_policy.py`
-  holds on `main` — read them there, never from this file. Background:
-  `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
+- GNU identity pins (`linux_gnu_contract_pin_errors`): the sysroot image,
+  protoc digest, and smoke images are pinned in the producer's job `env:` and
+  hardcoded in the verifier. An image or protoc bump moves the verifier
+  constants, that `env:` block, and `.github/linux-gnu-abi.toml` together in one
+  direct-to-`main` commit. → "GNU sysroot identity pins".
+- Job generation pairs (`CI_JOB_GENERATION_TRANSITIONS`,
+  `WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS`): exact, path-bound, one-way
+  SHA-256 pairs; read the live pairs from the verifier on `main`, never from
+  this file. → "Admitted CI job SHA-256 generation transitions".
 
 ## Cargo Dependabot And The Rustc Wrapper
 
@@ -262,7 +161,7 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - `tests/integration/vendor_integrity_tests.rs` hashes every governed `vendor/`
   file against `vendor/VENDOR_INTEGRITY.sha256` (LF-normalized SHA-256 for
   allowlisted text paths; byte-exact for binary/unrecognized paths) and runs in
-  the `protocols-data-plane` integration shard. Incidental vendor `Cargo.lock`
+  the `mesh-protocols` Integration Tests shard in `ci.yml`. Incidental vendor `Cargo.lock`
   files are ignored unless listed in `GOVERNED_VENDOR_LOCKFILES` (currently the
   committed dimpl standalone-regression lockfile). Drift beyond the manifest
   fails CI.

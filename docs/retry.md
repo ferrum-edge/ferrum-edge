@@ -176,7 +176,7 @@ backoff: !fixed
 
 ### Exponential Backoff with Jitter
 
-Delay doubles on each attempt, capped at a maximum, with decorrelated jitter to prevent thundering herd effects when multiple clients retry against the same failing backend.
+Delay doubles on each attempt, capped at a maximum, with ±50% jitter to prevent thundering herd effects when multiple clients retry against the same failing backend.
 
 ```yaml
 backoff: !exponential

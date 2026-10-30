@@ -55,13 +55,17 @@ fn production_readiness_does_not_track_completed_epic_rows_as_open() {
         "removed launch gate / policy inventory must not own subsequent launch state"
     );
     assert!(
-        PRODUCTION_READINESS
+        !PRODUCTION_READINESS
             .contains("| Provenance-complete mesh/HBONE/DNS perf baselines | #3332 |"),
-        "open #3332 must remain in the residual map"
+        "closed #3332 must not remain a residual-map live row"
     );
     assert!(
-        PRODUCTION_READINESS.contains("#3892"),
-        "still-open 2026-08-15 scaling-regression tracker #3892 must remain recorded as OPEN"
+        PRODUCTION_READINESS.contains("#3332 (2026-08-21) | #4088 |"),
+        "closed #3332 must be recorded as implemented with its closing PR"
+    );
+    assert!(
+        PRODUCTION_READINESS.contains("#3892 (2026-08-21) | #3895 |"),
+        "closed scaling-regression tracker #3892 must be recorded with its closing PR"
     );
     assert!(
         !PRODUCTION_READINESS.contains("| Live OIDC / OAuth2 introspection coverage | #3333 |"),

@@ -50,6 +50,9 @@ Fixes # (issue number)
 - [ ] I have updated the documentation accordingly (if applicable)
 - [ ] My code follows the project's style guidelines
 - [ ] Breaking changes (config shapes, env vars, schema, defaults) have an entry in `CHANGELOG.md` under `Unreleased`
+- [ ] Admin API endpoint, field, status-code, or plugin schema changes are reflected in `openapi.yaml` (N/A if untouched)
+- [ ] New `FERRUM_*` env vars are documented in `docs/configuration.md` and `ferrum.conf` (N/A if none)
+- [ ] Changes to the edge-owned contract surfaces listed in `CLAUDE.md` have the required ferrum-contracts update, linked here (N/A if untouched):
 
 ## Performance Impact
 
