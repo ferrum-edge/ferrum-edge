@@ -88,6 +88,7 @@ runners. A concrete candidate is:
 
 | Rust profile | Standard runner | Features |
 | --- | --- | --- |
+| Existing workspace baseline | `ubuntu-latest` | unset: current all-features behavior |
 | Linux ordinary release | `ubuntu-26.04` | `default,cloud-secrets` |
 | Linux FIPS release | `ubuntu-26.04` | `fips,cloud-secrets` |
 | Linux ordinary compatible features | `ubuntu-26.04` | `default,cloud-secrets,acme,pkcs11,ebpf,fuzzing,bench-pool-profile,bench-udp-profile` |
@@ -95,14 +96,19 @@ runners. A concrete candidate is:
 | Windows ordinary release | `windows-2025` | `default,cloud-secrets` |
 | macOS ordinary release | `macos-15` | `default,cloud-secrets` |
 
-Run the two Linux compatible-feature profiles on the existing default/protected
-branch push/PR triggers and weekly schedule. These retain the feature union of
-the current wildcard scan while separating the incompatible crypto backends;
-`bench-pool-profile` also enables `bench-h1-profile`. Keep benchmark/fuzz feature
-coverage in this proposal rather than silently dropping it. Add the release-exact
-Linux and native Windows/macOS profiles on weekly/manual triggers initially.
-Keep heavy Rust jobs sequential. Preserve the three non-Rust analyses and their
-current triggers.
+Keep the existing wildcard workspace baseline on the current default/protected
+branch push/PR triggers and weekly schedule. Add the six selected-feature and
+native-platform profiles on weekly/manual triggers initially. The compatible
+profiles retain the root crate's complete feature union while separating crypto
+backends; `bench-pool-profile` also enables `bench-h1-profile`.
+
+That root feature union does not establish coverage of other Cargo workspaces.
+CodeQL 2.27.3 applies one Cargo feature selection to every discovered manifest;
+for example, `tests/performance/Cargo.toml` rejects `cloud-secrets`. The new
+profiles need workspace-specific preflight/scoping, with the existing wildcard
+baseline retained for auxiliary workspaces. Retiring that baseline requires
+separate workspace coverage evidence and approval. Keep heavy Rust jobs
+sequential. Preserve the three non-Rust analyses and their current triggers.
 Validate extraction and generated bindings for every proposed row before
 switching setup mode. Query results and processed uploads must then succeed
 before declaring those profiles covered. New categories may change alert
@@ -110,11 +116,11 @@ grouping; this proposal does not authorize dismissing existing alerts.
 
 CodeQL and standard hosted compute are free while the repository remains public.
 No larger runners, new artifact uploads, paid products or trials are proposed.
-The PR/push lane would have two Rust analyses instead of one, and a weekly run
-would have six. Rust analysis can take hours, so serialized jobs increase CI
-latency even though the proposed compute has no charge. The current wildcard
-Rust invocation would be retired only after the replacement rows are verified
-and the migration is explicitly approved. Source/branch changes and overlapping
+The PR/push lane keeps its one baseline Rust analysis; a weekly run would have
+seven. Rust analysis can take hours, so the added serialized weekly jobs take
+longer even though the proposed compute has no charge. Default setup would be
+replaced only by a separately approved advanced configuration that retains the
+existing baseline and other languages. Source/branch changes and overlapping
 conditional code require review; this matrix still would not prove every
 feature combination or macro path.
 
