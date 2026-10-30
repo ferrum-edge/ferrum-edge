@@ -7103,32 +7103,34 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let h3 = include_str!("../../../src/http3/server.rs");
 
+    // Native buffered gRPC settles a late failure exactly as its shared
+    // `timeout_at` arm: the client's DEADLINE_EXCEEDED, or an earlier operator
+    // read bound's BackendTimeout (#6976).
     let buffered = source_fn_body(grpc, "pub(crate) async fn proxy_grpc_request_core(");
-    assert!(
-        buffered.contains("response_deadline_at.filter(|_| response_deadline_is_client)"),
-        "only the client's deadline may claim a failure; an operator read timeout keeps \
-         BackendTimeout accounting"
-    );
     let header = bounded(
         buffered,
-        "client_deadline_owns_failure(\n                client_response_deadline_at,",
+        "if client_deadline_owns_failure(response_deadline_at, tokio::time::Instant::now()) {",
         "error!(",
     );
     assert!(
-        header.contains("GrpcDeadlinePhase::ResponseHeaders"),
-        "a late header-wait failure must be the ResponseHeaders deadline"
+        header.contains("GrpcDeadlinePhase::ResponseHeaders")
+            && header.contains("if response_deadline_is_client")
+            && header.contains("\"Read timeout after {}ms (end-to-end)\""),
+        "a late header-wait failure must settle as its shared response deadline"
     );
     let body = bounded(
         buffered,
-        "client_deadline_owns_failure(\n                        client_response_deadline_at,",
+        "client_deadline_owns_failure(\n                        response_deadline_at,",
         "warn_sampled!(",
     );
     assert!(
-        body.contains("GrpcDeadlinePhase::ResponseBody"),
-        "a late body-collection failure must be the ResponseBody deadline"
+        body.contains("GrpcDeadlinePhase::ResponseBody")
+            && body.contains("if response_deadline_is_client")
+            && body.contains("\"Body read timeout after {}ms (end-to-end)\""),
+        "a late body-collection failure must settle as its shared response deadline"
     );
     let body_check = buffered
-        .find("client_deadline_owns_failure(\n                        client_response_deadline_at,")
+        .find("client_deadline_owns_failure(\n                        response_deadline_at,")
         .expect("body-collection deadline check");
     let body_error_log = buffered
         .find("gRPC: error reading backend response frame")
@@ -7191,21 +7193,8 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
         "the direct-H2 header wait must settle a late send failure as the client deadline"
     );
 
-    for signature in [
-        "async fn proxy_to_backend(",
-        "pub(crate) async fn proxy_to_backend_retry(",
-    ] {
-        let reqwest = source_fn_body(proxy, signature);
-        let before_classify = bounded(
-            reqwest,
-            "reqwest_send_failure_is_client_deadline(",
-            "retry::classify_reqwest_error(&e)",
-        );
-        assert!(
-            before_classify.contains("client_grpc_deadline_exceeded_response_for_request("),
-            "{signature} must settle a late send failure before reqwest classification"
-        );
-    }
+    // Both reqwest header waits settle every timeout-shaped outcome and late
+    // failure through one owner rule (#6976), checked in the #6976 test below.
 
     let relay = source_fn_body(h3, "async fn dispatch_grpc_native_h3(");
     assert_eq!(
@@ -7295,12 +7284,13 @@ async fn a_buffered_collect_keeps_late_success_and_early_failure() {
     );
 }
 
-/// Issue #6976: a reqwest header-wait expiry is owned by the composed
-/// client/authorization bound when that bound is earlier (or tied) and has
-/// elapsed, however the nested timers were polled.
+/// Issue #6976: when a dispatch bound (client RPC deadline / authorization)
+/// and a response-header bound race one wait, the earlier one owns the outcome
+/// once it has elapsed, the response-header bound winning an exact tie as the
+/// direct HTTP/1.1 composer attributes it.
 #[test]
-fn the_earlier_composed_send_bound_owns_a_reqwest_header_expiry() {
-    use ferrum_edge::_test_support::composed_send_bound_owns_header_expiry_for_test as owns;
+fn the_earlier_elapsed_bound_owns_a_racing_outcome() {
+    use ferrum_edge::_test_support::elapsed_owning_bound_for_test as owner;
     use std::time::Duration;
 
     let now = tokio::time::Instant::now();
@@ -7311,70 +7301,28 @@ fn the_earlier_composed_send_bound_owns_a_reqwest_header_expiry() {
         .checked_sub(Duration::from_millis(10))
         .expect("representable");
     let future = now + Duration::from_secs(1);
-
-    assert!(
-        owns(Some(earlier), Some(later), now),
-        "an earlier composed bound owns it"
-    );
-    assert!(
-        owns(Some(earlier), Some(earlier), now),
-        "a tie goes to the composed bound"
-    );
-    assert!(
-        owns(Some(earlier), None, now),
-        "no operator bound: the composed bound"
-    );
-    assert!(
-        !owns(Some(later), Some(earlier), now),
-        "a strictly earlier operator bound keeps its own ReadWriteTimeout"
-    );
-    assert!(
-        !owns(Some(future), None, now),
-        "an unexpired bound owns nothing"
-    );
-    assert!(
-        !owns(None, Some(earlier), now),
-        "no composed bound: the operator's"
-    );
-}
-
-/// Issue #6976: the H3 plain bridge attributes a pre-header outcome to the
-/// earlier of its write and header bounds once it has elapsed.
-#[test]
-fn the_earlier_elapsed_bound_owns_a_plain_bridge_pre_header_outcome() {
-    use ferrum_edge::_test_support::elapsed_plain_pre_header_bound_for_test as owner;
-    use std::time::Duration;
-
-    let now = tokio::time::Instant::now();
-    let earlier = now
-        .checked_sub(Duration::from_millis(20))
-        .expect("representable");
-    let later = now
-        .checked_sub(Duration::from_millis(10))
-        .expect("representable");
-    let future = now + Duration::from_secs(1);
-    const WRITE: Option<bool> = Some(true);
+    const DISPATCH: Option<bool> = Some(true);
     const HEADER: Option<bool> = Some(false);
 
-    assert_eq!(owner(Some(earlier), Some(later), now), WRITE);
+    assert_eq!(owner(Some(earlier), Some(later), now), DISPATCH);
     assert_eq!(owner(Some(later), Some(earlier), now), HEADER);
     assert_eq!(
         owner(Some(earlier), Some(earlier), now),
-        WRITE,
-        "a tie goes to write"
+        HEADER,
+        "an exact tie goes to the response-header bound"
     );
-    assert_eq!(owner(Some(earlier), None, now), WRITE);
+    assert_eq!(owner(Some(earlier), None, now), DISPATCH);
     assert_eq!(owner(None, Some(earlier), now), HEADER);
     assert_eq!(owner(Some(future), Some(future), now), None);
     assert_eq!(
         owner(Some(future), Some(earlier), now),
         HEADER,
-        "an elapsed header bound earlier than a live write bound owns it"
+        "an elapsed header bound earlier than a live dispatch bound owns it"
     );
     assert_eq!(
         owner(Some(earlier), Some(future), now),
-        WRITE,
-        "an elapsed write bound earlier than a live header bound owns it"
+        DISPATCH,
+        "an elapsed dispatch bound earlier than a live header bound owns it"
     );
     assert_eq!(owner(None, None, now), None);
 }
@@ -7415,9 +7363,10 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
         "break Some(result);",
     );
     assert!(
-        streamed_send.contains("elapsed_plain_pre_header_bound(")
-            && streamed_send.contains("Some(PlainPreHeaderBound::Write) =>")
-            && streamed_send.contains("Some(PlainPreHeaderBound::Header) =>"),
+        streamed_send.contains("crate::proxy::elapsed_owning_bound(")
+            && streamed_send.contains("Some(crate::proxy::OwningBound::Dispatch) =>")
+            && streamed_send.contains("Some(crate::proxy::OwningBound::ResponseHeader) =>")
+            && streamed_send.contains("!oversized.load(Ordering::Relaxed)"),
         "a late streamed-bridge send failure must settle as its owning bound"
     );
     let streamed_timer = bounded(
@@ -7426,7 +7375,7 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
         "upload_auth_expired = plain_write_bound.expired_authorization();",
     );
     assert!(
-        streamed_timer.contains("== Some(PlainPreHeaderBound::Header)")
+        streamed_timer.contains("== Some(crate::proxy::OwningBound::ResponseHeader)")
             && streamed_timer.contains("header_wait_expired = true;"),
         "a strictly earlier header bound must keep its terminal on a late wake"
     );
@@ -7437,7 +7386,8 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
     );
     assert!(
         prebuffered.contains("Ok(Ok(H3BackendOrPeer::Ready(Err(_))))")
-            && prebuffered.contains("elapsed_plain_pre_header_bound("),
+            && prebuffered.contains("Ok(Ok(H3BackendOrPeer::Deadline))")
+            && prebuffered.contains("crate::proxy::elapsed_owning_bound("),
         "the prebuffered bridge must attribute the outer timer and late failures by owner"
     );
 
@@ -7448,8 +7398,27 @@ fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
         let reqwest = source_fn_body(proxy, signature);
         let wait = bounded(reqwest, "let header_wait = match bounded {", "Err(()) => {");
         assert!(
-            wait.contains("composed_send_bound_owns_header_expiry("),
-            "{signature}: the nested operator timer must yield to an earlier composed bound"
+            wait.contains("settle_reqwest_header_wait("),
+            "{signature}: every timeout-shaped outcome and late failure must settle by owner"
+        );
+        assert!(
+            !reqwest.contains("reqwest_send_failure_is_client_deadline("),
+            "{signature}: the owner rule replaces the client-only late-failure check"
         );
     }
+    let settle = source_fn_body(proxy, "fn settle_reqwest_header_wait(");
+    assert!(
+        settle.contains("Ok(Ok(Err(error))) => !gateway_owned(error),")
+            && settle.contains("Ok(Err(())) | Err(()) => true,"),
+        "inner and outer expiries and non-gateway late failures must all settle by owner"
+    );
+
+    let pool = include_str!("../../../src/http3/client.rs");
+    let dispatch = source_fn_body(pool, "pub(crate) async fn await_h3_dispatch<F, T>(");
+    assert!(
+        dispatch
+            .contains("Ok(Err(error)) if error.lifetime_expired() || bound.elapsed().is_none()")
+            && dispatch.contains("Ok(Err(_)) | Err(_)"),
+        "an H3 dispatch failure completing after its bound must settle as that bound"
+    );
 }

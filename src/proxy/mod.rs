@@ -48427,21 +48427,19 @@ pub(crate) async fn proxy_to_backend_retry(
     )
     .await;
     let header_wait = match bounded {
-        Ok(Ok(inner)) => inner,
-        Ok(Err(()))
-            if composed_send_bound_owns_header_expiry(
-                send_bound_at,
-                header_deadline_at,
-                tokio::time::Instant::now(),
-            ) =>
-        {
-            Err(())
-        }
-        Ok(Err(())) => {
-            return http_backend_dispatch_error_response(
-                retry::ErrorClass::ReadWriteTimeout,
-                resolved_ip,
-            );
+        Ok(outcome) => {
+            match settle_reqwest_header_wait(outcome, send_bound_at, header_deadline_at, |error| {
+                crate::backend_conn_limit::is_backend_connection_limit_error(error)
+            }) {
+                ReqwestHeaderWait::Send(result) => Ok(result),
+                ReqwestHeaderWait::Dispatch => Err(()),
+                ReqwestHeaderWait::ResponseHeader => {
+                    return http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    );
+                }
+            }
         }
         Err(()) => {
             // Stop writing the replayed body now rather than leaving the task
@@ -48712,17 +48710,6 @@ pub(crate) async fn proxy_to_backend_retry(
                     request_on_wire: false,
                     buffered_trailers: None,
                 };
-            }
-            if reqwest_send_failure_is_client_deadline(
-                send_bound,
-                request_ctx.grpc_deadline_at(),
-                header_deadline_at,
-            ) {
-                return client_grpc_deadline_exceeded_response_for_request(
-                    request_ctx,
-                    headers,
-                    resolved_ip,
-                );
             }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::TlsError {
@@ -52562,17 +52549,16 @@ async fn proxy_to_backend(
     )
     .await;
     let header_wait = match bounded {
-        Ok(Ok(inner)) => Some(inner),
-        Ok(Err(()))
-            if composed_send_bound_owns_header_expiry(
-                send_bound_at,
-                header_deadline_at,
-                tokio::time::Instant::now(),
-            ) =>
-        {
-            Some(Err(()))
+        Ok(outcome) => {
+            match settle_reqwest_header_wait(outcome, send_bound_at, header_deadline_at, |error| {
+                body_size_exceeded.load(Ordering::Acquire)
+                    || crate::backend_conn_limit::is_backend_connection_limit_error(error)
+            }) {
+                ReqwestHeaderWait::Send(result) => Some(Ok(result)),
+                ReqwestHeaderWait::Dispatch => Some(Err(())),
+                ReqwestHeaderWait::ResponseHeader => None,
+            }
         }
-        Ok(Err(())) => None,
         Err(()) => {
             write_watermark_expired = true;
             None
@@ -53119,21 +53105,6 @@ async fn proxy_to_backend(
                         request_on_wire: false,
                         buffered_trailers: None,
                     },
-                    retained_body,
-                    backend_admission_permits,
-                );
-            }
-            if reqwest_send_failure_is_client_deadline(
-                send_bound,
-                request_ctx.grpc_deadline_at(),
-                header_deadline_at,
-            ) {
-                return backend_dispatch_response(
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        resolved_ip,
-                    ),
                     retained_body,
                     backend_admission_permits,
                 );
@@ -58755,39 +58726,82 @@ impl CollectOutcome for retry::BackendResponse {
     }
 }
 
-/// Whether the composed client/authorization send bound, not the operator
-/// response-header bound it is nested inside, owns a reqwest header-wait expiry
-/// (issue #6976). The operator timer wraps the composed one, so after a late wake
-/// with both elapsed the outer timer is polled first even when the composed
-/// bound was earlier. Attribution comes from the captured instants instead; a
-/// tie goes to the composed bound, matching
-/// [`reqwest_send_failure_is_client_deadline`].
-pub(crate) fn composed_send_bound_owns_header_expiry(
-    send_bound_at: Option<tokio::time::Instant>,
-    header_deadline_at: Option<tokio::time::Instant>,
-    now: tokio::time::Instant,
-) -> bool {
-    send_bound_at
-        .is_some_and(|send| header_deadline_at.is_none_or(|header| send <= header) && now >= send)
+/// Which of two captured bounds owns an outcome (issue #6976).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwningBound {
+    /// The composed dispatch bound: the client RPC deadline (or gRPC-Web RPC
+    /// deadline) and the authorization lifetime.
+    Dispatch,
+    /// The operator response-header bound, with any route deadlines folded in.
+    ResponseHeader,
 }
 
-/// Whether a reqwest `send()` failure observed now belongs to the client RPC
-/// deadline that composed `bound` (issue #6022): the client deadline, not the
-/// authorization lifetime, owns the bound, no earlier operator response-header
-/// bound applies, and the deadline has passed. Settled as that deadline, as if
-/// the bound's timer had fired first.
-fn reqwest_send_failure_is_client_deadline(
-    bound: DispatchPhaseBound,
-    client_deadline_at: Option<tokio::time::Instant>,
+/// The bound that owns an outcome observed at `now` when a dispatch bound and
+/// a response-header bound race one wait: the earlier of the two once it has
+/// elapsed. The response-header bound wins an exact tie, exactly as
+/// [`compose_backend_handoff_bound`] attributes it for the direct HTTP/1.1
+/// pool. Attribution comes from the captured instants, never from timer
+/// nesting, select-arm order, or which timer a late wake polled first, and a
+/// backend failure observed at or after the owner settles as that bound.
+pub(crate) fn elapsed_owning_bound(
+    dispatch_at: Option<tokio::time::Instant>,
+    header_at: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Option<OwningBound> {
+    match (dispatch_at, header_at) {
+        (Some(dispatch), Some(header)) if header <= dispatch => {
+            (now >= header).then_some(OwningBound::ResponseHeader)
+        }
+        (Some(dispatch), _) => (now >= dispatch).then_some(OwningBound::Dispatch),
+        (None, Some(header)) => (now >= header).then_some(OwningBound::ResponseHeader),
+        (None, None) => None,
+    }
+}
+
+/// A reqwest response-header wait, settled by its owning bound.
+enum ReqwestHeaderWait {
+    /// `send()` resolved before either bound, or with a gateway-owned error.
+    Send(Result<reqwest::Response, reqwest::Error>),
+    /// The composed client/authorization bound owns the outcome.
+    Dispatch,
+    /// The operator response-header bound owns the outcome.
+    ResponseHeader,
+}
+
+/// Settle a reqwest header wait nested as `operator(composed(send()))`
+/// (issue #6976). Every timeout-shaped outcome, and a backend failure observed
+/// after a bound, is owned by the EARLIER captured bound: the nesting alone
+/// would let the outer operator timer claim an expiry an earlier client
+/// deadline owns after a late wake, and an inner expiry or late reset ignore an
+/// earlier operator bound. `gateway_owned` keeps the gateway's own typed
+/// terminals (an oversized upload, a `maxConnections` refusal) ahead of it.
+fn settle_reqwest_header_wait(
+    outcome: Result<Result<Result<reqwest::Response, reqwest::Error>, ()>, ()>,
+    send_bound_at: Option<tokio::time::Instant>,
     header_deadline_at: Option<tokio::time::Instant>,
-) -> bool {
-    !bound.authorization_wins
-        && client_deadline_at
-            .is_some_and(|client| header_deadline_at.is_none_or(|header| client <= header))
-        && crate::proxy::grpc_proxy::client_deadline_owns_failure(
-            client_deadline_at,
+    gateway_owned: impl FnOnce(&reqwest::Error) -> bool,
+) -> ReqwestHeaderWait {
+    let settles_by_owner = match &outcome {
+        Ok(Ok(Ok(_))) => false,
+        Ok(Ok(Err(error))) => !gateway_owned(error),
+        Ok(Err(())) | Err(()) => true,
+    };
+    if settles_by_owner {
+        match elapsed_owning_bound(
+            send_bound_at,
+            header_deadline_at,
             tokio::time::Instant::now(),
-        )
+        ) {
+            Some(OwningBound::Dispatch) => return ReqwestHeaderWait::Dispatch,
+            Some(OwningBound::ResponseHeader) => return ReqwestHeaderWait::ResponseHeader,
+            None => {}
+        }
+    }
+    match outcome {
+        Ok(Ok(result)) => ReqwestHeaderWait::Send(result),
+        Ok(Err(())) => ReqwestHeaderWait::Dispatch,
+        Err(()) => ReqwestHeaderWait::ResponseHeader,
+    }
 }
 
 /// Attribute an already-fired composed dispatch-phase bound (issue #3815).

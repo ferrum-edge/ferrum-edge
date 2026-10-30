@@ -74,14 +74,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The deadline cutoff now covers every gRPC dispatch path, and the earlier
   of two racing bounds always owns the outcome** (issue #6976). A native
   HTTP/3 backend head failure observed after the dispatch bound settles exactly
-  as that bound's timer arm (no H3 capability downgrade). The HTTP/3-frontend
-  gRPC-Web bridge settles a late send failure as its gRPC-Web deadline,
-  authorization lifetime, or header bound. The reqwest header waits no longer
-  let the operator's response-header timer, which wraps the client RPC
-  deadline, claim an expiry the strictly earlier client deadline owns after a
-  late wake (it was charged as `ReadWriteTimeout`); the bridge's two pre-header
-  bounds follow the same earliest-owner rule, a tie going to the client or
-  authorization bound.
+  as that bound's timer arm (no H3 capability downgrade), and any native H3
+  dispatch phase that fails after its bound settles as that bound. The
+  HTTP/3-frontend gRPC-Web bridge settles a late send failure as its gRPC-Web
+  deadline, authorization lifetime, or header bound. Native buffered gRPC
+  settles a late failure after an earlier operator read bound as that bound's
+  `BackendTimeout`. The reqwest header waits no longer let the operator's
+  response-header timer, which wraps the client RPC deadline, claim an expiry
+  the strictly earlier client deadline or authorization lifetime owns after a
+  late wake (it was charged as `ReadWriteTimeout`), nor let a late reset or an
+  inner expiry ignore an earlier operator bound. Where two bounds race, the
+  response-header bound wins an exact tie, as the direct HTTP/1.1 pool already
+  attributed it. Gateway-owned terminals (an oversized upload, a
+  `maxConnections` refusal, a write watermark) keep precedence.
 
 ## [0.9.19] - 2026-10-27
 
