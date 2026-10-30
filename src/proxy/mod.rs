@@ -50956,10 +50956,11 @@ async fn proxy_to_backend(
         } else {
             effective_max_request_body_size_bytes
         };
+        let request_header_map = headers.to_map();
         let (unix_request_body, unix_retained_body) = match prepare_mesh_request_body(
             client_request_body,
             method,
-            &headers.to_map(),
+            &request_header_map,
             unix_request_body_limit,
             proxy.backend_read_timeout_ms,
             request_ctx.grpc_deadline_at(),
@@ -50998,7 +50999,7 @@ async fn proxy_to_backend(
                 proxy,
                 backend_url,
                 method,
-                &headers.to_map(),
+                &request_header_map,
                 unix_request_body,
                 upstream_target,
                 plugins,
@@ -51028,7 +51029,7 @@ async fn proxy_to_backend(
                 socket_path,
                 backend_url,
                 method,
-                &headers.to_map(),
+                &request_header_map,
                 unix_request_body,
                 plugins,
                 Some(request_ctx),
@@ -51066,10 +51067,11 @@ async fn proxy_to_backend(
         ) {
             return reject;
         }
+        let request_header_map = headers.to_map();
         let (mesh_request_body, mesh_retained_body) = match prepare_mesh_request_body(
             client_request_body,
             method,
-            &headers.to_map(),
+            &request_header_map,
             effective_max_request_body_size_bytes,
             proxy.backend_read_timeout_ms,
             request_ctx.grpc_deadline_at(),
@@ -51100,7 +51102,6 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         backend_attempt_handoff.mark_handed_to_backend(mesh_retained_body.as_ref());
-        let request_header_map = headers.to_map();
         let (backend_resp, body_bytes, request_body_exceeded) = boxed_proxy_future(|| {
             proxy_to_backend_hbone(
                 state,
@@ -51204,10 +51205,11 @@ async fn proxy_to_backend(
         } else {
             effective_max_request_body_size_bytes
         };
+        let request_header_map = headers.to_map();
         let (mesh_request_body, mesh_retained_body) = match prepare_mesh_request_body(
             client_request_body,
             method,
-            &headers.to_map(),
+            &request_header_map,
             mesh_request_body_limit,
             proxy.backend_read_timeout_ms,
             request_ctx.grpc_deadline_at(),
@@ -51238,7 +51240,6 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         backend_attempt_handoff.mark_handed_to_backend(mesh_retained_body.as_ref());
-        let request_header_map = headers.to_map();
         let (backend_resp, body_bytes, request_body_exceeded) = boxed_proxy_future(|| {
             proxy_to_backend_mesh_mtls(
                 state,
@@ -59039,7 +59040,7 @@ fn request_upload_auth_family(
     if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
         return StreamAuthProtocolFamily::GrpcWeb;
     }
-    match ctx.headers.get("content-type") {
+    match ctx.effective_request_header("content-type") {
         Some(content_type) if crate::plugins::grpc_web::is_grpc_web_content_type(content_type) => {
             StreamAuthProtocolFamily::GrpcWeb
         }

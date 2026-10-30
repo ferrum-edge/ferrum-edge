@@ -54,14 +54,18 @@ impl RequestHeaderLookup for RequestHeaders<'_> {
 /// Whether the plugin-facing map of `raw` would be a 1:1 projection of it.
 ///
 /// Materialization folds repeated names into one joined value, drops values
-/// that are not UTF-8 and reserved gateway-assertion names, and the outbound
-/// builders drop values `HeaderValue::from_str` refuses. A block needing any of
-/// that stays on the materialized path, so passthrough never has to reproduce
-/// those rules.
+/// that are not UTF-8 and reserved gateway-assertion names, the hop
+/// re-assertion drops backend-equivalent spellings of `X-Ferrum-Hops` such as
+/// `x_ferrum_hops`, and the outbound builders drop values
+/// `HeaderValue::from_str` refuses. A block needing any of that stays on the
+/// materialized path, so passthrough never has to reproduce those rules.
 pub(crate) fn raw_request_headers_passthrough_eligible(raw: &HeaderMap) -> bool {
     raw.len() == raw.keys_len()
         && raw.iter().all(|(name, value)| {
-            !crate::plugins::RequestContext::is_reserved_gateway_assertion_header(name.as_str())
+            let name = name.as_str();
+            !crate::plugins::RequestContext::is_reserved_gateway_assertion_header(name)
+                && (name == PROXY_HOPS_HEADER
+                    || !crate::proxy::hop_limit::is_proxy_hops_header(name))
                 && value_forwards_unchanged(value)
         })
 }

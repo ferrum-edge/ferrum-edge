@@ -17894,6 +17894,8 @@ pub mod _test_support {
         pub lookups_match: bool,
         /// The view's length and entry count both equal the eager map's length.
         pub len_matches: bool,
+        /// The view's `Connection`-listed names equal the eager map parse.
+        pub connection_listed_matches: bool,
         /// Outbound headers built from the eager map, as sorted name/bytes pairs.
         pub eager_outbound: Vec<(String, Vec<u8>)>,
         /// Outbound headers built from the passthrough view.
@@ -17958,6 +17960,8 @@ pub mod _test_support {
                     && ctx.effective_request_header(name) == expected
             });
         let len_matches = view.len() == eager.len() && view.entries().count() == eager.len();
+        let connection_listed_matches = view.connection_listed()
+            == crate::proxy::headers::parse_connection_listed_from_str_map(&eager);
         let eager_outbound = sorted(&crate::proxy::outbound_request_headers_for_test(
             RequestHeaders::Materialized(&eager),
         ));
@@ -17969,6 +17973,7 @@ pub mod _test_support {
             rematerialized: ctx.headers.clone(),
             lookups_match,
             len_matches,
+            connection_listed_matches,
             eager_outbound,
             view_outbound,
         })

@@ -54,6 +54,10 @@ fn assert_equivalent(probe: &RequestHeaderPassthroughProbe) {
         "every lookup agrees with the eager map"
     );
     assert!(probe.len_matches, "length and entry count agree");
+    assert!(
+        probe.connection_listed_matches,
+        "Connection-listed names agree"
+    );
     assert_eq!(
         probe.view_outbound, probe.eager_outbound,
         "outbound headers are byte-identical"
@@ -180,6 +184,14 @@ fn blocks_the_eager_path_reshapes_stay_materialized() {
             "path-parameter assertion is scrubbed",
             block(&[("x-path-param-id", b"7")]),
         ),
+        (
+            "backend-equivalent hop-count spelling is scrubbed",
+            block(&[("x_ferrum_hops", b"0")]),
+        ),
+        (
+            "case-folded hop-count spelling next to the canonical one",
+            block(&[("x-ferrum-hops", b"1"), ("x_Ferrum_Hops", b"0")]),
+        ),
     ];
     for (case, raw) in ineligible {
         assert!(
@@ -187,4 +199,73 @@ fn blocks_the_eager_path_reshapes_stay_materialized() {
             "{case}"
         );
     }
+}
+
+#[test]
+fn connection_listed_names_match_the_eager_parse() {
+    let probe = probe(
+        block(&[
+            ("connection", b"keep-alive, X-Debug, , bad header"),
+            ("x-debug", b"1"),
+            ("keep-alive", b"timeout=5"),
+        ]),
+        None,
+        Some(1),
+    )
+    .expect("single Connection field is eligible");
+    assert_equivalent(&probe);
+}
+
+/// Strip `//` comment lines and all whitespace so the check survives rustfmt.
+fn compact(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// The handler admits a request to the lane only behind every exclusion the
+/// view does not model, and only once the plugin view is known.
+#[test]
+fn handler_gate_keeps_every_lane_exclusion() {
+    let source = compact(include_str!("../../../src/proxy/mod.rs"));
+    let arm = source
+        .find("ifrm.path_params.is_empty(){request_headers_deferred=true;}else{")
+        .expect("route match defers only routes without path-parameter captures");
+    let view = source
+        .find("letplugin_cache_view=ifgrpc_web_request{")
+        .expect("plugin view resolution");
+    let gate_start = source[view..]
+        .find("ifrequest_headers_deferred{")
+        .map(|at| view + at)
+        .expect("passthrough decision follows the plugin view");
+    assert!(arm < view, "deferral is recorded at route match");
+    let gate_end = source[gate_start..]
+        .find("materialize_routed_request_headers(&mutctx,req.uri().authority());")
+        .map(|at| gate_start + at)
+        .expect("a declined request materializes at the decision point");
+    let gate = &source[gate_start..gate_end];
+    for needle in [
+        "matches!(request_protocol,ProxyProtocol::Http)",
+        "matches!(flavor,HttpFlavor::Plain)",
+        "!grpc_web_request",
+        "hyper::Version::HTTP_10|hyper::Version::HTTP_11|hyper::Version::HTTP_2",
+        "ctx.mesh_direction.is_none()",
+        "!is_hbone_connect_any",
+        "method!=\"OPTIONS\"",
+        "state.mesh_egress_strip_baggage_keys.is_empty()",
+        "plugin_cache_view.plugins().is_empty()",
+        "ctx.try_begin_request_header_passthrough(",
+    ] {
+        assert!(gate.contains(needle), "passthrough gate lost `{needle}`");
+    }
+    let first_reject = source[gate_start..]
+        .find("ROUTE_PROTOCOL_NOT_PERMITTED_BODY")
+        .map(|at| gate_start + at)
+        .expect("route-level protocol reject");
+    assert!(
+        gate_end < first_reject,
+        "the decision precedes every route-level reject that can log headers"
+    );
 }
