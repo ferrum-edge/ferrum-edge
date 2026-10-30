@@ -2609,6 +2609,28 @@ pub mod _test_support {
         crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
     }
 
+    /// The reqwest header wait's owner rule (issue #6976): whether the composed
+    /// client/authorization send bound owns an expiry observed at `now`.
+    pub fn composed_send_bound_owns_header_expiry_for_test(
+        send_bound_at: Option<tokio::time::Instant>,
+        header_deadline_at: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        crate::proxy::composed_send_bound_owns_header_expiry(send_bound_at, header_deadline_at, now)
+    }
+
+    /// The H3 plain bridge's pre-header owner rule (issue #6976): `Some(true)`
+    /// for the write bound, `Some(false)` for the header bound, `None` while
+    /// neither has elapsed.
+    pub fn elapsed_plain_pre_header_bound_for_test(
+        write_at: Option<tokio::time::Instant>,
+        header_at: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> Option<bool> {
+        crate::http3::cross_protocol::elapsed_plain_pre_header_bound(write_at, header_at, now)
+            .map(|bound| bound == crate::http3::cross_protocol::PlainPreHeaderBound::Write)
+    }
+
     pub fn client_deadline_owns_failure_for_test(
         deadline: Option<tokio::time::Instant>,
         now: tokio::time::Instant,

@@ -71,6 +71,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the same way, and the inline body adapter applies the cutoff to a route
   request deadline (already a health-neutral route cut). The remaining paths
   are tracked in #6976.
+- **The deadline cutoff now covers every gRPC dispatch path, and the earlier
+  of two racing bounds always owns the outcome** (issue #6976). A native
+  HTTP/3 backend head failure observed after the dispatch bound settles exactly
+  as that bound's timer arm (no H3 capability downgrade). The HTTP/3-frontend
+  gRPC-Web bridge settles a late send failure as its gRPC-Web deadline,
+  authorization lifetime, or header bound. The reqwest header waits no longer
+  let the operator's response-header timer, which wraps the client RPC
+  deadline, claim an expiry the strictly earlier client deadline owns after a
+  late wake (it was charged as `ReadWriteTimeout`); the bridge's two pre-header
+  bounds follow the same earliest-owner rule, a tie going to the client or
+  authorization bound.
 
 ## [0.9.19] - 2026-10-27
 

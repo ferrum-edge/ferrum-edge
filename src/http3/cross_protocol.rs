@@ -2905,6 +2905,36 @@ type PlainBridgeDispatchBounds = (
     crate::proxy::auth_lifetime::ComposedAuthBound,
 );
 
+/// Which bound owns a plain bridge pre-header outcome (issue #6976).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlainPreHeaderBound {
+    /// The composed write bound: the gRPC-Web RPC deadline and the
+    /// authorization lifetime.
+    Write,
+    /// The operator response-header bound or the route deadlines.
+    Header,
+}
+
+/// The bound that owns a pre-header outcome observed at `now`: the earlier of
+/// the write and header bounds once it has elapsed, a tie going to the write
+/// bound. Attribution comes from the captured instants, never from which timer
+/// the wheel fired first or which arm a late wake polled first, and a backend
+/// failure observed at or after the owner settles as that bound (issue #6976).
+pub(crate) fn elapsed_plain_pre_header_bound(
+    write_at: Option<tokio::time::Instant>,
+    header_at: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Option<PlainPreHeaderBound> {
+    match (write_at, header_at) {
+        (Some(write), Some(header)) if write <= header => {
+            (now >= write).then_some(PlainPreHeaderBound::Write)
+        }
+        (_, Some(header)) => (now >= header).then_some(PlainPreHeaderBound::Header),
+        (Some(write), None) => (now >= write).then_some(PlainPreHeaderBound::Write),
+        (None, None) => None,
+    }
+}
+
 /// Start a retry attempt's route budget (#5646) at its handoff to the
 /// backend and return the bridge's bounds under it. A no-op on the bounds
 /// unless a gRPC-Web request's matched rule carries a per-attempt budget.
@@ -4485,17 +4515,50 @@ where
                             plain_attempt_builder = next;
                         };
                         drop(pending_slot);
+                        // The outer header timer or a backend failure observed
+                        // at/after a bound is owned by the EARLIER captured
+                        // bound, not by timer nesting (issue #6976).
+                        let late_owner = match &header_bound {
+                            Ok(Err(())) | Ok(Ok(H3BackendOrPeer::Ready(Err(_)))) => {
+                                elapsed_plain_pre_header_bound(
+                                    plain_upload_deadline,
+                                    plain_header_deadline_at,
+                                    tokio::time::Instant::now(),
+                                )
+                            }
+                            _ => None,
+                        };
                         match header_bound {
                             Err(()) => PlainAttemptEnd::WriteWatermark,
+                            Ok(Err(()) | Ok(H3BackendOrPeer::Ready(Err(_))))
+                                if late_owner == Some(PlainPreHeaderBound::Write) =>
+                            {
+                                match plain_write_bound.expired_authorization() {
+                                    Some(termination) => {
+                                        PlainAttemptEnd::AuthorizationExpired(termination)
+                                    }
+                                    None => PlainAttemptEnd::GrpcWebDeadline { handed_off: true },
+                                }
+                            }
                             // The route attempt budget (#5646) ended this attempt
                             // before its response head: the ordinary backend
                             // timeout, charged to this backend and retryable.
-                            Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
+                            Ok(Err(()) | Ok(H3BackendOrPeer::Ready(Err(_))))
+                                if late_owner == Some(PlainPreHeaderBound::Header)
+                                    && route.attempt_budget_expired(route_attempt_deadline) =>
+                            {
                                 if let Some(pump) = plain_upload_pump.as_mut() {
                                     pump.cancel();
                                 }
                                 PlainAttemptEnd::Settled(Err(PlainAttemptFailure::AttemptBudget))
                             }
+                            Ok(Err(()) | Ok(H3BackendOrPeer::Ready(Err(_))))
+                                if late_owner == Some(PlainPreHeaderBound::Header) =>
+                            {
+                                PlainAttemptEnd::HeaderTimeout
+                            }
+                            // The outer header timer fired, so `late_owner` is
+                            // always `Some` here; kept total for the compiler.
                             Ok(Err(())) => PlainAttemptEnd::HeaderTimeout,
                             // A buffered body is part of its attempt (#5738): collect
                             // it here when a failure during collection could be
@@ -5668,10 +5731,23 @@ where
                             // backend response. Attribution comes from the
                             // composition, not from arm order between two sleeps.
                             _ = &mut upload_deadline, if upload_deadline_active => {
-                                upload_auth_expired = plain_write_bound.expired_authorization();
-                                upload_deadline_after_handoff = true;
                                 drop(pending_slot.take());
                                 abort_backend_upload = true;
+                                // Both timers can be ready on a late wake: the
+                                // strictly earlier header bound keeps its own
+                                // terminal (issue #6976).
+                                if elapsed_plain_pre_header_bound(
+                                    upload_deadline_at,
+                                    header_wait_at,
+                                    tokio::time::Instant::now(),
+                                ) == Some(PlainPreHeaderBound::Header)
+                                {
+                                    header_wait_expired = true;
+                                    halt_reader_after_loop = true;
+                                    break None;
+                                }
+                                upload_auth_expired = plain_write_bound.expired_authorization();
+                                upload_deadline_after_handoff = true;
                                 break None;
                             }
                             _ = optional_sleep_elapsed(header_wait.as_mut()), if header_wait_active => {
@@ -5739,6 +5815,31 @@ where
                                 if result.is_err() && write_timed_out.load(Ordering::Acquire) {
                                     backend_write_watermark_expired = true;
                                     break None;
+                                }
+                                // A backend failure observed at/after a bound is
+                                // that bound, exactly as its timer arm settles it
+                                // (issue #6976). A SUCCESSFUL response still wins.
+                                if result.is_err() {
+                                    match elapsed_plain_pre_header_bound(
+                                        upload_deadline_at,
+                                        header_wait_at,
+                                        tokio::time::Instant::now(),
+                                    ) {
+                                        Some(PlainPreHeaderBound::Write) => {
+                                            upload_auth_expired =
+                                                plain_write_bound.expired_authorization();
+                                            upload_deadline_after_handoff = true;
+                                            abort_backend_upload = true;
+                                            break None;
+                                        }
+                                        Some(PlainPreHeaderBound::Header) => {
+                                            header_wait_expired = true;
+                                            halt_reader_after_loop = true;
+                                            abort_backend_upload = true;
+                                            break None;
+                                        }
+                                        None => {}
+                                    }
                                 }
                                 break Some(result);
                             }

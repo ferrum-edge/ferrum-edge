@@ -48428,6 +48428,15 @@ pub(crate) async fn proxy_to_backend_retry(
     .await;
     let header_wait = match bounded {
         Ok(Ok(inner)) => inner,
+        Ok(Err(()))
+            if composed_send_bound_owns_header_expiry(
+                send_bound_at,
+                header_deadline_at,
+                tokio::time::Instant::now(),
+            ) =>
+        {
+            Err(())
+        }
         Ok(Err(())) => {
             return http_backend_dispatch_error_response(
                 retry::ErrorClass::ReadWriteTimeout,
@@ -52554,6 +52563,15 @@ async fn proxy_to_backend(
     .await;
     let header_wait = match bounded {
         Ok(Ok(inner)) => Some(inner),
+        Ok(Err(()))
+            if composed_send_bound_owns_header_expiry(
+                send_bound_at,
+                header_deadline_at,
+                tokio::time::Instant::now(),
+            ) =>
+        {
+            Some(Err(()))
+        }
         Ok(Err(())) => None,
         Err(()) => {
             write_watermark_expired = true;
@@ -58735,6 +58753,22 @@ impl CollectOutcome for retry::BackendResponse {
     fn is_failure(&self) -> bool {
         self.error_class.is_some()
     }
+}
+
+/// Whether the composed client/authorization send bound, not the operator
+/// response-header bound it is nested inside, owns a reqwest header-wait expiry
+/// (issue #6976). The operator timer wraps the composed one, so after a late wake
+/// with both elapsed the outer timer is polled first even when the composed
+/// bound was earlier. Attribution comes from the captured instants instead; a
+/// tie goes to the composed bound, matching
+/// [`reqwest_send_failure_is_client_deadline`].
+pub(crate) fn composed_send_bound_owns_header_expiry(
+    send_bound_at: Option<tokio::time::Instant>,
+    header_deadline_at: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    send_bound_at
+        .is_some_and(|send| header_deadline_at.is_none_or(|header| send <= header) && now >= send)
 }
 
 /// Whether a reqwest `send()` failure observed now belongs to the client RPC

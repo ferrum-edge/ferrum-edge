@@ -16066,35 +16066,45 @@ async fn dispatch_grpc_native_h3(
     // here, never as a backend timeout. The composed deadline keeps precedence.
     let response_stopped = crate::http3::stream_util::peer_response_stopped(&send_half);
     let peer_connection = ctx.peer_connection.clone();
+    // `None` is a backend head failure observed at/after the composed bound:
+    // settled below exactly as if the bound's timer had fired first (issue
+    // #6976), so a lagged timer wheel cannot turn a deadline-driven backend
+    // reset into a charged transport failure and an H3 capability downgrade.
     let header_fut = async {
         tokio::select! {
             biased;
-            fault = h3_grpc_terminating_upload_fault(&upload) => match fault {
+            fault = h3_grpc_terminating_upload_fault(&upload) => Some(match fault {
                 H3GrpcTerminatingUploadFault::AuthorizationExpired(termination) => {
                     Err(termination)
                 }
                 other => Ok(Err(other.as_pool_error())),
-            },
+            }),
             head = crate::http3::client::recv_h3_backend_response_head(&mut backend_recv) => {
-                Ok(head)
+                if head.is_err()
+                    && dispatch_deadline_at.is_some_and(|at| tokio::time::Instant::now() >= at)
+                {
+                    None
+                } else {
+                    Some(Ok(head))
+                }
             }
-            peer_stop_sending = response_stopped => Ok(Err(h3_response_cancelled_pool_error(
+            peer_stop_sending = response_stopped => Some(Ok(Err(h3_response_cancelled_pool_error(
                 peer_stop_sending,
                 peer_connection.as_ref(),
                 true,
-            ))),
+            )))),
         }
     };
     let head_result = match crate::plugins::await_deadline_first(dispatch_deadline_at, header_fut)
         .await
     {
-        Ok(result) => result,
+        Ok(Some(result)) => result,
         // Authorization first, exactly as on the open arm. A continuously
         // active upload keeps the pump making progress forever and a
         // backend that simply withholds its response head keeps this race
         // parked, so this is the arm that would otherwise let an admitted
         // credential outlive itself before ANY response head existed.
-        Err(()) => match dispatch_bound.expired_authorization() {
+        Ok(None) | Err(()) => match dispatch_bound.expired_authorization() {
             Some(termination) => Err(termination),
             None => {
                 // Attribute the expiry to whoever the gateway was actually

@@ -7294,3 +7294,162 @@ async fn a_buffered_collect_keeps_late_success_and_early_failure() {
         "a failure before the deadline reaches the caller as the collect's own error"
     );
 }
+
+/// Issue #6976: a reqwest header-wait expiry is owned by the composed
+/// client/authorization bound when that bound is earlier (or tied) and has
+/// elapsed, however the nested timers were polled.
+#[test]
+fn the_earlier_composed_send_bound_owns_a_reqwest_header_expiry() {
+    use ferrum_edge::_test_support::composed_send_bound_owns_header_expiry_for_test as owns;
+    use std::time::Duration;
+
+    let now = tokio::time::Instant::now();
+    let earlier = now
+        .checked_sub(Duration::from_millis(20))
+        .expect("representable");
+    let later = now
+        .checked_sub(Duration::from_millis(10))
+        .expect("representable");
+    let future = now + Duration::from_secs(1);
+
+    assert!(
+        owns(Some(earlier), Some(later), now),
+        "an earlier composed bound owns it"
+    );
+    assert!(
+        owns(Some(earlier), Some(earlier), now),
+        "a tie goes to the composed bound"
+    );
+    assert!(
+        owns(Some(earlier), None, now),
+        "no operator bound: the composed bound"
+    );
+    assert!(
+        !owns(Some(later), Some(earlier), now),
+        "a strictly earlier operator bound keeps its own ReadWriteTimeout"
+    );
+    assert!(
+        !owns(Some(future), None, now),
+        "an unexpired bound owns nothing"
+    );
+    assert!(
+        !owns(None, Some(earlier), now),
+        "no composed bound: the operator's"
+    );
+}
+
+/// Issue #6976: the H3 plain bridge attributes a pre-header outcome to the
+/// earlier of its write and header bounds once it has elapsed.
+#[test]
+fn the_earlier_elapsed_bound_owns_a_plain_bridge_pre_header_outcome() {
+    use ferrum_edge::_test_support::elapsed_plain_pre_header_bound_for_test as owner;
+    use std::time::Duration;
+
+    let now = tokio::time::Instant::now();
+    let earlier = now
+        .checked_sub(Duration::from_millis(20))
+        .expect("representable");
+    let later = now
+        .checked_sub(Duration::from_millis(10))
+        .expect("representable");
+    let future = now + Duration::from_secs(1);
+    const WRITE: Option<bool> = Some(true);
+    const HEADER: Option<bool> = Some(false);
+
+    assert_eq!(owner(Some(earlier), Some(later), now), WRITE);
+    assert_eq!(owner(Some(later), Some(earlier), now), HEADER);
+    assert_eq!(
+        owner(Some(earlier), Some(earlier), now),
+        WRITE,
+        "a tie goes to write"
+    );
+    assert_eq!(owner(Some(earlier), None, now), WRITE);
+    assert_eq!(owner(None, Some(earlier), now), HEADER);
+    assert_eq!(owner(Some(future), Some(future), now), None);
+    assert_eq!(
+        owner(Some(future), Some(earlier), now),
+        HEADER,
+        "an elapsed header bound earlier than a live write bound owns it"
+    );
+    assert_eq!(
+        owner(Some(earlier), Some(future), now),
+        WRITE,
+        "an elapsed write bound earlier than a live header bound owns it"
+    );
+    assert_eq!(owner(None, None, now), None);
+}
+
+/// Issue #6976 structural coverage: the native-H3 header wait, both H3 plain
+/// bridge branches and both reqwest header waits settle late outcomes by the
+/// captured owner. The unit harness cannot stall the timer wheel inside a live
+/// dispatch.
+#[test]
+fn the_remaining_dispatch_paths_settle_late_outcomes_by_the_captured_owner() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+
+    let relay = source_fn_body(server, "async fn dispatch_grpc_native_h3(");
+    let head = bounded(
+        relay,
+        "head = crate::http3::client::recv_h3_backend_response_head(&mut backend_recv) => {",
+        "peer_stop_sending = response_stopped",
+    );
+    assert!(
+        head.contains("head.is_err()") && head.contains("tokio::time::Instant::now() >= at"),
+        "a late native-H3 head failure must be detected against the composed bound"
+    );
+    let settle = bounded(
+        relay,
+        "Ok(None) | Err(()) => match dispatch_bound.expired_authorization() {",
+        "let h3_resp = match head_result",
+    );
+    assert!(
+        settle.contains("classify_h3_grpc_header_wait_expiry(&upload)"),
+        "a late native-H3 head failure must settle exactly as the timer arm"
+    );
+
+    let streamed_send = bounded(
+        bridge,
+        "if result.is_err() && write_timed_out.load(Ordering::Acquire) {",
+        "break Some(result);",
+    );
+    assert!(
+        streamed_send.contains("elapsed_plain_pre_header_bound(")
+            && streamed_send.contains("Some(PlainPreHeaderBound::Write) =>")
+            && streamed_send.contains("Some(PlainPreHeaderBound::Header) =>"),
+        "a late streamed-bridge send failure must settle as its owning bound"
+    );
+    let streamed_timer = bounded(
+        bridge,
+        "_ = &mut upload_deadline, if upload_deadline_active => {",
+        "upload_auth_expired = plain_write_bound.expired_authorization();",
+    );
+    assert!(
+        streamed_timer.contains("== Some(PlainPreHeaderBound::Header)")
+            && streamed_timer.contains("header_wait_expired = true;"),
+        "a strictly earlier header bound must keep its terminal on a late wake"
+    );
+    let prebuffered = bounded(
+        bridge,
+        "let late_owner = match &header_bound {",
+        "match header_bound {",
+    );
+    assert!(
+        prebuffered.contains("Ok(Ok(H3BackendOrPeer::Ready(Err(_))))")
+            && prebuffered.contains("elapsed_plain_pre_header_bound("),
+        "the prebuffered bridge must attribute the outer timer and late failures by owner"
+    );
+
+    for signature in [
+        "async fn proxy_to_backend(",
+        "pub(crate) async fn proxy_to_backend_retry(",
+    ] {
+        let reqwest = source_fn_body(proxy, signature);
+        let wait = bounded(reqwest, "let header_wait = match bounded {", "Err(()) => {");
+        assert!(
+            wait.contains("composed_send_bound_owns_header_expiry("),
+            "{signature}: the nested operator timer must yield to an earlier composed bound"
+        );
+    }
+}
