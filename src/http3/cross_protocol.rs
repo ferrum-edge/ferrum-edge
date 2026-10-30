@@ -4485,17 +4485,60 @@ where
                             plain_attempt_builder = next;
                         };
                         drop(pending_slot);
+                        // The outer header timer or a backend failure observed
+                        // at/after a bound is owned by the EARLIER captured
+                        // bound, not by timer nesting (issue #6976).
+                        let late_owner = match &header_bound {
+                            Ok(Err(()))
+                            | Ok(Ok(H3BackendOrPeer::Ready(Err(_))))
+                            | Ok(Ok(H3BackendOrPeer::Deadline)) => {
+                                crate::proxy::elapsed_owning_bound(
+                                    plain_upload_deadline,
+                                    plain_header_deadline_at,
+                                    tokio::time::Instant::now(),
+                                )
+                            }
+                            _ => None,
+                        };
                         match header_bound {
                             Err(()) => PlainAttemptEnd::WriteWatermark,
+                            Ok(Err(()) | Ok(H3BackendOrPeer::Ready(Err(_))))
+                                if late_owner == Some(crate::proxy::OwningBound::Dispatch) =>
+                            {
+                                match plain_write_bound.expired_authorization() {
+                                    Some(termination) => {
+                                        PlainAttemptEnd::AuthorizationExpired(termination)
+                                    }
+                                    None => PlainAttemptEnd::GrpcWebDeadline { handed_off: true },
+                                }
+                            }
                             // The route attempt budget (#5646) ended this attempt
                             // before its response head: the ordinary backend
                             // timeout, charged to this backend and retryable.
-                            Ok(Err(())) if route.attempt_budget_expired(route_attempt_deadline) => {
+                            Ok(
+                                Err(())
+                                | Ok(H3BackendOrPeer::Ready(Err(_)))
+                                | Ok(H3BackendOrPeer::Deadline),
+                            ) if late_owner == Some(crate::proxy::OwningBound::ResponseHeader)
+                                && route.attempt_budget_owns(
+                                    route_attempt_deadline,
+                                    operator_header_deadline_at,
+                                ) =>
+                            {
                                 if let Some(pump) = plain_upload_pump.as_mut() {
                                     pump.cancel();
                                 }
                                 PlainAttemptEnd::Settled(Err(PlainAttemptFailure::AttemptBudget))
                             }
+                            Ok(
+                                Err(())
+                                | Ok(H3BackendOrPeer::Ready(Err(_)))
+                                | Ok(H3BackendOrPeer::Deadline),
+                            ) if late_owner == Some(crate::proxy::OwningBound::ResponseHeader) => {
+                                PlainAttemptEnd::HeaderTimeout
+                            }
+                            // The outer header timer fired, so `late_owner` is
+                            // always `Some` here; kept total for the compiler.
                             Ok(Err(())) => PlainAttemptEnd::HeaderTimeout,
                             // A buffered body is part of its attempt (#5738): collect
                             // it here when a failure during collection could be
@@ -5668,17 +5711,43 @@ where
                             // backend response. Attribution comes from the
                             // composition, not from arm order between two sleeps.
                             _ = &mut upload_deadline, if upload_deadline_active => {
-                                upload_auth_expired = plain_write_bound.expired_authorization();
-                                upload_deadline_after_handoff = true;
                                 drop(pending_slot.take());
                                 abort_backend_upload = true;
+                                // Both timers can be ready on a late wake: the
+                                // strictly earlier header bound keeps its own
+                                // terminal (issue #6976).
+                                if crate::proxy::elapsed_owning_bound(
+                                    upload_deadline_at,
+                                    header_wait_at,
+                                    tokio::time::Instant::now(),
+                                ) == Some(crate::proxy::OwningBound::ResponseHeader)
+                                {
+                                    header_wait_expired = true;
+                                    halt_reader_after_loop = true;
+                                    break None;
+                                }
+                                upload_auth_expired = plain_write_bound.expired_authorization();
+                                upload_deadline_after_handoff = true;
                                 break None;
                             }
                             _ = optional_sleep_elapsed(header_wait.as_mut()), if header_wait_active => {
-                                header_wait_expired = true;
                                 drop(pending_slot.take());
-                                halt_reader_after_loop = true;
                                 abort_backend_upload = true;
+                                // A strictly earlier elapsed write bound keeps its
+                                // own terminal, whichever timer fired first (issue
+                                // #6976).
+                                if crate::proxy::elapsed_owning_bound(
+                                    upload_deadline_at,
+                                    header_wait_at,
+                                    tokio::time::Instant::now(),
+                                ) == Some(crate::proxy::OwningBound::Dispatch)
+                                {
+                                    upload_auth_expired = plain_write_bound.expired_authorization();
+                                    upload_deadline_after_handoff = true;
+                                    break None;
+                                }
+                                header_wait_expired = true;
+                                halt_reader_after_loop = true;
                                 break None;
                             }
                             // STOP_SENDING on the response, or the connection
@@ -5698,6 +5767,11 @@ where
                                 break None;
                             }
                             result = &mut send_future => {
+                                // The instant `send()` was observed, before the
+                                // reader drain/halt below can await: a failure
+                                // ready before a bound stays the backend's
+                                // (issue #6976).
+                                let observed_at = tokio::time::Instant::now();
                                 send_done = true;
                                 drop(pending_slot.take());
                                 if !reader_done {
@@ -5714,8 +5788,14 @@ where
                                     if !reader_done {
                                         halt_notify.notify_one();
                                         let halt_deadline = Duration::from_millis(100);
-                                        let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
-                                            .await;
+                                        // A completed reader must never be polled
+                                        // again by the post-loop halt.
+                                        if tokio::time::timeout(halt_deadline, &mut reader_future)
+                                            .await
+                                            .is_ok()
+                                        {
+                                            reader_done = true;
+                                        }
                                     }
                                 }
                                 // Biased select checks send_future before
@@ -5739,6 +5819,32 @@ where
                                 if result.is_err() && write_timed_out.load(Ordering::Acquire) {
                                     backend_write_watermark_expired = true;
                                     break None;
+                                }
+                                // A backend failure observed at/after a bound is
+                                // that bound, exactly as its timer arm settles it
+                                // (issue #6976). A SUCCESSFUL response still wins.
+                                // An oversized upload keeps its `413` (issue #6976).
+                                if result.is_err() && !oversized.load(Ordering::Relaxed) {
+                                    match crate::proxy::elapsed_owning_bound(
+                                        upload_deadline_at,
+                                        header_wait_at,
+                                        observed_at,
+                                    ) {
+                                        Some(crate::proxy::OwningBound::Dispatch) => {
+                                            upload_auth_expired =
+                                                plain_write_bound.expired_authorization();
+                                            upload_deadline_after_handoff = true;
+                                            abort_backend_upload = true;
+                                            break None;
+                                        }
+                                        // The reader was already halted above.
+                                        Some(crate::proxy::OwningBound::ResponseHeader) => {
+                                            header_wait_expired = true;
+                                            abort_backend_upload = true;
+                                            break None;
+                                        }
+                                        None => {}
+                                    }
                                 }
                                 break Some(result);
                             }

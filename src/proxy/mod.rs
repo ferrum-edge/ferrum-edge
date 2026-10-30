@@ -48454,12 +48454,19 @@ pub(crate) async fn proxy_to_backend_retry(
     )
     .await;
     let header_wait = match bounded {
-        Ok(Ok(inner)) => inner,
-        Ok(Err(())) => {
-            return http_backend_dispatch_error_response(
-                retry::ErrorClass::ReadWriteTimeout,
-                resolved_ip,
-            );
+        Ok(outcome) => {
+            match settle_reqwest_header_wait(outcome, send_bound_at, header_deadline_at, |error| {
+                crate::backend_conn_limit::is_backend_connection_limit_error(error)
+            }) {
+                ReqwestHeaderWait::Send(result) => Ok(result),
+                ReqwestHeaderWait::Dispatch => Err(()),
+                ReqwestHeaderWait::ResponseHeader => {
+                    return http_backend_dispatch_error_response(
+                        retry::ErrorClass::ReadWriteTimeout,
+                        resolved_ip,
+                    );
+                }
+            }
         }
         Err(()) => {
             // Stop writing the replayed body now rather than leaving the task
@@ -48730,17 +48737,6 @@ pub(crate) async fn proxy_to_backend_retry(
                     request_on_wire: false,
                     buffered_trailers: None,
                 };
-            }
-            if reqwest_send_failure_is_client_deadline(
-                send_bound,
-                request_ctx.grpc_deadline_at(),
-                header_deadline_at,
-            ) {
-                return client_grpc_deadline_exceeded_response_for_request(
-                    request_ctx,
-                    headers,
-                    resolved_ip,
-                );
             }
             let error_class = retry::classify_reqwest_error(&e);
             if error_class == retry::ErrorClass::TlsError {
@@ -52580,8 +52576,16 @@ async fn proxy_to_backend(
     )
     .await;
     let header_wait = match bounded {
-        Ok(Ok(inner)) => Some(inner),
-        Ok(Err(())) => None,
+        Ok(outcome) => {
+            match settle_reqwest_header_wait(outcome, send_bound_at, header_deadline_at, |error| {
+                body_size_exceeded.load(Ordering::Acquire)
+                    || crate::backend_conn_limit::is_backend_connection_limit_error(error)
+            }) {
+                ReqwestHeaderWait::Send(result) => Some(Ok(result)),
+                ReqwestHeaderWait::Dispatch => Some(Err(())),
+                ReqwestHeaderWait::ResponseHeader => None,
+            }
+        }
         Err(()) => {
             write_watermark_expired = true;
             None
@@ -53128,21 +53132,6 @@ async fn proxy_to_backend(
                         request_on_wire: false,
                         buffered_trailers: None,
                     },
-                    retained_body,
-                    backend_admission_permits,
-                );
-            }
-            if reqwest_send_failure_is_client_deadline(
-                send_bound,
-                request_ctx.grpc_deadline_at(),
-                header_deadline_at,
-            ) {
-                return backend_dispatch_response(
-                    client_grpc_deadline_exceeded_response_for_request(
-                        request_ctx,
-                        headers,
-                        resolved_ip,
-                    ),
                     retained_body,
                     backend_admission_permits,
                 );
@@ -54216,13 +54205,14 @@ async fn proxy_to_backend_direct_h1(
                     // no socket at all.
                     continue;
                 }
-                // A send failure observed at/after the client RPC deadline or
-                // authorization bound is that bound, exactly as the timer arm
-                // above settles it (issue #6022).
-                if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader
-                    && handoff_bound
-                        .at
-                        .is_some_and(|at| tokio::time::Instant::now() >= at)
+                // A send failure observed at/after the handoff bound is that
+                // bound, exactly as the timer arms above settle it, whichever
+                // source owns it: the client RPC deadline, the authorization
+                // lifetime, or the response-header read bound (issues #6022,
+                // #6976).
+                if handoff_bound
+                    .at
+                    .is_some_and(|at| tokio::time::Instant::now() >= at)
                 {
                     if let Some(pump) = upload_pump.as_mut() {
                         pump.cancel();
@@ -58764,23 +58754,82 @@ impl CollectOutcome for retry::BackendResponse {
     }
 }
 
-/// Whether a reqwest `send()` failure observed now belongs to the client RPC
-/// deadline that composed `bound` (issue #6022): the client deadline, not the
-/// authorization lifetime, owns the bound, no earlier operator response-header
-/// bound applies, and the deadline has passed. Settled as that deadline, as if
-/// the bound's timer had fired first.
-fn reqwest_send_failure_is_client_deadline(
-    bound: DispatchPhaseBound,
-    client_deadline_at: Option<tokio::time::Instant>,
+/// Which of two captured bounds owns an outcome (issue #6976).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwningBound {
+    /// The composed dispatch bound: the client RPC deadline (or gRPC-Web RPC
+    /// deadline) and the authorization lifetime.
+    Dispatch,
+    /// The operator response-header bound, with any route deadlines folded in.
+    ResponseHeader,
+}
+
+/// The bound that owns an outcome observed at `now` when a dispatch bound and
+/// a response-header bound race one wait: the earlier of the two once it has
+/// elapsed. The response-header bound wins an exact tie, exactly as
+/// [`compose_backend_handoff_bound`] attributes it for the direct HTTP/1.1
+/// pool. Attribution comes from the captured instants, never from timer
+/// nesting, select-arm order, or which timer a late wake polled first, and a
+/// backend failure observed at or after the owner settles as that bound.
+pub(crate) fn elapsed_owning_bound(
+    dispatch_at: Option<tokio::time::Instant>,
+    header_at: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Option<OwningBound> {
+    match (dispatch_at, header_at) {
+        (Some(dispatch), Some(header)) if header <= dispatch => {
+            (now >= header).then_some(OwningBound::ResponseHeader)
+        }
+        (Some(dispatch), _) => (now >= dispatch).then_some(OwningBound::Dispatch),
+        (None, Some(header)) => (now >= header).then_some(OwningBound::ResponseHeader),
+        (None, None) => None,
+    }
+}
+
+/// A reqwest response-header wait, settled by its owning bound.
+enum ReqwestHeaderWait {
+    /// `send()` resolved before either bound, or with a gateway-owned error.
+    Send(Result<reqwest::Response, reqwest::Error>),
+    /// The composed client/authorization bound owns the outcome.
+    Dispatch,
+    /// The operator response-header bound owns the outcome.
+    ResponseHeader,
+}
+
+/// Settle a reqwest header wait nested as `operator(composed(send()))`
+/// (issue #6976). Every timeout-shaped outcome, and a backend failure observed
+/// after a bound, is owned by the EARLIER captured bound: the nesting alone
+/// would let the outer operator timer claim an expiry an earlier client
+/// deadline owns after a late wake, and an inner expiry or late reset ignore an
+/// earlier operator bound. `gateway_owned` keeps the gateway's own typed
+/// terminals (an oversized upload, a `maxConnections` refusal) ahead of it.
+fn settle_reqwest_header_wait(
+    outcome: Result<Result<Result<reqwest::Response, reqwest::Error>, ()>, ()>,
+    send_bound_at: Option<tokio::time::Instant>,
     header_deadline_at: Option<tokio::time::Instant>,
-) -> bool {
-    !bound.authorization_wins
-        && client_deadline_at
-            .is_some_and(|client| header_deadline_at.is_none_or(|header| client <= header))
-        && crate::proxy::grpc_proxy::client_deadline_owns_failure(
-            client_deadline_at,
+    gateway_owned: impl FnOnce(&reqwest::Error) -> bool,
+) -> ReqwestHeaderWait {
+    let settles_by_owner = match &outcome {
+        Ok(Ok(Ok(_))) => false,
+        Ok(Ok(Err(error))) => !gateway_owned(error),
+        Ok(Err(())) | Err(()) => true,
+    };
+    if settles_by_owner {
+        match elapsed_owning_bound(
+            send_bound_at,
+            header_deadline_at,
             tokio::time::Instant::now(),
-        )
+        ) {
+            Some(OwningBound::Dispatch) => return ReqwestHeaderWait::Dispatch,
+            Some(OwningBound::ResponseHeader) => return ReqwestHeaderWait::ResponseHeader,
+            None => {}
+        }
+    }
+    match outcome {
+        Ok(Ok(result)) => ReqwestHeaderWait::Send(result),
+        Ok(Err(())) => ReqwestHeaderWait::Dispatch,
+        Err(()) => ReqwestHeaderWait::ResponseHeader,
+    }
 }
 
 /// Attribute an already-fired composed dispatch-phase bound (issue #3815).
@@ -60534,6 +60583,22 @@ async fn proxy_to_backend_hbone_after_ready(
                     upload_pump.as_mut(),
                 )
                 .await;
+                // A send failure observed at/after the composed bound, before its
+                // timer fired, settles exactly as that timer's arm below (issue
+                // #6976); the failed lease drops without check-in, as there. A
+                // gateway-caused upload error (issue #6776) keeps its typed
+                // terminal in the error arm below.
+                let bounded = match bounded {
+                    Ok(Ok((Err(try_err), _)))
+                        if tokio::time::Instant::now() >= send_deadline
+                            && !crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                                try_err.error(),
+                            ) =>
+                    {
+                        Ok(Err(()))
+                    }
+                    other => other,
+                };
                 match bounded {
                     Ok(Ok(result)) => Some(result),
                     Ok(Err(_)) => {
@@ -61651,6 +61716,22 @@ async fn proxy_to_backend_unix(
                     upload_pump.as_mut(),
                 )
                 .await;
+                // A send failure observed at/after the composed bound, before its
+                // timer fired, settles exactly as that timer's arm below (issue
+                // #6976); the failed lease drops without check-in, as there. A
+                // gateway-caused upload error (issue #6776) keeps its typed
+                // terminal in the error arm below.
+                let bounded = match bounded {
+                    Ok(Ok((Err(try_err), _)))
+                        if tokio::time::Instant::now() >= send_deadline
+                            && !crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                                try_err.error(),
+                            ) =>
+                    {
+                        Ok(Err(()))
+                    }
+                    other => other,
+                };
                 match bounded {
                     Ok(Ok(result)) => Some(result),
                     Ok(Err(_)) => {
@@ -63380,6 +63461,27 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             upload_pump.as_mut(),
         )
         .await;
+        // A send failure observed at/after the composed bound, before its timer
+        // fired, settles exactly as that timer's arm below: the request-size
+        // terminal first, then the authorization lifetime, then the client or
+        // operator deadline (issue #6976).
+        // Gateway-caused upload errors (a client abort or malformed upload,
+        // issue #6776) and the pipe write watermark keep their typed terminals
+        // in the error arm below.
+        let bounded = match bounded {
+            Ok(Ok(Err(err)))
+                if tokio::time::Instant::now() >= deadline
+                    && !pipe_write_timeout
+                        .as_ref()
+                        .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
+                    && !crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                        &err,
+                    ) =>
+            {
+                Ok(Err(()))
+            }
+            other => other,
+        };
         match bounded {
             Ok(Ok(result)) => Some(result),
             Ok(Err(_)) => {
@@ -64548,31 +64650,25 @@ async fn proxy_to_backend_http2(
             upload_pump.as_mut(),
         )
         .await;
-        match bounded {
-            Ok(Ok(Ok(resp))) => Some(resp),
-            // A send failure observed at/after the client deadline, before its
-            // timer fired, is that deadline (issue #6022). The gateway-owned
-            // size and write-watermark terminals keep precedence.
+        // A send failure observed at/after the header bound, before its timer
+        // fired, settles exactly as that timer's arm below, whichever source
+        // owns the bound: the client deadline, the authorization lifetime, or
+        // the operator read bound (issues #6022, #6976). The gateway-owned size
+        // and write-watermark terminals keep precedence.
+        let bounded = match bounded {
             Ok(Ok(Err(_)))
-                if deadline_source == ResponseHeaderDeadlineSource::Client
-                    && !body_size_exceeded.load(std::sync::atomic::Ordering::Acquire)
+                if !body_size_exceeded.load(std::sync::atomic::Ordering::Acquire)
                     && !passthrough_write_timeout
                         .as_ref()
                         .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
-                    && crate::proxy::grpc_proxy::client_deadline_owns_failure(
-                        Some(deadline),
-                        tokio::time::Instant::now(),
-                    ) =>
+                    && tokio::time::Instant::now() >= deadline =>
             {
-                return (
-                    client_grpc_deadline_exceeded_response_for_optional_request(
-                        ctx,
-                        headers,
-                        resolved_ip,
-                    ),
-                    None,
-                );
+                Ok(Err(()))
             }
+            other => other,
+        };
+        match bounded {
+            Ok(Ok(Ok(resp))) => Some(resp),
             Ok(Ok(Err(e))) => return map_h2_err(e),
             Err(()) => {
                 header_write_watermark_expired = true;

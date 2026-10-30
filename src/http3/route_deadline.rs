@@ -137,6 +137,23 @@ impl H3RouteDeadlines {
             && attempt_deadline.is_some_and(|attempt| attempt <= now)
     }
 
+    /// Whether the attempt budget owns an elapsed response-header bound that
+    /// folds it with `operator_at` and the total deadline, from the captured
+    /// instants rather than the clock at observation (issue #6976): it must be
+    /// the earliest of the three. The total deadline wins a tie, as in
+    /// [`Self::attempt_budget_expired`], and so does the operator bound.
+    #[inline]
+    pub(crate) fn attempt_budget_owns(
+        self,
+        attempt_deadline: Option<tokio::time::Instant>,
+        operator_at: Option<tokio::time::Instant>,
+    ) -> bool {
+        attempt_deadline.is_some_and(|attempt| {
+            self.total.is_none_or(|total| attempt < total)
+                && operator_at.is_none_or(|operator| attempt < operator)
+        })
+    }
+
     /// How the committed attempt's [`Self::body_deadline`] ended it once it
     /// fired: the total deadline when that has elapsed (it wins a tie, as in
     /// proxy core, so a spent transaction is never retried), otherwise the

@@ -6491,9 +6491,6 @@ pub(crate) async fn proxy_grpc_request_core(
     };
     let response_deadline_is_client = client_grpc_deadline_at
         .is_some_and(|client| response_deadline_at.is_some_and(|effective| client <= effective));
-    // The response deadline only when it is the client's: an earlier operator
-    // read timeout keeps its own `BackendTimeout` accounting.
-    let client_response_deadline_at = response_deadline_at.filter(|_| response_deadline_is_client);
     let response_deadline_ms = response_deadline_at.map(|deadline| {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1)
@@ -6522,14 +6519,23 @@ pub(crate) async fn proxy_grpc_request_core(
             if e.is_canceled() || protocol_nack {
                 transport.invalidate_on_pre_wire_cancel(proxy);
             }
-            // A failure at/after the client deadline is that deadline, not a
-            // backend fault, whichever of hyper and `timeout_at` reports first
-            // (issue #6022; same rule as the streaming header wait).
-            if client_deadline_owns_failure(
-                client_response_deadline_at,
-                tokio::time::Instant::now(),
-            ) {
-                return GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseHeaders);
+            // A failure at/after the shared response deadline is that deadline,
+            // settled exactly as its `timeout_at` arm below, whichever of hyper
+            // and the timer reports first (issues #6022, #6976): the client's
+            // `DEADLINE_EXCEEDED`, or an earlier operator read bound's
+            // `BackendTimeout`.
+            if client_deadline_owns_failure(response_deadline_at, tokio::time::Instant::now()) {
+                return if response_deadline_is_client {
+                    GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseHeaders)
+                } else {
+                    GrpcProxyError::BackendTimeout {
+                        kind: GrpcTimeoutKind::Read,
+                        message: format!(
+                            "Read timeout after {}ms (end-to-end)",
+                            response_deadline_ms.unwrap_or(1)
+                        ),
+                    }
+                };
             }
             error!(
                 transport = transport.label(),
@@ -6777,14 +6783,23 @@ pub(crate) async fn proxy_grpc_request_core(
                     // circuit-breaker/admission SUCCESS for a failed exchange.
                     // h2 trailers are the final frame, so an error here always
                     // means the response never completed. A failure at/after
-                    // the client deadline is that deadline (issue #6022).
+                    // the shared response deadline is that deadline, settled
+                    // as its `timeout_at` arm (issues #6022, #6976).
                     if client_deadline_owns_failure(
-                        client_response_deadline_at,
+                        response_deadline_at,
                         tokio::time::Instant::now(),
                     ) {
-                        return Err(GrpcProxyError::ClientDeadlineExceeded(
-                            GrpcDeadlinePhase::ResponseBody,
-                        ));
+                        return Err(if response_deadline_is_client {
+                            GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseBody)
+                        } else {
+                            GrpcProxyError::BackendTimeout {
+                                kind: GrpcTimeoutKind::Read,
+                                message: format!(
+                                    "Body read timeout after {}ms (end-to-end)",
+                                    response_deadline_ms.unwrap_or(1)
+                                ),
+                            }
+                        });
                     }
                     warn_sampled!("gRPC: error reading backend response frame: {}", e);
                     return Err(GrpcProxyError::backend_unavailable_with_source(

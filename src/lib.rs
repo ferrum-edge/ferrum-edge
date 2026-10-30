@@ -2609,6 +2609,18 @@ pub mod _test_support {
         crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
     }
 
+    /// The shared owner rule for two racing bounds (issue #6976): `Some(true)`
+    /// for the dispatch bound, `Some(false)` for the response-header bound,
+    /// `None` while neither has elapsed.
+    pub fn elapsed_owning_bound_for_test(
+        dispatch_at: Option<tokio::time::Instant>,
+        header_at: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> Option<bool> {
+        crate::proxy::elapsed_owning_bound(dispatch_at, header_at, now)
+            .map(|bound| bound == crate::proxy::OwningBound::Dispatch)
+    }
+
     pub fn client_deadline_owns_failure_for_test(
         deadline: Option<tokio::time::Instant>,
         now: tokio::time::Instant,
