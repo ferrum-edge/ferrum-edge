@@ -7072,37 +7072,64 @@ fn the_client_deadline_owns_only_failures_at_or_after_it() {
     );
 }
 
-/// The buffered native-gRPC dispatch applies the #6022 rule in both response
-/// phases, against the client deadline only, and the streaming header wait
-/// keeps it. Structural: the unit harness cannot stall the timer wheel inside
-/// a live dispatch.
+/// Slice the body of the function whose signature starts at `signature`.
+fn source_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+    let start = src
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} not found"));
+    let tail = &src[start..];
+    &tail[..tail.find("\n}\n").expect("end of function body")]
+}
+
+/// The text between `from` and the next `until` after it, so a check cannot be
+/// satisfied by an unrelated later occurrence in the same function.
+fn bounded<'a>(body: &'a str, from: &str, until: &str) -> &'a str {
+    let start = body
+        .find(from)
+        .unwrap_or_else(|| panic!("{from:?} not found"));
+    let tail = &body[start..];
+    let end = tail[from.len()..]
+        .find(until)
+        .map_or(tail.len(), |offset| from.len() + offset);
+    &tail[..end]
+}
+
+/// Every gRPC dispatch path applies the #6022 cutoff: a backend failure
+/// observed at/after the client deadline is that deadline. Structural: the unit
+/// harness cannot stall the timer wheel inside a live dispatch.
 #[test]
 fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
-    let src = include_str!("../../../src/proxy/grpc_proxy.rs");
-    let fn_body = |signature: &str| {
-        let start = src
-            .find(signature)
-            .unwrap_or_else(|| panic!("{signature} not found"));
-        let tail = &src[start..];
-        &tail[..tail.find("\n}\n").expect("end of function body")]
-    };
+    let grpc = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
 
-    let buffered = fn_body("pub(crate) async fn proxy_grpc_request_core(");
+    let buffered = source_fn_body(grpc, "pub(crate) async fn proxy_grpc_request_core(");
     assert!(
         buffered.contains("response_deadline_at.filter(|_| response_deadline_is_client)"),
         "only the client's deadline may claim a failure; an operator read timeout keeps \
          BackendTimeout accounting"
     );
-    let header_check = buffered
-        .find("client_deadline_owns_failure(\n                client_response_deadline_at,")
-        .expect("the buffered header wait must let the client deadline own late failures");
+    let header = bounded(
+        buffered,
+        "client_deadline_owns_failure(\n                client_response_deadline_at,",
+        "error!(",
+    );
     assert!(
-        buffered[header_check..].contains("GrpcDeadlinePhase::ResponseHeaders"),
+        header.contains("GrpcDeadlinePhase::ResponseHeaders"),
         "a late header-wait failure must be the ResponseHeaders deadline"
+    );
+    let body = bounded(
+        buffered,
+        "client_deadline_owns_failure(\n                        client_response_deadline_at,",
+        "warn_sampled!(",
+    );
+    assert!(
+        body.contains("GrpcDeadlinePhase::ResponseBody"),
+        "a late body-collection failure must be the ResponseBody deadline"
     );
     let body_check = buffered
         .find("client_deadline_owns_failure(\n                        client_response_deadline_at,")
-        .expect("buffered body collection must let the client deadline own late failures");
+        .expect("body-collection deadline check");
     let body_error_log = buffered
         .find("gRPC: error reading backend response frame")
         .expect("body collection error arm");
@@ -7111,11 +7138,81 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
         "the deadline check must precede the backend failure in the body error arm"
     );
 
-    let streaming = fn_body("async fn proxy_grpc_streaming_dispatch(");
+    let streaming = source_fn_body(grpc, "async fn proxy_grpc_streaming_dispatch(");
     assert!(
         streaming.contains(
             "client_deadline_owns_failure(grpc_deadline_at, tokio::time::Instant::now())"
         ),
         "the streaming header wait must keep the same rule"
+    );
+
+    let mesh = source_fn_body(proxy, "async fn proxy_to_backend_mesh_mtls_after_ready(");
+    let mesh_read = bounded(
+        mesh,
+        "Err(HyperBodyCollectError::Read(err)) => {",
+        "mesh_grpc_unavailable_response(",
+    );
+    assert!(
+        mesh_read.contains("buffered_grpc_shared_deadline_is_client")
+            && mesh_read.contains("client_deadline_owns_failure(")
+            && mesh_read.contains("client_grpc_deadline_exceeded_response_for_request("),
+        "the sidecar-mTLS buffered collect must settle a late read failure as the client deadline"
+    );
+
+    let direct = source_fn_body(proxy, "async fn proxy_to_backend_http2(");
+    let direct_send = bounded(
+        direct,
+        "Ok(Ok(Ok(resp))) => Some(resp),",
+        "=> return map_h2_err(e)",
+    );
+    assert!(
+        direct_send.contains("ResponseHeaderDeadlineSource::Client")
+            && direct_send.contains("client_deadline_owns_failure(")
+            && direct_send.contains("client_grpc_deadline_exceeded_response_for_optional_request("),
+        "the direct-H2 header wait must settle a late send failure as the client deadline"
+    );
+
+    for signature in [
+        "async fn proxy_to_backend(",
+        "pub(crate) async fn proxy_to_backend_retry(",
+    ] {
+        let reqwest = source_fn_body(proxy, signature);
+        let before_classify = bounded(
+            reqwest,
+            "reqwest_send_failure_is_client_deadline(",
+            "retry::classify_reqwest_error(&e)",
+        );
+        assert!(
+            before_classify.contains("client_grpc_deadline_exceeded_response_for_request("),
+            "{signature} must settle a late send failure before reqwest classification"
+        );
+    }
+
+    let relay = source_fn_body(h3, "async fn dispatch_grpc_native_h3(");
+    assert_eq!(
+        relay.matches("settle_client_grpc_deadline!();").count(),
+        2,
+        "the native H3 relay's deadline arm and late body-error arm must share one terminal"
+    );
+    let late_body = bounded(
+        relay,
+        "} else if grpc_deadline_active\n",
+        "mark_h3_unsupported",
+    );
+    assert!(
+        late_body.contains("expired_authorization().is_none()")
+            && late_body.contains("settle_client_grpc_deadline!();"),
+        "a late H3 body failure must settle as the client deadline before any capability \
+         downgrade, and only when the authorization lifetime did not win"
+    );
+    let late_trailers = bounded(
+        relay,
+        "Err(_)\n                    if grpc_deadline_active",
+        "mark_h3_unsupported",
+    );
+    assert!(
+        late_trailers.contains("client_deadline_expired = true;"),
+        "a late H3 trailer failure must settle as the client deadline before any capability \
+         downgrade"
     );
 }

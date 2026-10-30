@@ -5897,17 +5897,19 @@ where
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
-                // An upstream failure at/after this adapter's own deadline is
-                // that deadline, even when the timer wheel has not fired the
-                // sleep yet (issue #6022): a backend enforcing the forwarded
-                // `grpc-timeout` with `CANCEL` must not be charged for winning
-                // that race. One clock read, on the error path only.
-                if this.deadline.as_ref().is_some_and(|deadline| {
-                    crate::proxy::grpc_proxy::client_deadline_owns_failure(
-                        Some(deadline.deadline()),
-                        tokio::time::Instant::now(),
-                    )
-                }) {
+                // An upstream failure observed at/after this adapter's own
+                // deadline is settled as that deadline, exactly as the check
+                // above does once the timer wheel has fired the sleep (issue
+                // #6022): the outcome must not depend on timer scheduling. In
+                // the client `grpc-timeout` regime that keeps a backend
+                // enforcing the forwarded deadline with `CANCEL` uncharged; in
+                // the route request regime it is the route's health-neutral
+                // cut. One clock read, on the error path only.
+                if this
+                    .deadline
+                    .as_ref()
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline.deadline())
+                {
                     return this.emit_deadline_terminal();
                 }
                 this.done = true;

@@ -7033,20 +7033,26 @@ pub(crate) fn apply_remaining_grpc_timeout_header(
     headers.insert("grpc-timeout", value);
 }
 
-/// Whether a backend failure observed at `now` belongs to the client RPC
-/// deadline rather than to the backend (issue #6022).
+/// Whether a backend failure observed at `now` is settled as the client RPC
+/// deadline rather than charged to the backend (issue #6022).
 ///
-/// The gateway forwards only the remaining budget, rounded up and measured
-/// after sender acquisition ([`apply_remaining_grpc_timeout_header`]), so a
-/// backend that enforces the forwarded `grpc-timeout` (grpc-java resets the
-/// stream with `CANCEL`, for example) reaches its deadline no earlier than the
-/// gateway does. Its failure can only arrive first when the gateway's own
-/// `timeout_at` has not yet been driven by the timer wheel, such as under
-/// scheduler lag. Reading the clock at the failure removes that dependency: a
-/// failure at or after the deadline is the deadline, exactly as if the timer
-/// had fired on time (`DEADLINE_EXCEEDED`, health-neutral). A failure before
-/// the deadline, including an unexplained backend `CANCEL`, stays a backend
-/// failure. `None` (no client deadline) never claims a failure.
+/// This is a cutoff, not proof of what caused the failure: once the client's
+/// deadline instant has passed, the deadline owns the attempt's outcome
+/// (`DEADLINE_EXCEEDED`, health-neutral), exactly as if the gateway's own
+/// timer had fired first. Without the clock read, accounting would depend on
+/// whether the timer wheel or the failure was polled first. The case it exists
+/// for is a backend enforcing the forwarded `grpc-timeout` (grpc-java resets
+/// the stream with `CANCEL`): the gateway forwards the remaining budget,
+/// rounded up to the millisecond and measured after sender acquisition
+/// ([`apply_remaining_grpc_timeout_header`]), so that reset can only beat the
+/// gateway's terminal when the gateway's timer fires late. Budgets beyond the
+/// eight-digit millisecond wire limit are coarsened down to whole seconds or
+/// larger units, where a backend may legitimately expire up to one unit early
+/// and is then still charged. A failure observed before the deadline,
+/// including an unexplained backend `CANCEL`, stays a backend failure. The
+/// cost is that a fault generated just before the deadline but observed after
+/// it, within the same scheduling lag, is not charged. `None` (no client
+/// deadline) never claims a failure.
 pub(crate) fn client_deadline_owns_failure(
     deadline: Option<tokio::time::Instant>,
     now: tokio::time::Instant,
