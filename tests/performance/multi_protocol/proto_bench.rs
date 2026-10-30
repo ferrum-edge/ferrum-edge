@@ -347,8 +347,9 @@ impl GrpcCallOptions {
 
     fn request<T>(&self, message: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(message);
-        // `set_timeout` only writes the `grpc-timeout` header; tonic's client
-        // enforces no deadline unless the endpoint itself has a timeout.
+        // `set_timeout` writes the `grpc-timeout` header. tonic's client
+        // `GrpcTimeout` layer then bounds only the wait for response headers
+        // (ending as `CANCELLED`), never the response stream.
         if let Some(timeout) = self.timeout {
             request.set_timeout(timeout);
         }

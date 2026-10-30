@@ -51,6 +51,7 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -364,6 +365,11 @@ def measure_cell(scenario: str, dest: Path, env: dict, gateway_pid: int) -> dict
     }
 
 
+# Failures of one control's process or its bracketing /bench-stats reads. They
+# are recorded in-band so the comparison keeps the rest of its evidence.
+EVIDENCE_ERRORS = (HarnessError, subprocess.TimeoutExpired, urllib.error.URLError, OSError, ValueError)
+
+
 def run_probe(auth: str, dest: Path, env: dict) -> dict:
     """Run the stalled-stream probe and return its evidence.
 
@@ -372,13 +378,14 @@ def run_probe(auth: str, dest: Path, env: dict) -> dict:
     A probe that fails to run or times out is recorded as evidence, not raised:
     a failing reference must not discard the candidate's measurements.
     """
-    stats_before = backend_stats()
+    started = None
     try:
+        stats_before = backend_stats()
         report = run_bench(f"probe-{auth}", dest, env)
+        started = counter_delta(stats_before, backend_stats(), "grpc_stalled_started")
         error = None
-    except (HarnessError, subprocess.TimeoutExpired) as exc:
+    except EVIDENCE_ERRORS as exc:
         report, error = {}, f"probe did not complete: {exc}"
-    started = counter_delta(stats_before, backend_stats(), "grpc_stalled_started")
     fields = ("calls", "calls_made", "deadline_exceeded", "unexpected_messages", "client_safety_timeouts",
               "grpc_timeout_ms", "release_checked", "release_failures", "max_release_wait_ms",
               "backend_stalled_started", "backend_stalled_released")
@@ -389,12 +396,20 @@ def run_probe(auth: str, dest: Path, env: dict) -> dict:
 
 
 def run_auth_refusal(dest: Path, env: dict) -> dict:
-    """Prove the key_auth route authenticates: a keyless call never reaches the backend."""
-    stats_before = backend_stats()
-    report = run_bench("auth-refusal", dest, env)
-    stats_after = backend_stats()
-    return {"total_requests": report.get("total_requests"), "total_errors": report.get("total_errors"),
-            "backend_calls": counter_delta(stats_before, stats_after, BACKEND_COUNTER["unary"])}
+    """Prove the key_auth route authenticates: a keyless call never reaches the backend.
+
+    A control that cannot run is recorded as evidence (and fails either role),
+    so the lifetime's probe row is still persisted.
+    """
+    try:
+        stats_before = backend_stats()
+        report = run_bench("auth-refusal", dest, env)
+        backend_calls = counter_delta(stats_before, backend_stats(), BACKEND_COUNTER["unary"])
+    except EVIDENCE_ERRORS as exc:
+        return {"error": f"negative control did not complete: {exc}", "total_requests": None,
+                "total_errors": None, "backend_calls": None}
+    return {"error": None, "total_requests": report.get("total_requests"),
+            "total_errors": report.get("total_errors"), "backend_calls": backend_calls}
 
 
 def rotated(values: tuple, offset: int) -> tuple:
@@ -566,6 +581,8 @@ def auth_refusal_problems(probe: dict) -> list[str]:
     refusal = probe.get("auth_refusal")
     if not isinstance(refusal, dict):
         return [f"{where}: missing"]
+    if refusal.get("error"):
+        return [f"{where}: {refusal['error']}"]
     if refusal.get("total_requests") or not refusal.get("total_errors") or refusal.get("backend_calls"):
         return [f"{where}: a call without the API key was not refused before the backend "
                 f"({refusal.get('total_requests')} succeeded, {refusal.get('total_errors')} errors, "
@@ -778,7 +795,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     for key, effect in report["deadline_effects"].items():
         if effect["verdict"] == "regression":
             print(f"::warning::{key}: the deadline path regressed beyond the contract margins (throughput {_ci(effect['throughput'])}, "
-                  f"CPU/call {_ci(effect['cpu_per_call'])})")
+                  f"CPU/call {_ci(effect['cpu_per_call'])}, p99 {_ci(effect['p99'])})")
     return 1 if report["failures"] else 0
 
 
@@ -822,7 +839,8 @@ def _probes(rounds: int = 4) -> list[dict]:
              "elapsed_ms": {"min": 251.0, "median": 253.0, "max": 260.0}, "grpc_timeout_ms": 250,
              "release_checked": True, "release_failures": 0, "max_release_wait_ms": 4.0,
              "backend_stalled_started": 20, "backend_stalled_released": 20, "backend_started_crosscheck": 20,
-             **({"auth_refusal": {"total_requests": 0, "total_errors": 1, "backend_calls": 0}} if auth == "auth" else {})}
+             **({"auth_refusal": {"error": None, "total_requests": 0, "total_errors": 1, "backend_calls": 0}}
+                if auth == "auth" else {})}
             for role in ROLES for auth in CONFIGS for r in range(1, rounds + 1)]
 
 
@@ -893,6 +911,11 @@ def self_test() -> int:
     probes = _probes()
     del next(p for p in probes if p["auth"] == "auth")["auth_refusal"]
     assert evaluate(c, _rows(), probes)["status"] == "fail"
+    probes = _probes()
+    next(p for p in probes if p["role"] == "reference" and p["auth"] == "auth")["auth_refusal"] = {
+        "error": "negative control did not complete: timeout", "total_requests": None, "total_errors": None,
+        "backend_calls": None}
+    assert evaluate(c, _rows(), probes)["status"] == "fail"
     # p99 alone can mark a regression when it is wholly beyond its margin.
     rows = _rows()
     for row in rows:
@@ -932,7 +955,7 @@ def self_test() -> int:
         raise AssertionError("a zero SHA must be rejected")
     # Every literal command exists for every cell and route.
     source = Path(__file__).read_text(encoding="utf-8")
-    for kind in (*SCENARIOS, *(f"warmup-{a}" for a in CONFIGS), *(f"probe-{a}" for a in CONFIGS)):
+    for kind in (*SCENARIOS, *(f"warmup-{a}" for a in CONFIGS), *(f"probe-{a}" for a in CONFIGS), "auth-refusal"):
         assert f'kind == "{kind}"' in source, kind
     summary_markdown(evaluate(c, _rows(), _probes()), {"reference": {"sha": "a"}, "candidate": {"sha": "b"}})
     print("grpc_deadline_comparison self-test passed")
