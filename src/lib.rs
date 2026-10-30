@@ -2609,6 +2609,13 @@ pub mod _test_support {
         crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
     }
 
+    pub fn client_deadline_owns_failure_for_test(
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        crate::proxy::grpc_proxy::client_deadline_owns_failure(deadline, now)
+    }
+
     pub fn direct_h2_send_request_error_response_for_class_for_test(
         error_class: crate::retry::ErrorClass,
         resolved_ip: Option<String>,

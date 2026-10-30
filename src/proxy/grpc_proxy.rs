@@ -6083,8 +6083,7 @@ async fn proxy_grpc_streaming_dispatch(
                 // header wait's `timeout_at` expires; whichever hyper reports
                 // first, a failure at/after the deadline is that deadline, not
                 // a backend fault.
-                if grpc_deadline_at.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                {
+                if client_deadline_owns_failure(grpc_deadline_at, tokio::time::Instant::now()) {
                     return GrpcProxyError::ClientDeadlineExceeded(
                         GrpcDeadlinePhase::StreamingResponseHeaders,
                     );
@@ -6492,6 +6491,9 @@ pub(crate) async fn proxy_grpc_request_core(
     };
     let response_deadline_is_client = client_grpc_deadline_at
         .is_some_and(|client| response_deadline_at.is_some_and(|effective| client <= effective));
+    // The response deadline only when it is the client's: an earlier operator
+    // read timeout keeps its own `BackendTimeout` accounting.
+    let client_response_deadline_at = response_deadline_at.filter(|_| response_deadline_is_client);
     let response_deadline_ms = response_deadline_at.map(|deadline| {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1)
@@ -6519,6 +6521,15 @@ pub(crate) async fn proxy_grpc_request_core(
             let protocol_nack = crate::retry::error_chain_is_protocol_nack(&e);
             if e.is_canceled() || protocol_nack {
                 transport.invalidate_on_pre_wire_cancel(proxy);
+            }
+            // A failure at/after the client deadline is that deadline, not a
+            // backend fault, whichever of hyper and `timeout_at` reports first
+            // (issue #6022; same rule as the streaming header wait).
+            if client_deadline_owns_failure(
+                client_response_deadline_at,
+                tokio::time::Instant::now(),
+            ) {
+                return GrpcProxyError::ClientDeadlineExceeded(GrpcDeadlinePhase::ResponseHeaders);
             }
             error!(
                 transport = transport.label(),
@@ -6765,7 +6776,16 @@ pub(crate) async fn proxy_grpc_request_core(
                     // no grpc-status anywhere, and the caller would record a
                     // circuit-breaker/admission SUCCESS for a failed exchange.
                     // h2 trailers are the final frame, so an error here always
-                    // means the response never completed.
+                    // means the response never completed. A failure at/after
+                    // the client deadline is that deadline (issue #6022).
+                    if client_deadline_owns_failure(
+                        client_response_deadline_at,
+                        tokio::time::Instant::now(),
+                    ) {
+                        return Err(GrpcProxyError::ClientDeadlineExceeded(
+                            GrpcDeadlinePhase::ResponseBody,
+                        ));
+                    }
                     warn_sampled!("gRPC: error reading backend response frame: {}", e);
                     return Err(GrpcProxyError::backend_unavailable_with_source(
                         GrpcBackendUnavailableKind::BackendRequest,
@@ -7011,6 +7031,27 @@ pub(crate) fn apply_remaining_grpc_timeout_header(
 ) {
     let value = remaining_grpc_timeout_header_value(deadline);
     headers.insert("grpc-timeout", value);
+}
+
+/// Whether a backend failure observed at `now` belongs to the client RPC
+/// deadline rather than to the backend (issue #6022).
+///
+/// The gateway forwards only the remaining budget, rounded up and measured
+/// after sender acquisition ([`apply_remaining_grpc_timeout_header`]), so a
+/// backend that enforces the forwarded `grpc-timeout` (grpc-java resets the
+/// stream with `CANCEL`, for example) reaches its deadline no earlier than the
+/// gateway does. Its failure can only arrive first when the gateway's own
+/// `timeout_at` has not yet been driven by the timer wheel, such as under
+/// scheduler lag. Reading the clock at the failure removes that dependency: a
+/// failure at or after the deadline is the deadline, exactly as if the timer
+/// had fired on time (`DEADLINE_EXCEEDED`, health-neutral). A failure before
+/// the deadline, including an unexplained backend `CANCEL`, stays a backend
+/// failure. `None` (no client deadline) never claims a failure.
+pub(crate) fn client_deadline_owns_failure(
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
 }
 
 /// Build the wire value for the remaining portion of a receipt-anchored gRPC

@@ -6964,3 +6964,146 @@ async fn dropping_the_client_facing_body_still_cancels_the_rpc_close() {
         "hyper dropping the client-facing body proves settlement and must cancel the close"
     );
 }
+
+/// A backend body that fails on its first poll, as a backend `RST_STREAM`
+/// surfaces through hyper.
+fn backend_reset_response_body() -> ferrum_edge::proxy::ProxyBody {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::proxy_body_streaming_for_test;
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let reset: ProxyBodyError = Box::new(std::io::Error::other("backend RST_STREAM(CANCEL)"));
+    let inner = StreamBody::new(stream::iter(vec![Err::<Frame<Bytes>, _>(reset)]));
+    proxy_body_streaming_for_test(Box::pin(inner))
+}
+
+/// Issue #6022: a backend failure that arrives after the client RPC deadline,
+/// before the timer wheel has fired the deadline's sleep, is that deadline.
+/// The gateway forwards only the remaining `grpc-timeout`, so a backend that
+/// enforces it (grpc-java resets with `CANCEL`) can only win this race under
+/// scheduler lag; it must not be reported, or charged, as a backend failure.
+#[tokio::test]
+async fn a_backend_failure_after_an_unfired_client_deadline_is_the_deadline() {
+    use ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+    let mut body = proxy_body_with_client_grpc_deadline_for_test(
+        backend_reset_response_body(),
+        deadline,
+        None,
+    );
+    // Block the runtime's only thread past the deadline without yielding, so
+    // the time driver cannot turn: the sleep is registered on the first poll
+    // below and is still unfired, which is the scheduler-lag window.
+    std::thread::sleep(Duration::from_millis(30));
+
+    let frame = body
+        .frame()
+        .await
+        .expect("the deadline must produce a terminal")
+        .expect("before response DATA the deadline terminal is native trailers");
+    let trailers = frame
+        .into_trailers()
+        .expect("the client deadline ends the RPC with gRPC trailers");
+    assert_eq!(
+        trailers.get("grpc-status").map(|value| value.as_bytes()),
+        Some(&b"4"[..]),
+        "a backend failure at/after the client deadline must end as DEADLINE_EXCEEDED"
+    );
+}
+
+/// The other half of the #6022 policy: a backend failure BEFORE the client
+/// deadline is unexplained and must still surface as the backend's failure.
+#[tokio::test]
+async fn a_backend_failure_before_the_client_deadline_stays_a_backend_failure() {
+    use ferrum_edge::_test_support::proxy_body_with_client_grpc_deadline_for_test;
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut body = proxy_body_with_client_grpc_deadline_for_test(
+        backend_reset_response_body(),
+        deadline,
+        None,
+    );
+
+    let error = body
+        .frame()
+        .await
+        .expect("the backend failure must surface")
+        .expect_err("a failure before the deadline is not the deadline terminal");
+    assert!(
+        error.to_string().contains("backend RST_STREAM(CANCEL)"),
+        "the backend's own failure must reach accounting unchanged, got: {error}"
+    );
+}
+
+#[test]
+fn the_client_deadline_owns_only_failures_at_or_after_it() {
+    use ferrum_edge::_test_support::client_deadline_owns_failure_for_test as owns;
+    use std::time::Duration;
+
+    let deadline = tokio::time::Instant::now();
+    let before = deadline
+        .checked_sub(Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+    let after = deadline + Duration::from_millis(1);
+
+    assert!(!owns(None, after), "no client deadline never claims a failure");
+    assert!(!owns(Some(deadline), before), "a failure before the deadline is the backend's");
+    assert!(owns(Some(deadline), deadline), "a failure at the deadline is the deadline");
+    assert!(owns(Some(deadline), after), "a failure after the deadline is the deadline");
+}
+
+/// The buffered native-gRPC dispatch applies the #6022 rule in both response
+/// phases, against the client deadline only, and the streaming header wait
+/// keeps it. Structural: the unit harness cannot stall the timer wheel inside
+/// a live dispatch.
+#[test]
+fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
+    let src = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let fn_body = |signature: &str| {
+        let start = src
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let tail = &src[start..];
+        &tail[..tail.find("\n}\n").expect("end of function body")]
+    };
+
+    let buffered = fn_body("pub(crate) async fn proxy_grpc_request_core(");
+    assert!(
+        buffered.contains("response_deadline_at.filter(|_| response_deadline_is_client)"),
+        "only the client's deadline may claim a failure; an operator read timeout keeps \
+         BackendTimeout accounting"
+    );
+    let header_check = buffered
+        .find("client_deadline_owns_failure(\n                client_response_deadline_at,")
+        .expect("the buffered header wait must let the client deadline own late failures");
+    assert!(
+        buffered[header_check..].contains("GrpcDeadlinePhase::ResponseHeaders"),
+        "a late header-wait failure must be the ResponseHeaders deadline"
+    );
+    let body_check = buffered
+        .find("client_deadline_owns_failure(\n                        client_response_deadline_at,")
+        .expect("buffered body collection must let the client deadline own late failures");
+    let body_error_log = buffered
+        .find("gRPC: error reading backend response frame")
+        .expect("body collection error arm");
+    assert!(
+        body_check < body_error_log,
+        "the deadline check must precede the backend failure in the body error arm"
+    );
+
+    let streaming = fn_body("async fn proxy_grpc_streaming_dispatch(");
+    assert!(
+        streaming.contains(
+            "client_deadline_owns_failure(grpc_deadline_at, tokio::time::Instant::now())"
+        ),
+        "the streaming header wait must keep the same rule"
+    );
+}

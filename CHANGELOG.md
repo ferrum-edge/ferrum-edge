@@ -43,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configs plus any free-form maps or embedded documents. The sweep runs over
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
+### Fixed
+- **A backend reset that lands after a gRPC client deadline is that deadline**
+  (issue #6022). The gateway forwards only the remaining `grpc-timeout`, so a
+  backend that enforces it (grpc-java resets the stream with `CANCEL`) can beat
+  the gateway's own deadline terminal only when the gateway's timer fires late,
+  for example under load. Such a failure was answered as `UNAVAILABLE` and
+  charged to circuit breakers and passive health. The buffered native-gRPC
+  header wait and body collection, and the inline streaming deadline adapter,
+  now read the clock at the failure, matching the streaming header wait: a
+  failure at or after the client deadline ends as `DEADLINE_EXCEEDED` and is
+  health-neutral. A backend `CANCEL` before the deadline still counts as a
+  backend failure.
+
 ## [0.9.19] - 2026-10-27
 
 This replacement release carries forward the changes prepared for 0.9.18.
