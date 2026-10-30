@@ -2494,6 +2494,13 @@ pub struct RequestContext {
     /// from `raw_headers`. Keeps materialization one-shot while preserving the
     /// raw map for policy evaluation (mirrors query-param materialization).
     headers_materialized: bool,
+    /// Request-header passthrough state (issue #6671). `Some` only on a routed
+    /// request no plugin can observe, whose wire block projects 1:1 onto the
+    /// materialized map: `headers` then stays empty and unmaterialized, and
+    /// backend dispatch reads [`Self::request_headers_view`] instead.
+    /// [`Self::materialize_headers`] ends passthrough and builds the exact map
+    /// the eager path would have held.
+    request_header_passthrough: Option<crate::proxy::request_headers::RequestHeaderPassthrough>,
     /// Raw query string stored for lazy parsing. `None` when empty. Preserved
     /// after query-param materialization so security plugins can inspect raw
     /// duplicate pairs. Unmodified when no query mutation/strip applies.
@@ -4339,6 +4346,19 @@ impl RequestContext {
         }
     }
 
+    /// [`Self::begin_backend_attempt_span`] over a dispatch header view. Only a
+    /// traced attempt needs the map; an untraced one materializes nothing.
+    pub(crate) fn begin_backend_attempt_span_for_view(
+        &self,
+        backend_url: &str,
+        headers: crate::proxy::request_headers::RequestHeaders<'_>,
+    ) -> crate::plugins::otel_tracing::BackendAttemptSpan {
+        match self.backend_attempt_trace.as_ref() {
+            Some(trace) => trace.begin(backend_url, &headers.to_map()),
+            None => crate::plugins::otel_tracing::BackendAttemptSpan::INACTIVE,
+        }
+    }
+
     /// [`Self::begin_backend_attempt_span`] for a dispatch whose backend
     /// headers are an ordered header list (the WebSocket upgrades, issue
     /// #5867). The attempt must dispatch `span.header_list(headers)`.
@@ -4613,6 +4633,7 @@ impl RequestContext {
             raw_headers: None,
             headers: HashMap::new(),
             headers_materialized: false,
+            request_header_passthrough: None,
             raw_query_string: None,
             outbound_query_string: None,
             replay_request_body_empty_proven: false,
@@ -6128,6 +6149,8 @@ impl RequestContext {
     /// by replay partitioning, but deliberately skips prebuffered body bytes and
     /// mirror receivers.
     pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
+        // The clone is marked materialized, so it must carry the real map.
+        self.end_request_header_passthrough();
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
@@ -6156,6 +6179,7 @@ impl RequestContext {
             raw_headers: self.raw_headers.clone(),
             headers: self.headers.clone(),
             headers_materialized: true,
+            request_header_passthrough: None,
             raw_query_string: self.raw_query_string.clone(),
             outbound_query_string: self.outbound_query_string.clone(),
             replay_request_body_empty_proven: self.replay_request_body_empty_proven,
@@ -7165,7 +7189,85 @@ impl RequestContext {
     #[inline]
     pub fn set_raw_headers(&mut self, headers: HeaderMap) {
         self.headers_materialized = false;
+        self.request_header_passthrough = None;
         self.raw_headers = Some(Arc::new(headers));
+    }
+
+    /// Enter the request-header passthrough lane (issue #6671) instead of
+    /// materializing `headers`. Call only for a routed request whose resolved
+    /// plugin chain is empty; `authority` is the request URI authority used for
+    /// the HTTP/2 `Host` backfill. Returns `false`, leaving the context
+    /// untouched, when the headers are already materialized or the wire block
+    /// is not a 1:1 projection of the materialized map; the caller must then
+    /// materialize as usual.
+    pub(crate) fn try_begin_request_header_passthrough(&mut self, authority: Option<&str>) -> bool {
+        if self.headers_materialized
+            || !self.headers.is_empty()
+            || self.request_header_passthrough.is_some()
+        {
+            return false;
+        }
+        let Some(raw) = self.raw_headers.as_deref() else {
+            return false;
+        };
+        let Some(passthrough) =
+            crate::proxy::request_headers::RequestHeaderPassthrough::begin(raw, authority)
+        else {
+            return false;
+        };
+        self.request_header_passthrough = Some(passthrough);
+        true
+    }
+
+    /// Whether this request dispatches from its wire headers (issue #6671).
+    #[inline]
+    pub(crate) fn request_header_passthrough_active(&self) -> bool {
+        self.request_header_passthrough.is_some()
+    }
+
+    /// Leave the passthrough lane, materializing the exact map the eager path
+    /// would hold at this point. No-op otherwise.
+    #[inline]
+    pub(crate) fn end_request_header_passthrough(&mut self) {
+        if self.request_header_passthrough.is_some() {
+            self.materialize_headers();
+        }
+    }
+
+    /// Record the `X-Ferrum-Hops` count re-asserted before dispatch on a
+    /// passthrough request, where there is no map to write it into.
+    #[inline]
+    pub(crate) fn set_request_header_passthrough_proxy_hops(&mut self, hops: Option<u8>) {
+        if let Some(passthrough) = self.request_header_passthrough.as_mut() {
+            passthrough.set_proxy_hops(hops);
+        }
+    }
+
+    /// The request headers backend dispatch forwards: `owned` when a plugin
+    /// produced a backend-specific map, the passthrough view of the wire block,
+    /// or the materialized `headers`.
+    pub(crate) fn request_headers_view<'a>(
+        &'a self,
+        owned: Option<&'a HashMap<String, String>>,
+    ) -> crate::proxy::request_headers::RequestHeaders<'a> {
+        use crate::proxy::request_headers::RequestHeaders;
+        if let Some(owned) = owned {
+            return RequestHeaders::Materialized(owned);
+        }
+        match (
+            self.request_header_passthrough.as_ref(),
+            self.raw_headers.as_deref(),
+        ) {
+            (Some(passthrough), Some(raw)) => RequestHeaders::Passthrough(passthrough.view(raw)),
+            _ => RequestHeaders::Materialized(&self.headers),
+        }
+    }
+
+    /// One request header as the materialized map holds it, also on a
+    /// passthrough request.
+    #[inline]
+    pub(crate) fn effective_request_header(&self, name: &str) -> Option<&str> {
+        self.request_headers_view(None).get(name)
     }
 
     /// Whether the pristine wire `HeaderMap` is still available for
@@ -7312,6 +7414,7 @@ impl RequestContext {
     /// deletes raw headers. It also means the non-UTF-8 values omitted above are
     /// dropped on those outbound paths rather than forwarded byte-exact.
     pub fn materialize_headers(&mut self) {
+        let passthrough = self.request_header_passthrough.take();
         crate::proxy::headers::canonicalize_request_header_map(&mut self.headers);
         if self.headers_materialized {
             return;
@@ -7347,6 +7450,11 @@ impl RequestContext {
             }
         }
         crate::proxy::headers::canonicalize_request_header_map(&mut self.headers);
+        // A passthrough request carries its Host backfill and re-asserted hop
+        // count outside the map; fold them in so the map matches the eager one.
+        if let Some(passthrough) = passthrough {
+            passthrough.apply_to_materialized(&mut self.headers);
+        }
     }
 
     // -- Lazy query param materialization ------------------------------------

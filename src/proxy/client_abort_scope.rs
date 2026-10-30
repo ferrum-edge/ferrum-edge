@@ -398,7 +398,9 @@ impl ClientAbortRecord {
             latency_plugin_external_io_ms: ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
             latency_gateway_overhead_ms: LATENCY_UNKNOWN_MS,
-            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            request_user_agent: ctx
+                .effective_request_header("user-agent")
+                .map(str::to_owned),
             // The transport ended the request before any response head; that
             // is the boundary this record describes.
             response_delivery: ResponseDelivery::Observed,

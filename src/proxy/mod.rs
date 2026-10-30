@@ -142,6 +142,7 @@ pub mod max_forwards;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+pub(crate) mod request_headers;
 #[allow(unused_imports)]
 // Used by external tests; unused in the separately compiled bin target.
 pub(crate) use mesh_tcp_egress::connection_balancer as mesh_tcp_egress_connection_balancer;
@@ -191,6 +192,8 @@ use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+use request_headers::{RequestHeaderLookup, RequestHeaders};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -4482,10 +4485,13 @@ where
     }
 }
 
-pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
+pub(crate) fn request_may_have_body<H: RequestHeaderLookup + ?Sized>(
+    method: &str,
+    headers: &H,
+) -> bool {
     !matches!(method, "GET" | "HEAD" | "OPTIONS")
-        || headers.contains_key("content-length")
-        || headers.contains_key("transfer-encoding")
+        || headers.has_request_header("content-length")
+        || headers.has_request_header("transfer-encoding")
 }
 
 pub(crate) fn http_flavor_allows_request_body_buffering(flavor: HttpFlavor) -> bool {
@@ -5006,9 +5012,9 @@ fn client_request_body_proven_empty(client_request_body: &ClientRequestBody) -> 
 /// hyper has already proven end-of-stream (no HTTP/1.1 framing, or END_STREAM
 /// on the HTTP/2 HEADERS frame), and a buffered body only when it holds no
 /// bytes, so an empty `GET` keeps its zero-cost empty-body fast path.
-fn dispatch_request_body_may_be_present(
+fn dispatch_request_body_may_be_present<H: RequestHeaderLookup + ?Sized>(
     method: &str,
-    headers: &HashMap<String, String>,
+    headers: &H,
     client_request_body: &ClientRequestBody,
 ) -> bool {
     request_may_have_body(method, headers) || !client_request_body_proven_empty(client_request_body)
@@ -5482,6 +5488,42 @@ fn insert_outbound_header_or_warn(
         }
     };
     headers.insert(header_name, header_value);
+}
+
+/// [`insert_outbound_header_or_warn`] for one dispatch header entry. A
+/// passthrough field (issue #6671) forwards its wire name and value as-is: they
+/// were validated on receipt and are exactly what parsing their text yields.
+fn insert_outbound_request_header_or_warn(
+    headers: &mut hyper::HeaderMap,
+    proxy_id: &str,
+    backend_path: &'static str,
+    source: &'static str,
+    entry: &request_headers::RequestHeaderEntry<'_>,
+) {
+    match entry.wire() {
+        Some((name, value)) => {
+            headers.insert(name.clone(), value.clone());
+        }
+        None => insert_outbound_header_or_warn(
+            headers,
+            proxy_id,
+            backend_path,
+            source,
+            entry.name,
+            entry.value,
+        ),
+    }
+}
+
+/// Every request field forwarded through the production outbound insert, with
+/// no hop-by-hop or forwarding filter: the representation-only half of the
+/// dispatch loops, for passthrough equivalence tests (issue #6671).
+pub(crate) fn outbound_request_headers_for_test(headers: RequestHeaders<'_>) -> hyper::HeaderMap {
+    let mut out = hyper::HeaderMap::with_capacity(headers.len());
+    for entry in headers.entries() {
+        insert_outbound_request_header_or_warn(&mut out, "test", "test", "client", &entry);
+    }
+    out
 }
 
 /// Remove client/plugin forwarding assertions that Ferrum regenerates for the
@@ -17253,7 +17295,9 @@ async fn handle_websocket_request_authenticated(
                             latency_plugin_execution_ms: ws_plugin_execution_ms,
                             latency_plugin_external_io_ms: ws_plugin_external_io_ms,
                             latency_gateway_overhead_ms: ws_gateway_overhead_ms,
-                            request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            request_user_agent: ctx
+                                .effective_request_header("user-agent")
+                                .map(str::to_owned),
                             error_class: Some(ws_error_class),
                             metadata,
                             ai_usage_export: ctx.ai_usage_export.clone(),
@@ -17498,7 +17542,9 @@ async fn handle_websocket_request_authenticated(
         latency_plugin_execution_ms: ws_plugin_execution_ms,
         latency_plugin_external_io_ms: ws_plugin_external_io_ms,
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_user_agent: ctx
+            .effective_request_header("user-agent")
+            .map(str::to_owned),
         metadata: clone_log_metadata(&ctx),
         ai_usage_export: ctx.ai_usage_export.clone(),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
@@ -25545,7 +25591,9 @@ pub async fn log_unrouted_request(
         latency_backend_ttfb_ms: -1.0,
         latency_backend_total_ms: -1.0,
         latency_gateway_overhead_ms: total_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_user_agent: ctx
+            .effective_request_header("user-agent")
+            .map(str::to_owned),
         bytes_sent: ctx
             .bytes_sent_observed
             .load(std::sync::atomic::Ordering::Acquire),
@@ -25745,7 +25793,9 @@ async fn log_rejected_request_with_path_and_backend_state(
         latency_plugin_execution_ms: plugin_execution_ms,
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_user_agent: ctx
+            .effective_request_header("user-agent")
+            .map(str::to_owned),
         bytes_sent,
         // Response body for rejection responses is built by
         // `reject_result_to_backend_response` / admin reject paths and is
@@ -34500,7 +34550,7 @@ pub mod request_stack_test_support {
                     proxy,
                     "http://127.0.0.1/",
                     "GET",
-                    &ctx.headers,
+                    RequestHeaders::Materialized(&ctx.headers),
                     ClientRequestBody::Streaming(Box::new(req)),
                     None,
                     &[],
@@ -34959,6 +35009,46 @@ async fn admit_proxy_request_on_frontend_port(
         *resp.body_mut() = body.with_request_guard(request_guard);
         resp
     })
+}
+
+/// Materialize a routed request's headers: the plugin-facing map plus the
+/// `Host` backfill from `authority`.
+fn materialize_routed_request_headers(
+    ctx: &mut RequestContext,
+    authority: Option<&http::uri::Authority>,
+) {
+    ctx.materialize_headers();
+
+    // Synthesize a `Host` entry from the HTTP/2 `:authority`
+    // pseudo-header when the client sent only `:authority`. RFC 9113
+    // §8.3.1 treats `:authority` as the Host equivalent for
+    // forwarding, but hyper-server places it on `req.uri()` and
+    // does not insert it into `req.headers()`. Without this
+    // backfill, every downstream codepath that reads
+    // `headers.get("host")` (backend Host emission with
+    // `preserve_host_header=true`, X-Forwarded-Host, RFC 7239
+    // `Forwarded`, plugins keyed on inbound host) sees `None`.
+    // HTTP/1.1 mandates an explicit Host so this is effectively
+    // an HTTP/2-only no-op for compliant H1 clients; we apply the
+    // backfill unconditionally because the cost is one
+    // `contains_key` + one optional insert and the rule is the
+    // same across versions.
+    //
+    // When `preserve_host_header == false`, the per-route Host
+    // override fires later in the dispatch path
+    // (`proxy_to_backend` for plain HTTP, `proxy_to_backend_http2`
+    // for the direct H2 pool, `proxy_grpc_request_core` /
+    // `proxy_grpc_request_streaming` for gRPC,
+    // `build_http3_backend_headers` for the H1/H2 → H3-native
+    // backend dispatch) and replaces this synthetic value with the
+    // upstream target's host — the existing semantics for
+    // non-preserve mode are preserved.
+    if !ctx.headers.contains_key("host")
+        && let Some(authority) = authority
+    {
+        ctx.headers
+            .insert("host".to_string(), authority.as_str().to_string());
+    }
 }
 
 /// Construct the routing future out of line and return only its pointer to
@@ -36098,51 +36188,25 @@ async fn handle_proxy_request_inner(
         route_match
     };
 
+    // A routed request materializes `ctx.headers` once its plugin view is
+    // known (issue #6671): when no plugin can observe the request it may
+    // dispatch from the wire headers instead. Path-parameter captures write
+    // into the map, so those routes materialize here. Requests that fail
+    // routing (404) never materialize.
+    let mut request_headers_deferred = false;
     let (proxy, mut strip_len) = match route_match {
         Some(rm) => {
-            // Materialize headers now — path param injection writes to ctx.headers,
-            // and all subsequent code (plugins, backend dispatch) needs the HashMap.
-            // Requests that fail routing (404) skip this entirely, saving ~20-60
-            // String allocations.
-            ctx.materialize_headers();
-
-            // Synthesize a `Host` entry from the HTTP/2 `:authority`
-            // pseudo-header when the client sent only `:authority`. RFC 9113
-            // §8.3.1 treats `:authority` as the Host equivalent for
-            // forwarding, but hyper-server places it on `req.uri()` and
-            // does not insert it into `req.headers()`. Without this
-            // backfill, every downstream codepath that reads
-            // `headers.get("host")` (backend Host emission with
-            // `preserve_host_header=true`, X-Forwarded-Host, RFC 7239
-            // `Forwarded`, plugins keyed on inbound host) sees `None`.
-            // HTTP/1.1 mandates an explicit Host so this is effectively
-            // an HTTP/2-only no-op for compliant H1 clients; we apply the
-            // backfill unconditionally because the cost is one
-            // `contains_key` + one optional insert and the rule is the
-            // same across versions.
-            //
-            // When `preserve_host_header == false`, the per-route Host
-            // override fires later in the dispatch path
-            // (`proxy_to_backend` for plain HTTP, `proxy_to_backend_http2`
-            // for the direct H2 pool, `proxy_grpc_request_core` /
-            // `proxy_grpc_request_streaming` for gRPC,
-            // `build_http3_backend_headers` for the H1/H2 → H3-native
-            // backend dispatch) and replaces this synthetic value with the
-            // upstream target's host — the existing semantics for
-            // non-preserve mode are preserved.
-            if !ctx.headers.contains_key("host")
-                && let Some(authority) = req.uri().authority()
-            {
-                ctx.headers
-                    .insert("host".to_string(), authority.as_str().to_string());
-            }
-
-            // Inject regex path parameters into context metadata and headers
-            for (name, value) in &rm.path_params {
-                ctx.metadata
-                    .insert(format!("path_param.{}", name), value.clone());
-                ctx.headers
-                    .insert(format!("x-path-param-{}", name), value.clone());
+            if rm.path_params.is_empty() {
+                request_headers_deferred = true;
+            } else {
+                materialize_routed_request_headers(&mut ctx, req.uri().authority());
+                // Inject regex path parameters into context metadata and headers
+                for (name, value) in &rm.path_params {
+                    ctx.metadata
+                        .insert(format!("path_param.{}", name), value.clone());
+                    ctx.headers
+                        .insert(format!("x-path-param-{}", name), value.clone());
+                }
             }
             (rm.proxy, rm.matched_prefix_len)
         }
@@ -36449,6 +36513,34 @@ async fn handle_proxy_request_inner(
             .plugin_cache
             .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
+    // Request-header passthrough (issue #6671): a plain HTTP/1.x or HTTP/2
+    // request outside the mesh whose resolved plugin chain is empty dispatches
+    // from its wire headers, provided they project 1:1 onto the materialized
+    // map (`RequestContext::try_begin_request_header_passthrough`). Excluded
+    // are the dispatch families that still consume the map directly (gRPC,
+    // gRPC-Web, WebSocket, HTTP/3 and mesh), `OPTIONS` (Max-Forwards rewrites
+    // the map), and egress baggage stripping. Anything else materializes now,
+    // before any route-level reject or plugin can read `ctx.headers`.
+    if request_headers_deferred {
+        let passthrough = matches!(request_protocol, ProxyProtocol::Http)
+            && matches!(flavor, HttpFlavor::Plain)
+            && !grpc_web_request
+            && matches!(
+                req.version(),
+                hyper::Version::HTTP_10 | hyper::Version::HTTP_11 | hyper::Version::HTTP_2
+            )
+            && ctx.mesh_direction.is_none()
+            && !is_hbone_connect_any
+            && method != "OPTIONS"
+            && state.mesh_egress_strip_baggage_keys.is_empty()
+            && plugin_cache_view.plugins().is_empty()
+            && ctx.try_begin_request_header_passthrough(
+                req.uri().authority().map(|authority| authority.as_str()),
+            );
+        if !passthrough {
+            materialize_routed_request_headers(&mut ctx, req.uri().authority());
+        }
+    }
     // Publish this route's effective client-facing body ceilings on the context
     // before any body is forwarded, retained, or collected. Every streaming
     // adapter, buffered collector, retry replay, and coalescer folds these with
@@ -37997,6 +38089,19 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
+    // A passthrough request (issue #6671) has no map for gateway assertions,
+    // a body-rule integrity strip or a final header policy to edit. None of
+    // them applies without a plugin, but one that does returns the request to
+    // the materialized path before it runs.
+    if ctx.request_header_passthrough_active()
+        && (ctx.backend_consumer_username().is_some()
+            || ctx.backend_authenticated_identity().is_some()
+            || ctx.backend_geo_country().is_some()
+            || ctx.request_body_integrity_retirement
+            || capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY))
+    {
+        ctx.end_request_header_passthrough();
+    }
     // Strip plugin-controlled gateway assertions and inject only the
     // authenticated principal and private GeoIP result. The common
     // no-assertion path avoids materializing an owned header map, and a
@@ -38015,12 +38120,18 @@ async fn handle_proxy_request_inner(
     // inbound hop to the local workload forwards the received count unchanged
     // (`effective_outbound_proxy_hops`). One lookup on the common path; the
     // native HTTP/3 frontend does the same at the same point — keep both call
-    // sites in sync.
-    hop_limit::reassert_outbound_proxy_hops(
-        hop_limit::effective_outbound_proxy_hops(&ctx),
-        &mut owned_proxy_headers,
-        &mut ctx.headers,
-    );
+    // sites in sync. A passthrough request records the count for dispatch to
+    // apply over the wire block.
+    let outbound_proxy_hops = hop_limit::effective_outbound_proxy_hops(&ctx);
+    if ctx.request_header_passthrough_active() {
+        ctx.set_request_header_passthrough_proxy_hops(outbound_proxy_hops);
+    } else {
+        hop_limit::reassert_outbound_proxy_hops(
+            outbound_proxy_hops,
+            &mut owned_proxy_headers,
+            &mut ctx.headers,
+        );
+    }
     // RFC 9110 §7.6.2 `Max-Forwards` on OPTIONS (issue #4647). One checked,
     // bounded hop-budget decision, taken here — after authentication,
     // authorization, the `cors` plugin's local preflight answer, and every
@@ -38174,7 +38285,7 @@ async fn handle_proxy_request_inner(
         &state,
         &epoch,
         &ctx.client_ip,
-        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+        &ctx.request_headers_view(owned_proxy_headers.as_ref()),
         ctx.orig_dst,
     );
     let mut lb_hash_key = selection.lb_hash_key.take();
@@ -38484,7 +38595,7 @@ async fn handle_proxy_request_inner(
                 &state,
                 &epoch,
                 &ctx.client_ip,
-                owned_proxy_headers.as_ref().unwrap_or(&ctx.headers),
+                &ctx.request_headers_view(owned_proxy_headers.as_ref()),
                 ctx.orig_dst,
             );
             lb_hash_key = selection.lb_hash_key.take();
@@ -41839,7 +41950,9 @@ async fn handle_proxy_request_inner(
                         latency_plugin_execution_ms: plugin_execution_ms,
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
-                        request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        request_user_agent: ctx
+                            .effective_request_header("user-agent")
+                            .map(str::to_owned),
                         response_streamed: streamed,
                         error_class: final_error_class,
                         bytes_sent,
@@ -43037,7 +43150,9 @@ async fn handle_proxy_request_inner(
                         latency_plugin_execution_ms: plugin_execution_ms,
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
-                        request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        request_user_agent: ctx
+                            .effective_request_header("user-agent")
+                            .map(str::to_owned),
                         bytes_sent,
                         bytes_received,
                         grpc_request_messages: ctx
@@ -43333,7 +43448,9 @@ async fn handle_proxy_request_inner(
                             latency_plugin_execution_ms: grpc_plugin_execution_ms,
                             latency_plugin_external_io_ms: grpc_plugin_external_io_ms,
                             latency_gateway_overhead_ms: grpc_gateway_overhead_ms,
-                            request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            request_user_agent: ctx
+                                .effective_request_header("user-agent")
+                                .map(str::to_owned),
                             error_class: Some(grpc_error_class),
                             bytes_sent,
                             metadata,
@@ -43427,6 +43544,13 @@ async fn handle_proxy_request_inner(
     // `ctx.headers` at each use so final-body deadline provenance can still
     // update the rest of `ctx` without cloning the hot-path request headers.
     let owned_proxy_headers_ref = owned_proxy_headers.as_ref();
+    // Passthrough (issue #6671) dispatches from the wire block, so nothing may
+    // have written into the map it leaves empty and unmaterialized.
+    debug_assert!(
+        !ctx.request_header_passthrough_active()
+            || (ctx.headers.is_empty() && owned_proxy_headers.is_none()),
+        "request-header passthrough must not carry a written header map"
+    );
 
     // Build backend URL (using upstream target if available)
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -43767,9 +43891,9 @@ async fn handle_proxy_request_inner(
         let initial_attempt_handoff = BackendAttemptHandoff::default();
         // The attempt's `otel_tracing` CLIENT span (issue #5864): the backend
         // receives the attempt's own `traceparent` when a trace is installed.
-        let initial_attempt_span = ctx.begin_backend_attempt_span(
+        let initial_attempt_span = ctx.begin_backend_attempt_span_for_view(
             &current_url,
-            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+            ctx.request_headers_view(owned_proxy_headers_ref),
         );
         // `proxy_to_backend` admits and prepares the request before it hands
         // it over, and marks that handoff itself: an attempt refused before it
@@ -43789,7 +43913,8 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     &current_url,
                     &method,
-                    initial_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
+                    initial_attempt_span
+                        .headers_view(ctx.request_headers_view(owned_proxy_headers_ref)),
                     client_request_body,
                     upstream_target.as_deref(),
                     &plugins,
@@ -43870,7 +43995,7 @@ async fn handle_proxy_request_inner(
                 let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    &ctx.request_headers_view(owned_proxy_headers_ref),
                     initial_handed_to_backend,
                     &mut response,
                 ) {
@@ -43976,7 +44101,7 @@ async fn handle_proxy_request_inner(
                     backend_dispatch::RetryTargetRequest {
                         base_hash_key: hash_key,
                         client_ip: &ctx.client_ip,
-                        proxy_headers: owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        proxy_headers: &ctx.request_headers_view(owned_proxy_headers_ref),
                         request_authority: request_host.as_deref(),
                     },
                 ) {
@@ -44084,7 +44209,7 @@ async fn handle_proxy_request_inner(
                 {
                     result = client_grpc_deadline_exceeded_response_for_request(
                         &ctx,
-                        owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                        &ctx.request_headers_view(owned_proxy_headers_ref),
                         result.backend_resolved_ip.clone(),
                     );
                     break;
@@ -44470,13 +44595,14 @@ async fn handle_proxy_request_inner(
                 RouteAttemptBudget::from_start(route_attempt_timeout, &mut route_attempt_deadline);
             // This retry's own `otel_tracing` CLIENT span and `traceparent`
             // (issue #5864).
-            let retry_attempt_span = ctx.begin_backend_attempt_span(
+            let retry_attempt_span = ctx.begin_backend_attempt_span_for_view(
                 &current_url,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                ctx.request_headers_view(owned_proxy_headers_ref),
             );
             let retry_attempt_headers =
-                retry_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers));
+                retry_attempt_span.headers_view(ctx.request_headers_view(owned_proxy_headers_ref));
             let attempt_result = if retry_dispatch_hbone || retry_dispatch_mesh_mtls {
+                let retry_attempt_header_map = retry_attempt_headers.to_map();
                 match await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
@@ -44487,7 +44613,7 @@ async fn handle_proxy_request_inner(
                             &proxy,
                             &current_url,
                             &method,
-                            retry_attempt_headers,
+                            &retry_attempt_header_map,
                             current_target.as_deref(),
                             retained_body.as_ref(),
                             mesh_retry_headers.as_deref(),
@@ -44515,6 +44641,7 @@ async fn handle_proxy_request_inner(
                     }
                 }
             } else if current_dispatch_h3 {
+                let retry_attempt_header_map = retry_attempt_headers.to_map();
                 await_backend_attempt_route_deadline(
                     route_request_deadline,
                     retry_attempt_budget,
@@ -44525,7 +44652,7 @@ async fn handle_proxy_request_inner(
                             &proxy,
                             &current_url,
                             &method,
-                            retry_attempt_headers,
+                            &retry_attempt_header_map,
                             current_target.as_deref(),
                             retained_body.as_deref(),
                             should_stream,
@@ -44582,7 +44709,7 @@ async fn handle_proxy_request_inner(
             last_attempt_recorded = false;
             if charge_generic_grpc_route_attempt_budget_expiry(
                 &ctx,
-                owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                &ctx.request_headers_view(owned_proxy_headers_ref),
                 true,
                 &mut result,
             ) {
@@ -44625,9 +44752,9 @@ async fn handle_proxy_request_inner(
         // See `initial_attempt_handoff` in the retry arm above.
         let dispatch_attempt_handoff = BackendAttemptHandoff::default();
         // See `initial_attempt_span` in the retry arm above.
-        let dispatch_attempt_span = ctx.begin_backend_attempt_span(
+        let dispatch_attempt_span = ctx.begin_backend_attempt_span_for_view(
             &backend_url,
-            owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+            ctx.request_headers_view(owned_proxy_headers_ref),
         );
         dispatch_attempt_span.handoff_reported_by_dispatch();
         // Construct the bounded attempt out of line before the deadline wrapper.
@@ -44647,7 +44774,8 @@ async fn handle_proxy_request_inner(
                     &proxy,
                     &backend_url,
                     &method,
-                    dispatch_attempt_span.headers(owned_proxy_headers_ref.unwrap_or(&ctx.headers)),
+                    dispatch_attempt_span
+                        .headers_view(ctx.request_headers_view(owned_proxy_headers_ref)),
                     client_request_body,
                     upstream_target.as_deref(),
                     &plugins,
@@ -44727,7 +44855,7 @@ async fn handle_proxy_request_inner(
                 let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
-                    owned_proxy_headers_ref.unwrap_or(&ctx.headers),
+                    &ctx.request_headers_view(owned_proxy_headers_ref),
                     dispatch_handed_to_backend,
                     &mut response,
                 ) {
@@ -45994,7 +46122,9 @@ async fn handle_proxy_request_inner(
                 latency_plugin_execution_ms: plugin_execution_ms,
                 latency_plugin_external_io_ms: plugin_external_io_ms,
                 latency_gateway_overhead_ms: gateway_overhead_ms,
-                request_user_agent: ctx.headers.get("user-agent").cloned(),
+                request_user_agent: ctx
+                    .effective_request_header("user-agent")
+                    .map(str::to_owned),
                 response_streamed: is_streaming_response,
                 error_class: ctx.response_policy_error_class(backend_error_class),
                 bytes_sent,
@@ -47948,7 +48078,7 @@ pub(crate) async fn proxy_to_backend_retry(
     proxy: &Proxy,
     backend_url: &str,
     method: &str,
-    headers: &HashMap<String, String>,
+    headers: RequestHeaders<'_>,
     upstream_target: Option<&UpstreamTarget>,
     request_body: Option<&[u8]>,
     stream_response: bool,
@@ -48062,7 +48192,7 @@ pub(crate) async fn proxy_to_backend_retry(
             Err(_) => {
                 return client_grpc_deadline_exceeded_response_for_request(
                     request_ctx,
-                    headers,
+                    &headers,
                     None,
                 );
             }
@@ -48124,7 +48254,7 @@ pub(crate) async fn proxy_to_backend_retry(
         Err(()) => {
             return client_grpc_deadline_exceeded_response_for_request(
                 request_ctx,
-                headers,
+                &headers,
                 resolved_ip,
             );
         }
@@ -48181,7 +48311,7 @@ pub(crate) async fn proxy_to_backend_retry(
         if remaining.is_zero() {
             return client_grpc_deadline_exceeded_response_for_request(
                 request_ctx,
-                headers,
+                &headers,
                 resolved_ip,
             );
         }
@@ -48205,7 +48335,7 @@ pub(crate) async fn proxy_to_backend_retry(
     // NAMED in the request's `Connection` field — see
     // `parse_connection_listed_from_str_map` for the spec rationale and
     // smuggling defence.
-    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let connection_listed_strip = headers.connection_listed();
     let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     let remaining_grpc_timeout_header = request_ctx
         .grpc_deadline_at()
@@ -48215,11 +48345,14 @@ pub(crate) async fn proxy_to_backend_retry(
                 .any(|name| name == "grpc-timeout")
         })
         .map(grpc_proxy::remaining_grpc_timeout_header_value);
-    for (k, v) in headers {
-        match k.as_str() {
+    for entry in headers.entries() {
+        match entry.name {
             "host" => {
                 if proxy.preserve_host_header {
-                    req_builder = req_builder.header("Host", v.as_str());
+                    req_builder = match entry.wire() {
+                        Some((_, value)) => req_builder.header("Host", value.clone()),
+                        None => req_builder.header("Host", entry.value),
+                    };
                 } else {
                     // Use the upstream target's FULL authority when load
                     // balancing, so SNI-based ingress routers see the correct
@@ -48246,7 +48379,10 @@ pub(crate) async fn proxy_to_backend_retry(
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
             _ => {
-                req_builder = req_builder.header(k.as_str(), v.as_str());
+                req_builder = match entry.wire() {
+                    Some((name, value)) => req_builder.header(name.clone(), value.clone()),
+                    None => req_builder.header(entry.name, entry.value),
+                };
             }
         }
     }
@@ -48273,7 +48409,7 @@ pub(crate) async fn proxy_to_backend_retry(
 
     // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
-        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        headers.get("x-forwarded-for"),
         client_ip,
         xff_append_ip,
         &state.trusted_proxies,
@@ -48282,7 +48418,7 @@ pub(crate) async fn proxy_to_backend_retry(
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
-        req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
+        req_builder = req_builder.header("X-Forwarded-Host", host);
     }
     let via = via_header_for_inbound_version(state, inbound_version);
     if let Some(via) = via {
@@ -48291,11 +48427,7 @@ pub(crate) async fn proxy_to_backend_retry(
     if state.add_forwarded_header {
         req_builder = req_builder.header(
             "Forwarded",
-            build_forwarded_value(
-                client_ip,
-                proto_str,
-                headers.get("host").map(|s| s.as_str()),
-            ),
+            build_forwarded_value(client_ip, proto_str, headers.get("host")),
         );
     }
 
@@ -48489,7 +48621,7 @@ pub(crate) async fn proxy_to_backend_retry(
             }
             return client_grpc_deadline_exceeded_response_for_request(
                 request_ctx,
-                headers,
+                &headers,
                 resolved_ip,
             );
         }
@@ -48609,7 +48741,7 @@ pub(crate) async fn proxy_to_backend_retry(
                         Err(ResponseCollectBound::RpcDeadline) => {
                             return client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
-                                headers,
+                                &headers,
                                 resolved_ip,
                             );
                         }
@@ -48672,7 +48804,7 @@ pub(crate) async fn proxy_to_backend_retry(
                         Err(ResponseCollectBound::RpcDeadline) => {
                             return client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
-                                headers,
+                                &headers,
                                 resolved_ip,
                             );
                         }
@@ -48738,7 +48870,7 @@ pub(crate) async fn proxy_to_backend_retry(
             ) {
                 return client_grpc_deadline_exceeded_response_for_request(
                     request_ctx,
-                    headers,
+                    &headers,
                     resolved_ip,
                 );
             }
@@ -50296,10 +50428,10 @@ pub(crate) fn canonical_header_content_length(headers: &http::HeaderMap) -> Opti
 /// have already folded headers into a `HashMap`. Used both as a size bound and
 /// as a body-preallocation hint, so an unusable declaration must read as "no
 /// length" rather than as a wrong length (`GHSA-xrfj-852f-645j`).
-pub(crate) fn canonical_header_content_length_from_map(
-    headers: &HashMap<String, String>,
+pub(crate) fn canonical_header_content_length_from_map<H: RequestHeaderLookup + ?Sized>(
+    headers: &H,
 ) -> Option<u64> {
-    match crate::util::body_limit::declared_content_length(headers)? {
+    match crate::util::body_limit::parse_content_length(headers.request_header("content-length")?) {
         crate::util::body_limit::ContentLength::Exact(len) => Some(len),
         crate::util::body_limit::ContentLength::Ambiguous => None,
     }
@@ -50316,8 +50448,8 @@ pub(crate) fn canonical_header_content_length_from_map(
 /// bounded by the streaming/collect ceiling instead of being guessed at, so this
 /// helper never turns an unparsable header into a wrong length
 /// (`GHSA-xrfj-852f-645j`).
-pub(crate) fn declared_request_content_length_over_limit(
-    headers: &HashMap<String, String>,
+pub(crate) fn declared_request_content_length_over_limit<H: RequestHeaderLookup + ?Sized>(
+    headers: &H,
     max_bytes: usize,
 ) -> bool {
     if max_bytes == 0 {
@@ -50335,10 +50467,10 @@ pub(crate) fn declared_request_content_length_over_limit(
 /// result when the declared Content-Length exceeds the limit, else `None`.
 /// `max_bytes` is the already-folded effective ceiling (global ∧ route), not the
 /// raw global knob, so an active route limit rejects here too.
-fn oversized_request_body_dispatch_reject(
+fn oversized_request_body_dispatch_reject<H: RequestHeaderLookup + ?Sized>(
     max_bytes: usize,
     method: &str,
-    headers: &HashMap<String, String>,
+    headers: &H,
     resolved_ip: Option<String>,
 ) -> Option<BackendDispatchResult> {
     if request_may_have_body(method, headers)
@@ -50509,7 +50641,7 @@ async fn proxy_to_backend(
     proxy: &Proxy,
     backend_url: &str,
     method: &str,
-    headers: &HashMap<String, String>,
+    headers: RequestHeaders<'_>,
     client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
@@ -50689,7 +50821,7 @@ async fn proxy_to_backend(
                     return backend_dispatch_response(
                         client_grpc_deadline_exceeded_response_for_request(
                             request_ctx,
-                            headers,
+                            &headers,
                             None,
                         ),
                         None,
@@ -50787,9 +50919,10 @@ async fn proxy_to_backend(
                 route_request_body_limit,
             );
             if grpc_limit > 0
-                && request_may_have_body(method, headers)
-                && let Some(crate::util::body_limit::ContentLength::Exact(len)) =
-                    crate::util::body_limit::declared_content_length(headers)
+                && request_may_have_body(method, &headers)
+                && let Some(crate::util::body_limit::ContentLength::Exact(len)) = headers
+                    .get("content-length")
+                    .map(crate::util::body_limit::parse_content_length)
                 && len > grpc_limit as u64
             {
                 return backend_dispatch_response(
@@ -50806,7 +50939,7 @@ async fn proxy_to_backend(
         } else if let Some(reject) = oversized_request_body_dispatch_reject(
             effective_max_request_body_size_bytes,
             method,
-            headers,
+            &headers,
             resolved_ip.clone(),
         ) {
             return reject;
@@ -50826,7 +50959,7 @@ async fn proxy_to_backend(
         let (unix_request_body, unix_retained_body) = match prepare_mesh_request_body(
             client_request_body,
             method,
-            headers,
+            &headers.to_map(),
             unix_request_body_limit,
             proxy.backend_read_timeout_ms,
             request_ctx.grpc_deadline_at(),
@@ -50865,7 +50998,7 @@ async fn proxy_to_backend(
                 proxy,
                 backend_url,
                 method,
-                headers,
+                &headers.to_map(),
                 unix_request_body,
                 upstream_target,
                 plugins,
@@ -50895,7 +51028,7 @@ async fn proxy_to_backend(
                 socket_path,
                 backend_url,
                 method,
-                headers,
+                &headers.to_map(),
                 unix_request_body,
                 plugins,
                 Some(request_ctx),
@@ -50928,7 +51061,7 @@ async fn proxy_to_backend(
         if let Some(reject) = oversized_request_body_dispatch_reject(
             effective_max_request_body_size_bytes,
             method,
-            headers,
+            &headers,
             resolved_ip.clone(),
         ) {
             return reject;
@@ -50936,7 +51069,7 @@ async fn proxy_to_backend(
         let (mesh_request_body, mesh_retained_body) = match prepare_mesh_request_body(
             client_request_body,
             method,
-            headers,
+            &headers.to_map(),
             effective_max_request_body_size_bytes,
             proxy.backend_read_timeout_ms,
             request_ctx.grpc_deadline_at(),
@@ -50967,13 +51100,14 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         backend_attempt_handoff.mark_handed_to_backend(mesh_retained_body.as_ref());
+        let request_header_map = headers.to_map();
         let (backend_resp, body_bytes, request_body_exceeded) = boxed_proxy_future(|| {
             proxy_to_backend_hbone(
                 state,
                 proxy,
                 backend_url,
                 method,
-                headers,
+                &request_header_map,
                 mesh_request_body,
                 upstream_target,
                 plugins,
@@ -51033,9 +51167,10 @@ async fn proxy_to_backend(
                 route_request_body_limit,
             );
             if grpc_limit > 0
-                && request_may_have_body(method, headers)
-                && let Some(crate::util::body_limit::ContentLength::Exact(len)) =
-                    crate::util::body_limit::declared_content_length(headers)
+                && request_may_have_body(method, &headers)
+                && let Some(crate::util::body_limit::ContentLength::Exact(len)) = headers
+                    .get("content-length")
+                    .map(crate::util::body_limit::parse_content_length)
                 && len > grpc_limit as u64
             {
                 return backend_dispatch_response(
@@ -51052,7 +51187,7 @@ async fn proxy_to_backend(
         } else if let Some(reject) = oversized_request_body_dispatch_reject(
             effective_max_request_body_size_bytes,
             method,
-            headers,
+            &headers,
             resolved_ip.clone(),
         ) {
             return reject;
@@ -51072,7 +51207,7 @@ async fn proxy_to_backend(
         let (mesh_request_body, mesh_retained_body) = match prepare_mesh_request_body(
             client_request_body,
             method,
-            headers,
+            &headers.to_map(),
             mesh_request_body_limit,
             proxy.backend_read_timeout_ms,
             request_ctx.grpc_deadline_at(),
@@ -51103,13 +51238,14 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         backend_attempt_handoff.mark_handed_to_backend(mesh_retained_body.as_ref());
+        let request_header_map = headers.to_map();
         let (backend_resp, body_bytes, request_body_exceeded) = boxed_proxy_future(|| {
             proxy_to_backend_mesh_mtls(
                 state,
                 proxy,
                 backend_url,
                 method,
-                headers,
+                &request_header_map,
                 mesh_request_body,
                 upstream_target,
                 plugins,
@@ -51168,7 +51304,7 @@ async fn proxy_to_backend(
         if let Some(reject) = oversized_request_body_dispatch_reject(
             effective_max_request_body_size_bytes,
             method,
-            headers,
+            &headers,
             resolved_ip.clone(),
         ) {
             return reject;
@@ -51185,13 +51321,14 @@ async fn proxy_to_backend(
             Err(rejection) => return BackendDispatchResult::AdmissionRejected(rejection),
         };
         *backend_admission_started_at = Instant::now();
+        let request_header_map = headers.to_map();
         let (mut backend_resp, body_bytes) = boxed_proxy_future(|| {
             proxy_to_backend_http3(
                 state,
                 proxy,
                 backend_url,
                 method,
-                headers,
+                &request_header_map,
                 client_request_body,
                 plugins,
                 ctx,
@@ -51367,7 +51504,7 @@ async fn proxy_to_backend(
             if let Some(reject) = oversized_request_body_dispatch_reject(
                 effective_max_request_body_size_bytes,
                 method,
-                headers,
+                &headers,
                 resolved_ip.clone(),
             ) {
                 return reject;
@@ -51407,7 +51544,7 @@ async fn proxy_to_backend(
                     return direct_h2_sender_bound_expired(
                         state,
                         request_ctx,
-                        headers,
+                        &headers,
                         source,
                         resolved_ip,
                     );
@@ -51669,7 +51806,7 @@ async fn proxy_to_backend(
     // OPTIONS can carry DATA without `Content-Length`, and that body must reach
     // the size-limited adapter rather than being replaced by an empty one.
     let direct_h1_has_body =
-        dispatch_request_body_may_be_present(method, headers, &client_request_body);
+        dispatch_request_body_may_be_present(method, &headers, &client_request_body);
     if sni_reqwest_dial.is_none()
         && direct_h1_dispatch_eligible(
             state,
@@ -51745,7 +51882,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 client_grpc_deadline_exceeded_response_for_request(
                     request_ctx,
-                    headers,
+                    &headers,
                     resolved_ip,
                 ),
                 None,
@@ -51807,7 +51944,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 client_grpc_deadline_exceeded_response_for_request(
                     request_ctx,
-                    headers,
+                    &headers,
                     resolved_ip,
                 ),
                 retained_body,
@@ -51832,7 +51969,7 @@ async fn proxy_to_backend(
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
     // (canonical predicate in `proxy::headers`). Also strip every header
     // NAMED in the request's `Connection` field.
-    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let connection_listed_strip = headers.connection_listed();
     let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     let remaining_grpc_timeout_header = request_ctx
         .grpc_deadline_at()
@@ -51842,11 +51979,14 @@ async fn proxy_to_backend(
                 .any(|name| name == "grpc-timeout")
         })
         .map(grpc_proxy::remaining_grpc_timeout_header_value);
-    for (k, v) in headers {
-        match k.as_str() {
+    for entry in headers.entries() {
+        match entry.name {
             "host" => {
                 if proxy.preserve_host_header {
-                    req_builder = req_builder.header("Host", v.as_str());
+                    req_builder = match entry.wire() {
+                        Some((_, value)) => req_builder.header("Host", value.clone()),
+                        None => req_builder.header("Host", entry.value),
+                    };
                 } else {
                     // Use the upstream target's FULL authority when load
                     // balancing, so SNI-based ingress routers see the correct
@@ -51873,7 +52013,10 @@ async fn proxy_to_backend(
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
             _ => {
-                req_builder = req_builder.header(k.as_str(), v.as_str());
+                req_builder = match entry.wire() {
+                    Some((name, value)) => req_builder.header(name.clone(), value.clone()),
+                    None => req_builder.header(entry.name, entry.value),
+                };
             }
         }
     }
@@ -51900,7 +52043,7 @@ async fn proxy_to_backend(
 
     // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
-        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        headers.get("x-forwarded-for"),
         client_ip,
         xff_append_ip,
         &state.trusted_proxies,
@@ -51909,7 +52052,7 @@ async fn proxy_to_backend(
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
-        req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
+        req_builder = req_builder.header("X-Forwarded-Host", host);
     }
     let via = via_header_for_inbound_version(state, inbound_version);
     if let Some(via) = via {
@@ -51918,18 +52061,14 @@ async fn proxy_to_backend(
     if state.add_forwarded_header {
         req_builder = req_builder.header(
             "Forwarded",
-            build_forwarded_value(
-                client_ip,
-                proto_str,
-                headers.get("host").map(|s| s.as_str()),
-            ),
+            build_forwarded_value(client_ip, proto_str, headers.get("host")),
         );
     }
 
     // Same body-presence decision as the direct HTTP/1.1 pool above, so turning
     // that pool off cannot reopen the empty-body substitution for an HTTP/2
     // GET/HEAD/OPTIONS upload without `Content-Length`.
-    let has_body = dispatch_request_body_may_be_present(method, headers, &client_request_body);
+    let has_body = dispatch_request_body_may_be_present(method, &headers, &client_request_body);
 
     // Shared flag for detecting size-limit exceeded during streaming.
     // Only allocated when we actually stream a request body.
@@ -51955,7 +52094,7 @@ async fn proxy_to_backend(
         // repeated identical values instead of failing to parse the whole list
         // and skipping the bound.
         if declared_request_content_length_over_limit(
-            headers,
+            &headers,
             effective_max_request_body_size_bytes,
         ) {
             return backend_dispatch_response(
@@ -52007,7 +52146,7 @@ async fn proxy_to_backend(
                         plugins,
                         ctx.as_deref_mut(),
                         request_ctx.grpc_deadline_at(),
-                        headers,
+                        &headers.for_plugin_hooks(!plugins.is_empty()),
                         buffered.body,
                     )
                     .await;
@@ -52015,7 +52154,7 @@ async fn proxy_to_backend(
                         plugins,
                         ctx,
                         request_ctx.grpc_deadline_at(),
-                        headers,
+                        &headers.for_plugin_hooks(!plugins.is_empty()),
                         &body_bytes,
                     )
                     .await
@@ -52288,7 +52427,7 @@ async fn proxy_to_backend(
                     )) => {
                         let response = client_grpc_deadline_exceeded_response_for_request(
                             request_ctx,
-                            headers,
+                            &headers,
                             resolved_ip.clone(),
                         );
                         return backend_dispatch_response(response, None, None);
@@ -52323,7 +52462,7 @@ async fn proxy_to_backend(
                     plugins,
                     ctx.as_deref_mut(),
                     request_ctx.grpc_deadline_at(),
-                    headers,
+                    &headers.for_plugin_hooks(!plugins.is_empty()),
                     body_bytes,
                 )
                 .await;
@@ -52337,7 +52476,7 @@ async fn proxy_to_backend(
                     plugins,
                     ctx,
                     request_ctx.grpc_deadline_at(),
-                    headers,
+                    &headers.for_plugin_hooks(!plugins.is_empty()),
                     &body_bytes,
                 )
                 .await
@@ -52639,7 +52778,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 client_grpc_deadline_exceeded_response_for_request(
                     request_ctx,
-                    headers,
+                    &headers,
                     resolved_ip,
                 ),
                 retained_body,
@@ -52804,7 +52943,7 @@ async fn proxy_to_backend(
                                 return backend_dispatch_response(
                                     client_grpc_deadline_exceeded_response_for_request(
                                         request_ctx,
-                                        headers,
+                                        &headers,
                                         resolved_ip.clone(),
                                     ),
                                     retained_body,
@@ -52898,7 +53037,7 @@ async fn proxy_to_backend(
                         return backend_dispatch_response(
                             client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
-                                headers,
+                                &headers,
                                 resolved_ip.clone(),
                             ),
                             retained_body,
@@ -52973,7 +53112,7 @@ async fn proxy_to_backend(
                             return backend_dispatch_response(
                                 client_grpc_deadline_exceeded_response_for_request(
                                     request_ctx,
-                                    headers,
+                                    &headers,
                                     resolved_ip.clone(),
                                 ),
                                 retained_body,
@@ -53033,7 +53172,7 @@ async fn proxy_to_backend(
                         return backend_dispatch_response(
                             client_grpc_deadline_exceeded_response_for_request(
                                 request_ctx,
-                                headers,
+                                &headers,
                                 resolved_ip.clone(),
                             ),
                             retained_body,
@@ -53140,7 +53279,7 @@ async fn proxy_to_backend(
                 return backend_dispatch_response(
                     client_grpc_deadline_exceeded_response_for_request(
                         request_ctx,
-                        headers,
+                        &headers,
                         resolved_ip,
                     ),
                     retained_body,
@@ -53467,13 +53606,13 @@ fn direct_h1_request_body_too_large(resolved_ip: Option<String>) -> retry::Backe
 /// terminal.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn direct_h1_handoff_bound_expired(
+fn direct_h1_handoff_bound_expired<H: RequestHeaderLookup + ?Sized>(
     proxy: &Proxy,
     source: BackendHandoffBoundSource,
     dispatch_bound: DispatchPhaseBound,
     send_auth_deadline: Option<&RequestAuthLifetimePlan>,
     request_ctx: &RequestContext,
-    headers: &HashMap<String, String>,
+    headers: &H,
     resolved_ip: Option<String>,
     retained_body: Option<Bytes>,
     backend_admission_permits: Option<BackendAdmissionPermitSet>,
@@ -53521,7 +53660,7 @@ fn direct_h1_handoff_bound_expired(
 /// built once per dispatch from absolute instants, so the first attempt and
 /// the one idle-race replay are held to the same instant.
 #[allow(clippy::too_many_arguments)]
-async fn direct_h1_bounded_checkout(
+async fn direct_h1_bounded_checkout<H: RequestHeaderLookup + ?Sized>(
     state: &ProxyState,
     proxy: &Proxy,
     conn_proxy: &Proxy,
@@ -53532,7 +53671,7 @@ async fn direct_h1_bounded_checkout(
     dispatch_bound: DispatchPhaseBound,
     send_auth_deadline: Option<&RequestAuthLifetimePlan>,
     request_ctx: &RequestContext,
-    headers: &HashMap<String, String>,
+    headers: &H,
     backend_url: &str,
     resolved_ip: &Option<String>,
     retained_body: &mut Option<Bytes>,
@@ -53595,7 +53734,7 @@ async fn proxy_to_backend_direct_h1(
     upstream_target: Option<&UpstreamTarget>,
     backend_url: &str,
     method: &str,
-    headers: &HashMap<String, String>,
+    headers: RequestHeaders<'_>,
     client_request_body: ClientRequestBody,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     backend_admission_plugins: &[Arc<dyn crate::plugins::Plugin>],
@@ -53664,7 +53803,7 @@ async fn proxy_to_backend_direct_h1(
         .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
     {
         return backend_dispatch_response(
-            client_grpc_deadline_exceeded_response_for_request(request_ctx, headers, resolved_ip),
+            client_grpc_deadline_exceeded_response_for_request(request_ctx, &headers, resolved_ip),
             None,
             None,
         );
@@ -53672,7 +53811,7 @@ async fn proxy_to_backend_direct_h1(
 
     // ── Request head: same rewrite rules as the reqwest path ──────────────
     let mut out_headers = hyper::HeaderMap::with_capacity(headers.len() + 4);
-    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let connection_listed_strip = headers.connection_listed();
     let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
     let remaining_grpc_timeout_header = request_ctx
         .grpc_deadline_at()
@@ -53683,17 +53822,16 @@ async fn proxy_to_backend_direct_h1(
         })
         .map(grpc_proxy::remaining_grpc_timeout_header_value);
     let scheme = backend_url_scheme_for_dispatch(proxy);
-    for (k, v) in headers {
-        match k.as_str() {
+    for entry in headers.entries() {
+        match entry.name {
             "host" => {
                 if proxy.preserve_host_header {
-                    insert_outbound_header_or_warn(
+                    insert_outbound_request_header_or_warn(
                         &mut out_headers,
                         &proxy.id,
                         "direct_h1",
                         "client_host",
-                        "host",
-                        v,
+                        &entry,
                     );
                 } else {
                     let outbound_host =
@@ -53716,13 +53854,12 @@ async fn proxy_to_backend_direct_h1(
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
             _ => {
-                insert_outbound_header_or_warn(
+                insert_outbound_request_header_or_warn(
                     &mut out_headers,
                     &proxy.id,
                     "direct_h1",
                     "client",
-                    k,
-                    v,
+                    &entry,
                 );
             }
         }
@@ -53747,7 +53884,7 @@ async fn proxy_to_backend_direct_h1(
         );
     }
     let xff_val = build_xff_value(
-        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        headers.get("x-forwarded-for"),
         client_ip,
         xff_append_ip,
         &state.trusted_proxies,
@@ -53790,11 +53927,7 @@ async fn proxy_to_backend_direct_h1(
         );
     }
     if state.add_forwarded_header {
-        let fwd = build_forwarded_value(
-            client_ip,
-            proto_str,
-            headers.get("host").map(|s| s.as_str()),
-        );
+        let fwd = build_forwarded_value(client_ip, proto_str, headers.get("host"));
         insert_outbound_header_or_warn(
             &mut out_headers,
             &proxy.id,
@@ -53813,7 +53946,7 @@ async fn proxy_to_backend_direct_h1(
         body::DirectH1RequestBody::Empty
     } else {
         if declared_request_content_length_over_limit(
-            headers,
+            &headers,
             effective_max_request_body_size_bytes,
         ) {
             return backend_dispatch_response(
@@ -54013,7 +54146,7 @@ async fn proxy_to_backend_direct_h1(
         send_bound,
         send_auth_deadline.as_ref(),
         request_ctx,
-        headers,
+        &headers,
         backend_url,
         &resolved_ip,
         &mut retained_body,
@@ -54087,7 +54220,7 @@ async fn proxy_to_backend_direct_h1(
                     send_bound,
                     send_auth_deadline.as_ref(),
                     request_ctx,
-                    headers,
+                    &headers,
                     resolved_ip,
                     retained_body,
                     backend_admission_permits,
@@ -54121,7 +54254,7 @@ async fn proxy_to_backend_direct_h1(
                     send_bound,
                     send_auth_deadline.as_ref(),
                     request_ctx,
-                    headers,
+                    &headers,
                     resolved_ip,
                     retained_body,
                     backend_admission_permits,
@@ -54195,7 +54328,7 @@ async fn proxy_to_backend_direct_h1(
                         send_bound,
                         send_auth_deadline.as_ref(),
                         request_ctx,
-                        headers,
+                        &headers,
                         backend_url,
                         &resolved_ip,
                         &mut retained_body,
@@ -54233,7 +54366,7 @@ async fn proxy_to_backend_direct_h1(
                         send_bound,
                         send_auth_deadline.as_ref(),
                         request_ctx,
-                        headers,
+                        &headers,
                         resolved_ip,
                         retained_body,
                         backend_admission_permits,
@@ -54380,7 +54513,7 @@ async fn proxy_to_backend_direct_h1(
             return backend_dispatch_response(
                 client_grpc_deadline_exceeded_response_for_request(
                     request_ctx,
-                    headers,
+                    &headers,
                     resolved_ip,
                 ),
                 retained_body,
@@ -57709,9 +57842,11 @@ fn route_deadline_dispatch_result(
     }
 }
 
-pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
+pub(crate) fn client_grpc_deadline_exceeded_response_for_request<
+    H: RequestHeaderLookup + ?Sized,
+>(
     request_ctx: &RequestContext,
-    request_headers: &HashMap<String, String>,
+    request_headers: &H,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
     grpc_deadline_exceeded_response_for_request(request_ctx, request_headers, resolved_ip, false)
@@ -57721,9 +57856,9 @@ pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
 /// wire shape. `charged_to_backend` selects the backend read-timeout shape
 /// ([`mesh_grpc_deadline_exceeded_response`]: `Backend deadline exceeded`,
 /// `ReadWriteTimeout`) instead of the health-neutral client-deadline one.
-fn grpc_deadline_exceeded_response_for_request(
+fn grpc_deadline_exceeded_response_for_request<H: RequestHeaderLookup + ?Sized>(
     request_ctx: &RequestContext,
-    request_headers: &HashMap<String, String>,
+    request_headers: &H,
     resolved_ip: Option<String>,
     charged_to_backend: bool,
 ) -> retry::BackendResponse {
@@ -57742,7 +57877,7 @@ fn grpc_deadline_exceeded_response_for_request(
         return native_response(resolved_ip);
     }
     let Some(content_type) = request_headers
-        .get("content-type")
+        .request_header("content-type")
         .filter(|content_type| crate::plugins::grpc_web::is_grpc_web_content_type(content_type))
     else {
         return native_response(resolved_ip);
@@ -57827,9 +57962,9 @@ pub(crate) fn charge_grpc_route_attempt_budget_expiry(
 /// deadline and replace `Backend deadline exceeded` with `Deadline exceeded at
 /// gateway`. With only the budget ended, nothing would bound the hooks at all;
 /// the marker bounds them as over the gateway deadline terminal instead.
-pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry(
+pub(crate) fn charge_generic_grpc_route_attempt_budget_expiry<H: RequestHeaderLookup + ?Sized>(
     ctx: &RequestContext,
-    request_headers: &HashMap<String, String>,
+    request_headers: &H,
     handed_to_backend: bool,
     response: &mut retry::BackendResponse,
 ) -> bool {
@@ -57902,9 +58037,9 @@ pub mod authorization_dispatch_test_support {
     }
 }
 
-fn client_grpc_deadline_exceeded_response_for_optional_request(
+fn client_grpc_deadline_exceeded_response_for_optional_request<H: RequestHeaderLookup + ?Sized>(
     request_ctx: Option<&RequestContext>,
-    request_headers: &HashMap<String, String>,
+    request_headers: &H,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
     match request_ctx {
@@ -59278,10 +59413,10 @@ fn direct_h2_sender_bound(state: &ProxyState, ctx: &RequestContext) -> BackendHa
 /// (GHSA-xcg4-wj3x-gjj2). Out of line: a cold arm of `proxy_to_backend`, whose
 /// poll frame is stack-budgeted.
 #[inline(never)]
-fn direct_h2_sender_bound_expired(
+fn direct_h2_sender_bound_expired<H: RequestHeaderLookup + ?Sized>(
     state: &ProxyState,
     request_ctx: &RequestContext,
-    headers: &HashMap<String, String>,
+    headers: &H,
     source: BackendHandoffBoundSource,
     resolved_ip: Option<String>,
 ) -> BackendDispatchResult {
@@ -59309,9 +59444,9 @@ fn direct_h2_sender_bound_expired(
 /// elapsed before `send_request` (GHSA-xcg4-wj3x-gjj2). Out of line: a cold arm
 /// of `proxy_to_backend_http2`, whose poll frame is stack-budgeted.
 #[inline(never)]
-pub(crate) fn direct_h2_handoff_bound_expired(
+pub(crate) fn direct_h2_handoff_bound_expired<H: RequestHeaderLookup + ?Sized>(
     ctx: Option<&RequestContext>,
-    headers: &HashMap<String, String>,
+    headers: &H,
     source: BackendHandoffBoundSource,
     dispatch_bound: DispatchPhaseBound,
     upload_auth_deadline: Option<&RequestAuthLifetimePlan>,
@@ -64010,7 +64145,7 @@ async fn proxy_to_backend_http2(
     mut sender: crate::proxy::http2_pool::Http2Sender,
     backend_url: &str,
     method: &str,
-    headers: &HashMap<String, String>,
+    headers: RequestHeaders<'_>,
     original_req: Request<Incoming>,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     ctx: Option<&RequestContext>,
@@ -64280,10 +64415,10 @@ async fn proxy_to_backend_http2(
 
     // Clear and rebuild headers from the plugin-processed headers map
     parts.headers.clear();
-    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let connection_listed_strip = headers.connection_listed();
     let peer_trusted = forwarding_peer_is_trusted(xff_append_ip, &state.trusted_proxies);
-    for (k, v) in headers {
-        match k.as_str() {
+    for entry in headers.entries() {
+        match entry.name {
             "host" => {
                 // Preserve-off Host is applied after the loop via
                 // `apply_outbound_h2_host` so it matches Hyper's `:authority`
@@ -64291,13 +64426,12 @@ async fn proxy_to_backend_http2(
                 // Host here; the same helper then rewrites the URI authority
                 // to agree.
                 if proxy.preserve_host_header {
-                    insert_outbound_header_or_warn(
+                    insert_outbound_request_header_or_warn(
                         &mut parts.headers,
                         &proxy.id,
                         "direct_h2",
                         "client_host",
-                        "host",
-                        v,
+                        &entry,
                     );
                 }
             }
@@ -64322,13 +64456,12 @@ async fn proxy_to_backend_http2(
             // request's `Connection` field — see `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
-                insert_outbound_header_or_warn(
+                insert_outbound_request_header_or_warn(
                     &mut parts.headers,
                     &proxy.id,
                     "direct_h2",
                     "client",
-                    k,
-                    v,
+                    &entry,
                 );
             }
         }
@@ -64336,7 +64469,7 @@ async fn proxy_to_backend_http2(
 
     // Add proxy-managed forwarding metadata.
     let xff_val = build_xff_value(
-        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        headers.get("x-forwarded-for"),
         client_ip,
         xff_append_ip,
         &state.trusted_proxies,
@@ -64379,11 +64512,7 @@ async fn proxy_to_backend_http2(
     }
     if state.add_forwarded_header {
         let proto_str = if request_is_secure { "https" } else { "http" };
-        let fwd = build_forwarded_value(
-            client_ip,
-            proto_str,
-            headers.get("host").map(|s| s.as_str()),
-        );
+        let fwd = build_forwarded_value(client_ip, proto_str, headers.get("host"));
         insert_outbound_header_or_warn(
             &mut parts.headers,
             &proxy.id,
@@ -64437,7 +64566,7 @@ async fn proxy_to_backend_http2(
         return (
             direct_h2_handoff_bound_expired(
                 ctx,
-                headers,
+                &headers,
                 source,
                 handoff_dispatch_bound,
                 upload_auth_deadline.as_ref(),
@@ -64567,7 +64696,7 @@ async fn proxy_to_backend_http2(
                 return (
                     client_grpc_deadline_exceeded_response_for_optional_request(
                         ctx,
-                        headers,
+                        &headers,
                         resolved_ip,
                     ),
                     None,
@@ -64624,7 +64753,7 @@ async fn proxy_to_backend_http2(
                         return (
                             client_grpc_deadline_exceeded_response_for_optional_request(
                                 ctx,
-                                headers,
+                                &headers,
                                 resolved_ip,
                             ),
                             None,
@@ -64798,7 +64927,7 @@ async fn proxy_to_backend_http2(
                             ) => (
                                 client_grpc_deadline_exceeded_response_for_optional_request(
                                     ctx,
-                                    headers,
+                                    &headers,
                                     resolved_ip,
                                 ),
                                 None,
@@ -65021,7 +65150,7 @@ async fn proxy_to_backend_http2(
                 return (
                     client_grpc_deadline_exceeded_response_for_optional_request(
                         ctx,
-                        headers,
+                        &headers,
                         resolved_ip,
                     ),
                     None,
@@ -71137,7 +71266,7 @@ mod tests {
             &proxy,
             "http://127.0.0.1:1/",
             "GET",
-            &HashMap::new(),
+            crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
             None,
             None,
             true,
@@ -71181,7 +71310,7 @@ mod tests {
             &proxy,
             "http://127.0.0.1:1/",
             "GET",
-            &HashMap::new(),
+            crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
             None,
             None,
             true,
@@ -71220,7 +71349,7 @@ mod tests {
             &proxy,
             "http://127.0.0.1:1/",
             "GET",
-            &HashMap::new(),
+            crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
             ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                 method: hyper::Method::GET,
                 headers: hyper::HeaderMap::new(),
@@ -71287,7 +71416,7 @@ mod tests {
                 proxy,
                 backend_url,
                 "GET",
-                &HashMap::new(),
+                crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
                 ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                     method: hyper::Method::GET,
                     headers: hyper::HeaderMap::new(),
@@ -71413,7 +71542,7 @@ mod tests {
                 proxy,
                 backend_url,
                 "GET",
-                &HashMap::new(),
+                crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
                 ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                     method: hyper::Method::GET,
                     headers: hyper::HeaderMap::new(),
@@ -71591,7 +71720,7 @@ mod tests {
             &proxy,
             &format!("{}/events", server.uri()),
             "GET",
-            &HashMap::new(),
+            crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
             ClientRequestBody::Buffered(Box::new(BufferedClientRequestBody {
                 method: hyper::Method::GET,
                 headers: hyper::HeaderMap::new(),
@@ -71635,7 +71764,7 @@ mod tests {
             &proxy,
             &format!("{}/events", server.uri()),
             "GET",
-            &HashMap::new(),
+            crate::proxy::request_headers::RequestHeaders::Materialized(&HashMap::new()),
             None,
             None,
             false,

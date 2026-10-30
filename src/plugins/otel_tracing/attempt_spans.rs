@@ -479,6 +479,21 @@ impl BackendAttemptSpan {
         }
     }
 
+    /// [`Self::headers`] over a dispatch header view: the traced copy when
+    /// this attempt is traced, otherwise `base` unchanged.
+    pub(crate) fn headers_view<'a>(
+        &'a self,
+        base: crate::proxy::request_headers::RequestHeaders<'a>,
+    ) -> crate::proxy::request_headers::RequestHeaders<'a> {
+        match self.0.as_deref() {
+            Some(BegunAttempt {
+                headers: AttemptHeaders::Map(headers),
+                ..
+            }) => crate::proxy::request_headers::RequestHeaders::Materialized(headers),
+            _ => base,
+        }
+    }
+
     /// [`Self::headers`] for an attempt begun with
     /// `RequestContext::begin_backend_attempt_span_for_header_list`.
     pub(crate) fn header_list<'a>(

@@ -2489,7 +2489,7 @@ fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
         "the generic retry backoff must not regress to native-only gRPC framing"
     );
     assert!(backoff.contains("&ctx,"));
-    assert!(backoff.contains("owned_proxy_headers_ref.unwrap_or(&ctx.headers),"));
+    assert!(backoff.contains("&ctx.request_headers_view(owned_proxy_headers_ref),"));
 }
 
 #[test]
