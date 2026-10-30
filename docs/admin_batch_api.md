@@ -202,73 +202,6 @@ Plaintext Basic-auth passwords are hashed during batch preparation. This require
 }
 ```
 
-### Full Example
-
-Create consumers, proxies, and plugin configs in a single request:
-
-```json
-{
-  "consumers": [
-    {
-      "username": "tenant-1",
-      "credentials": {"keyauth": [{ "key": "key-001-0123456789abcdef" }]}
-    },
-    {
-      "username": "tenant-2",
-      "credentials": {"keyauth": [{ "key": "key-002-0123456789abcdef" }]}
-    }
-  ],
-  "proxies": [
-    {
-      "id": "proxy-1",
-      "name": "svc-1",
-      "listen_path": "/svc/1",
-      "backend_scheme": "http",
-      "backend_host": "localhost",
-      "backend_port": 9090
-    },
-    {
-      "id": "proxy-2",
-      "name": "svc-2",
-      "listen_path": "/svc/2",
-      "backend_scheme": "http",
-      "backend_host": "localhost",
-      "backend_port": 9090
-    }
-  ],
-  "plugin_configs": [
-    {
-      "plugin_name": "key_auth",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-1",
-      "config": {}
-    },
-    {
-      "plugin_name": "access_control",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-1",
-      "config": {"allowed_consumers": ["tenant-1"]}
-    },
-    {
-      "plugin_name": "key_auth",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-2",
-      "config": {}
-    },
-    {
-      "plugin_name": "access_control",
-      "enabled": true,
-      "scope": "proxy",
-      "proxy_id": "proxy-2",
-      "config": {"allowed_consumers": ["tenant-2"]}
-    }
-  ]
-}
-```
-
 ## Usage Examples
 
 ### curl: Create consumers with API keys
@@ -586,50 +519,7 @@ done
 
 ## Pagination on List Endpoints
 
-All list endpoints (`GET /proxies`, `GET /consumers`, `GET /plugins/config`, `GET /upstreams`) support pagination via query parameters:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `limit`   | 100     | Maximum number of items to return (max: 1000; `0` means the default) |
-| `offset`  | 0       | Number of items to skip (max: 2^63 - 1) |
-
-An omitted `limit` applies the default of 100, and a `limit` above 1000 is
-capped at 1000, so list endpoints never return an unbounded collection. Use
-`GET /backup` for a full export. Malformed or negative `limit`/`offset` values,
-and offsets above 2^63 - 1, are rejected with `400`. Validation runs after
-authentication, so an unauthenticated caller still receives `401`. See
-[Pagination](admin_api.md#pagination) for the full contract.
-
-### Paginated Request
-
-```bash
-# Get the first 50 proxies
-curl -s "http://localhost:9000/proxies?limit=50" \
-  -H "Authorization: Bearer $TOKEN"
-
-# Get the next 50
-curl -s "http://localhost:9000/proxies?limit=50&offset=50" \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-### Response Format
-
-List responses always use the pagination envelope, whether or not `limit` and
-`offset` are supplied:
-
-```json
-{
-  "data": [ ... ],
-  "pagination": {
-    "offset": 50,
-    "limit": 50,
-    "total": 3000
-  }
-}
-```
-
-`pagination.limit` reports the page size the server applied — 100 when the
-request omitted `limit` — not the number of items in `data`.
+List endpoints (`GET /proxies`, `GET /consumers`, `GET /plugins/config`, `GET /upstreams`) are paginated with `limit`/`offset`; see [Pagination](admin_api.md#pagination) for the full contract.
 
 ## Database Considerations
 

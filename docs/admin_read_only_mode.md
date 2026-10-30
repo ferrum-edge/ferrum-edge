@@ -60,6 +60,8 @@ With HTTP status code `403 Forbidden`.
 |---|---|---|
 | `FERRUM_ADMIN_READ_ONLY` | `false` | Opt in to read-only mode for `database` and `cp`. `file`, `dp`, `mesh`, and the optional `node_agent` admin listener are always read-only regardless of this value. |
 
+Changing `FERRUM_ADMIN_READ_ONLY` requires a process restart and only affects `database` and `cp`; `database` and `cp` default to read-write.
+
 ### Mode-Specific Behavior
 
 #### Database and Control Plane (CP) Modes
@@ -75,23 +77,6 @@ With HTTP status code `403 Forbidden`.
 #### Node Agent Mode
 - **Always** read-only when its opt-in admin listener is enabled
 - **Scope**: The listener exposes operational health and metrics surfaces, not configuration mutation APIs
-
-## Use Cases
-
-### Production Safety
-```bash
-# Enable read-only mode for production
-FERRUM_ADMIN_READ_ONLY=true
-```
-
-Prevents accidental configuration changes that could cause service disruptions.
-
-### Data Plane Security
-File, data-plane, mesh, and node-agent admin surfaces automatically run in read-only mode, ensuring they cannot persist configuration mutations. This maintains the security boundary between configuration owners and consumers.
-
-### Compliance and Maintenance
-Freeze configuration to satisfy change-management policies or during maintenance
-windows, while monitoring dashboards and health checks keep working.
 
 ## Examples
 
@@ -163,24 +148,7 @@ environment variable.
 - **Audit Events**: Blocked read-only mutations do **not** produce admin audit events; the durable audit pipeline runs only after read-only admission succeeds. Use the structured warning log and Prometheus counter for alerting and compliance evidence.
 - **Sensitive Reads**: Read-only mode blocks mutations only; it does not make management-plane reads, diagnostics, or bearer tokens safe to expose on an untrusted network
 - **Graceful Degradation**: Read operations continue to work during read-only enforcement
-
-## Migration Guide
-
-### Existing Deployments
-No changes are required for existing deployments. `database` and `cp` default to read-write; `file`, `dp`, `mesh`, and the optional `node_agent` admin listener remain unconditionally read-only.
-
-### Enabling Read-Only
-1. Set `FERRUM_ADMIN_READ_ONLY=true` in your environment
-2. Restart the gateway service
-3. Verify write operations are blocked (should return 403)
-4. Verify read operations still work (should return 200)
-
-### Disabling Read-Only
-1. In `database` or `cp` mode, set `FERRUM_ADMIN_READ_ONLY=false` in your environment
-2. Restart the gateway service
-3. Verify all operations work normally
-
-This setting cannot enable mutations in `file`, `dp`, `mesh`, or `node_agent` mode.
+- **Alerting**: Alert on `increase(ferrum_admin_read_only_rejected_mutations_total[15m]) > 0` and on the structured `admin mutation blocked by read-only mode` warning log
 
 ## Troubleshooting
 
@@ -189,20 +157,12 @@ This setting cannot enable mutations in `file`, `dp`, `mesh`, or `node_agent` mo
 - Check if `FERRUM_ADMIN_READ_ONLY=false` is set
 - Verify the gateway process was restarted after changing the variable
 
-### Read Operations Blocked
-- Verify JWT authentication is working
-- Check if you're using a Data Plane deployment (always read-only)
-- Review logs for authentication errors
+### Read Operations Fail
+- Read-only mode never blocks reads, in any mode
+- Verify JWT authentication and namespace authorization (`401`/`403`), and review logs for authentication errors
+- Check config-source availability, for example an unreachable database
 
 ### Unexpected 403 Errors
 - Check environment variable spelling: `FERRUM_ADMIN_READ_ONLY`
 - Verify the gateway is using the correct configuration mode
 - Check `ferrum_admin_read_only_rejected_mutations_total` or the `admin mutation blocked by read-only mode` warning to confirm read-only mode is the cause
-
-## Best Practices
-
-1. **Production**: Enable read-only mode for production `database`/`cp` deployments that must not accept configuration mutations; the consuming modes enforce it automatically
-2. **Development**: Keep read-write mode for development and testing
-3. **File/Data Plane/Mesh/Node Agent**: Rely on the automatic read-only behavior; the variable cannot make these modes writable
-4. **Monitoring**: Alert on `increase(ferrum_admin_read_only_rejected_mutations_total[15m]) > 0` and on the structured `admin mutation blocked by read-only mode` warning log
-5. **Documentation**: Document your read-only mode configuration in runbooks

@@ -48,7 +48,7 @@ Enforcement details, in either case:
 
 - The `ns` claim accepts the same shapes as the gRPC plane: a single string (`"ns": "prod"`) or an array of strings (`"ns": ["prod", "staging"]`).
 - A request whose `X-Ferrum-Namespace` (or the `ferrum` default when the header is omitted) is not in the token's `ns` set is rejected with `403 Forbidden`, whether or not enforcement is on. With enforcement on, tokens without an `ns` claim are also rejected on namespace-scoped routes — tenancy intent must be explicit.
-- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/apply-status` is not namespace-scoped.
+- Enforcement covers the namespace-scoped resource surfaces: `/proxies`, `/consumers` (including credentials), `/plugins/config`, `/upstreams`, `/api-specs`, `/batch`, `/backup`, `/deployment-snapshot`, `/config/export`, `/backend-egress-policy`, `/restore`, `/audit`, `/gateway-trust-bundles`, and `/gateway-trust` (including `/gateway-trust/status`). Those routes are selected by `X-Ferrum-Namespace`. `/config/apply-status` is not namespace-scoped.
 - The `/namespaces` registry is a global surface (the header does not select a tenant). When the flag is on, or the token carries an `ns` claim, `GET /namespaces` is **filtered** to the JWT `ns` claim — with the flag on, a token with no claim receives an empty list rather than `403`. `GET`/`PUT`/`DELETE /namespaces/{name}` and `POST /namespaces` return `403` when the token cannot address that name; rename checks both the current and target names.
 - Other global surfaces (observability, `/cluster`, TLS management, backend capabilities, mesh introspection, `GET /plugins` type listing) are not selected by `X-Ferrum-Namespace`; a token without an `ns` claim reaches them whatever the flag says, and a token with one is refused (see below). Audit events for those fleet-global mutations (including TLS/ACME management and `POST /mesh/config-revision/reset`) are stored under the canonical default namespace (`ferrum`), not the request header. The same canonical bucket is used for an invalid `X-Ferrum-Namespace` and for an `ns`-claim denial, so a scoped caller cannot file a privileged record under another tenant.
 - Malformed `ns` claims (non-string entries, empty strings) are rejected at authentication time regardless of the flag — a garbled tenancy claim never widens access.
@@ -169,7 +169,8 @@ are never affected.
   route runs. It does not depend on `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`.
 - Every namespace-scoped route listed above (proxies, consumers and
   credentials, plugin configs, upstreams, API specs, trust bundles and
-  `/gateway-trust/status`, `/batch`, `/backup`, `/restore`, `/audit`) and
+  `/gateway-trust/status`, `/batch`, `/backup`, `/deployment-snapshot`,
+  `/restore`, `/audit`) and
   `GET /config/export` and `GET /backend-egress-policy` answer `403` for a namespace outside the ceiling,
   including the `ferrum` default when the header is omitted. The refusal
   depends only on the credential and the requested namespace, never on whether
@@ -186,12 +187,9 @@ are never affected.
 - For a ceiling-bound viewer-key token, global routes fail closed with `403`
   unless they are `GET /namespaces`, `GET /namespaces/{name}`, `GET /plugins`
   (plugin type catalog), or health/liveness/readiness probes (`GET /health`,
-  `/live`, `/status`, `/overload`). Without an allowlisted source IP, these
-  tokens receive the [tenant tier](#tenant-tier-for-namespace-bounded-tokens)
-  from `/health` and `/status`, and only `{level}` from `/overload`. An
-  allowlisted IP retains the detail it would receive without the viewer token,
-  consistently across all three routes. Detailed `/metrics` routes return
-  `403`, even from an allowlisted source IP. Other
+  `/live`, `/status`, `/overload`). Their observability detail follows the
+  namespace-bounded rules under [Authentication](#authentication). Detailed
+  `/metrics` routes return `403`, even from an allowlisted source IP. Other
   denied routes include `/charges`, `/admin/metrics`,
   `/metrics/runtime`, `/cluster`, `/backend-capabilities`, mesh introspection,
   and all other global routes. The namespace registry remains filtered as
@@ -461,7 +459,15 @@ Service-discovery task lifecycle and bounded staleness drive the same coarse fie
 
 A terminating process reports `status: "draining"`, `ready: false`, and HTTP 503. The verdict is published the moment SIGTERM/SIGINT is observed — ahead of the accept-loop close — so an orchestrator or load balancer can withdraw the replica from its endpoint set before a new connection is refused; `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` keeps every listener (proxy and admin) accepting for that window. `draining` is terminal and wins over every other status. `/live` is deliberately unaffected and keeps returning 200: a liveness probe pointed at a draining pod must not trigger a SIGKILL mid-drain. See [graceful_shutdown.md](graceful_shutdown.md).
 
-Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state. The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require an admin JWT that is not namespace-bounded, `FERRUM_METRICS_BEARER_TOKEN`, or a `FERRUM_METRICS_ALLOWED_CIDRS` source IP (a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens)). In **data-plane mode**, authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect). In database mode the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. Both **database** and **cp** modes expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing. In **cp** mode, unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`. In **database** mode the poll task is respawned after an unexpected exit while last-known-good config continues to serve. When the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
+Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state.
+
+The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require the authenticated tier described under [Authentication](#authentication); a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens).
+
+- **Data-plane mode**: authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect).
+- **Database mode**: the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. The poll task is respawned after an unexpected exit while last-known-good config continues to serve.
+- **Database and cp modes**: both expose `database_polling.last_poll_completed_at` (updated on every normally completed poll outcome — empty success, rejection, or handled error — not on panic/abort/cancel) so operators can alert when the supervised poll task stops advancing.
+- **CP mode**: unexpected poll-task exit (panic/abort/unexpected completion — not ordinary shutdown) flips sticky `serving_degraded`, so `/health` returns 503 with `status: "unavailable"` and `ready: false`.
+- **MongoDB change stream**: when the optional MongoDB change-stream watcher is enabled (`FERRUM_MONGO_CHANGE_STREAM_ENABLED`, replica sets only), `database_polling.change_stream` reports its bounded connected/degraded/reconnect state; it is a reload-latency signal only and never forces `status: "degraded"`, because periodic polling stays authoritative. See [mongodb.md](mongodb.md#change-stream-triggered-reloads).
 
 In mesh mode, authenticated health detail includes
 `mesh.egress_scope.sidecar_admitted_services` and
@@ -1962,56 +1968,14 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9000/restore?confirm=true"
 ```
 
-The backup output can be passed unchanged to `POST /batch` (additive) or `POST /restore` (full replacement). Backup resources always include `id`s; restore requires them, while batch generates them if a caller strips them. [admin_backup_restore.md](admin_backup_restore.md) is the full reference; the key points are:
+The backup output can be passed unchanged to `POST /batch` (additive) or `POST /restore` (full replacement). Backup resources always include `id`s; restore requires them, while batch generates them if a caller strips them. [admin_backup_restore.md](admin_backup_restore.md) is the full reference; in summary:
 
-- **Backup is audited unconditionally.** Successful exports and authenticated denied/failed attempts are audited before (or instead of) releasing unredacted bytes, independent of `FERRUM_ADMIN_AUDIT_ENABLED`. If no audit sink accepts the success record, the export returns `503` with no attachment. See [Audit Log](#audit-log).
-- **Strict `resources` filter.** Query keys and values are strictly percent-decoded (`?resources=proxies%2Cconsumers` is a two-token filter; `?%72esources=` is the same key). `+`, whitespace (raw or encoded, e.g. `?resources=proxies, upstreams`), bad `%` escapes, invalid UTF-8, duplicates, a key-only `?resources`, and unknown tokens all fail closed with `400` and the static `Unsupported backup resource filter` text; the rejected text is never echoed, and audit records the fixed `invalid` sentinel. A filter never widens to a full, credential-bearing export.
-- **Closed restore envelope.** `POST /restore` requires a JSON object and rejects unknown top-level keys with `400` before anything is deleted. Accepted keys are `version`, `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`, `gateway_trust_bundles`, and the backup metadata `ferrum_version`, `exported_at`, `source` (strings) and `counts` (object), which are shape-checked and ignored. An explicit `{}` or empty arrays mean "replace this namespace with nothing". `POST /batch` and single-resource writes also require a JSON object, and object-valued fields (`circuit_breaker`, `retry`, `stream_match`, `trigger`, `health_checks`, `hash_on_cookie_config`, `service_discovery`, `locality_lb_setting`) accept an object or `null`, never an array.
-- **Validate, snapshot, then replace.** Restore validates the payload, acquires a persistent namespace guard, and snapshots the current namespace with a non-validating raw load from the primary (so already-invalid config can still be rolled back). The same guard owner is held through the clear, every import batch, and any compensating replay, so concurrent writers fail closed instead of being lost. If the snapshot cannot be taken, restore **aborts with `503` before deleting anything**. Inserts are chunked into 1,000-record batches. Conditional mTLS DNS-identity uniqueness is checked under the same guard; only the rollback replay of the old snapshot skips newly introduced mTLS DNS admission.
-- **Failure reporting.** A failed restore returns `500` with `rollback`: `completed`, `incomplete`, `not_needed` (the clear aborted atomically on SQL / replica-set MongoDB, so nothing was deleted), or `unknown_outcome` (an unknown MongoDB commit result; the guard stays held). `api_specs_not_restored` / `api_specs_note` appear only when rollback is `incomplete` and the prior namespace carried specs.
-- **API specs** travel as a versioned `api_specs` section (`section_version: "2"`). Restoring a legacy backup that omits the section into a namespace that still holds specs requires `?confirm_api_spec_deletion=true` in addition to `?confirm=true`.
-- **Gateway trust bundles** travel as a `gateway_trust_bundles` array on full, unfiltered database exports only. On restore an **absent** array leaves existing roots untouched; a **present** array (including an empty one, which revokes) is authoritative for the authenticated target namespace. More than one record is rejected with `400`. Records are re-validated through the normal admission path before the clear; `id` and `created_at` come from the stored record, `revision` is assigned by the store, and `updated_by` is the restoring admin's JWT subject (at most 255 characters; longer subjects are rejected).
+- **Backup is audited unconditionally**, independent of `FERRUM_ADMIN_AUDIT_ENABLED`; if no audit sink accepts the success record, the export returns `503` with no attachment. See [Audit Log](#audit-log).
+- **Strict `resources` filter.** Malformed, duplicate, or unknown filter tokens fail closed with `400`.
+- **Closed restore envelope.** `POST /restore` rejects unknown top-level keys with `400` before anything is deleted.
+- **Validate, snapshot, then replace.** Restore validates the payload and snapshots the current namespace under a persistent namespace guard before the destructive clear; if the snapshot cannot be taken it aborts with `503` before deleting anything.
 
-### Namespace metadata is not part of a backup
-
-A namespace backup payload carries namespace-**scoped configuration
-resources** — proxies, consumers, plugin configs, upstreams, API specs, and
-gateway trust bundles — and never the namespace registry row itself (its
-`description` and its `created_at`/`updated_at`). This boundary is deliberate:
-`POST /restore` writes into the **authenticated target namespace**, so
-transplanting the source tenant's registry metadata into a different target
-would silently relabel that target from an artifact taken elsewhere.
-
-The consequences are explicit rather than implied:
-
-- Restoring **in place** (same namespace the backup came from) leaves that
-  namespace's registry row untouched: description and timestamps are preserved
-  exactly as they were, including across the destructive clear.
-- Importing into a **fresh target** yields a namespace that holds resources but
-  has no registry row and therefore no description — a derived-only namespace.
-  It still appears in `GET /namespaces`, and `GET /namespaces/{name}` returns a
-  synthesized record with observation timestamps (see [Derived-only namespace
-  timestamps](#derived-only-namespace-timestamps)). Use `POST /namespaces` or
-  `PUT /namespaces/{name}` to materialize a durable registry row with the
-  description you want.
-
-### MongoDB restore refuses malformed split identities
-
-`POST /restore` on MongoDB uses the same strict namespace cascade as namespace
-`DELETE ?confirm=true`. Before its destructive clear, it validates every
-consumer and consumer-identity-index document's durable key against its
-embedded `namespace` (`_id = "{namespace}:{suffix}"` plus a matching
-`namespace` field and identity value), and deletes only the identities it
-validated.
-
-A document whose `_id` and embedded `namespace` disagree (a split identity that
-only a hand-edited database or an out-of-band writer can produce) aborts the
-restore as registry corruption: a redacted `500`, rolled back, prior
-configuration retained. This is intentional: deleting it could delete another
-tenant's data, and skipping it would leave the target namespace half-cleared.
-Repair or deliberately remove the offending document and re-run the restore.
-
-See [admin_backup_restore.md](admin_backup_restore.md) for details.
+Two destructive-restore exceptions to know: restoring a backup without an `api_specs` section into a namespace that still holds specs requires `?confirm_api_spec_deletion=true`, and an **absent** `gateway_trust_bundles` array leaves trust untouched while a **present** one (including an empty one, which revokes) is authoritative. [Namespace registry metadata is not part of a backup](admin_backup_restore.md#namespace-metadata-is-not-part-of-a-backup), and [MongoDB restore refuses malformed split identities](admin_backup_restore.md#mongodb-restore-refuses-malformed-split-identities).
 
 ### Read-only configuration export (`GET /config/export`)
 
@@ -2667,6 +2631,8 @@ A proxy that serves both HTTP and stream traffic under one `proxy_id` reports `"
 
 **Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node with admin JWT credentials and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
 
+`GET /charges/sink/status` returns `api_chargeback_sink` delivery status as JSON under the same admin-JWT gate; see [plugins.md](plugins.md#api_chargeback_sink).
+
 ## API Spec Management
 
 Ferrum Edge can ingest an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specification document and atomically provision a proxy, optional upstream, and proxy-scoped plugins as a single bundle. Specs are admin-plane-only metadata and the gateway runtime never reads them — submitting or updating a spec has no effect on in-flight requests. Authenticated `viewer`, `operator`, and `admin` tokens can list non-secret spec metadata. Retrieving an original spec document requires `admin` because it can contain sensitive upstream or plugin configuration that the normal Viewer/Operator resource responses redact. Creating, replacing, or deleting a spec also requires `admin`. See [docs/api_specs.md](api_specs.md) for the full extension contract, worked examples, and curl recipes.
@@ -3032,7 +2998,7 @@ their meaning requires a versioned contract update in `ferrum-contracts`.
 
 ## Backend Capability Registry
 
-Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [CLAUDE.md — Backend Capability Registry](../CLAUDE.md) and [docs/http3.md](http3.md) for the underlying design.
+Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [docs/http3.md](http3.md) for the underlying design.
 
 Plaintext HTTP backends are still probed for prior-knowledge h2c because gRPC is a runtime flavor, not a scheme — a single `http` origin may carry native gRPC. That probe uses the same pool handshake as live gRPC, but with explicit capability-probe context: an expected HTTP/1.1 classification miss (`h2c handshake failed`) is a debug-level event, including on SIGHUP refresh, and does not emit `WARN` at the documented default `FERRUM_LOG_LEVEL=warn`. Request-time gRPC establishment failures, probe dial timeouts, port exhaustion, and unexpected candidate connection/handshake failures remain `WARN`/`ERROR`. Secrets and credential metadata are never included in these lines.
 
@@ -3040,7 +3006,7 @@ Two JWT-authenticated endpoints let operators inspect and force-refresh the regi
 
 ### `GET /backend-capabilities`
 
-Returns every cached entry keyed by the deduplicated backend-target identity the registry uses internally (scheme + host + port + `dns_override` + CA + mTLS cert + mTLS key + verify flag, plus HBONE sidecar port for targets tagged `mesh.hbone=true`).
+Returns every cached entry keyed by the deduplicated backend-target identity the registry uses internally: scheme, host, port, `dns_override`, the effective backend TLS identity and policy (CA, client cert/key, SNI, SAN digest, verify flag, optional `tlsrefused`/`noglobalid` markers, and the `svidg=` segment, `svidg=static` here), plus HBONE port, dial host, and peer SPIFFE identity for targets tagged `mesh.hbone=true`. The key is an opaque internal connection identity; its field layout may change.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/backend-capabilities
@@ -3052,7 +3018,7 @@ Response:
 {
   "entries": [
     {
-      "key": "https|api.example.internal|443||/etc/ferrum/ca.pem|||1",
+      "key": "https|api.example.internal|443|…|1|svidg=static|",
       "plain_http": {
         "h1": "supported",
         "h2_tls": "supported",
@@ -3067,7 +3033,7 @@ Response:
       "last_probe_error": null
     },
     {
-      "key": "https|legacy.example.internal|443||||0",
+      "key": "https|legacy.example.internal|443|…|0|svidg=static|",
       "plain_http": {
         "h1": "supported",
         "h2_tls": "unsupported",
@@ -3509,12 +3475,10 @@ map of strings, for example:
 {"labels": {"provisioned-by": "ferrum-nexus", "team": "platform"}}
 ```
 
-**Availability.** Resource labels landed on `main` in
-[#5483](https://github.com/ferrum-edge/ferrum-edge/pull/5483) on 2026-09-12.
-Every published release up to and including **v0.9.4** rejects the `labels`
-field with ``unknown field `labels` ``. **v0.9.5 is the first tagged release
-with resource labels**; operators and clients should use v0.9.5 or later.
-See the [v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095).
+**Availability.** **v0.9.5 is the first tagged release with resource
+labels**; v0.9.4 and earlier reject the `labels` field with
+``unknown field `labels` ``. See the
+[v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095).
 
 Labels appear on GET/list, backup/restore, file configuration, and CP/DP
 configuration, and survive namespace renames. Empty maps are omitted from
@@ -3540,19 +3504,13 @@ managed-resource ledger, consumer identities, or upstream target `tags`.
 The gateway namespace registry and fleet-global TLS/ACME/trust management
 surfaces are separate from these four gateway configuration resource types.
 
-This schema change follows the build-out policy: the SQL baseline includes the
-labels column for PostgreSQL, MySQL and SQLite; initialize/rebuild the development
-database from that baseline when deploying it. MongoDB stores labels through its
-existing BSON resource serialization. Upgrade the gateway and file validator
-before upgrading clients that emit labels in resource bodies. In control-plane
-deployments the CP and every DP must run the same build: the ConfigSync
-build-identity gate refuses a mismatched peer before any config is streamed.
-Upgrade them together, CP first and then every DP, as described in
-[upgrade_guide.md](upgrade_guide.md#upgrade-order). Until a DP is replaced, the
-new CP refuses its subscription. The DP keeps serving its last applied config,
-bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`, so it never receives a
-`labels`-bearing snapshot that it could not parse (`config_json` is parsed with
-`deny_unknown_fields`).
+Upgrade the gateway and file validator before clients that emit labels; see
+the [v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095) for the schema
+baseline. In control-plane deployments the CP and every DP must run the same
+build: the ConfigSync build-identity gate refuses a mismatched peer before any
+config is streamed, and the DP keeps serving its last applied config until it is
+replaced. Upgrade CP first and then every DP, as described in
+[upgrade_guide.md](upgrade_guide.md#upgrade-order).
 
 Diagnostic builds with the default-off `bench-h1-profile` feature append fixed
 `ferrum_h1_profile_*` metrics to the existing authenticated `/metrics` response.

@@ -13,7 +13,7 @@ For the full Prometheus family reference (exact names, types, HELP text, label k
 | `/metrics` | GET | JWT / metrics token / allowed CIDR | 5-second TTL (configurable via `render_cache_ttl_seconds`); process-static families are exempt — see below | Prometheus exposition format, including request, AI token/cost, and TLS certificate metrics |
 | `/health` | GET | None (tiered) | None | `status`+`ready` unauthenticated; full diagnostics require auth |
 
-`/metrics` "Auth" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401`. An admin JWT carrying an `ns` claim (or a viewer-key JWT under a namespace ceiling) is namespace-bounded: it receives `403` from `/metrics`, `/admin/metrics`, and `/metrics/runtime`, even from a `FERRUM_METRICS_ALLOWED_CIDRS` source IP (the CIDR allowance covers only scrapes that present no such token). The same credential set unlocks the detailed `/health` and `/overload` views; a namespace-bounded JWT gets the bounded tenant tier of `/health` and `/status` instead (see [admin_api.md](admin_api.md#tenant-tier-for-namespace-bounded-tokens)).
+`/metrics` "Auth" means a valid admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP within `FERRUM_METRICS_ALLOWED_CIDRS`; otherwise it returns `401`. A namespace-bounded JWT receives `403` from `/metrics`, `/admin/metrics`, and `/metrics/runtime`, even from an allowlisted source IP; the detailed `/health` / `/overload` views and the tenant tier follow [admin_api.md](admin_api.md#authentication).
 
 #### What `render_cache_ttl_seconds` does and does not cover
 
@@ -400,7 +400,7 @@ The router cache stores `(host, path) → proxy` lookups in bounded DashMaps for
 | `regex_cache_entries` | integer | Current entries in the regex route cache |
 | `prefix_eviction_count` | integer | Total eviction sweeps for the prefix cache since startup |
 | `regex_eviction_count` | integer | Total eviction sweeps for the regex cache since startup |
-| `max_cache_entries` | integer | Maximum entries per partition before random-sample eviction triggers (default 10,000) |
+| `max_cache_entries` | integer | Maximum entries per partition before random-sample eviction triggers (`FERRUM_ROUTER_CACHE_MAX_ENTRIES`; default auto-sizes to proxies × 3, clamped to 10,000–1,000,000) |
 
 **What to look for:**
 
@@ -431,11 +431,11 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `tracked_key_count` | integer | Total rate-limit keys currently tracked across all `rate_limiting` plugin instances. Each key represents a unique client (by IP, consumer identity, or SPIFFE identity) with an active rate-limit window. Bounded to 100K entries per plugin instance with automatic stale entry eviction |
+| `tracked_key_count` | integer | Total keys currently tracked across deduplicated plugin instances that report a tracked-key count: rate limiters (`rate_limiting` and the other rate-limiting plugins) plus other state/cache plugins such as `request_deduplication`, `ai_semantic_cache`, and `adaptive_concurrency`. For `rate_limiting`, each key represents a unique client (by IP, consumer identity, or SPIFFE identity) with an active rate-limit window. Capacity depends on each contributing plugin; `rate_limiting` instances are bounded by `max_state_entries` (default 100,000) with automatic stale entry eviction |
 
 **What to look for:**
 
-- A `tracked_key_count` approaching 100K may indicate a DDoS or scanner generating many unique source IPs
+- Interpret `tracked_key_count` growth against the configured capacity of the contributing plugins and the observed client cardinality; unexpected growth well beyond the normal client count may indicate a DDoS or scanner generating many unique source IPs
 - Under normal traffic, this count should correlate with the number of unique clients in your active window duration
 
 ### `adaptive_concurrency`

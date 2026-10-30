@@ -280,7 +280,7 @@ The following are rejected with HTTP 422 (the `code` field of the error body is 
 
 The credential-key check walks the plugin's `config` *value*, not the plugin metadata, so a plugin named `jwt` is fine. A JWT plugin with `config: { secret_lookup: env, validation: { validate_exp: true } }` passes; one with `config: { jwt: { secret: "abc" } }` fails.
 
-### External `$ref` policy {#external-ref-policy}
+### External `$ref` policy
 
 External and cross-document `$ref` resolution is **explicitly opt-in** and runs only at API-spec admission (POST/PUT). Runtime validation never performs network or filesystem I/O for `$ref`s: schemas and Path Items are materialized into the generated `openapi_validator` config, and an immutable external-document snapshot (plus digest) is stored on the `api_specs` row.
 
@@ -363,23 +363,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 ## Dependency-fenced deployment recovery (#6010)
 
-Use admin-only `GET /deployment-snapshot` for complete original spec metadata,
-stored-document digests, one base64 copy of the stored spec bytes
-(`api_spec_contents`), plugin and raw dependency evidence. Send its original
-deployment token to
-`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
-`PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
-partially mutate inside one owner-fenced transaction on all four supported
-stores (MongoDB requires a replica set). Stale evidence is `412`; invalid modes
-or headers refuse without fallback. Ordinary row deletion, spec replacement,
-backup and restore profiles retain their supported behavior.
-
-Only an acknowledgement with `durable: "committed"`, `live: "applied"` and
-`recovery_cleanup_authorized: true` authorizes automatic journal removal.
-Durable-only CP/unserved results explicitly return `false`. Preserve the original
-encrypted journal after every refusal or uncertain outcome. See the
-[consumer adoption guide](deployment_mutations.md) for exact evidence, query,
-ownership, preservation and acknowledgement rules.
+For exact-owner proxy removal and spec replacement fenced by `GET /deployment-snapshot`, see [deployment_mutations.md](deployment_mutations.md) and [admin_api.md](admin_api.md#dependency-fenced-deployment-recovery-6010).
 
 ## Atomicity and retries
 

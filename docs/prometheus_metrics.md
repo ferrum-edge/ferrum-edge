@@ -323,7 +323,7 @@ batch-materialization layer for the process as a whole.
 Both label values come from fixed compile-time sets and never carry an
 endpoint, topic, namespace, policy id, or record content:
 
-| `plugin` | one of the ten sinks above, or `other` for a sink identity outside the closed set |
+| `plugin` | one of the eleven sinks above, or `other` for a sink identity outside the closed set |
 | --- | --- |
 | `reason` | `batch_discard`, `byte_budget`, `queue_full`, `record_too_large`, `shutdown`, `sink_error` |
 

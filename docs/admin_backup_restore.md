@@ -105,25 +105,56 @@ A filtered export that includes `api_specs` without `proxies`, `upstreams`, and 
 
 ## Dependency-fenced deployment recovery (#6010)
 
-Use admin-only `GET /deployment-snapshot` for complete original spec metadata,
-stored-document digests, one base64 copy of the stored spec bytes
-(`api_spec_contents`), plugin and raw dependency evidence. Send its original
-deployment token to
-`DELETE /proxies/{id}?conditional=true&cleanup_orphaned_upstream=false` or
-`PUT /api-specs/{id}?conditional=true`. These opt-in operations compare and
-partially mutate inside one owner-fenced transaction on all four supported
-stores (MongoDB requires a replica set). Stale evidence is `412`; invalid modes
-or headers refuse without fallback. Ordinary row deletion, spec replacement,
-backup and restore profiles retain their supported behavior.
-
-Only an acknowledgement with `durable: "committed"`, `live: "applied"` and
-`recovery_cleanup_authorized: true` authorizes automatic journal removal.
-Durable-only CP/unserved results explicitly return `false`. Preserve the original
-encrypted journal after every refusal or uncertain outcome. See the
-[consumer adoption guide](deployment_mutations.md) for exact evidence, query,
-ownership, preservation and acknowledgement rules.
+For exact-owner proxy removal and spec replacement fenced by `GET /deployment-snapshot`, see [deployment_mutations.md](deployment_mutations.md) and [admin_api.md](admin_api.md#dependency-fenced-deployment-recovery-6010).
 
 ## Restore — `POST /restore?confirm=true`
+
+Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is normalized and validated before any data is deleted:
+
+1. **Normalizes** the restore payload once with the same `normalize_fields()` admission used by CRUD, batch, file mode, and database loaders (lowercase hosts/backend hosts/upstream targets, backend TLS SNI and DNS SAN allow-list entries, blank `custom_id` / plugin `proxy_id` → omitted). That exact canonical instance is what later preparation and persistence use — credential hashing and restore timestamps do not reintroduce the discarded wire-form original.
+2. **Validates** the normalized payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, proxy and upstream `name` uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, stream `mtls_auth` transport compatibility, upstream references, and plugin-config admission — plugin name and definition, including `enabled: false` rows, exactly as `POST /batch` validates them). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
+3. **Snapshots** the current namespace configuration for recovery (fail-safe — see below)
+4. **Deletes** all existing proxies, consumers, plugin configs, upstreams, junction table entries, and API specs
+5. **Imports** the provided resources in dependency order (consumers & upstreams → proxies → plugin configs → associations → API specs)
+6. **Rolls back** to the snapshot if the delete or any import persistence step fails
+
+### The restore envelope is closed
+
+Because every resource collection is optional and defaults to empty, a body that
+Ferrum *misreads* as "an empty backup" is a request to delete the namespace.
+The envelope is therefore closed on both axes, and both checks run before the
+snapshot and the clear:
+
+- **It must be a JSON object.** A top-level array (`[]`), a positional sequence
+  (`["1",[],[],[],[]]`), or a scalar is `400`. Serde's derived struct visitors
+  otherwise accept a sequence *positionally*, filling each declared field in
+  turn and defaulting the rest — which is how `[]` used to parse as a backup
+  with every collection empty.
+- **Unknown top-level keys are rejected.** A misspelled collection
+  (`{"proxise": [ ... ]}`) is `400`, not "restore zero proxies". The accepted
+  keys are `version`, `proxies`, `consumers`, `plugin_configs`, `upstreams`,
+  `api_specs`, `gateway_trust_bundles`, and the `GET /backup` metadata members
+  `ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted
+  and ignored so an unmodified backup artifact round-trips. Ignored is not
+  unchecked: `counts` must be a JSON object (the `type: object` `openapi.yaml`
+  publishes) and the other three must be strings, so a malformed artifact is a
+  `400` like every other shape mismatch rather than reaching the destructive
+  clear. `api_specs` and each of its items are closed the same way.
+
+An explicit `{}` and explicit empty collections keep their documented meaning:
+that is the deliberate way to ask for an empty namespace.
+
+`version`, when present and non-empty, must match the configuration version this
+gateway expects; an incompatible value is `400` and nothing is deleted.
+
+The same object-shape requirement applies to `POST /batch` and to the ordinary
+single-resource admin `POST`/`PUT` bodies, and nested object-valued fields are
+held to it too: `circuit_breaker`, `retry`, `stream_match`, `trigger`,
+`health_checks`, `hash_on_cookie_config`, `service_discovery`, and
+`locality_lb_setting` accept an object or `null`, never an array that would
+otherwise become a default-constructed configuration object.
+
+Each `basicauth` entry must contain exactly one `password` or `password_hash` field. Remove obsolete fields from older backups (for example an entry-local `username`) before restoring; there is no compatibility shim.
 
 ### Conditional snapshots and restore
 
@@ -177,7 +208,7 @@ whose canonical representation (excluding spec bytes) would exceed **64 MiB**
 is refused with `507 Insufficient Storage` instead of being fenced; nothing is
 applied. Tags issued before this representation (v0.9.12 and earlier) no longer
 match and fail closed with `412`: re-read `GET /backup?conditional=true` after
-upgrading.
+upgrading (see [upgrade_guide.md](upgrade_guide.md#upgrading-to-0913)).
 
 Send the namespace tag as `If-Match` to `POST /restore?confirm=true`. Comparison,
 clear, every import chunk, ownership restoration, trust changes, config-change
@@ -190,56 +221,9 @@ reading the authoritative state before deciding whether to retry.
 
 `conditional` body metadata is accepted and ignored by restore and batch. It
 does not establish a precondition by itself. Omitting `If-Match` retains the
-existing unconditional restore behavior described below. Admin role, namespace
+existing unconditional restore behavior described above. Admin role, namespace
 JWT authorization, write-mode/topology restrictions, validation, audit, and live
 apply semantics still apply.
-
-Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is normalized and validated before any data is deleted:
-
-1. **Normalizes** the restore payload once with the same `normalize_fields()` admission used by CRUD, batch, file mode, and database loaders (lowercase hosts/backend hosts/upstream targets, backend TLS SNI and DNS SAN allow-list entries, blank `custom_id` / plugin `proxy_id` → omitted). That exact canonical instance is what later preparation and persistence use — credential hashing and restore timestamps do not reintroduce the discarded wire-form original.
-2. **Validates** the normalized payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, proxy and upstream `name` uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, stream `mtls_auth` transport compatibility, upstream references, and plugin-config admission — plugin name and definition, including `enabled: false` rows, exactly as `POST /batch` validates them). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
-3. **Snapshots** the current namespace configuration for recovery (fail-safe — see below)
-4. **Deletes** all existing proxies, consumers, plugin configs, upstreams, junction table entries, and API specs
-5. **Imports** the provided resources in dependency order (consumers & upstreams → proxies → plugin configs → associations → API specs)
-6. **Rolls back** to the snapshot if the delete or any import persistence step fails
-
-### The restore envelope is closed
-
-Because every resource collection is optional and defaults to empty, a body that
-Ferrum *misreads* as "an empty backup" is a request to delete the namespace.
-The envelope is therefore closed on both axes, and both checks run before the
-snapshot and the clear:
-
-- **It must be a JSON object.** A top-level array (`[]`), a positional sequence
-  (`["1",[],[],[],[]]`), or a scalar is `400`. Serde's derived struct visitors
-  otherwise accept a sequence *positionally*, filling each declared field in
-  turn and defaulting the rest — which is how `[]` used to parse as a backup
-  with every collection empty.
-- **Unknown top-level keys are rejected.** A misspelled collection
-  (`{"proxise": [ ... ]}`) is `400`, not "restore zero proxies". The accepted
-  keys are `version`, `proxies`, `consumers`, `plugin_configs`, `upstreams`,
-  `api_specs`, `gateway_trust_bundles`, and the `GET /backup` metadata members
-  `ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted
-  and ignored so an unmodified backup artifact round-trips. Ignored is not
-  unchecked: `counts` must be a JSON object (the `type: object` `openapi.yaml`
-  publishes) and the other three must be strings, so a malformed artifact is a
-  `400` like every other shape mismatch rather than reaching the destructive
-  clear. `api_specs` and each of its items are closed the same way.
-
-An explicit `{}` and explicit empty collections keep their documented meaning:
-that is the deliberate way to ask for an empty namespace.
-
-`version`, when present and non-empty, must match the configuration version this
-gateway expects; an incompatible value is `400` and nothing is deleted.
-
-The same object-shape requirement applies to `POST /batch` and to the ordinary
-single-resource admin `POST`/`PUT` bodies, and nested object-valued fields are
-held to it too: `circuit_breaker`, `retry`, `stream_match`, `trigger`,
-`health_checks`, `hash_on_cookie_config`, `service_discovery`, and
-`locality_lb_setting` accept an object or `null`, never an array that would
-otherwise become a default-constructed configuration object.
-
-Each `basicauth` entry must contain exactly one `password` or `password_hash` field. Remove obsolete fields from older backups (for example an entry-local `username`) before restoring; there is no compatibility shim.
 
 ### Recovery snapshot is authoritative and fail-safe
 
@@ -335,6 +319,45 @@ gateway-to-mesh identity is refused until an authoritative database full reload
 settles it. `GET /gateway-trust/status` reports `authority_unresolved: true`
 for that duration. Use `POST /restore` to move administrative resources between
 databases; mounting an export as a startup backup does not write to the database.
+
+### Namespace metadata is not part of a backup
+
+A namespace backup payload carries namespace-**scoped configuration
+resources** — proxies, consumers, plugin configs, upstreams, API specs, and
+gateway trust bundles — and never the namespace registry row itself (its
+`description` and its `created_at`/`updated_at`). This boundary is deliberate:
+`POST /restore` writes into the **authenticated target namespace**, so
+transplanting the source tenant's registry metadata into a different target
+would silently relabel that target from an artifact taken elsewhere.
+
+The consequences are explicit rather than implied:
+
+- Restoring **in place** (same namespace the backup came from) leaves that
+  namespace's registry row untouched: description and timestamps are preserved
+  exactly as they were, including across the destructive clear.
+- Importing into a **fresh target** yields a namespace that holds resources but
+  has no registry row and therefore no description — a derived-only namespace.
+  It still appears in `GET /namespaces`, and `GET /namespaces/{name}` returns a
+  synthesized record with observation timestamps (see [Derived-only namespace
+  timestamps](admin_api.md#derived-only-namespace-timestamps)). Use `POST /namespaces` or
+  `PUT /namespaces/{name}` to materialize a durable registry row with the
+  description you want.
+
+### MongoDB restore refuses malformed split identities
+
+`POST /restore` on MongoDB uses the same strict namespace cascade as namespace
+`DELETE ?confirm=true`. Before its destructive clear, it validates every
+consumer and consumer-identity-index document's durable key against its
+embedded `namespace` (`_id = "{namespace}:{suffix}"` plus a matching
+`namespace` field and identity value), and deletes only the identities it
+validated.
+
+A document whose `_id` and embedded `namespace` disagree (a split identity that
+only a hand-edited database or an out-of-band writer can produce) aborts the
+restore as registry corruption: a redacted `500`, rolled back, prior
+configuration retained. This is intentional: deleting it could delete another
+tenant's data, and skipping it would leave the target namespace half-cleared.
+Repair or deliberately remove the offending document and re-run the restore.
 
 ### Safety Guard
 

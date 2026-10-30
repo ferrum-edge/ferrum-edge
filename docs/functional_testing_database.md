@@ -55,6 +55,55 @@ so a dialect, driver, or concurrency difference between backends shows up as a
 diff in one place. The replica-set cells are opt-in through
 `FERRUM_TEST_MONGO_REPLICA_SET` and fail closed once it is declared.
 
+### Gateway trust-bundle acceptance coverage
+
+The store contract, the admission validation, the publication accounting, and
+the ConfigSync projection are asserted in-process by
+[`gateway_trust_bundle_store_tests.rs`](../tests/integration/gateway_trust_bundle_store_tests.rs),
+[`gateway_trust_bundle_admin_tests.rs`](../tests/integration/gateway_trust_bundle_admin_tests.rs),
+and [`gateway_trust_bundle_tests.rs`](../tests/unit/config/gateway_trust_bundle_tests.rs).
+Database serving mode's live-verifier installation (startup, rotation,
+revocation, ambiguous authority, unconvertible material, and the non-database
+no-op) is asserted in
+[`gateway_trust_runtime_publication_tests.rs`](../tests/unit/gateway_core/gateway_trust_runtime_publication_tests.rs).
+
+Live, backend-by-backend acceptance runs in the hosted `Functional Tests
+(data-plane)` job through
+[`functional_gateway_trust_bundle_ha_test.rs`](../tests/functional/functional_gateway_trust_bundle_ha_test.rs):
+
+| Acceptance criterion | Where it is proved live |
+|---|---|
+| Create / read / rotate with overlap / explicit revoke on every provisioned backend | `test_gateway_trust_bundle_acceptance_{sqlite,postgres,mysql,mongodb_standalone,mongodb_replica_set}` |
+| Optimistic concurrency (a stale expectation is a typed `409`, never an overwrite) | the same acceptance cells |
+| A malformed or oversized candidate is refused before publication and the prior valid bundle survives | the same acceptance cells |
+| A rotation reaches the publication boundary (`published_generations_total` advances at the swap) | the same acceptance cells |
+| Namespace A cannot read, write, delete, list, or infer namespace B's record | the same acceptance cells |
+| A restart reconstructs the identical generation, revision, and material from the database alone | the same acceptance cells, plus the CP restart in the HA cells |
+| Two CP replicas observe and publish the same committed revision **without a restart** | `test_two_control_plane_replicas_converge_{postgres,mongodb}` |
+| Concurrent writers racing from one read leave exactly one winner | the same HA cells |
+| An interrupted MongoDB write never leaves a committed document whose revision no change row records | `test_mongodb_{standalone,replica_set}_leaves_no_unrecorded_trust_revision` |
+| A committed create / rotation / revocation whose signal was already consumed is still detected by the next poll | `tests/unit/config/gateway_trust_bundle_tests.rs` drift-detection cells |
+| Detected drift is repaired by the full-reload publication path in the same poll tick, with poll-completion accounting unchanged | `gateway_trust_drift_escalates_into_the_same_tick_full_reload` + `{database,control_plane}_poll_tick_records_on_every_normal_exit_without_async_wrapper` in `tests/unit/gateway_core/db_poll_supervision_tests.rs` |
+
+The MongoDB interruption cells `SIGKILL` the control plane mid-rotation and then
+read the collection directly: the committed document's `revision` must still be
+a `config_changes` sequence that exists. That is a *crash-consistency* property
+of the signal-first ordering, and it is deliberately narrower than visibility —
+it proves a matching change row exists, not that the row was still unconsumed
+when the document committed. A live poller can consume that row before the
+document lands, which is why standalone visibility is proved on the read side
+instead. A redundant change row is allowed by contract and costs one wasted full
+reload.
+
+The live suite cannot reproduce that interleaving deterministically, so the
+poll-side repair is asserted against a store simulator that commits the change
+signal and the document as two explicit, separately ordered steps: signal
+committed → cursor advanced by a full reload against the old document →
+document commits with no unconsumed signal left → the next poll's drift check
+still escalates. Rotation, first-incarnation create, revocation, and
+delete-then-recreate each have their own cell, alongside the bounded-cost,
+namespace-isolation, and read-failure cells.
+
 ### CI job mapping
 
 | Hosted job | Required backends | Required behaviors |

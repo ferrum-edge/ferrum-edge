@@ -277,11 +277,12 @@ dispatch(
 ## When to extend this module
 
 Add a new channel under `src/notifications/channels/<name>.rs` with:
-- A `NewName::new(name: &str, value: &serde_json::Value) -> Result<Self, String>` constructor.
+- A `NewName::new(name: &str, value: &serde_json::Value) -> Result<Self, String>` constructor. A channel that opens sockets outside `PluginHttpClient` must also take the resolved `BackendEgressPolicy`, admit literal destinations against it, and screen resolved addresses before connecting, as `EmailChannel::new` does; HTTP channels keep the shared `PluginHttpClient` enforcement path.
 - A `dispatch(&self, &Notification, &PluginHttpClient) -> Result<(), String>` method.
 - A `name(&self) -> &str` accessor.
 - A new `NotificationChannel` variant.
 - A match arm in `build_channel()` in `src/notifications/channels/mod.rs`.
+- A `<NAME>_CHANNEL_KEYS` allowlist enforced with `reject_unknown_keys` in that `build_channel()` arm; any nested channel configuration must be closed the same way.
 - Snapshot / parse tests in `tests/unit/notifications/channels_tests.rs`.
 
 Email / SMTP ships natively (see [Email (SMTP)](#email-smtp)). PagerDuty and Opsgenie remain deferred follow-ups — the generic webhook covers both via `body_template` and `headers` today.

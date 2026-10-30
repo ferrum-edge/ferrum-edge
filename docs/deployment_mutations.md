@@ -1,9 +1,7 @@
 # Dependency-fenced deployment mutations
 
-Merged #6012 shipped this capability in [v0.9.12](releases/v0.9.12.md),
-published at 2026-10-05T12:33:02Z; canonical `contracts-edge-0.9.12` publishes
-its contract. v0.9.11 and earlier do not provide this profile. Downstream
-adoption is qualified separately in each consumer.
+Available since [v0.9.12](releases/v0.9.12.md); `contracts-edge-0.9.12`
+publishes its contract.
 
 The opt-in `deployment-v1` profile (#6010) supports exact proxy cascade removal
 and API-spec replacement without replaying a whole namespace through restore.
@@ -75,7 +73,8 @@ in full to compute it.
 Tokens issued before stored bytes were digested (v0.9.12) keep the
 `deployment-v1-` shape but no longer match: they fail closed with `412`.
 Finish or abandon in-flight recoveries before upgrading, then capture new
-authority; never refresh authority to retry a refused recovery.
+authority; never refresh authority to retry a refused recovery. See
+[upgrade_guide.md](upgrade_guide.md#upgrading-to-0913).
 
 Snapshots require PostgreSQL, MySQL, SQLite or replica-set MongoDB. Standalone
 MongoDB returns `501`. Missing stores or unavailable/undecodable coherent state
