@@ -441,10 +441,14 @@ def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
     # It must cover exactly the original samples and agree with every leaf
     # the original unwinder did produce.
     flat_status, flat = decoded.get('flat_status') or {}, None
-    if flat_status.get('returncode') != 0 or flat_status.get('incomplete'):
+    try:
+        flat_text = (out / 'flat.txt').read_text(errors='replace')
+    except OSError:
+        flat_text = None
+    if flat_status.get('returncode') != 0 or flat_status.get('incomplete') or flat_text is None:
         row['issues'].append('flat sampled-PC decode failed or was incomplete')
     else:
-        flat = decode_cpu((out / 'flat.txt').read_text(errors='replace'), '', {pid})['callchains']
+        flat = decode_cpu(flat_text, '', {pid})['callchains']
         def samples(chains):
             return [(s['pid'], s['tid'], s['time_secs']) for s in chains]
         if samples(flat) != samples(original['callchains']):
@@ -456,6 +460,10 @@ def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
         elif any(u['frames'] and u['frames'][0]['ip'] != f['frames'][0]['ip']
                  for u, f in zip(original['callchains'], flat)):
             row['issues'].append('flat sampled PCs differ from unwound leaf PCs')
+            flat = None
+        elif any(known_leaf(u) and not known_leaf(f) for u, f in zip(decoded['callchains'], flat)):
+            # Same PC, same overlay: a leaf the stack decode named must be named here.
+            row['issues'].append('flat decode left symbolized leaves unnamed')
             flat = None
     row.update(pair=manifest.get('binding', {}).get('pair'), samples=decoded['samples'],
                decoder_issues=decoded['issues'], inline_expansion=decoded.get('inline_expansion'),

@@ -59,14 +59,15 @@ The same overlay then decodes each sample's sampled PC with `perf script -G`,
 which skips DWARF unwinding. That names the leaf of samples whose unwind kept
 no frame. This flat decode has the same 600-second, 64 MiB bounds. It must
 reproduce every original sample (PID, TID and time), with exactly one PC each.
-Each PC must equal the leaf of every sample that the original decode did
-unwind. Otherwise the capture is unmatched. A flat leaf is self time only; it
-has no callers.
+Where the original decode unwound a sample, that sample's PC must equal its
+unwound leaf, and a leaf the symbolized decode named must stay named.
+Otherwise the capture is unmatched and gets no flat summary. A flat leaf is
+self time only; it has no callers.
 
 Each capture that reaches the publish step gains `envoy-symbols/`; every other
 capture appears only in `envoy-symbols.json`. The directory holds folded stacks,
-decoder coverage, the flat decode (`flat.txt`), each decoder's stderr and
-status, and a summary. It is published whole and never overwritten. The summary
+decoder coverage, the flat decode (`flat.txt`), the stack and flat decoders'
+stderr and status, and a summary. It is published whole and never overwritten. The summary
 gives measurement-window leaf coverage before and after symbols, and the top
 leaf functions with their DSOs. `flat` gives the same summary for every sampled
 PC; `flat_no_unwound_frame` restricts it to samples whose unwind kept no frame.
