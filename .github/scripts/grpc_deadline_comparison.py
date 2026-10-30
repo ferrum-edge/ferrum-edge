@@ -206,8 +206,15 @@ def clean_env() -> dict:
 
 
 def backend_stats() -> dict:
-    with urllib.request.urlopen(BACKEND_STATS_URL, timeout=5) as response:
-        return json.loads(response.read().decode("utf-8"))
+    """Read proto_backend's counters; any transport or parse failure is a HarnessError."""
+    try:
+        with urllib.request.urlopen(BACKEND_STATS_URL, timeout=5) as response:
+            stats = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise HarnessError(f"backend /bench-stats is unreadable: {exc}") from exc
+    if not isinstance(stats, dict):
+        raise HarnessError("backend /bench-stats is not a JSON object")
+    return stats
 
 
 def process_cpu_seconds(pid: int) -> float:
@@ -337,7 +344,10 @@ def run_bench(kind: str, dest: Path, env: dict) -> dict:
 def counter_delta(before: dict, after: dict, key: str) -> int:
     if key not in before or key not in after:
         raise HarnessError(f"backend /bench-stats is missing {key!r}; rebuild proto_backend from this tree")
-    return int(after[key]) - int(before[key])
+    try:
+        return int(after[key]) - int(before[key])
+    except (TypeError, ValueError) as exc:
+        raise HarnessError(f"backend /bench-stats {key!r} is not an integer") from exc
 
 
 def measure_cell(scenario: str, dest: Path, env: dict, gateway_pid: int) -> dict:
@@ -365,9 +375,12 @@ def measure_cell(scenario: str, dest: Path, env: dict, gateway_pid: int) -> dict
     }
 
 
-# Failures of one control's process or its bracketing /bench-stats reads. They
-# are recorded in-band so the comparison keeps the rest of its evidence.
-EVIDENCE_ERRORS = (HarnessError, subprocess.TimeoutExpired, urllib.error.URLError, OSError, ValueError)
+# Failures of one control's process or its bracketing /bench-stats reads (both
+# surface as HarnessError, or TimeoutExpired from the process). They are
+# recorded in-band so the comparison keeps the rest of its evidence. Anything
+# else, such as an OSError writing a sample artifact, is a harness failure and
+# still aborts the run.
+EVIDENCE_ERRORS = (HarnessError, subprocess.TimeoutExpired)
 
 
 def run_probe(auth: str, dest: Path, env: dict) -> dict:
@@ -903,6 +916,7 @@ def self_test() -> int:
         probes = _probes()
         next(p for p in probes if p["role"] == "candidate")[field] = value
         assert evaluate(c, _rows(), probes)["status"] == "fail", field
+    _self_test_collection(c)
     # A key_auth route that let a keyless call through fails either role.
     for role in ROLES:
         probes = _probes()
@@ -960,6 +974,80 @@ def self_test() -> int:
     summary_markdown(evaluate(c, _rows(), _probes()), {"reference": {"sha": "a"}, "candidate": {"sha": "b"}})
     print("grpc_deadline_comparison self-test passed")
     return 0
+
+
+def _self_test_collection(contract: dict) -> None:
+    """Drive run_probe / run_auth_refusal through fakes for the process and stats reads."""
+    global backend_stats, run_bench
+    real = (backend_stats, run_bench)
+    dest = Path("/nonexistent/probe.json")
+    good_probe = {"calls": 20, "calls_made": 20, "deadline_exceeded": 20, "other_statuses": {}, "unexpected_messages": 0,
+                  "client_safety_timeouts": 0, "elapsed_ms": {"min": 251.0, "median": 253.0, "max": 260.0},
+                  "grpc_timeout_ms": 250, "release_checked": True, "release_failures": 0, "max_release_wait_ms": 4.0,
+                  "backend_stalled_started": 20, "backend_stalled_released": 20}
+
+    def fakes(stats_seq: list, bench):
+        it = iter(stats_seq)
+
+        def stats():
+            item = next(it)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        return stats, bench
+
+    def bench_returning(report):
+        return lambda kind, dest, env: dict(report)
+
+    def bench_raising(exc):
+        def bench(kind, dest, env):
+            raise exc
+        return bench
+
+    s0 = {"grpc_stalled_started": 0, "grpc_echo_requests": 0}
+    s20 = {"grpc_stalled_started": 20, "grpc_echo_requests": 0}
+    try:
+        # Success path yields a record evaluate() accepts.
+        backend_stats, run_bench = fakes([s0, s20], bench_returning(good_probe))
+        probe = run_probe("open", dest, {})
+        assert probe["error"] is None and probe["backend_started_crosscheck"] == 20, probe
+        # Process failure, timeout, and a failed stats read before or after are in-band errors.
+        for stats_seq, bench in (([s0, s20], bench_raising(HarnessError("exit 1"))),
+                                 ([s0, s20], bench_raising(subprocess.TimeoutExpired("proto_bench", 180))),
+                                 ([HarnessError("stats down")], bench_returning(good_probe)),
+                                 ([s0, HarnessError("stats down")], bench_returning(good_probe))):
+            backend_stats, run_bench = fakes(stats_seq, bench)
+            probe = run_probe("open", dest, {})
+            assert probe["error"], probe
+            probe.update({"role": "candidate", "round": 1})
+            assert probe_problems(probe, 250, 20), probe
+        # Artifact-persistence errors stay fatal.
+        backend_stats, run_bench = fakes([s0, s20], bench_raising(OSError("disk full")))
+        for helper in (lambda: run_probe("open", dest, {}), lambda: run_auth_refusal(dest, {})):
+            try:
+                helper()
+            except OSError:
+                pass
+            else:
+                raise AssertionError("an artifact write error must not be recorded in-band")
+            backend_stats, run_bench = fakes([s0, s20], bench_raising(OSError("disk full")))
+        # Negative control: success, refusal evidence, and in-band failure.
+        backend_stats, run_bench = fakes([s0, s0], bench_returning({"total_requests": 0, "total_errors": 1}))
+        refusal = run_auth_refusal(dest, {})
+        assert refusal == {"error": None, "total_requests": 0, "total_errors": 1, "backend_calls": 0}, refusal
+        backend_stats, run_bench = fakes([s0, s0], bench_raising(subprocess.TimeoutExpired("proto_bench", 180)))
+        refusal = run_auth_refusal(dest, {})
+        assert refusal["error"], refusal
+        assert auth_refusal_problems({"role": "reference", "round": 1, "auth": "auth", "auth_refusal": refusal})
+        # Unreadable or non-integer stats surface as HarnessError, never a raw exception.
+        try:
+            counter_delta({"k": "x"}, {"k": 1}, "k")
+        except HarnessError:
+            pass
+        else:
+            raise AssertionError("a non-integer counter must be a HarnessError")
+    finally:
+        backend_stats, run_bench = real
 
 
 # ── entry point ─────────────────────────────────────────────────────────────
