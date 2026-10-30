@@ -7172,12 +7172,12 @@ fn every_grpc_response_phase_lets_the_client_deadline_own_late_failures() {
 
     let h1_claim = bounded(
         proxy,
-        "if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader\n                    && handoff_bound",
+        "// #6976).\n                if handoff_bound\n                    .at",
         "let never_sent = try_err.take_message().is_some();",
     );
     assert!(
         h1_claim.contains("direct_h1_handoff_bound_expired("),
-        "a late direct-H1 send failure must settle as its client or authorization bound"
+        "a late direct-H1 send failure must settle as its handoff bound, whatever its source"
     );
 
     // Direct H2, sidecar mTLS / Unix H2, HBONE H1 and Unix H1 route a late

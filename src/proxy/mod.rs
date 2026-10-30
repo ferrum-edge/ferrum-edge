@@ -54178,13 +54178,14 @@ async fn proxy_to_backend_direct_h1(
                     // no socket at all.
                     continue;
                 }
-                // A send failure observed at/after the client RPC deadline or
-                // authorization bound is that bound, exactly as the timer arm
-                // above settles it (issue #6022).
-                if handoff_bound.source != BackendHandoffBoundSource::ResponseHeader
-                    && handoff_bound
-                        .at
-                        .is_some_and(|at| tokio::time::Instant::now() >= at)
+                // A send failure observed at/after the handoff bound is that
+                // bound, exactly as the timer arms above settle it, whichever
+                // source owns it: the client RPC deadline, the authorization
+                // lifetime, or the response-header read bound (issues #6022,
+                // #6976).
+                if handoff_bound
+                    .at
+                    .is_some_and(|at| tokio::time::Instant::now() >= at)
                 {
                     if let Some(pump) = upload_pump.as_mut() {
                         pump.cancel();

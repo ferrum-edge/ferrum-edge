@@ -69,8 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CANCEL`, still counts as a backend failure. A buffered collect that fails
   after an operator read bound or authorization lifetime settles as that bound
   in the same way, and the inline body adapter applies the cutoff to a route
-  request deadline (already a health-neutral route cut). The remaining paths
-  are tracked in #6976.
+  request deadline (already a health-neutral route cut).
 - **The deadline cutoff now covers every gRPC dispatch path, and the earlier
   of two racing bounds always owns the outcome** (issue #6976). A native
   HTTP/3 backend head failure observed after the dispatch bound settles exactly
