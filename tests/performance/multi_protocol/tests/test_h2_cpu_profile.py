@@ -248,7 +248,7 @@ class H2CPUAdmissionTests(unittest.TestCase):
                 '\t    6000 __libc_start_main+0x80 (/usr/lib/x86_64-linux-gnu/libc.so.6)\n\n')
     # perf script -G: one line per sample, its sampled PC on the header.
     # The first line keeps perf's real -G padding (%16s comm, %7d/%-7d pid/tid, %16x PC).
-    FLAT = ('           envoy       7/8       10.000000000: cpu-clock:uS:                 5000 Envoy::Http::CodecHelper::dispatch+0x10 (/usr/local/bin/envoy)\n'
+    FLAT = ('           envoy       7/8       10.000000000: cpu-clock:uS:              5000 Envoy::Http::CodecHelper::dispatch+0x10 (/usr/local/bin/envoy)\n'
             'envoy 7/9 11.000000000: cpu-clock:uS:     5100 Envoy::Http::CodecHelper::dispatch+0x20 (/usr/local/bin/envoy)\n'
             'envoy 7/9 12.000000000: cpu-clock:uS:     5300 Envoy::Buffer::OwnedImpl::move(Envoy::Buffer::Instance&)+0x8 (/usr/local/bin/envoy)\n'
             'envoy 7/9 30.000000000: cpu-clock:uS:     5200 Envoy::Http::CodecHelper::dispatch+0x30 (/usr/local/bin/envoy)\n')
