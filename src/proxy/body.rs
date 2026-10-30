@@ -6211,8 +6211,8 @@ where
 /// read ahead without waiting (issue #6904), within
 /// [`CLIENT_RPC_READ_AHEAD_MAX_FRAMES`] / [`CLIENT_RPC_READ_AHEAD_MAX_BYTES`].
 /// A unary response's DATA and trailers usually arrive with its headers. When
-/// the upstream's terminal is among them and the deadline has not elapsed, the
-/// backend body is dropped at once, so the backend is released before any
+/// the upstream's terminal is among them and the deadline had not elapsed when
+/// it was read, the backend body is dropped at once, so the backend is released before any
 /// client could stall, and the finished frames are served from memory with no
 /// pump, task, or timer. That is the pump's own rule for a response that
 /// reached its terminal before the deadline: it keeps that terminal however
@@ -6246,22 +6246,36 @@ where
             } else {
                 (VecDeque::new(), ReadAheadEnd::Open)
             };
-            if let ReadAheadEnd::Complete(terminal_error) = end {
-                // The upstream's own terminal was read before the deadline:
-                // release the backend now and serve the finished response.
-                drop(body);
-                let complete = ReadAheadBody::new(frames, terminal_error, None);
-                let timed = TotalDeadlineBody::with_deadline_frame(
-                    http_body_util::Either::Left(http_body_util::Either::Right(complete)),
-                    // No timer: a response that completed before its deadline
-                    // keeps its own terminal, as it does under the pump.
-                    None,
-                    deadline_frame,
-                    fired,
-                );
-                return (timed, None);
-            }
-            let owned = ReadAheadBody::new(frames, None, Some(body));
+            let owned = match end {
+                ReadAheadEnd::Complete(terminal_error) => {
+                    // The upstream reached its own terminal: release the
+                    // backend now, whatever the clock says.
+                    drop(body);
+                    let complete = ReadAheadBody::new(frames, terminal_error, None);
+                    // Re-read the clock where the terminal was OBSERVED: a
+                    // read-ahead that crossed the deadline must not settle a
+                    // late terminal as a completion (the pump's
+                    // `claim_inner_completion` refuses the same race).
+                    if tokio::time::Instant::now() < at {
+                        let timed = TotalDeadlineBody::with_deadline_frame(
+                            http_body_util::Either::Left(http_body_util::Either::Right(complete)),
+                            // No timer: a response that completed before its
+                            // deadline keeps its own terminal, as it does under
+                            // the pump.
+                            None,
+                            deadline_frame,
+                            fired,
+                        );
+                        return (timed, None);
+                    }
+                    // Past the deadline: the pump's deadline-first select
+                    // settles the finished body as an expiry (status 4 or a
+                    // reset, `fired`, and the close grace) without polling the
+                    // released backend again.
+                    complete
+                }
+                ReadAheadEnd::Open => ReadAheadBody::new(frames, None, Some(body)),
+            };
             let (pumped, pump) = AuthorizationCancellableBody::for_client_rpc_deadline(
                 owned,
                 at,
