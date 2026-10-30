@@ -44,26 +44,7 @@ authoritative Gateway API conformance check, and it **gates** merges:
 | GatewayClass | `ferrum` |
 | Controller name | `ferrum.io/gateway-controller` |
 
-**Known deviations in the declared rule-timeout features** (details in
-[Rule timeouts](#rule-timeouts)). The upstream tests pass; these are the places
-where Ferrum's behavior differs from the upstream field definitions:
-
-- `HTTPRouteBackendTimeout`: upstream v1.5.1 defines `backendRequest` as the
-  time from when a request starts being sent to the backend until its full
-  response has been received. HTTP/1.1, HTTP/2 and HTTP/3 enforce exactly that,
-  per attempt, for non-gRPC requests. Where Ferrum differs:
-  - **gRPC and gRPC-Web** fold the budget into the RPC deadline **when the rule
-    is selected**, not at the handoff to the backend. That is stricter than
-    upstream: gateway-side time before the handoff (collecting a buffered
-    upload, DNS, admission, connection acquisition) counts against the first
-    attempt's budget. An expiry after the request was sent is charged to the
-    backend (`Backend deadline exceeded`); one before it stays health-neutral.
-  - **A gRPC budget expiry is not retried**: gRPC calls are retried only after
-    connection failures, never after `DEADLINE_EXCEEDED`, even when the rule's
-    `retry` lists `504`.
-- `HTTPRouteRequestTimeout`: no known deviation. HTTP/1.1, HTTP/2 and native
-  HTTP/3 enforce `request` fully, and HTTP/3 stays advertised (`Alt-Svc`) on a
-  listener port that serves a timed rule.
+Ferrum's `backendRequest` handling differs for gRPC/gRPC-Web; see [Rule timeouts → Known deviations](#rule-timeouts).
 
 Kick a manual run with:
 
@@ -73,24 +54,6 @@ gh workflow run "Gateway API Conformance" \
   --field conformance_profile=GATEWAY-HTTP,GATEWAY-GRPC \
   --field supported_features=Gateway,ReferenceGrant,HTTPRoute,GRPCRoute,HTTPRouteResponseHeaderModification,HTTPRoutePathRewrite,HTTPRouteHostRewrite,HTTPRouteRequestTimeout,HTTPRouteBackendTimeout
 ```
-
-## Independent Validation
-
-Historical note (baseline `12522467`, June 2026): the original workflow
-advertised only `Gateway,HTTPRoute`, ran four status-only upstream tests
-(`GatewayClassObservedGenerationBump`, `GatewayObservedGenerationBump`,
-`HTTPRouteObservedGenerationBump`, `HTTPRouteInvalidCrossNamespaceParentRef`),
-and deployed no Ferrum data plane, so request-path tests such as
-`HTTPRouteSimpleSameNamespace` were skipped (run `27799052406`). It validated
-controller status only, not data-plane conformance.
-
-Running traffic through a real data plane then exposed request-path gaps:
-invalid `backendRefs` returned 404 instead of the fail-closed 500, listener
-`certificateRefs` were not applied to the serving certificate,
-`RequestHeaderModifier` and `RequestRedirect` were incomplete, and
-selectorless/headless Services backed only by EndpointSlices did not resolve.
-Those gaps are fixed and covered by translator/status unit tests plus the
-direct black-box lab checks.
 
 ## Supported-Feature Matrix
 
@@ -373,7 +336,60 @@ Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
 dispatch-rule list, and only claim-for-claim collisions are resolved as
 conflicts.
 
-**Port-aware route representation.** Ferrum materializes Gateway API HTTP-family
+### Fail-closed match shapes
+
+Shapes Ferrum cannot represent exactly are **dropped fail closed** with a
+field-specific translator warning (`GRPCRoute {ns}/{name}
+rules[i].matches[j] dropped fail-closed: …`) rather than widened. The
+`Exact` operand grammars are exactly the ones the v1.5.1 CRD enforces, so a
+predicate the API server would have admitted is never rejected and a
+hand-authored one that it would have rejected never reaches routing state:
+
+- `method.type: RegularExpression`, and any `method.type` other than `Exact`.
+- A `method` block with neither `service` nor `method`.
+- An `Exact` `service` that is empty, longer than 1024 bytes (the CRD's
+  `MaxLength=1024`; both grammars are ASCII-only, so bytes and characters
+  coincide for any operand the API server could have admitted), or does not
+  match `^\.?[a-z_][a-z_0-9]*(\.[a-z_][a-z_0-9]*)*$` (applied
+  case-insensitively) — so a leading digit or hyphen, an empty dotted segment,
+  a path separator, a percent escape, or whitespace is refused.
+- An `Exact` `method` that is empty, longer than 1024 bytes, or does not
+  match `^[A-Za-z_][A-Za-z_0-9]*$` — a single protobuf identifier, so a dot or
+  hyphen is refused here even though `service` allows the dot.
+- A `content-type` header match whose value is not a native gRPC media type — it
+  would replace the protocol gate and widen the route onto non-gRPC traffic.
+- `headers[].type: RegularExpression`, or a header match missing `name` or
+  `value` — only `Exact` header matches are translated, matching the HTTPRoute
+  translator.
+- An **explicit** `method: null` or `headers: null`. An explicit null is
+  malformed input, not an omission: reading it as absent would widen `method`
+  into the any-gRPC-call predicate and `headers` into the headerless match.
+  *Omitting* either field keeps its documented meaning — an omitted `method`
+  matches any gRPC call on the route's hostnames, and omitted `headers` adds no
+  header predicate.
+- A **present but non-string** `method.service` or `method.method` (including an
+  explicit null). Reading it as an omission would silently degrade an exact
+  `=/{service}/{method}` listener into the far broader method-only or
+  service-only shape.
+- A match entry carrying **both** `method` and Ferrum's hand-authored
+  `matches[].path` extension. `path` is not a GRPCRoute CRD field (the API
+  server prunes it), and Ferrum's plan is a single listen path *or* a single URI
+  predicate, so honoring either half alone would discard the other and widen the
+  match. Use one or the other.
+
+Refusal warnings never echo the operator-supplied operand or header value back,
+since both are unbounded, attacker-influenceable input.
+
+A rule whose every match is dropped materializes no route, so its parent status
+is not reported as programmed.
+
+## Gateway listener realization
+
+How Gateway API listeners become sockets and port-scoped routes.
+
+### Port-aware routes
+
+Ferrum materializes Gateway API HTTP-family
 routes with the admitting listener's identity, so listeners of one Gateway are
 distinguishable both in the route table and on the wire:
 
@@ -455,7 +471,9 @@ distinguishable both in the route table and on the wire:
   process-global default certificate from a namespace that contains no managed
   Gateway.
 
-**Listener lifecycle and its bounds.** The listener set is reconciled on every
+### Listener lifecycle
+
+The listener set is reconciled on every
 config publication, so reload / update / delete / withdrawal reach the sockets
 without a restart. These bounds are deliberate and tested:
 
@@ -551,7 +569,9 @@ invalidate. A listener that is merely a same-namespace TLS sibling with a
 different `certificateRef` is not refused for that reason alone and keeps its
 ordinary status while materializing with its own SNI candidate.
 
-**HTTP/3 on Gateway listener ports.** When `FERRUM_ENABLE_HTTP3=true` and
+### HTTP/3
+
+When `FERRUM_ENABLE_HTTP3=true` and
 frontend TLS is configured, every TLS-class Gateway listener port also gets its
 own QUIC socket, added, withdrawn and class-flipped with its TCP listener. Two
 TLS listener ports are therefore reachable over HTTP/3 as well as HTTP/1.1 and
@@ -571,95 +591,27 @@ refused-route set. Adding the UDP/DTLS claim on reload drains only QUIC
 already-running TCP listener. A stale reconcile cannot restore QUIC after a
 newer epoch reserved the UDP port.
 
-The Gateway listener manager and the stream listener manager reconcile the same
-publication concurrently, so either side of that UDP port handoff can try to
-bind while the other still holds the socket (#5843). Both consult one
-in-process ledger of the UDP ports their datagram listeners' sockets hold. An
-entry is added when the socket binds and removed when the socket closes, not
-when the listener task ends: Quinn keeps a QUIC socket open until its endpoint
-driver and every connection have dropped it, and UDP/DTLS session tasks keep
-their listener's socket open until they observe the shutdown. A bind that
-fails with `Address already in use` on a port the ledger shows held, or closed
-within the last second, is retried instead of waiting for the 30-second retry
-tick. Each reconcile pass has a 2-second budget for these retries, shared by
-all of its ports and started by its first such collision, so a stream listener
-pass spends at most 2 seconds on them. A Gateway pass also keeps a separate 2-second
-budget, counted from the start of the pass, for QUIC halves it retired itself
-and that the ledger has no entry for; the two budgets are independent, so one
-Gateway pass can wait up to about 4 seconds in total. A port no Ferrum listener
-holds fails on the first attempt as before, unless a Ferrum listener held that
-port number within the last second. A socket still held when the budget runs
-out is reported as the ordinary bind failure. That failure is retried when the
-other side's socket on the same port closes, not only on the next tick, even
-when the socket closes while a reconcile started by a config change is still
-running; releases of other ports do not trigger a reconcile. Each manager
-follows the other's releases from before its first reconcile, so a socket that
-closes during startup, before the retry loop begins, is not missed (#5851). A
-stream listener's pass only checks that the port is free and its listener task
-binds the socket afterwards, so the task's own bind retries the same collision
-with a 2-second budget of its own; a listener shut down while it waits stops at
-once, so its manager's next reconcile never waits on it. If that budget runs
-out and the QUIC socket closes just before the task reports the failure, the
-task itself asks for a new reconcile, so the port is still retried at once
-rather than on the next tick (#5855). TCP/TLS raw-stream
+A UDP/DTLS stream claim on an HTTPS port disables only that port's QUIC half;
+the Gateway and stream listener managers share a UDP-port ledger and briefly
+retry `EADDRINUSE` during handoff (#5843). Retries are bounded and apply only to
+ports a Ferrum listener holds, recently released, or locally retired; when the
+budget runs out the result is the ordinary bind failure, which is retried as soon
+as the other side releases the socket (budget details:
+`src/proxy/udp_port_handoff.rs`). TCP/TLS raw-stream
 collisions still refuse the whole HTTP-family listener; plaintext HTTP
 listeners remain unaffected by UDP/DTLS same-port claims.
 
-**Single-listener protocol remap.** When the whole route table declares exactly
-one listener port of a protocol class, a request arriving on the global process
-bind of that class is also served by it. This exists for the Service-fronted
-topology, where a `Service` maps the Gateway listener port (`:80`) onto the
-pod's `FERRUM_PROXY_HTTP_PORT` (`:8000`) and the listener port is never bound
-inside the pod. With two or more same-class listener ports the remap is off and
+### Single-listener remap
+
+When the whole route table declares exactly one listener port of a protocol
+class, a request arriving on the global process bind of that class is also
+served by it. This exists for the Service-fronted topology, where a `Service`
+maps the Gateway listener port (`:80`) onto the pod's `FERRUM_PROXY_HTTP_PORT`
+(`:8000`). The remap is admitted only while that listener port is itself admitted
+for the current generation: an admission-refused, bind-failed, withdrawn, or
+retiring port is never served through it. With two or more same-class listener ports the remap is off and
 only an exact listener match serves, because the request would otherwise be
 ambiguous.
-
-### Fail-closed match shapes
-
-Shapes Ferrum cannot represent exactly are **dropped fail closed** with a
-field-specific translator warning (`GRPCRoute {ns}/{name}
-rules[i].matches[j] dropped fail-closed: …`) rather than widened. The
-`Exact` operand grammars are exactly the ones the v1.5.1 CRD enforces, so a
-predicate the API server would have admitted is never rejected and a
-hand-authored one that it would have rejected never reaches routing state:
-
-- `method.type: RegularExpression`, and any `method.type` other than `Exact`.
-- A `method` block with neither `service` nor `method`.
-- An `Exact` `service` that is empty, longer than 1024 bytes (the CRD's
-  `MaxLength=1024`; both grammars are ASCII-only, so bytes and characters
-  coincide for any operand the API server could have admitted), or does not
-  match `^\.?[a-z_][a-z_0-9]*(\.[a-z_][a-z_0-9]*)*$` (applied
-  case-insensitively) — so a leading digit or hyphen, an empty dotted segment,
-  a path separator, a percent escape, or whitespace is refused.
-- An `Exact` `method` that is empty, longer than 1024 bytes, or does not
-  match `^[A-Za-z_][A-Za-z_0-9]*$` — a single protobuf identifier, so a dot or
-  hyphen is refused here even though `service` allows the dot.
-- A `content-type` header match whose value is not a native gRPC media type — it
-  would replace the protocol gate and widen the route onto non-gRPC traffic.
-- `headers[].type: RegularExpression`, or a header match missing `name` or
-  `value` — only `Exact` header matches are translated, matching the HTTPRoute
-  translator.
-- An **explicit** `method: null` or `headers: null`. An explicit null is
-  malformed input, not an omission: reading it as absent would widen `method`
-  into the any-gRPC-call predicate and `headers` into the headerless match.
-  *Omitting* either field keeps its documented meaning — an omitted `method`
-  matches any gRPC call on the route's hostnames, and omitted `headers` adds no
-  header predicate.
-- A **present but non-string** `method.service` or `method.method` (including an
-  explicit null). Reading it as an omission would silently degrade an exact
-  `=/{service}/{method}` listener into the far broader method-only or
-  service-only shape.
-- A match entry carrying **both** `method` and Ferrum's hand-authored
-  `matches[].path` extension. `path` is not a GRPCRoute CRD field (the API
-  server prunes it), and Ferrum's plan is a single listen path *or* a single URI
-  predicate, so honoring either half alone would discard the other and widen the
-  match. Use one or the other.
-
-Refusal warnings never echo the operator-supplied operand or header value back,
-since both are unbounded, attacker-influenceable input.
-
-A rule whose every match is dropped materializes no route, so its parent status
-is not reported as programmed.
 
 ## Rule-filter admission
 

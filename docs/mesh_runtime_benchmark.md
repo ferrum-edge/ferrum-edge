@@ -12,25 +12,7 @@ overhead, mesh DNS), which contain no competitor comparison.
 - Harness: `tests/performance/mesh_runtime/` (see its README)
 - Summarizer: `.github/scripts/summarize_mesh_runtime_results.py`
 
-## Qualification update (2026-10-21)
-
-The historical `consul` arm has no HTTP service-defaults entry. It is an
-L4 TCP/mTLS control, not an equivalent HTTP mesh: its echo and intention
-probes do not establish L7 processing. `consulhttp` is the separate L7 arm,
-with explicit HTTP service-defaults for both services and a live listener
-filter check requiring an HTTP connection manager on the active client
-15101 and server 21000 listener chains. Warming, draining, and unrelated
-listeners cannot satisfy it. The L4 arm requires TCP proxy filters and no
-HTTP connection manager on those same chains. Artifacts
-include listener-only config dumps; SDS secrets are never collected.
-These distinct paths were first verified from retained listener dumps in
-[qualification run 39566902232](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39566902232).
-That campaign failed fixture qualification because Ferrum and static Envoy
-could not read host-owned synthetic private keys. After the fixture repair,
-[qualification run 39577108262](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39577108262)
-completed all 48 planned cells, including all 16 Consul listener pairs. Its
-instrumented Ferrum diagnostic build still cannot establish a shipping-product
-ranking.
+## Campaign controls
 
 The campaign now reverses arm and payload blocks every other repetition.
 An optional exact `baseline_sha` builds a second Ferrum image with that
@@ -103,8 +85,8 @@ produces a successful echo.
 | `direct` | loadgen → echo backend | — |
 | `ferrum` | the real Ferrum mesh runtime: two `FERRUM_MODE=mesh` Sidecar processes, localized file config (`FERRUM_MESH_CONFIG_PROTOCOL=file`), file SVIDs, STRICT PeerAuthentication, SPIFFE-ID pinning, full proxy/plugin chain | not a stripped proxy fixture |
 | `envoy` | two hand-configured `envoyproxy/envoy:v1.39.1` proxies as a static HTTP/2-over-mTLS sidecar pair (client-cert required, SAN pinning both directions, session resumption off) | **not full Istio** — no istiod-generated config, telemetry filters, Wasm, or capture iptables. An Envoy proxy control, labeled “Envoy” in every output |
-| `consul` | Consul 1.21.4 dev agent generating two Envoy 1.39.1 sidecars, Connect CA mTLS, default TCP service; active listeners prove L4 TCP proxying | separate L4 control, not an HTTP-policy comparison; a single dev agent, default-allow intentions outside the deny probe |
-| `consulhttp` | same Consul/Envoy versions and topology with explicit HTTP service defaults; active measured listeners prove L7 HTTP connection managers | H1 peer transport differs from Ferrum/static Envoy H2; control-plane agent resource use is excluded from proxy-pair accounting |
+| `consul` | Consul 1.21.4 dev agent generating two Envoy 1.39.1 sidecars, Connect CA mTLS, default TCP service (no HTTP service-defaults entry); qualification requires TCP proxy filters and no HTTP connection manager on the active client 15101 and server 21000 listener chains | separate L4 control, not an HTTP-policy comparison; a single dev agent, default-allow intentions outside the deny probe |
+| `consulhttp` | same Consul/Envoy versions and topology with explicit HTTP service defaults for both services; qualification requires an HTTP connection manager on the active client 15101 and server 21000 listener chains (warming, draining, and unrelated listeners cannot satisfy it; artifacts include listener-only config dumps, never SDS secrets) | H1 peer transport differs from Ferrum/static Envoy H2; control-plane agent resource use is excluded from proxy-pair accounting |
 | `linkerd` | standalone probe of `ghcr.io/linkerd/proxy` | cannot run without the Linkerd Destination/Identity control plane (`Invalid configuration: no destination service configured` with static identity); the arm records `unsupported-standalone` with logs instead of numbers |
 
 Cilium service mesh also uses Envoy as the L7 data plane. Consul

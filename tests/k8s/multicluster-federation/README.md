@@ -13,7 +13,7 @@ It is intentionally not self-skipping: the CI job that calls it must provide two
 disposable kind clusters on a shared docker network and `docker`, `kind`,
 `kubectl`, `curl`, and `python3`.
 
-## What it proves (Stages 2–3 of the M5 cross-cluster roadmap)
+## What it proves
 
 Two clusters, `ferrum-fed-a` (trust domain `cluster-a.test`) and `ferrum-fed-b`
 (`cluster-b.test`), each run an identical, symmetric topology so traffic can be
@@ -123,10 +123,10 @@ live suite gates its `node_waypoint.*` IDs in its own run.sh REQUIRED array):
 | `multicluster.eastwest.b_to_a_authenticated` | the mirror direction (200, body `svc-a`) |
 | `multicluster.eastwest.bidirectional_authenticated_traffic` | both directions pass |
 | `multicluster.eastwest.untrusted_peer_rejected` | the federated `rogue` client is rejected at the DESTINATION by MeshPolicy (403 `Mesh authorization denied`, not 200/`svc-b`) |
-| `multicluster.federation.bundle_revoked_rejected` | (Stage 3) after dropping cluster A's federated bundle from B's dest slice + reload, A→B fails closed (no 200/`svc-b`) |
-| `multicluster.federation.trust_restored_recovers` | (Stage 3) re-adding the federated bundle + reload restores A→B (200, body `svc-b`) |
-| `multicluster.eastwest.endpoint_blackhole_when_dest_down` | (Stage 3) with B's `svc` scaled to 0, A→B returns a real upstream error (a 5xx from the client sidecar — not a `000` curl-timeout hang, not 200) |
-| `multicluster.eastwest.endpoint_recovers_when_dest_returns` | (Stage 3) scaling `svc` back up + re-rendering the gateway for the new pod IP restores A→B (200, body `svc-b`) |
+| `multicluster.federation.bundle_revoked_rejected` | after dropping cluster A's federated bundle from B's dest slice + reload, A→B fails closed (no 200/`svc-b`) |
+| `multicluster.federation.trust_restored_recovers` | re-adding the federated bundle + reload restores A→B (200, body `svc-b`) |
+| `multicluster.eastwest.endpoint_blackhole_when_dest_down` | with B's `svc` scaled to 0, A→B returns a real upstream error (a 5xx from the client sidecar — not a `000` curl-timeout hang, not 200) |
+| `multicluster.eastwest.endpoint_recovers_when_dest_returns` | scaling `svc` back up + re-rendering the gateway for the new pod IP restores A→B (200, body `svc-b`) |
 
 Cross-cluster east-west SNI passthrough + SPIRE trust-bundle federation is
 **GA-enrolled** in `tests/conformance/ga_contract.yaml` and live-backed by this
@@ -158,7 +158,7 @@ Hosted coverage is the full datapath run in
 `.github/workflows/multicluster-federation-live.yml`; the required check is
 `Multicluster Federation Live`.
 
-## Stage 3 (failure injection)
+## Failure injection
 
 After the positive/negative traffic tests, the script injects two failure
 scenarios (A→B only; each mutates state then self-restores so the next starts
@@ -181,11 +181,4 @@ changes the pod IP and this file-config fixture's east-west gateway pins a
 **static** svc pod IP (no live endpoint discovery), each `svc` replacement also
 re-renders + restarts the gateway.
 
-**Deferred — network partition / last-good retention.** Bounded-staleness
-last-good retention is a property of the federation / remote-discovery POLLER,
-which this static file-config fixture does not run (endpoints are statically
-declared, not polled), so a partition here would only prove "down→fail, up→
-recover," not the M5 retention machinery. A meaningful partition/last-good test
-needs poller-driven remote discovery (a separate fixture); kind also has no
-NetworkPolicy enforcement (kindnet), so a clean in-cluster partition primitive is
-unavailable here regardless.
+Network partition and last-good retention are out of scope here (endpoints are static); `tests/k8s/multicluster-poller-partition/` owns that contract.

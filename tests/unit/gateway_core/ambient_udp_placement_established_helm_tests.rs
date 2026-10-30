@@ -556,14 +556,14 @@ fn client_render_parity_keeps_an_explicit_env_value_under_the_same_boundary() {
 /// separate workload would reopen the stale same-boot proof window.
 #[test]
 fn the_operator_docs_describe_the_same_pod_preflight_lifecycle() {
-    let mesh = read_repo("docs/mesh.md");
+    let node_agent = read_repo("docs/node_agent.md");
     let node_agent_security = read_repo("docs/node_agent_security.md");
     let configuration = read_repo("docs/configuration.md");
     let cli = read_repo("docs/cli.md");
     let schema = read("values.schema.json");
 
     for (name, doc) in [
-        ("docs/mesh.md", &mesh),
+        ("docs/node_agent.md", &node_agent),
         ("docs/node_agent_security.md", &node_agent_security),
         ("docs/configuration.md", &configuration),
     ] {
@@ -576,19 +576,19 @@ fn the_operator_docs_describe_the_same_pod_preflight_lifecycle() {
     }
 
     assert!(
-        mesh.contains("init container** on")
-            && mesh.contains("Why it lives in the proxy's own pod")
-            && mesh.contains("name on the same boot**")
-            && mesh.contains("Do not split this into a separate DaemonSet."),
-        "docs/mesh.md must state the same-pod ordering fence and the stale same-boot pair \
+        node_agent.contains("init container** on")
+            && node_agent.contains("Why it lives in the proxy's own pod")
+            && node_agent.contains("name on the same boot**")
+            && node_agent.contains("Do not split this into a separate DaemonSet."),
+        "docs/node_agent.md must state the same-pod ordering fence and the stale same-boot pair \
          it exists to refuse"
     );
     assert!(
-        mesh.contains("Why it needs no `hostPID`")
-            && mesh.contains("--host-proc-root /host/proc")
-            && mesh.contains("translated into the reading process's PID")
-            && mesh.contains("`/proc/self/ns/net` — the stage's own namespace"),
-        "docs/mesh.md must explain the host-proc redirect, including why cgroup.procs \
+        node_agent.contains("Why it needs no `hostPID`")
+            && node_agent.contains("--host-proc-root /host/proc")
+            && node_agent.contains("translated into the reading process's PID")
+            && node_agent.contains("`/proc/self/ns/net` — the stage's own namespace"),
+        "docs/node_agent.md must explain the host-proc redirect, including why cgroup.procs \
          cannot be used through a foreign procfs and what stays on the own procfs"
     );
     assert!(
@@ -607,11 +607,11 @@ fn the_operator_docs_describe_the_same_pod_preflight_lifecycle() {
             && !schema.contains("dedicated DaemonSet"),
         "values.schema.json must describe the shipped preflight shape"
     );
-    let mesh_normalized = normalize_markdown_whitespace(&mesh);
+    let node_agent_normalized = normalize_markdown_whitespace(&node_agent);
     assert!(
-        mesh.contains("automountServiceAccountToken: false")
-            && mesh.contains("kube-api-access")
-            && mesh_normalized.contains("only when no explicit `FERRUM_K8S_NODE_UID`")
+        node_agent.contains("automountServiceAccountToken: false")
+            && node_agent.contains("kube-api-access")
+            && node_agent_normalized.contains("only when no explicit `FERRUM_K8S_NODE_UID`")
             && node_agent_security.contains("automountServiceAccountToken: false")
             && node_agent_security.contains("does not receive the projected token"),
         "operator docs must record ServiceAccount token isolation for the privileged init"

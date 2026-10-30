@@ -58,8 +58,10 @@ CNI chain is being removed. The default is `[]`, which renders no
 
 When `controlPlane.enabled=true` and `controlPlane.rbac.gatewayApi=true` (the
 default), this chart renders a cluster-scoped `GatewayClass` and Gateway API
-RBAC over `HTTPRoute`, `GRPCRoute`, `TCPRoute`, `TLSRoute`, `UDPRoute`,
-`ListenerSet`, and `XBackendTrafficPolicy`. Those upstream CRDs are **not**
+and related RBAC (see `templates/control-plane-rbac.yaml`). The upstream
+Gateway API CRDs (`GatewayClass`, `Gateway`, `HTTPRoute`, `GRPCRoute`,
+`TCPRoute`, `TLSRoute`, `UDPRoute`, `ReferenceGrant`, `BackendTLSPolicy`,
+`BackendLBPolicy`, `ListenerSet`, and `XBackendTrafficPolicy`) are **not**
 shipped in this chart.
 
 Ferrum-owned `UDPResponseAmplificationPolicy` is rendered from
