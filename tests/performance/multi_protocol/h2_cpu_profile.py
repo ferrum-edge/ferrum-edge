@@ -451,22 +451,32 @@ def symbolize_capture(root, manifest_path, debug_elf, scratch, pins, decode):
     return row
 
 
-def write_symbols(root, result):
-    result['complete'] = (not result['issues'] and bool(result['captures'])
+def write_symbols(root, result, *, final):
+    # Only the closing write may claim completeness, and only once every
+    # retained capture has a row; a pass cut short stays incomplete.
+    result['complete'] = (final and not result['issues'] and bool(result['captures'])
+                          and len(result['captures']) == result['expected_captures']
                           and all(not row['issues'] for row in result['captures']))
-    (root / 'envoy-symbols.json').write_text(json.dumps(result, indent=2) + '\n')
+    # Replace whole, so an interruption leaves the previous record readable.
+    partial = root / '.envoy-symbols.json.partial'
+    partial.write_text(json.dumps(result, indent=2) + '\n')
+    partial.replace(root / 'envoy-symbols.json')
 
 
 def symbolize_envoy(root, debug_elf, scratch, *, pins=ENVOY_SYMBOLS, decode=None):
     """Re-decode each retained Envoy CPU capture against the debug twin."""
-    root, scratch, debug_elf = Path(root).resolve(), Path(scratch), Path(debug_elf).resolve()
+    root, scratch, debug_elf = Path(root).resolve(), Path(scratch).resolve(), Path(debug_elf).resolve()
     if decode is None:
         from h1_trace import cpu_decode
         def decode(out, owners, dsos, *, symfs):
             return cpu_decode(out, owners, dsos, symfs=symfs,
                               script_timeout=ENVOY_DECODE_SECONDS, script_limit=ENVOY_DECODE_BYTES)
-    result = dict(schema=1, diagnostic_only=True, complete=False, source=dict(pins), captures=[], issues=[])
+    result = dict(schema=1, diagnostic_only=True, complete=False, source=dict(pins), captures=[], issues=[],
+                  expected_captures=None)
     try:
+        # Scratch is cleared per capture, so it must never overlap evidence.
+        if scratch.is_relative_to(root) or root.is_relative_to(scratch):
+            raise ValueError('scratch directory overlaps the evidence root')
         if debug_elf.stat().st_size != pins['bytes'] or file_sha256(debug_elf) != pins['sha256']:
             raise ValueError('debug executable does not match the pinned image layer member')
         identity = elf_identity(debug_elf)
@@ -476,6 +486,7 @@ def symbolize_envoy(root, debug_elf, scratch, *, pins=ENVOY_SYMBOLS, decode=None
         result['issues'].append(f'{type(error).__name__}: {error}')
     else:
         manifests = sorted((root / 'cpu' / 'pairs').glob('pair_*/traces/envoy_*/trace-manifest.json'))
+        result['expected_captures'] = len(manifests)
         if not manifests:
             result['issues'].append('no retained Envoy CPU captures')
         for path in manifests:
@@ -493,8 +504,8 @@ def symbolize_envoy(root, debug_elf, scratch, *, pins=ENVOY_SYMBOLS, decode=None
                                                issues=[f'{type(error).__name__}: {error}']))
             finally:
                 # Keep a record of finished captures even if the step is cut short.
-                write_symbols(root, result)
-    write_symbols(root, result)
+                write_symbols(root, result, final=False)
+    write_symbols(root, result, final=True)
     return 0 if result['complete'] else 1
 
 

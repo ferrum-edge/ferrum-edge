@@ -52,15 +52,16 @@ decode, so only names may change. A capture is reported as unmatched if:
 - the twin's extra sections changed unwinding;
 - the original decode was incomplete;
 - the measurement window has no Envoy executable leaves;
-- the twin resolved no additional Envoy executable leaves.
+- some Envoy executable leaves were unresolved and the twin resolved no more of
+  them.
 
-Each capture that reaches the decoder gains `envoy-symbols/`; earlier refusals
-appear only in `envoy-symbols.json`. The directory holds folded stacks, decoder coverage,
+Each capture that reaches the publish step gains `envoy-symbols/`; every other
+capture appears only in `envoy-symbols.json`. The directory holds folded stacks, decoder coverage,
 the decoder's stderr and status, and a summary. The directory is published
 whole and never overwritten. The summary gives measurement-window leaf coverage
 before and after symbols, and the top leaf functions with their DSOs. The run
 also writes `envoy-symbols.json` after every capture, which `h2-cpu-report.json`
-includes. A decoder that outlives its post-kill reap bound stops the pass.
+includes. Only the closing write, with a row for every capture, can be complete. A decoder that outlives its post-kill reap bound stops the pass.
 
 The 881 MB debug executable is never added to the artifact. A missing or
 mismatched symbol twin fails that step but leaves the capture evidence and

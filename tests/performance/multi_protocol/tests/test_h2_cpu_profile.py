@@ -271,7 +271,8 @@ class H2CPUAdmissionTests(unittest.TestCase):
             (trace / 'perf.data').write_bytes(perf_data)
             (trace / 'stacks.txt').write_text(self.STRIPPED.replace('(/usr/local/bin/envoy)', '(/usr/lib/other.so)')
                                               if fault == 'no-executable-leaves' else self.STRIPPED)
-            recorded = 'ff' * 20 if fault == 'recorded-build-id' else build_id.hex()
+            recorded = ('ff' * 20 if fault == 'recorded-build-id' or (fault == 'first-refused' and pair == 1)
+                        else build_id.hex())
             (trace / 'perf-buildids.txt').write_text(f'{recorded} {ENVOY_EXECUTABLE}\n')
             (trace / 'build-mappings.json').write_text(json.dumps(dict(complete=True, dsos=[
                 dict(path=ENVOY_EXECUTABLE, sha256=hashlib.sha256(release).hexdigest(),
@@ -404,6 +405,54 @@ class H2CPUAdmissionTests(unittest.TestCase):
             self.assertEqual(result['issues'], ['stopped after an unreaped decoder'])
             self.assertTrue((root / 'cpu/pairs/pair_001/traces/envoy_10240/envoy-symbols/summary.json').is_file())
             self.assertFalse((root / 'cpu/pairs/pair_002/traces/envoy_10240/envoy-symbols').exists())
+
+    def test_an_ordinary_refusal_does_not_stop_the_next_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, debug, scratch, pins, decode, calls = self.envoy_symbols(directory, 'first-refused')
+            self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 1)
+            first, second = json.loads((root / 'envoy-symbols.json').read_text())['captures']
+            self.assertIn('recorded Envoy build ID does not match', first['issues'][0])
+            self.assertEqual(second['issues'], [])
+            self.assertEqual(len(calls), 1)
+            self.assertTrue((root / 'cpu/pairs/pair_002/traces/envoy_10240/envoy-symbols/summary.json').is_file())
+
+    def test_workflow_symbolizes_after_hand_back_and_before_report_in_runner_scratch(self):
+        workflow = (Path(__file__).resolve().parents[4] / '.github/workflows/h2-cpu-profile.yml').read_text()
+        order = [workflow.index(name) for name in (
+            '- name: Hand back bounded root-owned trace artifacts',
+            '- name: Symbolize Envoy CPU stacks offline',
+            '- name: Retain a report even when a campaign stops early',
+            '- name: Retain raw profiles, coverage limits, counters and controls')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn('symbols="$RUNNER_TEMP/envoy-symbols"', workflow)
+        self.assertIn('--scratch "$symbols/decode"', workflow)
+
+    def test_intermediate_records_never_claim_completeness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, debug, scratch, pins, decode, calls = self.envoy_symbols(directory)
+            seen = []
+
+            def observing(out, owners, dsos, *, symfs):
+                if calls:
+                    # The first capture already succeeded and was recorded.
+                    seen.append(json.loads((root / 'envoy-symbols.json').read_text()))
+                return decode(out, owners, dsos, symfs=symfs)
+            self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=observing), 0)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual((len(seen[0]['captures']), seen[0]['expected_captures']), (1, 2))
+            self.assertFalse(seen[0]['complete'])
+            self.assertTrue(json.loads((root / 'envoy-symbols.json').read_text())['complete'])
+
+    def test_scratch_overlapping_evidence_is_refused_before_any_capture_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, debug, _, pins, decode, calls = self.envoy_symbols(directory)
+            for scratch in (root, root / 'cpu', root.parent):
+                with self.subTest(scratch=scratch):
+                    self.assertEqual(symbolize_envoy(root, debug, scratch, pins=pins, decode=decode), 1)
+                    result = json.loads((root / 'envoy-symbols.json').read_text())
+                    self.assertEqual(result['issues'], ['ValueError: scratch directory overlaps the evidence root'])
+            self.assertEqual(calls, [])
+            self.assertTrue((root / 'cpu/pairs/pair_001/traces/envoy_10240/perf.data').is_file())
 
     def test_an_unreaped_decoder_stops_later_captures(self):
         with tempfile.TemporaryDirectory() as directory:
