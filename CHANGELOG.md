@@ -53,6 +53,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
 ### Fixed
+- **Per-request CPU no longer doubles under the credential-dumping log
+  filter** (regression from #6852, tagged in 0.9.18, which was not published,
+  and shipped in 0.9.19). That filter was nested outside the level filter on
+  the gateway's output layers. Its missing max-level hint raised the
+  process-wide `tracing` level to TRACE, and nesting cached every disabled
+  callsite as "sometimes". So every TRACE/DEBUG callsite in hyper, h2, and
+  tokio was evaluated on each hit even at `FERRUM_LOG_LEVEL=error`. The level
+  filter is outermost again, and the credential filter still drops the same
+  records under every directive and RTDS reload. On same-runner A/Bs of the
+  gRPC deadline lane (h2c, 1 KiB, 100 concurrent calls, 2 worker threads):
+  - #6852 alone cut unary throughput by 52% and raised gateway CPU per call
+    from 91 µs to 210 µs.
+  - This fix against `main` raised unary throughput by 115% and cut CPU per
+    call from 211 µs to 89 µs.
+  - Every cell in both runs moved by 40–115%, including server-streaming,
+    `key_auth`, and `grpc-timeout` calls.
 - **A backend failure that lands after a gRPC client deadline is settled as
   that deadline** (issue #6022). The gateway forwards only the remaining
   `grpc-timeout`, so for budgets that fit the millisecond encoding a backend
