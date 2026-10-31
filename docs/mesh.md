@@ -20,7 +20,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [Bootstrap Behavior](#bootstrap-behavior)
 - [Mesh Data Model](#mesh-data-model)
 - [MeshSlice](#meshslice)
-- [Authorization](#authorization)
+- [Authorization](#authorization-1)
   - [PolicyScope Filtering](#policyscope-filtering)
   - [AuthorizationPolicy targetRefs](#authorizationpolicy-targetref--targetrefs-issue-3226)
   - [Evaluation Semantics](#evaluation-semantics)
