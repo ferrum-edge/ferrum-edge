@@ -2721,7 +2721,7 @@ paths:
                   summary: Two backends — one h3-capable, one ALPN-downgraded to h1
                   value:
                     entries:
-                      - key: "https|api.example.internal|443||/etc/ferrum/ca.pem|||1"
+                      - key: "https|api.example.internal|443|…|1|svidg=static|"
                         plain_http:
                           h1: supported
                           h2_tls: supported
@@ -2732,7 +2732,7 @@ paths:
                         hbone: unsupported
                         last_probe_at_unix_secs: 1714003200
                         last_probe_error: null
-                      - key: "https|legacy.example.internal|443||||0"
+                      - key: "https|legacy.example.internal|443|…|0|svidg=static|"
                         plain_http:
                           h1: supported
                           h2_tls: unsupported
@@ -43848,10 +43848,13 @@ components:
         key:
           type: string
           description: |
-            Deduplicated backend-target identity key:
-            `scheme|host|port|dns_override|ca|mtls_cert|mtls_key|verify|hbone_port`.
-            The HBONE port field is populated only for targets tagged
-            `mesh.hbone=true`.
+            Deduplicated backend-target identity key: an opaque internal
+            connection identity covering scheme, host, port, `dns_override`,
+            the effective backend TLS identity and policy (CA, client
+            cert/key, SNI, SAN digest, verify flag, optional
+            `tlsrefused`/`noglobalid` markers, and the `svidg=` segment),
+            plus HBONE port, dial host, and peer SPIFFE identity for targets
+            tagged `mesh.hbone=true`. The field layout may change.
             Stable across responses for the same target; safe to match
             for churn detection.
         plain_http:

@@ -3504,13 +3504,16 @@ managed-resource ledger, consumer identities, or upstream target `tags`.
 The gateway namespace registry and fleet-global TLS/ACME/trust management
 surfaces are separate from these four gateway configuration resource types.
 
-Upgrade the gateway and file validator before clients that emit labels; see
-the [v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095) for the schema
-baseline. In control-plane deployments the CP and every DP must run the same
-build: the ConfigSync build-identity gate refuses a mismatched peer before any
-config is streamed, and the DP keeps serving its last applied config until it is
-replaced. Upgrade CP first and then every DP, as described in
-[upgrade_guide.md](upgrade_guide.md#upgrade-order).
+Upgrade the gateway and file validator before clients that emit labels; the
+[v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095) covers the schema
+baseline only. For upgrade sequencing, follow
+[Upgrade Order](upgrade_guide.md#upgrade-order): CP first, then every DP. In
+control-plane deployments the CP and every DP must run the same build: the
+ConfigSync build-identity gate refuses a mismatched peer before any config is
+streamed. Until a DP is replaced it keeps serving its last applied config only
+within `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` (default 3600); after that, the
+default `fail_closed` stale action refuses new traffic (see
+[configuration.md](configuration.md#control-plane--data-plane)).
 
 Diagnostic builds with the default-off `bench-h1-profile` feature append fixed
 `ferrum_h1_profile_*` metrics to the existing authenticated `/metrics` response.
