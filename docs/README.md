@@ -91,6 +91,18 @@ Topology, routing, and the control plane.
 | [plugin_execution_order.md](plugin_execution_order.md) | Hook phases and ordering |
 | [plugins/ai_tool_governor.md](plugins/ai_tool_governor.md) | `ai_tool_governor` plugin |
 | [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) | `api_chargeback_sink` plugin |
+| [plugins/a2a_gateway.md](plugins/a2a_gateway.md) | `a2a_gateway` plugin |
+| [plugins/ai_federation.md](plugins/ai_federation.md) | `ai_federation` plugin |
+| [plugins/ai_rate_limiter.md](plugins/ai_rate_limiter.md) | `ai_rate_limiter` plugin |
+| [plugins/ai_semantic_cache.md](plugins/ai_semantic_cache.md) | `ai_semantic_cache` plugin |
+| [plugins/ai_semantic_firewall.md](plugins/ai_semantic_firewall.md) | `ai_semantic_firewall` plugin |
+| [plugins/ai_stream_router.md](plugins/ai_stream_router.md) | `ai_stream_router` plugin |
+| [plugins/ai_transcript_audit.md](plugins/ai_transcript_audit.md) | `ai_transcript_audit` plugin |
+| [plugins/mcp_gateway.md](plugins/mcp_gateway.md) | `mcp_gateway` plugin |
+| [plugins/mesh_route_dispatch.md](plugins/mesh_route_dispatch.md) | `mesh_route_dispatch` plugin |
+| [plugins/serverless_function.md](plugins/serverless_function.md) | `serverless_function` plugin |
+| [plugins/rate_limiting_redis.md](plugins/rate_limiting_redis.md) | Centralized rate limiting design notes |
+| [plugins/request_deduplication.md](plugins/request_deduplication.md) | `request_deduplication` design notes |
 | [ai_prompt_compressor.md](ai_prompt_compressor.md) | `ai_prompt_compressor` plugin |
 | [cors_plugin.md](cors_plugin.md) | CORS plugin |
 
