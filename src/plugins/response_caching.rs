@@ -2247,10 +2247,11 @@ impl ResponseCaching {
         for header in vary_headers {
             hasher.text("vary_name", header);
             match request_headers.get(header.as_str()) {
-                Some(value) if ctx.is_gateway_generated_correlation_header(header, value) => {
-                    // Omit only the minted unique value. The name stays in the
-                    // origin/operator Vary contract; treating presence as
-                    // absent keeps two generated ids on one entry.
+                Some(value) if ctx.is_gateway_minted_request_header(header, value) => {
+                    // Omit only the minted per-request value (a generated
+                    // correlation id or published rate-limit telemetry). The
+                    // name stays in the origin/operator Vary contract; treating
+                    // presence as absent keeps two minted values on one entry.
                     hasher.bool_value("vary_present", false);
                 }
                 None => hasher.bool_value("vary_present", false),

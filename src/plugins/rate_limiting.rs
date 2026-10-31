@@ -864,15 +864,23 @@ impl RateLimiting {
         // injected onto the downstream response by after_proxy and disclose the
         // gateway's internal consumer/SPIFFE identity to the client.
         self.claim_published_headers(ctx, authority);
+        // Stage each published value twice: in the public metadata that
+        // `before_proxy` / `after_proxy` render, and as private provenance so
+        // replay partitions can recognize the forwarded per-request counter
+        // without trusting plugin-writable metadata.
         if let Some(limit) = outcome.limit {
-            ctx.metadata
-                .insert("ratelimit_limit".to_string(), limit.to_string());
+            let limit = limit.to_string();
+            ctx.stage_published_rate_limit_header(RATELIMIT_LIMIT_HEADER, limit.clone());
+            ctx.metadata.insert("ratelimit_limit".to_string(), limit);
         }
+        let remaining = remaining.to_string();
+        ctx.stage_published_rate_limit_header(RATELIMIT_REMAINING_HEADER, remaining.clone());
         ctx.metadata
-            .insert("ratelimit_remaining".to_string(), remaining.to_string());
+            .insert("ratelimit_remaining".to_string(), remaining);
         if let Some(window) = outcome.window_seconds {
-            ctx.metadata
-                .insert("ratelimit_window".to_string(), window.to_string());
+            let window = window.to_string();
+            ctx.stage_published_rate_limit_header(RATELIMIT_WINDOW_HEADER, window.clone());
+            ctx.metadata.insert("ratelimit_window".to_string(), window);
         }
     }
 
@@ -885,6 +893,7 @@ impl RateLimiting {
         for &(meta_key, _) in EXPOSED_RATELIMIT_HEADERS {
             ctx.metadata.remove(meta_key);
         }
+        ctx.clear_published_rate_limit_headers();
         ctx.metadata
             .insert(RATE_LIMIT_AUTHORITY_KEY.to_string(), authority.encode());
     }
@@ -2048,6 +2057,12 @@ fn ip_key(client_ip: &str, ipv6_prefix: u8) -> String {
     key
 }
 
+/// Public response/request header names of the published budget, also the
+/// names `RequestContext` records as private publication provenance.
+const RATELIMIT_LIMIT_HEADER: &str = "x-ratelimit-limit";
+const RATELIMIT_REMAINING_HEADER: &str = "x-ratelimit-remaining";
+const RATELIMIT_WINDOW_HEADER: &str = "x-ratelimit-window";
+
 /// Metadata key -> response header for the telemetry `expose_headers` publishes.
 ///
 /// x-ratelimit-identity is intentionally NOT mapped: injecting the limiter key
@@ -2057,9 +2072,9 @@ fn ip_key(client_ip: &str, ipv6_prefix: u8) -> String {
 /// Shared by the injection site and `owns_deadline_response_header` so the
 /// written set and the declared-owned set cannot drift apart.
 static EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
-    ("ratelimit_limit", "x-ratelimit-limit"),
-    ("ratelimit_remaining", "x-ratelimit-remaining"),
-    ("ratelimit_window", "x-ratelimit-window"),
+    ("ratelimit_limit", RATELIMIT_LIMIT_HEADER),
+    ("ratelimit_remaining", RATELIMIT_REMAINING_HEADER),
+    ("ratelimit_window", RATELIMIT_WINDOW_HEADER),
 ];
 
 /// The same table in the bounded `&[String]` form
