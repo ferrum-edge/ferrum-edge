@@ -129,7 +129,7 @@ Validation passed.
 
 `run` reports the same non-secret facts as structured `info!` records instead, so serving modes keep normal log-level semantics.
 
-1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
+1. **Settings** (`ferrum.conf`) — `EnvConfig` settings are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.; see [configuration.md](configuration.md))
 2. **Spec** (resources YAML/JSON, file mode only):
    - YAML/JSON syntax and deserialization
    - Field-level validation on all proxies, consumers, upstreams, and plugin configs
@@ -170,7 +170,7 @@ Validation passed.
 
 Resource discovery runs after external secret resolution and settings loading. A `FERRUM_FILE_CONFIG_PATH` in the selected `ferrum.conf` suppresses resource discovery, and `--spec` overrides the environment and settings file. A bare `ferrum-edge` invocation prints usage and exits nonzero; use `run`.
 
-**Externally sourced values are never printed.** Failure diagnostics name the base variable, the provider, and the reason, but not the source reference, even when a provider SDK echoes it (a one- or two-byte reference that cannot be removed safely causes the provider detail to be replaced with a fixed key-level failure). After materialization, externally sourced values are withheld from later settings and spec diagnostics, from warnings emitted during parsing (matched verbatim, trimmed, per list entry, case-normalized, and JSON-escaped), and from `validate` report fields. For example, a malformed `FERRUM_DB_PORT_FILE` reports `Invalid FERRUM_DB_PORT value <redacted: value from external secret source>. Expected a valid u16 integer`, and `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>` (`run` withholds its `Operating mode:` log line the same way). The overall result, including `Validation passed.` and spec counts, is unaffected. Rejection and startup diagnostics also withhold directly supplied scalar values, keeping field names, failure reasons, allowed bounds, and recovery guidance.
+**Externally sourced values are never printed.** Failure diagnostics name the base variable, the provider, and the reason, but not the source reference, even when a provider SDK echoes it (a one- or two-byte reference that cannot be removed safely causes the provider detail to be replaced with a fixed key-level failure). After materialization, externally sourced values are withheld from later settings and spec diagnostics, from warnings emitted during parsing (matched verbatim, trimmed, per list entry, case-normalized, and JSON-escaped), and from `validate` report fields. For example, a malformed `FERRUM_PROXY_HTTP_PORT_FILE` reports `Invalid FERRUM_PROXY_HTTP_PORT value <redacted: value from external secret source>. Expected a valid u16 integer`, and `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>` (`run` withholds its `Operating mode:` log line the same way). The overall result, including `Validation passed.` and spec counts, is unaffected. Rejection and startup diagnostics also withhold directly supplied scalar values, keeping field names, failure reasons, allowed bounds, and recovery guidance.
 
 ### Examples
 

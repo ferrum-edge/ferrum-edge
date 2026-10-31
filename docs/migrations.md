@@ -675,7 +675,7 @@ FERRUM_MODE=migrate \
 - **No junction tables**: SQL uses `proxy_plugins` — keyed `(namespace, proxy_id, plugin_config_id)` — to associate proxies with plugins. MongoDB embeds plugin associations directly in proxy documents.
 - **Composite document keys**: the `proxies`, `upstreams`, `plugin_configs`, `api_specs`, and `consumers` collections use `_id = "{namespace}:{id}"`, matching the SQL `PRIMARY KEY (namespace, id)`. Hand-written queries must build that key, not the bare resource id.
 - **No migration tracking table**: SQL tracks applied migrations in `_ferrum_migrations`. MongoDB indexes are idempotent and don't need tracking.
-- **Automatic field propagation**: New fields added to domain types (`Proxy`, `Consumer`, etc.) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed.
+- **Automatic field propagation**: New fields added to domain types (`Proxy`, `Consumer`, etc.) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. See [mongodb.md](mongodb.md#adding-new-fields).
 
 ### MongoDB Custom Plugin Storage
 

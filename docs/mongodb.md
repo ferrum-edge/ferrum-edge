@@ -740,7 +740,7 @@ already matches). See [docs/migrations.md](migrations.md#mongodb-migrations).
 
 ### Adding New Fields
 
-New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. This is a key advantage over SQL backends where new fields require explicit schema migrations.
+New fields added to the Rust domain types (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed. SQL backends instead need the column added to the V001 baseline (and, during build-out, a fresh database); see [migrations.md](migrations.md#build-out-schema-policy).
 
 ## Incremental Polling
 

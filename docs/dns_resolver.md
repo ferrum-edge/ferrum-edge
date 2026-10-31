@@ -8,7 +8,7 @@ By default, the DNS cache respects each record's **native TTL** from the DNS res
 
 **TTL priority** (highest to lowest):
 
-1. **Per-proxy TTL** (`dns_cache_ttl_seconds` on the proxy config) — governs this proxy's freshness window on **direct** H2, gRPC, and H3 connectors, which pass the value into `resolve_candidates`. On the **shared reqwest path** (default HTTP/1.1 and HTTP/2 via reqwest), one `reqwest::Client` serves every proxy on a pool key that does not carry `dns_cache_ttl_seconds`, so the resolver passes `per_proxy_ttl = None`. There the proxy's TTL still applies indirectly: warmup, reload, and per-caller resolves record each proxy's `dns_cache_ttl_seconds` on the hostname row, and proactive background refresh uses the shortest TTL observed for that hostname, so reqwest callers normally stay current at the short cadence. The gap is the **eviction-and-recreate window**: if `evict_expired` or capacity trimming drops the row and a reqwest-only caller re-creates it, proactive refresh reverts to the native TTL until the next warmup/reload re-registers the proxy's value.
+1. **Per-proxy TTL** (`dns_cache_ttl_seconds` on the proxy config) — governs this proxy's freshness window on **direct** H2, gRPC, and H3 connectors, which pass the value into `resolve_candidates`; on the shared reqwest path it applies only indirectly (see [Shared hostnames and per-proxy TTL isolation](#shared-hostnames-and-per-proxy-ttl-isolation)).
 2. **Global TTL override** (`FERRUM_DNS_TTL_OVERRIDE_SECONDS`) — forces a fixed TTL on all records when no per-proxy TTL applies to the caller
 3. **Native record TTL** — the TTL from the DNS response itself (default behavior)
 
@@ -16,7 +16,7 @@ The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
 
 ### Shared hostnames and per-proxy TTL isolation
 
-The DNS cache stores **one shared answer row per hostname** (addresses, native TTL, publish time) so concurrent proxies, upstreams, and plugins deduplicate lookups and background refreshes. **Freshness is evaluated per caller** when the connector passes `dns_cache_ttl_seconds` into `resolve_candidates`: each such resolve computes `resolved_at + effective_ttl(native_ttl, caller_dns_cache_ttl_seconds)` and does not inherit another proxy's TTL from insertion or warmup order. **Reqwest pool callers pass `None`**, so their per-request freshness window follows global/native policy even when their proxy configured a short `dns_cache_ttl_seconds`; the configured value still participates through the shared row's observed shortest TTL for proactive refresh and warmup registration (see [TTL priority](#native-ttl-respect)).
+The DNS cache stores **one shared answer row per hostname** (addresses, native TTL, publish time) so concurrent proxies, upstreams, and plugins deduplicate lookups and background refreshes. **Freshness is evaluated per caller** when the connector passes `dns_cache_ttl_seconds` into `resolve_candidates`: each such resolve computes `resolved_at + effective_ttl(native_ttl, caller_dns_cache_ttl_seconds)` and does not inherit another proxy's TTL from insertion or warmup order. **Reqwest pool callers pass `None`**: on the shared reqwest path (default HTTP/1.1 and HTTP/2 via reqwest), one `reqwest::Client` serves every proxy on a pool key that does not carry `dns_cache_ttl_seconds`, so their per-request freshness window follows global/native policy even when their proxy configured a short `dns_cache_ttl_seconds`. The configured value still applies indirectly: warmup, reload, and per-caller resolves record each proxy's `dns_cache_ttl_seconds` on the hostname row, and proactive background refresh uses the shortest TTL observed for that hostname, so reqwest callers normally stay current at the short cadence. The gap is the **eviction-and-recreate window**: if `evict_expired` or capacity trimming drops the row and a reqwest-only caller re-creates it, proactive refresh reverts to the native TTL until the next warmup/reload re-registers the proxy's value.
 
 **Stale-while-revalidate with mixed TTLs:**
 
@@ -69,14 +69,7 @@ If a caller past its own stale window attempts a synchronous refresh and DNS fai
 
 ### System-Level DNS Settings
 
-Ferrum Edge respects the following system-level environment variables, as parsed from `/etc/resolv.conf`:
-
-| Variable | Description |
-|----------|-------------|
-| `RES_OPTIONS` | Space-separated resolver options: `rotate` (round-robin nameservers), `ndots:N` (minimum dots before absolute lookup), `timeout:N` (query timeout seconds), `attempts:N` (retry count). |
-| `LOCALDOMAIN` | Space-separated search domains for unqualified hostnames. |
-
-These are automatically applied unless explicitly overridden by `FERRUM_DNS_RESOLVER_ADDRESS` (which replaces nameservers) or `FERRUM_DNS_TTL_OVERRIDE_SECONDS` / `FERRUM_DNS_ERROR_TTL` (which override TTL behavior).
+Ferrum starts from the platform system DNS configuration (on Linux, `/etc/resolv.conf` supplies nameservers, `search`/`domain`, `ndots`, `timeout`, `attempts`, and `edns0`). `FERRUM_DNS_RESOLVER_ADDRESS` replaces only the nameservers; system search domains and resolver options remain. The `RES_OPTIONS` and `LOCALDOMAIN` environment variables are not read, and the resolv.conf `rotate` option is not imported. If the system configuration cannot be loaded, Ferrum warns and uses Hickory defaults (Google DNS). `FERRUM_DNS_TTL_OVERRIDE_SECONDS` / `FERRUM_DNS_ERROR_TTL` override TTL behavior.
 
 ## DNS Order
 
@@ -242,8 +235,8 @@ After DNS warmup completes, the gateway optionally **warms connection pools** fo
 
 All outbound HTTP clients (proxy traffic, health check probes, plugin outbound calls) use a custom DNS resolver that transparently routes DNS lookups through the gateway's central DNS cache. This is set via `reqwest::ClientBuilder::dns_resolver()` on every client, ensuring that:
 
-- **No DNS in the hot path**: Hostname resolution is always served from the in-memory cache, never from the network.
-- **Per-proxy `dns_cache_ttl_seconds` on reqwest**: The shared `DnsCacheResolver` passes `per_proxy_ttl = None` because one `reqwest::Client` serves every proxy on a pool key that does not carry `dns_cache_ttl_seconds`. The proxy's TTL still influences freshness through the shared row's observed refresh cadence (shortest per-proxy TTL ever recorded for the hostname). After `evict_expired` or capacity trimming drops and recreates a row, that cadence resets until warmup/reload re-registers the proxy's value — see [TTL priority](#native-ttl-respect).
+- **Mostly off the hot path**: Cached answers keep most request-time resolution off the network; a cache miss, a successful entry past the caller's stale window, or an expired cached error can require an awaited DNS lookup.
+- **Per-proxy `dns_cache_ttl_seconds` on reqwest**: The shared `DnsCacheResolver` passes `per_proxy_ttl = None`; the proxy's TTL applies only through the shared row's observed refresh cadence — see [Shared hostnames and per-proxy TTL isolation](#shared-hostnames-and-per-proxy-ttl-isolation).
 - **Per-proxy `dns_override`**: When a proxy has a static `dns_override` IP, the reqwest connection pool installs it on that client's `DnsCacheResolver`. The override then applies to **every hostname** the shared client dials — including load-balanced upstream targets whose host differs from the route template's `backend_host` — matching direct connectors that pass the same override into `DnsCache::resolve_candidates`. Pool keys already partition by `dns_override`, so one proxy's override cannot freeze onto another proxy's client. The configured target hostname remains Host/`:authority`, TLS SNI, and certificate verification identity while the socket dials the override IP. URL hosts that are already IP literals are the dependency-level exception: reqwest bypasses custom DNS resolution for them. Ferrum Edge rejects a statically known direct literal that differs from `dns_override`, and fails a reqwest dispatch closed with `502` if a load-balanced or dynamically discovered literal differs, rather than dialing the unoverridden address. A literal equal to the override remains valid.
 - **Unified caching**: Proxy backends, upstream targets, health check probes, and plugin outbound calls (http_logging, tcp_logging, jwks_auth, etc.) all share the same DNS cache, benefiting from warmup and background refresh.
 - **Complete answer sets**: reqwest receives every policy-approved cached address, not only the first record. Its connector can therefore try alternates when an address is unavailable.
@@ -386,16 +379,6 @@ FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS=5
 
 # Disable the background failed-DNS retry task.
 FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS=0
-```
-
-### System Resolver Options
-
-```bash
-# Set ndots to 1, timeout to 3 seconds, 4 retry attempts, round-robin nameservers
-RES_OPTIONS="ndots:1 timeout:3 attempts:4 rotate"
-
-# Set search domain
-LOCALDOMAIN="internal.mycompany.com"
 ```
 
 ## Per-Proxy DNS Settings

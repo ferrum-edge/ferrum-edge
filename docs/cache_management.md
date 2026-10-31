@@ -68,7 +68,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### Status Code Counters
 
-**What it stores:** Per-status-code request counters exposed via the admin `/status` endpoint. Common HTTP status codes (200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504) are pre-populated at startup so the hot path uses DashMap read locks.
+**What it stores:** Per-status-code request counters exposed via `GET /admin/metrics` (`gateway.status_codes_total`) and `GET /metrics/runtime`. Common HTTP status codes (200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504) are pre-populated at startup so the hot path uses DashMap read locks.
 
 **Default limit:** 200 entries.
 
