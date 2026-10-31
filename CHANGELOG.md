@@ -78,9 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry under the same `Idempotency-Key` was refused with `409` as a different
   request instead of being replayed. These plugins now leave the three
   forwarded values out of their request partitions, but only while each live
-  value still equals what the owning limiter privately staged. A
-  client-supplied value, a value a later plugin rewrote, and a value rendered
-  from rewritten `ratelimit_*` metadata stay bound.
+  value still equals what the owning limiter privately staged. Any other
+  client-supplied value, a value a later plugin rewrote, or a value rendered
+  from rewritten `ratelimit_*` metadata stays bound.
 - **Per-request CPU no longer doubles under the credential-dumping log
   filter** (regression from #6852, tagged in 0.9.18, which was not published,
   and shipped in 0.9.19). That filter was nested outside the level filter on

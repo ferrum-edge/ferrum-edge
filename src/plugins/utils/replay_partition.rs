@@ -47,7 +47,11 @@
 //!   `respect_no_cache` is enabled, and single-field zero-length
 //!   `Content-Length`) and, separately, a gateway-minted correlation header
 //!   whose current value still matches private request provenance (issue
-//!   #3929). Client-supplied correlation values stay bound. Mixed Cache-Control
+//!   #3929), and the `x-ratelimit-*` telemetry `rate_limiting` forwards under
+//!   `expose_headers` while each value still equals the owning limiter's
+//!   private staging (also omitted by `request_deduplication` fingerprints and
+//!   the `ai_semantic_cache` request context). Client-supplied correlation
+//!   values and any other `x-ratelimit-*` value stay bound. Mixed Cache-Control
 //!   members and Cache-Control under `respect_no_cache: false` stay bound.
 //!
 //! Every component is serialized with typed, length-framed fields

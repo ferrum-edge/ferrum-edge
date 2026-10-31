@@ -8810,6 +8810,91 @@ async fn forwarded_rate_limit_telemetry_is_omitted_from_the_cache_key() {
     );
 }
 
+fn rate_limiter_with_limit(max_requests: u64) -> RateLimiting {
+    RateLimiting::new(
+        &json!({
+            "limit_by": "ip",
+            "expose_headers": true,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": max_requests}]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn composed_limiters_hand_off_rate_limit_provenance_with_header_ownership() {
+    let _guard = response_cache_replay_policy_guard();
+    // Two composed limiters publish one verdict: the tightest remaining budget
+    // owns the header set whichever runs first. The provenance must follow that
+    // ownership, so a looser sibling's earlier staging can neither linger nor
+    // stop the owner's forwarded values from being recognized.
+    for loose_first in [true, false] {
+        let loose = rate_limiter_with_limit(100);
+        let tight = rate_limiter_with_limit(10);
+        let order: [&RateLimiting; 2] = if loose_first {
+            [&loose, &tight]
+        } else {
+            [&tight, &loose]
+        };
+        let cache = default_plugin();
+        let path = format!("/p/rl-composed-{loose_first}");
+
+        async fn run(
+            order: [&RateLimiting; 2],
+            ctx: &mut RequestContext,
+        ) -> HashMap<String, String> {
+            for limiter in order {
+                assert!(matches!(
+                    limiter.on_request_received(ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+            let mut headers = ctx.headers.clone();
+            for limiter in order {
+                assert!(matches!(
+                    limiter.before_proxy(ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+            }
+            headers
+        }
+
+        let mut miss_ctx = make_ctx("GET", &path);
+        let mut miss_headers = run(order, &mut miss_ctx).await;
+        assert_eq!(
+            miss_headers.get("x-ratelimit-limit").map(String::as_str),
+            Some("10"),
+            "the tighter limiter owns the published set (loose_first={loose_first})"
+        );
+        assert_eq!(
+            miss_headers
+                .get("x-ratelimit-remaining")
+                .map(String::as_str),
+            Some("9")
+        );
+        store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"composed").await;
+
+        let mut hit_ctx = make_ctx("GET", &path);
+        let mut hit_headers = run(order, &mut hit_ctx).await;
+        assert_eq!(
+            hit_headers.get("x-ratelimit-remaining").map(String::as_str),
+            Some("8")
+        );
+        let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+        assert_eq!(body, b"composed", "loose_first={loose_first} must HIT");
+
+        // A value from the non-owning sibling is not what was published.
+        let mut stale_ctx = make_ctx("GET", &path);
+        let mut stale_headers = run(order, &mut stale_ctx).await;
+        stale_headers.insert("x-ratelimit-limit".to_string(), "100".to_string());
+        assert!(matches!(
+            cache.before_proxy(&mut stale_ctx, &mut stale_headers).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
 #[tokio::test]
 async fn rewritten_rate_limit_header_remains_a_cache_dimension() {
     let _guard = response_cache_replay_policy_guard();

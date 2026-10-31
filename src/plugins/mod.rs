@@ -3915,8 +3915,12 @@ pub(crate) struct PluginRequestState {
     /// their partition only while its LIVE value still equals the value staged
     /// here — the same private-provenance rule as a gateway-minted correlation
     /// id. A client-supplied value, a value a later plugin rewrote, and a value
-    /// laundered through the plugin-writable `ratelimit_*` metadata keys never
-    /// match, so they stay bound. Typed and outside `metadata` for that reason.
+    /// laundered through the plugin-writable `ratelimit_*` metadata keys stay
+    /// bound unless they are byte-identical to the staged value. A later
+    /// writer that happens to produce exactly that value leaves the backend
+    /// with exactly the request the limiter alone would have produced, so
+    /// omitting it loses no backend-visible distinction. Typed and outside
+    /// `metadata` so plugin-writable state cannot move the comparison target.
     pub(crate) published_rate_limit_headers: Vec<(&'static str, String)>,
     /// Per-`ai_semantic_cache`-instance embedding vectors staged between
     /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
@@ -4902,11 +4906,14 @@ impl RequestContext {
     /// Whether `name` currently carries the exact rate-limit telemetry value
     /// the owning `rate_limiting` instance staged for this request.
     ///
-    /// Private typed state, so neither a client nor a plugin that rewrites the
-    /// header (or the public `ratelimit_*` metadata it is rendered from) can
-    /// make a value look gateway-published. Replay partitions use it to omit
-    /// the per-request budget counter — which changes on every admitted
-    /// request — while binding every other value of the same field.
+    /// The comparison target is private typed state, so neither a client nor
+    /// a plugin that rewrites the header (or the public `ratelimit_*` metadata
+    /// it is rendered from) can choose which value is omitted. A live value
+    /// equal to the target is byte-identical to the limiter's own forwarded
+    /// value whoever wrote it, so the backend cannot tell the two apart and
+    /// omitting it hides nothing. Replay partitions use it to omit the
+    /// per-request budget counter — which changes on every admitted request —
+    /// while binding every other value of the same field.
     pub(crate) fn is_gateway_published_rate_limit_header(&self, name: &str, value: &str) -> bool {
         self.plugin_state().is_some_and(|state| {
             state
