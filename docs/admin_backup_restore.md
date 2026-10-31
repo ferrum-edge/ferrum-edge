@@ -135,7 +135,9 @@ snapshot and the clear:
   keys are `version`, `proxies`, `consumers`, `plugin_configs`, `upstreams`,
   `api_specs`, `gateway_trust_bundles`, and the `GET /backup` metadata members
   `ferrum_version`, `exported_at`, `source`, and `counts`, which are accepted
-  and ignored so an unmodified backup artifact round-trips. Ignored is not
+  and ignored so an unmodified backup artifact round-trips. A conditional
+  export's `conditional` object is accepted and ignored as well (see
+  [Conditional snapshots and restore](#conditional-snapshots-and-restore)). Ignored is not
   unchecked: `counts` must be a JSON object (the `type: object` `openapi.yaml`
   publishes) and the other three must be strings, so a malformed artifact is a
   `400` like every other shape mismatch rather than reaching the destructive

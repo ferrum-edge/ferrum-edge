@@ -3504,10 +3504,9 @@ managed-resource ledger, consumer identities, or upstream target `tags`.
 The gateway namespace registry and fleet-global TLS/ACME/trust management
 surfaces are separate from these four gateway configuration resource types.
 
-Upgrade the gateway and file validator before clients that emit labels; the
-[v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095) covers the schema
-baseline only. For upgrade sequencing, follow
-[Upgrade Order](upgrade_guide.md#upgrade-order): CP first, then every DP. In
+Upgrade the gateway and file validator before clients that emit labels; for
+the labels upgrade, follow the
+[v0.9.5 upgrade guidance](upgrade_guide.md#upgrading-to-095). In
 control-plane deployments the CP and every DP must run the same build: the
 ConfigSync build-identity gate refuses a mismatched peer before any config is
 streamed. Until a DP is replaced it keeps serving its last applied config only
