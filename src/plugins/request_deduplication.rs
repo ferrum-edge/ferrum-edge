@@ -1874,7 +1874,7 @@ impl RequestDeduplication {
         // regenerates (`PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS`).
         // A credential header that an earlier `request_transformer` renamed
         // to an ordinary name keeps its credential classification here.
-        let mut fields = request_headers_for_fingerprint(headers, &self.header_name);
+        let mut fields = request_headers_for_fingerprint(ctx, headers, &self.header_name);
         hasher.count("headers", fields.len());
         for (header_name, value) in fields.drain(..) {
             hasher.text("header_name", &header_name);
@@ -3680,7 +3680,18 @@ fn canonical_authority(headers: &HashMap<String, String>) -> String {
 /// emits a fresh trace ID by design. Binding it would make every retry a new
 /// operation and defeat the plugin's entire purpose — re-executing the side
 /// effect is the failure mode dedup exists to prevent.
+///
+/// The same reasoning excludes the `x-ratelimit-*` telemetry a `rate_limiting`
+/// instance with `expose_headers: true` forwards (it runs earlier, at 2900):
+/// the remaining budget changes on every admitted request, so a byte-identical
+/// retry would otherwise be refused as a different request. Only a value the
+/// owning limiter's private provenance still vouches for — the exact lowercase
+/// key it wrote, with the exact value it staged, as the field's only line — is
+/// excluded. Any other client-supplied or rewritten value remains part of the
+/// operation, and a case-variant duplicate keeps every line of that field
+/// (the limiter's own included) bound, because egress folds them together.
 fn request_headers_for_fingerprint<'a>(
+    ctx: &RequestContext,
     headers: &'a HashMap<String, String>,
     idempotency_header: &str,
 ) -> Vec<(String, &'a str)> {
@@ -3694,6 +3705,7 @@ fn request_headers_for_fingerprint<'a>(
                 .iter()
                 .any(|excluded| normalized == *excluded)
             || is_per_request_trace_header(&normalized)
+            || ctx.is_gateway_published_rate_limit_header(headers, name, value)
         {
             continue;
         }

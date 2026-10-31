@@ -3904,6 +3904,24 @@ pub(crate) struct PluginRequestState {
     /// by configured `response_caching` instances.
     pub(crate) response_cache_request_header_deltas:
         HashMap<u64, Arc<HashMap<String, Option<String>>>>,
+    /// The exact `x-ratelimit-*` values the `rate_limiting` instance that owns
+    /// this request's public header set staged for publication (at most the
+    /// three exposed names), replaced whenever ownership changes.
+    ///
+    /// `rate_limiting` with `expose_headers: true` forwards these values to the
+    /// backend, and `x-ratelimit-remaining` changes on every admitted request.
+    /// The retained-result plugins (`response_caching`,
+    /// `request_deduplication`, `ai_semantic_cache`) omit a request header from
+    /// their partition only while its LIVE value still equals the value staged
+    /// here — the same private-provenance rule as a gateway-minted correlation
+    /// id. A client-supplied value, a value a later plugin rewrote, and a value
+    /// laundered through the plugin-writable `ratelimit_*` metadata keys stay
+    /// bound unless they are byte-identical to the staged value. A later
+    /// writer that happens to produce exactly that value leaves the backend
+    /// with exactly the request the limiter alone would have produced, so
+    /// omitting it loses no backend-visible distinction. Typed and outside
+    /// `metadata` so plugin-writable state cannot move the comparison target.
+    pub(crate) published_rate_limit_headers: Vec<(&'static str, String)>,
     /// Per-`ai_semantic_cache`-instance embedding vectors staged between
     /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
     /// high-dimensional vectors cannot enter transaction logs. The outer key is
@@ -4862,6 +4880,84 @@ impl RequestContext {
     /// partitions.
     pub(crate) fn is_gateway_generated_correlation_header(&self, name: &str, value: &str) -> bool {
         self.canonical_client_ip.is_generated_header(name, value)
+    }
+
+    /// Replace the staged `x-ratelimit-*` publication with nothing.
+    ///
+    /// Called when a `rate_limiting` instance takes ownership of the public
+    /// header set, before it stages its own values. Never allocates the
+    /// per-plugin state just to clear it.
+    pub(crate) fn clear_published_rate_limit_headers(&mut self) {
+        if let Some(state) = self.plugin_state_opt_mut() {
+            state.published_rate_limit_headers.clear();
+        }
+    }
+
+    /// Record one exact `x-ratelimit-*` value the owning limiter publishes.
+    pub(crate) fn stage_published_rate_limit_header(&mut self, name: &'static str, value: String) {
+        let staged = &mut self.plugin_state_mut().published_rate_limit_headers;
+        if let Some(entry) = staged.iter_mut().find(|(known, _)| *known == name) {
+            entry.1 = value;
+        } else {
+            staged.push((name, value));
+        }
+    }
+
+    /// Whether `name` currently carries the exact rate-limit telemetry value
+    /// the owning `rate_limiting` instance staged for this request.
+    ///
+    /// The comparison target is private typed state, so neither a client nor
+    /// a plugin that rewrites the header (or the public `ratelimit_*` metadata
+    /// it is rendered from) can choose which value is omitted. A live value
+    /// equal to the target is byte-identical to the limiter's own forwarded
+    /// value whoever wrote it, so the backend cannot tell the two apart and
+    /// omitting it hides nothing. Replay partitions use it to omit the
+    /// per-request budget counter — which changes on every admitted request —
+    /// while binding every other value of the same field.
+    ///
+    /// `name` must be a key of `headers` (the backend-visible map being
+    /// partitioned) and is compared EXACTLY against the lowercase name the
+    /// limiter wrote. The exemption also requires that field to be a single
+    /// line: when `headers` holds any case-variant duplicate key (for example
+    /// a rename onto `X-RateLimit-Limit`), the egress path folds every line
+    /// into one combined value the limiter never staged, so EVERY line of that
+    /// field stays bound — including the limiter's own — and the complete
+    /// field reaches the partition. The duplicate scan runs only after an
+    /// exact provenance match, i.e. for at most the three published names.
+    pub(crate) fn is_gateway_published_rate_limit_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        let Some(state) = self.plugin_state() else {
+            return false;
+        };
+        let Some((staged_name, _)) = state
+            .published_rate_limit_headers
+            .iter()
+            .find(|(staged_name, staged_value)| name == *staged_name && value == staged_value)
+        else {
+            return false;
+        };
+        let lines = headers
+            .keys()
+            .filter(|key| key.eq_ignore_ascii_case(staged_name))
+            .count();
+        lines == 1
+    }
+
+    /// Whether `name`/`value` in `headers` is gateway-minted per-request state
+    /// that a retained-result partition must not bind: a generated correlation
+    /// id or published rate-limit telemetry, each proven by private provenance.
+    pub(crate) fn is_gateway_minted_request_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        self.is_gateway_generated_correlation_header(name, value)
+            || self.is_gateway_published_rate_limit_header(headers, name, value)
     }
 
     pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {

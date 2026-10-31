@@ -47,7 +47,11 @@
 //!   `respect_no_cache` is enabled, and single-field zero-length
 //!   `Content-Length`) and, separately, a gateway-minted correlation header
 //!   whose current value still matches private request provenance (issue
-//!   #3929). Client-supplied correlation values stay bound. Mixed Cache-Control
+//!   #3929), and the `x-ratelimit-*` telemetry `rate_limiting` forwards under
+//!   `expose_headers` while each value still equals the owning limiter's
+//!   private staging (also omitted by `request_deduplication` fingerprints and
+//!   the `ai_semantic_cache` request context). Client-supplied correlation
+//!   values and any other `x-ratelimit-*` value stay bound. Mixed Cache-Control
 //!   members and Cache-Control under `respect_no_cache: false` stay bound.
 //!
 //! Every component is serialized with typed, length-framed fields
@@ -945,15 +949,21 @@ pub fn append_request_context_partition(
 
 /// Append the finalized JSON request context used by `ai_semantic_cache`.
 /// Body framing and coding do not select a semantic neighborhood: the cache
-/// separately binds the parsed, normalized body. Keep every other origin input
-/// and the independent caller/destination partitions intact.
+/// separately binds the parsed, normalized body. The per-request
+/// `x-ratelimit-*` counters a `rate_limiting` instance with `expose_headers`
+/// forwards are omitted while their live value still matches that limiter's
+/// private provenance — they change on every admitted request, so binding them
+/// makes every entry unreachable. Keep every other origin input and the
+/// independent caller/destination partitions intact.
 pub fn append_semantic_request_context_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
 ) {
-    append_filtered_request_context_partition(hasher, ctx, request_headers, |name, _| {
-        name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("content-encoding")
+    append_filtered_request_context_partition(hasher, ctx, request_headers, |name, value| {
+        name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("content-encoding")
+            || ctx.is_gateway_published_rate_limit_header(request_headers, name, value)
     });
 }
 
@@ -972,6 +982,9 @@ pub fn append_semantic_request_context_partition(
 /// * `Content-Length` — zero-length framing on an otherwise empty GET/HEAD
 /// * a gateway-minted correlation header whose live value still matches
 ///   private request provenance (issue #3929)
+/// * a `rate_limiting` `x-ratelimit-*` value forwarded under `expose_headers`
+///   whose live value still matches the owning limiter's private provenance
+///   (the remaining-budget counter changes on every admitted request)
 ///
 /// Unsupported precondition / cache-directive dimensions (`If-Match`,
 /// `If-Unmodified-Since`, `If-Range`, `Range`, `Pragma`, mixed / arbitrary /
@@ -984,7 +997,10 @@ pub fn append_semantic_request_context_partition(
 /// provenance says this instance generated the live value because the client
 /// omitted a valid inbound field. Client-supplied values remain origin-visible
 /// dimensions. This is not a global `x-request-id` exemption and does not read
-/// public metadata.
+/// public metadata. Rate-limit telemetry follows the same rule: a client-sent,
+/// rewritten, or metadata-laundered `x-ratelimit-*` value stays bound unless it
+/// is the exact lowercase key and value the owning limiter staged and the
+/// field's only line; a case-variant duplicate keeps every line bound.
 pub fn append_response_cache_request_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
@@ -993,7 +1009,7 @@ pub fn append_response_cache_request_partition(
 ) {
     append_filtered_request_context_partition(hasher, ctx, request_headers, |name, value| {
         is_response_cache_entry_operation_header(name, value, respect_no_cache)
-            || ctx.is_gateway_generated_correlation_header(name, value)
+            || ctx.is_gateway_minted_request_header(request_headers, name, value)
     });
 }
 
