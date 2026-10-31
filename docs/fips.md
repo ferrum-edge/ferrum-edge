@@ -101,7 +101,12 @@ and the policy, key-admission, and frontend/backend/CP-DP handshake tests.
 `FIPS Build & Test` is **merge-blocking and publish-blocking** (issue #4445): it
 is a required check on `main` and in `.github/required-publication-checks.json`,
 so every immutable `v*` tag artifact fails closed unless it succeeded for the
-exact product SHA. It runs on every push to `main` with no `paths:` filter. The
+exact product SHA. It runs on every push to `main` with no `paths:` filter, and
+on that event `fips-plan` force-runs the full gate, so each product commit
+carries its own exact-SHA evidence. Its relevance job validates the trusted-base
+planner blob's mode, size, path, and object ID, materializes those bytes at the
+literal checked-out planner path, and invokes only that statically inspectable
+path; it never executes a variable-named temporary program. The
 `latest` / `main-<sha>` development images are gated on the `CI` workflow's push
 run only (see [ci_cd.md → Main latest image](ci_cd.md#main-latest-image)). Compile
 caches, the immutable producer and test-binary handoffs, and the cache trust

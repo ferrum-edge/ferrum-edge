@@ -148,8 +148,8 @@ traffic, and both are fail-closed on explicitly configured material:
 * A backend TLS **server-name override** (`backend_tls_sni`, which
   `BackendTLSPolicy` `validation.hostname` and a DestinationRule
   `trafficPolicy.tls.sni` both project onto) is enforced by direct HTTP/2,
-  gRPC over H2, native H3, reqwest HTTP/1.1, and terminating `tcp`/`tcp_tls`
-  stream paths that originate backend TLS. It sets both ClientHello SNI and
+  gRPC over H2, native H3, reqwest HTTP/1.1, and `tcps` stream paths that
+  originate backend TLS. It sets both ClientHello SNI and
   the certificate verification name while the selected target controls the
   socket destination. The override partitions HTTP-family backend pools;
   stream proxies do not pool connections. It is applied by **HTTP and gRPC

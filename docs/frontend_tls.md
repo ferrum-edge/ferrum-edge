@@ -1187,8 +1187,8 @@ Relay traffic never refreshes it.
 
 #### Kernel TLS and the stream authorization deadline
 
-The optional Linux kernel-TLS (kTLS) fast path for terminating `tcp_tls`
-listeners hands the socket to the kernel and relays with `splice(2)`. The
+The optional Linux kernel-TLS (kTLS) fast path for TLS-terminating TCP
+listeners (`tcp` with `frontend_tls: true`) hands the socket to the kernel and relays with `splice(2)`. The
 gateway no longer owns the byte stream at that point, so the userspace
 authorization-deadline wrapper that bounds an admitted TCP+TLS session cannot be
 installed — and once `dangerous_into_kernel_connection` has run there is no safe
