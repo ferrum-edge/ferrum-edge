@@ -224,7 +224,7 @@ Ferrum-owned rules inside every predecessor pod netns. The incoming host
 producer does not start in that release. `finalize` is admitted only after the
 node-local durable proof exists, and only then does the chart drop
 `SYS_ADMIN`/`SYS_PTRACE` and pod-wide `hostPID` from the running container. See
-the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
+the [Ambient UDP migration procedure](node_agent.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
 
 Once that migration has completed, a node with no node-local durable record —
 one that joined the cluster afterwards, or whose registry directory was
@@ -454,7 +454,7 @@ spec:
               add:
                 - BPF              # kernel >= 5.8; covered by SYS_ADMIN on older
                 - NET_ADMIN        # cgroup/tc attach, iptables fallback
-                - PERFMON          # kernel >= 5.8 BPF info/BTF
+                - PERFMON          # kernel >= 5.8 BPF prog/map info
                 # SYS_ADMIN only with dropCapSysAdmin=false (kernel < 5.8)
           volumeMounts:
             - name: bpf-fs
@@ -751,46 +751,8 @@ complete reports failure instead of success (see
 | `ferrum-mesh-cni-cleanup-wait` (pre-delete hook Job) | during `helm uninstall` | Kubernetes API only | No host mounts, runs as non-root. Its Role names one object: `get` + `delete` on `daemonsets` and `get` on `daemonsets/status`, both with `resourceNames: [ferrum-mesh-cni-cleanup]` in the release namespace — no list, no watch, no writes of any other kind. It exists because Helm's hook wait ignores DaemonSets, so without it the release could be deleted mid-cleanup; `delete` is what lets it retire that DaemonSet itself instead of relying on a Helm deletion policy that would also fire on failure. |
 | `ferrum-mesh-cni-cleanup` / `-wait` identity (ServiceAccounts, Role, RoleBinding) | for the lifetime of the release | none of their own | Ordinary release resources, deliberately not hook resources: on Helm 3.19+ and v4, a later hook's failure also deletes the earlier `hook-succeeded` hooks in that phase, so identity held that way would disappear exactly when a retry needs it. Grants are unchanged by this; the cleanup ServiceAccount still has no Role at all. |
 
-Removal is gated on evidence written at install time, never on a path guess:
+Removal and replacement are gated on ownership evidence written at install time (the in-conflist `managedBy`/`owner`/`generation` marker and the sibling ownership manifest), never on a path guess. The canonical rules — owner/generation scope, the shared-binary rule in both directions, `previousBinarySha256` / `binaryOwned` attestation, the fixed install order, failed-install chain recovery, and the lifecycle `flock` — are in [docs/node_agent.md → Ownership markers](node_agent.md#ownership-markers) and [Ordering, locking, and what the swap checks do not claim](node_agent.md#ordering-locking-and-what-the-swap-checks-do-not-claim). The security-relevant bounds on top of them:
 
-- The conflist must carry `managedBy: ferrum-edge` inside its own `ferrum-cni`
-  plugin entry, and its `owner`/`generation` must match the run's scope.
-- `<hostBinDir>/ferrum-cni` is a **shared** executable, so it is removed only
-  when all of the following hold: this run's chain is gone, no remaining
-  `.conf`/`.conflist`/`.json` in the directory still names the `ferrum-cni`
-  plugin type, the sibling ownership manifest names *these exact* artifacts
-  (`confFileName` / `binaryFileName`), and the manifest's recorded SHA-256
-  matches the bytes on disk. A directory that could not be fully scanned, or
-  manifest evidence bound to different file names, keeps the binary. Retaining
-  an unreferenced executable is inert; deleting one another release still
-  chains to is not.
-- A manifest's `previousBinarySha256` is an **attestation, not an
-  observation**. Hashing whatever already occupies the shared plugin path
-  proves nothing about who owns it, so the installer records that digest only
-  when the manifest already on disk carries this same owner, names these exact
-  artifact names, and had itself already recorded that digest. Every other
-  case records `null`: a pre-existing operator or third-party binary can never
-  be made removable merely because the installer read it. Because an
-  unreferenced binary is inert, retaining it never fails chain cleanup.
-- The manifest's `binaryOwned` bit applies the same proof to its current
-  digest. Publishing the staged inode sets it; reusing an inode sets it only
-  when prior same-owner evidence already attested that inode's digest.
-  Byte-identical operator-provided contents alone never transfer ownership.
-- Install applies the shared-binary rule in the other direction too: while any
-  remaining `.conf`/`.conflist`/`.json` still names `ferrum-cni`, the shared
-  executable is not replaced with different bytes. Byte-identical
-  republication is not a replacement and stays allowed; an installed object
-  that cannot be classified, or a directory that cannot be fully scanned,
-  fails safe by refusing the replacement with a fixed error and leaving the
-  shared binary and manifest byte-identical.
-- A failed install does not get to strand a chain. Everything that can fail on
-  uncontrolled input — locating the primary config, building the chain,
-  serializing it, staging and gating the binary — runs before any shared
-  write, and if a later step still fails the installer removes the same-owner
-  chain its preflight had classified, re-proving owner, generation, and
-  device/inode under the same lock first. A different owner, or a generation
-  that overtook the run, is retained and logged; the original failure is
-  always surfaced.
 - The configured file name is validated as a single path component, so `..`
   or an embedded separator can never redirect a delete out of the directory.
 - Artifacts are opened with `O_NOFOLLOW` and classified against the **open
@@ -804,15 +766,6 @@ Removal is gated on evidence written at install time, never on a path guess:
 - Temporary files are created `O_EXCL | O_NOFOLLOW` at mode `0600` under an
   unpredictable name in the destination directory, so a pre-planted symlink or
   file at a guessable path cannot be followed or truncated by a root process.
-- Every mutating run — install and cleanup alike — holds an exclusive `flock`
-  on `/etc/cni/net.d/.ferrum-cni-install.lock` for its whole duration, so two
-  Ferrum lifecycle steps on one node can never interleave.
-- Install fail-closes under that lock before any staging, manifest, binary, or
-  target-config write: an existing configured conflist is overwritten only when
-  it classifies as a bounded regular single-link file and its Ferrum ownership
-  marker names this same owner. Unmarked, malformed, oversized, symlinked,
-  non-regular, hard-linked, or differently-owned targets are refused with a
-  fixed error and leave those shared artifacts byte-identical.
 - Ownership tokens are bounded to 128 bytes of `[A-Za-z0-9._:/@#-]`, so
   nothing operator-supplied reaches the filesystem or a log line unchecked.
   Cleanup diagnostics report fixed reason strings and operator-configured

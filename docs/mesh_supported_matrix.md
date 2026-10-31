@@ -25,88 +25,28 @@ suite is observational, but a GA feature that regresses breaks its own test, so
 a promised feature cannot be silently downgraded. See
 `tests/conformance/ga_scope.rs` for the gate.
 
-The GA contract **grows incrementally** — a feature is enrolled only once we
-are prepared to fail CI on its regression. The source of truth is
-`tests/conformance/ga_contract.yaml`. The **Stable sidecar traffic surface is
-enrolled vertically** (semantic assertion → contract row → required live
-assertion): PeerAuthentication STRICT, AuthorizationPolicy ALLOW/DENY,
-RequestAuthentication JWT, DestinationRule `connectTimeout`/`maxConnections`,
-and VirtualService CORS, each backed by a `sidecar.*` live assertion the
-`mesh-e2e-sidecar` suite must emit and pass. DestinationRule `exportTo`
-visibility and lookup-namespace resolution are also GA-enrolled and live
-blocking: the sidecar fixture drives those behaviors on the captured client
-egress datapath against a multi-namespace DestinationRule model and requires
-both emitted assertion IDs to pass. For VS CORS, the mesh slice carries
-`virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
-plugin onto its materialized outbound routes (issue #1973). **SPIFFE identity
-plumbing (SPIRE Agent CA) is enrolled too** (`mesh.identity.spire_svid_issuance`):
-semantics pinned by the `mesh_spiffe_identity` conformance module (SPIFFE ID
-parse + Istio `ns/sa` convention, URI-SAN SVID extraction, the inbound
-peer-SVID verification decision, the fail-closed SVID slot, and `spire_agent`
-backend selection), live-gated by the required `sidecar.spire.workload_entries`
-and `sidecar.peer_auth.strict_mtls_authenticated` assertions. **Native
-`MeshSubscribe` config transport is enrolled as well**
-(`mesh.config_transport.native_subscribe`, issue #2002 / #3855): semantics pinned by
-the `mesh_config_transport` conformance module (the namespace-scoped
-`MeshSlice` snapshot build MeshSubscribe serves from, `content_eq`
-update dedupe that ignores the transport version stamp, and the DP-side
-slice apply that fails closed on malformed payloads), live-gated by the
-required `sidecar.config.native_subscribe_*` assertions — the
-`mesh-e2e-sidecar` fixture deploys a Ferrum CP (`cp` mode, sqlite, K8s
-pod discovery building the mesh model from the cluster's real Services and
-pods) and a sidecar DP on `FERRUM_MESH_CONFIG_PROTOCOL=native` whose captured
-inbound datapath only serves traffic if the CP-delivered slice materialized
-over production mTLS + JWT (`https://ferrum-cp.<ns>.svc.cluster.local:50051`
-with SAN verification, CP client-CA, and DP client cert/key). Dedicated
-probes prove omit-client / foreign-client / untrusted-server-CA / wrong-SAN /
-invalid-JWT fail closed, and a projected Secret generation swap proves watched
-CP/DP gRPC TLS rotation reconnects without a pod restart, with the replacement
-leaf serial observed over mTLS from the running CP listener. `GET /mesh/config-drift`
-attributes the accepted slice to the native transport. `coverage.md` lists the currently enrolled rows and required live
-assertion IDs, which are the authoritative answer to "what regression fails
-CI today."
+The GA contract **grows incrementally**: a feature is enrolled only once we are
+prepared to fail CI on its regression. Enrolled rows live in
+`tests/conformance/ga_contract.yaml`; the generated
+`target/conformance/coverage.md` (emitted by the conformance suite) lists the
+enrolled rows and required live assertion IDs; fixture detail is in the
+`tests/k8s/*/README.md` of each live suite.
 
 ## Current headline state
 
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
-  + `VirtualService` routing + `DestinationRule` LB/timeout/outlier **plus `exportTo`
-  namespace visibility and the client → target-service → root-namespace lookup
-  hierarchy** (issues #2465 / #2469). Lookup resolution is per destination HOST at both
-  layers, the mesh root namespace rides the slice so the data plane can refuse
-  a rule outside all three lookup namespaces (missing/blank root provenance
-  fails closed rather than restoring permissive Unscoped bucketing), host-owner
-  evidence is authoritative over a conflicting upstream container namespace, and
-  VirtualService-derived CORS
-  policy narrows through the SAME shared `exportTo` evaluator at the same
-  enforcement points a DestinationRule does. These DestinationRule semantics are
-  pinned by Rust conformance/integration gates **and** by live
-  `sidecar.destination_rule.export_to_namespace_visibility` /
-  `sidecar.destination_rule.lookup_tier_client_wins` assertions from the
-  `mesh-e2e-sidecar` suite. The existing sidecar traffic surface **and the native
-  config transport** remain **live-verified
-  and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real
-  captured datapath (STRICT mTLS positive + plaintext-rejected negative,
-  destination-side authz 403, JWT valid/missing/invalid, DR exportTo visibility
-  + lookup hierarchy, DR connectTimeout
-  two-phase timing, DR maxConnections=1 WebSocket hold/reject/release, and a
-  CP + native-subscribe leg proving CP-delivered `MeshSubscribe` config over
-  production mTLS + JWT with Service-DNS SAN verification, fail-closed
-  omit-client / foreign-client / untrusted-server-CA / wrong-SAN / invalid-JWT
-  negatives, and watched projected-Secret rotation) on every relevant PR and every main push, the artifact is
-  contract-validated, and both the required CI aggregate and `release.yml`
-  gate on it.
-  An identity-less mesh — no file-based gateway SVID material **and** no CA
-  backend (`FERRUM_MESH_CA_BACKEND=spire_agent|internal` + `FERRUM_MESH_WORKLOAD_SPIFFE_ID`) supplying a runtime SVID — **fails startup closed** (no mTLS ⇒ PERMISSIVE would accept plaintext)
-  unless `FERRUM_MESH_ALLOW_NO_CA=true`, and `FERRUM_MESH_PRODUCTION_MODE=true`
-  refuses it unconditionally — so the GA path cannot silently degrade to
-  unauthenticated plaintext. This is enforced at **both** config-validation time
-  (presence check) and **runtime** (`enforce_mesh_inbound_fail_closed`, at startup
-  and on PeerAuthentication live reload): the gateway SVID also backs the inbound
-  listener's server cert, a resolved inbound listener that would serve plaintext
-  (PeerAuthentication DISABLE, or no usable server identity) is refused in
-  production, and a configured-but-unloadable SVID verifier (TLS without
-  trust-domain verification) is fatal regardless of mode.
+  + `VirtualService` routing + `DestinationRule` LB/timeout/outlier, `exportTo`
+  namespace visibility, and the client → target-service → root-namespace lookup
+  hierarchy (issues #2465 / #2469), live-verified and blocking through the
+  `mesh-e2e-sidecar` suite on every relevant PR, main push, and `release.yml`
+  (required assertion IDs: `target/conformance/coverage.md`).
+  An identity-less mesh (no gateway SVID material and no CA backend) **fails
+  startup closed** unless `FERRUM_MESH_ALLOW_NO_CA=true`, and
+  `FERRUM_MESH_PRODUCTION_MODE=true` refuses it unconditionally; at runtime a
+  listener that would serve plaintext in production, or a configured-but-unloadable
+  SVID verifier, is refused (see [mesh.md → Internal Dev CA and Production
+  Guardrails](mesh.md#internal-dev-ca-and-production-guardrails)).
 - **GA track — cross-cluster east-west federation.** `EastWestGateway` SNI
   passthrough + SPIRE trust-bundle federation are enrolled vertically as well
   (issue #2459): `mesh.multicluster.spire_trust_federation`,

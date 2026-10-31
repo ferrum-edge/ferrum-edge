@@ -355,8 +355,10 @@ These consume the Workload API directly:
 FERRUM_MODE=mesh
 FERRUM_MESH_CA_BACKEND=spire
 FERRUM_MESH_SPIRE_AGENT_SOCKET=/run/spire/sockets/agent.sock
-FERRUM_MESH_CERT_TTL_SECONDS=3600        # hint only; SPIRE clamps to its own policy
+FERRUM_MESH_WORKLOAD_SPIFFE_ID=spiffe://<trust-domain>/ns/<ns>/sa/<sa>   # required; the fetched SVID is pinned to it
 ```
+
+SPIRE controls SVID lifetime through its registration-entry TTL (`x509SVIDTTL` / `-ttl`), server defaults, and issuance policy; `FERRUM_MESH_CERT_TTL_SECONDS` applies only to Ferrum's `internal` CA.
 
 Mount the agent socket into the pod. Two equivalent options:
 
@@ -801,7 +803,8 @@ Before declaring a cluster ready for production mesh traffic:
       separate debug pod.
 - [ ] **Ferrum env vars** set: `FERRUM_MESH_CA_BACKEND=spire`,
       `FERRUM_MESH_SPIRE_AGENT_SOCKET` matches the Agent's socket path,
-      `FERRUM_MESH_CERT_TTL_SECONDS` aligned with SPIRE entry TTLs. For
+      `FERRUM_MESH_WORKLOAD_SPIFFE_ID` matches the registration entry's
+      `-spiffeID`. For
       gateways: all three `FERRUM_GATEWAY_SVID_*_PATH` vars and a working
       file-writer sidecar.
 - [ ] **Federation reachable** (multi-cluster only) — `GET /mesh/federation`

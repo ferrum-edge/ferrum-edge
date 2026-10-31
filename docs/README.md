@@ -78,6 +78,7 @@ Topology, routing, and the control plane.
 | [cp_namespace_tenancy.md](cp_namespace_tenancy.md) | Multi-namespace control plane, JWT tenancy, and trust binding |
 | [mesh.md](mesh.md) | Mesh mode: topologies, config sources, data model, and maturity |
 | [mesh_supported_matrix.md](mesh_supported_matrix.md) | Mesh supported-feature product contract |
+| [mesh_udp_capture.md](mesh_udp_capture.md) | Mesh UDP TPROXY capture datapath reference |
 | [mesh_multicluster_federation_runbook.md](mesh_multicluster_federation_runbook.md) | Multicluster federation runbook |
 | [gateway_api_conformance.md](gateway_api_conformance.md) | Kubernetes Gateway API conformance (canonical) |
 | [admin_api.md](admin_api.md) | Admin API reference: auth, health tiers, and every endpoint |

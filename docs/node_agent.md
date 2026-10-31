@@ -111,7 +111,7 @@ When node-agent mode starts its admin listener, `/metrics` includes:
 | `ferrum_node_agent_ingress_interface_topology{state,reason}` | Gauge for the optional NodeWaypoint ingress-interface proof. `state` and `reason` are closed sets; configured interface names, route destinations, node addresses, and other host/Kubernetes values are never labels. Notable bounded reasons include `no_remote_topology_evidence`, `node_set_too_large`, `requirement_set_too_large`, and `datapath_update_failed`. |
 | `ferrum_node_agent_ingress_interface_configured_interfaces`, `ferrum_node_agent_ingress_interface_expected_interfaces` | Bounded counts for the explicit operator set and the complete route-derived set. Names are deliberately omitted. |
 | `ferrum_node_agent_ingress_interface_family_required{family}`, `ferrum_node_agent_ingress_interface_family_covered{family}` | Closed `ipv4`/`ipv6` gauges showing which families the observed remote PodCIDRs require and whether the current topology proof covers them. |
-| `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`,`node_waypoint_ingress_redirect_unavailable`} when startup cannot provide the requested eBPF topology. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
+| `ferrum_mesh_node_topology_degraded{reason}` | Gauge. `1` with `reason` ∈ {`kernel_too_old`,`cgroup_v1`,`bpffs_missing`,`ebpf_feature_disabled`,`capture_mode_not_ebpf`,`capture_unavailable`,`node_waypoint_sock_ops_unavailable`,`node_waypoint_ingress_redirect_unavailable`,`node_waypoint_node_source_ipv4_missing`,`node_waypoint_node_source_ipv6_missing`,`unknown`} when startup or pod enrollment cannot provide the requested eBPF topology (`unknown` is a defensive fallback for a degraded kernel probe that reports no specific reason). For the two `node_source_*_missing` reasons, set `FERRUM_NODE_AGENT_NODE_IP(S)` / `nodeAgent.trustedKubeletProbeSourceIps` for that family and restart the node-agent (the addresses are read only during backend initialization); until then inbound relay dials to that family's pods are dropped. `0` with `reason="none"` when the eBPF capture path is nominal. Cardinality is bounded per node (a single series at a time). |
 
 `ferrum_node_agent_ingress_interface_topology` emits only the current active
 `state`/`reason` series with value `1`; it does not emit every possible state as
@@ -431,74 +431,190 @@ listener to serve them).
 
 ### Host-network UDP capture placement (issue #3288)
 
-`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` on the **ambient proxy** (with
-`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`) moves UDP source-capture into the proxy's
-own network namespace instead. The **node-agent's role is unchanged**: it still
-publishes the per-pod registry and still keeps each pod's BPF UDP gate closed
-until the producer publishes `<registry_dir>/.udp-ready/<pod_uid>`, and it still
-installs no UDP rules of its own. What changes is where the rules and the socket
-live. A readiness-marker write that fails after capture becomes live is retried
-on every otherwise-idle producer reconcile; only a successful publication is
-recorded as ready, so a transient registry I/O failure cannot strand the pod's
-BPF gate permanently closed.
+The **node-agent's role is unchanged** by this placement: it still publishes the
+per-pod registry, still keeps each pod's BPF UDP gate closed until the producer
+publishes `<registry_dir>/.udp-ready/<pod_uid>`, and still installs no UDP rules
+of its own. A readiness-marker write that fails after capture becomes live is
+retried on every otherwise-idle producer reconcile, so a transient registry I/O
+failure cannot strand the pod's BPF gate permanently closed; while
+acknowledgements are outstanding the mesh proxy logs the outstanding pods
+periodically and keeps retrying.
 
-The producer also drives the same **gate-close handshake** the pod-netns producer
-uses when a pod stops being captured: it persists
-`<registry_dir>/.udp-ack-required/<pod_uid>`, retracts `.udp-ready`, and keeps the
-pod's host capture rule in place behind a DROP guard until the node-agent
-publishes `<registry_dir>/.udp-not-ready/<pod_uid>`. Retracting readiness does not
-close the BPF gate synchronously, so removing the rule first would let that pod's
-UDP egress leave the node in plaintext for as long as the node-agent took to
-notice.
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` (default `false`, requires
+`FERRUM_MESH_CAPTURE_UDP_ENABLED=true` and `FERRUM_MESH_TOPOLOGY=ambient`) moves
+Ambient's UDP source-capture from each pod's network namespace into the mesh
+proxy's own. Setting it without the capture switch, or on any topology but
+Ambient, is a **startup error**, not a silent no-op — both halves are enforced in
+the process (the capture-switch half in `capture::udp_capture_settings_from_env`,
+the topology half in `modes::mesh::validate_udp_host_netns_placement` on the
+serving path), so a direct-env or hand-rolled-manifest deployment that never
+renders the chart still fails closed rather than starting with no producer. It
+captures the same traffic and feeds the same session, relay, overload, and
+return-path machinery as the per-pod-netns producer — only the placement differs.
 
-That handshake also crosses the **process boundary**. Those markers are durable,
-so a producer that dies leaves the node-agent holding an open UDP gate for every
-pod it had readied — and the node-agent has no way to tell a dead producer from a
-busy one. A replacement therefore does not reap the previous generation's host
-rules first: it re-issues the close handshake for every pod the durable state
-names, waits for `.udp-not-ready`, and only then removes anything. Until it
-settles, the predecessor's rules stay installed (a capture path whose socket died
-with its process drops rather than leaks) and this generation applies nothing.
-The same recovery runs on a node that switched **away** from the host placement.
-One bounded pass runs during mesh initialization; if safe marker retraction is
-still incomplete, recovery continues in the background and only the replacement
-UDP producer waits for that boundary. Other mesh/admin listeners still start,
-while predecessor rules retain a fail-closed UDP posture. Once retraction is
-complete the producer may safely republish `.udp-ready`; stale host-state reaping
-can continue without retracting those new markers. A node-agent that stops
-acknowledging therefore leaves those pods' UDP dropped rather than released — the
-mesh proxy logs the outstanding pods periodically and keeps retrying.
+**Why the host namespace needed a different mechanism.** The pod-netns generator
+splits inbound from outbound with `-m addrtype --dst-type LOCAL`, which is only
+true inside a pod. In the host namespace pod IPs are forwarded, not local, so
+inbound-to-pod UDP would match the outbound chain's `! --dst-type LOCAL` and be
+mis-captured. The host path therefore does not use `addrtype` at all.
 
-Direction is discriminated by INGRESS INTERFACE — `mangle PREROUTING -i <the
-pod's host-side interface>` — which is exact in the host namespace: a pod's egress
-is the only traffic entering there on that pod's own interface, pod-destined
-traffic arrives on the node uplink, and the node's own traffic is locally
-generated and traverses `OUTPUT` only. **No `mangle OUTPUT` chain is installed at
-all**, so node traffic cannot be captured. Each datagram is attributed to a pod by
-its ingress interface index plus its registry-published source address; anything
-not attributable to exactly one enrolled pod is dropped rather than relayed under
-an absent or neighbouring identity, and two pods resolving to one interface are
-both refused.
+**The discriminator is the ingress interface.** In `mangle PREROUTING`, every
+capture rule carries `-i <that pod's host-side interface>`:
 
-This placement enters no namespace, so the host UDP path needs `NET_ADMIN` and
-the capture tools but **not** `hostPID`, `SYS_ADMIN`, or `SYS_PTRACE`; the chart
-narrows the ambient DaemonSet's capabilities accordingly while retaining its
-baseline `NET_RAW`. It keeps the registry hostPath (the enrolled-pod set and the
-registry-published pod addresses) and the read-only host cgroup mount, and
-resolves each pod's host-side interface only from the host route table keyed on
-the registry-published pod IP — `/proc/net/route` for a v4 address and
-`/proc/net/ipv6_route` for a v6 one, so an **IPv6-only** enrolled pod resolves on
-this path too rather than being refused for want of an address it does not have.
-A pod's own `/proc` or sysfs view is never consulted. The lookup accepts only
-an unambiguous `/32` or `/128` host route, and sysfs must identify the resolved
-device as a distinct peer rather than a self-linked bridge/uplink. A broader
-route through a shared bridge is refused because it is not per-pod interface
-ownership evidence. It requires a CNI that gives each pod its own host-side
-interface.
-The production host-netns TPROXY datapath is live-gated by the required
-`ambient-host-udp-live` workflow ([#3705](https://github.com/ferrum-edge/ferrum-edge/issues/3705)).
-Full behaviour, ownership, and the enforced generation-bound cleanup/finalize
-workflow are in [`docs/mesh.md`](mesh.md) → "Ambient UDP placement migration".
+| Traffic | Where it appears in the host namespace | Captured? |
+|---|---|---|
+| An enrolled pod's egress | `PREROUTING` on **that pod's** interface | **Yes** — this is the whole capture set |
+| Traffic destined for a pod | `PREROUTING` on the **node uplink**, then forwarded | No — never matches a pod interface |
+| The node's own traffic (kubelet, CNI, DNS, `hostNetwork` pods, the proxy's own relay egress) | `OUTPUT` only | No — **the host path installs no `mangle OUTPUT` chain at all** |
+
+That last row is structural, not a filter: there is no OUTPUT chain, no `-j MARK`,
+and no loopback reinjection loop, so node traffic cannot be captured even by
+misconfiguration.
+
+**Per-datagram identity.** One transparent socket serves every enrolled pod, so
+evidence is resolved per datagram from two kernel-provided facts — the original
+destination (`IP_RECVORIGDSTADDR`, un-rewritten by TPROXY) and the ingress
+interface index (`IP_PKTINFO`/`IPV6_PKTINFO`, a fatal `setsockopt` for this path).
+The interface index must map to exactly one enrolled pod **and** the datagram's
+source address must be one that pod published in the registry. Neither fact comes
+from the datagram payload, so forging a source address does not change which
+interface a packet entered on. A datagram failing either check is dropped; the
+path never falls back to an unattested or mesh-wide identity.
+
+**Requires per-pod host interfaces.** Two enrolled pods resolving to one interface
+(a shared-bridge CNI, or a stale registry entry on a recycled veth) make
+attribution ambiguous, so **both** are refused — first-wins would be a
+cross-tenant identity bug. Refused pods are not captured and their readiness
+marker is withheld, so the node-agent's tc guard keeps their UDP egress closed
+rather than letting it bypass the mesh. A pod is also refused when it has no
+attested SPIFFE identity, no published address, an unresolvable interface, or a
+name this path will not place in an `iptables -i` argument (notably a `+` suffix,
+which would be a prefix wildcard).
+
+**Privileges.** The host UDP path's running producer needs `NET_ADMIN` plus
+`iproute2`/`iptables` in the image — but **not** `SYS_ADMIN` or `SYS_PTRACE`,
+because no namespace is entered. The chart narrows those capabilities
+automatically when this placement is selected while retaining the ambient
+container's baseline `NET_RAW`. The settled host-netns placement renders **no**
+`hostPID` at all. The default preflight is an init container in the same pod,
+but it resolves target pids through a read-only host `/proc` mount declared on
+that container alone rather than through the pod-scoped host PID namespace, so
+neither the mount nor `SYS_ADMIN`/`SYS_PTRACE` survives into the steady-state
+producer. A cluster that refuses a host `/proc` hostPath or those init
+capabilities cannot use this default unchanged — set
+`ambient.udpNodePreflight.enabled=false` and follow the documented fail-closed
+operator recovery path. With `hostPID` absent,
+the registry hostPath and read-only host cgroup mount stay (the enrolled-pod
+set and interface resolution use them). Interface resolution always uses the
+host route table keyed on the registry-published pod IP; a pod's own sysfs view
+is workload-controlled and is never ownership evidence. The lookup covers **both
+families** — `/proc/net/route` for a v4 address and `/proc/net/ipv6_route` for a
+v6 one — which is what lets an IPv6-only enrolled pod use this placement at all:
+a v4-only lookup would refuse every such pod while the path claimed dual-stack
+support. Route resolution accepts only an
+unambiguous `RTF_UP` host route (`/32` for IPv4 or `/128` for IPv6), and the
+resolved sysfs device must expose a distinct non-zero peer `iflink`: a broader
+subnet route commonly names a shared CNI bridge, while a self-linked device is
+not a dedicated pod peer. Using either in `iptables -i` could capture enrolled
+and unenrolled neighbours alike. Two devices claiming the same host route
+resolve to nothing rather than to a guess, an oversized table refuses instead
+of answering from a truncated view, and malformed rows are ignored unless a
+valid, unambiguous host route remains.
+
+**Ownership and cleanup.** The path owns `mangle` chain `FERRUM_MESH_UDP_HOST`,
+guards `FERRUM_MESH_UDP_HOST_GUARD_A`/`_B`, routing table `33135`, and `ip rule`
+priority `101` — all disjoint from the pod-netns path (`33133`/`100`) and from the
+node-agent's tc ingress-redirect table (`33134`), so neither teardown can remove
+the other's state. Startup reaps the previous generation before installing
+anything — but only **after** discharging its durable readiness handshake (next
+paragraph); a deployment that is **not** using this placement runs the same
+recovery-then-reap, so a switched-away node cannot keep a jump into a chain no
+socket serves. Reconciliation rebuilds the chain's contents behind a scope-exact
+DROP guard while the `PREROUTING` jump stays constant; guard install, capture install,
+socket bind, or guard release failing all leave the node dropping enrolled UDP
+egress rather than leaking it. Shutdown retracts readiness, waits briefly (bounded
+to fit inside mesh mode's background-task drain) for the node-agent to acknowledge
+that its BPF gates closed, and only then removes everything; without the
+acknowledgement it installs the DROP guard and retires the capture jumps/routes
+while retaining the guard. The wait must not exceed that drain budget: an aborted
+handshake leaves socketless host jumps and fwmark routes behind.
+
+**Hosted live-kernel coverage (#3705).** The required
+`ambient-host-udp-live` workflow exercises the production
+`ProxyHostUdpBackend` / host-netns TPROXY path with
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` on a privileged runner: two
+independent workload netns/veth pairs, IPv4 and IPv6 delivery, original-destination
+recovery, ingress-ifindex attribution (including same-source-port /
+same-destination probes from distinct workload IPs kept distinct by interface),
+transparent replies, restart/reinstall, exact Ferrum-owned cleanup, and explicit
+negatives (source spoofing, missing/zero pktinfo, unenrolled/ambiguous interfaces,
+node-originated and inbound-to-pod traffic, fail-closed prerequisite/partial-install
+contracts). `FERRUM_LIVE_TESTS_REQUIRED=1` converts unsupported runners into hard
+failures. Bounded redacted diagnostics capture rules/routes, Ferrum chains, socket
+bind state, interface indexes, and post-cleanup state.
+
+**A restart is a handshake too.** Readiness is durable and shared with the
+node-agent, so a generation that dies — a crash, a restart, a rollout that
+switches placement or turns UDP capture off — leaves behind BOTH its `mangle`
+state and an open BPF UDP gate for every pod it readied. Leaving the rules is
+safe (a capture path whose socket died with its process drops), but removing them
+while those gates are open is exactly a plaintext window, and the stale interface
+set does not bound the damage: a pod that restarted onto a new veth has no stale
+rule at all and an open gate regardless. So the first thing a new generation does
+is **not** a teardown. It reads the durable `.udp-ready` and `.udp-ack-required`
+directories, puts every pod they name back through the ordinary close handshake
+(persist a fresh `.udp-ack-required`, delete any `.udp-not-ready` so a stale
+acknowledgement cannot authorize this handoff, then retract `.udp-ready`), and
+waits for the node-agent to republish `.udp-not-ready`. Nothing is applied and
+nothing is removed until that settles, and a reap that fails is retried rather
+than logged once — an abandoned `PREROUTING` jump would otherwise black-hole the
+node's UDP with no code path left to clean it up. A pod also settles when
+readiness REAPPEARS for it: this recovery's own retraction removed the marker, so
+a marker that exists again was published by the incoming per-pod-netns producer,
+which publishes only once it is capturing that pod inside its namespace — its
+egress no longer reaches the host namespace at all. Without that clause the two
+halves of a placement switch would deadlock, each waiting on the other. On a node
+whose placement is now the pod-netns producer, mesh startup runs one bounded
+recovery pass before returning to unrelated listener startup. If safe retraction
+is still incomplete, recovery continues in the background and only the incoming
+UDP producer waits on that boundary, so it cannot fight recovery over the shared
+markers; admin, HBONE, and other proxy listeners still start. Until the boundary
+resolves, predecessor rules remain installed and enrolled UDP stays fail-closed.
+Stale-state reaping can continue after the incoming producer starts because
+discovery/retraction is then frozen, and republished readiness is the
+acknowledgement that settles a placement switch.
+
+**A pod LEAVING capture is a handshake, not a rule deletion.** Removing a
+`.udp-ready` marker does not synchronously close the node-agent's BPF UDP gate,
+so a pod that is removed or becomes refused keeps its capture rule until the
+node-agent publishes the matching `.udp-not-ready` acknowledgement — the same
+durable `.udp-ack-required` handshake shutdown and the pod-netns cleanup manager
+use. Until then the guard installed for the rebuild covers the **union** of the
+interfaces the new generation captures and the interfaces of every pod still
+owing an acknowledgement, so the departing pod's egress is dropped rather than
+released in plaintext; a failed persistence or an acknowledgement timeout keeps
+that posture and retries on the next poll. A pod that re-enters capture before
+its acknowledgement arrives cancels the handshake and is readied again by the
+ordinary apply path. Withdrawing (or re-attributing) a binding also **restarts
+the shared capture listener** before the new evidence generation goes live: a
+session admitted earlier still holds the old workload identity and its
+transparent reply socket, so a one-way return stream would otherwise keep
+reaching a removed — or recycled — pod address until it idled out. A pure
+addition is not disruptive and leaves live sessions alone. The capture loop is
+supervised on every reconcile: one that exits on its own (a socket error, a
+panicked task) is detected, the datapath is guarded, stale evidence is cleared,
+and the loop is restarted through the normal guarded apply path instead of the
+node black-holing captured traffic while readiness stays published. An
+operator-requested shutdown is never mistaken for such an exit.
+
+**Placement migration is runtime-enforced.** Host cleanup cannot enter workload
+network namespaces, and pod cleanup must not guess that host objects are absent.
+Ferrum therefore rejects a stable requested placement that differs from the
+durable node-local owner. The Helm chart also records the rendered target and
+migration tuple in `ferrum-mesh-udp-placement-<release>`; on upgrade it rejects a
+direct target change before accepting a disruptive DaemonSet rollout. The only
+supported change is the explicit cleanup/finalize procedure below.
+
 During cleanup the node-agent retracts `.udp-registry-synced` at relist start and
 atomically republishes a bounded proof containing the requested generation and a
 fresh publication identity only after `InitDone`; the proxy will not prove
@@ -597,6 +713,708 @@ HTTP/TCP/gRPC liveness, readiness, or startup probe. Keep
 `FERRUM_NODE_AGENT_NODE_IPS` limited to source addresses that are required for
 the host-network relay and kubelet probes; other host traffic still needs the
 trusted relay mark or follows the UDP/extension-header fail-closed behavior.
+
+### Ambient UDP upgrade notes
+
+Ambient topology keeps the per-pod registry and stale-rule cleanup lifecycle
+active even when UDP capture is disabled. Consequently, an Ambient node without
+eBPF support refuses node-agent startup instead of entering the host
+iptables fallback: that fallback cannot publish the registry, so proceeding
+would strand fail-closed pod-netns guards. Existing Ambient fleets relying on
+the fallback must move workloads to eBPF-capable nodes before upgrading.
+
+The Helm chart provisions every `ambient` deployment with an enabled node-agent
+for this lifecycle, including when UDP capture is currently off and even when
+`nodeAgent.captureMode=iptables`. Both DaemonSets receive the shared registry and
+`FERRUM_MESH_TOPOLOGY=ambient`, so an iptables fallback reaches the node-agent's
+fail-closed startup check instead of silently bypassing cleanup. In the supported
+eBPF configuration the node-agent keeps the distroless `-ebpf` image, while the
+ambient proxy is rendered with the tools-capable `-ebpf-tools` image, shares the
+pod-registry hostPath, and is granted the setns/`NET_ADMIN` capabilities needed
+for stale pod-netns cleanup. The image split is load-bearing, not cosmetic: the
+UDP producer and the disabled stale-rule cleanup manager both execute generated
+`sh -c` scripts calling `ip`/`iptables`/`ip6tables`, and the distroless `-ebpf`
+image ships none of them, so `preflight_capture_tools` refuses startup there by
+design. `-ebpf-tools` is a strict superset of `-ebpf` (same binaries, same BPF
+ELF) on a Debian base; it is not distroless and runs as root, so only the pod
+that needs the tools receives it. This is a deliberate security-footprint
+increase that makes a later enabled-to-disabled rollout repairable without
+another chart shape change.
+
+Every node-agent restart re-derives enrollment from the live Kubernetes pod
+list. During that relist it removes existing `.udp-ready` markers and closes the
+host-veth UDP gate; producers rewrite readiness on their next registry poll
+(at most two seconds) and the node-agent reopens the gate on its next readiness
+reconcile (at most 250 ms). Budget roughly 2.5 seconds of fail-closed UDP
+unavailability per node-agent restart; traffic is dropped during the interval,
+not allowed to bypass capture.
+
+#### Ambient UDP placement migration (enforced hard-upgrade guard)
+
+Every placement or enabled-state change uses one operator-chosen generation and
+two explicit releases. The placements are `pod-netns`, `host-netns`, and
+`disabled`; the destination must agree with
+`FERRUM_MESH_CAPTURE_UDP_ENABLED` and
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`. A later transition must choose a
+new generation rather than reusing the most recently completed value.
+
+Migration cleanup consumes the same strict, bounded, all-or-nothing pod-
+registry snapshot as the inbound relay node bound. A registry leaf that is
+unlinked between enumeration and open is skipped as an ordinary pod-withdrawal
+race; every present malformed `spiffe_id=` / `ipv4=` / `ipv6=` value, duplicate
+recognized key, unrecognized non-empty line, unsafe leaf name, or unreadable /
+oversized / symlinked / non-regular entry makes the pass report
+`registry_not_synchronized`. Regenerate legacy or hand-authored entries
+with the node-agent before starting a placement migration.
+
+The Helm-side contract is a live-cluster guard. Run these transitions with
+`helm upgrade` under an identity allowed to read the release namespace: Helm's
+`lookup` must read the installed
+`ferrum-mesh-udp-placement-<release>` ConfigMap. `helm template` does not query
+the cluster. Without `--is-upgrade` it therefore cannot enforce predecessor
+ordering; with `--is-upgrade` its empty lookup is treated as a pre-contract
+release and blocks ordinary upgrades. GitOps/client-render pipelines must add
+an equivalent cluster-state admission gate if they need the Helm-side check.
+The per-node durable runtime guard remains authoritative, fail-closed, and
+independent of that pipeline gate.
+
+1. Render the destination switches plus
+   `FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup`, a new
+   `..._GENERATION`, and exact `..._FROM` / `..._TO` values. Do not use Helm
+   `--wait`: cleanup pods deliberately remain unready. The chart temporarily
+   uses `maxUnavailable: 100%` so that intentional unready state cannot deadlock
+   the DaemonSet rollout. This can restart every Ambient proxy simultaneously,
+   interrupting HBONE and raw TCP as well as UDP; finalize applies the same
+   strategy and can create a second mesh-wide restart. Schedule both releases
+   in a maintenance window sized for complete Ambient data-plane interruption.
+   When the predecessor is `pod-netns` (or the conservative
+   `disabled` case), the cleanup pod retains `hostPID`, `SYS_ADMIN`,
+   `SYS_PTRACE`, and `NET_ADMIN`. Stable/final host placement drops
+   `SYS_ADMIN`/`SYS_PTRACE` and `hostPID` from the pod entirely. The default
+   preflight keeps `SYS_ADMIN`/`SYS_PTRACE` and its read-only host `/proc`
+   mount on the init container only; it needs no `hostPID`, which is why the
+   settled pod can drop that pod-scoped field while still running the stage.
+2. Wait for every node's authenticated `/health` detail
+   `mesh.udp_placement_migration.phase` to become `cleanup_complete` (the HTTP
+   status remains 503 because readiness is intentionally false), or for
+   `ferrum_mesh_udp_placement_migration_phase{phase="cleanup_complete"}` to be 1.
+   `ferrum_mesh_udp_placement_migration_outstanding` and the bounded
+   `..._failures_total{reason}` family diagnose progress without generation or
+   pod-UID labels. A cleanup image missing the required setns/iptables tooling
+   reports phase `failed` with reason `pod_cleanup_failed`; the UDP producer and
+   cleanup stay stopped, but admin/HBONE/TCP listeners remain available for
+   diagnosis while readiness stays false. Repair the image or privileges and
+   restart the same cleanup tuple.
+3. Upgrade the same destination with phase `finalize` and the identical
+   generation/from/to tuple. Helm requires the installed cleanup ConfigMap, and
+   each incoming proxy independently requires its node-local durable completion
+   proof before publishing readiness or starting a producer. An early finalize
+   therefore fails closed on only the nodes lacking proof; it never guesses from
+   a missing marker.
+4. After the finalize DaemonSet is ready, remove generation/from/to and return
+   phase to `stable`. The durable active owner remains, so later restarts resume
+   the selected producer without repeating migration. Use a committed values
+   file that omits the three tuple keys for this release; do not carry them
+   forward with `--reuse-values`.
+
+**Node reboots and scale-out.** The node-local durable record lives in the pod
+registry hostPath (`nodeAgent.podRegistryDir`, default `/run/ferrum/...`, which
+is tmpfs on a systemd host). A node reboot recreates that directory, and a node
+that joins the cluster after the migration never had one, so neither carries a
+durable record. Both nonetheless provably carry **no** predecessor rules: pod
+network namespaces do not survive a reboot, and a new node has never run a
+predecessor producer. From the stable release onward the chart therefore renders
+`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` from the **installed**
+`ferrum-mesh-udp-placement-<release>` ConfigMap — only when that installed
+contract already records the same target in a `stable` or `finalize` phase, so
+the release that performs a change can never attest itself. A node with no
+durable record then adopts that placement (once the node-specific proof below
+also agrees), records it durably, logs the adoption, sets
+`mesh.udp_placement_migration.established_adoption` on authenticated `/health`,
+and increments `ferrum_mesh_udp_placement_migration_adoptions_total{proof}` for
+the node-specific proof that authorized it — `new_boot` (including a durable
+record that survived from an earlier boot of this same node UID),
+`node_cleanup`, or `operator_exempt`. The
+attestation is consulted **only** when the durable record is absent: a present
+record that disagrees with the requested placement is still the hard rejection
+above, so an in-place flip on a running node can never be authorized this way.
+
+That release-level value is **desired state, never authorization**
+([#3809](https://github.com/ferrum-edge/ferrum-edge/issues/3809)). It records a
+target, a phase, and a generation — no node identity, no node incarnation, and
+no per-node cleanup result — so it cannot tell a fresh or rebooted node from a
+**pre-contract node that stayed booted with live workloads** while it was
+partitioned, cordoned, or otherwise unavailable throughout the cleanup and
+finalize rollout. That node's pod network namespaces can still hold predecessor
+TPROXY rules pointing at a listener that no longer exists, so adopting on the
+release object alone would start the host producer into a deterministic
+node-local UDP blackhole.
+
+#### Node-specific proof for a recordless host placement
+
+A recordless `host-netns` start is therefore admitted only when the release
+attestation agrees **and** node-specific evidence bound to this exact machine
+and incarnation agrees. Every proof is bound to the immutable
+`Node.metadata.uid`, the current boot id, the requested target, and the
+release's `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION`:
+
+| Proof | Evidence | Why it is sound |
+| --- | --- | --- |
+| `new_boot` | The durable `.udp-placement-state-v1.json` record exists and carries an earlier boot id for this same node UID (only reachable on a persistent registry path). | Every pod network namespace that could hold predecessor rules died with the previous incarnation. |
+| `node_cleanup` | `.udp-node-cleanup-proof-v1.json`, published by the privileged node preflight after it retired both predecessor placements. | The retirement itself is the proof; nothing is inferred from absence. |
+| `operator_exempt` | `.udp-placement-node-exempt`, written by an operator with the same node-UID/boot-id/target/generation binding. | An explicitly decommissioned or exempt node is distinguished from one that merely missed the migration. |
+
+**The node-proof generation is migration-era-specific, and it cannot recur.**
+Binding a proof to a generation is only a staleness boundary if that generation
+changes across every placement migration. A generation derived from the
+release's *observable shape* — `<target>-<phase>`, say — repeats the moment a
+target and phase recur: an old settled host era writes `host-netns-stable`, the
+cluster later migrates host → pod and then pod → host, and that same token names
+the NEW host era, so a same-boot node that missed the intervening
+cleanup/finalize rollout could replay its stale proof into it. The placement
+ConfigMap therefore persists a monotonic `nodeProofEra` ordinal and an
+era-qualified `nodeProofGeneration` of the form `e<era>.<migration generation>`.
+The ordinal is incremented exactly once when a cleanup release *starts* a
+migration (re-rendering the same cleanup release resumes the era already open),
+and is then carried forward unchanged through finalize and every settled release
+after it. A **present** installed `nodeProofEra`/`nodeProofGeneration` pair is
+validated as one unit: both must be well-formed, in the supported 1..=10 digit
+era bounds, and consistent (`nodeProofGeneration` is exactly
+`e<era>.<nonempty generation>` for that era). A malformed, incomplete,
+out-of-range, or mismatched pair fails chart rendering rather than being coerced
+to era 0 — that coercion would let the next cleanup emit `e1.*` again and
+recreate a token an earlier placement era already used. Increment is refused
+when the next ordinal would overflow those bounds. Only the pre-contract
+**absence of both fields** may enter the explicit cleanup migration, which
+stamps era 1; there is no compatibility fallback for a partial or malformed
+pair. `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` is that persisted
+value and nothing else — there is no derived fallback, and the runtime refuses a
+value that is not era-qualified with `node_proof_missing`, so a client-render
+pipeline supplying the variable directly is held to the same non-recurrence
+contract. An initial install, and any contract installed before this field
+existed, carries no node-proof generation at all; that is fail-closed, and the
+settled host DaemonSet refuses to render until an explicit cleanup/finalize pair
+has stamped one.
+
+Anything else refuses before the incoming producer starts, with readiness false
+and a bounded failure reason: `node_proof_missing` (no attestation, an
+attestation from an earlier boot, a target mismatch, or no node identity at
+all), `node_identity_mismatch` (durable ownership or an attestation naming a
+different Kubernetes node UID — a reused node name can never inherit another
+machine's evidence), `node_identity_unresolved` (see below),
+`generation_mismatch` (a superseded node-proof
+generation), and `durable_state_rejected` (unreadable, oversized, symlinked,
+multiply-linked, foreign-UID, or malformed evidence). A
+`.udp-placement-quarantined` tombstone still refuses every absent-state
+bootstrap ahead of all of this.
+
+**An identity-bound durable record fails closed when current identity is
+unknown.** The node-UID comparison above is only a boundary while BOTH sides of
+it exist. If the durable record carries an incarnation but this process cannot
+resolve the current node identity — the node-agent could not read
+`Node.metadata.uid` (RBAC removed, API server unreachable), no
+`FERRUM_K8S_NODE_UID` was supplied, or the boot id is unreadable — then a
+restored `hostPath`, a copied registry artifact, or a rebuilt machine reusing a
+node name would have its record trusted verbatim, because there is nothing left
+to compare it against. Every phase therefore refuses such a record BEFORE
+reading it, with failure reason `node_identity_unresolved`, and the operator
+recovers by restoring the node-agent's `nodes: get` permission (or supplying
+`FERRUM_K8S_NODE_UID` directly).
+
+**Durable ownership that names no node is never adopted.** A record carrying no
+incarnation — one written before this binding existed, or one written by a
+process that could not resolve an identity — asserts no ownership claim at all,
+so it cannot prove which machine established the placement it describes. A
+registry directory restored from a backup, copied between machines, or
+reattached under a recycled node name presents exactly that shape. Ferrum
+therefore refuses it for every placement that runs a producer (`pod-netns` and
+`host-netns` alike), with failure reason `migration_required`, whether or not a
+current identity is resolvable — a missing identity is not a way past it.
+`disabled` runs no producer and carries no traffic, so it is the one placement
+an unbound record may still carry, and it is bound as soon as an identity is
+resolvable. The supported recovery is the explicit cleanup/finalize pair, which
+retires the exact Ferrum-owned predecessor state on this node and binds this
+node's identity to the record it leaves behind; from then on the ordinary
+node-UID boundary applies. Node identity is therefore a **requirement** for
+running an Ambient UDP producer across a restart, not merely an input to the
+`host-netns` proof.
+
+That recovery cannot complete into the shape it recovers from. Finalize is the
+boundary at which node ownership is asserted — it flips `active` to the incoming
+placement, returns a running producer in that very process, and leaves the record
+every later start reads as evidence this node established the placement — so a
+finalize whose target runs a producer is **refused** (`node_identity_unresolved`)
+when neither the record nor the request carries an identity. Cleanup may still
+run without one, because it only retires state; `disabled` may still be
+finalized without one, because it owns no producer and carries no traffic.
+
+The proof is visible on authenticated `/health` as
+`mesh.udp_placement_migration.adoption_proof` (with `established_adoption` true
+whenever the node started without a same-incarnation durable record) and as
+`ferrum_mesh_udp_placement_migration_adoption_proof{proof}` /
+`ferrum_mesh_udp_placement_migration_adoptions_total{proof}`. None of these
+surfaces carries a node identity, a path, a generation, or any other
+operator-supplied value.
+
+#### The privileged node preflight
+
+The chart renders a one-shot `ferrum-udp-node-preflight` **init container** on
+every settled `host-netns` Ambient pod (`ambient.udpNodePreflight.enabled`,
+default `true`). It runs `ferrum-edge ambient-udp-preflight` from the same
+`-ebpf-tools` image and is the only producer of `node_cleanup` proof.
+
+##### Why it lives in the proxy's own pod
+
+Same-pod placement is the ordering guarantee, not a packaging convenience.
+Kubernetes runs an init container to completion before the app container starts
+**within one pod**, and provides no startup ordering at all between two
+DaemonSets. Both `.node-identity-v1.json` and
+`.udp-node-cleanup-proof-v1.json` live on the shared registry hostPath, and both
+survive a Kubernetes Node object being deleted and recreated under the **same
+name on the same boot** — the runtime accepts a published identity whose boot id
+is this incarnation's, and the proof written under it matches. A preflight in
+its own DaemonSet could therefore be scheduled *after* a replacement proxy had
+already read that stale old-UID pair and adopted the host placement; eventual
+retraction by the preflight or the node-agent does not close that window,
+because the adoption already happened. Because deleting a Node object also
+deletes the pods bound to it, keeping the init container in the proxy pod means
+every replacement proxy carries its own preflight, which retracts the leftover
+publication and republishes only what it proved **before** the steady-state
+container can start. Do not split this into a separate DaemonSet.
+
+A non-zero exit keeps the whole pod non-running and is retried fail-closed by
+the kubelet; a successful exit runs once for that pod, and a generation, image,
+or config change rolls the DaemonSet and re-runs it. It is an ordinary init
+container: it has no container-level `restartPolicy: Always` (which would make
+it a native sidecar and keep the privileged process alive beside the proxy), and
+it is never an ordinary container (which would restart the one-shot forever).
+
+##### Why it needs no `hostPID`
+
+`hostPID` is a PodSpec field, so granting it for the init stage would leave the
+long-running proxy container in the host PID namespace for its whole lifetime.
+Instead the chart mounts the host's own `/proc` **read-only at `/host/proc` on
+the init container alone** and passes `--host-proc-root /host/proc`. That flag
+redirects only **target**-pid reads: pod cgroup membership and the resulting
+`<root>/<pid>/ns/net` handle. `/proc/self/ns/net` — the stage's own namespace
+identity and the `setns` save/restore handle — always comes from the container's
+own procfs, because the preflight already runs in the host network namespace and
+must compare pod namespaces against its own.
+
+The redirect also changes *how* a pod's pid is found. `cgroup.procs` is
+translated into the reading process's PID namespace (cgroup v1 omits invisible
+tasks, cgroup v2 prints them as `0`), so a container that mounted the host's
+procfs but kept its own PID namespace cannot use it. With an explicit root the
+lookup is inverted: `<root>/<pid>/cgroup` is scanned and matched against the
+registry-published cgroup path by component-aligned suffix, which no PID
+namespace can distort. The default (`/proc`) path keeps the original
+`cgroup.procs` read unchanged, so the mesh data plane's own cleanup phase is
+byte-for-byte unaffected.
+
+The mount, `SYS_ADMIN`, and `SYS_PTRACE` are all declared on the init container
+only. The steady-state container has no host `/proc` mount, no host PID
+visibility, no preflight command, and keeps its narrow `NET_ADMIN`/`NET_RAW`
+pair.
+
+##### What it does
+
+The init container:
+
+1. It resolves this node's identity **authoritatively**, from this node's own
+   Kubernetes object, and never from the node-agent's published
+   `.node-identity-v1.json` (see *Node identity* below). It retracts any
+   publication first, **then** reads this incarnation's boot id, then performs
+   one bounded read-only `get` bound to the node name the downward API stamped
+   on this pod. The chart injects `FERRUM_K8S_NODE_NAME` from `spec.nodeName`
+   when the preflight is enabled; `ambient.env.FERRUM_K8S_NODE_NAME` fails
+   rendering so the lookup cannot be redirected to another Node object. An
+   explicit `FERRUM_K8S_NODE_UID` skips the API lookup. The lookup uses in-cluster
+   config only; a missing in-cluster config fails closed unless the explicit
+   UID is set. The ambient pod sets `automountServiceAccountToken: false` and
+   always projects a short-lived `kube-api-access` volume (token, `kube-root-ca.crt`,
+   namespace) at the standard service-account path into the steady-state proxy,
+   so Kubernetes-backed controller, discovery, and TLS/source identity keep
+   working. The privileged init container mounts that volume **only when no
+   explicit `FERRUM_K8S_NODE_UID`** is supplied; the explicit-UID path performs
+   no API call and must not receive the bearer token. The chart's `nodes: get` grant
+   has no list/watch/write and no `resourceNames`; Kubernetes therefore permits
+   a named GET for any node whose name is already known, and the **runtime
+   request** is what binds the lookup to this pod. It republishes only what it
+   proved. Every failure path — an unremovable stale publication, an unreadable
+   boot id, a lookup/RBAC/API failure, a node object with no UID, or a failed
+   republication — leaves NO identity and exits non-zero.
+2. It retracts any existing cleanup proof and runs the idempotent predecessor
+   retirement on **every** invocation. A leftover
+   `.udp-node-cleanup-proof-v1.json` is not authority for a newly starting
+   preflight pod: a Helm rollback, a re-applied historical manifest, or a
+   restored ConfigMap can recreate an earlier era's generation token, and a
+   mutable monotonic counter cannot prove that did not happen. Cleanup is
+   ownership-safe and idempotent, so a genuine restart is a second complete
+   pass rather than a skip.
+3. It waits for the node-agent's authoritative `.udp-registry-synced`
+   publication — republished under the node-proof generation while no migration
+   generation is in flight, and **bound to the node UID that agent resolved** —
+   so it never retires rules against a registry that may not yet list every
+   enrolled pod, and never against the pod inventory of a previous Kubernetes
+   Node object. A publication naming a different UID, or none at all, is not
+   consumable by the preflight; the migration cleanup phase, which already
+   decides from durable node-bound ownership, still consumes an unbound one.
+4. It enumerates every enrolled pod network namespace plus the host namespace
+   and retires **both** predecessor placements for **IPv4 and IPv6** by exact
+   Ferrum-owned name: the `FERRUM_MESH_UDP_*` chains and jumps, the
+   `FERRUM_UDP_FAIL_CLOSED_{A,B}` pod-netns guard chains, and the exact
+   Ferrum-owned policy rule and route. It never flushes a table, never matches a
+   chain by pattern, and never touches a co-resident CNI's or Istio's state. A
+   pre-contract node with no durable owner is exactly the conservative
+   both-domains case the cleanup phase already handles, so the same supervisor
+   implements both and they cannot drift.
+5. It publishes the attestation only after two identical complete passes under
+   one continuous registry publication, re-checking that publication immediately
+   before the write.
+
+It exits non-zero without publishing anything on any failure or on its
+`--timeout-seconds` budget (default 300), so the unprivileged steady-state
+container never starts on a node whose retirement could not be proven. That
+budget is a wall-clock ceiling: the preflight owns every `sh`/iptables/ip child
+it starts, waits with `try_wait`, collects stderr under the same ceiling, and
+SIGKILLs the child's process group if the deadline wins — including when the
+shell has already exited but a grandchild still holds the inherited stderr pipe
+or process state. Explicit-root target-PID resolution (the host `/proc` scan
+used for both netns-key reconcile and the stable netns handle open) observes
+the same Instant ceiling during the walk and returns a classified deadline
+outcome instead of continuing toward the 262,144-entry scan cap. Process-group
+cleanup failure is reported rather than claimed
+as a successful termination; the caller still fails closed and withholds proof.
+A proof publication that races the deadline is retracted (or invalidated into a
+record no reader will treat as attestation) before the deadline outcome is
+returned, so a timeout cannot leave a usable cleanup attestation behind. A
+stalled cleanup command cannot pin the current-thread runtime or leave an orphan
+mutating network state after timeout. `SYS_ADMIN`, `SYS_PTRACE`, and the
+read-only host `/proc` mount are confined to the init container; after it exits
+the host placement keeps its narrow `NET_ADMIN`/`NET_RAW` steady-state
+capability posture, with no host-proc mount and no host PID namespace anywhere
+in the pod. The elevated init stage is also narrower than the pod default rather
+than merely additive: it sets
+`allowPrivilegeEscalation: false` and drops `ALL` capabilities before adding
+back exactly `NET_ADMIN`, `NET_RAW`, `SYS_ADMIN`, and `SYS_PTRACE`, so those
+four are its complete, declared privilege surface and it inherits nothing from
+the runtime's ambient or default set. This same-pod ordering is **not** usable
+unchanged on a cluster that refuses a host `/proc` hostPath or the init stage's
+setns capabilities.
+
+On such a cluster, set `ambient.udpNodePreflight.enabled=false` and adopt each
+node explicitly. That does **not** relax the runtime boundary: write
+`.udp-placement-node-exempt` into the node's registry directory only after you
+have independently established that the node carries no predecessor rules (it
+was reimaged, or its workloads were drained and restarted), using the mesh
+container's effective UID, a single link, and the same atomic
+temp/fsync/rename/fsync-directory sequence the recovery procedure below
+specifies:
+
+```json
+{"version":1,"node":{"node_uid":"<Node.metadata.uid>","boot_id":"<contents of /proc/sys/kernel/random/boot_id>"},"target":"host-netns","generation":"<FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION>"}
+```
+
+**Node identity.** The Kubernetes downward API exposes `spec.nodeName` but not
+the node UID, and the mesh proxy holds no Kubernetes client. A validated
+`FERRUM_K8S_NODE_UID` is first-precedence for both the privileged preflight and
+the node-agent and skips the Node API — that is the GitOps/client-render path
+when node GET RBAC is unavailable. An empty or malformed value fails closed
+without a GET and without publishing identity or a UID-bound
+`.udp-registry-synced` proof. Only when the variable is unset does the
+node-agent resolve `Node.metadata.uid` with a bounded `get nodes` and publish
+`.node-identity-v1.json` beside the pod registry. The chart injects the same
+`ambient.env` UID (and `FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH`, when set)
+into both DaemonSets and fails rendering if `nodeAgent.env` tries to override
+either; it grants the identity `nodes: get` only when Ambient UDP needs the API
+and an explicit UID is absent (ingress-topology monitoring retains its own
+broader read verbs when independently required). A published record is honoured only while
+the boot id it recorded is this incarnation's. A transient API, RBAC, or
+publication failure does not freeze that absence for the life of the process:
+the node-agent retries and revalidates on its existing enrollment-retry cadence
+(~30s), remaining fail-closed until it can read this Node object. A same-name
+Node recreation that resolves to a different UID never keeps using the
+predecessor: registry-sync is retracted before the identity change, the stale
+identity is retracted before the replacement is published, and a fresh
+registry-sync marker is bound to exactly the new UID only after the current pod
+inventory is converged. A pipeline that already knows the
+value may set `FERRUM_K8S_NODE_UID` directly, which takes precedence. If neither
+is available the node has no identity, and every recordless host adoption stays
+fail-closed.
+
+**A published identity is not, by itself, evidence of the current Node object.**
+A `.node-identity-v1.json` left by a PREVIOUS Kubernetes Node object on this same
+boot records the CURRENT boot id, so no reader can distinguish it from a live
+one — and a reader-side staleness check is impossible, because nothing local
+changes when a Node object is replaced. The node-agent therefore **retracts** its
+publication before it consults Kubernetes and again after any failure, and treats
+a failed initial retraction as a hard stop rather than publishing over a file it
+could not clear: every failure path leaves NO identity rather than a
+predecessor's, and also withholds the node UID from its registry-synchronization
+publications. The same retract-then-lookup ordering is reused on the
+enrollment-retry cadence so a recovered API/RBAC grant can publish identity
+later, and so a Node object recreated under the same name cannot keep the old
+UID in memory or on disk.
+
+That is a publisher-side mitigation, and the ambient and node-agent DaemonSets
+have no Kubernetes startup ordering between them, so it cannot by itself close
+the window in which the replacement node-agent has not started yet. The
+**privileged preflight therefore does not consume that publication at all**: it
+performs its own bounded, node-name-bound `get` from in-cluster config only
+(step 1 above) and republishes what it proved, immediately before the
+steady-state container starts in the same pod. Because deleting a Node object
+also deletes the pods bound to it, the ambient pod that runs the producer always
+carries a fresh init stage, so the identity its steady-state container reads was
+established by that same pod. This is exactly the ordering a preflight in its
+own DaemonSet would forfeit: Kubernetes would then be free to start the
+replacement proxy first, and the leftover same-boot identity/proof pair would
+already be sufficient. The registry-synchronization marker is bound to the node
+UID the node-agent resolved for the *same* reason, so the
+preflight requires two independent authorities to agree before it retires
+anything: a stale identity and the stale cleanup proof written under it can never
+be self-consistent enough to authorize node-name reuse.
+
+Disabling the preflight (`ambient.udpNodePreflight.enabled=false`) gives up that
+per-pod republication. It does not relax the runtime boundary — a node with no
+durable record and no attestation still refuses — but on such a cluster you
+should clear `.udp-node-cleanup-proof-v1.json` from the registry directory when
+you turn the preflight off, and drive adoption through the explicit
+cleanup/finalize pair or a freshly written per-node exemption.
+
+**Coverage.** The deterministic external suites cover the whole proof boundary
+(pre-contract same-boot refusal, explicit cleanup proof, same-node-UID reboot
+adoption, node-name reuse under a different UID, an identity-bound record with
+no resolvable current identity, unbound durable ownership and its
+cleanup/finalize recovery, a finalize that would leave an unbound
+producer-owning record, a stale same-boot identity publication and its
+retraction, same-boot Node-object recreation, a preflight running before the
+node-agent has published anything, an unreadable boot id after identity
+retraction, every failed retraction/lookup/publication path, a
+registry-synchronization publication from another node, a recurring
+`<target>-<phase>`-shaped node-proof generation, a proof earned in an earlier
+placement era, a leftover cleanup proof that cannot skip a new preflight pod's
+retirement, the cleanup-complete/finalize-missed resumption,
+stale/malformed/release-only evidence, and the dual-stack both-domains
+retirement plan). The chart-side ordering and privilege boundary — one
+DaemonSet, the init container ahead of the proxy container, no `hostPID`, an
+init-only host `/proc` mount and capability set, and ServiceAccount token
+isolation (`automountServiceAccountToken: false`, projected `kube-api-access`
+mounted into the proxy always and into the init container only without an
+explicit UID) — is pinned in
+`tests/unit/gateway_core/ambient_udp_placement_established_helm_tests.rs`, and
+the explicit target-procfs resolution the `hostPID` removal rests on (including
+that the default `/proc` behaviour is unchanged, and that the one-shot scan
+honours `--timeout-seconds`) in
+`tests/unit/gateway_core/ambient_udp_preflight_proc_root_tests.rs`.
+
+The **missed-rollout/rejoin scenario itself is proven on the hosted live
+kernel** by the required `ambient-host-udp-live` gate
+(`host_udp_live_kernel_missed_rollout_rejoin_refuses_then_recovers_without_a_blackhole`
+in `src/proxy/host_udp_capture_live_tests.rs`). It builds the multi-pod
+privileged fixture the scenario needs and keeps the workload pods and their
+network namespaces alive from beginning to end — nothing is restarted or
+recreated:
+
+1. The real predecessor pod-netns TPROXY placement (`IptablesPlan::udp_setup_script`,
+   IPv4 and IPv6) is installed inside two live workload namespaces with no
+   listener behind it — the exact state a skipped node still carries.
+2. The incoming host producer is brought up and the blackhole is DEMONSTRATED:
+   IPv4 and IPv6 workload egress is swallowed inside the pod netns and never
+   reaches the host capture socket.
+3. `prepare_placement` refuses the settled host release for that recordless
+   same-boot node (`migration_required`) and writes no ownership — so a real
+   deployment never reaches step 2's outcome.
+4. The **production** retirement supervisor (`for_node_preflight` +
+   `run_udp_placement_cleanup`, driven inside the fixture's host namespace over
+   a real node-agent pod registry) enumerates both namespaces through the
+   production `cgroup.procs` → PID → `/proc/<pid>/ns/net` path and retires both
+   ownership domains for both families. Nothing is simulated or hand-deleted.
+5. The same release is then admitted with `adoption_proof=node_cleanup`, and the
+   SAME never-restarted workloads' UDP reaches the host producer with exact
+   ingress-interface attribution, correct original destinations for IPv4 and
+   IPv6, and a working transparent return path — the executable proof that no
+   blackhole survives.
+
+The gate's `run.sh` pins the lib live pass count at three and its timeout covers
+the supervisor's polling window; `ambient_host_udp_live_contract_tests.rs` pins
+that the scenario, its production supervisor, and its dual-stack blackhole
+demonstration all remain in the live module.
+
+**Helm and client-render parity.** The boundary lives in the runtime and in
+node-local files, so a GitOps/client-render pipeline enforces exactly the same
+contract: a bare `FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED=<target>` value
+authorizes nothing on its own. Such a pipeline must render the equivalent
+privileged preflight init stage **in the proxy's own pod** (or supply node-bound
+exemptions) — moving it to a separate workload silently forfeits the
+init-before-container ordering the same-boot Node-recreation boundary rests on —
+and must carry
+an era-qualified `FERRUM_MESH_CAPTURE_UDP_NODE_PROOF_GENERATION` on the ambient
+pod, the preflight, and the node-agent. The chart injects `FERRUM_K8S_NODE_NAME`
+from `spec.nodeName` on the preflight when it is enabled (a literal
+`ambient.env.FERRUM_K8S_NODE_NAME` fails rendering); a GitOps/client-render
+pipeline may instead supply `FERRUM_K8S_NODE_UID` on **both** the preflight and
+the node-agent so they share the same identity binding without a Node API lookup.
+When a client-render pipeline overrides the
+boot-id path, it must set `FERRUM_MESH_CAPTURE_UDP_NODE_BOOT_ID_PATH` on both
+processes as well. The preflight's Kubernetes client is in-cluster only; a
+missing in-cluster config fails closed unless the explicit UID is used.
+Omitting any of it is fail-closed but costly:
+affected nodes keep readiness false with a bounded refusal reason until the
+proof exists.
+
+For example, pod-netns to host-netns uses one tuple throughout (replace
+`$GENERATION` with a deployment identifier):
+
+```bash
+helm upgrade ferrum ./charts/ferrum-mesh --reuse-values \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION="$GENERATION" \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns
+
+# After every node reports cleanup_complete:
+helm upgrade ferrum ./charts/ferrum-mesh --reuse-values \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize
+```
+
+Host-netns to pod-netns reverses `FROM`/`TO` and sets the host switch false in
+the cleanup release. Enabled to disabled sets `TO=disabled` and disables capture
+in that release; disabled to enabled names the incoming placement. A `disabled`
+predecessor conservatively reaps both ownership domains, which covers a legacy
+disabled node. Any pre-contract node with no durable owner record also reaps
+both domains, regardless of the declared predecessor, so a mistaken legacy
+placement claim cannot strand Ferrum-owned rules. Accordingly, the first Helm
+upgrade from any pre-contract release requires an explicit cleanup adoption
+release even when the requested placement appears unchanged or disabled: the
+missing ConfigMap cannot prove whether that older release owned pod- or
+host-netns rules. Initial installs are unaffected.
+
+**Abort and durable-state recovery (maintenance only).** There is deliberately
+no online `cleanup -> stable` or tuple-switch transition. Once cleanup is
+persisted, resuming/finalizing that exact tuple is the only traffic-bearing
+path. If the tuple is wrong, or a node rejects a corrupt/truncated/unsupported,
+non-regular, multiply-linked, foreign-UID, or unreadable
+`.udp-placement-state-v1.json`, use this fail-closed procedure:
+
+1. Enter a maintenance window, cordon every node selected by both the Ambient
+   and node-agent DaemonSets, drain all enrolled workloads, and verify there is
+   no workload UDP, HBONE, or TCP traffic left on those nodes. Do not delete or
+   rewrite either artifact while traffic is active.
+2. Stop both DaemonSets and verify that no Ambient proxy or node-agent pod is
+   running on any affected node. This is the proof that neither the pod-netns
+   nor host-netns producer can start while ownership is repaired.
+3. Repair the Helm artifact first. Set
+   `ferrum-mesh-udp-placement-<release>` to the release state that step 4 will
+   make true on the nodes:
+   - for a true abort back to `disabled`: the known predecessor
+     (`target=disabled`, `phase=stable`, and empty `generation/from/to`);
+   - for a true abort back to `pod-netns` or `host-netns`, and for
+     corrupt/unknown ownership: the new cleanup-adoption tuple (a fresh
+     `generation`, `phase=cleanup`, `to=<the placement you are returning to>`).
+
+   This ordering prevents the next Helm operation from authorizing a producer
+   before node-local state is repaired.
+4. On **every** node in the DaemonSet scope, repair the registry hostPath named
+   by `nodeAgent.podRegistryDir`. Retract `.udp-registry-synced` while both
+   processes are stopped, then:
+   - **Abort back to `disabled`.** Atomically replace
+     `.udp-placement-state-v1.json` with this record:
+
+     ```json
+     {"version":1,"active":"disabled","pending":null,"completed":null}
+     ```
+
+     Create the temp file in the same directory, use the mesh container's
+     effective UID and a single link, fsync the file, rename it, then fsync the
+     directory. This record names no owning node. That is accepted only
+     because `disabled` runs no producer, and the first start that can resolve
+     this node's identity binds it.
+   - **Abort back to `pod-netns` or `host-netns`.** Do **not** hand-write a
+     record. A hand-written record cannot carry the node identity binding
+     (`incarnation`) that only cleanup/finalize writes, and stable startup
+     refuses any producer placement whose existing record names no owning node
+     (`migration_required`), even when the current node identity is resolvable.
+     An unbound record is not proof that this node owns the placement. Instead,
+     recover through the same explicit cleanup/finalize path as corrupt
+     ownership:
+     1. Quarantine the state outside the registry and create the tombstone,
+        exactly as in the next bullet.
+     2. Run a cleanup adoption release with a fresh generation,
+        `FROM=<the aborted target>`, and `TO=<the placement you are returning to>`.
+     3. Once every node reports `cleanup_complete` (step 5 resumes the
+        DaemonSets for this), run `finalize` with the same tuple. Finalize is what writes the node-bound record for the restored
+        placement.
+   - **Corrupt or unknown ownership.** Quarantine the rejected state outside the
+     registry, leave the state path absent, create an empty
+     `.udp-placement-quarantined` tombstone beside it, and then run a fresh
+     explicit cleanup adoption release. Absent state makes cleanup probe
+     **both** ownership domains, whatever `FROM` names. The tombstone is
+     load-bearing, not a note: while it is present, **every** stable bootstrap
+     from an absent record is refused — including a release-attested adoption —
+     so a proxy that restarts between the quarantine and the cleanup release
+     cannot silently adopt a placement instead of proving cleanup. A successful
+     finalize removes it.
+
+   Never guess ownership, chown a live file, follow a symlink, or repair only a
+   subset of nodes.
+5. Verify both artifacts and their tuple on every node **while both
+   DaemonSets are still stopped**. Then apply the matching Helm values and
+   resume the DaemonSets, so the repaired ConfigMap becomes the release
+   contract rather than a transient manual edit. For the cleanup paths
+   (producer abort, corrupt/unknown ownership), the cleanup release can only
+   complete once both DaemonSets run again: the node-agent republishes
+   `.udp-registry-synced`, and the Ambient process performs the cleanup. Keep
+   the nodes cordoned and drained, wait until every node reports
+   `cleanup_complete`, and only then apply the `finalize` release. Keep nodes
+   drained until the node-agent has completed its relist, the intended Ambient
+   producer is ready, and authenticated health shows the expected phase
+   (`stable` after finalize). Then uncordon nodes under the normal rollout
+   policy.
+
+A planned `securityContext` UID change must use the same stopped-and-drained
+procedure (or retain the old UID until after the migration); the reader rejects
+old-UID state by design. Re-adopting `host-netns` from **rejected** state always
+requires cleanup/finalize—a corrupt, truncated, foreign-UID, or unreadable
+record is a hard failure, never an absence—and re-adopting it from **absent**
+state requires cleanup/finalize, or the release-level
+`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` attestation described under
+"Node reboots and scale-out" **together with** the node-specific proof required
+by "Node-specific proof for a recordless host placement" — which a
+`.udp-placement-quarantined` tombstone refuses outright. Stable host startup never fabricates a predecessor proof from node-local
+inspection.
+
+**Recovery and churn contract.** Cleanup persists `(generation, from, to)`
+before touching rules. A proxy restart resumes only that tuple; a different or
+stale generation is rejected, and a completed generation cannot bind a later
+transition to a registry marker left by the earlier rollout. Each node-agent
+restart/relist first retracts its
+generation acknowledgement, closes UDP gates, reconstructs the registry from
+the Kubernetes pod list, and then atomically publishes `.udp-registry-synced`
+as a bounded, versioned proof containing that generation and a fresh publication
+identity. Every later pod/CNI capture mutation retracts the marker first and
+republishes a new identity only after the registry and retry state converge. The
+cleanup supervisor requires the exact same proof before and after every pass;
+disappearance or replacement resets both repeated-pass counters and the pod
+registry fingerprint. It checks that proof again immediately before persisting
+completion. Pod-netns cleanup starts only after that proof and requires two
+identical complete registry passes under one publication, so partial per-pod
+cleanup, temporarily unresolvable netns handles, pod deletion/recreation, and a
+crash between any passes simply retry. Pods created after the predecessor stopped
+have no predecessor rules and join the current registry pass; pods removed
+during the phase lose their namespace and cannot retain rules. Cleanup always probes both
+IPv4 and IPv6 exact Ferrum chain/jump/rule/route names, even when the new config
+disables one family, and never flushes a table or sweeps foreign state.
+
+The existing gate acknowledgement remains load-bearing throughout. A missing or
+stale `.udp-not-ready` cannot authorize cleanup because cleanup writes a fresh
+`.udp-ack-required`, removes the stale acknowledgement, and retracts
+`.udp-ready` in that order. Until a fresh acknowledgement arrives, predecessor
+capture or a scope-exact DROP guard remains and the incoming placement stays
+unready. Thus interruption after readiness retraction, partial netns cleanup,
+host cleanup, durable proof publication, or before final producer publication
+costs availability but never opens plaintext egress.
 
 ### Inbound TC ingress redirect (issue #3287)
 
@@ -1180,10 +1998,9 @@ STATUS reports whether that node-agent + Kubernetes API dependency is ready for 
 The Helm chart at `charts/ferrum-mesh/` ships an opt-in CNI installer init container, gated by `nodeAgent.cni.enabled`. When enabled:
 
 1. The DaemonSet pod starts the rollback watcher as a **native sidecar** (an init container with `restartPolicy: Always`; Kubernetes 1.29+), ordered before the installer so it is already running while the chain is written.
-2. The next init container runs `/app/ferrum-cni install`, which copies the binary into the host's `/opt/cni/bin/` (host-path mount).
-3. Under the install lock the installer fail-closes if the configured target conflist already exists and is not a same-owner Ferrum-marked regular file, then records an ownership manifest, reads the existing primary CNI config matching `nodeAgent.cni.chainedWith`, preserves its plugin fields/IPAM, appends Ferrum as a meta-plugin, and writes the generated `*-ferrum.conflist` into `/etc/cni/net.d/`.
-4. The node-agent container mounts `/var/run/ferrum/` so both the binary and the daemon share the UDS path.
-5. Set `FERRUM_NODE_AGENT_CNI_ENABLED=true` (the chart sets this when `nodeAgent.cni.enabled=true`).
+2. The next init container runs `/app/ferrum-cni install`, which publishes the binary into `/opt/cni/bin/` and a chained `*-ferrum.conflist` (built from the primary CNI config matching `nodeAgent.cni.chainedWith`) into `/etc/cni/net.d/` in the fixed order described in [Ordering, locking, and what the swap checks do not claim](#ordering-locking-and-what-the-swap-checks-do-not-claim).
+3. The node-agent container mounts `/var/run/ferrum/` so both the binary and the daemon share the UDS path.
+4. Set `FERRUM_NODE_AGENT_CNI_ENABLED=true` (the chart sets this when `nodeAgent.cni.enabled=true`).
 
 Manual install (no Helm): run `ferrum-cni install` on every node with `HOST_BIN_DIR`, `HOST_CONF_DIR`, `HOST_SOCKET_DIR`, `CONF_FILE_NAME`, `CHAINED_WITH`, `SOCKET_PATH`, `OWNER_ID`, and `INSTALL_GENERATION` set, or hand-write the equivalent chained `.conflist` (see "Ownership markers" for what `ferrum-cni uninstall` will and will not remove). Ensure `/var/run/ferrum/` is writable and set `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The default Unix socket path is `/var/run/ferrum/node-agent-cni.sock`; any `FERRUM_NODE_AGENT_CNI_SOCKET_PATH` override must be absolute.
 
@@ -1236,7 +2053,7 @@ Install publishes in a fixed order, and each step exists to make the *next* fail
 2. Stage the new binary in `/opt/cni/bin/` under an unguessable `O_EXCL | O_NOFOLLOW` temporary name, hashing the bytes as they are written. The staging sibling is removed on every exit, so nothing shared has changed yet.
 3. **Apply the shared-binary rule.** `/opt/cni/bin/ferrum-cni` is shared, and cleanup already refuses to delete it while another `.conf` / `.conflist` / `.json` on the node names `ferrum-cni`; install owes that reference the mirror guarantee and will not swap the bytes out from under it. Republishing byte-identical bytes is not a replacement and is always allowed. Otherwise, if any other configuration still references the plugin — or if the installed object cannot be classified, or the directory cannot be fully scanned — the install is refused with a fixed error and the shared binary and manifest are left byte-identical. (A directory that cannot be scanned therefore blocks a *binary-changing* upgrade; a same-image reinstall is unaffected.)
 4. Write the ownership manifest — **before** the shared binary is published — recording the staged digest, plus an *attested* previous digest where one exists (see "Ownership markers" above). From here on, every artifact this install can leave behind, including after a crash at any later step, is provably Ferrum's and therefore removable.
-5. Publish the binary with an atomic same-directory `rename`.
+5. Publish the binary with an atomic same-directory `rename`; the installed file is never truncated or written through, so an already-exec'd `ferrum-cni` keeps a valid inode (no torn-binary or `ETXTBSY` window). When the staged bytes are byte-identical to what is installed — the routine `helm upgrade` with an unchanged image — the rename is **skipped entirely**. A plugin process already `exec`'d from a previous inode runs the previous code until it exits; that is a POSIX property, not a gap Ferrum closes, and the RPC contract is forward-compatible within a release.
 6. Write the chained conflist **last**, atomically. The moment that file lands, every pod ADD on the node traverses `ferrum-cni`, so nothing that can fail may still be pending — its bytes were already built in step 1.
 
 **If any step after the preflight fails and the preflight found this owner's previous chain, the installer lifts that chain before returning the error.** This is an availability rule, not tidiness. On a same-owner upgrade the node is already carrying generation N-1 while the replacement pod's rollback watcher is scoped to generation N; an install that dies before publishing N leaves every pod ADD traversing a socket no node-agent will serve, and the watcher correctly reports `never published` and removes nothing. The recovery runs under the same lock and re-proves the chain first: it removes the file only when it is still the exact object the preflight classified — same device/inode/length **and** a marker naming the same owner *and* the same generation. A different owner, or a generation that overtook the run, is retained untouched and logged; so is a chain the recovery could not remove, which is reported as an error because the node is still dependent. The failure itself is always surfaced; the recovery never masks it.
@@ -1388,22 +2205,9 @@ recovery.
 
 ### Lifecycle coverage and remaining gaps
 
-Delivered (issue #3609):
+Uninstall (`ferrum-cni uninstall` plus the `pre-delete` hook DaemonSet), never-ready rollback (`ferrum-cni rollback-watch`, whose STATUS poll is the post-install probe), install verification, and in-place upgrade (see [Ordering, locking, and what the swap checks do not claim](#ordering-locking-and-what-the-swap-checks-do-not-claim)) are delivered (issue #3609). The manifest is rewritten before the swap with the staged digest and, only when a prior same-owner manifest attested it, the replaced digest (see [Ownership markers](#ownership-markers)); the conflist is re-stamped with the new generation last.
 
-- **Uninstall.** `ferrum-cni uninstall`, plus the `pre-delete` hook DaemonSet that runs it on every node before the socket disappears.
-- **Rollback.** `ferrum-cni rollback-watch` removes an install that never reached CNI readiness, scoped by ownership and generation, with the readiness budget gated on this generation's own publication.
-- **Install verification.** The rollback watcher's STATUS poll *is* the post-install probe: an install whose plugin never answers is undone rather than left in place. The ownership manifest additionally records the digest of the binary that was installed, so an out-of-band replacement is detectable (and blocks removal of that binary). Install also fail-closes under the lifecycle lock before overwriting an existing target conflist unless that file's Ferrum marker names this same owner.
-- **In-place upgrade.** See below.
-- **Hosted evidence.** External Rust integration coverage in `tests/integration/cni_tests.rs` (`install_lifecycle`, including crash-loop ADD fail-closed, ownership mismatch, repeated cleanup, and upgrade ordering) plus the existing CI Helm render/static contract assertions, plus the privileged live suite `tests/k8s/cni_lifecycle_live/run.sh` (workflow `.github/workflows/cni-lifecycle-live.yml`): live kind install → fail-closed pod creation → rollback recovery → idempotent uninstall → chart cleanup graph failure/retry → full-chart `helm install` / `helm uninstall` under the cluster's real primary CNI.
-
-**In-place upgrade.** A re-run of the installer is an upgrade:
-
-- The new binary is staged in the destination directory and published by an atomic same-directory `rename`. The installed file is never truncated or written through, so an already-exec'd `ferrum-cni` keeps a valid inode and finishes its RPC forward against the binary it started with — there is no torn-binary or `ETXTBSY` window.
-- When the staged bytes are byte-identical to what is already installed — the routine `helm upgrade` with an unchanged image — the rename is **skipped entirely**. The common upgrade therefore performs no binary swap at all, so no in-flight plugin can straddle one.
-- The manifest is rewritten before the swap and records both the digest being published and the digest being replaced, so a crash between those two steps still leaves whichever binary is on disk provably removable.
-- The conflist is re-stamped with the new generation last, so kubelet's next ADD resolves the new inode through a fresh `exec`.
-
-What remains true, and is a property of POSIX rather than a gap Ferrum can close: a plugin process already `exec`'d from the previous inode runs the previous code until it exits. Because the RPC contract is forward-compatible within a release and the forward is a single sub-second call, that is a coordination *cost* rather than an upgrade barrier — and the skip-if-identical rule removes it from the common case. There is no cross-process handshake that would make an already-running plugin adopt new code, so none is claimed.
+**Evidence.** `tests/integration/cni_tests.rs` (`install_lifecycle`, including crash-loop ADD fail-closed, ownership mismatch, repeated cleanup, and upgrade ordering), the CI Helm render/static contract assertions, and the privileged live suite `tests/k8s/cni_lifecycle_live/run.sh` (workflow `.github/workflows/cni-lifecycle-live.yml`): live kind install → fail-closed pod creation → rollback recovery → idempotent uninstall → chart cleanup graph failure/retry → full-chart `helm install` / `helm uninstall` under the cluster's real primary CNI.
 
 **Post-readiness failure recovery boundary (by design).** Automatic rollback is a *never-ready* path only. The moment CNI STATUS answers `Ok` for this generation, the watcher retains the chain for the lifetime of the pod and never silently unchains a later crash-loop. That is the capture-race posture: a node that was once enrolled stays dependent until an operator (or `helm uninstall`) removes the chain. Recovery after that boundary is the manual path in "Recovering a node" — delete the Ferrum-owned conflist (preferably via `ferrum-cni uninstall`), fix the node-agent, recreate the pod to reinstall. The Rust suite pins the retain-after-ready half (`rollback_watch_retains_artifacts_once_readiness_is_observed`); the live suite pins the never-ready and uninstall halves.
 

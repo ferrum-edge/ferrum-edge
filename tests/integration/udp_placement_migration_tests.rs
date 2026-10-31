@@ -671,18 +671,18 @@ fn write_unbound_state(registry: &std::path::Path, active: UdpPlacement) {
     .expect("write unbound durable state");
 }
 
-/// The durable record docs/mesh.md tells an operator to write for a true abort
+/// The durable record docs/node_agent.md tells an operator to write for a true abort
 /// back to `disabled` (issue #6703), extracted verbatim so the documented
 /// artifact and the runtime acceptance rule cannot drift apart.
 fn documented_disabled_abort_record() -> &'static str {
-    const MESH_DOC: &str = include_str!("../../docs/mesh.md");
-    MESH_DOC
+    const NODE_AGENT_DOC: &str = include_str!("../../docs/node_agent.md");
+    NODE_AGENT_DOC
         .split("**Abort back to `disabled`.**")
         .nth(1)
         .and_then(|tail| tail.split("```json").nth(1))
         .and_then(|tail| tail.split("```").next())
         .map(str::trim)
-        .expect("docs/mesh.md documents the disabled abort record")
+        .expect("docs/node_agent.md documents the disabled abort record")
 }
 
 #[test]
@@ -731,14 +731,14 @@ fn documented_abort_recovery_is_accepted_only_for_its_intended_target() {
     }
 }
 
-/// The documented producer-abort procedure from docs/mesh.md (issue #6703).
+/// The documented producer-abort procedure from docs/node_agent.md (issue #6703).
 fn documented_producer_abort_procedure() -> &'static str {
-    const MESH_DOC: &str = include_str!("../../docs/mesh.md");
-    MESH_DOC
+    const NODE_AGENT_DOC: &str = include_str!("../../docs/node_agent.md");
+    NODE_AGENT_DOC
         .split("**Abort back to `pod-netns` or `host-netns`.**")
         .nth(1)
         .and_then(|tail| tail.split("**Corrupt or unknown ownership.**").next())
-        .expect("docs/mesh.md documents the producer abort procedure")
+        .expect("docs/node_agent.md documents the producer abort procedure")
 }
 
 #[test]
@@ -758,7 +758,7 @@ fn documented_producer_abort_recovers_through_quarantine_cleanup_and_finalize() 
     ] {
         assert!(
             procedure.contains(required),
-            "docs/mesh.md producer abort procedure must say {required:?}"
+            "docs/node_agent.md producer abort procedure must say {required:?}"
         );
     }
 
