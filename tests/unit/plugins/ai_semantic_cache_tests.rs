@@ -7676,6 +7676,73 @@ async fn exact_key_binds_client_supplied_correlation_id() {
     );
 }
 
+/// `rate_limiting` with `expose_headers: true` forwards the caller's current
+/// budget to the backend. `x-ratelimit-remaining` changes on every admitted
+/// request, so binding the limiter's own value made every completion
+/// unreachable; a value the limiter did not publish stays bound.
+#[tokio::test]
+async fn forwarded_rate_limit_telemetry_is_omitted_from_the_exact_key() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+    let limiter = ferrum_edge::plugins::rate_limiting::RateLimiting::new(
+        &json!({
+            "limit_by": "ip",
+            "expose_headers": true,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    async fn rate_limited(
+        limiter: &ferrum_edge::plugins::rate_limiting::RateLimiting,
+        forged_remaining: Option<&str>,
+    ) -> RequestContext {
+        let mut ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+        assert!(matches!(
+            limiter.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            limiter.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        if let Some(forged) = forged_remaining {
+            headers.insert("x-ratelimit-remaining".to_string(), forged.to_string());
+        }
+        ctx.headers = headers;
+        ctx
+    }
+
+    let mut first = rate_limited(&limiter, None).await;
+    assert_eq!(
+        first
+            .headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("99")
+    );
+    partition_store(&plugin, &mut first).await;
+
+    let mut second = rate_limited(&limiter, None).await;
+    assert_eq!(
+        second
+            .headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("98")
+    );
+    assert!(
+        partition_is_hit(&plugin, &mut second).await,
+        "only the gateway's own budget counter differs, so the completion must replay"
+    );
+
+    let mut forged = rate_limited(&limiter, Some("forged")).await;
+    assert!(
+        !partition_is_hit(&plugin, &mut forged).await,
+        "a value the limiter did not publish is backend-visible and must partition"
+    );
+}
+
 /// An earlier `ai_stream_router` replaces the client credential with the
 /// provider's. Binding only the live header view would collapse two clients.
 #[tokio::test]

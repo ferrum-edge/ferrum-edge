@@ -94,7 +94,15 @@ paths:
   framing — and a gateway-minted `correlation_id` header whose live value still
   matches private request provenance (issue #3929). Client-supplied correlation
   values remain origin-visible dimensions; do not globally ignore `x-request-id`
-  or trust a client-spoofable metadata/header marker. The only operator
+  or trust a client-spoofable metadata/header marker. The `x-ratelimit-*` values
+  `rate_limiting` (`expose_headers: true`, priority 2900) forwards are the other
+  gateway-minted exception, for `response_caching`, `request_deduplication`
+  fingerprints, and `ai_semantic_cache` alike: omitted only while the live value
+  equals the owning limiter's PRIVATE staging
+  (`RequestContext::is_gateway_published_rate_limit_header`, written beside the
+  public `ratelimit_*` metadata in `store_metadata`, cleared on ownership
+  change), never because the name matches and never from that plugin-writable
+  metadata. The only operator
   relaxation is `ignore_request_headers`, which REMOVES each named header from
   the backend request before keying (so the key still binds everything the
   origin receives); never turn it into a key-only exclusion. The key also binds
