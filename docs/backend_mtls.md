@@ -152,8 +152,9 @@ traffic, and both are fail-closed on explicitly configured material:
   originate backend TLS. It sets both ClientHello SNI and
   the certificate verification name while the selected target controls the
   socket destination. The override partitions HTTP-family backend pools;
-  stream proxies do not pool connections. It is applied by **HTTP and gRPC
-  probes** as well. A backend whose certificate is valid only for the override
+  stream proxies do not pool connections. See
+  [Server-name override (SNI) transport](#server-name-override-sni-transport)
+  for the HTTP/1.1 dial. It is applied by **HTTP and gRPC probes** as well. A backend whose certificate is valid only for the override
   name would otherwise serve requests successfully while every probe failed name
   verification against the target host and ejected it. The probe still dials
   only the already-resolved, egress-screened target candidate, and the backend
@@ -516,6 +517,63 @@ variables.
 - Replacing the contents of a watched cert/key/CA/CRL file at the **same path** refreshes already-built HTTP-family backend TLS configs (reqwest, direct HTTP/2, gRPC, and HTTP/3) and cached `wss://` WebSocket backend TLS configs when backend TLS live reload is enabled; a gateway SVID rotation likewise drains the WebSocket configs built from the rotated SVID, so the next upgrade uses the new material. If you disable it, use a process restart, Kubernetes rolling redeploy, or a config change that produces a new backend TLS identity (a different CA, client certificate or key source, SNI, SAN allow-list, or verify setting) to pick up in-place rotations; a new pool entry that shares an existing TLS identity reuses that identity's cached config.
 - If certificate source loading or parsing fails at request time (e.g., file deleted after startup), the request fails with an error. This behavior is consistent across all backend protocols (HTTP/1.1, H2, and HTTP/3). The gateway continues running and serves other proxies normally.
 - Connection reuse respects the original mTLS configuration
+
+### Server-name override (SNI) transport
+
+Plain HTTPS requests with a `backend_tls_sni` override prefer the direct HTTP/2
+pool, which sets the TLS server name natively. When that pool is unavailable or
+the backend speaks only HTTP/1.1, the request uses a reqwest HTTP/1.1 dial.
+reqwest exposes no per-request server-name hook — its connector derives the
+rustls server name from the request URL's host — so this dial puts the override
+in the URL **authority** while the pooled client's `DnsCacheResolver` is pinned
+to the load-balancer-selected target's already-resolved, already-egress-screened
+address. The resolver answers every name with the pinned address, so the
+override hostname is never itself resolved. `backend_tls_sni` is validated to be
+a DNS hostname and never an IP literal, so it cannot become a URL-literal dial
+that bypasses the resolver.
+
+* **ALPN is restricted to `http/1.1`** on that client. HTTP/2 derives
+  `:authority` from the URL, which carries the server name, so the backend
+  instead reads its authority from the explicit `Host` header dispatch sets from
+  the effective target host. H2-capable targets keep using the direct-H2 pool.
+* **Pool identity** carries the pinned address and a force-H1 discriminator
+  alongside the SNI / CA / SAN-digest / mTLS / verification components, so an
+  SNI dial shares a client neither with a default h2-capable client nor with
+  another target's pin. An SNI-override route therefore partitions its reqwest
+  client per target (up to one per endpoint) and gives up in-client
+  multi-address failover for that dial.
+* **Retries, timeouts, and streaming bodies** behave as on any other reqwest
+  dial. A retry builds the same dial against the newly selected target under the
+  same server name.
+* **HTTP/3 frontend requests** bridged to a non-H3 backend use the same H1 SNI
+  dial on both the buffered and streaming legs. The bridge keeps the real target
+  for circuit-breaker, load-balancer, and `backend_target` accounting, and
+  resolves the dial as a local dispatch-policy decision before backend
+  admission, the least-connections connection-start record, and any client
+  fetch.
+* Nonzero global body-size limits (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` /
+  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, including the default 10 MiB response
+  cap) do **not** disqualify direct-H2: that path enforces them in-path (413 on
+  oversized requests, 502 on oversized responses) with the same `ErrorClass` /
+  `connection_error` contracts as the reqwest path.
+
+`ferrum-edge validate` and the Admin API admit proxy-level and DestinationRule /
+`BackendTLSPolicy` per-port SNI overrides combined with effective retry,
+request-body-buffering plugins, `pool_enable_http2: false`, or all three,
+because the H1 dial serves them (issue #3276). What stays fail-closed is decided
+at runtime:
+
+* On every dispatch path (HTTP/1.1 and HTTP/2 frontends, the retry path, and the
+  HTTP/3 bridge), a dial that cannot be constructed — no resolved target address
+  to pin, or a backend URL whose authority does not carry the selected target
+  host — answers `502` with
+  `gateway-error-reason: backend_tls_sni_requires_direct_h2`, so the override is
+  never silently dropped and the handshake is never made under the wrong server
+  name.
+* On the HTTP/3 bridge that decision is made before backend admission, so the
+  `502` is sent without dialing the backend or relaying a request body.
+* A `wss://` WebSocket upgrade with an override is refused before dialing, as
+  described under [Connection Pool Behavior](#connection-pool-behavior).
 
 ## Testing with Self-Signed Certificates
 
