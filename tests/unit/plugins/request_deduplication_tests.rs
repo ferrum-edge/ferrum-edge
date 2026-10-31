@@ -1323,6 +1323,7 @@ async fn keyed_request_after_rate_limit(
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn forwarded_rate_limit_telemetry_does_not_split_a_retried_operation() {
     let _policy = pinned_policy_guard();
     let limiter = exposing_rate_limiter();
@@ -1369,6 +1370,7 @@ async fn forwarded_rate_limit_telemetry_does_not_split_a_retried_operation() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
 async fn rewritten_rate_limit_header_still_distinguishes_operations() {
     let _policy = pinned_policy_guard();
     let limiter = exposing_rate_limiter();

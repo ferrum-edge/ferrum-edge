@@ -2133,8 +2133,10 @@ impl ResponseCaching {
     ///   implements (`If-None-Match` / `If-Modified-Since` revalidation,
     ///   pure honored bare request `Cache-Control: no-cache` / `no-store`
     ///   refreshes when `respect_no_cache` is enabled, and zero-length
-    ///   `Content-Length` framing) and a gateway-minted correlation header
-    ///   whose live value still matches private request provenance. This
+    ///   `Content-Length` framing), a gateway-minted correlation header
+    ///   whose live value still matches private request provenance, and the
+    ///   `x-ratelimit-*` telemetry an earlier `rate_limiting` forwards while
+    ///   each value still equals that limiter's private staging. This
     ///   prevents replay across unannounced tenant or policy headers even when
     ///   an origin omits `Vary`, while still letting anonymous GETs share an
     ///   entry when `correlation_id` mints a unique request id. Unsupported

@@ -7736,6 +7736,23 @@ async fn forwarded_rate_limit_telemetry_is_omitted_from_the_exact_key() {
         "only the gateway's own budget counter differs, so the completion must replay"
     );
 
+    // H1/H2 run final request-body hooks on a compatibility clone of the live
+    // context. The provenance must survive that clone, or H1/H2 lookups would
+    // miss while native H3 (which uses the real context) hits.
+    let mut live = rate_limited(&limiter, None).await;
+    let mut hook_clone =
+        ferrum_edge::_test_support::clone_for_final_request_body_hooks_for_test(&mut live);
+    // The clone deliberately drops the `request_body` metadata view (the hook
+    // receives the final body as an argument); this harness derives the body
+    // from that view, so hand it the same bytes.
+    hook_clone
+        .metadata
+        .insert("request_body".to_string(), REPLAY_BODY.to_string());
+    assert!(
+        partition_is_hit(&plugin, &mut hook_clone).await,
+        "the H1/H2 final-body hook clone must carry the limiter's provenance"
+    );
+
     let mut forged = rate_limited(&limiter, Some("forged")).await;
     assert!(
         !partition_is_hit(&plugin, &mut forged).await,
