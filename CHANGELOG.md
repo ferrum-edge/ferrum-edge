@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
 ### Fixed
+- **An HTTP/1.1 client that stops reading can no longer hold its connection
+  and backend forever.** Every backend-facing bound deliberately ignores time
+  spent waiting on the client (`backend_read_timeout_ms` arms only on backend
+  wait, and hyper stops polling a response body while the client socket is
+  full), so an unauthenticated client that requested a large or endless
+  response and stopped reading held the connection, the response body, the
+  backend connection, and its admission guards indefinitely (slow-read
+  exhaustion). The new `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (default
+  `60`, `0` disables, at most `86400`) closes a proxy client connection whose
+  socket accepts no bytes for that long while the gateway has bytes to write,
+  like nginx's `send_timeout`; on TLS listeners it sits below rustls. Any write
+  the socket accepts re-arms it. It also covers upgraded WebSockets and HTTP/2
+  connections whose socket stops accepting bytes, but not an HTTP/2 response
+  parked on the client's flow-control window. HTTP/3 and admin listeners are
+  unchanged.
 - **Per-request CPU no longer doubles under the credential-dumping log
   filter** (regression from #6852, tagged in 0.9.18, which was not published,
   and shipped in 0.9.19). That filter was nested outside the level filter on

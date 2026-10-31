@@ -30,6 +30,7 @@ mod client_abort_accounting_tests;
 mod client_abort_terminal_tests;
 mod client_identity_tests;
 mod client_ip_tests;
+mod client_write_stall_tests;
 #[cfg(unix)]
 mod cni_install_mode_tests;
 mod cni_ownership_tests;

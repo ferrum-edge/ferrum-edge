@@ -83,6 +83,11 @@ fn process_private_tls_managed_store_path() -> String {
 
 /// Default bound on waiting for the shared managed-TLS/ACME store lock.
 pub const DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 10;
+
+/// Upper bound for `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (24 hours, the
+/// same ceiling as `FERRUM_SHUTDOWN_DRAIN_SECONDS`). Larger values are refused
+/// at the configuration boundary instead of silently never firing.
+pub const MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS: u64 = 86_400;
 /// Settings key for that bound.
 pub const TLS_STORE_LOCK_TIMEOUT_KEY: &str = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
 const MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 1;
@@ -3392,6 +3397,14 @@ pub struct EnvConfig {
     /// after that first request is not closed. `0` disables the bound.
     /// Default: 10 seconds.
     pub http_header_read_timeout_seconds: u64,
+    /// Downstream write-stall bound for HTTP/1.1 and HTTP/2 proxy client
+    /// connections, in seconds (`FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS`).
+    ///
+    /// The connection is closed when the gateway has bytes to write and the
+    /// client transport accepts none of them for this long (nginx
+    /// `send_timeout` semantics). Any write the transport accepts re-arms it.
+    /// `0` disables it. Default: 60.
+    pub http_client_write_timeout_seconds: u64,
     /// Frontend TLS handshake timeout in seconds. Applies before HTTP header
     /// parsing, so slow TLS handshakes cannot hold connection slots forever.
     /// 0 = disabled (no timeout). Default: 10 seconds.
@@ -4674,6 +4687,7 @@ impl Default for EnvConfig {
             websocket_permessage_deflate_max_message_bytes: 1_048_576,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
+            http_client_write_timeout_seconds: 60,
             frontend_tls_handshake_timeout_seconds: 10,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
@@ -5335,6 +5349,7 @@ impl EnvConfig {
             websocket_permessage_deflate_max_message_bytes: usize = "FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES" => 1_048_576usize;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
+            http_client_write_timeout_seconds: u64 = "FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS" => 60u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
         }
 
@@ -6234,6 +6249,7 @@ impl EnvConfig {
             websocket_permessage_deflate_max_message_bytes,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
+            http_client_write_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,
             dns_overrides,
             dns_resolver_address,
@@ -7541,6 +7557,15 @@ impl EnvConfig {
             return Err(format!(
                 "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS must be 0 (no bound) or at most {}",
                 crate::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS
+            ));
+        }
+
+        // A value too large to add to an `Instant` would silently never fire,
+        // leaving slow-read exhaustion unbounded while claiming a bound.
+        if self.http_client_write_timeout_seconds > MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS {
+            return Err(format!(
+                "FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS must be at most \
+                 {MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS} seconds (0 disables the bound)"
             ));
         }
 
