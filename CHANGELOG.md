@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
 ### Fixed
+- **`rate_limiting` with `expose_headers: true` no longer defeats response
+  caching and idempotent replay.** The limiter (priority 2900) forwards the
+  caller's `x-ratelimit-*` budget to the backend, and `x-ratelimit-remaining`
+  changes on every admitted request. `response_caching`, the
+  `request_deduplication` fingerprint, and `ai_semantic_cache` bound that value
+  like any other backend-visible header. As a result a repeat request was
+  always a cache `MISS` (each request stored a new entry), and a byte-identical
+  retry under the same `Idempotency-Key` was refused with `409` as a different
+  request instead of being replayed. These plugins now leave the three
+  forwarded values out of their request partitions, but only while each live
+  value still equals what the owning limiter privately staged. A value
+  identical to that one reaches the origin byte for byte as the limiter's own
+  value. Every other client-supplied value, a value a later plugin rewrote, a
+  value rendered from rewritten `ratelimit_*` metadata, and a case-variant
+  duplicate field stays bound.
 - **Per-request CPU no longer doubles under the credential-dumping log
   filter** (regression from #6852, tagged in 0.9.18, which was not published,
   and shipped in 0.9.19). That filter was nested outside the level filter on

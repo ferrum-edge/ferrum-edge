@@ -24,6 +24,7 @@ use ferrum_edge::config::types::Proxy;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
 use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
+use ferrum_edge::plugins::rate_limiting::RateLimiting;
 use ferrum_edge::plugins::request_deduplication::{
     CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS, DYNAMIC_RESPONSE_PRESENTATION_PLUGINS,
     RequestDeduplication,
@@ -1287,6 +1288,124 @@ async fn test_first_request_passes_then_replay() {
         }
         _ => panic!("Expected RejectBinary replay, got {:?}", result),
     }
+}
+
+fn exposing_rate_limiter() -> RateLimiting {
+    RateLimiting::new(
+        &json!({
+            "limit_by": "ip",
+            "expose_headers": true,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+/// Run `rate_limiting` (2900) ahead of deduplication (3010) as the chain does:
+/// charge the budget, then let it forward its `x-ratelimit-*` telemetry.
+async fn keyed_request_after_rate_limit(
+    limiter: &RateLimiting,
+    key: &str,
+) -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = new_ctx("POST", "/api/rl");
+    assert!(matches!(
+        limiter.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut headers = HashMap::new();
+    headers.insert("idempotency-key".to_string(), key.to_string());
+    assert!(matches!(
+        limiter.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    (ctx, headers)
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn forwarded_rate_limit_telemetry_does_not_split_a_retried_operation() {
+    let _policy = pinned_policy_guard();
+    let limiter = exposing_rate_limiter();
+    let plugin = make_plugin(json!({}));
+
+    let (mut first, mut first_headers) = keyed_request_after_rate_limit(&limiter, "rl-1").await;
+    assert_eq!(
+        first_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("99")
+    );
+    assert!(matches!(
+        plugin.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first).await;
+
+    // The client retries the identical operation. Only the gateway's own budget
+    // counter differs, so it must replay rather than be refused as a different
+    // request.
+    let (mut retry, mut retry_headers) = keyed_request_after_rate_limit(&limiter, "rl-1").await;
+    assert_eq!(
+        retry_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("98")
+    );
+    match plugin.before_proxy(&mut retry, &mut retry_headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => {
+            assert_eq!(status_code, 201);
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(&body[..], b"{\"ok\":true}");
+        }
+        other => panic!("expected a replay of the completed operation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn rewritten_rate_limit_header_still_distinguishes_operations() {
+    let _policy = pinned_policy_guard();
+    let limiter = exposing_rate_limiter();
+    let plugin = make_plugin(json!({}));
+
+    let (mut first, mut first_headers) = keyed_request_after_rate_limit(&limiter, "rl-2").await;
+    assert!(matches!(
+        plugin.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first).await;
+
+    // A value the limiter did not publish (client-chosen or rewritten by a
+    // later plugin) is backend-visible request content and stays bound.
+    let (mut other, mut other_headers) = keyed_request_after_rate_limit(&limiter, "rl-2").await;
+    other_headers.insert("x-ratelimit-remaining".to_string(), "forged".to_string());
+    assert_fingerprint_conflict(plugin.before_proxy(&mut other, &mut other_headers).await);
+
+    // A case-variant duplicate of a published field is a second field line the
+    // backend receives folded into the limiter's own value, so it is a
+    // different request even though its value coincides.
+    let (mut duplicated, mut duplicated_headers) =
+        keyed_request_after_rate_limit(&limiter, "rl-2").await;
+    assert_eq!(
+        duplicated_headers
+            .get("x-ratelimit-limit")
+            .map(String::as_str),
+        Some("100")
+    );
+    duplicated_headers.insert("X-RateLimit-Limit".to_string(), "100".to_string());
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut duplicated, &mut duplicated_headers)
+            .await,
+    );
 }
 
 /// A dedup context as the protocol entry paths build it: bound to the effective

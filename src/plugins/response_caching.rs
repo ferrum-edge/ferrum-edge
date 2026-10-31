@@ -2133,8 +2133,10 @@ impl ResponseCaching {
     ///   implements (`If-None-Match` / `If-Modified-Since` revalidation,
     ///   pure honored bare request `Cache-Control: no-cache` / `no-store`
     ///   refreshes when `respect_no_cache` is enabled, and zero-length
-    ///   `Content-Length` framing) and a gateway-minted correlation header
-    ///   whose live value still matches private request provenance. This
+    ///   `Content-Length` framing), a gateway-minted correlation header
+    ///   whose live value still matches private request provenance, and the
+    ///   `x-ratelimit-*` telemetry an earlier `rate_limiting` forwards while
+    ///   each value still equals that limiter's private staging. This
     ///   prevents replay across unannounced tenant or policy headers even when
     ///   an origin omits `Vary`, while still letting anonymous GETs share an
     ///   entry when `correlation_id` mints a unique request id. Unsupported
@@ -2247,10 +2249,11 @@ impl ResponseCaching {
         for header in vary_headers {
             hasher.text("vary_name", header);
             match request_headers.get(header.as_str()) {
-                Some(value) if ctx.is_gateway_generated_correlation_header(header, value) => {
-                    // Omit only the minted unique value. The name stays in the
-                    // origin/operator Vary contract; treating presence as
-                    // absent keeps two generated ids on one entry.
+                Some(value) if ctx.is_gateway_minted_request_header(header, value) => {
+                    // Omit only the minted per-request value (a generated
+                    // correlation id or published rate-limit telemetry). The
+                    // name stays in the origin/operator Vary contract; treating
+                    // presence as absent keeps two minted values on one entry.
                     hasher.bool_value("vary_present", false);
                 }
                 None => hasher.bool_value("vary_present", false),

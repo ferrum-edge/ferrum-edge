@@ -21,11 +21,12 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::config::types::{Consumer, HttpWireTransport};
 use ferrum_edge::plugins::correlation_id::CorrelationId;
+use ferrum_edge::plugins::rate_limiting::RateLimiting;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
 use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
-    validate_plugin_config,
+    Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+    plugin_failure_policy, validate_plugin_config,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -8725,6 +8726,331 @@ async fn generated_correlation_omit_is_identical_on_h1_h2_h3() {
         let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
         assert_eq!(body, b"wire-body", "{transport:?} must HIT");
     }
+}
+
+// === Forwarded `rate_limiting` telemetry is not a cache dimension ===
+//
+// `rate_limiting` (2900) with `expose_headers: true` writes the caller's
+// current `x-ratelimit-*` budget into the backend request before
+// `response_caching` (3500) builds its key. `x-ratelimit-remaining` changes on
+// every admitted request, so binding it made every entry unreachable for the
+// caller that stored it, contradicting the documented cache-HIT decoration.
+
+fn exposing_rate_limiter(expose_headers: bool) -> RateLimiting {
+    RateLimiting::new(
+        &json!({
+            "limit_by": "ip",
+            "expose_headers": expose_headers,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+/// Charge the limiter and return the backend-visible header map exactly as
+/// its `before_proxy` leaves it for the later cache hook.
+async fn apply_rate_limit(
+    limiter: &RateLimiting,
+    ctx: &mut RequestContext,
+) -> HashMap<String, String> {
+    assert!(matches!(
+        limiter.on_request_received(ctx).await,
+        PluginResult::Continue
+    ));
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        limiter.before_proxy(ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    headers
+}
+
+#[tokio::test]
+async fn forwarded_rate_limit_telemetry_is_omitted_from_the_cache_key() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/rl-cache");
+    let mut miss_headers = apply_rate_limit(&limiter, &mut miss_ctx).await;
+    assert_eq!(
+        miss_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("99")
+    );
+    store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"rl-body").await;
+    assert_status(&cache, &miss_ctx, "MISS");
+
+    let mut hit_ctx = make_ctx("GET", "/p/rl-cache");
+    let mut hit_headers = apply_rate_limit(&limiter, &mut hit_ctx).await;
+    assert_eq!(
+        hit_headers.get("x-ratelimit-remaining").map(String::as_str),
+        Some("98"),
+        "the second request forwards a different budget"
+    );
+    let (status, body, mut response_headers) =
+        expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"rl-body");
+    assert_status(&cache, &hit_ctx, "HIT");
+
+    // The documented contract: the HIT is decorated with THIS request's budget.
+    assert!(matches!(
+        limiter
+            .after_proxy(&mut hit_ctx, status, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("98")
+    );
+}
+
+fn rate_limiter_with_limit(max_requests: u64) -> RateLimiting {
+    RateLimiting::new(
+        &json!({
+            "limit_by": "ip",
+            "expose_headers": true,
+            "limits": [{"scope": "default", "window_seconds": 60, "max_requests": max_requests}]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn composed_limiters_hand_off_rate_limit_provenance_with_header_ownership() {
+    let _guard = response_cache_replay_policy_guard();
+    // Two composed limiters publish one verdict: the tightest remaining budget
+    // owns the header set whichever runs first. The provenance must follow that
+    // ownership, so a looser sibling's earlier staging can neither linger nor
+    // stop the owner's forwarded values from being recognized.
+    for loose_first in [true, false] {
+        let loose = rate_limiter_with_limit(100);
+        let tight = rate_limiter_with_limit(10);
+        let order: [&RateLimiting; 2] = if loose_first {
+            [&loose, &tight]
+        } else {
+            [&tight, &loose]
+        };
+        let cache = default_plugin();
+        let path = format!("/p/rl-composed-{loose_first}");
+
+        async fn run(
+            order: [&RateLimiting; 2],
+            ctx: &mut RequestContext,
+        ) -> HashMap<String, String> {
+            for limiter in order {
+                assert!(matches!(
+                    limiter.on_request_received(ctx).await,
+                    PluginResult::Continue
+                ));
+            }
+            let mut headers = ctx.headers.clone();
+            for limiter in order {
+                assert!(matches!(
+                    limiter.before_proxy(ctx, &mut headers).await,
+                    PluginResult::Continue
+                ));
+            }
+            headers
+        }
+
+        let mut miss_ctx = make_ctx("GET", &path);
+        let mut miss_headers = run(order, &mut miss_ctx).await;
+        assert_eq!(
+            miss_headers.get("x-ratelimit-limit").map(String::as_str),
+            Some("10"),
+            "the tighter limiter owns the published set (loose_first={loose_first})"
+        );
+        assert_eq!(
+            miss_headers
+                .get("x-ratelimit-remaining")
+                .map(String::as_str),
+            Some("9")
+        );
+        store_public_entry(&cache, &mut miss_ctx, &mut miss_headers, b"composed").await;
+
+        let mut hit_ctx = make_ctx("GET", &path);
+        let mut hit_headers = run(order, &mut hit_ctx).await;
+        assert_eq!(
+            hit_headers.get("x-ratelimit-remaining").map(String::as_str),
+            Some("8")
+        );
+        let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+        assert_eq!(body, b"composed", "loose_first={loose_first} must HIT");
+
+        // A value from the non-owning sibling is not what was published.
+        let mut stale_ctx = make_ctx("GET", &path);
+        let mut stale_headers = run(order, &mut stale_ctx).await;
+        stale_headers.insert("x-ratelimit-limit".to_string(), "100".to_string());
+        assert!(matches!(
+            cache.before_proxy(&mut stale_ctx, &mut stale_headers).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
+async fn rewritten_rate_limit_header_remains_a_cache_dimension() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    // A later plugin replacing the forwarded value breaks provenance: the
+    // origin now sees a value the limiter did not publish, so it is bound.
+    let mut first = make_ctx("GET", "/p/rl-rewritten");
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    first_headers.insert("x-ratelimit-remaining".to_string(), "tier-a".to_string());
+    store_public_entry(&cache, &mut first, &mut first_headers, b"tier-a-body").await;
+
+    let mut other = make_ctx("GET", "/p/rl-rewritten");
+    let mut other_headers = apply_rate_limit(&limiter, &mut other).await;
+    other_headers.insert("x-ratelimit-remaining".to_string(), "tier-b".to_string());
+    assert!(matches!(
+        cache.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &other, "MISS");
+}
+
+#[tokio::test]
+async fn case_variant_duplicate_of_a_published_rate_limit_field_stays_bound() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/rl-case-variant");
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    store_public_entry(&cache, &mut first, &mut first_headers, b"single-field").await;
+
+    // A second, case-variant field line carrying the same value folds into
+    // `x-ratelimit-limit: 100, 100` on egress, so the backend sees different
+    // bytes than for the limiter's single field; it must not share the entry.
+    let mut duplicated = make_ctx("GET", "/p/rl-case-variant");
+    let mut duplicated_headers = apply_rate_limit(&limiter, &mut duplicated).await;
+    assert_eq!(
+        duplicated_headers
+            .get("x-ratelimit-limit")
+            .map(String::as_str),
+        Some("100")
+    );
+    duplicated_headers.insert("X-RateLimit-Limit".to_string(), "100".to_string());
+    assert!(matches!(
+        cache
+            .before_proxy(&mut duplicated, &mut duplicated_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &duplicated, "MISS");
+}
+
+#[tokio::test]
+async fn metadata_laundered_rate_limit_value_remains_a_cache_dimension() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/rl-metadata");
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    store_public_entry(&cache, &mut first, &mut first_headers, b"meta-body").await;
+
+    // Public `ratelimit_*` metadata is plugin-writable. A value rendered from
+    // it is not what the limiter staged, so it cannot collapse partitions.
+    let mut laundered = make_ctx("GET", "/p/rl-metadata");
+    assert!(matches!(
+        limiter.on_request_received(&mut laundered).await,
+        PluginResult::Continue
+    ));
+    laundered
+        .metadata
+        .insert("ratelimit_remaining".to_string(), "attacker".to_string());
+    let mut laundered_headers = laundered.headers.clone();
+    assert!(matches!(
+        limiter
+            .before_proxy(&mut laundered, &mut laundered_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        laundered_headers
+            .get("x-ratelimit-remaining")
+            .map(String::as_str),
+        Some("attacker")
+    );
+    assert!(matches!(
+        cache
+            .before_proxy(&mut laundered, &mut laundered_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &laundered, "MISS");
+}
+
+#[tokio::test]
+async fn client_supplied_rate_limit_headers_remain_cache_dimensions() {
+    let _guard = response_cache_replay_policy_guard();
+    // `expose_headers: false` forwards the client's own value untouched and
+    // stages no provenance, so distinct client values stay distinct entries.
+    let limiter = exposing_rate_limiter(false);
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/rl-client");
+    first
+        .headers
+        .insert("x-ratelimit-remaining".to_string(), "1".to_string());
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    store_public_entry(&cache, &mut first, &mut first_headers, b"client-1").await;
+
+    let mut same = make_ctx("GET", "/p/rl-client");
+    same.headers
+        .insert("x-ratelimit-remaining".to_string(), "1".to_string());
+    let mut same_headers = apply_rate_limit(&limiter, &mut same).await;
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut same, &mut same_headers).await);
+    assert_eq!(body, b"client-1");
+
+    let mut other = make_ctx("GET", "/p/rl-client");
+    other
+        .headers
+        .insert("x-ratelimit-remaining".to_string(), "2".to_string());
+    let mut other_headers = apply_rate_limit(&limiter, &mut other).await;
+    assert!(matches!(
+        cache.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn origin_vary_on_forwarded_rate_limit_header_still_hits() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut miss_ctx = make_ctx("GET", "/p/rl-vary");
+    let mut miss_headers = apply_rate_limit(&limiter, &mut miss_ctx).await;
+    assert!(matches!(
+        cache.before_proxy(&mut miss_ctx, &mut miss_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = public_response_headers();
+    response_headers.insert("vary".to_string(), "x-ratelimit-remaining".to_string());
+    cache
+        .after_proxy(&mut miss_ctx, 200, &mut response_headers)
+        .await;
+    cache
+        .on_final_response_body(&mut miss_ctx, 200, &response_headers, b"vary-body")
+        .await;
+
+    // Same treatment as a generated correlation id named in `Vary`: the name
+    // stays in the contract, the minted per-request value does not split it.
+    let mut hit_ctx = make_ctx("GET", "/p/rl-vary");
+    let mut hit_headers = apply_rate_limit(&limiter, &mut hit_ctx).await;
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"vary-body");
 }
 
 // === Issue #5147: repeated `Age` field lines arrive comma-folded ===
