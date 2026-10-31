@@ -790,6 +790,103 @@ fn external_secret_refusal_names_the_alternative_but_not_the_settings() {
     assert!(error.contains("docs/fips.md"), "{error}");
 }
 
+/// The body of the item starting at `signature` in `source`, up to its closing
+/// top-level brace.
+fn item_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("`{signature}` must still exist"));
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("`{signature}` must close"));
+    &rest[..end]
+}
+
+#[test]
+fn vault_plaintext_opt_in_is_inert_because_the_vault_provider_is_refused_first() {
+    // `FERRUM_VAULT_ALLOW_PLAINTEXT` is deliberately absent from the FIPS rule
+    // set: its only reader is Vault client construction, and an enforcing
+    // process refuses the whole Vault provider before any client is built.
+    // This pins each link, so the key cannot become live under enforce mode
+    // without failing a FIPS test.
+
+    // Both Vault entry points are refused under enforce: a `_VAULT` env
+    // reference at startup, and a `vault://` TLS material source.
+    let error = policy::check_external_secret_sources_enforced(vec!["_VAULT"])
+        .expect_err("a _VAULT reference is refused");
+    assert!(error.contains("_VAULT"), "{error}");
+    policy::check_external_secret_uri_scheme_enforced("vault")
+        .expect_err("a vault:// source is refused");
+
+    // Neither refusal can be conditioned on the plaintext opt-in: the gate,
+    // from the provider suffix list through the URI-scheme check, never
+    // consults any plaintext setting.
+    let policy_source = include_str!("../../../src/fips/policy.rs");
+    let gate_start = policy_source
+        .find("pub const REMOTE_SECRET_PROVIDER_SUFFIXES")
+        .expect("the external secret gate must still exist");
+    let gate_end = policy_source
+        .find("pub fn check_gateway_config(")
+        .expect("the gateway config gate must still follow it");
+    assert!(
+        !policy_source[gate_start..gate_end]
+            .to_ascii_lowercase()
+            .contains("plaintext"),
+        "the external secret refusal must not depend on FERRUM_VAULT_ALLOW_PLAINTEXT"
+    );
+
+    // Both refusals run before anything resolves through Vault.
+    let startup = item_body(
+        include_str!("../../../src/gateway_entry.rs"),
+        "fn resolve_startup_secrets()",
+    );
+    let gate = startup
+        .find("fips::policy::check_external_secret_sources()?")
+        .expect("startup secret resolution must keep its FIPS gate");
+    let resolve = startup
+        .find("secrets::resolve_all_env_secrets()")
+        .expect("startup secret resolution must still resolve the environment");
+    assert!(
+        gate < resolve,
+        "the provider refusal must precede resolution"
+    );
+
+    let material = item_body(
+        include_str!("../../../src/tls/source/mod.rs"),
+        "fn load_secret_material_with(",
+    );
+    let gate = material
+        .find("check_external_secret_uri_scheme(")
+        .expect("provider URI loading must keep its FIPS gate");
+    let resolve = material
+        .find("resolve_secret_reference_blocking(")
+        .expect("provider URI loading must still resolve the reference");
+    assert!(
+        gate < resolve,
+        "the URI-scheme refusal must precede resolution"
+    );
+
+    // And the key is read only while constructing a Vault client.
+    let vault_source = include_str!("../../../src/secrets/vault.rs");
+    assert_eq!(
+        vault_source
+            .matches("env::var(ALLOW_PLAINTEXT_ENV)")
+            .count(),
+        1,
+        "FERRUM_VAULT_ALLOW_PLAINTEXT must have exactly one reader"
+    );
+    let constructor = item_body(vault_source, "impl VaultClientWrapper {");
+    let constructor = &constructor[..constructor
+        .find("pub async fn fetch_secret(")
+        .expect("VaultClientWrapper must keep fetch_secret")];
+    assert!(
+        constructor.contains("pub fn new()")
+            && constructor.contains("env::var(ALLOW_PLAINTEXT_ENV)"),
+        "the plaintext opt-in must be read only in VaultClientWrapper::new"
+    );
+}
+
 // ── The gate itself ─────────────────────────────────────────────────────────
 
 #[test]

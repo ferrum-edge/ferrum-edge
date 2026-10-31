@@ -313,8 +313,8 @@ walks through, so all of the following are refused:
 | `ai_federation` | `providers[].allow_plaintext: true` |
 | `ai_stream_router` | `providers[].allow_plaintext: true` |
 
-Four settings are deliberately absent from that table. The first two each have
-a test that keeps the reasoning honest rather than leaving it as a comment:
+Four settings are deliberately absent from that table. The first three each
+have a test that keeps the reasoning honest rather than leaving it as a comment:
 
 - `FERRUM_DP_GRPC_TLS_NO_VERIFY` is already refused **unconditionally**, on every
   build and in every mode, by the ordinary validator. A FIPS rule for it would
@@ -323,13 +323,15 @@ a test that keeps the reasoning honest rather than leaving it as a comment:
 - `kafka_logging`'s `ssl_no_verify` is covered by the refusal of the whole
   plugin (below). A test pins that relationship so removing the plugin-level
   rejection cannot orphan the key.
-
-The other two are not FIPS-gated and no FIPS test pins them:
-
 - `FERRUM_VAULT_ALLOW_PLAINTEXT` can never take effect in enforce mode, because
   the whole Vault provider (`_VAULT` and `vault://`) is refused before any
   provider client is built (§"External secret providers: why they are
-  refused"). That provider-level refusal is tested; nothing ties this key to it.
+  refused"). A test pins that the refusal ignores this key, runs before either
+  Vault path resolves anything, and that Vault client construction is the
+  key's only reader.
+
+The fourth is not FIPS-gated and no FIPS test pins it:
+
 - `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT` is **not** refused by FIPS enforce
   mode. It is a development switch for unauthenticated h2c to a stock xDS
   control plane: loopback hosts only (`127.0.0.0/8`, `::1`, `localhost`), never
