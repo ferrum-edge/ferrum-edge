@@ -4,6 +4,8 @@ An admitted HTTP-family request keeps the absolute authorization deadline accept
 Activity, connection establishment, a retry, or a rewritten `grpc-timeout` header cannot extend it.
 The earliest authorization, client RPC, or applicable operator phase bound wins; its source is
 captured when the phase starts, so late observation cannot change the terminal's attribution.
+The streaming response and upload contract (including the gateway-owned response and upload
+pumps) is in [stream_authorization_lifetime.md](stream_authorization_lifetime.md).
 
 | Dispatch | Acquisition and readiness | Handoff and response headers | Buffered response |
 | --- | --- | --- | --- |
@@ -72,8 +74,7 @@ early `before_proxy` prebuffer, which also prepares HBONE and sidecar mesh-mTLS 
 retry and body-plugin collect, the native HTTP/3 backend collect, and the native gRPC buffered
 collect) is read through the same END_STREAM gate. hyper drops the service future on a client
 reset only while that future is pending, so a collect that read the last DATA and a masked reset in
-the same poll used to finish with the truncated body. It now fails as a client disconnect, and
-nothing is dispatched: a `499` on the HTTP paths, and gRPC `CANCELLED` on the native gRPC collect.
+the same poll fails as a client disconnect, and nothing is dispatched: a `499` on the HTTP paths, and gRPC `CANCELLED` on the native gRPC collect.
 
 When hyper drops the service future instead — the reset arrives while the handler is pending, or an
 HTTP/1.1 client closes its connection — no handler code runs at all. The request's
@@ -107,8 +108,7 @@ masked `NO_ERROR` reset, or a dropped connection) as the client's own cancellati
 answers Trailers-Only `grpc-status: 1` (`CANCELLED`), runs the reject-path hooks, and logs the
 request under `rejection_phase` `client_disconnect_buffered_grpc_upload` with the
 `client_disconnect` error class. It releases a circuit-breaker probe and any backend admission
-taken for the body neutrally, and dials no backend. It used to answer `INTERNAL`, and on the
-retry path it handed the read failure to the dispatch pipeline as a gateway error.
+taken for the body neutrally, and dials no backend.
 
 An HTTP/3 frontend upload has its own form of the rule. A trailer section ends the request body
 but not the request stream, so a streamed HTTP/3 upload ends the backend upload only after the
@@ -199,18 +199,13 @@ Per path, for a streamed upload:
 - Plain HTTP/3 to HTTP bridge: the request body ends with an error. An HTTP/1.1 backend sees an
   aborted body and a closed connection, never the terminal chunk. An HTTP/2 backend sees its stream
   reset. The client's response is reset with `H3_REQUEST_CANCELLED`, and the request is recorded as
-  `499` / `client_disconnect`. Before #6772 it was recorded with status `0`.
+  `499` / `client_disconnect`.
 
 A malformed upload on these paths is `400` / `INVALID_ARGUMENT`, and a stream the gateway ended is
 `503` / `UNAVAILABLE`. Both are neutral for backend health. On the plain bridge both are logged
 without a write, and the response is reset because the stream has failed. The buffered plain and
 mesh bridges reset a departed plain-HTTP client's response too: they run the cancellation hooks and
 log `499`, but never write it.
-Before #6772 the native HTTP/3 backend answered a mid-upload reset with a gateway `502`, and the
-gRPC paths answered `UNAVAILABLE`. Alerts keyed on `5xx` or `UNAVAILABLE` therefore see fewer of
-these requests, and alerts keyed on `499` or `CANCELLED` see more. Before #6022 the native paths and
-the gRPC bridge answered a reset after the trailers as malformed trailers (`400` /
-`INVALID_ARGUMENT`).
 
 ### Plain bridge backend body abort
 

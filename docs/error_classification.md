@@ -827,7 +827,7 @@ When a backend connection times out, the `TransactionSummary` JSON includes the 
   "proxy_name": "users-api",
   "backend_target": "https://upstream.internal:8443/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
-  "response_status_code": 502,
+  "response_status_code": 504,
   "error_class": "connection_timeout",
   "latency_total_ms": 30000.0
 }
@@ -860,7 +860,7 @@ For a TCP/DTLS session whose backend TLS setup failed before any bytes were rela
 
 Refer to the canonical-taxonomy table above for what each class means. A few class-specific operational notes:
 
-- **`ConnectionPoolError`** — pool exhaustion, or a reqwest/H1 send that hyper canceled before dispatch (`is_canceled`; issue #3578). A backend mTLS misconfig (origin requires a client certificate, gateway presents none) lands here on the reqwest HTTP/1 path when rustls is not in the request chain (issue #4406). Increase `FERRUM_POOL_MAX_IDLE_PER_HOST` or per-proxy `pool_idle_timeout` for genuine pool exhaustion; for the mTLS case configure `backend_tls_client_cert_path` / `backend_tls_client_key_path`.
+- **`ConnectionPoolError`** — pool exhaustion, or a reqwest/H1 send that hyper canceled before dispatch (`is_canceled`; issue #3578). A backend mTLS misconfig (origin requires a client certificate, gateway presents none) lands here on the reqwest HTTP/1 path when rustls is not in the request chain (issue #4406). Increase `FERRUM_POOL_MAX_IDLE_PER_HOST` or per-proxy `pool_idle_timeout_seconds` for genuine pool exhaustion; for the mTLS case configure `backend_tls_client_cert_path` / `backend_tls_client_key_path`.
 - **`PortExhaustion`** — EADDRNOTAVAIL. Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on authenticated `GET /overload` detail (unauthenticated callers receive only `{"level": ...}`).
 - **`TlsError`** — for self-signed certs in development, set
   `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate

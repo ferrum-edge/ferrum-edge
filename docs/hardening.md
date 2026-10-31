@@ -104,7 +104,7 @@ See [admin_metrics.md](admin_metrics.md) and
 | Do this | Setting | Secure value | Reference |
 |---|---|---|---|
 | Terminate TLS at the gateway | `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH` | file or provider-backed material | [Frontend TLS](frontend_tls.md) |
-| Disable the plaintext proxy listener when clients are TLS-only | `FERRUM_PROXY_HTTP_PORT` | `0` | [Deployment Flexibility](frontend_tls.md#deployment-flexibility) |
+| Disable the plaintext proxy listener when clients are TLS-only | `FERRUM_PROXY_HTTP_PORT` | `0` | [TLS Only](frontend_tls.md#4-tls-only-no-plaintext) |
 | Raise the protocol floor where clients allow it | `FERRUM_TLS_MIN_VERSION` | `1.3` (default `1.2`) | [TLS / mTLS](configuration.md#tls--mtls) |
 | Require client certificates for zero-trust frontends | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | your client CA bundle | [Client Certificate Verification (mTLS)](frontend_tls.md#client-certificate-verification-mtls) |
 | Keep a handshake deadline | `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | leave at `10`; `0` only behind a load balancer with an equivalent deadline | [Handshake Timeout](frontend_tls.md#handshake-timeout) |
@@ -246,9 +246,9 @@ posture see [fips.md](fips.md).
 
 ## Never in production
 
-Each of these is verified against the shipped configuration reference. The first
-two are refused or refused-in-context rather than merely discouraged; the rest
-are accepted and silently weaken the deployment.
+These settings weaken production security or availability. Some are rejected or
+disabled in the contexts described below; accepted development opt-ins may emit
+warnings.
 
 | Setting | Why not |
 |---|---|
@@ -263,7 +263,7 @@ are accepted and silently weaken the deployment.
 | `FERRUM_MESH_ALLOW_NO_CA=true` | Runs mesh mode with no workload identity at all. Refused under `FERRUM_MESH_PRODUCTION_MODE`. |
 | `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY=true` | Mints a process-local JWT signing key, so tokens stop verifying across replicas and restarts. Refused under `FERRUM_MESH_PRODUCTION_MODE`. |
 | `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` | Mints a self-signed root for the internal CA backend. Refused under `FERRUM_MESH_PRODUCTION_MODE`. |
-| `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT=true` | Admits plaintext (h2c) stock ADS endpoints. Development only. |
+| `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT=true` | Admits plaintext (h2c) stock ADS endpoints. Development only: loopback hosts only, incompatible with a bearer credential (`FERRUM_MESH_STOCK_XDS_TOKEN_FILE`), and refused under `FERRUM_MESH_PRODUCTION_MODE`. |
 | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true` on a networked address | Sends the entire configuration stream, including the plane bearer token, in cleartext. |
 | `udp_max_response_amplification_factor: 0` on a `udp`/`dtls` proxy | Removes the reply budget (unset defaults to `8.0`), so any small-request/large-response backend becomes a spoofed-source reflector. The listener logs a startup warning. |
 

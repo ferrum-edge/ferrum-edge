@@ -1,6 +1,6 @@
 # WebSocket Proxying
 
-Ferrum Edge supports bidirectional WebSocket proxying for `ws://` and `wss://` backend protocols.
+Ferrum Edge supports bidirectional WebSocket proxying for `ws://` and `wss://` backend protocols. WebSocket is detected per request on any HTTP-family proxy, not configured as a scheme: `backend_scheme: http` dials `ws://` and `https` dials `wss://`.
 
 ## Architecture
 
@@ -64,8 +64,11 @@ All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`
 - **Connect timeout**: Uses the proxy's `backend_connect_timeout_ms` setting (default: 5000ms) for the backend WebSocket connection
 - **Active connection cap**: `FERRUM_WEBSOCKET_MAX_CONNECTIONS` limits concurrently upgraded WebSocket connections (default: 20,000). Upgrades beyond the cap are rejected with `503 Service Unavailable`
 - **Per-source session cap**: `FERRUM_WEBSOCKET_MAX_CONNECTIONS_PER_IP` limits concurrently upgraded sessions per resolved client IP (default: 0 = disabled). Source identity is the socket peer, or a forwarding header only when the direct peer is in `FERRUM_TRUSTED_PROXIES`. The per-IP *request* guard is released at upgrade time so a long-lived session does not block ordinary HTTP from that IP; this session bound replaces it. Same `503` rejection as the global budget. The slot is held by an RAII guard for the session lifetime and released on every disconnect path.
+- **Idle timeout**: per-proxy `websocket_idle_timeout_seconds` (0–86400; `0` disables), else `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` (default: 300)
+- **Incomplete-message bounds**: `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` (default: 1024) and `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS` (default: 60) bound a fragmented message
 - **Max frame size**: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` (default: 16 MiB / 16,777,216 bytes) per WebSocket frame
 - **Max message size**: 4× the frame limit (default: 64 MiB / 67,108,864 bytes); a message can span multiple frames. Plugins with tighter `ws_message_size_limiting` rules may lower the effective ceiling
+- **Write buffer and permessage-deflate inflate ceiling**: `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` and `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`; see [Configuration — Size Limits](docs/configuration.md#size-limits)
 - **Upgrade flood protection**: WebSocket requests go through the normal plugin pipeline before upgrade, so `rate_limiting` and `ip_restriction` can throttle abusive upgrade bursts
 - **Absolute authorization lifetime**: `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` (default: 3600, valid range: 1–86400) bounds every session from request receipt. When JWT, JWKS, OIDC, or OAuth2 introspection supplies an authoritative expiry, the earlier validated credential deadline wins. JWT/OIDC leeway is included exactly once using the provider's existing validation setting. Traffic, Ping/Pong, and low-rate bidirectional streams never extend this deadline. Credentials without expiry remain bounded by the configured maximum.
 

@@ -80,15 +80,11 @@ The 881 MB debug executable is never added to the artifact. A missing or
 mismatched symbol twin fails that step but leaves the capture evidence and
 calibration unchanged.
 
-Symbols do not fix Envoy's unwinding. Hosted run 40999505084 (HTTP/2, 10 KiB)
-had two Envoy captures. The twin named every Envoy executable leaf in the
-measurement window: 62 of 62 and 46 of 46, up from 2 and 0. Even so, in pair 1,
-2,073 of all 2,319 Envoy samples carried no unwound frame, against 12 of all
-2,393 Ferrum samples, and symbolization left those counts unchanged. Total Envoy
-known-leaf coverage in the window therefore rose only from 1.4–1.9% to about 4%.
-Most Envoy samples have no frame to name, so unwinding, not symbols, is the
-dominant remaining coverage gap. A function-level comparison needs the sampled
-PC even when DWARF unwinding fails, which the flat decode above now supplies.
+Symbols do not fix Envoy's unwinding. In retained run 40999505084, matching
+symbols named the existing Envoy leaves but did not repair the missing unwinds
+([dated counts](benchmark_h2_cpu_profile_envoy_unwind_2026_10_30.md)). Comparing
+functions for those samples requires their sampled PCs even when DWARF
+unwinding fails, which the flat decode above now supplies.
 
 The flat decode closes that gap. In hosted run 41136450150 (HTTP/2, 10 KiB), both
 Envoy captures passed the flat checks of that revision, and their retained data

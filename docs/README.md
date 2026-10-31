@@ -73,6 +73,7 @@ Topology, routing, and the control plane.
 | [http3.md](http3.md) | HTTP/3 (QUIC) frontend and backend |
 | [tcp_udp_proxy.md](tcp_udp_proxy.md) | TCP/UDP/DTLS stream proxy, encryption matrices, and Gateway API routes |
 | [response_body_streaming.md](response_body_streaming.md) | Streaming response semantics |
+| [stream_authorization_lifetime.md](stream_authorization_lifetime.md) | Authorization lifetime of authenticated streams and uploads |
 | [cp_dp_mode.md](cp_dp_mode.md) | Control plane / data plane distributed mode |
 | [cp_namespace_tenancy.md](cp_namespace_tenancy.md) | Multi-namespace control plane, JWT tenancy, and trust binding |
 | [mesh.md](mesh.md) | Mesh mode: topologies, config sources, data model, and maturity |
@@ -141,6 +142,7 @@ stated date and are not updated as behaviour changes.
 | [benchmark_h3_smoke_2026_09_18.md](benchmark_h3_smoke_2026_09_18.md) | H3 live smoke lifecycle loss ([results](benchmark_h3_smoke_2026_09_18_results.json)) |
 | [benchmark_h2_guard_transitions_2026_09_19.md](benchmark_h2_guard_transitions_2026_09_19.md) | H2 guard campaign findings and transition follow-up |
 | [benchmark_wss_tcp_2026_09_19.md](benchmark_wss_tcp_2026_09_19.md) | WSS and TCP/TLS missing-payload audit ([results](benchmark_wss_tcp_2026_09_19_results.json)) |
+| [benchmark_h2_cpu_profile_envoy_unwind_2026_10_30.md](benchmark_h2_cpu_profile_envoy_unwind_2026_10_30.md) | H2 CPU profile Envoy symbol vs. unwind coverage |
 | [ci_throughput_2026-09-08.md](ci_throughput_2026-09-08.md) | Hosted CI throughput follow-up ([cache inventory](ci_throughput_2026-09-08_cache.json)) |
 | [ci_pr_validation_review_2026_09_24.md](ci_pr_validation_review_2026_09_24.md) | PR validation scope review |
 

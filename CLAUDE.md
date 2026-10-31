@@ -14,7 +14,8 @@ Ferrum Edge is in active build-out with no deployed-user compatibility obligatio
 
 - Mesh behavior: `docs/mesh.md`, `src/modes/mesh/`, `.claude/rules/mesh.md` (plus `mesh-hbone-waypoint.md`,
   `mesh-capture-cni.md`, `mesh-k8s-controller.md`)
-- HTTP/3, WebSocket, QUIC, TCP/UDP: `docs/http3.md`, `docs/tcp_udp_proxy.md`, `src/proxy/`, `src/http3/`, `.claude/rules/proxy-protocols.md`
+- HTTP/3, WebSocket, QUIC, TCP/UDP: `docs/http3.md`, `docs/tcp_udp_proxy.md`, `src/proxy/`, `src/http3/`, `.claude/rules/proxy-protocols.md` (plus `connect-udp.md`,
+  `ktls.md`, `datagram-proxy-protocol.md`)
 - Plugin ordering/hooks: `docs/plugin_execution_order.md`, `src/plugins/mod.rs`, `.claude/rules/plugins.md`
 - Config/env/database: `docs/configuration.md`, `ferrum.conf`, `src/config/env_config.rs`, `.claude/rules/config-database.md`
 - Admin API/spec extraction: `docs/admin_api.md`, `docs/api_specs.md`, `openapi.yaml`, `.claude/rules/admin-api-specs.md`
