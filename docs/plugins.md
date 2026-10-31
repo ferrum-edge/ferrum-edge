@@ -40,7 +40,8 @@ what an invalid **enabled** config does to the surrounding generation:
 | Path | `FailClosed` / `KeepLastKnownGood` | `OptionalFailOpen` |
 |---|---|---|
 | Admin API create/update | `400`; nothing is stored | `400`; nothing is stored |
-| File-mode startup, `ferrum-edge validate` | Rejected; the gateway refuses to start | Warning; the instance is omitted |
+| `ferrum-edge validate` and file-mode validation | Rejected | Warning only; validation can still succeed |
+| File-mode startup (building the serving cache) | The gateway refuses to start | The instance is omitted from the cache |
 | Database-mode cold start | Refuses to start, unless a usable `FERRUM_DB_CONFIG_BACKUP_PATH` backup can be served (then `config_rejected` is raised) | The row is quarantined: logged, omitted from the cache, `config_rejected` raised; it stays readable and deletable through the Admin API |
 | File, database, or DP reload | The candidate is rejected; the previous generation keeps serving | Warning; the instance is omitted from the new cache |
 | Control-plane admission | The snapshot is rejected and never broadcast | Not rejected by the CP, so the row can be broadcast; each data plane omits the instance |
@@ -178,8 +179,8 @@ contain **at most one** instance per proxy of `api_chargeback`,
 admission rejects a chain with more. For `api_chargeback`, at most one enabled
 global instance is also permitted per process (the process-global `/charges`
 registry would otherwise double-count a transaction), and the shared
-render/cleanup tunables must match across instances; pricing and `currency`
-may differ per proxy. See [`api_chargeback`](#api_chargeback).
+render, cleanup, and budget tunables and the `/charges` projection must match
+across instances; pricing and `currency` may differ per proxy. See [`api_chargeback`](#api_chargeback).
 
 **Examples:**
 
@@ -461,8 +462,13 @@ contradict the bytes sent. That exemption is selected from the trusted
 request method and the gateway-selected status — never from a response
 header name or value, so a plugin cannot buy it.
 
-Because that boundary owns these fields, plugins may not configure them as
-write destinations. `Connection`, `Content-Length`, `Keep-Alive`,
+
+---
+
+### Protocol-managed response header names
+
+Because the [final response framing](#final-response-framing) boundary owns
+these fields, plugins may not configure them as write destinations. `Connection`, `Content-Length`, `Keep-Alive`,
 `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
 `Transfer-Encoding`, and `Upgrade` (case-insensitive) are rejected at
 construction by every configuration surface that writes an arbitrary
@@ -470,17 +476,14 @@ response-header name: [`response_transformer`](#response_transformer)
 `add`/`update` and rename destinations, [`response_mock`](#response-mock-plugin)
 `headers`, [`mesh_route_dispatch`](#mesh_route_dispatch)
 `response_transform`, [`security_headers`](#security_headers) `set`,
-[`opa`](#opa) `deny_headers` / `fail_closed_headers`, and
+[`opa`](#opa) `deny_headers` / `fail_closed_headers`,
+[`request_termination`](#request_termination) `headers`, and
 [`mcp_gateway`](#mcp_gateway) `sessions.downstream_session_header`.
 Removing those names stays allowed everywhere — dropping a
 protocol-managed field is a no-op after the origin strip and never invents
 framing.
 
----
-
-### Protocol-managed response header names
-
-Plugins that write response headers — `response_transformer`, `security_headers`, `request_termination`, `response_mock`, `opa` denial headers, and `mesh_route_dispatch` response transforms — reject these destinations case-insensitively, because the final response framing boundary above owns them: `Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, and `Upgrade`. Request-direction header rules and synthetic responses add their own restrictions; each plugin's section lists them.
+Request-direction header rules and synthetic responses add their own restrictions; each plugin's section lists them.
 
 ## Plugin HTTP calls and the proxy hop limit
 
@@ -663,7 +666,7 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 | `endpoint_url` | String | *(required)* | URL to POST transaction logs to. Must be `http://` or `https://` with a hostname or IP; empty, malformed, or non-HTTP URLs fail plugin creation at config load. |
 | `custom_headers` | Object | *(none)* | Key-value pairs of custom HTTP headers to include on every batch request |
 
-Also accepts the [common batching sink options](#common-batching-sink-options) (`batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes`, `schema`, `schema_ref`).
+Also accepts the [common batching sink options](#common-batching-sink-options): `batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes` (hard max 268435456 / 256 MiB), and `schema` / `schema_ref` (see [docs/log_schema.md](log_schema.md)).
 
 Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before serializing attacker-shaped summary fields, then shrinks that lease to the exact retained JSON size.
 
@@ -883,7 +886,7 @@ leave the sink disconnected).
 | `connect_timeout_ms` | Integer | `5000` | Bound covering DNS, TCP, TLS, and WebSocket Upgrade establishment (100–60000). On timeout the partial transport is dropped and retry/reconnect advances. When the endpoint resolves to several addresses, each one but the last may spend at most an equal share of the remaining budget connecting, so a silently unreachable first address (for example a broken IPv6 route) cannot keep a reachable later address from ever being dialed. |
 | `write_timeout_ms` | Integer | `5000` | Bound covering batch write/flush progress on an established socket (100–60000). On timeout the complete connection (writer + drain task) is invalidated before retry/reconnect. Delivery is at-least-once: a timeout after partial progress may duplicate a batch on the next attempt. |
 
-Also accepts the [common batching sink options](#common-batching-sink-options) (`batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes`, `schema`, `schema_ref`). The `retry_delay_ms` row above overrides the shared bound.
+Also accepts the [common batching sink options](#common-batching-sink-options): `batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes` (hard max 268435456 / 256 MiB), and `schema` / `schema_ref` (see [docs/log_schema.md](log_schema.md)). The `retry_delay_ms` row above overrides the shared bound.
 
 Each batch is sent as a single JSON array text message over the WebSocket connection. Entries are serialized under `max_entry_bytes` at admission (schema applied then). Each lease conservatively reserves the queued JSON plus a second copy and framing for contiguous batch assembly; assembly consumes the queued entries, retains only their leases, and converts the completed payload into tungstenite's reference-counted UTF-8 buffer. Retries clone only that buffer handle. This keeps queued, assembly, and retry content within `buffer_max_bytes` even while new records arrive. Overflow diagnostics are rate-limited (first drop, then every 100).
 
@@ -928,7 +931,7 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 | `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
 | `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 
-Also accepts the [common batching sink options](#common-batching-sink-options) (`batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes`, `schema`, `schema_ref`).
+Also accepts the [common batching sink options](#common-batching-sink-options): `batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes` (hard max 268435456 / 256 MiB), and `schema` / `schema_ref` (see [docs/log_schema.md](log_schema.md)).
 
 Unknown top-level configuration keys are rejected at admission with an actionable allowed-key list (for example a misspelled `tlls` cannot silently leave the sink on plaintext).
 
@@ -995,7 +998,7 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `max_retries` | Integer | `1` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts (0–60000) |
 
-Also accepts the [common batching sink options](#common-batching-sink-options) (`batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes`, `schema`, `schema_ref`). The rows above override the shared defaults.
+Also accepts the [common batching sink options](#common-batching-sink-options): `batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes` (hard max 268435456 / 256 MiB), and `schema` / `schema_ref` (see [docs/log_schema.md](log_schema.md)). The rows above override the shared defaults.
 
 Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
@@ -1285,11 +1288,11 @@ Every variant emits the same structure; the table lists only the keys and values
 | Variant | Differences |
 |---|---|
 | Streaming response (H1/H2) | Adds `"response_streamed": true` and, when the body finished, `"body_completed": true`; `"response_delivery": "observed"`; `latency_gateway_processing_ms`, `latency_backend_total_ms`, and `latency_gateway_overhead_ms` are `-1.0`; `latency_total_ms` covers the whole streamed lifetime |
-| HTTP/3 (QUIC) | Same fields as H1/H2 |
+| HTTP/3 (QUIC) | The summary is built after the downstream send settles, so `"response_delivery": "observed"`, and a completed send adds `"body_completed": true` (an incomplete one carries its `body_error_class` / `client_disconnected` outcome); other fields as H1/H2 |
 | gRPC | `http_method: "POST"`, `request_path: "/<package.Service>/<Method>"`, `response_status_code: 200`; adds `grpc_status`; `metadata` carries `grpc_service` and `grpc_method`, plus `grpc_status` / `grpc_message` for gateway-generated errors |
 | WebSocket upgrade handshake | `response_status_code: 101` (HTTP/1.1) or `http_method: "CONNECT"` with status `200` (HTTP/2 or HTTP/3 Extended CONNECT); `backend_target` uses `ws://` / `wss://`; `latency_backend_ttfb_ms` and `latency_backend_total_ms` are `0.0` |
 | WebSocket upgrade failed | `response_status_code: 502`; adds `error_class` (for example `connection_refused`); `metadata.rejection_phase: "websocket_backend_error"`; `backend_resolved_ip` absent; backend latencies `-1.0` |
-| Rejected request (auth failure) | `response_status_code: 401`; `consumer_username: null`; `backend_target: null`; backend latencies `-1.0`; `metadata.rejection_phase: "authenticate"` |
+| Rejected request (auth failure) | `response_status_code: 401`; `consumer_username: null`; `backend_target` keeps the matched proxy's configured target for attribution only (the backend was not contacted); backend latencies `-1.0`; `metadata.rejection_phase: "authenticate"` |
 
 Deferred logging emits this summary at body termination. `latency_total_ms` reflects the full streamed lifetime. `latency_backend_total_ms`, `latency_gateway_processing_ms`, and `latency_gateway_overhead_ms` remain `-1.0` because concurrent backend-body production and client delivery cannot be separated on the default streaming path — they are never filled by treating TTFB as full backend duration. Use `latency_backend_ttfb_ms` for streaming backend alerting.
 
@@ -1553,7 +1556,7 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`; when `max_entry_bytes` is omitted the default 65,536 ceiling applies) |
 | `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
 
-Also accepts the [common batching sink options](#common-batching-sink-options) (`batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes`, `schema`, `schema_ref`). The rows above override the shared defaults and bounds; Loki retries use exponential backoff.
+Also accepts the [common batching sink options](#common-batching-sink-options): `batch_size`, `flush_interval_ms`, `max_retries`, `retry_delay_ms`, `buffer_capacity`, `max_entry_bytes`, `buffer_max_bytes` (hard max 268435456 / 256 MiB), and `schema` / `schema_ref` (see [docs/log_schema.md](log_schema.md)). The rows above override the shared defaults and bounds; Loki retries use exponential backoff.
 
 HTTP **204 No Content** is Loki's canonical delivery success. A received 204 is treated as committed even if the best-effort response drain is incomplete, because retrying after the sink accepted the batch can duplicate entries. Other 2xx responses from Loki-compatible receivers or intermediaries are accepted only when their response drains completely and is empty. Loki's blocked-ingestion status **260**, non-empty or anomalously drained compatible-success responses, 3xx, and non-retryable 4xx responses are terminal; transport failures, 408, 429, and 5xx retry with capped exponential backoff and full jitter. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications. Loki-compatible receivers should return the standard 204.
 
@@ -5192,13 +5195,18 @@ Shared by `request_transformer` and `response_transformer` (which has no `query`
 - Unknown top-level keys and unknown header/query/body rule keys are rejected with path-qualified diagnostics (for example `config.rules[0]`).
 - Unknown operations and unknown targets are rejected.
 - Header and query operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints. Rejection is by property **presence**, not by parsed value, for every target — an explicit `new_key: null` on `add`/`update`/`remove`, or an explicit `value: null` on `remove`/`rename`, fails exactly as a string would. (An explicit `value: null` on a body `add`/`update` remains valid: that sets the target field to JSON null.)
+- Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
+- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF keep a dedicated diagnostic and other forbidden control bytes (NUL, DEL, …) fail construction instead of being dropped later at a protocol boundary. Route-level request header transforms (`mesh_route_dispatch` → `apply_route_overrides`) apply the same value gate.
+- Body `key` / `new_key` paths must not contain an empty segment: an empty path, or a leading, trailing, or doubled unescaped `.` (`""`, `"user."`, `".user"`, `"a..b"`) is rejected instead of silently reading or writing a `""` member. Escape a literal dot as `\.`.
+
+#### Request-only rules
+
+These apply to `request_transformer` only. `response_transformer` screens destinations against the smaller [protocol-managed response header names](#protocol-managed-response-header-names) set instead and has no request-variable templates.
+
 - Header `add`/`update` destinations and `rename` destinations reject gateway-owned names (case-insensitive, with `_` treated as `-`, so `X_Forwarded_For`, `content_length`, and `x_forwarded_proto` are refused exactly like their dashed spellings — CGI-style backends such as Rack, WSGI, and PHP-FPM fold both onto the same `HTTP_*` variable): `Host`, `Content-Length`, `Connection`, `Transfer-Encoding`, `Keep-Alive`, `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, `Expect`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Ferrum-Original-Content-Encoding`, and `X-Grpc-Web-Mode`. Use `preserve_host_header` for Host or trusted-proxy configuration for forwarding identity. Removal and rename sources remain allowed; query/body keys are unaffected.
 - Header `add`/`update` destinations and `rename` destinations also reject the whole gateway-owned `x-consumer-*` namespace (case-insensitive), including `X-Consumer-Username` and `X-Consumer-Custom-Id`: the error names the offending `rule[N]` and the `x-consumer-*` rule. Only the gateway asserts consumer identity to backends (see [Consumer Identity Headers](#consumer-identity-headers)). `remove` of, and `rename` away from, an `x-consumer-*` name remain allowed.
 - Header `add`/`update` destinations and `rename` destinations also reject the router's `x-path-param-*` route-capture namespace (case-insensitive, `_` or `-`): those headers carry the trusted regex captures the router injected, nothing re-asserts them after `before_proxy`, and a backend may authorize on them, so a rule must not overwrite or mint one. `remove` of, and `rename` away from, an `x-path-param-*` name remain allowed.
 - Every header rule that names the gateway-owned `X-Ferrum-Hops` proxy hop count (any case, `_` or `-`) is rejected, including `remove` and `rename` away from it: resetting the count would let a request loop past `FERRUM_MAX_PROXY_HOPS` (see [Proxy hop limit](routing.md#proxy-hop-limit)).
-- Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
-- Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF keep a dedicated diagnostic and other forbidden control bytes (NUL, DEL, …) fail construction instead of being dropped later at a protocol boundary. Route-level request header transforms (`mesh_route_dispatch` → `apply_route_overrides`) apply the same value gate.
-- Body `key` / `new_key` paths must not contain an empty segment: an empty path, or a leading, trailing, or doubled unescaped `.` (`""`, `"user."`, `".user"`, `"a..b"`) is rejected instead of silently reading or writing a `""` member. Escape a literal dot as `\.`.
 
 **Request-variable templates in `value`.** Header and query `add` / `update` values may reference a bounded set of request variables, compiled when the plugin loads:
 
@@ -5770,6 +5778,18 @@ The local name is admitted against the XML `NCName` grammar — the XML `Name` p
 **Priority:** 2960 · **Phases:** `validate_client_request_body_contract`, `before_proxy`, `on_final_request_body`, `after_proxy`, `on_final_response_body` · **Protocols:** HTTP · **Failure policy:** `FailClosed`
 
 Validates request parameters and request and response bodies against operation schemas generated from an attached OpenAPI or Swagger document. It is normally auto-injected by `POST /api-specs` or `PUT /api-specs/{id}` when the document includes `x-ferrum-validate`, which generates the required `operations` table; direct plugin configuration must supply that generated `operations` array itself.
+
+```yaml
+plugin_name: openapi_validator
+config:
+  operations:
+    - method: POST
+      path_template: /orders
+      path_regex: "^/orders$"
+      request_body:
+        content:
+          application/json: { type: object, required: [sku] }
+```
 
 See [openapi_validator.md](openapi_validator.md) for the configuration reference, runtime behavior, and metadata.
 

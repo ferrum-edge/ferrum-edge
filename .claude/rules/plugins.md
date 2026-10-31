@@ -529,7 +529,8 @@ Outside the HTTP ladder (the canonical doc numbers stream phases separately):
 - `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
 - `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
 
-Per-instance execution triggers gate the CONTEXTLESS phases (12, 13, 14, 15) by
+Per-instance execution triggers gate the CONTEXTLESS hooks (`log`, `on_ws_frame`,
+`on_stream_connect` / `on_stream_disconnect`, `on_udp_datagram`) by
 carrying ONE opaque decision from the authoritative admission point, never by
 re-evaluating a predicate later. `TransactionSummary.plugin_trigger_decisions`
 is stamped centrally in `plugins::log_with_mirror` (the single HTTP-family
