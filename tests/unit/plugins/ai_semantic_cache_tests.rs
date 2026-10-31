@@ -7758,6 +7758,17 @@ async fn forwarded_rate_limit_telemetry_is_omitted_from_the_exact_key() {
         !partition_is_hit(&plugin, &mut forged).await,
         "a value the limiter did not publish is backend-visible and must partition"
     );
+
+    // A case-variant duplicate line folds with the limiter's own line on
+    // egress, so it keeps the whole field bound even with a coinciding value.
+    let mut duplicated = rate_limited(&limiter, None).await;
+    duplicated
+        .headers
+        .insert("X-RateLimit-Limit".to_string(), "100".to_string());
+    assert!(
+        !partition_is_hit(&plugin, &mut duplicated).await,
+        "a duplicated published field is a different backend request"
+    );
 }
 
 /// An earlier `ai_stream_router` replaces the client credential with the
