@@ -146,7 +146,7 @@ capabilities:
     live_assertions:
       - sidecar.authz.denied_principal_rejected
     platform_profile: kind-spire-sidecar
-    docs_anchor: docs/mesh.md#authorization
+    docs_anchor: docs/mesh.md#authorization-1
     owner: mesh
     exclusions:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
@@ -336,7 +336,7 @@ capabilities:
     live_assertions:
       - multicluster.eastwest.untrusted_peer_rejected
     platform_profile: kind-spire-multicluster-federation
-    docs_anchor: docs/mesh.md#authorization
+    docs_anchor: docs/mesh.md#trust-federation
     owner: mesh
     exclusions:
       - Cross-cluster endpoint discovery (poller-driven) is Beta.
