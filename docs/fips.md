@@ -323,12 +323,14 @@ have a test that keeps the reasoning honest rather than leaving it as a comment:
 - `kafka_logging`'s `ssl_no_verify` is covered by the refusal of the whole
   plugin (below). A test pins that relationship so removing the plugin-level
   rejection cannot orphan the key.
-- `FERRUM_VAULT_ALLOW_PLAINTEXT` can never take effect in enforce mode, because
-  the whole Vault provider (`_VAULT` and `vault://`) is refused before any
-  provider client is built (§"External secret providers: why they are
-  refused"). A test pins that the refusal ignores this key, runs before either
-  Vault path resolves anything, and that Vault client construction is the
-  key's only reader.
+- `FERRUM_VAULT_ALLOW_PLAINTEXT` can never take effect in an enforcing
+  process, because the whole Vault provider (`_VAULT` and `vault://`) is
+  refused before any provider client is built (§"External secret providers:
+  why they are refused"). A test pins that both refusals run before startup
+  secret resolution and TLS material loading resolve anything, and that
+  `VaultClientWrapper::new` is the only code that reads the key.
+  `ferrum-edge health` never enforces FIPS mode, so a `_VAULT` source on one
+  of its endpoint settings still resolves under the key's ordinary rules.
 
 The fourth is not FIPS-gated and no FIPS test pins it:
 

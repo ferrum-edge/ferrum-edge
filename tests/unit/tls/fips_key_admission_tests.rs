@@ -867,12 +867,50 @@ fn vault_plaintext_opt_in_is_inert_because_the_vault_provider_is_refused_first()
         "the URI-scheme refusal must precede resolution"
     );
 
-    // And the key is read only while constructing a Vault client.
+    // And the key is read only while constructing a Vault client. First, no
+    // other source file can read it: outside `vault.rs` the name appears only
+    // in the public env inventory's list of names.
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![src_root.clone()];
+    let mut naming_files = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src is readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && std::fs::read_to_string(&path)
+                    .expect("source is readable")
+                    .contains("FERRUM_VAULT_ALLOW_PLAINTEXT")
+            {
+                let relative = path.strip_prefix(&src_root).expect("under src");
+                naming_files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    naming_files.sort();
+    assert_eq!(
+        naming_files,
+        ["config/public_env_inventory.rs", "secrets/vault.rs"],
+        "a new site naming FERRUM_VAULT_ALLOW_PLAINTEXT must be checked against the FIPS \
+         Vault refusal"
+    );
+
+    // Within `vault.rs`, the name is bound once to a private constant, and that
+    // constant is passed to exactly one call, inside `VaultClientWrapper::new`.
     let vault_source = include_str!("../../../src/secrets/vault.rs");
     assert_eq!(
+        vault_source.matches("FERRUM_VAULT_ALLOW_PLAINTEXT").count(),
+        1,
+        "the key must be named only by its constant"
+    );
+    assert!(
         vault_source
-            .matches("env::var(ALLOW_PLAINTEXT_ENV)")
-            .count(),
+            .contains("\nconst ALLOW_PLAINTEXT_ENV: &str = \"FERRUM_VAULT_ALLOW_PLAINTEXT\";"),
+        "the constant must stay private to the Vault backend"
+    );
+    assert_eq!(
+        vault_source.matches("(ALLOW_PLAINTEXT_ENV)").count(),
         1,
         "FERRUM_VAULT_ALLOW_PLAINTEXT must have exactly one reader"
     );
