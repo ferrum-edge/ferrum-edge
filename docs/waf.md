@@ -1521,9 +1521,9 @@ What gets scanned, by proxy type:
 | Proxy | Opening bytes seen by signatures |
 | --- | --- |
 | Plain TCP (`tcp`) | the first segment, in cleartext |
-| TLS-terminating (`tcp_tls`) | the first **decrypted** application bytes (re-encrypted to the backend) |
+| TLS-terminating (`tcp` or `tcps` with `frontend_tls: true`) | the first **decrypted** application bytes (re-encrypted to the backend only for `tcps`) |
 | Plain UDP (`udp`) | each datagram payload |
-| DTLS-terminating (`dtls`) | each **decrypted** datagram payload (re-encrypted to the backend) |
+| DTLS-terminating (`udp` or `dtls` with `frontend_tls: true`) | each **decrypted** datagram payload (re-encrypted to the backend only for `dtls`) |
 | Passthrough (`passthrough: true`) | **not L7-scanned** — the gateway never decrypts; only `tcp_require_tls` applies |
 
 Limitations and behavior to know:

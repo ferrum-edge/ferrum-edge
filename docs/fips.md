@@ -133,7 +133,7 @@ state` step in `.github/workflows/fips-build.yml`).
 | Resolved-feature-graph audit in CI (both profiles, and every claimed optional combination) | **Shipped** |
 | Hosted compile lane for every claimed optional FIPS combination | **Shipped** |
 | Approved key-strength/form admission for certificates and JWKS keys | **Shipped** (`src/fips/keys.rs`) |
-| Fail-closed gate on every independently configurable peer-verification opt-out | **Shipped** |
+| Fail-closed gate on the independently configurable peer-verification opt-outs (exceptions listed under §"What FIPS mode enforces") | **Shipped** |
 | Request surface (`--fips-mode`, `FERRUM_FIPS_MODE`, `FERRUM_FIPS_REQUIRED_PROVIDER`) | **Shipped** |
 | Fail-closed bootstrap, including the module's power-on self-test | **Shipped** |
 | Single crypto-provider seam (`crate::fips`) across all rustls construction | **Shipped** |
@@ -284,7 +284,7 @@ flow through the existing secure loading boundary (`parse_pem_private_key`) and
 are never parsed, copied, or logged by this gate. Diagnostics name the surface,
 the algorithm family, and the observed bit length, and nothing else.
 
-**Peer verification — every independently configurable opt-out**
+**Peer verification — independently configurable opt-outs**
 
 An unverified peer defeats the point of an approved key exchange: the module can
 perform a perfect ECDHE and it is still a key agreement with whoever answered.
@@ -313,8 +313,8 @@ walks through, so all of the following are refused:
 | `ai_federation` | `providers[].allow_plaintext: true` |
 | `ai_stream_router` | `providers[].allow_plaintext: true` |
 
-Two entries are deliberately absent, each with a test that keeps the reasoning
-honest rather than leaving it as a comment:
+Four settings are deliberately absent from that table. The first two each have
+a test that keeps the reasoning honest rather than leaving it as a comment:
 
 - `FERRUM_DP_GRPC_TLS_NO_VERIFY` is already refused **unconditionally**, on every
   build and in every mode, by the ordinary validator. A FIPS rule for it would
@@ -323,6 +323,20 @@ honest rather than leaving it as a comment:
 - `kafka_logging`'s `ssl_no_verify` is covered by the refusal of the whole
   plugin (below). A test pins that relationship so removing the plugin-level
   rejection cannot orphan the key.
+
+The other two are not FIPS-gated and no FIPS test pins them:
+
+- `FERRUM_VAULT_ALLOW_PLAINTEXT` can never take effect in enforce mode, because
+  the whole Vault provider (`_VAULT` and `vault://`) is refused before any
+  provider client is built (§"External secret providers: why they are
+  refused"). That provider-level refusal is tested; nothing ties this key to it.
+- `FERRUM_MESH_STOCK_XDS_ALLOW_PLAINTEXT` is **not** refused by FIPS enforce
+  mode. It is a development switch for unauthenticated h2c to a stock xDS
+  control plane: loopback hosts only (`127.0.0.0/8`, `::1`, `localhost`), never
+  combined with a bearer credential (`FERRUM_MESH_STOCK_XDS_TOKEN_FILE`), and
+  refused outright under `FERRUM_MESH_PRODUCTION_MODE=true`. Those mesh
+  transport rules are tested; the FIPS gate does not add to them. For a FIPS
+  deployment, leave it unset and set `FERRUM_MESH_PRODUCTION_MODE=true`.
 
 `backend_tls_verify_server_cert: false` is refused **even where it is currently
 inert** — for example on a plaintext backend. That is a deliberate decision, not
@@ -543,7 +557,7 @@ than being allowed to run outside the boundary:
 | ChaCha20-Poly1305, X25519 | not an approved AEAD / not an approved SP 800-56A scheme | AES-GCM suites, secp256r1 / secp384r1 |
 | RSA below 2048 bits; DSA, GOST, Ed25519/Ed448/X25519 certificates | SP 800-131A Rev. 2 / FIPS 186-5 | RSA 2048–8192, ECDSA P-256/P-384/P-521 |
 | Stapled OCSP responses signed with `sha1WithRSAEncryption` or Ed25519, and responses carrying a non-approved responder certificate key | SHA-1 is disallowed for signature verification (SP 800-131A Rev. 2); Ed25519 is not routed through the selected module; an embedded responder certificate bypasses the PEM bundle key gate | a response signed with SHA-2 RSA (PKCS#1 or PSS) or ECDSA P-256/P-384, carrying only approved responder certificates |
-| Any peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
+| A gated peer-verification opt-out | an unauthenticated peer defeats the approved key exchange | pin the peer's CA (see the table in §"What FIPS mode enforces") |
 | **External secret providers** (`_VAULT`, `_AWS`, `_AZURE`, `_GCP`, and `vault://`, `aws://`, `azure://`, or `gcp://` TLS-material sources) | their SDKs resolve secrets over their own TLS stacks, which are not built from Ferrum's provider seam and are not selected by the `crypto-ring` / `fips` feature pair | a local file or direct value backed by an operator-validated delivery mechanism (mounted secret, init container, KMS-backed volume) |
 
 ### DTLS: why the whole transport is refused
