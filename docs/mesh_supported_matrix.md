@@ -123,9 +123,10 @@ entries must declare exact hosts or use `resolution: STATIC` with `endpoints[]`.
 
 ## Support boundaries, deferrals, and non-goals (the long tail)
 
-These items are off the GA path. Each is a **non-goal**, a **deferred** field
-(parsed, surfaced in `deferred_fields`, not applied), a **rejected** shape, or a
-feature **supported within a stated boundary**. The linked `docs/mesh.md`
+These items are off the GA path. Each is a **non-goal**, **deferred** (a field
+that is parsed, surfaced in `deferred_fields`, and not applied, or a capability
+not yet targeted for GA), a **rejected** shape, or a feature **supported within
+a stated boundary**. The linked `docs/mesh.md`
 section is canonical for the detail.
 
 **Non-goals**
@@ -151,13 +152,13 @@ section is canonical for the detail.
   destination, and it fails closed the same way (DENY applies, ALLOW/AUDIT
   cannot match). HTTP-family, raw TCP, TLS passthrough, and captured mesh
   inbound carry it. See [Condition keys](mesh.md#condition-keys).
-- **LB `MAGLEV`** — `loadBalancer.simple = MAGLEV` is a hard reject at
-  translation.
-- **Active-active multi-cluster endpoint discovery at scale** — minority need;
-  targets verified-Beta, not GA. See [Multi-Cluster](mesh.md#multi-cluster).
 
-**Deferred or rejected fields**
+**Deferred or rejected**
 
+- **LB `MAGLEV`** — **Rejected**: `loadBalancer.simple = MAGLEV` is a hard
+  reject at translation.
+- **Active-active multi-cluster endpoint discovery at scale** — **Deferred**: a
+  minority need that targets verified-Beta, not GA. See [Multi-Cluster](mesh.md#multi-cluster).
 - **DR `connectionPool.http.maxRequestsPerConnection`** — **Deferred**: backend
   close-after-N-requests is unsupported. Use `maxConcurrentStreams` for
   per-connection HTTP/2 stream concurrency or `http2MaxRequests` for the
