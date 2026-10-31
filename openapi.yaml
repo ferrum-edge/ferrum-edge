@@ -10749,7 +10749,7 @@ components:
 
 
             **MUST be omitted / null for stream-family proxies** (`tcp`,
-            `tcp_tls`, `udp`, `dtls`). Stream proxies route on `listen_port`.
+            `tcps`, `udp`, `dtls`). Stream proxies route on `listen_port`.
 
 
             When `listen_path` is null on an HTTP proxy, the proxy matches any
@@ -11189,7 +11189,7 @@ components:
             Forward encrypted client bytes directly to the backend without
             terminating TLS (TCP) or DTLS (UDP). The proxy peeks at the
             ClientHello to extract SNI for logging but does not decrypt traffic.
-            Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
+            Only valid for stream proxies (tcp, tcps, udp, dtls).
             Mutually exclusive with frontend_tls.
 
             SNI-based routing is not exclusive to this flag: an ordinary
@@ -11207,14 +11207,14 @@ components:
             TCP stream idle timeout in seconds. After this duration of no data transfer
             in either direction, the connection is closed. When omitted, uses the global
             FERRUM_TCP_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to disable.
-            Only applicable for tcp/tcp_tls protocols.
+            Only applicable for tcp/tcps schemes.
         stream_proxy_protocol:
           type: [boolean, "null"]
           description: |
             Enable inbound PROXY protocol on this stream proxy listener. The framing
             depends on the scheme:
 
-            * tcp / tcp_tls: PROXY protocol v1 text or v2 binary (auto-detected), read once
+            * tcp / tcps: PROXY protocol v1 text or v2 binary (auto-detected), read once
               at the head of each accepted connection. A connection that does not begin with
               a valid header is closed immediately (fail closed).
             * udp / dtls: the PROXY protocol v2 DGRAM envelope, present on EVERY datagram
@@ -11251,7 +11251,7 @@ components:
             socket peer (the LB's own IP). This mirrors XFF + FERRUM_TRUSTED_PROXIES
             on the HTTP path.
 
-            Only valid for tcp / tcp_tls / udp / dtls stream proxies. Setting it on an
+            Only valid for tcp / tcps / udp / dtls stream proxies. Setting it on an
             HTTP-family proxy produces a validation error: HTTP-family proxies share the
             global HTTP/HTTPS listeners, which enable inbound PROXY protocol listener-wide
             with the FERRUM_FRONTEND_PROXY_PROTOCOL_HTTP / FERRUM_FRONTEND_PROXY_PROTOCOL_HTTPS
@@ -15100,8 +15100,8 @@ components:
             DestinationRule `trafficPolicy.tls.sni` and Gateway API
             `BackendTLSPolicy` `validation.hostname` both project to this
             field. Enforced at the backend handshake on every path where
-            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, terminating
-            `tcp`/`tcp_tls` streams that originate backend TLS, and the
+            Ferrum owns TLS: direct HTTP/2, gRPC over H2, native H3, non-passthrough
+            `tcps` streams that originate backend TLS, and the
             reqwest HTTP/1.1 dial (which carries the override in the request
             URL authority while pinning the socket to the selected target).
             It also partitions HTTP-family backend connection pools, so two

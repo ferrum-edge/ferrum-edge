@@ -248,7 +248,7 @@ cluster.
 - Per-remote-cluster discovery credentials that fail a cluster closed when its
   reference does not resolve.
 - Mesh authorization policy and REGISTRY_ONLY outbound scoping —
-  [Authorization](mesh.md#authorization).
+  [Authorization](mesh.md#authorization-1).
 - SPIFFE issuance through SPIRE — [spire_deployment.md](spire_deployment.md).
 
 **Residuals at this boundary.**

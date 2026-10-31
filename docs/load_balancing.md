@@ -266,7 +266,7 @@ upstreams:
 
 #### Stream-family proxies (TCP / UDP / DTLS)
 
-`least_connections` is fully accounted on the stream family. A `tcp` / `tcp_tls`
+`least_connections` is fully accounted on the stream family. A `tcp` / `tcps`
 connection holds the balancer's active-connection guard from backend selection
 until the relay ends (including across connect-phase retry rotation, which moves
 the count to the new target rather than leaving a residue on the abandoned one),
