@@ -27,7 +27,11 @@ ordering.
 
 Every built-in plugin validates its `config` with the same constructor on every
 path (Admin API, `ferrum-edge validate`, file/database/control-plane loads, and
-plugin-cache rebuilds). By default the root must be an object, and keys are
+plugin-cache rebuilds). Plugins whose construction needs node-local resources
+(`geo_restriction`, `body_validator`, `ai_response_guard`, `ai_transcript_audit`,
+`udp_logging` DTLS material, `oidc_relying_party`, `transaction_log_schema`, and
+`serverless_function`) use a shape-only check at admission; the full
+constructor runs where the serving cache is built. By default the root must be an object, and keys are
 closed at the root and in every fixed-shape nested object: an unknown key is
 rejected with a path-qualified diagnostic (with a spelling suggestion when one
 is close) instead of falling back to a default. Free-form maps and opaque
@@ -461,7 +465,6 @@ describes the representation a `GET` would have returned and cannot
 contradict the bytes sent. That exemption is selected from the trusted
 request method and the gateway-selected status — never from a response
 header name or value, so a plugin cannot buy it.
-
 
 ---
 
