@@ -2174,6 +2174,7 @@ jobs:
               functional_websocket_frame_limit_test
               functional_websocket_connection_limit_test
               functional_header_read_timeout_test
+              functional_client_write_timeout_test
               functional_injector_serving_test
               functional_response_body_limits_test
               functional_request_body_limits_test

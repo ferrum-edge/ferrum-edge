@@ -4369,6 +4369,37 @@ fn test_env_config_http_header_read_timeout_disabled() {
 }
 
 #[test]
+fn test_env_config_http_client_write_timeout_default_custom_and_disabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.http_client_write_timeout_seconds, 60,
+                "http_client_write_timeout_seconds should default to 60 (nginx send_timeout)"
+            );
+        },
+    );
+    for (raw, expected) in [("5", 5), ("0", 0)] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS", raw),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.http_client_write_timeout_seconds, expected);
+            },
+        );
+    }
+}
+
+#[test]
 fn test_env_config_frontend_tls_handshake_timeout_default() {
     with_env_vars(
         &[

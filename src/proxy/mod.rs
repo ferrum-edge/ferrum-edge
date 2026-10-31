@@ -42,6 +42,7 @@ pub mod body;
 pub mod client_abort;
 pub mod client_abort_scope;
 pub mod client_ip;
+pub mod client_write_stall;
 pub mod datagram_client_address;
 pub mod deferred_log;
 /// Pre-request admission bound for the data-plane HTTP frontend (issue #4152).
@@ -15615,6 +15616,14 @@ async fn handle_connection(
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
 
+    // Bound a client that stops reading while the gateway has bytes to send
+    // (slow-read exhaustion). Below hyper, so it also covers HTTP/2 and
+    // upgraded WebSocket transports on this connection.
+    let stream = client_write_stall::ClientWriteStallIo::new(
+        stream,
+        state.env_config.http_client_write_timeout_seconds,
+    );
+
     #[cfg(feature = "bench-h1-profile")]
     let stream =
         crate::h1_profile::io::ObservedIo::new(stream, crate::h1_profile::io::Layer::ClearMixed);
@@ -15849,7 +15858,16 @@ async fn handle_connection(
 
     if let Err(e) = result {
         let err_string = e.to_string();
-        if is_client_disconnect_error(&err_string) {
+        if client_write_stall::is_client_write_stall(e.as_ref()) {
+            info!(
+                remote_addr = %remote_addr.ip(),
+                tls = false,
+                error_kind = "client_write_stall",
+                timeout_seconds = post_conn_state.env_config.http_client_write_timeout_seconds,
+                "Closing client connection: the client accepted no response bytes within \
+                 FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS"
+            );
+        } else if is_client_disconnect_error(&err_string) {
             debug!(
                 remote_addr = %remote_addr.ip(),
                 error_kind = "client_disconnect",
@@ -25235,20 +25253,27 @@ async fn handle_tls_connection(
     // requests. ALPN `h2` is already HTTP/2: skip the observer so those
     // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
     // adapter still disables itself if the bytes are an h2c-style preface.
-    let (tls_stream, h1_framing_signals) =
-        if matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
-            (
-                h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
-                None,
-            )
-        } else {
-            let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
-                tls_stream,
-                http1_parser_max_buf_size(state.max_header_size_bytes),
-                Some(remote_addr),
-            );
-            (io, Some(signals))
-        };
+    let negotiated_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
+    // Bound a client that stops reading while the gateway has bytes to send
+    // (slow-read exhaustion); see `handle_connection`. Above rustls, so the
+    // timer measures plaintext the TLS session cannot hand to the socket.
+    let tls_stream = client_write_stall::ClientWriteStallIo::new(
+        tls_stream,
+        state.env_config.http_client_write_timeout_seconds,
+    );
+    let (tls_stream, h1_framing_signals) = if negotiated_h2 {
+        (
+            h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),
+            None,
+        )
+    } else {
+        let (io, signals) = h1_framing_guard::MaybeH1FramingGuardIo::observed(
+            tls_stream,
+            http1_parser_max_buf_size(state.max_header_size_bytes),
+            Some(remote_addr),
+        );
+        (io, Some(signals))
+    };
     #[cfg(feature = "bench-h1-profile")]
     let tls_stream = crate::h1_profile::io::ObservedIo::new(tls_stream, profile_layer);
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -25505,7 +25530,16 @@ async fn handle_tls_connection(
 
     if let Err(e) = result {
         let err_string = e.to_string();
-        if is_client_disconnect_error(&err_string) {
+        if client_write_stall::is_client_write_stall(e.as_ref()) {
+            info!(
+                remote_addr = %remote_addr.ip(),
+                tls = true,
+                error_kind = "client_write_stall",
+                timeout_seconds = post_conn_state.env_config.http_client_write_timeout_seconds,
+                "Closing client connection: the client accepted no response bytes within \
+                 FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS"
+            );
+        } else if is_client_disconnect_error(&err_string) {
             debug!(
                 remote_addr = %remote_addr.ip(),
                 error_kind = "client_disconnect",
