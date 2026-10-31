@@ -336,7 +336,7 @@ capabilities:
     live_assertions:
       - multicluster.eastwest.untrusted_peer_rejected
     platform_profile: kind-spire-multicluster-federation
-    docs_anchor: docs/mesh.md#trust-federation
+    docs_anchor: docs/mesh.md#authorization-1
     owner: mesh
     exclusions:
       - Cross-cluster endpoint discovery (poller-driven) is Beta.
