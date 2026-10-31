@@ -7,6 +7,8 @@ operator overview lives in [mesh.md → UDP TPROXY capture](mesh.md#udp-tproxy-c
 the host-network placement and the Ambient UDP upgrade/migration procedure live in
 [node_agent.md](node_agent.md#host-network-udp-capture-placement-issue-3288).
 
+## Capture rules and policy routing
+
 TCP mesh capture uses iptables `REDIRECT` in the `nat` table: REDIRECT rewrites the
 packet's destination to the proxy port, and the proxy recovers the pre-NAT
 original destination per-connection via `SO_ORIGINAL_DST`. **This does not work for
@@ -111,6 +113,9 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   such as `0xF00/0xF00`. The default TPROXY mark `0x733` differs from Ferrum's
   NodeWaypoint marks `0x734`, `0x735`, and `0x736`; the `1337` proxy UID is a
   socket-owner match in a separate namespace from `skb->mark`.
+
+## Enablement and placements
+
 - **Default OFF.** The flag defaults off and, when off, emits **no**
   `mangle`/TPROXY/routing rules and binds **no** listener. **The injector
   produces only Sidecar pods, and Sidecar UDP egress is supported (#1808), so
@@ -145,6 +150,9 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   malformed, mesh startup aborts (`serve_mesh_runtime` validates the env before
   binding any listener) rather than silently omitting the listener while diverted
   UDP hits a now-unbound port.
+
+## Capture listener, egress, and destination relay
+
 - **Consuming UDP listener + datagram-over-mesh egress (Ambient OR Sidecar).**
   When `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`, the **two topologies that relay
   captured UDP** — Ambient (HBONE) and Sidecar (mesh-mTLS) — emit the
@@ -290,6 +298,9 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   socket and reply path inside the destination pod netns) is live-gated by
   `functional_mesh_live_source_capture_udp_manager_hbone_round_trip` in
   `netns-capture-live`.
+
+## Source-capture producers
+
 - **End-to-end status (#1808, #2013): both topologies have a UDP source-capture
   producer.** The **Sidecar** mesh-mTLS datagram relay (`open_datagram_tunnel`) pairs
   the shared codec / materialization / dest-side unframe with the
@@ -411,9 +422,17 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   transparent reply sourced from the original VIP:port, with fail-closed
   destination-registry withdrawal. See note 12 of [mesh.md → Protocol x Topology Support Matrix](mesh.md#protocol-x-topology-support-matrix).
   eBPF UDP capture stays a non-goal (#1803 per-pod TC not resurrected).
-- **DTLS passthrough — opaque, never terminated.** There is no
-  separate `Dtls` `AppProtocol`: a DTLS service port is declared `protocol: UDP` and
-  rides the exact same `mesh_udp_egress` datapath as any other UDP datagram. The mesh
+
+## DTLS
+
+- **DTLS passthrough on the capture path — opaque, never terminated.** A DTLS
+  service port is a `protocol: UDP` port; an `appProtocol: dtls` / port-name hint (or an
+  Istio `dtls` port protocol) models it as `AppProtocol::Dtls`, which is the same L4
+  transport as `Udp`. Every UDP-family predicate treats the two identically, so a
+  `Dtls` port rides the exact same `mesh_udp_egress` capture datapath as any other UDP
+  datagram; only the NodeWaypoint UDP listener materializer distinguishes them, where a
+  `Dtls` port selects frontend DTLS termination instead of an opaque datagram relay
+  (see [mesh.md → Node Waypoint](mesh.md#node-waypoint)). On the capture path the mesh
   relays DTLS **opaquely** — it never terminates the DTLS session, parses the
   ClientHello, or routes on DTLS SNI (unlike the standalone `passthrough` UDP/DTLS
   stream proxy, which peeks the first ClientHello for SNI). The inner DTLS handshake
@@ -425,6 +444,9 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   ServiceEntry egress IS materialized (issue #3263) — see "External UDP egress (EgressGateway)" in [mesh.md](mesh.md#egress-gateway) — including the source-side producer that originates the
   `udp` CONNECT. The opaque relay is regression-pinned by
   `dtls_handshake_datagram_round_trips_opaque` in `mesh_udp_frame`.
+
+## Fail-closed gates
+
 - **Fail-closed contract — every relay decision drops/rejects on
   doubt.** The UDP datapath mirrors the raw-TCP egress fail-closed table
   gate-for-gate. Each gate has a regression pin:
@@ -451,6 +473,9 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   answers fail closed. Sidecar retains own-namespace loopback privilege.
   Sidecar `ingress[]` remaps and separately authorized EgressGateway external
   UDP remain distinct and skip that local-termination screen.
+
+## Locally generated egress loop
+
 - **Locally-generated pod UDP egress: OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY
   loop.** TPROXY runs **only in `PREROUTING`**, never for locally-generated (OUTPUT)
   packets — jumping into a `-j TPROXY` chain from `mangle OUTPUT` is invalid and can
@@ -505,6 +530,8 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   correctness** of the OUTPUT-MARK → lo-reroute → PREROUTING-TPROXY loop (and of the
   PREROUTING-visible inbound/forwarded capture) is validated by the
   **`netns-capture-live` e2e**; unit tests assert only the emitted rule shapes.
+
+## Cleanup
 
 Cleanup (`IptablesPlan::cleanup_commands(udp_capture_enabled)`) removes all four
 `mangle` chains (`FERRUM_MESH_UDP_INBOUND` / `FERRUM_MESH_UDP_OUTBOUND` /

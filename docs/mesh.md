@@ -140,7 +140,7 @@ This section consolidates every known residual gap so operators do not have to r
 - **eBPF capture is a build feature** — the default published image refuses eBPF mode before readiness; see [Platform prerequisites](#platform-prerequisites).
 - **NodeWaypoint is Experimental** — identity bridge, destination metadata, and per-source-pod UDP/DTLS scoping are documented under [Node Waypoint](#node-waypoint).
 - **NodeWaypoint inbound tc redirect** — opt-in (`FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES`), IPv4 + IPv6; a single-node cluster (or any node without remote topology evidence) reports `no_remote_topology_evidence`. See [Inbound capture (tc ingress redirect)](#inbound-capture-tc-ingress-redirect).
-- **Alternate policy routing and encapsulating CNIs** (inner and outer devices differ) are unsupported by the tc redirect's topology proof and stay failed closed.
+- **Alternate policy routing and encapsulating CNIs** (inner and outer devices differ) are unsupported by the tc redirect's topology proof and stay failed closed. See [Inbound capture (tc ingress redirect)](#inbound-capture-tc-ingress-redirect).
 - **Capture-destination residual risk** — the capture path is only as good as the destination inventory the config authority publishes; a workload with missing or wrong `node_waypoint` metadata is not captured for (fail closed). See [Inbound capture (tc ingress redirect)](#inbound-capture-tc-ingress-redirect).
 
 ### Authorization
@@ -4016,7 +4016,7 @@ Datadog export groups spans by trace in the Agent v0.3 payload shape and sends t
   Headers, body bytes, credentials, client IPs, and request paths are rejected (credential exposure and/or unbounded cardinality). HTTP-only attributes (`request.method`, `request.host`, `response.code`) fail closed when the override targets a TCP family or `ALL_METRICS`. Missing attributes evaluate to an empty sanitized label rather than inventing traffic data; output is truncated to 256 UTF-8 bytes and stripped of quotes/controls. Missing, empty, malformed, unsupported, or over-budget expressions make the Telemetry resource invalid (`FerrumAccepted=False`) with field-specific diagnostics that never echo expression text. Metric selectors are those listed under [RED Metrics](#red-metrics). Unsupported tag names, unsafe or oversized literal values, and unknown metric selectors likewise fail translation visibly. A changed label shape creates a new Prometheus series; the previous series ages out under the configured stale-entry TTL.
 
   **Dynamic series budget.** Exact CEL-derived label values and ordinary mesh identity series share one finite per-family live-series budget (`mesh_series_budget_per_family` on the global `prometheus_metrics` plugin; default `10_000`, range `1`–`1_000_000`) of distinct `MeshRequestKey` entries per mesh metric family in the process `MetricsRegistry`. Admission uses exact atomic reservation (not `DashMap::len()`). Already-admitted keys continue to update at capacity. A previously unseen key beyond the budget — including a newly observed legitimate identity combination — is dropped for that family and counted on the fixed-cardinality overflow series `ferrum_mesh_metric_series_overflow_total{family}` where `family` is one of the ten closed names (`request_count`, `request_duration`, `request_size`, `response_size`, `tcp_opened_connections`, `tcp_closed_connections`, `tcp_sent_bytes`, `tcp_received_bytes`, `grpc_request_messages`, `grpc_response_messages`). Stale TTL eviction releases live capacity so later distinct keys can be admitted again. Because the cap is shared across identity and CEL dimensions, CEL cardinality pressure can suppress newly observed identity series until eviction frees slots (and the reverse). `0` is rejected — there is no unlimited mode. The default is sized for large legitimate meshes (thousands of src×dst×code combinations) while bounding attacker-controlled CEL cardinality such as `request.host` or custom HTTP methods rewritten into metric labels. `request.host` / `request.method` / `destination.port` metadata is stamped only when an active CEL expression requires it, under the reserved internal-only `mesh.metrics.cel.*` namespace so those temporary values never become transaction-log or trace attributes.
-- `disabled_metrics`: suppresses only the selected mesh metric family before its counter or histogram is updated. It accepts the same metric selectors as `tag_overrides`. Newly accepted Telemetry configuration affects subsequent transactions immediately; an already-created series remains visible at its last value until the Prometheus stale-entry TTL evicts it, and re-enabling resumes recording without a restart.
+- `disabled_metrics`: suppresses only the selected mesh metric family before its counter or histogram is updated. It accepts the metric selectors listed under [RED Metrics](#red-metrics). Newly accepted Telemetry configuration affects subsequent transactions immediately; an already-created series remains visible at its last value until the Prometheus stale-entry TTL evicts it, and re-enabling resumes recording without a restart.
 
 **Access logging configuration**:
 
@@ -4290,8 +4290,10 @@ A datagram matching no declared mesh UDP destination is dropped.
   gateway SVID or pinned peer refuses the dial.
 - Unknown, future, or malformed CONNECT markers are rejected (405); a destination without
   UDP relay support 404s a `udp` CONNECT.
-- Ambient producers install a fail-closed OUTPUT DROP guard before binding, and pod UDP
-  stays blocked by the node-agent's BPF gate until the producer publishes
+- Before binding, each Ambient placement installs its own fail-closed DROP guard —
+  the per-pod-netns producer a `mangle OUTPUT` guard inside each pod netns, the
+  host-netns producer an interface-scoped `mangle PREROUTING` guard (it installs no
+  OUTPUT chain) — and pod UDP stays blocked by the node-agent's BPF gate until the producer publishes
   `.udp-ready/<pod_uid>`; a pod leaving capture keeps its DROP posture until the
   node-agent acknowledges the closed gate.
 - Startup fails closed on an invalid capture config, a runtime image missing
@@ -5068,7 +5070,7 @@ Set `FERRUM_NODE_AGENT_FALLBACK_MODE=iptables` only when running a custom node-a
 
 ### Environment Variables
 
-The node-agent variables are listed in the [Node Agent](#node-agent) table under Environment Variables at the end of this guide; the capture variables it shares with the injector are in the [Injector](#injector) table.
+The node-agent variables are indexed under [Node Agent](#node-agent) in Environment Variables at the end of this guide; the capture variables it shares with the injector are under [Injector](#injector). Both link to the canonical tables in configuration.md.
 
 ## VirtualService Translation
 
@@ -5390,9 +5392,12 @@ The selector is an atomic security boundary. Ferrum validates it completely befo
 | `get/list/watch` | `gatewayclasses`, `gateways`, `listenersets`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `referencegrants`, `backendtlspolicies`, `backendlbpolicies` (`gateway.networking.k8s.io`) |
 | `get/list/watch` | `xbackendtrafficpolicies` (`gateway.networking.x-k8s.io` — not covered by a `gateway.networking.k8s.io` grant) |
 | `get/list/watch` | `udpresponseamplificationpolicies` (`gateway.ferrum.io`) |
-| `get/list/watch` | MCS `serviceimports` |
-| `get/list/watch` | core `namespaces` (part of the `allowedRoutes.namespaces.from: Selector` authorization boundary), `secrets`, `configmaps`, `services`, `endpointslices` |
-| `patch` | `status` of Gateway, ListenerSet, routes, `backendtlspolicies`, `backendlbpolicies`, `xbackendtrafficpolicies`, `udpresponseamplificationpolicies` |
+| `get/list/watch` | `serviceimports` (`multicluster.x-k8s.io`) |
+| `get/list/watch` | core `namespaces` (part of the `allowedRoutes.namespaces.from: Selector` authorization boundary), `secrets`, `configmaps`, `services` |
+| `get/list/watch` | `endpointslices` (`discovery.k8s.io`) |
+| `get/patch/update` | `status` of `gatewayclasses`, `gateways`, `listenersets`, `httproutes`, `grpcroutes`, `tcproutes`, `tlsroutes`, `udproutes`, `backendtlspolicies`, `backendlbpolicies` (`gateway.networking.k8s.io`), `xbackendtrafficpolicies` (`gateway.networking.x-k8s.io`), and `udpresponseamplificationpolicies` (`gateway.ferrum.io`) |
+
+The chart's `templates/control-plane-rbac.yaml` is the reference grant.
 
 A watched kind that is installed but not granted is not a quiet degradation: every list is rejected `403` and the reflector retries for the life of the process. `GatewayClass` and `Namespace` watches are cluster-scoped; route, Gateway, ListenerSet, and ServiceImport watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there for a narrower controller.
 
