@@ -109,7 +109,7 @@ adding, removing, or materially changing a workflow.
 | `native-cache-envelope.yml` | Native Cache Envelope Proof | Manual; PRs and push to `main` on its own paths run contracts only | Synthetic GHCR envelope proof for native compiler caches; see [native_cache_envelope.md](native_cache_envelope.md). |
 | `native-compiler-store.yml` | Native Compiler Store Transfer | Manual; PRs and push to `main` on its own paths | Real compiler-store transfer proof through GHCR; see [native_compiler_store_transfer.md](native_compiler_store_transfer.md). |
 | `codeql-extraction-diagnostic.yml` | CodeQL Rust Extraction Diagnostic | Manual | Extraction-only default vs FIPS feature comparison; see [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md). |
-| `compose-fixture-qualification.yml` | Compose Fixture Qualification | PRs on `docker-compose*.yml`, `setup_db_tls.sh`, `check_compose_fixtures.sh`, and the workflow itself; manual | Disposable Compose fixture boundary checks. Optional. |
+| `compose-fixture-qualification.yml` | Compose Fixture Qualification | PRs on `docker-compose.yml`, `docker-compose.tls-test.yml`, `setup_db_tls.sh`, `check_compose_fixtures.sh`, and the workflow itself; manual | Disposable Compose fixture boundary checks. Optional. |
 | `h2-cpu-profile.yml` | H2 and gRPC CPU Profile | PRs on its own paths, manual | H2/gRPC CPU profile contracts on PRs; manual dispatch runs the profile campaign; see [h2_cpu_profile.md](h2_cpu_profile.md). Optional. |
 | `mesh-runtime-benchmark.yml` | Mesh Runtime Benchmark | Manual | Mesh data-plane head-to-head; see [mesh_runtime_benchmark.md](mesh_runtime_benchmark.md). |
 | `mesh-runtime-harness-tests.yml` | Mesh Runtime Harness Tests | PRs and push to `main` on `tests/performance/mesh_runtime/**` and its harness scripts, manual | Standalone harness tests/contracts. Optional. |
@@ -739,8 +739,12 @@ The verifier reuses only lexical results (#4668): shell tokens and executable
 basenames are held in per-process LRU caches of at most 2,048 entries, inputs
 over 4,096 characters bypass the cache, nothing persists across runs, and
 policy decisions are never cached because they depend on dispatcher and
-opaque-stdin scopes. Before the parallel split (#4680), CI Plan's policy step
-took 316s in [main run 34016773796](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34016773796);
+opaque-stdin scopes. Before that change, CI Plan's Cross verifier step took
+5m09s in [PR run 34005446618](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34005446618)
+and 6m56s in [merge-group run 33973581181](https://github.com/ferrum-edge/ferrum-edge/actions/runs/33973581181),
+and a local `cProfile` run of `--self-test` recorded 1,315,116 shell
+tokenizations and 16,979,146 executable basename lookups. Before the parallel
+split (#4680), CI Plan's policy step took 316s in [main run 34016773796](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34016773796);
 no post-adoption improvement has been measured. To compare scheduling, use
 matched source SHA, toolchain, runner class, cache state, and event kind, and
 measure plan completion (CI Plan `completed_at` minus workflow start), policy

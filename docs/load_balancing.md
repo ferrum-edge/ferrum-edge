@@ -809,7 +809,7 @@ HTTP/1.1 200 OK
 
 ## Retry Logic
 
-When a request to a backend target fails, the retry system can automatically retry to a **different** target in the upstream. This provides automatic failover without client-side retry logic. Configuration fields, defaults, backoff strategies, and examples live in [Retry Logic](retry.md).
+When a request to a backend target fails, the retry system can automatically retry, preferring a **different** healthy target in the upstream. This provides automatic failover without client-side retry logic. Configuration fields, defaults, backoff strategies, and examples live in [Retry Logic](retry.md).
 
 ### Key Behaviors
 
