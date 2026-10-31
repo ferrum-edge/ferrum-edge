@@ -561,13 +561,19 @@ that bypasses the resolver.
 `BackendTLSPolicy` per-port SNI overrides combined with effective retry,
 request-body-buffering plugins, `pool_enable_http2: false`, or all three,
 because the H1 dial serves them (issue #3276). What stays fail-closed is decided
-at runtime: a `502` with `gateway-error-reason: backend_tls_sni_requires_direct_h2`
-when the dial cannot be constructed — no resolved target address to pin, or a
-backend URL whose authority does not carry the selected target host — sent on
-the HTTP/3 bridge without dialing the backend or relaying a request body, so the
-override is never silently dropped and the handshake is never made under the
-wrong server name; and the `wss://` WebSocket pre-dial refusal described under
-[Connection Pool Behavior](#connection-pool-behavior).
+at runtime:
+
+* On every dispatch path (HTTP/1.1 and HTTP/2 frontends, the retry path, and the
+  HTTP/3 bridge), a dial that cannot be constructed — no resolved target address
+  to pin, or a backend URL whose authority does not carry the selected target
+  host — answers `502` with
+  `gateway-error-reason: backend_tls_sni_requires_direct_h2`, so the override is
+  never silently dropped and the handshake is never made under the wrong server
+  name.
+* On the HTTP/3 bridge that decision is made before backend admission, so the
+  `502` is sent without dialing the backend or relaying a request body.
+* A `wss://` WebSocket upgrade with an override is refused before dialing, as
+  described under [Connection Pool Behavior](#connection-pool-behavior).
 
 ## Testing with Self-Signed Certificates
 

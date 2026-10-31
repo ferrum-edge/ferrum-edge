@@ -173,15 +173,18 @@ section is canonical for the detail.
   `consecutiveLocalOriginFailures` / `minHealthPercent`** — **Deferred** with a
   translate-time warning (issue #4292): passive health keeps one failure bucket
   and bounds ejection with `maxEjectionPercent` alone. `consecutive5xxErrors`
-  IS applied with Istio's consecutive-streak semantics; an omitted threshold
-  inherits Istio's default of 5, explicit `0` disables the consecutive-5xx
-  detector, and an omitted `maxEjectionPercent` inherits Istio's 10%. See the
+  IS applied with Istio's consecutive-streak semantics. Omitting both
+  `consecutive5xxErrors` and `consecutiveErrors` inherits Istio's default of 5,
+  and omitting `maxEjectionPercent` inherits Istio's 10%, only when no
+  lower-precedence outlier tier supplied that value; explicit `0` disables the
+  consecutive-5xx detector. See the
   [DestinationRule support matrix](mesh.md#meshdestinationrule).
 - **`RequestAuthentication` / `Telemetry` `targetRef` / `targetRefs`** —
   **Rejected** (`FerrumAccepted=False` / `Invalid`, issue #4305): admitting
   either would read as "no selector" and widen the resource to namespace scope,
   or to the whole mesh in the Istio root namespace. Scope these with a workload
-  selector. See [Telemetry API](mesh.md#telemetry-api).
+  selector. See [RequestAuthentication](mesh.md#requestauthentication) and
+  [Telemetry API](mesh.md#telemetry-api).
 - **`RequestAuthentication` `jwtRules[].outputPayloadToHeader` / `fromCookies`**
   — **Deferred** (issue #4277), reported by field name only.
   `outputClaimToHeaders` IS applied: every declared header is stripped from the
@@ -201,7 +204,8 @@ section is canonical for the detail.
   `Workload.node_waypoint` metadata, which is published only with an explicit
   waypoint SPIFFE ID. Identity-backed source runtimes skip metadata-absent
   targets instead of dialing them in plaintext, and destination `mesh_authz`
-  trusts HBONE baggage only from the `node_waypoint_assertors` inventory; only
+  trusts HBONE baggage only from the `node_waypoint_assertors` inventory (see
+  [Trusted HBONE Assertors](mesh.md#trusted-hbone-assertors)); only
   explicit no-CA/no-identity development runs keep the plaintext fallback. The
   pod-veth tc guard drops unmanaged direct Pod-IP attempts to enrolled pods.
   See [Destination metadata](mesh.md#destination-metadata-workloadnode_waypoint).
