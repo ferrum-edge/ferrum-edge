@@ -154,7 +154,7 @@ fn stall_gateway_builder(backend_port: u16, timeout_seconds: &str) -> TestGatewa
 }
 
 async fn spawn_gateway(backend_port: u16, timeout_seconds: &str) -> TestGateway {
-    let mut gateway = stall_gateway_builder(backend_port, timeout_seconds)
+    let gateway = stall_gateway_builder(backend_port, timeout_seconds)
         .spawn()
         .await
         .expect("start client-write-timeout gateway");
