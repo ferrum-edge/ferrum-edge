@@ -17,7 +17,9 @@
 //!
 //! # The bound
 //!
-//! [`ClientWriteStallIo`] wraps the accepted client transport, below hyper.
+//! [`ClientWriteStallIo`] wraps the accepted client socket: below hyper on
+//! plaintext listeners and below rustls on TLS listeners, so every byte the
+//! kernel accepts (ciphertext, on TLS) counts as progress.
 //! It is the transport-level analogue of nginx's `send_timeout`: the timer
 //! runs only while the gateway has bytes to write and the transport refuses
 //! all of them (`poll_write` / `poll_write_vectored` / `poll_flush` /
@@ -42,12 +44,22 @@
 //!
 //! # Scope
 //!
-//! This bounds **transport** progress. An HTTP/2 client that keeps reading its
-//! socket but withholds one stream's `WINDOW_UPDATE` is not stalled at the
-//! transport (other streams and control frames still flow); that per-stream
-//! case remains bounded by the authenticated-stream lifetime for authenticated
-//! streams. HTTP/3 has its own QUIC idle timeout and flow control and does not
-//! use this wrapper.
+//! This bounds **transport** progress, so it is complete for HTTP/1.1 (one
+//! response per connection at a time, written straight to the socket) and for
+//! upgraded WebSocket transports. On HTTP/2 it fires only when the socket
+//! itself stops accepting bytes: a client whose stream or connection
+//! flow-control window is smaller than what the socket buffers can absorb (the
+//! RFC 9113 default window is 65,535 bytes) parks hyper's response pipe on
+//! send capacity before any transport write blocks, and a client that keeps
+//! reading its socket but withholds one stream's `WINDOW_UPDATE` never stalls
+//! the transport at all. Those HTTP/2 stream-capacity stalls are NOT bounded
+//! here; authenticated streams stay bounded by the authorization lifetime.
+//! HTTP/3 has its own QUIC idle timeout and flow control and does not use
+//! this wrapper. Admin and injector listeners are not wrapped.
+//!
+//! The connection-close log line (`error_kind=client_write_stall`) is emitted
+//! by the HTTP connection handlers. A WebSocket that was already upgraded when
+//! the stall fired ends through the WebSocket relay's own close path instead.
 
 use std::future::Future;
 use std::io;
@@ -143,14 +155,6 @@ impl<T> ClientWriteStallIo<T> {
         }
     }
 
-    pub fn get_ref(&self) -> &T {
-        &self.inner
-    }
-
-    pub fn get_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
-
     /// `true` once the bound has fired on this connection.
     pub fn is_expired(&self) -> bool {
         self.expired
@@ -170,8 +174,10 @@ impl<T> ClientWriteStallIo<T> {
         if !self.armed {
             self.armed = true;
             let now = tokio::time::Instant::now();
-            // `checked_add` keeps an absurd timeout from panicking; such a
-            // deadline is effectively "never", so leave the episode unarmed.
+            // `checked_add` keeps an unrepresentable timeout from panicking.
+            // `EnvConfig::validate` refuses anything above
+            // `MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS`, so this is unreachable
+            // from configuration.
             let Some(deadline) = now.checked_add(timeout) else {
                 return Poll::Pending;
             };

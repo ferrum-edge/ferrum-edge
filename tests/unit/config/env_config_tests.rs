@@ -4384,7 +4384,7 @@ fn test_env_config_http_client_write_timeout_default_custom_and_disabled() {
             );
         },
     );
-    for (raw, expected) in [("5", 5), ("0", 0)] {
+    for (raw, expected) in [("5", 5), ("0", 0), ("86400", 86_400)] {
         with_env_vars(
             &[
                 ("FERRUM_MODE", "file"),
@@ -4394,6 +4394,28 @@ fn test_env_config_http_client_write_timeout_default_custom_and_disabled() {
             || {
                 let config = EnvConfig::from_env().unwrap();
                 assert_eq!(config.http_client_write_timeout_seconds, expected);
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_http_client_write_timeout_rejects_values_that_would_never_fire() {
+    // Above the ceiling the deadline would be unrepresentable and silently
+    // never fire; refuse it instead of claiming a bound.
+    for value in ["86401", "18446744073709551615"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    error.contains("FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS"),
+                    "unexpected error for {value}: {error}"
+                );
             },
         );
     }

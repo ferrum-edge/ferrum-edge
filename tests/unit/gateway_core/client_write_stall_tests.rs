@@ -6,12 +6,16 @@
 //! Time is paused, so the bound's 60s windows run instantly and exactly.
 
 use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use ferrum_edge::proxy::client_write_stall::{
     CLIENT_WRITE_STALL_MESSAGE, ClientWriteStallIo, is_client_write_stall,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::Instant;
 
 const PIPE: usize = 64;
@@ -148,4 +152,150 @@ fn stall_detection_survives_message_rebuild_and_rejects_other_timeouts() {
     assert!(!is_client_write_stall(&bare));
     let wrong_kind = io::Error::other(CLIENT_WRITE_STALL_MESSAGE.to_string());
     assert!(!is_client_write_stall(&wrong_kind));
+}
+
+/// Transport whose writes and flushes park while the matching flag is set,
+/// to drive the `poll_flush` / `poll_write_vectored` arms directly (the TLS
+/// session and hyper's vectored H1 writes use them).
+struct GatedIo {
+    write_blocked: Arc<AtomicBool>,
+    flush_blocked: Arc<AtomicBool>,
+}
+
+impl AsyncRead for GatedIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for GatedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.write_blocked.load(Ordering::SeqCst) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if self.write_blocked.load(Ordering::SeqCst) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(bufs.iter().map(|b| b.len()).sum()))
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.flush_blocked.load(Ordering::SeqCst) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn gated(write: bool, flush: bool) -> (GatedIo, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let write_blocked = Arc::new(AtomicBool::new(write));
+    let flush_blocked = Arc::new(AtomicBool::new(flush));
+    (
+        GatedIo {
+            write_blocked: Arc::clone(&write_blocked),
+            flush_blocked: Arc::clone(&flush_blocked),
+        },
+        write_blocked,
+        flush_blocked,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn parked_flush_arms_the_bound_and_fires_after_the_window() {
+    let (inner, _w, _f) = gated(false, true);
+    let mut io = ClientWriteStallIo::new(inner, TIMEOUT_SECS);
+    let start = Instant::now();
+    let err = io
+        .flush()
+        .await
+        .expect_err("a flush that never completes must be cut");
+    assert!(is_client_write_stall(&err));
+    assert_eq!(Instant::now() - start, Duration::from_secs(TIMEOUT_SECS));
+}
+
+#[tokio::test(start_paused = true)]
+async fn parked_vectored_write_arms_the_bound_and_fires_after_the_window() {
+    let (inner, _w, _f) = gated(true, false);
+    let mut io = ClientWriteStallIo::new(inner, TIMEOUT_SECS);
+    assert!(
+        io.is_write_vectored(),
+        "vectored capability must be forwarded"
+    );
+    let start = Instant::now();
+    let bufs = [io::IoSlice::new(b"head"), io::IoSlice::new(b"body")];
+    let err = io
+        .write_vectored(&bufs)
+        .await
+        .expect_err("a vectored write that never completes must be cut");
+    assert!(is_client_write_stall(&err));
+    assert_eq!(Instant::now() - start, Duration::from_secs(TIMEOUT_SECS));
+}
+
+#[tokio::test(start_paused = true)]
+async fn completed_flush_ends_the_stall_episode() {
+    // A parked flush that completes before the window is progress: a later
+    // stall gets a fresh window rather than the remainder of the old one.
+    let (inner, _w, flush_blocked) = gated(false, true);
+    let mut io = ClientWriteStallIo::new(inner, TIMEOUT_SECS);
+    let releaser = {
+        let flush_blocked = Arc::clone(&flush_blocked);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(TIMEOUT_SECS - 10)).await;
+            flush_blocked.store(false, Ordering::SeqCst);
+        })
+    };
+    // The gate has no waker, so poll the flush on a short cadence the way a
+    // transport readiness wakeup would.
+    let started = Instant::now();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), io.flush()).await {
+            Ok(res) => {
+                res.expect("flush completed before the window");
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    releaser.await.expect("releaser");
+    assert!(Instant::now() - started < Duration::from_secs(TIMEOUT_SECS));
+
+    flush_blocked.store(true, Ordering::SeqCst);
+    let second = Instant::now();
+    let err = io
+        .flush()
+        .await
+        .expect_err("second stall must still be cut");
+    assert!(is_client_write_stall(&err));
+    assert_eq!(
+        Instant::now() - second,
+        Duration::from_secs(TIMEOUT_SECS),
+        "the second stall must get a full fresh window"
+    );
 }

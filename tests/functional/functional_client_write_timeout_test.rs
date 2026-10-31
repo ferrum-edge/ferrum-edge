@@ -19,7 +19,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,8 @@ const DISABLED_HOLD: Duration = Duration::from_secs(6);
 /// go of the upstream connection).
 struct EndlessBackend {
     port: u16,
+    /// Streams whose response head the backend has written.
+    started: Arc<AtomicUsize>,
     released: watch::Receiver<Option<Duration>>,
     task: JoinHandle<()>,
 }
@@ -62,14 +64,17 @@ async fn spawn_endless_backend() -> EndlessBackend {
     let port = listener.local_addr().expect("backend addr").port();
     let (tx, rx) = watch::channel(None);
     let tx = Arc::new(tx);
+    let started = Arc::new(AtomicUsize::new(0));
+    let started_task = Arc::clone(&started);
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
             let tx = Arc::clone(&tx);
+            let started = Arc::clone(&started_task);
             tokio::spawn(async move {
-                let elapsed = serve_endless(stream).await;
+                let elapsed = serve_endless(stream, &started).await;
                 if let Some(elapsed) = elapsed {
                     let _ = tx.send(Some(elapsed));
                 }
@@ -78,6 +83,7 @@ async fn spawn_endless_backend() -> EndlessBackend {
     });
     EndlessBackend {
         port,
+        started,
         released: rx,
         task,
     }
@@ -86,7 +92,7 @@ async fn spawn_endless_backend() -> EndlessBackend {
 /// Serves one endless chunked response. Returns how long after the response
 /// head the gateway closed the connection, or `None` if the request never
 /// arrived (a capability probe, for example).
-async fn serve_endless(mut stream: TcpStream) -> Option<Duration> {
+async fn serve_endless(mut stream: TcpStream, started_streams: &AtomicUsize) -> Option<Duration> {
     let mut head = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -112,6 +118,7 @@ async fn serve_endless(mut stream: TcpStream) -> Option<Duration> {
     {
         return Some(started.elapsed());
     }
+    started_streams.fetch_add(1, Ordering::SeqCst);
     let payload = vec![b'x'; 32 * 1024];
     let mut chunk = format!("{:x}\r\n", payload.len()).into_bytes();
     chunk.extend_from_slice(&payload);
@@ -181,6 +188,17 @@ async fn non_reading_h1_client(proxy_port: u16) -> TcpStream {
     stream
 }
 
+async fn wait_for_started(backend: &EndlessBackend) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while backend.started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the gateway never forwarded the streaming request to the backend"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_release(backend: &mut EndlessBackend, within: Duration) -> Option<Duration> {
     let waited = tokio::time::timeout(within, async {
         loop {
@@ -218,6 +236,7 @@ async fn functional_client_write_timeout_releases_backend_of_non_reading_h1_clie
     let mut gateway = spawn_gateway(backend.port, "2").await;
 
     let _client = non_reading_h1_client(gateway.proxy_port).await;
+    wait_for_started(&backend).await;
 
     let released = wait_for_release(&mut backend, RELEASE_GRACE).await;
     let logs = gateway.read_combined_captured_output().unwrap_or_default();
@@ -244,12 +263,20 @@ async fn functional_client_write_timeout_zero_keeps_non_reading_h1_client() {
     let mut gateway = spawn_gateway(backend.port, "0").await;
 
     let _client = non_reading_h1_client(gateway.proxy_port).await;
+    // Positive evidence that the exchange is live: otherwise a request the
+    // gateway refused would never notify `released` and pass vacuously.
+    wait_for_started(&backend).await;
 
     assert!(
         wait_for_release(&mut backend, DISABLED_HOLD)
             .await
             .is_none(),
         "with the bound disabled the stalled exchange must stay open"
+    );
+    assert_eq!(
+        backend.started.load(Ordering::SeqCst),
+        1,
+        "exactly one streamed exchange expected"
     );
 
     gateway.shutdown();
@@ -353,5 +380,110 @@ async fn functional_client_write_timeout_releases_backend_of_non_reading_h2_clie
     assert_stall_logged(&gateway).await;
 
     driver.abort();
+    gateway.shutdown();
+}
+
+/// Accepts any server certificate: the test drives the gateway's own
+/// self-signed `tests/certs/server.crt`.
+#[derive(Debug)]
+struct AcceptAnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// HTTPS (ALPN `http/1.1`) variant. On TLS listeners the bound sits below
+/// rustls, so this pins that the TLS frontend is wrapped at all and that the
+/// stall is still recognized through the TLS session's error.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_client_write_timeout_releases_backend_of_non_reading_tls_h1_client() {
+    let mut backend = spawn_endless_backend().await;
+    let crt = std::fs::canonicalize("tests/certs/server.crt").expect("server.crt");
+    let key = std::fs::canonicalize("tests/certs/server.key").expect("server.key");
+    let mut gateway = stall_gateway_builder(backend.port, "2")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", crt.to_string_lossy())
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key.to_string_lossy())
+        .spawn()
+        .await
+        .expect("start TLS client-write-timeout gateway");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("ephemeral HTTPS port");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let tcp = loop {
+        match TcpStream::connect(("127.0.0.1", https_port)).await {
+            Ok(tcp) => break tcp,
+            Err(err) => {
+                assert!(Instant::now() < deadline, "HTTPS listener not ready: {err}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    let _ = socket2::SockRef::from(&tcp).set_recv_buffer_size(8 * 1024);
+    let provider = rustls::crypto::ring::default_provider();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let mut tls = connector.connect(name, tcp).await.expect("TLS handshake");
+    tls.write_all(b"GET /stream/events HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .expect("write request");
+    tls.flush().await.expect("flush request");
+    // From here the client reads nothing; `tls` stays alive so the socket
+    // stays open.
+    wait_for_started(&backend).await;
+
+    let released = wait_for_release(&mut backend, RELEASE_GRACE).await;
+    assert!(
+        released.is_some(),
+        "a TLS client that never reads held the backend connection for {RELEASE_GRACE:?}; \
+         logs:\n{}",
+        gateway.read_combined_captured_output().unwrap_or_default()
+    );
+    assert_stall_logged(&gateway).await;
+
+    drop(tls);
     gateway.shutdown();
 }

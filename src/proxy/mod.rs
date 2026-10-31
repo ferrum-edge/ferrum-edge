@@ -15617,8 +15617,8 @@ async fn handle_connection(
     set_tcp_keepalive(&stream);
 
     // Bound a client that stops reading while the gateway has bytes to send
-    // (slow-read exhaustion). Below hyper, so it also covers HTTP/2 and
-    // upgraded WebSocket transports on this connection.
+    // (slow-read exhaustion). Below hyper, so it also covers HTTP/2 transport
+    // writes and upgraded WebSocket transports on this connection.
     let stream = client_write_stall::ClientWriteStallIo::new(
         stream,
         state.env_config.http_client_write_timeout_seconds,
@@ -25176,6 +25176,17 @@ async fn handle_tls_connection(
         }
     }
 
+    // Bound a client that stops reading while the gateway has bytes to send
+    // (slow-read exhaustion); see `handle_connection`. BELOW rustls, so every
+    // ciphertext write the socket accepts is progress: above rustls a
+    // `poll_flush` that drains part of the TLS buffer and then parks reports
+    // only `Pending`, which would time out a slow client that is still
+    // reading. The handshake keeps its own, shorter timeout.
+    let stream = client_write_stall::ClientWriteStallIo::new(
+        stream,
+        state.env_config.http_client_write_timeout_seconds,
+    );
+
     #[cfg(feature = "bench-h1-profile")]
     let stream =
         crate::h1_profile::io::ObservedIo::new(stream, crate::h1_profile::io::Layer::TlsWireMixed);
@@ -25254,13 +25265,6 @@ async fn handle_tls_connection(
     // connections do not allocate `H1FramingSignals`. Otherwise wrap; the
     // adapter still disables itself if the bytes are an h2c-style preface.
     let negotiated_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
-    // Bound a client that stops reading while the gateway has bytes to send
-    // (slow-read exhaustion); see `handle_connection`. Above rustls, so the
-    // timer measures plaintext the TLS session cannot hand to the socket.
-    let tls_stream = client_write_stall::ClientWriteStallIo::new(
-        tls_stream,
-        state.env_config.http_client_write_timeout_seconds,
-    );
     let (tls_stream, h1_framing_signals) = if negotiated_h2 {
         (
             h1_framing_guard::MaybeH1FramingGuardIo::passthrough(tls_stream),

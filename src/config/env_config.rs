@@ -83,6 +83,11 @@ fn process_private_tls_managed_store_path() -> String {
 
 /// Default bound on waiting for the shared managed-TLS/ACME store lock.
 pub const DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 10;
+
+/// Upper bound for `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (24 hours, the
+/// same ceiling as `FERRUM_SHUTDOWN_DRAIN_SECONDS`). Larger values are refused
+/// at the configuration boundary instead of silently never firing.
+pub const MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS: u64 = 86_400;
 /// Settings key for that bound.
 pub const TLS_STORE_LOCK_TIMEOUT_KEY: &str = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
 const MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 1;
@@ -7552,6 +7557,15 @@ impl EnvConfig {
             return Err(format!(
                 "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS must be 0 (no bound) or at most {}",
                 crate::proxy::unix_backend_pool::MAX_UNIX_INGRESS_MAX_CONNECTIONS
+            ));
+        }
+
+        // A value too large to add to an `Instant` would silently never fire,
+        // leaving slow-read exhaustion unbounded while claiming a bound.
+        if self.http_client_write_timeout_seconds > MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS {
+            return Err(format!(
+                "FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS must be at most \
+                 {MAX_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS} seconds (0 disables the bound)"
             ));
         }
 
