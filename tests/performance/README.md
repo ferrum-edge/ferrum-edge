@@ -21,6 +21,7 @@ duration, build profile, and comparison baseline.
 | In-process hot-path microbenches | [`mesh/`](mesh/) | Criterion microbenches for IP restriction lookup, mesh authorization, slice apply, xDS translation, round-robin/weighted round-robin selection, Unix backend pooling, and AI semantic-cache cleanup. | [`mesh/README.md`](mesh/README.md) and `mesh/baseline.md`. |
 | Mesh DNS E2E | [`mesh-dns-e2e/`](mesh-dns-e2e/) | End-to-end transparent mesh DNS proxy latency/throughput over UDP and TCP. | [`mesh-dns-e2e/README.md`](mesh-dns-e2e/README.md). |
 | Mesh HBONE E2E | [`mesh-hbone-e2e/`](mesh-hbone-e2e/) | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS. | [`mesh-hbone-e2e/README.md`](mesh-hbone-e2e/README.md). |
+| Mesh runtime head-to-head | [`mesh_runtime/`](mesh_runtime/) | Ferrum as a mesh data plane vs other mesh data planes: throughput, latency, proxy-pair CPU/memory across payload sizes (`mesh-runtime-benchmark.yml`). | [`mesh_runtime/README.md`](mesh_runtime/README.md). |
 
 ## Result Provenance Checklist
 

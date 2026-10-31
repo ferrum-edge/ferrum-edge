@@ -36,7 +36,7 @@ src/
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS support
 ├── consumer_index.rs          # Consumer lookup index for auth plugins
 ├── health_check.rs            # Active and passive backend health checking
-├── load_balancer.rs           # Load balancing (six algorithms; see docs/load_balancing.md)
+├── load_balancer.rs           # Load balancing (seven algorithms; see docs/load_balancing.md)
 ├── plugin_cache.rs            # Plugin configuration cache with atomic updates
 ├── retry.rs                   # Retry logic with backoff strategies
 ├── router_cache.rs            # Pre-sorted route table with bounded path cache
@@ -298,14 +298,14 @@ Optional HTTP/3 listener using QUIC transport, enabled via `FERRUM_ENABLE_HTTP3=
 Distributes traffic across multiple backend targets within an upstream group:
 
 **Key Features**:
-- Six algorithms: round robin, weighted round robin (smooth WRR), least connections, least latency, consistent hashing (150 vnodes), random
+- Seven algorithms: round robin, weighted round robin (smooth WRR), least connections, least latency, consistent hashing (150 vnodes), random, and passthrough (mesh original-destination; falls back to round robin elsewhere)
 - Atomic rebuild on config changes — no requests dropped during reconfiguration
 - Active health checks (periodic HTTP, TCP, UDP, or gRPC probes) and passive health checks (response monitoring)
 - Passive recovery timer (`healthy_after_seconds`) for automatic target restoration
 - Connection errors always count as passive health check failures
 - All-unhealthy fallback: routes to all targets rather than returning errors
 - `TargetSelection` carries `is_fallback` flag for downstream observability
-- Client-facing headers: `X-Gateway-Error` (connection_failure | backend_timeout | request_timeout | backend_error | circuit_breaker_open | overload | config_stale | concurrency_limit) and `X-Gateway-Upstream-Status: degraded`
+- Client-facing headers: `X-Gateway-Error` (connection_failure | backend_timeout | request_timeout | backend_error | circuit_breaker_open | overload | config_stale | concurrency_limit | loop_detected) and `X-Gateway-Upstream-Status: degraded`
 - See [docs/load_balancing.md](docs/load_balancing.md) for full configuration reference
 
 ### **4.1 Connection Pool (`src/connection_pool.rs`)**

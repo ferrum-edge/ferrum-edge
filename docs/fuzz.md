@@ -47,11 +47,6 @@ truncated header, a TLV whose declared length runs past the address block,
 duplicate authentication and duplicate freshness TLVs, a wrong-length freshness
 value, and an authenticated-shape envelope (freshness + tag TLVs).
 
-Because the whole `fuzz-smoke` job is byte-frozen, scheduling the target
-required a new admitted generation of that job rather than an edit, and the
-`fuzz.yml` whole-file freeze had to move with it. That is a direct-to-`main`
-trusted-policy change; no pull request can carry it.
-
 `ocsp_response`, `jwt_svid`, and `tls_material` (issue #6584) cover the
 hand-rolled parsers and admission rules for hostile ASN.1, PEM, and JSON input.
 Stapled OCSP responses and TLS material arrive from files, provider URIs,
@@ -111,9 +106,7 @@ job now uses the repository's checksum-pinned `setup-sccache` action and
 strictly `${{ github.event_name == 'push' && github.ref ==
 'refs/heads/main' }}`: pull requests (including same-repository PR refs and
 forks), `merge_group`, and `workflow_dispatch` never publish a `fuzz-smoke`
-cache. The generation that predates #3902 had no `save-if` at all, which is how
-a full-mode predecessor PR could still mint a PR-ref Fuzz cache; no
-admitted generation can create another.
+cache.
 The credential-bearing sccache GHA backend is never enabled. After a
 successful property-smoke command the run logs `Fuzz property smoke seconds`,
 and after a successful sanitizer budget `Fuzz sanitizer lane seconds`; both
@@ -129,7 +122,10 @@ silently.
 Both hosted shapes are byte-frozen by the trusted Cross build policy. The
 `fuzz-smoke` job is admitted as an ordered list of generations with one-way
 transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`); see
-[ci_cd.md](ci_cd.md#admitted-fuzz-smoke-generations).
+[ci_cd.md](ci_cd.md#admitted-fuzz-smoke-generations). Scheduling a new target
+therefore requires a new admitted generation of that job (and moving the
+`fuzz.yml` whole-file freeze with it), a direct-to-`main` trusted-policy change
+that no pull request can carry.
 
 The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
 `librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1
@@ -180,65 +176,24 @@ in the `fuzz/` crate per `docs/dependency-policy.md`.
 
 ## Compile-time resource observations (#4694)
 
-The existing main/manual sanitizer smoke step emits `Fuzz build resources:`
-JSON records during compilation and its sanitizer target run. Samples
-are spaced 30 seconds apart, capped at 240 records and two hours, and written
-directly to the hosted log. Hard runner loss can prevent that log from being
-published: the first observer trial lost communication and left no retrievable
-Fuzz log or resource samples. Outer job status can also lag the actual failed
-step; compare step timestamps before inferring ongoing compilation.
-The observer stops with the owning shell and preserves its original exit code.
+The main/manual sanitizer smoke step emits `Fuzz build resources:` JSON records
+to the hosted log during compilation and its sanitizer target run: samples 30
+seconds apart, capped at 240 records and two hours, holding only numeric host
+memory/swap, root-cgroup, and visible-process RSS counters (no process
+arguments, environment, request bytes, or corpus data). A second, best-effort
+channel emits at most nine notice annotations at first threshold crossings.
+Thresholds only select diagnostic samples and never stop the build. Hard runner
+loss can lose both channels, notices may be delayed or omitted while the step
+is live, and missing records do not prove absence of memory pressure. RSS sums
+double-count shared pages and root-cgroup counters may include other runner
+processes, so no sample alone proves a rustc OOM; compare the final samples and
+OOM counters with the runner's termination annotation.
 
-A second, best-effort channel emits at most nine notice annotations: the initial
-sample, first available-memory crossings of 75/50/25/10/5 percent, first free-swap
-crossings of 25/5 percent when swap exists, and the first increase in exposed root
-cgroup OOM counters. Simultaneous reasons share one annotation. Notices carry
-only selected numeric counters, are queued as runner timeline issues,
-and do not grant API credentials to the observer or compiler. Results-only live
-step updates can omit annotations; queuing does not establish that the Checks
-API exposes them before step/job completion. They can also be
-lost if the runner stops before forwarding them; missing records do not prove
-absence of memory pressure. Validate retrieval on a hosted run before relying
-on this channel. Thresholds select diagnostic samples and do not stop the build.
-The [notice command](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-a-notice-message)
-and [runner issue handling](https://github.com/actions/runner/blob/0b0ac2fdabf53d69add6175026945b8afc8549a5/src/Runner.Worker/ExecutionContext.cs#L795)
-describe the annotation path and the ten-notice limit; these are not a delivery
-guarantee after runner loss.
-
-Records contain host available memory/swap, swap page counters, root cgroup
-memory limits/events when exposed, and an RSS summary of at most 1,024 visible
-processes. No process arguments, environment, request bytes or corpus data are
-read or logged. Missing kernel counters are reported as null. RSS sums double
-count shared pages, sampled maxima are not exact peaks, and root cgroup counters
-may include other runner processes; none alone proves that rustc exhausted
-memory. Compare the final samples and cgroup OOM counters with the runner's
-termination annotation before attributing a shutdown to resource pressure.
-
-The second trial recovered 44 samples and six notices after a runner shutdown
-(exit 143). The largest visible process reached about 14.3 GiB RSS, available
-host memory fell below 250 MiB and the 3 GiB swap area had less than 45 MiB free.
-Root cgroup OOM counters were unavailable, so this establishes severe sampled
-pressure without proving a kernel OOM kill or the exact shutdown cause. Notices
-were not observed through the Checks API during the run; both channels became
-available afterward, so this is not proof of recovery after hard runner loss.
-
-Main/manual jobs now add a bounded 12 GiB swap file under `/mnt`, following the
-existing unit/PKCS11 provisioning. Existing swap remains enabled; provisioning
-fails visibly if allocation or activation fails. The observer records whether
-this adds useful headroom, and a fresh full run must validate it. Paging may
-increase wall time; this is not a measured latency improvement. Compiler/profile/
-cache settings, AddressSanitizer, every target and every libFuzzer bound
-remain unchanged.
-
-The scheduled sanitizer lane (`fuzz.yml`) builds the same AddressSanitizer
-release library with the same profile and `--codegen-units 16`, but had only
-the runner's 3 GiB swap. On 2026-10-01 the `fuzz-smoke` observer recorded a
-14.6 GiB rustc RSS peak and about 22-23 GiB of RAM plus swap in use (up to
-7.9 GiB of swap) during that compile, which a 16 GiB RAM + 3 GiB swap runner
-cannot hold. As `ferrum-edge` grew (the `src/` tree is about 10% larger than on
-2026-09-07, the last all-green week), scheduled lanes started dying inside that
-compile with the runner shutdown signal: 1/7 on 2026-09-14, 7/7 on 09-21, 3/7
-on 09-28, and 7/7 on the first `nightly-2026-09-30` dispatch. The lane now adds
-the same bounded 12 GiB `/mnt` swap file before building; the toolchain,
-profile, sanitizer, targets, matrix concurrency and every libFuzzer bound are
-unchanged.
+Both sanitizer lanes (`fuzz-smoke` on main/manual and the scheduled `fuzz.yml`)
+add a bounded 12 GiB swap file under `/mnt` before building, because the
+AddressSanitizer release compile exceeds a 16 GiB RAM + 3 GiB swap runner (the
+2026-10-01 observer sample recorded a 14.6 GiB rustc RSS peak). Provisioning
+fails visibly if allocation or activation fails; toolchain, profile, sanitizer,
+targets, and every libFuzzer bound are unchanged. Trial data and the scheduled
+lane's failure history are on issue
+[#4694](https://github.com/ferrum-edge/ferrum-edge/issues/4694).

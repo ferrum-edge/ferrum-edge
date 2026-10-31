@@ -108,6 +108,11 @@ adding, removing, or materially changing a workflow.
 | `windows-confinement.yml` | Windows File Confinement | PRs and push to `main` on `src/tls/source/**`, the confinement tests and their registration chain (`tests/unit_tests.rs`, `tests/unit/mod.rs`, `tests/unit/tls/mod.rs`), `src/lib.rs`, `src/config/file_loader.rs`, Cargo/toolchain/build configuration, or its own file; manual | Runs the Windows-only tenant-file confinement unit tests (`windows_confined_files`) natively on `windows-latest`, including the elevated case-sensitive NTFS directory test that is `#[ignore]`d elsewhere. Every unit shard runs on Linux, where these tests compile out ([#6540](https://github.com/ferrum-edge/ferrum-edge/issues/6540)). Fails when fewer tests run than the module holds. Optional. |
 | `native-cache-envelope.yml` | Native Cache Envelope Proof | Manual; PRs and push to `main` on its own paths run contracts only | Synthetic GHCR envelope proof for native compiler caches; see [native_cache_envelope.md](native_cache_envelope.md). |
 | `native-compiler-store.yml` | Native Compiler Store Transfer | Manual; PRs and push to `main` on its own paths | Real compiler-store transfer proof through GHCR; see [native_compiler_store_transfer.md](native_compiler_store_transfer.md). |
+| `codeql-extraction-diagnostic.yml` | CodeQL Rust Extraction Diagnostic | Manual | Extraction-only default vs FIPS feature comparison; see [codeql-extraction-diagnostic.md](codeql-extraction-diagnostic.md). |
+| `compose-fixture-qualification.yml` | Compose Fixture Qualification | PRs on `docker-compose.yml`, `docker-compose.tls-test.yml`, `setup_db_tls.sh`, `check_compose_fixtures.sh`, and the workflow itself; manual | Disposable Compose fixture boundary checks. Optional. |
+| `h2-cpu-profile.yml` | H2 and gRPC CPU Profile | PRs on its own paths, manual | H2/gRPC CPU profile contracts on PRs; manual dispatch runs the profile campaign; see [h2_cpu_profile.md](h2_cpu_profile.md). Optional. |
+| `mesh-runtime-benchmark.yml` | Mesh Runtime Benchmark | Manual | Mesh data-plane head-to-head; see [mesh_runtime_benchmark.md](mesh_runtime_benchmark.md). |
+| `mesh-runtime-harness-tests.yml` | Mesh Runtime Harness Tests | PRs and push to `main` on `tests/performance/mesh_runtime/**` and its harness scripts, manual | Standalone harness tests/contracts. Optional. |
 
 ### CI Pipeline Flow
 
@@ -147,13 +152,10 @@ app id `15368`). The same nine are the publish-blocking set: see
 | `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
 | `FIPS Build & Test` | `.github/workflows/fips-build.yml` | `fips-build` |
 
-The launch-readiness governance lane (`launch-readiness.yml`,
-`launch-integrity.yml`, `launch-advisory-trust.yml`, their verifiers, the blocker
-policy/exemption data, and `release.yml`'s `validate-launch-readiness` job) was
-removed once every tracked blocker had closed. There is no automated go/no-go
-launch verdict, and a `v*` tag no longer requires one. `Launch Readiness
-Integrity` must also be dropped from the branch ruleset's required contexts, or
-pull requests will wait on a check that can never report.
+The launch-readiness lane, including `Launch Readiness Integrity`, was removed
+(#4010); there is no automated go/no-go launch verdict, and the context must be
+dropped from the branch ruleset's required contexts if still listed, or pull
+requests will wait on a check that can never report.
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -205,31 +207,21 @@ under `pull_request_target` and rejects any change to
   base usable as a trusted baseline.
 
 **Live main-branch settings (read-only API snapshot, 2026-10-15 07:24 UTC).**
-Sources: `GET /repos/ferrum-edge/ferrum-edge/rules/branches/main` (the
-effective rules), the individual repository and organization rulesets, and
-`GET /repos/ferrum-edge/ferrum-edge/branches/main/protection`.
-
-| Source | Rules on `main` | Bypass actors |
-|---|---|---|
-| Org ruleset `24977662` (A: trusted required workflows) | `workflows` (the nine required workflow files, run from `main`), `deletion`, `non_fast_forward` | `OrganizationAdmin`, `bypass_mode: pull_request` |
-| Org ruleset `24979476` (B: PR required, 0 approvals) | `pull_request` with `required_approving_review_count=0`, `dismiss_stale_reviews_on_push=false`, `required_review_thread_resolution=false`, `require_last_push_approval=false`, no code-owner review; merge methods `merge` and `squash` | `OrganizationAdmin`, `bypass_mode: pull_request` |
-| Repo ruleset `20208307` (Main merge queue and root review gate) | `deletion`, `non_fast_forward`, `required_status_checks` (all nine checks above, integration id `15368`, `strict_required_status_checks_policy=false`) | `OrganizationAdmin` and `RepositoryRole` id `5`, both `bypass_mode: always` |
-| Classic branch protection | The same nine checks bound to app id `15368`, `strict=false`, `enforce_admins=false`, force pushes and deletion disallowed, no required pull-request reviews | — |
-
-So a change must reach `main` through a pull request whose nine required
-checks pass, but no approving review, stale-review dismissal, review-thread
-resolution, or `merge_queue` rule is enforced, and none of the rulesets is a
-no-bypass ruleset. The repository setting `can_approve_pull_request_reviews`
-read `true` at the same time.
-These API observations describe only the settings returned at the read time.
-Re-query both APIs after any settings change and before claiming administrator
-enforcement, bypass behavior, approval requirements, or merge-queue enforcement.
-
-**Historical record:** the 2026-09-01 note for issue #4445 recorded that
-administrator enforcement was enabled and the ruleset bypass list was empty.
-That is a record of the earlier observation, not a statement of current
-settings. The 2026-09-26 and 2026-10-04 ruleset observations likewise predate
-this snapshot.
+Read from `GET /repos/ferrum-edge/ferrum-edge/rules/branches/main`, the
+individual repository and organization rulesets, and
+`GET /repos/ferrum-edge/ferrum-edge/branches/main/protection`: org ruleset
+`24977662` requires the nine workflow files run from `main`; org ruleset
+`24979476` requires a pull request with 0 approvals; repo ruleset `20208307`
+and classic branch protection require the nine checks above (app id `15368`,
+non-strict). No approving review, stale-review dismissal, review-thread
+resolution, or `merge_queue` rule was enforced, and none of the rulesets is a
+no-bypass ruleset: `OrganizationAdmin` bypasses all three (`bypass_mode:
+pull_request` on the org rulesets, `always` on the repo ruleset, which also
+admits `RepositoryRole` id `5`), and classic protection had
+`enforce_admins=false`. `can_approve_pull_request_reviews` read `true`.
+These observations describe only the read time. Re-query both APIs after any
+settings change and before claiming administrator enforcement, bypass
+behavior, approval requirements, or merge-queue enforcement.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
@@ -336,21 +328,14 @@ that do not use it), with the checksum-pinned local `setup-sccache` compiler
 cache. Pull requests and merge groups restore only; only a lane's designated
 producer saves, and only on a push to `refs/heads/main`.
 
-No `ci.yml` job requests `id-token: write`. Issue #6573 removed the BoringCache
-backend (PR #5890's rollout), which had been disabled through the
-`BORINGCACHE_ENABLED` repository variable since 2026-09-30 because it added no
-measurable benefit. With it went the 17 job-scoped `id-token: write`
-grants it needed, `setup-boringcache`, `.boringcache.toml`, the
-`boringcache-connect.yml` enrollment workflow, and the `BORINGCACHE_ENABLED`
-variable. GitHub Actions cannot condition a job's permissions on its event, so
-those grants let pull-request code mint repository OIDC tokens. The trusted
-Cross build policy now refuses `id-token: write` anywhere in `ci.yml`
-(`nonpublishing_ci_errors`), job-scoped or workflow-level. A same-repository
-pull request can still add the permission to its own workflow copy for that
-run, so a token is only harmless when nothing trusts it: revoke the
+No `ci.yml` job may request `id-token: write`, job-scoped or workflow-level
+(the trusted Cross policy's `nonpublishing_ci_errors`; the BoringCache backend
+that needed it was removed in issue #6573). OIDC is used only by `release.yml`
+and `main-latest-image.yml` for signing and attestation. A same-repository pull
+request can still add the permission to its own workflow copy for that run, so
+a token is only harmless when nothing trusts it: revoke the
 `ferrum-edge/ferrum-edge` Machine connection in the BoringCache Workspace
-`jeremy-j/ferrum-edge`. OIDC remains only where it signs or attests release
-artifacts (`release.yml` and `main-latest-image.yml`).
+`jeremy-j/ferrum-edge` if not already revoked.
 
 ## CI runtime caching (production images and FIPS)
 
@@ -748,15 +733,35 @@ This is only an early rejection: it does not replace the full policy scan or
 admit policy migrations. Other invalid changes can still spend compilation minutes before
 the parallel policy verdict arrives. If the immutable-base guard rejects a
 legitimate workflow migration, resolve it through reviewed policy governance,
-never by suppressing checks or synthesizing successful release proof. See
-[policy performance measurement](ci_policy_performance.md) for the rollout
-measurements.
+never by suppressing checks or synthesizing successful release proof.
+
+The verifier reuses only lexical results (#4668): shell tokens and executable
+basenames are held in per-process LRU caches of at most 2,048 entries, inputs
+over 4,096 characters bypass the cache, nothing persists across runs, and
+policy decisions are never cached because they depend on dispatcher and
+opaque-stdin scopes. Before that change, CI Plan's Cross verifier step took
+5m09s in [PR run 34005446618](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34005446618)
+and 6m56s in [merge-group run 33973581181](https://github.com/ferrum-edge/ferrum-edge/actions/runs/33973581181),
+and a local `cProfile` run of `--self-test` recorded 1,315,116 shell
+tokenizations and 16,979,146 executable basename lookups. Before the parallel
+split (#4680), CI Plan's policy step took 316s in [main run 34016773796](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34016773796);
+no post-adoption improvement has been measured. To compare scheduling, use
+matched source SHA, toolchain, runner class, cache state, and event kind, and
+measure plan completion (CI Plan `completed_at` minus workflow start), policy
+overlap (CI Policy runtime intersected with application compilation), and
+runner-minutes (all job runtime, including failed or cancelled speculative
+work).
 
 The `CI Plan` job selects `full` or `light` mode and, inside full mode, a
 per-job gate for every compile-based job. Pull requests and merge-group runs
 whose entire diff is limited to ordinary documentation, `.agents/**`,
 `.claude/**`, Markdown outside `vendor/`, or license files use light mode and
 preserve a fast `Tests` aggregate without starting the Rust/build matrix.
+Exceptions that always select full mode: anything under `vendor/` or
+`charts/`, `docs/prometheus_metrics.md` / `docs/prometheus_metric_contract.json`,
+and the dependency-governance docs (`docs/dependency-policy.md`,
+`docs/vendored-patch-lifecycle.json`, `docs/upstream-*`,
+`PRODUCTION_READINESS.md`); see `pr_ci_plan.py` `is_lightweight_path`.
 Documentation-only changes never schedule a live datapath suite on a pull
 request.
 
@@ -942,7 +947,7 @@ run red on the commit that caused it. Its concurrency group follows
 
 | Workflow | Pin check | Pinned repository inputs (in its `push` paths) |
 |---|---|---|
-| `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the path-sourced `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table and its vendored `h2` line in `Cargo.toml`, the vendored h2 patches (`docs/upstream-h2-patches/00{1,3}-…/*.patch`) and their `vendor/VENDOR_INTEGRITY.sha256` hashes, the two `cargo build` calls in `Dockerfile` |
+| `h2-guard-observation.yml` | `tests/performance/multi_protocol/h2_guard/prepare.py` | `src/admin/mod.rs` (`context_files` SHA-256 in `h2_guard/source.json`), the path-sourced `h2` entry in `Cargo.lock`, the single `[patch.crates-io]` table and its vendored `h2` line in `Cargo.toml`, the vendored h2 patches (`docs/upstream-h2-patches/00{1,3,4}-…/*.patch`) and their `vendor/VENDOR_INTEGRITY.sha256` hashes, the two `cargo build` calls in `Dockerfile` |
 
 `h2-guard-pin-check.yml` runs the same pin and anchor validation on the pull
 request that changes one of those inputs or the H2 guard assets. Its
@@ -1330,6 +1335,16 @@ cargo nextest run --archive-file integration-tests-*.tar.zst \
   --no-fail-fast \
   <shard filters>
 
+# test-integration-conditional-live-stores (POSTGRES_URL, MYSQL_URL and
+# MONGO_URL must point at the containers the shard starts)
+cargo nextest run --archive-file integration-tests-*.tar.zst \
+  --workspace-remap . \
+  --no-fail-fast \
+  --run-ignored=all -j 1 \
+  integration::admin_conditional_write_tests::postgres_conditional_restore_checks_state_and_lease_in_transaction \
+  integration::admin_conditional_write_tests::mysql_conditional_restore_checks_state_and_lease_in_transaction \
+  integration::admin_conditional_write_tests::mongo_replica_set_conditional_restore_checks_state_and_lease_in_transaction
+
 # build-test-artifacts (one job/cache for both archives and both binaries).
 # The test build also produces target/debug/ferrum-edge and ferrum-cni;
 # see "Test artifact producer: one test-feature build".
@@ -1479,11 +1494,15 @@ stripped of newlines and backticks before they are written.
   paths those tests call, the feature-gated config and TLS inventory surfaces,
   `tests/unit/tls` PKCS modules, and the same shared compile-graph inputs;
   sibling ACME/FIPS TLS unit files do not schedule it.
-- Integration tests split across two shards (`admin-platform`,
-  `mesh-protocols`). Each shard runs the prebuilt `integration_tests` nextest
-  archive with a visible list of `integration::<file_module>` positional
-  filters that nextest ORs together. Integration tests are in-process (no
-  gateway binary, no Redis/Mongo services); each shard has a 30-minute cap.
+- Integration tests split across three shards. `admin-platform` and
+  `mesh-protocols` run the prebuilt `integration_tests` nextest archive with a
+  visible list of `integration::<file_module>` positional filters that nextest
+  ORs together, and are in-process (no gateway binary, no services).
+  `conditional-live-stores` runs the same archive with
+  `--run-ignored=all -j 1` and three exact filters, the PostgreSQL, MySQL and
+  MongoDB-replica-set conditional-restore tests, against containers it starts
+  first (`POSTGRES_URL`, `MYSQL_URL` and `MONGO_URL` are required). Each
+  shard's test step has a 30-minute cap, separate from fixture setup time.
 - The `CI Plan` job diffs `ls tests/integration/*.rs` against the union of
   declared shard filters in `ci.yml`. Adding a new `mod foo_tests` without
   wiring it into a shard fails this silent-skip guard.
@@ -3765,6 +3784,20 @@ Required for pushing Docker Hub images. The workflows unconditionally run the Do
 2. Account Settings → Security
 3. Create new access token
 4. Copy token to `DOCKERHUB_TOKEN`
+
+#### Release tagging
+
+- `RELEASE_TAG_TOKEN` - used by `release-dispatch.yml` to push the version tag.
+  It must be a user or GitHub App token for the principal permitted to create
+  release tags (the **Release tag creation principal** ruleset); tags pushed with
+  `GITHUB_TOKEN` do not trigger **Release**. See
+  [Creating a New Release](#creating-a-new-release).
+
+#### Pending-review cleanup
+
+- `REVIEW_TOKEN` - PAT of a named environment reviewer, used for every API call
+  in `cleanup-pending-reviews.yml` (`GITHUB_TOKEN` cannot approve or reject
+  deployment reviews).
 
 For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare
 job-level `permissions: { contents: write }` for release creation,

@@ -130,13 +130,9 @@ The current floors are set in the `env` block of `.github/workflows/coverage.yml
 | `src/plugins/` line coverage | **89.00%** (`MIN_PLUGINS_LINE_COVERAGE`) | Full matrix only |
 | Changed coverable `src/plugins/` lines | **84.98%** (`MIN_CHANGED_PLUGIN_LINE_COVERAGE`) | Plugin and shard-scoped PR plans only (not selected by the active planner; see below) |
 
-Floors are rounded down from measured remote values so presentation precision
-does not fail a run, while any real drop still fails the full gate. The gate
-was introduced on 2026-06-20 at 78.28% overall / 84.98% plugins (measured
-`210900/269397` and `54957/64665` lines). The overall and plugin floors were
-raised after the functional shards landed; run 36117488050 measured 82.79%
-overall (`526,752/636,227` lines) and 90.81% for `src/plugins/`
-(`154,123/169,721` lines).
+Floors are deliberately below measured main coverage to allow run-to-run
+variance; raise them deliberately after coverage improves, rather than pinning
+them to a measured peak (measured provenance is in the `coverage.yml` comments).
 
 The active planner, `select_plan` in `.github/scripts/coverage_plan.py`,
 treats coverage as a main-branch backstop:
@@ -242,21 +238,6 @@ regressions:
   shared default `{FERRUM_NAMESPACE}:dedup` prefix, and distinct-header
   instances with unique Redis prefixes that each complete and token-release
   independently.
-
-Latest opt-in functional benchmark: **81.68% line coverage**
-(`148,432/181,717` lines), captured locally on 2026-05-25 with
-`rustc 1.95.0 (59807616e 2026-04-14)`. This is not the scheduled CI baseline
-because functional coverage is heavier and depends on subprocess-based
-fixtures, but it is the current top-gap benchmark for tracking progress toward
-90%.
-
-The 81.68% profile used:
-
-- `scripts/coverage.sh --functional`
-- `scripts/coverage.sh --functional-filter functional_cp_dp`
-- `scripts/coverage.sh --functional-filter functional_cp_dp_resilience`
-- `scripts/coverage.sh --functional-filter functional_grpc`
-- `scripts/coverage.sh --functional-filter functional_load_balancer`
 
 The default `--functional` filters include coverage-aware TCP/UDP/Mongo and
 common-harness subprocess paths. Broad filters such as `h3`, and additional
@@ -371,46 +352,12 @@ ignore regex, full/changed-line gates, and exact-SHA publication evidence are
 unaffected by this transport (floors: see
 [CI Baseline And Gates](#ci-baseline-and-gates)).
 
-Observations from two successful main runs on 2026-09-06, before streaming
-extraction was introduced:
-
-| Measurement | [34008463617](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34008463617) | [34018271783](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34018271783) |
-| --- | ---: | ---: |
-| Source SHA | `5d586f5e013ec4ea7d0ed573c604bb2ddade4e2f` | `aa251c3326c8d237e46bf8b7346861cec6c7aaf4` |
-| Lib/unit job | 28m02s | 33m39s |
-| Integration job range | 13m07s–14m31s | 17m21s–18m10s |
-| Sum of six shard job durations | 96m12s | 121m55s |
-| Merge Coverage job | 9m58s | 12m10s |
-| Download/extract step | 5m58s | 7m11s |
-| Report generation | 2m22s | 2m53s |
-| Total uploaded shard ZIP bytes | 7,492,574,957 | 7,531,180,534 |
-
-The job-duration sum measures elapsed runner time, excluding queueing, rather
-than billing-rounded minutes. API artifact sizes are exact; the expanded tar
-sizes below are only the rounded `ls -lh` values in the packaging logs, not
-exact extracted-file byte counts.
-
-| Shard | Historical ZIP bytes | Historical tar | Latest ZIP bytes | Latest tar |
-| --- | ---: | ---: | ---: | ---: |
-| lib-unit | 872,186,168 | 4.0 GiB | 878,861,708 | 4.1 GiB |
-| admin-api | 1,205,668,583 | 4.8 GiB | 1,212,123,854 | 4.8 GiB |
-| admin-config | 1,340,759,632 | 5.2 GiB | 1,347,138,224 | 5.3 GiB |
-| mesh-routing | 1,307,752,897 | 5.1 GiB | 1,314,158,779 | 5.2 GiB |
-| mesh-platform | 1,338,184,871 | 5.2 GiB | 1,344,557,956 | 5.3 GiB |
-| protocols-data-plane | 1,428,022,806 | 5.5 GiB | 1,434,340,013 | 5.6 GiB |
-
-Log timestamps put download-to-extract intervals at approximately 3m15s and
-4m43s in total, with the remaining approximately 2m43s and 2m28s spent in
-extraction, cleanup, and other step overhead. The old download interval itself
-includes ZIP decompression and writing the expanded tar, so these are not pure
-network measurements. Streaming removes about 30 GiB of intermediate tar writes
-and rereads per full run; its net wall-time benefit was not measured in these
-runs. ZIP size, upload cost, and report-generation cost
-are not expected to improve. These different-SHA runs are timing evidence, not
-a same-source coverage-equivalence comparison. Identical cross-run object
-content and the cost of duplicate workspace metadata have not been established.
-The latest lib/unit log reports 21m07s compilation and about 9m26s running its
-two suites; streaming extraction does not address compilation latency.
+Pre-streaming timing measurements were taken from successful main runs
+[34008463617](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34008463617)
+and [34018271783](https://github.com/ferrum-edge/ferrum-edge/actions/runs/34018271783)
+on 2026-09-06 (issue #4670). Streaming removes the intermediate tar writes and
+rereads (its net wall-time benefit was not measured); ZIP size, upload cost,
+report generation, and compilation latency are not expected to improve.
 
 Hosted workflow regression tests exercise the actual transport shell using
 small ZIP/tar fixtures: forced ZIP64 headers, pagination, unplanned artifacts,
@@ -429,46 +376,3 @@ conditions, and an `always()` job can continue after cancellation
 Both sampled runs succeeded, so they do not measure a cancellation delay.
 The required aggregate's existing `always()` and failure semantics are retained;
 changing cancellation behavior needs a dedicated failing/cancelled-run check.
-
-## Lowest-Covered Modules (historical snapshot)
-
-> **Historical.** The table and percentages below are a dated local baseline
-> snapshot retained for archaeology. They are **not** a current coverage claim
-> and must not drive "next priority" planning without regenerating from a fresh
-> `scripts/coverage.sh` / CI coverage artifact. Prefer timeless guidance: raise
-> coverage where new code lands; do not treat this table as the live gap list.
-
-Measured from a prior local baseline run. Percentages are line coverage.
-
-| Module | Coverage | Assessment |
-| --- | ---: | --- |
-| `src/main.rs` | 0.00% | Binary startup and process-exit paths are not exercised by lib/unit/integration coverage; keep most testing in CLI/startup helpers and functional smoke tests. |
-| `src/http3/` | 23.69% | Protocol integration candidate; the server, WebSocket, and cross-protocol fallback paths need QUIC/H3 stream fixtures. |
-| `src/bin/ferrum-cni.rs` | 49.64% | CLI-style binary path; targeted command parsing and error-path tests should be cheap. |
-| `src/cli.rs` | 54.68% | Easy win; parser, path resolution, and health/version/reload branches are deterministic. |
-| `src/runtime_metrics_tracing_layer.rs` | 58.33% | Easy win; small classification layer with bounded pure functions plus one untested event-recording path. |
-| `src/health_check.rs` | 60.95% | Mixed candidate; passive health is unit-friendly, while active HTTP/gRPC probes need mocked backends. |
-| `src/identity/` | 63.03% | Integration-test candidate; rotation and Workload API paths involve async CA/SPIFFE flows and long-running tasks. |
-| `src/proxy/` | 64.81% | High-value integration candidate; hot-path protocol behavior needs focused fixtures rather than broad unit mocks. |
-| `src/tls_offload.rs` | 75.71% | Targeted-test candidate for policy and offload edge cases. |
-| `src/grpc/` | 77.34% | Protocol integration candidate; CP/DP and mesh gRPC failure paths are the likely remaining gaps. |
-
-## Next Test Priorities (historical planning notes)
-
-> **Historical.** The H3-fixture / health-check / identity / CLI / UDP items
-> below were written against the snapshot table above. Substantial H3 fixtures,
-> health-check, identity, CLI, and UDP coverage have landed since; do not treat
-> this list as the current backlog. Regenerate priorities from the latest
-> coverage artifact when prioritizing new tests.
-
-1. `src/http3/`: add a small H3 fixture layer for handshake, request body,
-   WebSocket, and cross-protocol fallback error cases. This was the largest
-   measured gap in core protocol code at snapshot time.
-2. `src/health_check.rs`: cover passive-state transitions and active-probe
-   formatting/error branches with mocked HTTP/gRPC backends.
-3. `src/identity/`: add fake-CA and fake-Workload-API tests for SVID rotation,
-   failed issuance, revision bumps, and trust-bundle refresh behavior.
-4. `src/cli.rs` and `src/bin/ferrum-cni.rs`: add parser/error-path tests for
-   command surfaces.
-5. `src/proxy/udp_proxy.rs` and `src/proxy/udp_batch.rs`: add narrow UDP
-   fixture tests for batching, disconnect, and timeout/error accounting.

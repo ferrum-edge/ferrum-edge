@@ -191,13 +191,11 @@ Both runs use the same embedded backend, which speaks **plaintext HTTP/1.1 only*
 
 ### Summary Tables
 
-The test prints a summary table for each backend pool setting. The tables below are historical examples from a PostgreSQL run on Apple Silicon macOS. They predate the current labels: their headings name the protocol setting, not an observed backend protocol (see [Backend Pool Settings](#backend-pool-settings)), and their reqwest rows use the [measurement boundary](#measurement-boundary) above (attempt RPS, response-head latency).
-
-#### `FERRUM_POOL_ENABLE_HTTP2=false` (historical output)
+The test prints a summary table for each backend pool setting. The example below is historical output from one PostgreSQL run with `FERRUM_POOL_ENABLE_HTTP2=false` on Apple Silicon macOS (release build), shown with the current header to illustrate the report format; it is not a current measurement. Its reqwest rows use the [measurement boundary](#measurement-boundary) above (attempt RPS, response-head latency).
 
 ```
 ======================================================================
-  LOAD & STRESS TEST SUMMARY (PostgreSQL, backend pool: HTTP/1.1)
+  LOAD & STRESS TEST SUMMARY (PostgreSQL, FERRUM_POOL_ENABLE_HTTP2=false, backend: plaintext HTTP/1.1)
 ======================================================================
 Phase                         Conc      RPS  Avg(ms)  P50(ms)  P95(ms)  P99(ms)  Max(ms)     OK%
 ----------------------------------------------------------------------
@@ -216,80 +214,17 @@ wrk key_auth c=200             200    37291      6.5      4.6      —      40.4
 wrk no-plugin c=200            200    61612      3.5      3.0      —      12.2    134.1  100.0%
 ```
 
-#### `FERRUM_POOL_ENABLE_HTTP2=true` (historical output)
+*(Actual results depend on hardware and system load.)*
 
-```
-======================================================================
-  LOAD & STRESS TEST SUMMARY (PostgreSQL, backend pool: HTTP/2)
-======================================================================
-Phase                         Conc      RPS  Avg(ms)  P50(ms)  P95(ms)  P99(ms)  Max(ms)     OK%
-----------------------------------------------------------------------
-Ramp c=50                       50    24575      2.0      1.8      3.5      5.8     66.1  100.0%
-Ramp c=100                     100    27900      3.5      3.4      5.7      7.5     40.1  100.0%
-Ramp c=200                     200    27657      7.2      6.8     12.2     15.8    130.0  100.0%
-Ramp c=400                     400    20726     19.2     15.6     46.0     78.5    279.1  100.0%
-----------------------------------------------------------------------
-No-plugin c=50                  50    11152      4.4      3.0     12.2     23.4    302.5  100.0%
-No-plugin c=100                100     8756     11.3      8.5     27.9     56.8    279.9  100.0%
-No-plugin c=200                200     9576     20.8     15.7     52.8     93.8    516.6  100.0%
-No-plugin c=400                400     9400     42.4     33.5    104.5    177.0    469.7  100.0%
-----------------------------------------------------------------------
-wrk key_auth c=50               50    49427      1.3      0.8      —      11.1    114.5  100.0%
-wrk key_auth c=200             200    56348      4.2      3.3      —      21.4    195.4  100.0%
-wrk no-plugin c=200            200    53449      4.8      3.3      —      33.8    213.3  100.0%
-```
-
-*(Apple Silicon macOS, release build, PostgreSQL. Actual results depend on hardware and system load.)*
-
-### `FERRUM_POOL_ENABLE_HTTP2` false vs true (historical)
-
-The columns below compare the two settings. The backend was HTTP/1.1-only in both runs, so these are not HTTP/1.1-versus-HTTP/2 measurements.
-
-With-plugins ramp (reqwest client):
-
-| Concurrency | `false` RPS | `true` RPS | `false` P99 | `true` P99 |
-|-------------|-------------|------------|-------------|------------|
-| 50 | 28,656 | 24,575 | 4.0ms | 5.8ms |
-| 100 | 28,261 | 27,900 | 7.4ms | 7.5ms |
-| 200 | 19,939 | 27,657 | 43.9ms | 15.8ms |
-| 400 | 11,613 | 20,726 | 112.5ms | 78.5ms |
-
-wrk (native C client):
-
-| Concurrency | `false` RPS | `true` RPS | `false` P99 | `true` P99 |
-|-------------|-------------|------------|-------------|------------|
-| 50 | 63,442 | 49,427 | 2.9ms | 11.1ms |
-| 200 | 37,291 | 56,348 | 40.4ms | 21.4ms |
-| 400 | 57,004 | 42,883 | 22.0ms | 53.2ms |
-
-**Interpretation:** Run-to-run differences in these tables cannot be attributed to HTTP/2 framing, HPACK, flow control, or multiplexing, because no backend leg spoke HTTP/2. This fixture does not identify their cause; run-to-run system load also varies. This fixture is not a basis for choosing a backend transport policy. Use an HTTP/2-capable backend with the controls described in [Backend Pool Settings](#backend-pool-settings) for that.
+**Interpretation:** Differences between the `false` and `true` runs cannot be attributed to HTTP/2 framing, HPACK, flow control, or multiplexing, because no backend leg speaks HTTP/2. This fixture does not identify their cause; run-to-run system load also varies. This fixture is not a basis for choosing a backend transport policy. Use an HTTP/2-capable backend with the controls described in [Backend Pool Settings](#backend-pool-settings) for that.
 
 ### wrk vs reqwest Client Comparison
 
-The test prints a direct comparison for each run. The gap between wrk and reqwest reflects the overhead of running the load generator in-process:
-
-```
---- HTTP/1.1 backend pool ---
-  wrk key_auth c=50         reqwest:    28656 RPS  |  wrk:    63442 RPS  (+121%)
-  wrk key_auth c=400        reqwest:    11613 RPS  |  wrk:    57004 RPS  (+391%)
-
---- HTTP/2 backend pool ---
-  wrk key_auth c=50         reqwest:    24575 RPS  |  wrk:    49427 RPS  (+101%)
-  wrk key_auth c=400        reqwest:    20726 RPS  |  wrk:    42883 RPS  (+107%)
-```
-
-The wrk numbers represent the gateway's true throughput ceiling. The reqwest numbers show realistic in-process client performance, which is influenced by CPU contention with the gateway and backend.
+For each run the test prints each wrk phase next to the matching reqwest phase (`reqwest: <n> attempt RPS | wrk: <n> RPS (+<x>%)`). wrk usually reports higher throughput than the in-process reqwest client. These reqwest phases share the runtime and host with the backend, while wrk uses a separate process and different request scenarios, so client contention can affect throughput; this comparison does not isolate its cause or establish the gateway's maximum throughput.
 
 ### Plugin Overhead Analysis
 
-The test quantifies the cost of auth + ACL + rate limiting (`FERRUM_POOL_ENABLE_HTTP2=false` run, wrk client):
-
-```
-  wrk c=200:  no-plugin 61,612 RPS  vs  key_auth 37,291 RPS  (-39.5%)
-  wrk c=400:  no-plugin 61,192 RPS  vs  key_auth 57,004 RPS  (-6.8%)
-```
-
-Plugin overhead varies with concurrency. At c=200 the auth plugin (key lookup + ACL check + rate limit) reduces throughput by ~40% — this is the cost of real authentication on every request. At c=400, the bottleneck shifts to connection handling and the relative overhead drops.
+The test prints the with-plugins (auth + ACL + rate limiting) ramp against the no-plugin phase at each concurrency (attempt RPS and response-head P99 for each). Plugin overhead varies with concurrency, so compare it at the concurrency you plan to run.
 
 ### Admin Mutation Impact
 
@@ -374,7 +309,7 @@ The test configures the gateway with tuned connection pool and flow-control sett
 
 ## Understanding reqwest vs wrk Performance Gap
 
-The reqwest-based phases report much lower throughput than the wrk phases. In one earlier run (different from the example tables above), the gap was ~6-8x (10k vs 75k RPS) with `FERRUM_POOL_ENABLE_HTTP2=false` and ~2x (31k vs 69k RPS) with `true`. This is a client-side bottleneck, **not** a gateway limitation:
+The reqwest-based phases usually report lower throughput than the wrk phases. The in-process reqwest client is the likely bottleneck, though this fixture does not isolate the cause:
 
 | Factor | reqwest (in-process) | wrk (native C) |
 |--------|---------------------|-----------------|
@@ -385,11 +320,11 @@ The reqwest-based phases report much lower throughput than the wrk phases. In on
 | **Connection model** | Per-worker client with pool | Thread-local connections |
 | **Body handling** | Full reqwest request builder | Raw socket writes |
 
-The reqwest numbers represent a realistic scenario of an application calling through the gateway from the same host. The wrk numbers represent the gateway's true throughput ceiling when the client is not a bottleneck.
+These reqwest phases share the runtime and host with the backend; wrk uses a separate process and different request scenarios, so client contention can affect throughput and neither number establishes the gateway's maximum throughput.
 
 ### What the wrk numbers tell us
 
-In that same earlier run, wrk at c=200 reached ~77k RPS with key_auth (3 plugins per proxy), and the gateway added roughly **2.5ms average latency per request** over the pure backend. Approximate breakdown:
+In one earlier wrk run at c=200 with key_auth (3 plugins per proxy), the gateway added roughly **2.5ms average latency per request** over the pure backend. Approximate breakdown:
 
 1. **Route matching** (~0.1ms) — longest-prefix match over 10k pre-sorted routes, with a bounded (host, path) lookup cache
 2. **Auth credential extraction + crypto** (~0.3-0.5ms) — API key hash lookup, or JWT decode, or HMAC verify
