@@ -55,12 +55,23 @@ decode, so only names may change. A capture is reported as unmatched if:
 - some Envoy executable leaves were unresolved and the twin resolved no more of
   them.
 
+The same overlay then decodes each sample's sampled PC with `perf script -G`,
+which skips DWARF unwinding. That names the leaf of samples whose unwind kept
+no frame. This flat decode has the same 600-second, 64 MiB bounds. It must
+reproduce every original sample (PID, TID and time), with exactly one PC each.
+Where the original decode unwound a sample, that sample's PC must equal its
+unwound leaf, and a leaf the symbolized decode named must stay named.
+Otherwise the capture is unmatched and gets no flat summary. A flat leaf is
+self time only; it has no callers.
+
 Each capture that reaches the publish step gains `envoy-symbols/`; every other
 capture appears only in `envoy-symbols.json`. The directory holds folded stacks,
-decoder coverage, the decoder's stderr and status, and a summary. It is
-published whole and never overwritten. The summary gives measurement-window
-leaf coverage before and after symbols, and the top leaf functions with their
-DSOs. The run also writes `envoy-symbols.json` after every capture, which
+decoder coverage, the flat decode (`flat.txt`), the stack and flat decoders'
+stderr and status, and a summary. It is published whole and never overwritten. The summary
+gives measurement-window leaf coverage before and after symbols, and the top
+leaf functions with their DSOs. `flat` gives the same summary for every sampled
+PC; `flat_no_unwound_frame` restricts it to samples whose unwind kept no frame.
+The run also writes `envoy-symbols.json` after every capture, which
 `h2-cpu-report.json` includes. Only the closing write, with a row for every
 capture, can be complete. A decoder that outlives its post-kill reap bound
 stops the pass.
@@ -77,8 +88,18 @@ measurement window: 62 of 62 and 46 of 46, up from 2 and 0. Even so, in pair 1,
 known-leaf coverage in the window therefore rose only from 1.4–1.9% to about 4%.
 Most Envoy samples have no frame to name, so unwinding, not symbols, is the
 dominant remaining coverage gap. A function-level comparison needs the sampled
-PC even when DWARF unwinding fails, for example a flat leaf decode of the same
-`perf.data`.
+PC even when DWARF unwinding fails, which the flat decode above now supplies.
+
+The flat decode closes that gap. In hosted run 41136450150 (HTTP/2, 10 KiB), both
+Envoy captures passed the flat checks of that revision, and their retained data
+also satisfy the later named-leaf check. Flat leaves named 91.8% and 92.0% of
+window samples, against 2.9% and 19.8% from the symbolized stacks. Of the
+1,861 and 1,596 window samples that kept no unwound frame, 1,838 and 1,570 had
+their sampled PC in the Envoy executable; the other 23 and 26 were in
+`[vdso]`. Those executable PCs spread across Envoy's functions much like all of
+its samples do, so the unwind failure is not confined to a few functions. The
+remaining unnamed leaves are libc and `[vdso]` addresses. Envoy's self time is broad: no function exceeds 4% of
+window samples, and AES-GCM, tcmalloc and nghttp2 lead.
 
 `process_usage.measurement` adds `user_cpu_seconds` and `system_cpu_seconds` from
 Linux `/proc/PID/stat`. With scheduler sampling enabled, gateway/backend
