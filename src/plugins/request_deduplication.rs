@@ -3685,8 +3685,10 @@ fn canonical_authority(headers: &HashMap<String, String>) -> String {
 /// instance with `expose_headers: true` forwards (it runs earlier, at 2900):
 /// the remaining budget changes on every admitted request, so a byte-identical
 /// retry would otherwise be refused as a different request. Only a value the
-/// owning limiter's private provenance still vouches for is excluded; a
-/// client-supplied or rewritten value remains part of the operation.
+/// owning limiter's private provenance still vouches for — the exact lowercase
+/// key it wrote, with the exact value it staged — is excluded. Any other
+/// client-supplied or rewritten value, including a case-variant duplicate key,
+/// remains part of the operation.
 fn request_headers_for_fingerprint<'a>(
     ctx: &RequestContext,
     headers: &'a HashMap<String, String>,
@@ -3702,7 +3704,7 @@ fn request_headers_for_fingerprint<'a>(
                 .iter()
                 .any(|excluded| normalized == *excluded)
             || is_per_request_trace_header(&normalized)
-            || ctx.is_gateway_published_rate_limit_header(&normalized, value)
+            || ctx.is_gateway_published_rate_limit_header(name, value)
         {
             continue;
         }

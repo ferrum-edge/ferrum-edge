@@ -824,11 +824,11 @@ impl RateLimiting {
         let mut headers = HashMap::with_capacity(4);
         if self.expose_headers {
             if let Some(limit) = outcome.limit {
-                headers.insert("x-ratelimit-limit".to_string(), limit.to_string());
+                headers.insert(RATELIMIT_LIMIT_HEADER.to_string(), limit.to_string());
             }
-            headers.insert("x-ratelimit-remaining".to_string(), "0".to_string());
+            headers.insert(RATELIMIT_REMAINING_HEADER.to_string(), "0".to_string());
             if let Some(window) = outcome.window_seconds {
-                headers.insert("x-ratelimit-window".to_string(), window.to_string());
+                headers.insert(RATELIMIT_WINDOW_HEADER.to_string(), window.to_string());
             }
         }
         headers

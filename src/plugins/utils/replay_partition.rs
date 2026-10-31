@@ -998,7 +998,9 @@ pub fn append_semantic_request_context_partition(
 /// omitted a valid inbound field. Client-supplied values remain origin-visible
 /// dimensions. This is not a global `x-request-id` exemption and does not read
 /// public metadata. Rate-limit telemetry follows the same rule: a client-sent,
-/// rewritten, or metadata-laundered `x-ratelimit-*` value stays bound.
+/// rewritten, or metadata-laundered `x-ratelimit-*` value, or a case-variant
+/// duplicate key, stays bound unless it is the exact lowercase key and value
+/// the owning limiter staged.
 pub fn append_response_cache_request_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,

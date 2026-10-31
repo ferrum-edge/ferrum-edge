@@ -4914,14 +4914,19 @@ impl RequestContext {
     /// omitting it hides nothing. Replay partitions use it to omit the
     /// per-request budget counter — which changes on every admitted request —
     /// while binding every other value of the same field.
+    ///
+    /// `name` must be the header map's own key, compared EXACTLY against the
+    /// lowercase name the limiter wrote. A case-variant duplicate key (for
+    /// example a later rename onto `X-RateLimit-Limit`) is a second field line
+    /// the egress path folds into the same header, so the backend would see a
+    /// different combined value; it must stay bound even when its own value
+    /// coincides.
     pub(crate) fn is_gateway_published_rate_limit_header(&self, name: &str, value: &str) -> bool {
         self.plugin_state().is_some_and(|state| {
             state
                 .published_rate_limit_headers
                 .iter()
-                .any(|(staged_name, staged_value)| {
-                    name.eq_ignore_ascii_case(staged_name) && value == staged_value
-                })
+                .any(|(staged_name, staged_value)| name == *staged_name && value == staged_value)
         })
     }
 

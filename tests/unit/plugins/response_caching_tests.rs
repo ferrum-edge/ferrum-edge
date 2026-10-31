@@ -8919,6 +8919,37 @@ async fn rewritten_rate_limit_header_remains_a_cache_dimension() {
 }
 
 #[tokio::test]
+async fn case_variant_duplicate_of_a_published_rate_limit_field_stays_bound() {
+    let _guard = response_cache_replay_policy_guard();
+    let limiter = exposing_rate_limiter(true);
+    let cache = default_plugin();
+
+    let mut first = make_ctx("GET", "/p/rl-case-variant");
+    let mut first_headers = apply_rate_limit(&limiter, &mut first).await;
+    store_public_entry(&cache, &mut first, &mut first_headers, b"single-field").await;
+
+    // A second, case-variant field line carrying the same value folds into
+    // `x-ratelimit-limit: 100, 100` on egress, so the backend sees different
+    // bytes than for the limiter's single field; it must not share the entry.
+    let mut duplicated = make_ctx("GET", "/p/rl-case-variant");
+    let mut duplicated_headers = apply_rate_limit(&limiter, &mut duplicated).await;
+    assert_eq!(
+        duplicated_headers
+            .get("x-ratelimit-limit")
+            .map(String::as_str),
+        Some("100")
+    );
+    duplicated_headers.insert("X-RateLimit-Limit".to_string(), "100".to_string());
+    assert!(matches!(
+        cache
+            .before_proxy(&mut duplicated, &mut duplicated_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &duplicated, "MISS");
+}
+
+#[tokio::test]
 async fn metadata_laundered_rate_limit_value_remains_a_cache_dimension() {
     let _guard = response_cache_replay_policy_guard();
     let limiter = exposing_rate_limiter(true);

@@ -1388,6 +1388,24 @@ async fn rewritten_rate_limit_header_still_distinguishes_operations() {
     let (mut other, mut other_headers) = keyed_request_after_rate_limit(&limiter, "rl-2").await;
     other_headers.insert("x-ratelimit-remaining".to_string(), "forged".to_string());
     assert_fingerprint_conflict(plugin.before_proxy(&mut other, &mut other_headers).await);
+
+    // A case-variant duplicate of a published field is a second field line the
+    // backend receives folded into the limiter's own value, so it is a
+    // different request even though its value coincides.
+    let (mut duplicated, mut duplicated_headers) =
+        keyed_request_after_rate_limit(&limiter, "rl-2").await;
+    assert_eq!(
+        duplicated_headers
+            .get("x-ratelimit-limit")
+            .map(String::as_str),
+        Some("100")
+    );
+    duplicated_headers.insert("X-RateLimit-Limit".to_string(), "100".to_string());
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut duplicated, &mut duplicated_headers)
+            .await,
+    );
 }
 
 /// A dedup context as the protocol entry paths build it: bound to the effective
