@@ -81,8 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value still equals what the owning limiter privately staged. A value
   identical to that one reaches the origin byte for byte as the limiter's own
   value. Every other client-supplied value, a value a later plugin rewrote, a
-  value rendered from rewritten `ratelimit_*` metadata, and a case-variant
-  duplicate field stays bound.
+  value rendered from rewritten `ratelimit_*` metadata stays bound. If a
+  case-variant duplicate line of the field is present, every line of that
+  field stays bound.
 - **Per-request CPU no longer doubles under the credential-dumping log
   filter** (regression from #6852, tagged in 0.9.18, which was not published,
   and shipped in 0.9.19). That filter was nested outside the level filter on

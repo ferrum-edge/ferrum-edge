@@ -963,7 +963,7 @@ pub fn append_semantic_request_context_partition(
     append_filtered_request_context_partition(hasher, ctx, request_headers, |name, value| {
         name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("content-encoding")
-            || ctx.is_gateway_published_rate_limit_header(name, value)
+            || ctx.is_gateway_published_rate_limit_header(request_headers, name, value)
     });
 }
 
@@ -998,9 +998,9 @@ pub fn append_semantic_request_context_partition(
 /// omitted a valid inbound field. Client-supplied values remain origin-visible
 /// dimensions. This is not a global `x-request-id` exemption and does not read
 /// public metadata. Rate-limit telemetry follows the same rule: a client-sent,
-/// rewritten, or metadata-laundered `x-ratelimit-*` value, or a case-variant
-/// duplicate key, stays bound unless it is the exact lowercase key and value
-/// the owning limiter staged.
+/// rewritten, or metadata-laundered `x-ratelimit-*` value stays bound unless it
+/// is the exact lowercase key and value the owning limiter staged and the
+/// field's only line; a case-variant duplicate keeps every line bound.
 pub fn append_response_cache_request_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
@@ -1009,7 +1009,7 @@ pub fn append_response_cache_request_partition(
 ) {
     append_filtered_request_context_partition(hasher, ctx, request_headers, |name, value| {
         is_response_cache_entry_operation_header(name, value, respect_no_cache)
-            || ctx.is_gateway_minted_request_header(name, value)
+            || ctx.is_gateway_minted_request_header(request_headers, name, value)
     });
 }
 

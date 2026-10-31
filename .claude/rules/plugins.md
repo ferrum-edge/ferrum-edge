@@ -102,7 +102,9 @@ paths:
   (`RequestContext::is_gateway_published_rate_limit_header`, written beside the
   public `ratelimit_*` metadata in `store_metadata`, cleared on ownership
   change), never because the name matches and never from that plugin-writable
-  metadata. The only operator
+  metadata. Match the map's exact lowercase key, and only while it is the
+  field's single line: a case-variant duplicate folds on egress, so every line
+  of that field stays bound. The only operator
   relaxation is `ignore_request_headers`, which REMOVES each named header from
   the backend request before keying (so the key still binds everything the
   origin receives); never turn it into a key-only exclusion. The key also binds

@@ -8947,6 +8947,22 @@ async fn case_variant_duplicate_of_a_published_rate_limit_field_stays_bound() {
         PluginResult::Continue
     ));
     assert_status(&cache, &duplicated, "MISS");
+
+    // Nor may the limiter's own line drop out while a duplicate stands in for
+    // the field: a single rewritten `200` and `100` + `X-RateLimit-Limit: 200`
+    // (egress `200, 100`) are different backend requests.
+    let mut rewritten = make_ctx("GET", "/p/rl-case-folded");
+    let mut rewritten_headers = apply_rate_limit(&limiter, &mut rewritten).await;
+    rewritten_headers.insert("x-ratelimit-limit".to_string(), "200".to_string());
+    store_public_entry(&cache, &mut rewritten, &mut rewritten_headers, b"rewritten").await;
+    let mut folded = make_ctx("GET", "/p/rl-case-folded");
+    let mut folded_headers = apply_rate_limit(&limiter, &mut folded).await;
+    folded_headers.insert("X-RateLimit-Limit".to_string(), "200".to_string());
+    assert!(matches!(
+        cache.before_proxy(&mut folded, &mut folded_headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&cache, &folded, "MISS");
 }
 
 #[tokio::test]

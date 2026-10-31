@@ -1406,6 +1406,24 @@ async fn rewritten_rate_limit_header_still_distinguishes_operations() {
             .before_proxy(&mut duplicated, &mut duplicated_headers)
             .await,
     );
+
+    // A duplicate must not let the limiter's own line drop out while the
+    // other line stands in for the field: `100` + `X-RateLimit-Limit: 200`
+    // egresses as a folded `200, 100`, which is not the single `200` a
+    // rewritten field carries.
+    let (mut rewritten, mut rewritten_headers) =
+        keyed_request_after_rate_limit(&limiter, "rl-3").await;
+    rewritten_headers.insert("x-ratelimit-limit".to_string(), "200".to_string());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut rewritten, &mut rewritten_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut rewritten).await;
+    let (mut folded, mut folded_headers) = keyed_request_after_rate_limit(&limiter, "rl-3").await;
+    folded_headers.insert("X-RateLimit-Limit".to_string(), "200".to_string());
+    assert_fingerprint_conflict(plugin.before_proxy(&mut folded, &mut folded_headers).await);
 }
 
 /// A dedup context as the protocol entry paths build it: bound to the effective

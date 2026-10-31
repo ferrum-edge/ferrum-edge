@@ -4915,27 +4915,49 @@ impl RequestContext {
     /// per-request budget counter — which changes on every admitted request —
     /// while binding every other value of the same field.
     ///
-    /// `name` must be the header map's own key, compared EXACTLY against the
-    /// lowercase name the limiter wrote. A case-variant duplicate key (for
-    /// example a later rename onto `X-RateLimit-Limit`) is a second field line
-    /// the egress path folds into the same header, so the backend would see a
-    /// different combined value; it must stay bound even when its own value
-    /// coincides.
-    pub(crate) fn is_gateway_published_rate_limit_header(&self, name: &str, value: &str) -> bool {
-        self.plugin_state().is_some_and(|state| {
-            state
-                .published_rate_limit_headers
-                .iter()
-                .any(|(staged_name, staged_value)| name == *staged_name && value == staged_value)
-        })
+    /// `name` must be a key of `headers` (the backend-visible map being
+    /// partitioned) and is compared EXACTLY against the lowercase name the
+    /// limiter wrote. The exemption also requires that field to be a single
+    /// line: when `headers` holds any case-variant duplicate key (for example
+    /// a rename onto `X-RateLimit-Limit`), the egress path folds every line
+    /// into one combined value the limiter never staged, so EVERY line of that
+    /// field stays bound — including the limiter's own — and the complete
+    /// field reaches the partition. The duplicate scan runs only after an
+    /// exact provenance match, i.e. for at most the three published names.
+    pub(crate) fn is_gateway_published_rate_limit_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
+        let Some(state) = self.plugin_state() else {
+            return false;
+        };
+        let Some((staged_name, _)) = state
+            .published_rate_limit_headers
+            .iter()
+            .find(|(staged_name, staged_value)| name == *staged_name && value == staged_value)
+        else {
+            return false;
+        };
+        let lines = headers
+            .keys()
+            .filter(|key| key.eq_ignore_ascii_case(staged_name))
+            .count();
+        lines == 1
     }
 
-    /// Whether `name`/`value` is gateway-minted per-request state that a
-    /// retained-result partition must not bind: a generated correlation id or
-    /// published rate-limit telemetry, each proven by private provenance.
-    pub(crate) fn is_gateway_minted_request_header(&self, name: &str, value: &str) -> bool {
+    /// Whether `name`/`value` in `headers` is gateway-minted per-request state
+    /// that a retained-result partition must not bind: a generated correlation
+    /// id or published rate-limit telemetry, each proven by private provenance.
+    pub(crate) fn is_gateway_minted_request_header(
+        &self,
+        headers: &HashMap<String, String>,
+        name: &str,
+        value: &str,
+    ) -> bool {
         self.is_gateway_generated_correlation_header(name, value)
-            || self.is_gateway_published_rate_limit_header(name, value)
+            || self.is_gateway_published_rate_limit_header(headers, name, value)
     }
 
     pub(crate) fn correlation_id(&self, instance_key: &str) -> Option<&str> {

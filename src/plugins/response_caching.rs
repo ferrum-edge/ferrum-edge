@@ -2249,7 +2249,9 @@ impl ResponseCaching {
         for header in vary_headers {
             hasher.text("vary_name", header);
             match request_headers.get(header.as_str()) {
-                Some(value) if ctx.is_gateway_minted_request_header(header, value) => {
+                Some(value)
+                    if ctx.is_gateway_minted_request_header(request_headers, header, value) =>
+                {
                     // Omit only the minted per-request value (a generated
                     // correlation id or published rate-limit telemetry). The
                     // name stays in the origin/operator Vary contract; treating
