@@ -5,9 +5,10 @@ hosted regression fixtures. It does not change coalescing, Content-Length, body 
 timeouts, retries, offered load, TLS verification, release optimization settings,
 or forwarding policy. #5600's client frame/chunk/TLS observations and `/proc/io`
 remain distinct sources. This is instrumentation only: it reports no performance
-result, repairs no 5 MiB drain failure, and does not close issue #5588. Campaign
-results, merge checkpoints, and the earlier failed 5 MiB observations (which remain
-valid failure evidence) are recorded in
+result, repairs no 5 MiB drain failure, and does not close issue #5588. The
+prior cutoff campaign's failed 5 MiB observations remain valid failure evidence
+(see [Bounded H1 request-drain diagnostic](#bounded-h1-request-drain-diagnostic));
+#5602's merge and the earlier manual diagnostic runs are recorded in
 [issue #5588](https://github.com/ferrum-edge/ferrum-edge/issues/5588).
 
 The feature introduces no dependency or crypto-provider edge. `fips,bench-h1-profile`
@@ -295,9 +296,9 @@ sampler timings, not analytically subtracted.
 
 ## Bounded H1 request-drain diagnostic
 
-The retained 5 MiB drain failures and slow 1 MiB tails (issue #5588) have **no
-proven cause or repair**. Process write accounting does not identify socket
-throughput, TCP pacing, a TLS flush, or an HTTP body boundary. This mode adds
+The retained three 5 MiB drain failures and slow 1 MiB tails still have **no
+proven cause or repair**. Process write accounting near 79 kB/s does not identify
+socket throughput, TCP pacing, a TLS flush, or an HTTP body boundary. This mode adds
 evidence at the client boundary; a clean run alone cannot resolve those
 failures. No production `src/`, allocator, body/counter, H3 observer or global
 clock implementation is changed by this diagnostic addition. Backend upload EOF,

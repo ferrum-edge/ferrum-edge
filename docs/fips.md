@@ -108,6 +108,17 @@ caches, the immutable producer and test-binary handoffs, and the cache trust
 boundary are documented in
 [ci_cd.md → CI runtime caching](ci_cd.md#ci-runtime-caching-production-images-and-fips).
 
+One FIPS-specific cache rule is not covered there: the stable rust-cache layer
+does not trust AWS-LC's runner-local CMake incremental tree across runners.
+After every non-cold rust-cache restore, `fips-compile` validates any restored
+`target/` root and removes matching `*/build/aws-lc-fips-sys-*/out/build`
+directories before Cargo can rerun the upstream build script. Installed AWS-LC
+libraries and Rust outputs stay warm, while any required CMake work starts clean
+instead of reparsing a restored `libbcm_c_generated_asm.a` archive. An
+explicitly requested exact handoff is promoted after this quarantine and
+replaces the stable target tree (see the `Quarantine restored AWS-LC FIPS CMake
+state` step in `.github/workflows/fips-build.yml`).
+
 ## Current capability
 
 | | Status |

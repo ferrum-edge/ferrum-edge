@@ -500,7 +500,7 @@ Six shapes of traffic are refused with `400` (reasons in the
 | Backslashes (`\`, `%5C`) | `literal_backslash`, `encoded_backslash` | Send `/`, not `\` |
 | Escapes outside the `pchar` decode set (`%20`, `%7B`, `/caf%C3%A9`) | `unrepresentable_escape` | Carry spaces or non-ASCII text in the query string, a header, or a body field, or use a `pchar`-legal identifier |
 | Non-final empty segments (`//a`, `/a//b`, `/;x/a`) | `empty_segment` | Send the collapsed path. A trailing slash is unaffected |
-| `;` path parameters (`/a;x/b`, `/a%3Bx/b`) | `path_parameter` | Set `allow_path_parameters: true` on that proxy (in mesh mode, that service). The parameter-stripped path must still resolve to the same proxy, and the other rules still apply |
+| `;` path parameters (`/a;x/b`, `/a%3Bx/b`) | `path_parameter` | Set `allow_path_parameters: true` on that proxy (in mesh mode, that service). The parameter-stripped path must not route to a different proxy (same proxy or no proxy is accepted; see [Path parameters](#path-parameters-require-a-per-proxy-opt-in) for the literal-`;` `listen_path` exception), and the other rules still apply |
 
 `unrepresentable_escape` is the broadest of the six: percent-encoded spaces and
 percent-encoded non-ASCII path segments are not accepted at all. Non-ASCII bytes

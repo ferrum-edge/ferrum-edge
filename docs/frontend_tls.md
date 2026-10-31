@@ -1011,11 +1011,15 @@ DTLS has no rustls live verifier: it publishes the new config into every active
 before the driver drains its final flight is still bound by the fence its
 accepted connection carries, and a refused peer never receives that flight.
 
-Admission captures the generation before loading the configuration, and every
-rustls surface re-verifies the presented chain against the live verifier once
-the handshake completes, so a connection racing a withdrawal can at worst be
-retired unnecessarily, never escape the fence. A connection registered while a
-publication sweeps is caught by a post-registration re-check. Implementation:
+Admission captures the generation before loading the configuration, so a
+connection racing a withdrawal can at worst be retired unnecessarily, never
+escape the fence. The TCP+TLS accept path is the exception: it snapshots the TLS
+configuration before reading the generation, so it can pair a post-withdrawal
+generation with a pre-withdrawal configuration. Its outcome is unchanged because
+every rustls surface re-verifies the presented chain against the live published
+verifier once the handshake completes, and that verifier is installed before the
+generation advances. A connection registered while a publication sweeps is
+caught by a post-registration re-check. Implementation:
 [`src/tls/client_trust.rs`](../src/tls/client_trust.rs).
 
 #### Observability
