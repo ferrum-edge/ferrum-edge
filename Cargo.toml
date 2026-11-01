@@ -667,7 +667,9 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # We also carry a narrowly scoped copy of dimpl 0.6.1 that transmits complete
 # leaf-first certificate chains and owns every retained private-key byte copy
 # in zeroizing storage. No compatible upstream release currently provides
-# either security property. See
+# either security property. The copy also backports upstream algesten/dimpl#153
+# (released in 0.7.0) so a DTLS 1.3 CertificateRequest omits, rather than sends
+# empty, the `certificate_authorities` extension. See
 # `docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md`.
 #
 # We also carry a vendored copy of h3-quinn 0.0.10 whose `RecvStream` owns its

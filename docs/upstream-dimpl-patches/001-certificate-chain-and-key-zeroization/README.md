@@ -27,6 +27,17 @@ Endpoint construction, clone-based configuration caches, auto-negotiation,
 protocol fallback, replacement, and shutdown can retain or release ordinary
 heap copies without clearing them.
 
+Published 0.6.1 also sends a DTLS 1.3 `CertificateRequest` whose
+`certificate_authorities` extension carries a zero-length authorities list.
+RFC 8446 §4.2.4 makes the extension optional but requires a non-empty list
+(`DistinguishedName authorities<3..2^16-1>`) when it is present, so strict
+peers (dimpl 0.8.0+, Chrome/BoringSSL) treat the encrypted flight as malformed
+and the required-client-certificate handshake never completes (issue #7000).
+Upstream fixed this in
+[algesten/dimpl#153](https://github.com/algesten/dimpl/pull/153), first
+released in 0.7.0; this copy backports it because the chain and zeroization
+changes keep Ferrum on 0.6.1.
+
 No compatible upstream release provides both full-chain transport and
 drop-time key clearing, so a gateway-only wrapper cannot establish either
 security boundary: `dimpl` itself owns the fallback credential and wire
@@ -52,7 +63,17 @@ The patch:
 - wraps temporary SEC1-to-PKCS#8 encodings in zeroizing storage and uses
   `pkcs8::SecretDocument` for PEM decoding; and
 - rejects incoming certificate lists beyond parser capacity instead of
-  panicking; and
+  panicking;
+- backports upstream algesten/dimpl#153 verbatim (except its `CHANGELOG.md`
+  line): the DTLS 1.3 `CertificateRequest` omits the optional
+  `certificate_authorities` extension instead of sending an empty list,
+  keeps the required `signature_algorithms` extension, and leaves
+  `require_client_certificate` and Ferrum's certificate verification
+  unchanged (dimpl has no configured CA names to advertise, so omission is
+  the only valid encoding);
+- passes a `DtlsCertificateChain` to `Engine::new` in the inline
+  `dtls13::engine` test helper, so the crate's `--lib` test target compiles
+  against the constructor signature this patch changed; and
 - makes documentation-only corrections to the vendored `README.md` /
   `CLAUDE.md` Sans-IO poll-loop illustrations so they cover every current
   `Output` variant and drain to `Timeout` before acting on `CloseNotify`
@@ -141,6 +162,18 @@ MIT/Apache-2.0 license is already allowed.
   does not claim erasure while a closed endpoint is still retained.
 - The `test-hooks` feature invokes a post-zeroization observer while the
   allocation is still live. Tests never inspect freed memory.
+- `dtls13::server::tests::certificate_request_omits_empty_certificate_authorities`
+  (upstream's #153 regression, run by the `Vendored Patch Regressions` CI job
+  with `cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --lib certificate_request_omits_empty_certificate_authorities`)
+  parses the serialized `CertificateRequest` and fails if a
+  `certificate_authorities` extension is emitted. Before the backport it fails
+  on `!extension_types.contains(&ExtensionType::CertificateAuthorities)`.
+  Interoperability was additionally checked out of tree with registry dimpl
+  0.8.0 (which rejects an empty list with `LengthValue`) as a DTLS 1.3 client
+  against this server with `require_client_certificate(true)` through
+  `Dtls::new_auto`: before the backport the client discards the server flight
+  and never connects; after it, the client connects, the server receives the
+  client certificate, and application data round-trips.
 - `tests/integration/dtls_integration_tests.rs` configures
   root → intermediate → leaf, trusts only the root, and completes a real
   Ferrum handshake because the intermediate is transmitted.
@@ -160,6 +193,9 @@ Retire the vendor copy only after a compatible upstream release:
    and drop of the endpoint (protocol `close()` alone, which retains the
    endpoint, is not required to erase it); and
 4. preserves Ferrum's supported ECDSA P-256/P-384 and constructor APIs.
+
+Any such release already contains the #153 `CertificateRequest` fix (0.7.0
+and later), so the backport adds no retirement condition of its own.
 
 Then remove the `[patch.crates-io]` rows (root `Cargo.toml`, `fuzz/Cargo.toml`
 and `tests/performance/mesh/Cargo.toml`), regenerate the three lockfiles while
