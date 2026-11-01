@@ -17183,7 +17183,7 @@ mod tests {
 
         /// A `response_committed` observer that never finishes.
         struct PendingCommittedObserver {
-            started: Arc<AtomicBool>,
+            started_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
         }
 
         #[async_trait]
@@ -17203,7 +17203,9 @@ mod tests {
                 _response_headers: &HashMap<String, String>,
                 _body: &[u8],
             ) {
-                self.started.store(true, Ordering::Release);
+                if let Ok(mut started_at) = self.started_at.lock() {
+                    started_at.get_or_insert_with(tokio::time::Instant::now);
+                }
                 std::future::pending::<()>().await;
             }
         }
@@ -17214,17 +17216,20 @@ mod tests {
         /// own `502` unchanged rather than a deadline terminal.
         #[tokio::test]
         async fn pending_committed_observer_at_the_deadline_keeps_the_gateway_terminal() {
-            let started = Arc::new(AtomicBool::new(false));
+            let started_at = Arc::new(std::sync::Mutex::new(None));
             let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PendingCommittedObserver {
-                started: Arc::clone(&started),
+                started_at: Arc::clone(&started_at),
             })];
             let mut ctx = RequestContext::new(
                 "127.0.0.1".to_string(),
                 "POST".to_string(),
                 "/operation".to_string(),
             );
-            ctx.grpc_deadline_at = Some(tokio::time::Instant::now() + Duration::from_millis(50));
             let mut exchange = h3_exchange("application/json").await;
+            // Armed after the loopback setup, so the observer is polled inline
+            // before the deadline rather than first in detached cleanup.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            ctx.grpc_deadline_at = Some(deadline);
 
             let outcome = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -17245,11 +17250,69 @@ mod tests {
             .expect("the terminal is written");
             let (response, body) = read_response(&mut exchange.client_stream).await;
 
-            assert!(started.load(Ordering::Acquire), "the observer ran");
+            let started_at = started_at
+                .lock()
+                .expect("observer start record")
+                .expect("the observer ran");
+            assert!(
+                started_at < deadline,
+                "the observer must be pending inline when the deadline passes"
+            );
+            assert!(
+                tokio::time::Instant::now() >= deadline,
+                "the terminal is written only once the observer's deadline passed"
+            );
             assert_eq!(outcome.response_status, 502);
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             assert_eq!(gateway_tokens(&response), ["connection_failure"]);
             assert_eq!(body, br#"{"error":"Backend unavailable"}"#);
+        }
+
+        /// Past the observers' deadline the gateway terminal is written under
+        /// the bounded post-deadline grace: a client that withholds stream
+        /// credit (here, never reading a terminal larger than its receive
+        /// window) cannot hold the request, and the response is reset.
+        #[tokio::test]
+        async fn terminal_after_the_observer_deadline_is_written_under_the_bounded_grace() {
+            let started_at = Arc::new(std::sync::Mutex::new(None));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PendingCommittedObserver {
+                started_at: Arc::clone(&started_at),
+            })];
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/operation".to_string(),
+            );
+            let mut exchange = h3_exchange("application/json").await;
+            ctx.grpc_deadline_at = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+            let oversized = Bytes::from(vec![b'x'; 16 * 1024 * 1024]);
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::http3::cross_protocol::write_plain_gateway_error_terminal(
+                    &mut exchange.server_stream,
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::BAD_GATEWAY,
+                    oversized,
+                    true,
+                    true,
+                    Instant::now(),
+                    0,
+                ),
+            )
+            .await
+            .expect("a client withholding credit must not hold the terminal past the grace")
+            .expect("the bounded write settles");
+
+            assert!(
+                started_at.lock().expect("observer start record").is_some(),
+                "the observer ran"
+            );
+            assert!(
+                !outcome.body_completed,
+                "the withheld terminal must be reset, not completed"
+            );
         }
 
         /// A plain client's pool-failure terminal is the fixed `502` with the
