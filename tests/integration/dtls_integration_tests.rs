@@ -1485,3 +1485,309 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
     accept_task.abort();
     let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
 }
+
+/// What [`strict_dtls13_client_handshake_on`] observed.
+#[derive(Debug)]
+struct StrictDtls13ClientOutcome {
+    /// The client's own view. In DTLS 1.3 the client reports `Connected` once
+    /// it has sent its Finished, before the server has judged its certificate,
+    /// so this is not an admission signal for a refused peer.
+    connected: bool,
+    echo: Option<Vec<u8>>,
+    transport_error: Option<String>,
+    server_datagrams: usize,
+}
+
+/// Turn a PEM fixture into the strict client's credential type.
+fn strict_dtls13_certificate(cert: &GeneratedCert) -> strict_dimpl::DtlsCertificate {
+    let certificate = CertificateDer::from_pem_slice(cert.cert_pem.as_bytes())
+        .expect("parse strict client certificate PEM")
+        .to_vec();
+    let private_key = PrivateKeyDer::from_pem_slice(cert.key_pem.as_bytes())
+        .expect("parse strict client key PEM")
+        .secret_der()
+        .to_vec();
+    strict_dimpl::DtlsCertificate {
+        certificate,
+        private_key,
+    }
+}
+
+async fn drain_strict_dtls13_outputs(
+    client: &mut strict_dimpl::Dtls,
+    socket: &UdpSocket,
+    out_buf: &mut [u8],
+    next_timeout: &mut Option<Instant>,
+    connected: &mut bool,
+    received: &mut Option<Vec<u8>>,
+) -> Result<(), anyhow::Error> {
+    let mut saw_timeout_after_connected = false;
+    for _ in 0..128 {
+        match client.poll_output(out_buf) {
+            strict_dimpl::Output::Packet(data) => {
+                socket.send(data).await?;
+            }
+            strict_dimpl::Output::Timeout(t) => {
+                *next_timeout = Some(t);
+                if *connected && !saw_timeout_after_connected {
+                    saw_timeout_after_connected = true;
+                    continue;
+                }
+                break;
+            }
+            strict_dimpl::Output::Connected => {
+                *connected = true;
+            }
+            strict_dimpl::Output::ApplicationData(data) => {
+                *received = Some(data.to_vec());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Drive registry dimpl 0.8.0 as a DTLS 1.3 client presenting `certificate`,
+/// then send `payload` and wait for its echo.
+///
+/// Unlike the vendored dimpl, this client rejects a `CertificateRequest`
+/// whose `certificate_authorities` list is empty, so it never reaches
+/// `Connected` against a server that sends one. A record the client cannot
+/// process (a refusal alert, say) ends the drive and is recorded, not returned
+/// as an error, because the refused case expects exactly that.
+async fn strict_dtls13_client_handshake_on(
+    socket: UdpSocket,
+    certificate: strict_dimpl::DtlsCertificate,
+    budget: Duration,
+    payload: &[u8],
+) -> Result<StrictDtls13ClientOutcome, anyhow::Error> {
+    let config = Arc::new(
+        strict_dimpl::Config::builder()
+            .build()
+            .expect("build strict DTLS 1.3 client config"),
+    );
+    let mut client = strict_dimpl::Dtls::new_13(config, certificate, Instant::now());
+    client.set_active(true);
+    client.handle_timeout(Instant::now())?;
+
+    let mut out_buf = vec![0u8; 4096];
+    let mut udp_buf = vec![0u8; 65536];
+    let mut next_timeout = None;
+    let mut connected = false;
+    let mut received = None;
+    let mut server_datagrams = 0usize;
+    let mut transport_error = None;
+    let mut sent_payload = false;
+
+    drain_strict_dtls13_outputs(
+        &mut client,
+        &socket,
+        &mut out_buf,
+        &mut next_timeout,
+        &mut connected,
+        &mut received,
+    )
+    .await?;
+
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline && received.is_none() && transport_error.is_none() {
+        if connected && !sent_payload {
+            client.send_application_data(payload)?;
+            sent_payload = true;
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let sleep_dur = next_timeout
+                .map(|t| t.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(100))
+                .min(remaining)
+                .min(Duration::from_millis(100));
+            tokio::select! {
+                result = socket.recv(&mut udp_buf) => {
+                    let len = result?;
+                    server_datagrams += 1;
+                    if let Err(e) = client.handle_packet(&udp_buf[..len]) {
+                        transport_error = Some(e.to_string());
+                    }
+                }
+                _ = tokio::time::sleep(sleep_dur) => {
+                    if let Some(t) = next_timeout
+                        && Instant::now() >= t
+                    {
+                        if let Err(e) = client.handle_timeout(Instant::now()) {
+                            transport_error = Some(e.to_string());
+                        }
+                        next_timeout = None;
+                    }
+                }
+            }
+        }
+
+        drain_strict_dtls13_outputs(
+            &mut client,
+            &socket,
+            &mut out_buf,
+            &mut next_timeout,
+            &mut connected,
+            &mut received,
+        )
+        .await?;
+    }
+
+    Ok(StrictDtls13ClientOutcome {
+        connected,
+        echo: received,
+        transport_error,
+        server_datagrams,
+    })
+}
+
+/// A frontend DTLS 1.3 listener that requires client certificates must send a
+/// `CertificateRequest` a strict, independent parser accepts (issue #7000).
+///
+/// The vendored dimpl server used to send `certificate_authorities` with an
+/// empty list, which RFC 8446 §4.2.4 forbids; registry dimpl 0.8.0 (like
+/// Chrome/BoringSSL) drops that flight, so the trusted control below never
+/// connected. The vendored client tolerates the empty list, so the
+/// vendored-client tests above cannot catch this. The fix only omits the
+/// extension: a certificate from an untrusted CA must still never be delivered
+/// through `accept()` or relayed.
+#[tokio::test]
+async fn test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_request_parser() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
+    let trusted_ca = generate_ca("DTLS 1.3 trusted client CA");
+    let untrusted_ca = generate_ca("DTLS 1.3 untrusted client CA");
+    let trusted_client = generate_client_auth_cert(&trusted_ca, "trusted-client", &["client-a"]);
+    let untrusted_client =
+        generate_client_auth_cert(&untrusted_ca, "untrusted-client", &["client-b"]);
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(trusted_ca.cert_der.clone()))
+        .expect("add trusted client CA");
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("build DTLS client verifier");
+
+    // The posture `dtls::build_frontend_dtls_config` produces for a listener
+    // with a client CA; the server endpoint is Ferrum's auto-sensing one, which
+    // negotiates DTLS 1.3 with this client.
+    let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
+        dimpl_config: Arc::new(
+            dimpl::Config::builder()
+                .require_client_certificate(true)
+                .build()
+                .expect("build frontend DTLS config"),
+        ),
+        certificate: dimpl::certificate::generate_self_signed_certificate()
+            .expect("generate server cert")
+            .into(),
+        client_cert_verifier: Some(verifier),
+        client_trust: None,
+    };
+
+    let server = Arc::new(
+        bind_dtls(
+            "127.0.0.1:0".parse().expect("server bind address"),
+            frontend_config,
+        )
+        .await
+        .expect("bind mTLS DTLS server"),
+    );
+    let server_addr = server.local_addr();
+    let server_runner = server.clone();
+    let run_task = tokio::spawn(async move { server_runner.run().await });
+
+    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let acceptor_delivered = delivered.clone();
+    let server_acceptor = server.clone();
+    let accept_task = tokio::spawn(async move {
+        while let Ok((conn, _addr)) = server_acceptor.accept().await {
+            acceptor_delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                loop {
+                    match conn.recv().await {
+                        Ok(data) if !data.is_empty() => {
+                            if conn.send(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            });
+        }
+    });
+
+    let trusted_socket = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind trusted client socket");
+    trusted_socket
+        .connect(server_addr)
+        .await
+        .expect("connect trusted client");
+    let admitted = strict_dtls13_client_handshake_on(
+        trusted_socket,
+        strict_dtls13_certificate(&trusted_client),
+        Duration::from_secs(10),
+        b"strict-dtls13-mtls",
+    )
+    .await
+    .expect("drive trusted strict DTLS 1.3 client");
+    assert!(
+        admitted.connected,
+        "a strict DTLS 1.3 client must accept the server's CertificateRequest and complete \
+         the handshake ({admitted:?})"
+    );
+    assert!(
+        admitted.transport_error.is_none(),
+        "an admitted strict DTLS 1.3 session must not end on a record the client rejects \
+         ({admitted:?})"
+    );
+    assert_eq!(
+        admitted.echo.as_deref(),
+        Some(&b"strict-dtls13-mtls"[..]),
+        "an admitted strict DTLS 1.3 mTLS session must relay application data ({admitted:?})"
+    );
+    assert_eq!(
+        delivered.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly the admitted session reaches the proxy"
+    );
+
+    let untrusted_socket = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind untrusted client socket");
+    untrusted_socket
+        .connect(server_addr)
+        .await
+        .expect("connect untrusted client");
+    let refused = strict_dtls13_client_handshake_on(
+        untrusted_socket,
+        strict_dtls13_certificate(&untrusted_client),
+        Duration::from_secs(3),
+        b"untrusted-must-not-relay",
+    )
+    .await
+    .expect("drive untrusted strict DTLS 1.3 client");
+    // The refusal is only meaningful if this peer got far enough to present its
+    // certificate, i.e. it was answered and parsed the CertificateRequest.
+    assert!(
+        refused.server_datagrams > 0,
+        "the untrusted peer must have been answered up to the certificate stage ({refused:?})"
+    );
+    assert!(
+        refused.echo.is_none(),
+        "a client certificate the verifier refuses must never be relayed ({refused:?})"
+    );
+    assert_eq!(
+        delivered.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a refused DTLS 1.3 handshake must never be delivered through accept()"
+    );
+
+    server.close().await;
+    accept_task.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(5), run_task).await;
+}

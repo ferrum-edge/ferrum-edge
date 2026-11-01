@@ -498,6 +498,9 @@ of the vendor copy and must keep passing after retirement:
   handshake because the configured intermediate is transmitted. The
   backported DTLS 1.3 `CertificateRequest` wire regression is the crate unit
   test `dtls13::server::tests::certificate_request_omits_empty_certificate_authorities`.
+  `tests/integration/dtls_integration_tests.rs` checks it against an
+  independent strict parser through the `strict_dimpl` dev-dependency (registry
+  dimpl `=0.8.0`, outside the patch's 0.6 range).
 
 - An HTTP/1 request stranded by a connection close during enqueue fails as
   unsent instead of hanging until `backend_read_timeout_ms` (issue #5714) — the

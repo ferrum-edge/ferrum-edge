@@ -168,12 +168,16 @@ MIT/Apache-2.0 license is already allowed.
   parses the serialized `CertificateRequest` and fails if a
   `certificate_authorities` extension is emitted. Before the backport it fails
   on `!extension_types.contains(&ExtensionType::CertificateAuthorities)`.
-  Interoperability was additionally checked out of tree with registry dimpl
-  0.8.0 (which rejects an empty list with `LengthValue`) as a DTLS 1.3 client
-  against this server with `require_client_certificate(true)` through
-  `Dtls::new_auto`: before the backport the client discards the server flight
-  and never connects; after it, the client connects, the server receives the
-  client certificate, and application data round-trips.
+- `tests/integration/dtls_integration_tests.rs`
+  `test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_request_parser`
+  drives registry dimpl 0.8.0 (the `strict_dimpl` dev-dependency, which
+  rejects an empty authorities list with `LengthValue`) as an independent
+  DTLS 1.3 client against Ferrum's real mTLS listener and client-CA verifier.
+  A certificate from the trusted CA must complete the handshake and
+  round-trip application data. Before the backport it never connects. A
+  certificate from an untrusted CA must still never be delivered through
+  `accept()` or relayed. The vendored client tolerates the empty list, so the
+  vendored-client tests cannot catch this regression on their own.
 - `tests/integration/dtls_integration_tests.rs` configures
   root → intermediate → leaf, trusts only the root, and completes a real
   Ferrum handshake because the intermediate is transmitted.

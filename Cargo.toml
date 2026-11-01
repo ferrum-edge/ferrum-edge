@@ -591,6 +591,13 @@ futures = "0.3"
 # Required for `tests/unit/plugins/soap_ws_security_tests.rs` end-to-end
 # sign-then-verify roundtrip coverage of the X.509 signature path.
 rcgen = { version = "0.14", features = ["aws_lc_rs"] }
+# Independent strict DTLS 1.3 peer for `tests/integration/dtls_integration_tests.rs`.
+# Registry dimpl 0.8.0 rejects an empty `certificate_authorities` list in a
+# CertificateRequest (RFC 8446 §4.2.4), which the vendored 0.6.1 copy tolerates,
+# so a gateway built on the vendored server alone cannot catch that regression
+# (issue #7000). The exact `=0.8.0` requirement is outside the vendored patch's
+# 0.6 range, so `[patch.crates-io]` leaves it on the registry release.
+strict_dimpl = { package = "dimpl", version = "=0.8.0" }
 # Test fixtures construct rustls providers and raw digests directly. Pinning
 # `ring` here — a DEV dependency, never linked into the shipped binary — keeps
 # the whole suite compiling under both `--features crypto-ring` and

@@ -745,7 +745,8 @@
       },
       "regression_tests": [
         "vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs",
-        "vendor/dimpl-0.6.1-ferrum-patched (dtls13::server::tests::certificate_request_omits_empty_certificate_authorities)"
+        "vendor/dimpl-0.6.1-ferrum-patched (dtls13::server::tests::certificate_request_omits_empty_certificate_authorities)",
+        "tests/integration/dtls_integration_tests.rs (test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_request_parser)"
       ]
     },
     {
