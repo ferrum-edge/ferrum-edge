@@ -84,6 +84,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped the flight and the handshake never completed. The extension is now
   omitted (a backport of upstream algesten/dimpl#153). Client certificates are
   still required and verified exactly as before.
+- **An HTTP/2 client that never sends `WINDOW_UPDATE` can no longer hold a
+  response stream and its backend forever.** A client that keeps its
+  connection alive (answering PINGs, reading its socket) but grants no
+  flow-control window parked the gateway's response pipe on send capacity
+  with an idle transport, so neither the transport-level write-stall bound
+  nor `backend_read_timeout_ms` could fire, and the response body held the
+  backend connection behind it indefinitely, once per stream up to
+  `max_concurrent_streams`. `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` now
+  also bounds that wait on the HTTP/2 frontends (h2c and ALPN `h2`): a stream
+  whose response has a chunk ready and no window from the client for that long
+  is reset with `RST_STREAM(CANCEL)`, which releases the backend; the
+  connection and its other streams continue. A full send buffer that still
+  has window does not count, so a client reading its socket slowly but
+  steadily is bounded only by the transport rule. The bound lives in the
+  vendored hyper (patch 008) with a forwarding hyper-util setting (patch 002).
 - **An HTTP/1.1 client that stops reading can no longer hold its connection
   and backend forever.** Every backend-facing bound deliberately ignores time
   spent waiting on the client (`backend_read_timeout_ms` arms only on backend
@@ -96,9 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   socket accepts no bytes for that long while the gateway has bytes to write,
   like nginx's `send_timeout`; on TLS listeners it sits below rustls. Any write
   the socket accepts re-arms it. It also covers upgraded WebSockets and HTTP/2
-  connections whose socket stops accepting bytes, but not an HTTP/2 response
-  parked on the client's flow-control window. HTTP/3 and admin listeners are
-  unchanged.
+  connections whose socket stops accepting bytes. HTTP/3 and admin listeners
+  are unchanged.
 - **`rate_limiting` with `expose_headers: true` no longer defeats response
   caching and idempotent replay.** The limiter (priority 2900) forwards the
   caller's `x-ratelimit-*` budget to the backend, and `x-ratelimit-remaining`

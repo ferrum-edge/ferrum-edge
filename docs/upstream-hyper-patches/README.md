@@ -21,8 +21,10 @@ root. Each patch is based on the output of all preceding patches:
 | [005](005-h2-small-window-coalescing/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 | Coalesce DATA frames cut from small HTTP/2 window increments |
 | [006](006-h2-stream-termination-origin/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 + 005 | Publish why an HTTP/2 server stream ended while its service future is dropped |
 | [007](007-h2-request-body-deadline/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 + 005 + 006 | Absolute HTTP/2 client request-body deadline that resets the stream whatever the body pipe is parked on |
+| [008](008-h2-response-write-timeout/README.md) | Hyper 1.10.0 + 001–007 | HTTP/2 server response-body bound on a closed client flow-control window |
 
-Patch 002 supplies `pending_data`; patches 004 and 005 build on it. Patch 002
+Patch 002 supplies `pending_data`; patches 004 and 005 build on it, and patch
+008 applies patch 004's write-stall timer to the server's response pipe. Patch 002
 is a complete diff from its stated baseline, replacing the former incremental
 correction that required the old fixed-minimum patch and patch 004 first.
 No stage reinstates the unsafe 1 KiB send-capacity threshold; patch 005's
@@ -31,7 +33,9 @@ For response pipes and uploads without a write-stall timeout, patch 005 can
 hand over the whole chunk when assigned window covers it, even if the
 per-stream send buffer limits capacity; a pipe carrying
 `Http2BodyWriteTimeout` keeps splitting at capacity so unsent chunk bytes
-remain owned and timed by the pipe. Telling window from send buffer apart
+remain owned and timed by the pipe. Patch 008's server response bound keeps the
+whole-chunk path: it times only a closed window, and leaves bytes waiting on
+the transport to the bound below hyper. Telling window from send buffer apart
 uses the vendored h2's `SendStream::capacity_and_assigned()`
 ([h2 patch 003](../upstream-h2-patches/003-assigned-send-capacity/README.md)).
 Against stock h2 the stack still builds and patch 005 falls back to splitting
@@ -42,7 +46,7 @@ at `capacity()`.
 The **Dependency Audit (cargo-deny)** job in
 [CI](../../.github/workflows/ci.yml) downloads and checks the pinned archive,
 then runs [the reconstruction verifier](../../.github/scripts/verify_hyper_patch_stack.py)
-before Cargo touches the vendor tree. It applies all seven patches with
+before Cargo touches the vendor tree. It applies all eight patches with
 `git apply` to a fresh extracted crate. It neither formats the result nor
 copies source from `vendor/` over it.
 
