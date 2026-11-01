@@ -1642,8 +1642,12 @@ impl PlainAttemptRecord {
         Self::failed(class)
     }
 
-    /// The plain bridge's one call to `RequestContext::record_backend_attempt`.
-    fn record(self, ctx: &RequestContext) {
+    /// The plain bridge's one call to `RequestContext::record_backend_attempt`,
+    /// after the dispatch provenance response-side plugins read
+    /// (`request_deduplication` releases its in-flight lease only on a proven
+    /// pre-wire failure), recorded for every attempt as proxy core records it.
+    fn record(self, ctx: &mut RequestContext) {
+        ctx.record_backend_dispatch_outcome(self.error_class, self.on_wire);
         ctx.record_backend_attempt(self.error_class, self.on_wire, self.status);
     }
 }
@@ -1713,16 +1717,13 @@ pub(crate) enum PlainAttemptEnd<T, D = std::convert::Infallible> {
 }
 
 impl<T: PlainSettledAttempt, D> PlainAttemptEnd<T, D> {
-    /// Record the attempt: end its `otel_tracing` CLIENT span and add it to
-    /// the request's diagnostic reference. A deadline or a disconnect is the
-    /// client's, except a gRPC-Web deadline that fired after the handoff and
-    /// was the route attempt budget (#5646), the backend's timeout, exactly as
-    /// the terminal records the attempt's outcome. Nothing is derived for a
-    /// request that records no attempts.
-    pub(crate) fn record(&self, ctx: &RequestContext) {
-        if !ctx.records_backend_attempts() {
-            return;
-        }
+    /// Record the attempt: its dispatch provenance, its `otel_tracing` CLIENT
+    /// span, and its diagnostic-reference entry. A deadline or a disconnect is
+    /// the client's, except a gRPC-Web deadline that fired after the handoff
+    /// and was the route attempt budget (#5646), the backend's timeout, exactly
+    /// as the terminal records the attempt's outcome. The record is derived
+    /// for every request: the provenance is request state, not a diagnostic.
+    pub(crate) fn record(&self, ctx: &mut RequestContext) {
         let record = match self {
             Self::Settled(settled) => settled.attempt_record(ctx),
             Self::HeaderTimeout | Self::WriteWatermark => {
@@ -9151,11 +9152,9 @@ where
             {
                 crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
             }
-            ctx.record_backend_attempt(
-                retry_error_class,
-                grpc_proxy::grpc_dispatch_reached_wire(&result, retry_error_class),
-                None,
-            );
+            let retry_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, retry_error_class);
+            ctx.record_backend_dispatch_outcome(retry_error_class, retry_on_wire);
+            ctx.record_backend_attempt(retry_error_class, retry_on_wire, None);
             last_attempt_recorded = true;
 
             // The failed attempt's route budget ends here: backoff is bounded
@@ -9334,21 +9333,22 @@ where
             crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);
         }
     }
+    // The final attempt's dispatch provenance, as proxy core's gRPC path
+    // records it; re-recording an attempt the loop already recorded leaves the
+    // state unchanged.
+    let dispatch_error = result
+        .as_ref()
+        .err()
+        .map(crate::retry::classify_grpc_proxy_error);
+    let dispatch_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error);
+    ctx.record_backend_dispatch_outcome(dispatch_error, dispatch_on_wire);
     if !last_attempt_recorded {
-        let dispatch_error = result
-            .as_ref()
-            .err()
-            .map(crate::retry::classify_grpc_proxy_error);
         if dispatch_error == Some(crate::retry::ErrorClass::TlsError)
             && let Err(error) = &result
         {
             crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
         }
-        ctx.record_backend_attempt(
-            dispatch_error,
-            grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
-            None,
-        );
+        ctx.record_backend_attempt(dispatch_error, dispatch_on_wire, None);
     }
 
     let final_backend_resolved_ip =
@@ -11067,11 +11067,9 @@ pub(crate) async fn dispatch_grpc_streaming(
     {
         crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
     }
-    ctx.record_backend_attempt(
-        dispatch_error,
-        grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
-        None,
-    );
+    let dispatch_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error);
+    ctx.record_backend_dispatch_outcome(dispatch_error, dispatch_on_wire);
+    ctx.record_backend_attempt(dispatch_error, dispatch_on_wire, None);
 
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
@@ -13106,6 +13104,13 @@ where
 /// the typed `connection_error` signal and the post-hook status, as HTTP/1.1
 /// and HTTP/2 write it: a hook can neither see, erase, replace, nor duplicate
 /// it (#5807).
+///
+/// The terminal ends the request, so its `response_committed` observers run
+/// over the normalized client response, as proxy core runs them over its
+/// gateway-built dispatch failure: `request_deduplication` releases a proven
+/// pre-wire failure's in-flight lease there. They run in the bounded
+/// charged-terminal mode (one poll each, pending work detached), so no
+/// observer can reword the gateway's own terminal.
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_gateway_error_terminal<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -13154,14 +13159,24 @@ where
         connection_error,
         status.as_u16(),
     );
-    write_plain_gateway_reject(
-        stream,
+    let (mut normalized, mut translated) =
+        normalize_reject_for_client(ctx, status, body, &headers, false);
+    run_cross_protocol_reject_committed_hooks(
+        plugins,
         ctx,
-        status,
-        body,
-        &headers,
+        false,
+        true,
+        &mut normalized,
+        &mut translated,
+    )
+    .await;
+    write_normalized_plain_gateway_reject(
+        stream,
+        normalized,
+        translated,
         backend_start,
         bytes_sent,
+        true,
     )
     .await
 }
@@ -13251,6 +13266,30 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     let (normalized, translated) = normalize_reject_for_client(ctx, status, body, headers, false);
+    write_normalized_plain_gateway_reject(
+        stream,
+        normalized,
+        translated,
+        backend_start,
+        bytes_sent,
+        halt_recv,
+    )
+    .await
+}
+
+/// Write an already-normalized plain-bridge gateway reject: the gRPC-Web
+/// translation when the client speaks gRPC-Web, else the normalized response.
+async fn write_normalized_plain_gateway_reject<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    normalized: crate::proxy::NormalizedRejectResponse,
+    translated: Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    backend_start: Instant,
+    bytes_sent: u64,
+    halt_recv: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
     if let Some(translated) = translated {
         return write_reject_with_headers_and_recv_halt(
             stream,

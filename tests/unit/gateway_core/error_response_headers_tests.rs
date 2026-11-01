@@ -380,12 +380,19 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
     let token = writer
         .find(token_writer)
         .expect("the writer applies the gateway token itself");
+    // The committed observers see the client response as written, token
+    // included (read-only), and settle request state such as the
+    // `request_deduplication` in-flight lease before the wire write.
+    let committed = writer
+        .find("run_cross_protocol_reject_committed_hooks(")
+        .expect("the writer runs the response_committed observers");
     let write = writer
-        .find("write_plain_gateway_reject(")
-        .expect("the writer writes through the gateway reject writer");
+        .find("write_normalized_plain_gateway_reject(")
+        .expect("the writer writes through the normalized gateway reject writer");
     assert!(
-        hooks < token && token < write,
-        "the token must be written after the hooks and before the wire write"
+        hooks < token && token < committed && committed < write,
+        "the token must be written after the hooks, and the committed observers \
+         must run over that terminal before the wire write"
     );
     assert_eq!(
         writer.matches(token_writer).count(),

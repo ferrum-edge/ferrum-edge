@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
 ### Fixed
+- **An HTTP/3 retry after a proven pre-wire backend failure is no longer
+  refused by `request_deduplication`.** The H3 → HTTP/1.1 / HTTP/2
+  cross-protocol bridge recorded each backend attempt only for diagnostics, so
+  the request's dispatch provenance stayed `not dispatched`, and its gateway
+  dispatch-failure terminal (`502` / `504`) never ran the `response_committed`
+  plugins. A connection refused before the request reached the wire therefore
+  kept the idempotency key's in-flight lease until `inflight_ttl_seconds`
+  expired, answering an immediate retry `409` where HTTP/1.1 and HTTP/2
+  execute it. The bridge now records every
+  attempt's dispatch outcome (plain and gRPC) and runs the committed plugins
+  over that terminal in the bounded charged-terminal mode. A failure that may
+  have reached the backend still keeps the lease.
 - **An HTTP/1.1 client that stops reading can no longer hold its connection
   and backend forever.** Every backend-facing bound deliberately ignores time
   spent waiting on the client (`backend_read_timeout_ms` arms only on backend
