@@ -57,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
 ### Fixed
+- **`adaptive_concurrency` now resets when a streaming `ai_federation` provider
+  destination changes.** With `streaming.enabled`, `ai_federation` commits a
+  provider through `route_override_*` and the ordinary proxy dispatch dials it,
+  but the route-override fingerprint ignored the plugin. A reload that moved a
+  provider to another host or port (`base_url`, provider type, Azure resource)
+  kept the old learned limits, and the new destination was admitted as an
+  untracked bypass. Streaming-eligible provider destinations, resolved the
+  way the plugin resolves its endpoint, are now route keys. Buffered
+  federation and providers that can never stream still contribute none.
 - **An HTTP/3 retry after a proven pre-wire backend failure is no longer
   refused by `request_deduplication`.** The H3 → HTTP/1.1 / HTTP/2
   cross-protocol bridge recorded each backend attempt only for diagnostics, so
