@@ -424,9 +424,16 @@ where
                                     // window assigned). A full send buffer
                                     // with window in hand waits on the
                                     // transport, which is bounded below
-                                    // hyper; it ends any window stall.
+                                    // hyper; it restarts the stall clock.
+                                    // The sleep stays armed all the same: a
+                                    // SETTINGS_INITIAL_WINDOW_SIZE decrease
+                                    // takes the assigned window back without
+                                    // waking this task, and the next wake (at
+                                    // most one bound later) must find the
+                                    // closed window and time it.
                                     if !write_timeout.times_buffered_bytes() && assigned > 0 {
                                         write_timeout.progressed();
+                                        let _ = write_timeout.poll_stalled(cx);
                                     } else if write_timeout.poll_stalled(cx) {
                                         debug!("body write timed out, resetting stream");
                                         // FERRUM PATCH 008: only a client

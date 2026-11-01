@@ -1,5 +1,5 @@
 diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
-index 783ab73..fc2d361 100644
+index 783ab73..8277e3f 100644
 --- a/src/proto/h2/mod.rs
 +++ b/src/proto/h2/mod.rs
 @@ -227,7 +227,11 @@ impl<B: Buf> CapacityAndAssigned for SendStream<B> {
@@ -84,7 +84,7 @@ index 783ab73..fc2d361 100644
                              && capacity < chunk.remaining()
                              && assigned >= chunk.remaining();
                          if covered
-@@ -385,12 +419,28 @@ where
+@@ -385,12 +419,35 @@ where
                              // written is a write stall; bound it.
                              if capacity == 0 {
                                  if let Some(write_timeout) = me.write_timeout.as_mut() {
@@ -96,9 +96,16 @@ index 783ab73..fc2d361 100644
 +                                    // window assigned). A full send buffer
 +                                    // with window in hand waits on the
 +                                    // transport, which is bounded below
-+                                    // hyper; it ends any window stall.
++                                    // hyper; it restarts the stall clock.
++                                    // The sleep stays armed all the same: a
++                                    // SETTINGS_INITIAL_WINDOW_SIZE decrease
++                                    // takes the assigned window back without
++                                    // waking this task, and the next wake (at
++                                    // most one bound later) must find the
++                                    // closed window and time it.
 +                                    if !write_timeout.times_buffered_bytes() && assigned > 0 {
 +                                        write_timeout.progressed();
++                                        let _ = write_timeout.poll_stalled(cx);
 +                                    } else if write_timeout.poll_stalled(cx) {
 +                                        debug!("body write timed out, resetting stream");
 +                                        // FERRUM PATCH 008: only a client
@@ -118,7 +125,7 @@ index 783ab73..fc2d361 100644
                                      }
                                  }
 diff --git a/src/proto/h2/server.rs b/src/proto/h2/server.rs
-index d826975..73d7e45 100644
+index d826975..6e8cc31 100644
 --- a/src/proto/h2/server.rs
 +++ b/src/proto/h2/server.rs
 @@ -58,6 +58,8 @@ pub(crate) struct Config {
@@ -241,7 +248,7 @@ index d826975..73d7e45 100644
                      } else {
                          reply!(me, res, true);
                          return Poll::Ready(Ok(()));
-@@ -621,3 +654,402 @@ where
+@@ -621,3 +654,466 @@ where
          })
      }
  }
@@ -621,6 +628,70 @@ index d826975..73d7e45 100644
 +            body.flow_control().release_capacity(data.len()).unwrap();
 +        }
 +        assert_eq!(received, BODY);
++    }
++
++    /// h2 takes a stream's assigned window back on a
++    /// `SETTINGS_INITIAL_WINDOW_SIZE` decrease without waking the body pipe.
++    /// A pipe parked on a full send buffer (window in hand, so not timed)
++    /// must still find the closed window and reset the stream: the client
++    /// stops reading with a wide window, shrinks it to zero, then reads what
++    /// is in flight but never grants window again.
++    #[tokio::test(start_paused = true)]
++    async fn a_window_taken_back_by_settings_still_trips_the_bound() {
++        const WINDOW: u32 = 8 * 1024 * 1024;
++        let (client_io, server_io) = tokio::io::duplex(CHUNK);
++        let (body, dropped) = streaming(None);
++        let body = Mutex::new(Some(body));
++        serve(server_io, true, Some(TIMEOUT), Some(CHUNK), move || {
++            body.lock().unwrap().take().expect("one request")
++        });
++        let paused = Arc::new(AtomicBool::new(false));
++        let waker = Arc::new(Mutex::new(None::<Waker>));
++        let io = Pausable {
++            inner: client_io,
++            paused: Arc::clone(&paused),
++            waker: Arc::clone(&waker),
++        };
++        let (mut sender, connection) = h2::client::Builder::new()
++            .initial_window_size(WINDOW)
++            .initial_connection_window_size(WINDOW)
++            .handshake::<_, Bytes>(io)
++            .await
++            .expect("client handshake");
++        let (shrink_tx, mut shrink_rx) = tokio::sync::oneshot::channel::<()>();
++        tokio::spawn(async move {
++            let mut connection = connection;
++            let mut shrunk = false;
++            let _ = std::future::poll_fn(|cx| {
++                if !shrunk && Pin::new(&mut shrink_rx).poll(cx).is_ready() {
++                    shrunk = true;
++                    connection
++                        .set_initial_window_size(0)
++                        .expect("shrink the stream window");
++                }
++                Pin::new(&mut connection).poll(cx)
++            })
++            .await;
++        });
++        let mut stream = get(&mut sender).await;
++
++        // Stop reading: the pipe fills the transport and h2's send buffer and
++        // parks with window in hand.
++        paused.store(true, Ordering::SeqCst);
++        tokio::time::sleep(TIMEOUT / 2).await;
++        // Take the window back, then read what is in flight without ever
++        // granting more.
++        shrink_tx.send(()).expect("driver alive");
++        tokio::time::sleep(TIMEOUT / 2).await;
++        paused.store(false, Ordering::SeqCst);
++        if let Some(waker) = waker.lock().unwrap().take() {
++            waker.wake();
++        }
++
++        let (_, reset) = drain_withholding_window(&mut stream, TIMEOUT * 10).await;
++        assert_eq!(reset, Some(h2::Reason::CANCEL));
++        tokio::task::yield_now().await;
++        assert!(dropped.load(Ordering::SeqCst), "the response body is released");
 +    }
 +
 +    /// A bound on a connection with no timer to run it resets each response

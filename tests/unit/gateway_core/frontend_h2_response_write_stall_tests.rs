@@ -165,8 +165,10 @@ async fn assert_stalled_stream_is_reset<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut body, driver) = open_stream(io, authority).await;
+    // Taken before the request: the gateway may start timing the stall
+    // before `open_stream` returns, so a later start could undercount it.
     let started = Instant::now();
+    let (mut body, driver) = open_stream(io, authority).await;
     let (received, reset) = drain_withholding_window(&mut body, RELEASE_GRACE).await;
     assert_eq!(
         reset,

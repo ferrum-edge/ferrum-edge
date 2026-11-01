@@ -1032,6 +1032,70 @@ mod ferrum_response_write_timeout_tests {
         assert_eq!(received, BODY);
     }
 
+    /// h2 takes a stream's assigned window back on a
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` decrease without waking the body pipe.
+    /// A pipe parked on a full send buffer (window in hand, so not timed)
+    /// must still find the closed window and reset the stream: the client
+    /// stops reading with a wide window, shrinks it to zero, then reads what
+    /// is in flight but never grants window again.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_taken_back_by_settings_still_trips_the_bound() {
+        const WINDOW: u32 = 8 * 1024 * 1024;
+        let (client_io, server_io) = tokio::io::duplex(CHUNK);
+        let (body, dropped) = streaming(None);
+        let body = Mutex::new(Some(body));
+        serve(server_io, true, Some(TIMEOUT), Some(CHUNK), move || {
+            body.lock().unwrap().take().expect("one request")
+        });
+        let paused = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(Mutex::new(None::<Waker>));
+        let io = Pausable {
+            inner: client_io,
+            paused: Arc::clone(&paused),
+            waker: Arc::clone(&waker),
+        };
+        let (mut sender, connection) = h2::client::Builder::new()
+            .initial_window_size(WINDOW)
+            .initial_connection_window_size(WINDOW)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("client handshake");
+        let (shrink_tx, mut shrink_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut connection = connection;
+            let mut shrunk = false;
+            let _ = std::future::poll_fn(|cx| {
+                if !shrunk && Pin::new(&mut shrink_rx).poll(cx).is_ready() {
+                    shrunk = true;
+                    connection
+                        .set_initial_window_size(0)
+                        .expect("shrink the stream window");
+                }
+                Pin::new(&mut connection).poll(cx)
+            })
+            .await;
+        });
+        let mut stream = get(&mut sender).await;
+
+        // Stop reading: the pipe fills the transport and h2's send buffer and
+        // parks with window in hand.
+        paused.store(true, Ordering::SeqCst);
+        tokio::time::sleep(TIMEOUT / 2).await;
+        // Take the window back, then read what is in flight without ever
+        // granting more.
+        shrink_tx.send(()).expect("driver alive");
+        tokio::time::sleep(TIMEOUT / 2).await;
+        paused.store(false, Ordering::SeqCst);
+        if let Some(waker) = waker.lock().unwrap().take() {
+            waker.wake();
+        }
+
+        let (_, reset) = drain_withholding_window(&mut stream, TIMEOUT * 10).await;
+        assert_eq!(reset, Some(h2::Reason::CANCEL));
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst), "the response body is released");
+    }
+
     /// A bound on a connection with no timer to run it resets each response
     /// with a body before its headers are sent, rather than serving it
     /// unbounded.

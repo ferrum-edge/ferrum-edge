@@ -71,7 +71,11 @@ bounds the same pipe on the client side.
   `SendStream::capacity_and_assigned()` (h2 patch 003) reports zero for both.
   A zero capacity with window still assigned means h2's send buffer is full,
   and only the transport can drain it. That wait is the transport bound's
-  job, so it ends any window stall instead of extending it. This keeps the
+  job, so it restarts the stall clock instead of extending a window stall.
+  The single sleep stays armed during it all the same: h2 takes the assigned
+  window back on a `SETTINGS_INITIAL_WINDOW_SIZE` decrease without waking the
+  pipe, so the pipe must wake on its own (at most once per bound) to find the
+  closed window and time it. This keeps the
   server bound from cutting a client that reads its socket slowly but
   steadily with a wide window. On the client side, patch 004 keeps timing both,
   because nothing below hyper bounds a backend that stops reading.
@@ -135,6 +139,10 @@ h2 client on tokio's paused clock:
   body. This test fails if the bound times send-buffer waits too. It needs the
   vendored h2: stock h2 reports `capacity()` for both values, so it cannot tell
   the two waits apart;
+- `a_window_taken_back_by_settings_still_trips_the_bound`: the client stops
+  reading with a wide window, the pipe parks on a full send buffer, and the
+  client then shrinks `SETTINGS_INITIAL_WINDOW_SIZE` to zero, which h2 applies
+  without waking the pipe. The stream is still reset with `CANCEL`;
 - `a_bound_without_a_timer_resets_the_stream`: fail closed.
 
 ```bash
