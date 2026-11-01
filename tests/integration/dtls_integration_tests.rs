@@ -1487,7 +1487,9 @@ async fn test_frontend_dtls_refuses_untrusted_client_without_completing_the_hand
 }
 
 /// What [`strict_dtls13_client_handshake_on`] observed.
-#[derive(Debug)]
+///
+/// Assertion messages print [`Self::state`], never `echo`: the echoed bytes
+/// are relayed application data.
 struct StrictDtls13ClientOutcome {
     /// The client's own view. In DTLS 1.3 the client reports `Connected` once
     /// it has sent its Finished, before the server has judged its certificate,
@@ -1496,6 +1498,15 @@ struct StrictDtls13ClientOutcome {
     echo: Option<Vec<u8>>,
     transport_error: Option<String>,
     server_datagrams: usize,
+}
+
+impl StrictDtls13ClientOutcome {
+    fn state(&self) -> String {
+        format!(
+            "connected={}, transport_error={:?}, server_datagrams={}",
+            self.connected, self.transport_error, self.server_datagrams
+        )
+    }
 }
 
 /// Turn a PEM fixture into the strict client's credential type.
@@ -1540,6 +1551,9 @@ async fn drain_strict_dtls13_outputs(
             }
             strict_dimpl::Output::ApplicationData(data) => {
                 *received = Some(data.to_vec());
+            }
+            strict_dimpl::Output::BufferTooSmall { needed } => {
+                anyhow::bail!("strict client output needs a {needed}-byte poll buffer");
             }
             _ => {}
         }
@@ -1641,31 +1655,78 @@ async fn strict_dtls13_client_handshake_on(
     })
 }
 
+/// Drive a strict DTLS 1.3 peer the listener must refuse and require positive
+/// evidence that it was judged: the client reports `Connected` only after it
+/// has parsed the CertificateRequest and sent its Certificate and Finished, so
+/// a refusal cannot pass because the handshake stalled earlier. Its payload
+/// is sent after that, so an admitted session would have echoed it within the
+/// budget.
+async fn assert_strict_dtls13_peer_refused(
+    server_addr: std::net::SocketAddr,
+    certificate: strict_dimpl::DtlsCertificate,
+    case: &str,
+    delivered: &std::sync::atomic::AtomicUsize,
+    delivered_before: usize,
+) {
+    let socket = UdpSocket::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind refused client socket");
+    socket
+        .connect(server_addr)
+        .await
+        .expect("connect refused client");
+    let refused = strict_dtls13_client_handshake_on(
+        socket,
+        certificate,
+        Duration::from_secs(5),
+        b"refused-must-not-relay",
+    )
+    .await
+    .expect("drive refused strict DTLS 1.3 client");
+    assert!(
+        refused.connected,
+        "{case}: the peer must reach the certificate stage (parse the CertificateRequest and \
+         send its authentication flight) for the refusal to mean anything ({})",
+        refused.state()
+    );
+    assert!(
+        refused.echo.is_none(),
+        "{case}: a refused peer must never have application data relayed ({})",
+        refused.state()
+    );
+    assert_eq!(
+        delivered.load(std::sync::atomic::Ordering::SeqCst),
+        delivered_before,
+        "{case}: a refused DTLS 1.3 handshake must never be delivered through accept()"
+    );
+}
+
 /// A frontend DTLS 1.3 listener that requires client certificates must send a
 /// `CertificateRequest` a strict, independent parser accepts (issue #7000).
 ///
 /// The vendored dimpl server used to send `certificate_authorities` with an
 /// empty list, which RFC 8446 §4.2.4 forbids; registry dimpl 0.8.0 (like
-/// Chrome/BoringSSL) drops that flight, so the trusted control below never
+/// Chrome/BoringSSL) drops that flight, so the accepted control below never
 /// connected. The vendored client tolerates the empty list, so the
 /// vendored-client tests above cannot catch this. The fix only omits the
-/// extension: a certificate from an untrusted CA must still never be delivered
-/// through `accept()` or relayed.
+/// extension, so admission must still fail closed: a certificate from a CA the
+/// verifier does not trust, and an empty client `Certificate` (which dimpl
+/// completes the handshake on, leaving Ferrum's verified-certificate gate to
+/// refuse it), must never be delivered through `accept()` or relayed.
 #[tokio::test]
 async fn test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_request_parser() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
-    let trusted_ca = generate_ca("DTLS 1.3 trusted client CA");
-    let untrusted_ca = generate_ca("DTLS 1.3 untrusted client CA");
-    let trusted_client = generate_client_auth_cert(&trusted_ca, "trusted-client", &["client-a"]);
-    let untrusted_client =
-        generate_client_auth_cert(&untrusted_ca, "untrusted-client", &["client-b"]);
+    let accepted_ca = generate_ca("DTLS 1.3 accepted client CA");
+    let foreign_ca = generate_ca("DTLS 1.3 foreign client CA");
+    let accepted_client = generate_client_auth_cert(&accepted_ca, "accepted-client", &["client-a"]);
+    let foreign_client = generate_client_auth_cert(&foreign_ca, "foreign-client", &["client-b"]);
 
     let mut roots = rustls::RootCertStore::empty();
     roots
-        .add(CertificateDer::from(trusted_ca.cert_der.clone()))
-        .expect("add trusted client CA");
+        .add(CertificateDer::from(accepted_ca.cert_der.clone()))
+        .expect("add accepted client CA");
     let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
         .expect("build DTLS client verifier");
@@ -1720,35 +1781,36 @@ async fn test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_
         }
     });
 
-    let trusted_socket = UdpSocket::bind_test("127.0.0.1:0")
+    let accepted_socket = UdpSocket::bind_test("127.0.0.1:0")
         .await
-        .expect("bind trusted client socket");
-    trusted_socket
+        .expect("bind accepted client socket");
+    accepted_socket
         .connect(server_addr)
         .await
-        .expect("connect trusted client");
+        .expect("connect accepted client");
     let admitted = strict_dtls13_client_handshake_on(
-        trusted_socket,
-        strict_dtls13_certificate(&trusted_client),
+        accepted_socket,
+        strict_dtls13_certificate(&accepted_client),
         Duration::from_secs(10),
         b"strict-dtls13-mtls",
     )
     .await
-    .expect("drive trusted strict DTLS 1.3 client");
+    .expect("drive accepted strict DTLS 1.3 client");
     assert!(
         admitted.connected,
         "a strict DTLS 1.3 client must accept the server's CertificateRequest and complete \
-         the handshake ({admitted:?})"
+         the handshake ({})",
+        admitted.state()
     );
     assert!(
         admitted.transport_error.is_none(),
-        "an admitted strict DTLS 1.3 session must not end on a record the client rejects \
-         ({admitted:?})"
+        "an admitted strict DTLS 1.3 session must not end on a record the client rejects ({})",
+        admitted.state()
     );
-    assert_eq!(
-        admitted.echo.as_deref(),
-        Some(&b"strict-dtls13-mtls"[..]),
-        "an admitted strict DTLS 1.3 mTLS session must relay application data ({admitted:?})"
+    assert!(
+        admitted.echo.as_deref() == Some(&b"strict-dtls13-mtls"[..]),
+        "an admitted strict DTLS 1.3 mTLS session must relay application data ({})",
+        admitted.state()
     );
     assert_eq!(
         delivered.load(std::sync::atomic::Ordering::SeqCst),
@@ -1756,36 +1818,29 @@ async fn test_frontend_dtls13_client_auth_interoperates_with_strict_certificate_
         "exactly the admitted session reaches the proxy"
     );
 
-    let untrusted_socket = UdpSocket::bind_test("127.0.0.1:0")
-        .await
-        .expect("bind untrusted client socket");
-    untrusted_socket
-        .connect(server_addr)
-        .await
-        .expect("connect untrusted client");
-    let refused = strict_dtls13_client_handshake_on(
-        untrusted_socket,
-        strict_dtls13_certificate(&untrusted_client),
-        Duration::from_secs(3),
-        b"untrusted-must-not-relay",
-    )
-    .await
-    .expect("drive untrusted strict DTLS 1.3 client");
-    // The refusal is only meaningful if this peer got far enough to present its
-    // certificate, i.e. it was answered and parsed the CertificateRequest.
-    assert!(
-        refused.server_datagrams > 0,
-        "the untrusted peer must have been answered up to the certificate stage ({refused:?})"
-    );
-    assert!(
-        refused.echo.is_none(),
-        "a client certificate the verifier refuses must never be relayed ({refused:?})"
-    );
-    assert_eq!(
-        delivered.load(std::sync::atomic::Ordering::SeqCst),
+    assert_strict_dtls13_peer_refused(
+        server_addr,
+        strict_dtls13_certificate(&foreign_client),
+        "certificate from a CA the verifier does not trust",
+        &delivered,
         1,
-        "a refused DTLS 1.3 handshake must never be delivered through accept()"
-    );
+    )
+    .await;
+
+    // An empty client Certificate with a usable signing key, the shape dimpl
+    // 0.8.0's own `dtls13_empty_client_certificate_is_rejected_when_required`
+    // drives.
+    assert_strict_dtls13_peer_refused(
+        server_addr,
+        strict_dimpl::DtlsCertificate {
+            certificate: Vec::new(),
+            private_key: strict_dtls13_certificate(&foreign_client).private_key,
+        },
+        "empty client Certificate",
+        &delivered,
+        1,
+    )
+    .await;
 
     server.close().await;
     accept_task.abort();

@@ -164,7 +164,8 @@ MIT/Apache-2.0 license is already allowed.
   allocation is still live. Tests never inspect freed memory.
 - `dtls13::server::tests::certificate_request_omits_empty_certificate_authorities`
   (upstream's #153 regression, run by the `Vendored Patch Regressions` CI job
-  with `cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --lib certificate_request_omits_empty_certificate_authorities`)
+  — which executes `ci.yml` from `main` through the trusted required-workflows
+  ruleset, so the step runs once it is on `main` — with `cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --lib certificate_request_omits_empty_certificate_authorities`)
   parses the serialized `CertificateRequest` and fails if a
   `certificate_authorities` extension is emitted. Before the backport it fails
   on `!extension_types.contains(&ExtensionType::CertificateAuthorities)`.
@@ -175,7 +176,10 @@ MIT/Apache-2.0 license is already allowed.
   DTLS 1.3 client against Ferrum's real mTLS listener and client-CA verifier.
   A certificate from the trusted CA must complete the handshake and
   round-trip application data. Before the backport it never connects. A
-  certificate from an untrusted CA must still never be delivered through
+  certificate from an untrusted CA and an empty client `Certificate` (which
+  dimpl completes the handshake on, leaving Ferrum's verified-certificate gate
+  to refuse it) must each reach the certificate stage, which the strict
+  client's `Connected` proves, and still never be delivered through
   `accept()` or relayed. The vendored client tolerates the empty list, so the
   vendored-client tests cannot catch this regression on their own.
 - `tests/integration/dtls_integration_tests.rs` configures
