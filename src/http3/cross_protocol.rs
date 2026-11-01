@@ -13153,7 +13153,8 @@ where
 /// pre-wire failure's in-flight lease there. Each is awaited up to the request's
 /// RPC / authorization deadline, as on HTTP/1.1 and HTTP/2, so a Redis-backed
 /// release lands before the response is written; one still pending then is
-/// detached, and never replaces the gateway's own terminal. A caller that
+/// detached, never replaces the gateway's own terminal, and leaves that
+/// terminal to the bounded post-deadline write grace. A caller that
 /// writes this terminal inside a deadline race of its own passes `false`: a
 /// race that fires mid-observer would drop the observer and write a second
 /// terminal whose observers run again.
@@ -13209,7 +13210,7 @@ where
     let (mut normalized, mut translated) =
         normalize_reject_for_client(ctx, status, body, &headers, false);
     if run_committed_observers {
-        let authorization_latched = ctx.authorization_termination().is_some();
+        let observer_deadline = ctx.precommit_response_phase_bound().deadline();
         run_cross_protocol_reject_committed_hooks_with(
             plugins,
             ctx,
@@ -13220,14 +13221,17 @@ where
             &mut translated,
         )
         .await;
-        // The credential's lifetime ended while an observer was pending: the
-        // runner dropped it and latched the termination, so the authorization
-        // terminal replaces the gateway's, under the bounded post-deadline
-        // grace rather than the unbounded reject writer.
-        if !authorization_latched && ctx.authorization_termination().is_some() {
-            return write_plain_authorization_expired_terminal(
+        // The RPC or authorization deadline passed while an observer was
+        // pending (it was detached, or dropped at an authorization expiry).
+        // The gateway's own terminal stands, as native H3 keeps it, and is
+        // written under the bounded post-deadline grace instead of the
+        // unbounded writer, so a client withholding flow-control credit cannot
+        // hold the request past that deadline.
+        if observer_deadline.is_some_and(|at| at <= tokio::time::Instant::now()) {
+            return write_normalized_plain_gateway_reject_after_deadline(
                 stream,
-                ctx,
+                normalized,
+                translated,
                 backend_start,
                 bytes_sent,
             )
@@ -13340,6 +13344,62 @@ where
         halt_recv,
     )
     .await
+}
+
+/// [`write_normalized_plain_gateway_reject`] after the request's RPC or
+/// authorization deadline: the write gets the shared post-deadline grace, a
+/// write that fails or outlives it resets the response, and the receive half
+/// is halted once the bounded write settles, as
+/// [`write_plain_authorization_expired_terminal`] writes its terminal.
+async fn write_normalized_plain_gateway_reject_after_deadline<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    normalized: crate::proxy::NormalizedRejectResponse,
+    translated: Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let status = if translated.is_some() {
+        StatusCode::OK.as_u16()
+    } else {
+        normalized.http_status.as_u16()
+    };
+    let write = write_normalized_plain_gateway_reject(
+        stream,
+        normalized,
+        translated,
+        backend_start,
+        bytes_sent,
+        false,
+    );
+    let result =
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
+            Ok(outcome) => Ok(outcome),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    status,
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    true,
+                ))
+            }
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    status,
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    false,
+                ))
+            }
+        };
+    crate::http3::stream_util::halt_request_body(stream);
+    result
 }
 
 /// Write an already-normalized plain-bridge gateway reject: the gRPC-Web
@@ -17119,6 +17179,77 @@ mod tests {
                 body.contains("grpc-status: 14"),
                 "the 502 is gRPC UNAVAILABLE in the trailer frame: {body:?}"
             );
+        }
+
+        /// A `response_committed` observer that never finishes.
+        struct PendingCommittedObserver {
+            started: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Plugin for PendingCommittedObserver {
+            fn name(&self) -> &str {
+                "pending_committed_observer"
+            }
+
+            fn requires_response_committed_hook(&self) -> bool {
+                true
+            }
+
+            async fn on_response_committed(
+                &self,
+                _ctx: &mut RequestContext,
+                _response_status: u16,
+                _response_headers: &HashMap<String, String>,
+                _body: &[u8],
+            ) {
+                self.started.store(true, Ordering::Release);
+                std::future::pending::<()>().await;
+            }
+        }
+
+        /// The gateway error terminal races its committed observers to the
+        /// request's RPC deadline: one still pending then is detached, the
+        /// terminal does not wait on it, and the client receives the gateway's
+        /// own `502` unchanged rather than a deadline terminal.
+        #[tokio::test]
+        async fn pending_committed_observer_at_the_deadline_keeps_the_gateway_terminal() {
+            let started = Arc::new(AtomicBool::new(false));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PendingCommittedObserver {
+                started: Arc::clone(&started),
+            })];
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/operation".to_string(),
+            );
+            ctx.grpc_deadline_at = Some(tokio::time::Instant::now() + Duration::from_millis(50));
+            let mut exchange = h3_exchange("application/json").await;
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::http3::cross_protocol::write_plain_gateway_error_terminal(
+                    &mut exchange.server_stream,
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
+                    true,
+                    true,
+                    Instant::now(),
+                    0,
+                ),
+            )
+            .await
+            .expect("the terminal must not wait on a pending observer past the deadline")
+            .expect("the terminal is written");
+            let (response, body) = read_response(&mut exchange.client_stream).await;
+
+            assert!(started.load(Ordering::Acquire), "the observer ran");
+            assert_eq!(outcome.response_status, 502);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(gateway_tokens(&response), ["connection_failure"]);
+            assert_eq!(body, br#"{"error":"Backend unavailable"}"#);
         }
 
         /// A plain client's pool-failure terminal is the fixed `502` with the

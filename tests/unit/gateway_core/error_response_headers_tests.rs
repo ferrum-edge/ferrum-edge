@@ -421,16 +421,16 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
         pool_call.contains("),true,false,backend_start,0,"),
         "the raced pooled-client failure terminal must not run committed observers"
     );
-    // An authorization expiry the observers latched is answered by the
-    // bounded authorization terminal, never the unbounded gateway reject.
-    let expired_after_observers = writer[committed..]
-        .find("return write_plain_authorization_expired_terminal(")
+    // A deadline that passed while an observer was pending leaves the gateway
+    // terminal to the bounded post-deadline write, never the unbounded one.
+    let bounded_after_observers = writer[committed..]
+        .find("return write_normalized_plain_gateway_reject_after_deadline(")
         .map(|idx| committed + idx)
-        .expect("an authorization expiry during the observers is detected");
+        .expect("a deadline that passed during the observers is detected");
     assert!(
-        expired_after_observers < write,
-        "the authorization terminal must be selected after the committed \
-         observers and before the gateway reject write"
+        bounded_after_observers < write,
+        "the bounded post-deadline write must be selected after the committed \
+         observers and before the unbounded gateway reject write"
     );
     assert_eq!(
         writer.matches(token_writer).count(),
