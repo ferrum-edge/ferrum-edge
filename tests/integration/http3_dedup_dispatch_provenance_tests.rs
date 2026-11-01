@@ -258,7 +258,9 @@ async fn h3_bridge_post_wire_close_retains_dedup_inflight_lease() {
 /// H3 frontend, HTTP/1.1 backend: the backend executes the operation and then
 /// withholds its response head past `backend_read_timeout_ms`. The gateway's
 /// `504` is not proof the operation failed, so the lease stays held and the
-/// retry is refused without a second backend write.
+/// retry is refused without a second backend write. This backend-timeout
+/// terminal runs no committed observers, so the lease is kept by omission; the
+/// close-before-head case above is the one that guards the observer path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h3_bridge_post_wire_timeout_retains_dedup_inflight_lease() {
     let reserved = reserve_port().await.expect("reserve slow backend");

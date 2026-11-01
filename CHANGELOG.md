@@ -71,7 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadline as on HTTP/1.1 and HTTP/2 (so a Redis-backed release lands before
   the response), and never allowed to replace it; a deadline that passes
   while one is pending leaves the terminal to the bounded post-deadline write
-  grace. A route-timeout `504` takes the same path. A failure that may have
+  grace. A route-timeout `504` answered before dispatch or in retry backoff
+  takes the same path; one that expires while an attempt is in flight is a
+  backend-timeout `504`, which does not. A failure that may have
   reached the backend still keeps the lease. `ai_transcript_audit` now also
   records the bridge's classified dispatch failures and oversized-response
   `502`s; its backend-timeout `504`s still skip the committed plugins.
