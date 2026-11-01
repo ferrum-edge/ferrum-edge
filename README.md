@@ -130,7 +130,8 @@ the series alias can change when another release in that series is published.
 
 Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`) and to GitHub
 Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Both are public and anonymously
-pullable, and each release verifies an anonymous pull from both before publishing.
+pullable. After publishing its version manifests, each release workflow checks an
+anonymous pull from both registries and fails if either refuses.
 
 ```bash
 # Replace with a version whose image has completed publication.
