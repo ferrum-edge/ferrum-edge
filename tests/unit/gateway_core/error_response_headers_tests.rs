@@ -380,12 +380,57 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
     let token = writer
         .find(token_writer)
         .expect("the writer applies the gateway token itself");
+    // The committed observers see the client response as written, token
+    // included (read-only), and settle request state such as the
+    // `request_deduplication` in-flight lease before the wire write.
+    let committed = writer
+        .find("run_cross_protocol_reject_committed_hooks_with(")
+        .expect("the writer runs the response_committed observers");
     let write = writer
-        .find("write_plain_gateway_reject(")
-        .expect("the writer writes through the gateway reject writer");
+        .find("write_normalized_plain_gateway_reject(")
+        .expect("the writer writes through the normalized gateway reject writer");
     assert!(
-        hooks < token && token < write,
-        "the token must be written after the hooks and before the wire write"
+        hooks < token && token < committed && committed < write,
+        "the token must be written after the hooks, and the committed observers \
+         must run over that terminal before the wire write"
+    );
+    // The observers race the RPC / authorization deadline (not charged) and
+    // may never replace the gateway terminal (`replace_on_deadline: false`).
+    let writer_compact: String = writer.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        writer_compact.contains(
+            "run_cross_protocol_reject_committed_hooks_with(plugins,ctx,false,false,false,"
+        ),
+        "the gateway terminal's observers must race the deadline without replacing it"
+    );
+    // The pooled-client failure terminal is written inside the caller's
+    // deadline race, so it runs no observers.
+    let pool_body =
+        "Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),";
+    let pool_start = cross
+        .find(pool_body)
+        .expect("the pooled-client failure terminal body");
+    let pool_call: String = cross[pool_start..]
+        .split(".await?;")
+        .next()
+        .expect("the pooled-client failure terminal call")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert!(
+        pool_call.contains("),true,false,backend_start,0,"),
+        "the raced pooled-client failure terminal must not run committed observers"
+    );
+    // A deadline that passed while an observer was pending leaves the gateway
+    // terminal to the bounded post-deadline write, never the unbounded one.
+    let bounded_after_observers = writer[committed..]
+        .find("return write_normalized_plain_gateway_reject_after_deadline(")
+        .map(|idx| committed + idx)
+        .expect("a deadline that passed during the observers is detected");
+    assert!(
+        bounded_after_observers < write,
+        "the bounded post-deadline write must be selected after the committed \
+         observers and before the unbounded gateway reject write"
     );
     assert_eq!(
         writer.matches(token_writer).count(),
@@ -434,7 +479,8 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
         oversized_compact.contains(
             "write_plain_gateway_error_terminal(stream,plugins,ctx,StatusCode::BAD_GATEWAY,"
         ) && oversized_compact.contains("Bytes::from_static(")
-            && oversized_compact.contains("),false,backend_start,bytes_sent,")
+            // `connection_error: false`, then `run_committed_observers: true`.
+            && oversized_compact.contains("),false,true,backend_start,bytes_sent,")
             && !oversized.contains(token_writer)
             && !oversized_compact.contains("headers"),
         "the declared-oversize 502 must hand the typed signal to the terminal writer"

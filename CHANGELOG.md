@@ -57,6 +57,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
 ### Fixed
+- **An HTTP/3 retry after a proven pre-wire backend failure is no longer
+  refused by `request_deduplication`.** The H3 → HTTP/1.1 / HTTP/2
+  cross-protocol bridge recorded each backend attempt only for diagnostics, so
+  the request's dispatch provenance stayed `not dispatched`, and its gateway
+  dispatch-failure terminal (`502` / `504`) never ran the `response_committed`
+  plugins. A connection refused before the request reached the wire therefore
+  kept the idempotency key's in-flight lease until `inflight_ttl_seconds`
+  expired, answering an immediate retry `409` where HTTP/1.1 and HTTP/2
+  execute it. The bridge now records every
+  attempt's dispatch outcome (plain and gRPC) and runs the committed plugins
+  over that terminal, each awaited up to the request's RPC or authorization
+  deadline as on HTTP/1.1 and HTTP/2 (so a Redis-backed release lands before
+  the response), and never allowed to replace it; a deadline that passes
+  while one is pending leaves the terminal to the bounded post-deadline write
+  grace. A route-timeout `504` answered before dispatch or in retry backoff
+  takes the same path; one that expires while an attempt is in flight is a
+  backend-timeout `504`, which does not. A failure that may have
+  reached the backend still keeps the lease. `ai_transcript_audit` now also
+  records the bridge's classified dispatch failures and oversized-response
+  `502`s; its backend-timeout `504`s still skip the committed plugins.
 - **Strict DTLS 1.3 clients can complete client-certificate handshakes**
   (issue #7000). The vendored dimpl server sent its DTLS 1.3
   `CertificateRequest` with an empty `certificate_authorities` list, which

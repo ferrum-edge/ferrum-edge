@@ -1642,8 +1642,12 @@ impl PlainAttemptRecord {
         Self::failed(class)
     }
 
-    /// The plain bridge's one call to `RequestContext::record_backend_attempt`.
-    fn record(self, ctx: &RequestContext) {
+    /// The plain bridge's one call to `RequestContext::record_backend_attempt`,
+    /// after the dispatch provenance response-side plugins read
+    /// (`request_deduplication` releases its in-flight lease only on a proven
+    /// pre-wire failure), recorded for every attempt as proxy core records it.
+    fn record(self, ctx: &mut RequestContext) {
+        ctx.record_backend_dispatch_outcome(self.error_class, self.on_wire);
         ctx.record_backend_attempt(self.error_class, self.on_wire, self.status);
     }
 }
@@ -1713,16 +1717,13 @@ pub(crate) enum PlainAttemptEnd<T, D = std::convert::Infallible> {
 }
 
 impl<T: PlainSettledAttempt, D> PlainAttemptEnd<T, D> {
-    /// Record the attempt: end its `otel_tracing` CLIENT span and add it to
-    /// the request's diagnostic reference. A deadline or a disconnect is the
-    /// client's, except a gRPC-Web deadline that fired after the handoff and
-    /// was the route attempt budget (#5646), the backend's timeout, exactly as
-    /// the terminal records the attempt's outcome. Nothing is derived for a
-    /// request that records no attempts.
-    pub(crate) fn record(&self, ctx: &RequestContext) {
-        if !ctx.records_backend_attempts() {
-            return;
-        }
+    /// Record the attempt: its dispatch provenance, its `otel_tracing` CLIENT
+    /// span, and its diagnostic-reference entry. A deadline or a disconnect is
+    /// the client's, except a gRPC-Web deadline that fired after the handoff
+    /// and was the route attempt budget (#5646), the backend's timeout, exactly
+    /// as the terminal records the attempt's outcome. The record is derived
+    /// for every request: the provenance is request state, not a diagnostic.
+    pub(crate) fn record(&self, ctx: &mut RequestContext) {
         let record = match self {
             Self::Settled(settled) => settled.attempt_record(ctx),
             Self::HeaderTimeout | Self::WriteWatermark => {
@@ -2273,6 +2274,12 @@ where
             // The client never existed: a pre-wire connection failure, tokened
             // `connection_failure` after the hooks (see
             // `plain_pool_client_failure_headers`).
+            // Written inside the caller's `plain_local_bound` race, so the
+            // committed observers do not run here: a race firing mid-observer
+            // would drop it and write a second terminal. This attempt never
+            // existed and records no provenance, so `request_deduplication`
+            // keeps its lease (fail-closed), even when every earlier retry
+            // attempt was refused pre-wire.
             let mut outcome = write_plain_gateway_error_terminal(
                 stream,
                 plugins,
@@ -2280,6 +2287,7 @@ where
                 StatusCode::BAD_GATEWAY,
                 Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),
                 true,
+                false,
                 backend_start,
                 0,
             )
@@ -6352,6 +6360,7 @@ where
             StatusCode::BAD_GATEWAY,
             Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
             false,
+            true,
             backend_start,
             bytes_sent,
         )
@@ -9151,11 +9160,9 @@ where
             {
                 crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
             }
-            ctx.record_backend_attempt(
-                retry_error_class,
-                grpc_proxy::grpc_dispatch_reached_wire(&result, retry_error_class),
-                None,
-            );
+            let retry_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, retry_error_class);
+            ctx.record_backend_dispatch_outcome(retry_error_class, retry_on_wire);
+            ctx.record_backend_attempt(retry_error_class, retry_on_wire, None);
             last_attempt_recorded = true;
 
             // The failed attempt's route budget ends here: backoff is bounded
@@ -9334,21 +9341,22 @@ where
             crate::proxy::charge_grpc_route_attempt_budget_expiry(ctx, &mut result);
         }
     }
+    // The final attempt's dispatch provenance, as proxy core's gRPC path
+    // records it; re-recording an attempt the loop already recorded leaves the
+    // state unchanged.
+    let dispatch_error = result
+        .as_ref()
+        .err()
+        .map(crate::retry::classify_grpc_proxy_error);
+    let dispatch_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error);
+    ctx.record_backend_dispatch_outcome(dispatch_error, dispatch_on_wire);
     if !last_attempt_recorded {
-        let dispatch_error = result
-            .as_ref()
-            .err()
-            .map(crate::retry::classify_grpc_proxy_error);
         if dispatch_error == Some(crate::retry::ErrorClass::TlsError)
             && let Err(error) = &result
         {
             crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
         }
-        ctx.record_backend_attempt(
-            dispatch_error,
-            grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
-            None,
-        );
+        ctx.record_backend_attempt(dispatch_error, dispatch_on_wire, None);
     }
 
     let final_backend_resolved_ip =
@@ -11067,11 +11075,15 @@ pub(crate) async fn dispatch_grpc_streaming(
     {
         crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
     }
-    ctx.record_backend_attempt(
+    let dispatch_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error);
+    // A client that gave up on the response while the attempt was in flight
+    // leaves it possibly executed: the synthesized cancel's connect-class label
+    // is not proof the request never reached the backend.
+    ctx.record_backend_dispatch_outcome(
         dispatch_error,
-        grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error),
-        None,
+        dispatch_on_wire || response_cancel.is_some(),
     );
+    ctx.record_backend_attempt(dispatch_error, dispatch_on_wire, None);
 
     let final_backend_resolved_ip =
         resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
@@ -13002,6 +13014,32 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
     normalized: &mut crate::proxy::NormalizedRejectResponse,
     translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) -> bool {
+    run_cross_protocol_reject_committed_hooks_with(
+        plugins,
+        ctx,
+        native_grpc,
+        charged_backend_deadline,
+        true,
+        normalized,
+        translated,
+    )
+    .await
+}
+
+/// [`run_cross_protocol_reject_committed_hooks`] with the deadline replacement
+/// selectable: `replace_on_deadline = false` still races each observer to the
+/// request's RPC / authorization deadline and detaches one still pending then,
+/// but keeps the response the caller already selected (the plain bridge's
+/// gateway error terminal is never swapped for a deadline terminal).
+async fn run_cross_protocol_reject_committed_hooks_with(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    native_grpc: bool,
+    charged_backend_deadline: bool,
+    replace_on_deadline: bool,
+    normalized: &mut crate::proxy::NormalizedRejectResponse,
+    translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+) -> bool {
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
             continue;
@@ -13033,7 +13071,8 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
                 }
             };
 
-        let deadline_replaced = !terminal_gateway_deadline && !charged_backend_deadline;
+        let deadline_replaced =
+            replace_on_deadline && !terminal_gateway_deadline && !charged_backend_deadline;
         if deadline_replaced {
             ctx.mark_gateway_deadline_response_selected();
             let deadline = normalized_h3_grpc_deadline();
@@ -13102,10 +13141,23 @@ where
 /// authorization terminal on this bridge is, under the bounded post-deadline
 /// write grace, never through the unbounded gateway reject writer.
 ///
-/// The gateway-owned `X-Gateway-Error` token is written after the hooks, from
-/// the typed `connection_error` signal and the post-hook status, as HTTP/1.1
-/// and HTTP/2 write it: a hook can neither see, erase, replace, nor duplicate
-/// it (#5807).
+/// The gateway-owned `X-Gateway-Error` token is written after the `after_proxy`
+/// hooks, from the typed `connection_error` signal and the post-hook status,
+/// as HTTP/1.1 and HTTP/2 write it: an `after_proxy` hook can neither see,
+/// erase, replace, nor duplicate it (#5807).
+///
+/// With `run_committed_observers`, the terminal ends the request, so its
+/// `response_committed` observers run over the normalized client response,
+/// token included (a read-only view), as proxy core runs them over its
+/// gateway-built dispatch failure: `request_deduplication` releases a proven
+/// pre-wire failure's in-flight lease there. Each is awaited up to the request's
+/// RPC / authorization deadline, as on HTTP/1.1 and HTTP/2, so a Redis-backed
+/// release lands before the response is written; one still pending then is
+/// detached, never replaces the gateway's own terminal, and leaves that
+/// terminal to the bounded post-deadline write grace. A caller that
+/// writes this terminal inside a deadline race of its own passes `false`: a
+/// race that fires mid-observer would drop the observer and write a second
+/// terminal whose observers run again.
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_gateway_error_terminal<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -13114,6 +13166,7 @@ async fn write_plain_gateway_error_terminal<S>(
     status: StatusCode,
     mut body: Bytes,
     connection_error: bool,
+    run_committed_observers: bool,
     backend_start: Instant,
     bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -13154,14 +13207,44 @@ where
         connection_error,
         status.as_u16(),
     );
-    write_plain_gateway_reject(
+    let (mut normalized, mut translated) =
+        normalize_reject_for_client(ctx, status, body, &headers, false);
+    if run_committed_observers {
+        let observer_deadline = ctx.precommit_response_phase_bound().deadline();
+        run_cross_protocol_reject_committed_hooks_with(
+            plugins,
+            ctx,
+            false,
+            false,
+            false,
+            &mut normalized,
+            &mut translated,
+        )
+        .await;
+        // The RPC or authorization deadline passed while an observer was
+        // pending (it was detached, or dropped at an authorization expiry).
+        // The gateway's own terminal stands, as native H3 keeps it, and is
+        // written under the bounded post-deadline grace instead of the
+        // unbounded writer, so a client withholding flow-control credit cannot
+        // hold the request past that deadline.
+        if observer_deadline.is_some_and(|at| at <= tokio::time::Instant::now()) {
+            return write_normalized_plain_gateway_reject_after_deadline(
+                stream,
+                normalized,
+                translated,
+                backend_start,
+                bytes_sent,
+            )
+            .await;
+        }
+    }
+    write_normalized_plain_gateway_reject(
         stream,
-        ctx,
-        status,
-        body,
-        &headers,
+        normalized,
+        translated,
         backend_start,
         bytes_sent,
+        true,
     )
     .await
 }
@@ -13201,6 +13284,7 @@ where
         status,
         body,
         attempt_result.connection_error,
+        true,
         backend_start,
         bytes_sent,
     )
@@ -13251,6 +13335,86 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     let (normalized, translated) = normalize_reject_for_client(ctx, status, body, headers, false);
+    write_normalized_plain_gateway_reject(
+        stream,
+        normalized,
+        translated,
+        backend_start,
+        bytes_sent,
+        halt_recv,
+    )
+    .await
+}
+
+/// [`write_normalized_plain_gateway_reject`] after the request's RPC or
+/// authorization deadline: the write gets the shared post-deadline grace, a
+/// write that fails or outlives it resets the response, and the receive half
+/// is halted once the bounded write settles, as
+/// [`write_plain_authorization_expired_terminal`] writes its terminal.
+async fn write_normalized_plain_gateway_reject_after_deadline<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    normalized: crate::proxy::NormalizedRejectResponse,
+    translated: Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    backend_start: Instant,
+    bytes_sent: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    let status = if translated.is_some() {
+        StatusCode::OK.as_u16()
+    } else {
+        normalized.http_status.as_u16()
+    };
+    let write = write_normalized_plain_gateway_reject(
+        stream,
+        normalized,
+        translated,
+        backend_start,
+        bytes_sent,
+        false,
+    );
+    let result =
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
+            Ok(outcome) => Ok(outcome),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    status,
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    true,
+                ))
+            }
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    status,
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    false,
+                ))
+            }
+        };
+    crate::http3::stream_util::halt_request_body(stream);
+    result
+}
+
+/// Write an already-normalized plain-bridge gateway reject: the gRPC-Web
+/// translation when the client speaks gRPC-Web, else the normalized response.
+async fn write_normalized_plain_gateway_reject<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    normalized: crate::proxy::NormalizedRejectResponse,
+    translated: Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    backend_start: Instant,
+    bytes_sent: u64,
+    halt_recv: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
     if let Some(translated) = translated {
         return write_reject_with_headers_and_recv_halt(
             stream,
@@ -17014,6 +17178,140 @@ mod tests {
             assert!(
                 body.contains("grpc-status: 14"),
                 "the 502 is gRPC UNAVAILABLE in the trailer frame: {body:?}"
+            );
+        }
+
+        /// A `response_committed` observer that never finishes.
+        struct PendingCommittedObserver {
+            started_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+        }
+
+        #[async_trait]
+        impl Plugin for PendingCommittedObserver {
+            fn name(&self) -> &str {
+                "pending_committed_observer"
+            }
+
+            fn requires_response_committed_hook(&self) -> bool {
+                true
+            }
+
+            async fn on_response_committed(
+                &self,
+                _ctx: &mut RequestContext,
+                _response_status: u16,
+                _response_headers: &HashMap<String, String>,
+                _body: &[u8],
+            ) {
+                if let Ok(mut started_at) = self.started_at.lock() {
+                    started_at.get_or_insert_with(tokio::time::Instant::now);
+                }
+                std::future::pending::<()>().await;
+            }
+        }
+
+        /// The gateway error terminal races its committed observers to the
+        /// request's RPC deadline: one still pending then is detached, the
+        /// terminal does not wait on it, and the client receives the gateway's
+        /// own `502` unchanged rather than a deadline terminal.
+        #[tokio::test]
+        async fn pending_committed_observer_at_the_deadline_keeps_the_gateway_terminal() {
+            let started_at = Arc::new(std::sync::Mutex::new(None));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PendingCommittedObserver {
+                started_at: Arc::clone(&started_at),
+            })];
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/operation".to_string(),
+            );
+            let mut exchange = h3_exchange("application/json").await;
+            // Armed after the loopback setup, so the observer is polled inline
+            // before the deadline rather than first in detached cleanup.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            ctx.grpc_deadline_at = Some(deadline);
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::http3::cross_protocol::write_plain_gateway_error_terminal(
+                    &mut exchange.server_stream,
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::BAD_GATEWAY,
+                    Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
+                    true,
+                    true,
+                    Instant::now(),
+                    0,
+                ),
+            )
+            .await
+            .expect("the terminal must not wait on a pending observer past the deadline")
+            .expect("the terminal is written");
+            let (response, body) = read_response(&mut exchange.client_stream).await;
+
+            let started_at = started_at
+                .lock()
+                .expect("observer start record")
+                .expect("the observer ran");
+            assert!(
+                started_at < deadline,
+                "the observer must be pending inline when the deadline passes"
+            );
+            assert!(
+                tokio::time::Instant::now() >= deadline,
+                "the terminal is written only once the observer's deadline passed"
+            );
+            assert_eq!(outcome.response_status, 502);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(gateway_tokens(&response), ["connection_failure"]);
+            assert_eq!(body, br#"{"error":"Backend unavailable"}"#);
+        }
+
+        /// Past the observers' deadline the gateway terminal is written under
+        /// the bounded post-deadline grace: a client that withholds stream
+        /// credit (here, never reading a terminal larger than its receive
+        /// window) cannot hold the request, and the response is reset.
+        #[tokio::test]
+        async fn terminal_after_the_observer_deadline_is_written_under_the_bounded_grace() {
+            let started_at = Arc::new(std::sync::Mutex::new(None));
+            let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(PendingCommittedObserver {
+                started_at: Arc::clone(&started_at),
+            })];
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/operation".to_string(),
+            );
+            let mut exchange = h3_exchange("application/json").await;
+            ctx.grpc_deadline_at = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+            let oversized = Bytes::from(vec![b'x'; 16 * 1024 * 1024]);
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::http3::cross_protocol::write_plain_gateway_error_terminal(
+                    &mut exchange.server_stream,
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::BAD_GATEWAY,
+                    oversized,
+                    true,
+                    true,
+                    Instant::now(),
+                    0,
+                ),
+            )
+            .await
+            .expect("a client withholding credit must not hold the terminal past the grace")
+            .expect("the bounded write settles");
+
+            assert!(
+                started_at.lock().expect("observer start record").is_some(),
+                "the observer ran"
+            );
+            assert!(
+                !outcome.body_completed,
+                "the withheld terminal must be reset, not completed"
             );
         }
 

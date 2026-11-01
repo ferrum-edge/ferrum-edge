@@ -5397,7 +5397,7 @@ fn gateway_error_terminals_are_built_out_of_line_and_bound_the_authorization_wri
         .find("return write_plain_authorization_expired_terminal(")
         .expect("and written under the bounded post-deadline grace");
     let unbounded = writer
-        .find("write_plain_gateway_reject(")
+        .find("write_normalized_plain_gateway_reject(")
         .expect("every other terminal keeps the gateway reject writer");
     assert!(
         hooks < authorization && authorization < bounded && bounded < unbounded,

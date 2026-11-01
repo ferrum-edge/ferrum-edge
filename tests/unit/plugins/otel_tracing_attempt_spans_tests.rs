@@ -769,7 +769,7 @@ async fn only_a_request_with_an_attempt_recorder_records_backend_attempts() {
 /// Run one HTTP/3 bridge attempt in its scope, then record how it ended at
 /// the bridge's one record point.
 async fn record_bridge_attempt(
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     headers: &HashMap<String, String>,
     end: PlainBridgeAttemptEndForTest,
 ) {
@@ -789,7 +789,7 @@ fn attempt_outcome(span: &Value) -> (Option<i64>, Option<&str>) {
 async fn http3_bridge_attempts_record_the_class_their_terminal_reports() {
     let server = collector().await;
     let plugin = otel(Some(&endpoint(&server)), json!({}));
-    let (ctx, headers) = traced_request(&plugin).await;
+    let (mut ctx, headers) = traced_request(&plugin).await;
 
     // Every way an HTTP/3 → HTTP/1.1/HTTP/2 bridge attempt can end, each
     // recorded once, in order (issue #5875).
@@ -802,7 +802,7 @@ async fn http3_bridge_attempts_record_the_class_their_terminal_reports() {
         PlainBridgeAttemptEndForTest::UploadTooLarge,
         PlainBridgeAttemptEndForTest::Response(200),
     ] {
-        record_bridge_attempt(&ctx, &headers, end).await;
+        record_bridge_attempt(&mut ctx, &headers, end).await;
     }
 
     let clients = client_spans(&exported_spans(&server, 7).await);
@@ -853,7 +853,7 @@ async fn an_http3_bridge_attempt_budget_expiry_is_the_backends_only_after_handof
     // attempt is recorded the same way.
     for handed_off in [true, false] {
         let end = PlainBridgeAttemptEndForTest::GrpcWebDeadline { handed_off };
-        record_bridge_attempt(&ctx, &headers, end).await;
+        record_bridge_attempt(&mut ctx, &headers, end).await;
     }
 
     let clients = client_spans(&exported_spans(&server, 2).await);

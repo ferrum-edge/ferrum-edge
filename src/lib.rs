@@ -1540,7 +1540,7 @@ pub mod _test_support {
     /// Record a bridge attempt that ended as `end` at the bridge's one record
     /// point (issue #5875).
     pub fn record_plain_bridge_attempt_for_test(
-        ctx: &crate::plugins::RequestContext,
+        ctx: &mut crate::plugins::RequestContext,
         end: PlainBridgeAttemptEndForTest,
     ) {
         use crate::http3::cross_protocol::PlainAttemptEnd;
