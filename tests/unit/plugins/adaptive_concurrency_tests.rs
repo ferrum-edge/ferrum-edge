@@ -2335,6 +2335,62 @@ fn adaptive_concurrency_ai_federation_streaming_destination_change_resets_key_sp
 }
 
 #[test]
+fn adaptive_concurrency_ai_federation_multimodal_mode_change_resets_key_space() {
+    // Same destination set before and after: only which provider may take a
+    // multimodal stream changes. Image streams first fall through `reject` on
+    // the primary to the fallback; once the primary translates, they commit to
+    // the primary instead.
+    let provider = |name: &str, priority: u64, host: &str, mode: &str| {
+        json!({
+            "name": name,
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "priority": priority,
+            "base_url": format!("https://{host}/v1/chat/completions"),
+            "multimodal_mode": mode
+        })
+    };
+    let config = ai_federation_route_config(
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+        json!({
+            "providers": [
+                provider("primary", 1, "primary-ai.example", "reject"),
+                provider("fallback", 2, "fallback-ai.example", "translate")
+            ],
+            "streaming": {"enabled": true}
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_route_proxy(&config, "fallback-ai.example", 443),
+        None,
+    )));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].config["providers"][0]["multimodal_mode"] = json!("translate");
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+            &[],
+            false,
+        )
+        .expect("multimodal policy change should publish");
+
+    let replacement_plugin = adaptive_plugin_from_cache(&cache);
+    let primary = effective_route_proxy(&reloaded, "primary-ai.example", 443);
+    let held = expect_admitted(acquire_from_plugin(&replacement_plugin, &primary, None));
+    assert_rejected(acquire_from_plugin(&replacement_plugin, &primary, None));
+    drop(held);
+}
+
+#[test]
 fn adaptive_concurrency_ai_federation_route_edits_without_stream_destination_stay_compatible() {
     let streaming_openai = json!({
         "providers": [{

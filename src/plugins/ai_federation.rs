@@ -7152,6 +7152,9 @@ pub(crate) struct StreamRouteProvider {
     pub(crate) priority: u64,
     pub(crate) weight: Option<u64>,
     pub(crate) model_patterns: Vec<String>,
+    /// Effective `multimodal_mode`: it decides whether a provider may take a
+    /// stream with non-text content or yields it to the next one.
+    pub(crate) multimodal_mode: Option<&'static str>,
     /// `None` when this provider can never be committed for a stream.
     pub(crate) destination: Option<StreamRouteDestination>,
 }
@@ -7195,6 +7198,7 @@ pub(crate) fn stream_route_plan(config: &Value) -> Option<StreamRoutePlan> {
                         .ok()
                         .flatten()
                         .unwrap_or_default(),
+                    multimodal_mode: stream_route_multimodal_mode(provider),
                     destination: stream_route_destination(provider),
                 })
                 .collect()
@@ -7207,6 +7211,16 @@ pub(crate) fn stream_route_plan(config: &Value) -> Option<StreamRoutePlan> {
         fail_on_no_matching_provider: flag("fail_on_no_matching_provider").unwrap_or(true),
         providers,
     })
+}
+
+fn stream_route_multimodal_mode(provider: &Value) -> Option<&'static str> {
+    let mode = match optional_str(provider, "multimodal_mode").ok()? {
+        Some(mode) => MultimodalMode::from_str(mode, "").ok()?,
+        None => MultimodalMode::default_for_provider(
+            ProviderType::from_str(optional_str(provider, "provider_type").ok()??).ok()?,
+        ),
+    };
+    Some(mode.as_str())
 }
 
 fn stream_route_destination(provider: &Value) -> Option<StreamRouteDestination> {
