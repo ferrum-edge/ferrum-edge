@@ -1910,6 +1910,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "dimpl"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df69b372e2de9011f8c22a58d1b5f5afa1752041bc5c0ae6b8a126aadaea5ed2"
+dependencies = [
+ "aes",
+ "arrayvec",
+ "aws-lc-rs",
+ "ccm",
+ "der",
+ "log",
+ "nom 8.0.0",
+ "once_cell",
+ "pkcs8",
+ "rand 0.9.4",
+ "rcgen",
+ "sec1",
+ "signature",
+ "spki",
+ "subtle",
+ "time",
+ "x509-cert",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2148,7 +2173,8 @@ dependencies = [
  "crossbeam-utils",
  "cryptoki",
  "dashmap",
- "dimpl",
+ "dimpl 0.6.1",
+ "dimpl 0.8.0",
  "ferrum-ebpf-common",
  "flate2",
  "futures",

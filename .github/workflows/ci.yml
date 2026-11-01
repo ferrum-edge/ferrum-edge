@@ -1951,6 +1951,9 @@ jobs:
       - name: Run vendored dimpl credential security regressions
         run: cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
 
+      - name: Run vendored dimpl DTLS 1.3 CertificateRequest regression
+        run: cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --lib certificate_request_omits_empty_certificate_authorities
+
       - name: Run vendored sqlx-core exclusive-root-CA regressions
         # `verify-ca` waives only the hostname check, so a configured
         # FERRUM_DB_TLS_CA_CERT_PATH must REPLACE the bundled public roots
