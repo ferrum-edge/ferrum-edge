@@ -71,11 +71,13 @@ bounds the same pipe on the client side.
   `SendStream::capacity_and_assigned()` (h2 patch 003) reports zero for both.
   A zero capacity with window still assigned means h2's send buffer is full,
   and only the transport can drain it. That wait is the transport bound's
-  job, so it restarts the stall clock instead of extending a window stall.
-  The single sleep stays armed during it all the same: h2 takes the assigned
-  window back on a `SETTINGS_INITIAL_WINDOW_SIZE` decrease without waking the
-  pipe, so the pipe must wake on its own (at most once per bound) to find the
-  closed window and time it. This keeps the
+  job, so it ends any window stall instead of extending it. A wakeup stays
+  armed during it all the same (`WriteTimeout::keep_awake`, at most one per
+  bound): h2 takes the assigned window back on a
+  `SETTINGS_INITIAL_WINDOW_SIZE` decrease without waking the pipe, so the pipe
+  must wake on its own to find the closed window. The stall is counted from
+  that wake, never from when the pipe parked, so a window taken back is reset
+  between one and two bounds later and never sooner. This keeps the
   server bound from cutting a client that reads its socket slowly but
   steadily with a wide window. On the client side, patch 004 keeps timing both,
   because nothing below hyper bounds a backend that stops reading.
@@ -119,6 +121,16 @@ holds back `WINDOW_UPDATE`. With the RFC default 65,535-byte window, a stream
 is cut only if the client takes a whole bound to read one window's worth and
 grant more. At the `60` default that is slower than about 1 KiB/s.
 
+The bound times a chunk the pipe still holds. Bytes already handed to h2 are
+not timed while the pipe waits on the response body, just as bytes the kernel
+accepted are not timed on HTTP/1.1. If a client takes back its window with
+`SETTINGS_INITIAL_WINDOW_SIZE` while such bytes are queued and the body then
+produces nothing more, the exchange is held by an idle backend. That is
+`backend_read_timeout_ms`'s job: it arms on the body's `Pending` and ends the
+body, which resets the stream. Only a route that sets it to `0`, opting out of
+bounding an idle backend, holds that exchange until the backend sends again.
+The next chunk then stalls on the closed window and is timed.
+
 ## Regression tests
 
 The `proto::h2::server::ferrum_response_write_timeout_tests` in the vendored
@@ -142,7 +154,11 @@ h2 client on tokio's paused clock:
 - `a_window_taken_back_by_settings_still_trips_the_bound`: the client stops
   reading with a wide window, the pipe parks on a full send buffer, and the
   client then shrinks `SETTINGS_INITIAL_WINDOW_SIZE` to zero, which h2 applies
-  without waking the pipe. The stream is still reset with `CANCEL`;
+  without waking the pipe. The stream is still reset with `CANCEL`, between
+  one and two bounds after the shrink;
+- `a_window_taken_back_briefly_is_not_cut_early`: a window taken back just
+  before the pipe's wakeup fires and given back within a bound is never
+  reset;
 - `a_bound_without_a_timer_resets_the_stream`: fail closed.
 
 ```bash

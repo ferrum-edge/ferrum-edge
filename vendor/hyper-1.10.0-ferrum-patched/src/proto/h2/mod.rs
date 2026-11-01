@@ -306,6 +306,22 @@ impl WriteTimeout {
         false
     }
 
+    /// FERRUM PATCH 008: keep a wakeup at most one bound away without
+    /// timing anything. A pipe waiting on a full send buffer with window in
+    /// hand is not stalled, but h2 may take that window back without waking
+    /// it; the stall is counted only from the wake that finds it closed. The
+    /// one sleep is re-armed only once it has fired.
+    fn keep_awake(&mut self, cx: &mut Context<'_>) {
+        let timeout = self.timeout;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| self.timer.sleep(timeout));
+        if sleep.as_mut().poll(cx).is_ready() {
+            *sleep = self.timer.sleep(timeout);
+            let _ = sleep.as_mut().poll(cx);
+        }
+    }
+
     /// A chunk was handed to h2: the stall, if any, is over.
     fn progressed(&mut self) {
         self.stalled_since = None;
@@ -424,16 +440,16 @@ where
                                     // window assigned). A full send buffer
                                     // with window in hand waits on the
                                     // transport, which is bounded below
-                                    // hyper; it restarts the stall clock.
-                                    // The sleep stays armed all the same: a
+                                    // hyper; it ends any window stall. A
+                                    // sleep stays armed all the same: a
                                     // SETTINGS_INITIAL_WINDOW_SIZE decrease
                                     // takes the assigned window back without
-                                    // waking this task, and the next wake (at
+                                    // waking this task, so the next wake (at
                                     // most one bound later) must find the
-                                    // closed window and time it.
+                                    // closed window and start timing it.
                                     if !write_timeout.times_buffered_bytes() && assigned > 0 {
                                         write_timeout.progressed();
-                                        let _ = write_timeout.poll_stalled(cx);
+                                        write_timeout.keep_awake(cx);
                                     } else if write_timeout.poll_stalled(cx) {
                                         debug!("body write timed out, resetting stream");
                                         // FERRUM PATCH 008: only a client

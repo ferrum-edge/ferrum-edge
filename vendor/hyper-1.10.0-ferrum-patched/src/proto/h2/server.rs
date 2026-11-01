@@ -1032,12 +1032,61 @@ mod ferrum_response_write_timeout_tests {
         assert_eq!(received, BODY);
     }
 
+    /// An h2 client on a transport whose reads the test can pause, with a
+    /// connection driver that applies each `SETTINGS_INITIAL_WINDOW_SIZE`
+    /// sent on the returned channel.
+    async fn settings_client(
+        io: tokio::io::DuplexStream,
+        window: u32,
+    ) -> (
+        h2::client::SendRequest<Bytes>,
+        tokio::sync::mpsc::UnboundedSender<u32>,
+        impl Fn(bool),
+    ) {
+        let paused = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(Mutex::new(None::<Waker>));
+        let io = Pausable {
+            inner: io,
+            paused: Arc::clone(&paused),
+            waker: Arc::clone(&waker),
+        };
+        let (sender, connection) = h2::client::Builder::new()
+            .initial_window_size(window)
+            .initial_connection_window_size(window)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("client handshake");
+        let (settings_tx, mut settings_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        tokio::spawn(async move {
+            let mut connection = connection;
+            let _ = std::future::poll_fn(|cx| {
+                while let Poll::Ready(Some(size)) = settings_rx.poll_recv(cx) {
+                    connection
+                        .set_initial_window_size(size)
+                        .expect("change the stream window");
+                }
+                Pin::new(&mut connection).poll(cx)
+            })
+            .await;
+        });
+        let set_paused = move |pause: bool| {
+            paused.store(pause, Ordering::SeqCst);
+            if !pause {
+                if let Some(waker) = waker.lock().unwrap().take() {
+                    waker.wake();
+                }
+            }
+        };
+        (sender, settings_tx, set_paused)
+    }
+
     /// h2 takes a stream's assigned window back on a
     /// `SETTINGS_INITIAL_WINDOW_SIZE` decrease without waking the body pipe.
     /// A pipe parked on a full send buffer (window in hand, so not timed)
-    /// must still find the closed window and reset the stream: the client
-    /// stops reading with a wide window, shrinks it to zero, then reads what
-    /// is in flight but never grants window again.
+    /// must still find the closed window and reset the stream, and must time
+    /// it from when it found it, never from when it parked: the client stops
+    /// reading with a wide window, shrinks it to zero, then reads what is in
+    /// flight but never grants window again.
     #[tokio::test(start_paused = true)]
     async fn a_window_taken_back_by_settings_still_trips_the_bound() {
         const WINDOW: u32 = 8 * 1024 * 1024;
@@ -1047,53 +1096,67 @@ mod ferrum_response_write_timeout_tests {
         serve(server_io, true, Some(TIMEOUT), Some(CHUNK), move || {
             body.lock().unwrap().take().expect("one request")
         });
-        let paused = Arc::new(AtomicBool::new(false));
-        let waker = Arc::new(Mutex::new(None::<Waker>));
-        let io = Pausable {
-            inner: client_io,
-            paused: Arc::clone(&paused),
-            waker: Arc::clone(&waker),
-        };
-        let (mut sender, connection) = h2::client::Builder::new()
-            .initial_window_size(WINDOW)
-            .initial_connection_window_size(WINDOW)
-            .handshake::<_, Bytes>(io)
-            .await
-            .expect("client handshake");
-        let (shrink_tx, mut shrink_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let mut connection = connection;
-            let mut shrunk = false;
-            let _ = std::future::poll_fn(|cx| {
-                if !shrunk && Pin::new(&mut shrink_rx).poll(cx).is_ready() {
-                    shrunk = true;
-                    connection
-                        .set_initial_window_size(0)
-                        .expect("shrink the stream window");
-                }
-                Pin::new(&mut connection).poll(cx)
-            })
-            .await;
-        });
+        let (mut sender, settings, set_paused) = settings_client(client_io, WINDOW).await;
         let mut stream = get(&mut sender).await;
 
         // Stop reading: the pipe fills the transport and h2's send buffer and
         // parks with window in hand.
-        paused.store(true, Ordering::SeqCst);
+        set_paused(true);
         tokio::time::sleep(TIMEOUT / 2).await;
         // Take the window back, then read what is in flight without ever
         // granting more.
-        shrink_tx.send(()).expect("driver alive");
-        tokio::time::sleep(TIMEOUT / 2).await;
-        paused.store(false, Ordering::SeqCst);
-        if let Some(waker) = waker.lock().unwrap().take() {
-            waker.wake();
-        }
+        let shrunk = tokio::time::Instant::now();
+        settings.send(0).expect("driver alive");
+        tokio::time::sleep(TIMEOUT / 10).await;
+        set_paused(false);
 
         let (_, reset) = drain_withholding_window(&mut stream, TIMEOUT * 10).await;
         assert_eq!(reset, Some(h2::Reason::CANCEL));
+        // Found at the next wake (at most one bound later), then timed for a
+        // whole bound.
+        let elapsed = shrunk.elapsed();
+        assert!(elapsed >= TIMEOUT, "reset before a whole closed bound: {elapsed:?}");
+        assert!(elapsed <= TIMEOUT * 2, "reset late: {elapsed:?}");
         tokio::task::yield_now().await;
         assert!(dropped.load(Ordering::SeqCst), "the response body is released");
+    }
+
+    /// The wakeup kept while the send buffer is full is not a stall start: a
+    /// window taken back just before it fires and given back within a bound
+    /// never resets the stream.
+    #[tokio::test(start_paused = true)]
+    async fn a_window_taken_back_briefly_is_not_cut_early() {
+        const WINDOW: u32 = 8 * 1024 * 1024;
+        let (client_io, server_io) = tokio::io::duplex(CHUNK);
+        let (body, dropped) = streaming(None);
+        let body = Mutex::new(Some(body));
+        serve(server_io, true, Some(TIMEOUT), Some(CHUNK), move || {
+            body.lock().unwrap().take().expect("one request")
+        });
+        let (mut sender, settings, set_paused) = settings_client(client_io, WINDOW).await;
+        let mut stream = get(&mut sender).await;
+
+        // The pipe parks on the full send buffer right away and keeps its
+        // wakeup about one bound out.
+        set_paused(true);
+        tokio::time::sleep(TIMEOUT * 9 / 10).await;
+        // Take the window back just before that wakeup...
+        settings.send(0).expect("driver alive");
+        tokio::time::sleep(TIMEOUT / 20).await;
+        set_paused(false);
+        // ...and give it back eight tenths of a bound later.
+        tokio::time::sleep(TIMEOUT * 3 / 4).await;
+        settings.send(WINDOW).expect("driver alive");
+
+        for _ in 0..64 {
+            let data = stream
+                .data()
+                .await
+                .expect("the stream stays open")
+                .expect("the stream is never reset");
+            stream.flow_control().release_capacity(data.len()).unwrap();
+        }
+        assert!(!dropped.load(Ordering::SeqCst));
     }
 
     /// A bound on a connection with no timer to run it resets each response
