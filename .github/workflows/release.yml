@@ -1624,8 +1624,8 @@ jobs:
 
       # The publishers above logged in before pushing, so their success does not
       # show that a first-time user can consume the images (issue #4637). Prove
-      # it with no credentials at all: the documented Docker Hub path must be
-      # anonymously pullable; GHCR is reported until the package is public.
+      # it with no credentials at all: both public registries must be
+      # anonymously pullable.
       - name: Verify the documented registry path is anonymously pullable
         env:
           VERSION_TAG: ${{ github.ref_name }}
@@ -1633,4 +1633,4 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/smoke_anonymous_pull.sh "docker.io/ferrumedge/ferrum-edge:${VERSION_TAG}"
-          bash scripts/smoke_anonymous_pull.sh --warn-only "ghcr.io/${GHCR_REPOSITORY}:${VERSION_TAG}"
+          bash scripts/smoke_anonymous_pull.sh "ghcr.io/${GHCR_REPOSITORY}:${VERSION_TAG}"

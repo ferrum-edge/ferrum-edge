@@ -64,8 +64,9 @@ concurrency:
 
 jobs:
   # No checkout and no repository code: this job only reads GitHub and the
-  # registries. It holds a GHCR read token because the GHCR package does not
-  # serve anonymous reads; Docker Hub is read anonymously.
+  # registries. It reads GHCR with an authenticated read token by policy (the
+  # package is public, but the resolver keeps its scoped login); Docker Hub is
+  # read anonymously.
   resolve:
     name: Resolve main commit
     if: github.repository == 'ferrum-edge/ferrum-edge' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.path == '.github/workflows/ci.yml' && github.event.workflow_run.head_repository.full_name == github.repository

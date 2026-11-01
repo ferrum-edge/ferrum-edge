@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **GHCR images are public.** `ghcr.io/ferrum-edge/ferrum-edge` is now
+  anonymously pullable like Docker Hub, and the release workflow's anonymous
+  pull smoke fails the release if either registry refuses an anonymous pull
+  (GHCR was previously warn-only).
 - **Mesh Telemetry documents are closed** (issue #6616 follow-up). On native,
   file, and Ferrum xDS mesh slices, a Telemetry resource now rejects unknown
   members at every level: the resource and its `config`, the `tracing`,
