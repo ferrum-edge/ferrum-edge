@@ -25,8 +25,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
   `[patch.crates-io]` in `Cargo.toml`: `sqlx-core 0.8.6`, `reqwest 0.13.4`,
   `h3 0.0.8`, `h3-quinn 0.0.10`, `tungstenite 0.29.0`,
-  `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`,
-  `hyper 1.10.0` (patches 001–007), and `h2 0.4.20` (coalescing,
+  `tokio-tungstenite 0.29.0`, `dimpl 0.6.1`, `hyper-util 0.1.21`
+  (patches 001–002), `hyper 1.10.0` (patches 001–008), and `h2 0.4.20` (coalescing,
   assigned-send-capacity, and reset-origin patches).
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
@@ -229,6 +229,15 @@ sections:
   (`*_sends_rst_stream_connect_error`, `*_still_ends_stream_cleanly`). A relay
   that ends on a socket error resets its CONNECT stream with
   `RST_STREAM(CONNECT_ERROR)`; stock hyper can only send `END_STREAM`.
+- hyper HTTP/2 response flow-control stall (hyper patch 008 + hyper-util
+  patch 002, #6998 follow-up): the vendored `--lib ferrum_response_write_timeout`
+  tests in `vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/server.rs` (run on
+  the vendored h2 by the `test-vendor-patches` `--lib ferrum_` pass) plus
+  `tests/unit/gateway_core/frontend_h2_response_write_stall_tests.rs`. A
+  client that never sends `WINDOW_UPDATE` parks the response pipe with an idle
+  socket; `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` resets that stream with
+  `CANCEL` so its body and backend are released. A full send buffer with
+  window in hand is not counted.
 - Per-request connect timeout across shared pool keys:
   `tests/integration/connection_pool_tests.rs`.
 - HTTP/3 graceful close with a buffered response is not a false 502:

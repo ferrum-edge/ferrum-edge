@@ -311,9 +311,9 @@ c482e01ab0513e31c610b181de7a36f34b7da7f8469dfa4759c1f37fcb7ee7fe  vendor/hyper-1
 bdb49167f68428e34b9b60a46c535fa44d9a3a6a849b1f232a466f8379efd792  vendor/hyper-1.10.0-ferrum-patched/src/proto/h1/mod.rs
 1a382c3f9e395fdbdac557072e1f6c5e4fcebcb53dc604410e117f34adb16ffc  vendor/hyper-1.10.0-ferrum-patched/src/proto/h1/role.rs
 2c2165675c7c6b3d90f715c890a622982e0b2dc0cf5bb1b6bd3cd465550cd82f  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/client.rs
-5495ca4ef2a6c6d177937700c3c9528588401e1cf8c9130aed460e3b95077745  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/mod.rs
+93b1c134488892c1c72cd1b26c40eab8c7af85cc220285c4651eecaf3e70c9be  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/mod.rs
 b091b7c2123a4003805992ea369d748ccbf65895e5f5b45ed2806da6cf1df171  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/ping.rs
-a0871194c7fe778821aa7c7c6e21d781eb2a7e06a5003f6774bca75897ae8d99  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/server.rs
+64ec50ff70c702af03e20eb76edfc733756d49e8891a6242f2aa300741770649  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/server.rs
 bbafd7712757b5e2994e265e188bf7f55c430d54ff86cf9fcc3e2a5435a32610  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/upgrade.rs
 7a1ac66edcc24b364eae3581abf151459a5259b4c521561aa7203c9ca4473da4  vendor/hyper-1.10.0-ferrum-patched/src/proto/mod.rs
 291fad36357caf76f3821164c98adb643cee1a8cfae8d5e917524fdf3dda50d9  vendor/hyper-1.10.0-ferrum-patched/src/rt/bounds.rs
@@ -321,7 +321,7 @@ d87e6aed2a10b63903b7469487e5b1cdf7a919f663527ed9717e036b5f02cb73  vendor/hyper-1
 4bdc9348a48e924b262c965265863a7ff465881f91c393b019120854241cd386  vendor/hyper-1.10.0-ferrum-patched/src/rt/mod.rs
 3d14bbe02133b70c3980db0375a77adca90854efaf398f28695b700f3d997c35  vendor/hyper-1.10.0-ferrum-patched/src/rt/timer.rs
 6a129ff6bb2275544aacb8f25416305cf3ff055102879b6b12e3f4ec0a51300e  vendor/hyper-1.10.0-ferrum-patched/src/server/conn/http1.rs
-37dcf01df2044aa97d72dc5e9e410245704fd98c1a54fec1e450757ad2877369  vendor/hyper-1.10.0-ferrum-patched/src/server/conn/http2.rs
+acd8e8cfe2a686cb9662b8e952693a456a15545180bbd7d76e19d55dc1ff9179  vendor/hyper-1.10.0-ferrum-patched/src/server/conn/http2.rs
 b2393dc0d68c09b560f7c9bcc61ed3bf99fce4d746eda9e1ad158891ee56f2be  vendor/hyper-1.10.0-ferrum-patched/src/server/conn/mod.rs
 192142f7d2f2da63699abeaca0bbfedc06bd1714531da2e53795828da5e946f3  vendor/hyper-1.10.0-ferrum-patched/src/server/mod.rs
 74b6a556f77bcbf6d2a17e8be3d619c54cc2e73f04bcb66666169d3f40c78a11  vendor/hyper-1.10.0-ferrum-patched/src/service/http.rs
@@ -331,7 +331,7 @@ a35d37abcd2fcf5c3c6a0c0241a9a9361922fe0da989f3314ab0b490db6b2b0b  vendor/hyper-1
 a766c472433c7569440862e978eceeea78220af170220e9fdc90b71bab731344  vendor/hyper-1.10.0-ferrum-patched/src/trace.rs
 e377346d3ad296df8670b222bcfda65d6b44be7b49738cc554b697cdb4374ec4  vendor/hyper-1.10.0-ferrum-patched/src/upgrade.rs
 9f90c6c77ac3a8a32612779fd7bd07e064ec918db13e1b19d6521baf74c68ed1  vendor/hyper-util-0.1.21-ferrum-patched/CHANGELOG.md
-be68258b960525839b23a699362c550c7c5e73934cabd9dfe1b2a3fdebb37a2e  vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml
+899aa3a7df84a9f42a9c19d319897f3fc9e082e3fddfbd9ffe915102be265826  vendor/hyper-util-0.1.21-ferrum-patched/Cargo.toml
 9e0a97848ea543aef745c98e84fde696a9a3e0735538f6daefdd3cb1942effc1  vendor/hyper-util-0.1.21-ferrum-patched/LICENSE
 b47cc5fcb41e5d802bd175f0014f5636eefb897419720ab125b446e0b7f6f666  vendor/hyper-util-0.1.21-ferrum-patched/README.md
 819859e84a75857828bfd47d6e653466ddd09e8de1ef36cc9367c2cb3307db12  vendor/hyper-util-0.1.21-ferrum-patched/examples/client.rs
@@ -375,7 +375,7 @@ a12123fb8ad0bcc12480a567099aa9836f2ca6c7c80eaacccfc738a557e9f731  vendor/hyper-u
 67b91e27248354ae138507a78dd62bbbe845ef16bcf6f59e00923c5877541f7e  vendor/hyper-util-0.1.21-ferrum-patched/src/rt/tokio/with_hyper_io.rs
 70f30a1475ed64047800da86b4e24a4a74e340be5046bc043f2b0b1ac8000fa5  vendor/hyper-util-0.1.21-ferrum-patched/src/rt/tokio/with_tokio_io.rs
 5fb8be1bc1aec598707a73f949f28464c3e8da98f05cc5b4dee950b0070f6876  vendor/hyper-util-0.1.21-ferrum-patched/src/rt/tracing.rs
-0f28859d1e7f2b6dd9bb255a07cd6e11d5acc0caf87159ea9217ae5e1b3d67d0  vendor/hyper-util-0.1.21-ferrum-patched/src/server/conn/auto/mod.rs
+fd3254f2e6ce0f402cd7588d7bfe4eeb8de5e23875b79a17dfeeaa9770dbc372  vendor/hyper-util-0.1.21-ferrum-patched/src/server/conn/auto/mod.rs
 293d823c1fb34d4bb505f835b8b26255a7bafc10c56bc9235c3cb151ebb1e72c  vendor/hyper-util-0.1.21-ferrum-patched/src/server/conn/auto/upgrade.rs
 f192ca3fb030351ad22dba11f58edf02503598e3f9c18652a445f3973d16b723  vendor/hyper-util-0.1.21-ferrum-patched/src/server/conn/mod.rs
 39d6fc356a4112125ae61e1a083e0875a486ffc55904aa4697165b80df957e45  vendor/hyper-util-0.1.21-ferrum-patched/src/server/graceful.rs

@@ -55,11 +55,13 @@
     },
     {
       "id": "hyper-h2-body-progress-and-timeout",
-      "description": "Hyper patches 004 and 005 depend on patch 002's pending-body implementation, and patch 005 rewrites the loop patch 004 extended. Retire them together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper; patch 005 may retire earlier once hyper or h2 coalesces small window increments itself.",
+      "description": "Hyper patches 004 and 005 depend on patch 002's pending-body implementation, and patch 005 rewrites the loop patch 004 extended. Retire them together after adopting an equivalent write-stall bound that preserves positive-capacity progress, or moving the HTTP/2 client off Hyper; patch 005 may retire earlier once hyper or h2 coalesces small window increments itself. Hyper patch 008 applies patch 004's timer to the server response pipe and changes patch 005's whole-chunk condition, and hyper-util patch 002 only forwards patch 008's setting, so both retire with the group.",
       "patch_ids": [
         "hyper-002-min-data-frame-capacity",
         "hyper-004-h2-body-write-timeout",
-        "hyper-005-h2-small-window-coalescing"
+        "hyper-005-h2-small-window-coalescing",
+        "hyper-008-h2-response-write-timeout",
+        "hyper-util-002-forward-h2-response-write-timeout"
       ]
     }
   ],
@@ -781,6 +783,36 @@
       ]
     },
     {
+      "id": "hyper-util-002-forward-h2-response-write-timeout",
+      "label": "hyper-util auto builder forwards the HTTP/2 response write-stall bound",
+      "crate": "hyper-util",
+      "vendored_version": "0.1.21",
+      "vendor_path": "vendor/hyper-util-0.1.21-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-util-patches/002-forward-h2-response-write-timeout/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Ferrum's HTTP frontends serve through hyper_util::server::conn::auto::Builder, which owns its hyper HTTP/2 builder privately and cannot reach hyper patch 008's response_write_timeout; Http2Builder::response_write_timeout forwards it, behind the ferrum-h2-response-write-timeout feature so the standalone crate still builds against stock hyper.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper-util",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with hyper patch 008, or earlier when a hyper-util release forwards an equivalent HTTP/2 server setting.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/frontend_h2_response_write_stall_tests.rs"
+      ]
+    },
+    {
       "id": "hyper-001-upgraded-h2-connect-error-reset",
       "label": "hyper upgraded HTTP/2 stream resets with CONNECT_ERROR",
       "crate": "hyper",
@@ -993,6 +1025,38 @@
       },
       "regression_tests": [
         "tests/integration/h2_request_body_deadline_tests.rs"
+      ]
+    },
+    {
+      "id": "hyper-008-h2-response-write-timeout",
+      "label": "hyper HTTP/2 server bounds a response body waiting for client window",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/008-h2-response-write-timeout/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper's HTTP/2 server response pipe parks in poll_capacity while the client grants no flow-control window, and polls nothing else; a client that keeps its connection alive but never sends WINDOW_UPDATE held the response body and the backend connection behind it indefinitely, out of reach of the transport-level FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS bound (#6998 follow-up). hyper::server::conn::http2::Builder::response_write_timeout runs patch 004's write-stall timer in the response pipe only while a ready chunk has no window assigned, and resets the stream with CANCEL when it fires.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with Hyper patches 002, 004 and 005, on which it builds, when hyper bounds an HTTP/2 server response body waiting on client flow-control window, or Ferrum stops serving HTTP/2 through hyper; hosted closed-window, slowly-opening-window, idle-body and full-send-buffer regressions must pass against the replacement. Retire hyper-util patch 002 in the same change.",
+        "co_retirement_group": "hyper-h2-body-progress-and-timeout",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": "No upstream hyper release bounds a server response body on a closed client window."
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::server::ferrum_response_write_timeout_tests)",
+        "tests/unit/gateway_core/frontend_h2_response_write_stall_tests.rs",
+        "tests/functional/functional_client_write_timeout_test.rs (functional_client_write_timeout_releases_backend_of_h2_client_withholding_window_update, functional_client_write_timeout_zero_keeps_h2_client_withholding_window_update, functional_client_write_timeout_keeps_h2_client_granting_window_slowly)"
       ]
     },
     {

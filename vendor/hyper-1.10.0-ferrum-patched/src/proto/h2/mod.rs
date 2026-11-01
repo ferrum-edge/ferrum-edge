@@ -227,7 +227,11 @@ impl<B: Buf> CapacityAndAssigned for SendStream<B> {
 /// any `Timer`: a `reset` that silently does nothing would leave an elapsed
 /// sleep `Ready` forever.
 pub(crate) struct WriteTimeout {
-    signal: crate::ext::Http2BodyWriteTimeout,
+    // FERRUM PATCH 008: the bound itself, so a server response pipe can carry
+    // one without a per-stream `Http2BodyWriteTimeout` (and its `Arc`).
+    timeout: Duration,
+    // The request extension that reports expiry, on a client request pipe.
+    signal: Option<crate::ext::Http2BodyWriteTimeout>,
     timer: crate::common::time::Time,
     sleep: Option<Pin<Box<dyn crate::rt::Sleep>>>,
     stalled_since: Option<std::time::Instant>,
@@ -240,17 +244,42 @@ impl WriteTimeout {
         timer: crate::common::time::Time,
     ) -> Self {
         WriteTimeout {
-            signal,
+            timeout: signal.timeout(),
+            signal: Some(signal),
             timer,
             sleep: None,
             stalled_since: None,
         }
     }
 
+    /// FERRUM PATCH 008: the server's per-connection response body bound.
+    #[cfg(feature = "server")]
+    pub(crate) fn for_response(timeout: Duration, timer: crate::common::time::Time) -> Self {
+        WriteTimeout {
+            timeout,
+            signal: None,
+            timer,
+            sleep: None,
+            stalled_since: None,
+        }
+    }
+
+    /// FERRUM PATCH 008: whether the pipe must keep every unsent byte in its
+    /// own hands, so the bound can time it. A client request pipe must: h2
+    /// buffers a chunk handed over whole, and nothing else bounds a backend
+    /// that stops reading its socket. A server response pipe need not: a
+    /// chunk the client's window already covers waits in h2 only on the
+    /// transport, which the gateway bounds below hyper, so patch 005's
+    /// whole-chunk fast path stays on and only flow-control stalls are timed
+    /// here.
+    fn times_buffered_bytes(&self) -> bool {
+        self.signal.is_some()
+    }
+
     /// Called while a chunk is ready but cannot be written. Reports whether
     /// the current stall has lasted the full bound.
     fn poll_stalled(&mut self, cx: &mut Context<'_>) -> bool {
-        let timeout = self.signal.timeout();
+        let timeout = self.timeout;
         let since = *self.stalled_since.get_or_insert_with(|| self.timer.now());
         // A bound too large to represent never fires.
         let Some(deadline) = since.checked_add(timeout) else {
@@ -313,7 +342,7 @@ where
     }
 
     /// FERRUM PATCH 004: bound how long a polled chunk may wait to be written.
-    #[cfg(feature = "client")]
+    /// FERRUM PATCH 008: server response pipes use it too.
     pub(crate) fn with_write_timeout(mut self, write_timeout: WriteTimeout) -> Self {
         self.write_timeout = Some(write_timeout);
         self
@@ -367,8 +396,13 @@ where
                     // is too small for a useful frame and the bounded wait
                     // for more is still running.
                     if capacity > 0 {
+                        // FERRUM PATCH 008: a server response bound times
+                        // only flow-control stalls, so it keeps this path.
                         covered = me.coalesce.is_some()
-                            && me.write_timeout.is_none()
+                            && me
+                                .write_timeout
+                                .as_ref()
+                                .map_or(true, |bound| !bound.times_buffered_bytes())
                             && capacity < chunk.remaining()
                             && assigned >= chunk.remaining();
                         if covered
@@ -385,12 +419,28 @@ where
                             // written is a write stall; bound it.
                             if capacity == 0 {
                                 if let Some(write_timeout) = me.write_timeout.as_mut() {
-                                    if write_timeout.poll_stalled(cx) {
-                                        debug!("request body write timed out, resetting stream");
-                                        write_timeout.signal.mark_expired();
+                                    // FERRUM PATCH 008: a server response
+                                    // bound counts only a closed window (no
+                                    // window assigned). A full send buffer
+                                    // with window in hand waits on the
+                                    // transport, which is bounded below
+                                    // hyper; it ends any window stall.
+                                    if !write_timeout.times_buffered_bytes() && assigned > 0 {
+                                        write_timeout.progressed();
+                                    } else if write_timeout.poll_stalled(cx) {
+                                        debug!("body write timed out, resetting stream");
+                                        // FERRUM PATCH 008: only a client
+                                        // request carries a signal.
+                                        let message = match write_timeout.signal.as_ref() {
+                                            Some(signal) => {
+                                                signal.mark_expired();
+                                                "HTTP/2 request body write timed out"
+                                            }
+                                            None => "HTTP/2 response body write timed out",
+                                        };
                                         me.body_tx.send_reset(h2::Reason::CANCEL);
                                         return Poll::Ready(Err(crate::Error::new_body_write(
-                                            "HTTP/2 request body write timed out",
+                                            message,
                                         )));
                                     }
                                 }
