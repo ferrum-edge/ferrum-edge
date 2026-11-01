@@ -220,6 +220,12 @@ client that completes the handshake without presenting a verified certificate at
 all (DTLS permits an empty `Certificate` message in response to a
 `CertificateRequest`, so this is a distinct case, not the same one).
 
+The DTLS 1.3 `CertificateRequest` carries no CA-name hints: it omits the
+optional `certificate_authorities` extension rather than sending it with an
+empty list, which RFC 8446 §4.2.4 forbids and strict clients reject. Omitting
+the hints does not broaden trust, because the presented chain is still verified
+by the configured client CA verifier.
+
 Both refusals happen **before the server's final flight is committed to the
 wire**. Ferrum discards every record the DTLS engine has queued for that session
 and only then emits the refusal alert, so under DTLS 1.2 the client never
