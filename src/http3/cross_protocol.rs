@@ -2274,6 +2274,9 @@ where
             // The client never existed: a pre-wire connection failure, tokened
             // `connection_failure` after the hooks (see
             // `plain_pool_client_failure_headers`).
+            // Written inside the caller's `plain_local_bound` race, so the
+            // committed observers do not run here (the attempt never existed,
+            // and its provenance stays `NotDispatched`).
             let mut outcome = write_plain_gateway_error_terminal(
                 stream,
                 plugins,
@@ -2281,6 +2284,7 @@ where
                 StatusCode::BAD_GATEWAY,
                 Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),
                 true,
+                false,
                 backend_start,
                 0,
             )
@@ -6353,6 +6357,7 @@ where
             StatusCode::BAD_GATEWAY,
             Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
             false,
+            true,
             backend_start,
             bytes_sent,
         )
@@ -13006,6 +13011,32 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
     normalized: &mut crate::proxy::NormalizedRejectResponse,
     translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) -> bool {
+    run_cross_protocol_reject_committed_hooks_with(
+        plugins,
+        ctx,
+        native_grpc,
+        charged_backend_deadline,
+        true,
+        normalized,
+        translated,
+    )
+    .await
+}
+
+/// [`run_cross_protocol_reject_committed_hooks`] with the deadline replacement
+/// selectable: `replace_on_deadline = false` still races each observer to the
+/// request's RPC / authorization deadline and detaches one still pending then,
+/// but keeps the response the caller already selected (the plain bridge's
+/// gateway error terminal is never swapped for a deadline terminal).
+async fn run_cross_protocol_reject_committed_hooks_with(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    native_grpc: bool,
+    charged_backend_deadline: bool,
+    replace_on_deadline: bool,
+    normalized: &mut crate::proxy::NormalizedRejectResponse,
+    translated: &mut Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+) -> bool {
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
             continue;
@@ -13037,7 +13068,8 @@ pub(crate) async fn run_cross_protocol_reject_committed_hooks(
                 }
             };
 
-        let deadline_replaced = !terminal_gateway_deadline && !charged_backend_deadline;
+        let deadline_replaced =
+            replace_on_deadline && !terminal_gateway_deadline && !charged_backend_deadline;
         if deadline_replaced {
             ctx.mark_gateway_deadline_response_selected();
             let deadline = normalized_h3_grpc_deadline();
@@ -13111,15 +13143,17 @@ where
 /// as HTTP/1.1 and HTTP/2 write it: an `after_proxy` hook can neither see,
 /// erase, replace, nor duplicate it (#5807).
 ///
-/// The terminal ends the request, so its `response_committed` observers run
-/// over the normalized client response, token included (a read-only view), as
-/// proxy core runs them over its gateway-built dispatch failure:
-/// `request_deduplication` releases a proven pre-wire failure's in-flight lease
-/// there. With no RPC or authorization deadline in force each observer is
-/// awaited inline, so a Redis-backed release completes before the response is
-/// written, as on HTTP/1.1 and HTTP/2. Under a deadline they run in the bounded
-/// charged-terminal mode (one poll each, pending work detached), so no observer
-/// can replace the gateway's own terminal with a deadline terminal.
+/// With `run_committed_observers`, the terminal ends the request, so its
+/// `response_committed` observers run over the normalized client response,
+/// token included (a read-only view), as proxy core runs them over its
+/// gateway-built dispatch failure: `request_deduplication` releases a proven
+/// pre-wire failure's in-flight lease there. Each is awaited up to the request's
+/// RPC / authorization deadline, as on HTTP/1.1 and HTTP/2, so a Redis-backed
+/// release lands before the response is written; one still pending then is
+/// detached, and never replaces the gateway's own terminal. A caller that
+/// writes this terminal inside a deadline race of its own passes `false`: a
+/// race that fires mid-observer would drop the observer and write a second
+/// terminal whose observers run again.
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_gateway_error_terminal<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -13128,6 +13162,7 @@ async fn write_plain_gateway_error_terminal<S>(
     status: StatusCode,
     mut body: Bytes,
     connection_error: bool,
+    run_committed_observers: bool,
     backend_start: Instant,
     bytes_sent: u64,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
@@ -13170,16 +13205,18 @@ where
     );
     let (mut normalized, mut translated) =
         normalize_reject_for_client(ctx, status, body, &headers, false);
-    let observers_bounded = ctx.precommit_response_phase_bound().deadline().is_some();
-    run_cross_protocol_reject_committed_hooks(
-        plugins,
-        ctx,
-        false,
-        observers_bounded,
-        &mut normalized,
-        &mut translated,
-    )
-    .await;
+    if run_committed_observers {
+        run_cross_protocol_reject_committed_hooks_with(
+            plugins,
+            ctx,
+            false,
+            false,
+            false,
+            &mut normalized,
+            &mut translated,
+        )
+        .await;
+    }
     write_normalized_plain_gateway_reject(
         stream,
         normalized,
@@ -13226,6 +13263,7 @@ where
         status,
         body,
         attempt_result.connection_error,
+        true,
         backend_start,
         bytes_sent,
     )

@@ -203,6 +203,58 @@ async fn h3_bridge_pre_wire_failure_releases_dedup_inflight_lease() {
     drop(backend);
 }
 
+/// H3 frontend, HTTP/1.1 backend: the backend consumes the operation and then
+/// closes before any status byte. The bridge answers a classified `502` through
+/// its gateway error terminal, whose committed observers now run; the attempt
+/// reached the wire, so they must keep the lease and refuse the retry without
+/// a second backend write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h3_bridge_post_wire_close_retains_dedup_inflight_lease() {
+    let reserved = reserve_port().await.expect("reserve closing backend");
+    let port = reserved.port;
+    let executed = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&executed);
+    let backend = ScriptedHttp1Backend::builder(reserved.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::custom(
+            move |request| {
+                let operation = is_operation(request);
+                if operation {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                operation
+            },
+        )))
+        .step(HttpStep::CloseBeforeStatus)
+        .spawn()
+        .expect("start closing backend");
+    let gateway = H3DedupGateway::start(config(port, 5000)).await;
+
+    let failed = post(&gateway, "h3-postwire-close").await;
+    assert_eq!(
+        failed.status,
+        StatusCode::BAD_GATEWAY,
+        "a backend that closed before its head must be a gateway 502: {failed:?}"
+    );
+    assert!(failed.headers.get("x-idempotent-replayed").is_none());
+    assert_eq!(executed.load(Ordering::SeqCst), 1, "backend executed");
+
+    let retry = post(&gateway, "h3-postwire-close").await;
+    assert_eq!(
+        retry.status,
+        StatusCode::CONFLICT,
+        "a failure that may have executed must keep the in-flight lease: {retry:?}"
+    );
+    assert!(retry.headers.get("x-idempotent-replayed").is_none());
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        1,
+        "no second application write"
+    );
+
+    gateway.shutdown().await;
+    drop(backend);
+}
+
 /// H3 frontend, HTTP/1.1 backend: the backend executes the operation and then
 /// withholds its response head past `backend_read_timeout_ms`. The gateway's
 /// `504` is not proof the operation failed, so the lease stays held and the

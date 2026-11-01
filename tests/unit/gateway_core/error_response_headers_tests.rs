@@ -384,7 +384,7 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
     // included (read-only), and settle request state such as the
     // `request_deduplication` in-flight lease before the wire write.
     let committed = writer
-        .find("run_cross_protocol_reject_committed_hooks(")
+        .find("run_cross_protocol_reject_committed_hooks_with(")
         .expect("the writer runs the response_committed observers");
     let write = writer
         .find("write_normalized_plain_gateway_reject(")
@@ -441,7 +441,8 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
         oversized_compact.contains(
             "write_plain_gateway_error_terminal(stream,plugins,ctx,StatusCode::BAD_GATEWAY,"
         ) && oversized_compact.contains("Bytes::from_static(")
-            && oversized_compact.contains("),false,backend_start,bytes_sent,")
+            // `connection_error: false`, then `run_committed_observers: true`.
+            && oversized_compact.contains("),false,true,backend_start,bytes_sent,")
             && !oversized.contains(token_writer)
             && !oversized_compact.contains("headers"),
         "the declared-oversize 502 must hand the typed signal to the terminal writer"

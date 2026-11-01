@@ -63,11 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expired, answering an immediate retry `409` where HTTP/1.1 and HTTP/2
   execute it. The bridge now records every
   attempt's dispatch outcome (plain and gRPC) and runs the committed plugins
-  over that terminal: awaited inline when no RPC or authorization deadline is
-  in force (so a Redis-backed release lands before the response), and in the
-  bounded charged-terminal mode otherwise. A failure that may have reached the
-  backend still keeps the lease. `ai_transcript_audit` now also records the
-  bridge's gateway dispatch failures, as it does on HTTP/1.1 and HTTP/2.
+  over that terminal, each awaited up to the request's RPC or authorization
+  deadline as on HTTP/1.1 and HTTP/2 (so a Redis-backed release lands before
+  the response), and never allowed to replace it. A failure that may have
+  reached the backend still keeps the lease. `ai_transcript_audit` now also
+  records the bridge's classified dispatch failures and oversized-response
+  `502`s; its backend-timeout `504`s still skip the committed plugins.
 - **An HTTP/1.1 client that stops reading can no longer hold its connection
   and backend forever.** Every backend-facing bound deliberately ignores time
   spent waiting on the client (`backend_read_timeout_ms` arms only on backend
