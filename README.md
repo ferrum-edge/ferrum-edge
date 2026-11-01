@@ -128,10 +128,9 @@ Versioned releases publish `vX.Y.Z`, `X.Y.Z`, and the moving `X.Y` series alias
 (for example, `0.9`). Pin the full version or digest for reproducible deployments;
 the series alias can change when another release in that series is published.
 
-Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`, anonymously
-pullable) and to GitHub Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Use the
-Docker Hub path unless you have confirmed the GHCR package is visible to you: a GHCR
-package that is not public returns `401 Unauthorized` to an anonymous `docker pull`.
+Images are published to Docker Hub (`docker.io/ferrumedge/ferrum-edge`) and to GitHub
+Container Registry (`ghcr.io/ferrum-edge/ferrum-edge`). Both are public and anonymously
+pullable, and each release verifies an anonymous pull from both before publishing.
 
 ```bash
 # Replace with a version whose image has completed publication.

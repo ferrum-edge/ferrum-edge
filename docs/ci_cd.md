@@ -3338,8 +3338,10 @@ reproducibility matters. The mesh injector is unchanged:
 
 The `anonymous-pull-smoke` job runs in `release.yml` after the standard
 version manifest is published, with an empty Docker configuration. Docker Hub
-must permit anonymous pulls and pass the version smoke; GHCR remains warn-only
-until the package is public. The same script supports manual verification:
+and GHCR must both permit anonymous pulls and pass the version smoke; GHCR was
+warn-only until its package became public on 2026-10-31. The script's
+`--warn-only` mode remains available for manual checks of other registries. The
+same script supports manual verification:
 `bash scripts/smoke_anonymous_pull.sh docker.io/ferrumedge/ferrum-edge:v0.9.3`.
 
 The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in `release.yml` and `main-latest-image.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
