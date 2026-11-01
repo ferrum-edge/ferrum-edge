@@ -11068,7 +11068,13 @@ pub(crate) async fn dispatch_grpc_streaming(
         crate::diagnostic_ref::note_backend_tls_failure(ctx.diagnostic_slot(), error);
     }
     let dispatch_on_wire = grpc_proxy::grpc_dispatch_reached_wire(&result, dispatch_error);
-    ctx.record_backend_dispatch_outcome(dispatch_error, dispatch_on_wire);
+    // A client that gave up on the response while the attempt was in flight
+    // leaves it possibly executed: the synthesized cancel's connect-class label
+    // is not proof the request never reached the backend.
+    ctx.record_backend_dispatch_outcome(
+        dispatch_error,
+        dispatch_on_wire || response_cancel.is_some(),
+    );
     ctx.record_backend_attempt(dispatch_error, dispatch_on_wire, None);
 
     let final_backend_resolved_ip =
@@ -13100,17 +13106,20 @@ where
 /// authorization terminal on this bridge is, under the bounded post-deadline
 /// write grace, never through the unbounded gateway reject writer.
 ///
-/// The gateway-owned `X-Gateway-Error` token is written after the hooks, from
-/// the typed `connection_error` signal and the post-hook status, as HTTP/1.1
-/// and HTTP/2 write it: a hook can neither see, erase, replace, nor duplicate
-/// it (#5807).
+/// The gateway-owned `X-Gateway-Error` token is written after the `after_proxy`
+/// hooks, from the typed `connection_error` signal and the post-hook status,
+/// as HTTP/1.1 and HTTP/2 write it: an `after_proxy` hook can neither see,
+/// erase, replace, nor duplicate it (#5807).
 ///
 /// The terminal ends the request, so its `response_committed` observers run
-/// over the normalized client response, as proxy core runs them over its
-/// gateway-built dispatch failure: `request_deduplication` releases a proven
-/// pre-wire failure's in-flight lease there. They run in the bounded
-/// charged-terminal mode (one poll each, pending work detached), so no
-/// observer can reword the gateway's own terminal.
+/// over the normalized client response, token included (a read-only view), as
+/// proxy core runs them over its gateway-built dispatch failure:
+/// `request_deduplication` releases a proven pre-wire failure's in-flight lease
+/// there. With no RPC or authorization deadline in force each observer is
+/// awaited inline, so a Redis-backed release completes before the response is
+/// written, as on HTTP/1.1 and HTTP/2. Under a deadline they run in the bounded
+/// charged-terminal mode (one poll each, pending work detached), so no observer
+/// can replace the gateway's own terminal with a deadline terminal.
 #[allow(clippy::too_many_arguments)]
 async fn write_plain_gateway_error_terminal<S>(
     stream: &mut RequestStream<S, Bytes>,
@@ -13161,11 +13170,12 @@ where
     );
     let (mut normalized, mut translated) =
         normalize_reject_for_client(ctx, status, body, &headers, false);
+    let observers_bounded = ctx.precommit_response_phase_bound().deadline().is_some();
     run_cross_protocol_reject_committed_hooks(
         plugins,
         ctx,
         false,
-        true,
+        observers_bounded,
         &mut normalized,
         &mut translated,
     )

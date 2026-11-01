@@ -5,8 +5,11 @@
 //! gateway terminal is committed, exactly as on HTTP/1.1 and HTTP/2
 //! (`scaffolding::dedup_dispatch`): an immediate retry under the same
 //! idempotency key executes instead of being refused with `409` until
-//! `inflight_ttl_seconds` expires.
+//! `inflight_ttl_seconds` expires. A failure that may have executed keeps the
+//! lease.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::config::types::GatewayConfig;
@@ -17,7 +20,7 @@ use serde_json::json;
 
 use crate::scaffolding::backends::{Http1Request, HttpStep, RequestMatcher, ScriptedHttp1Backend};
 use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
-use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_refused_tcp_port};
+use crate::scaffolding::{reserve_colocated_tcp_udp, reserve_port, reserve_refused_tcp_port};
 
 const WAIT: Duration = Duration::from_secs(15);
 
@@ -85,7 +88,7 @@ impl Drop for H3DedupGateway {
     }
 }
 
-fn config(backend_port: u16) -> GatewayConfig {
+fn config(backend_port: u16, read_timeout_ms: u64) -> GatewayConfig {
     serde_json::from_value(json!({
         "version": "1",
         "proxies": [{
@@ -94,7 +97,7 @@ fn config(backend_port: u16) -> GatewayConfig {
             "backend_port": backend_port, "strip_listen_path": true,
             // Darwin drops a SYN to a bound-but-unlistened port instead of
             // answering RST, so keep the pre-wire connect failure prompt there.
-            "backend_connect_timeout_ms": 500, "backend_read_timeout_ms": 5000,
+            "backend_connect_timeout_ms": 500, "backend_read_timeout_ms": read_timeout_ms,
             "backend_write_timeout_ms": 5000,
             "plugins": [{"plugin_config_id": "h3-dedup-plugin"}]
         }],
@@ -140,7 +143,7 @@ fn is_operation(request: &Http1Request) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h3_bridge_pre_wire_failure_releases_dedup_inflight_lease() {
     let refused = reserve_refused_tcp_port().expect("reserve refused backend");
-    let gateway = H3DedupGateway::start(config(refused.port)).await;
+    let gateway = H3DedupGateway::start(config(refused.port, 5000)).await;
 
     let failed = post(&gateway, "h3-prewire").await;
     assert!(
@@ -196,6 +199,67 @@ async fn h3_bridge_pre_wire_failure_releases_dedup_inflight_lease() {
         1,
         "exactly one application write; observed requests: {requests:?}"
     );
+    gateway.shutdown().await;
+    drop(backend);
+}
+
+/// H3 frontend, HTTP/1.1 backend: the backend executes the operation and then
+/// withholds its response head past `backend_read_timeout_ms`. The gateway's
+/// `504` is not proof the operation failed, so the lease stays held and the
+/// retry is refused without a second backend write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h3_bridge_post_wire_timeout_retains_dedup_inflight_lease() {
+    let reserved = reserve_port().await.expect("reserve slow backend");
+    let port = reserved.port;
+    let executed = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&executed);
+    let backend = ScriptedHttp1Backend::builder(reserved.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::custom(
+            move |request| {
+                let operation = is_operation(request);
+                if operation {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                operation
+            },
+        )))
+        .step(HttpStep::Sleep(Duration::from_secs(3)))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"done".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("start slow backend");
+    let gateway = H3DedupGateway::start(config(port, 500)).await;
+
+    let timed_out = post(&gateway, "h3-postwire").await;
+    assert_eq!(
+        timed_out.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "a withheld response head must be a gateway timeout: {timed_out:?}"
+    );
+    assert!(timed_out.headers.get("x-idempotent-replayed").is_none());
+    assert_eq!(executed.load(Ordering::SeqCst), 1, "backend executed");
+
+    let retry = post(&gateway, "h3-postwire").await;
+    assert_eq!(
+        retry.status,
+        StatusCode::CONFLICT,
+        "a failure that may have executed must keep the in-flight lease: {retry:?}"
+    );
+    assert!(retry.headers.get("x-idempotent-replayed").is_none());
+    assert_eq!(
+        executed.load(Ordering::SeqCst),
+        1,
+        "no second application write"
+    );
+
     gateway.shutdown().await;
     drop(backend);
 }
