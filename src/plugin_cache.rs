@@ -3840,6 +3840,10 @@ struct AdaptiveConcurrencyRouteOverride {
     proxy_key: String,
     plugin_name: String,
     effective_priority: u16,
+    /// The execution trigger decides which requests the route plugin rewrites
+    /// at all, so editing it can move traffic between destinations that are
+    /// all already route keys.
+    trigger: Option<crate::config::plugin_trigger::PluginTrigger>,
     destination_fingerprint: serde_json::Value,
 }
 
@@ -4666,6 +4670,7 @@ fn adaptive_concurrency_route_definition(
                 proxy_key: proxy_runtime_key(proxy),
                 plugin_name: route_pc.plugin_name.clone(),
                 effective_priority: route_override_priority(route_pc),
+                trigger: route_pc.trigger.clone(),
                 destination_fingerprint: route_override_destination_fingerprint(route_pc),
             });
         }

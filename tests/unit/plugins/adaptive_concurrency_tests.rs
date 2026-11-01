@@ -2391,6 +2391,61 @@ fn adaptive_concurrency_ai_federation_multimodal_mode_change_resets_key_space() 
 }
 
 #[test]
+fn adaptive_concurrency_route_override_trigger_change_resets_key_space() {
+    // The destination set is the same before and after: only which requests
+    // the federation claims changes. Streaming POSTs first miss a GET-only
+    // trigger and reach the proxy backend; once the trigger admits POST, they
+    // commit to the provider instead.
+    let mut config = ai_federation_route_config(
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+        json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": "https://ai.example/v1/chat/completions"
+            }],
+            "streaming": {"enabled": true}
+        }),
+    );
+    config.plugin_configs[1].trigger = Some(
+        serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}}))
+            .expect("trigger should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &config.proxies[0],
+        None,
+    )));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].trigger = Some(
+        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}}))
+            .expect("trigger should deserialize"),
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+            &[],
+            false,
+        )
+        .expect("trigger change should publish");
+
+    let replacement_plugin = adaptive_plugin_from_cache(&cache);
+    let provider = effective_route_proxy(&reloaded, "ai.example", 443);
+    let held = expect_admitted(acquire_from_plugin(&replacement_plugin, &provider, None));
+    assert_rejected(acquire_from_plugin(&replacement_plugin, &provider, None));
+    drop(held);
+}
+
+#[test]
 fn adaptive_concurrency_ai_federation_route_edits_without_stream_destination_stay_compatible() {
     let streaming_openai = json!({
         "providers": [{
