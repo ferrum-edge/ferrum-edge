@@ -2275,8 +2275,11 @@ where
             // `connection_failure` after the hooks (see
             // `plain_pool_client_failure_headers`).
             // Written inside the caller's `plain_local_bound` race, so the
-            // committed observers do not run here (the attempt never existed,
-            // and its provenance stays `NotDispatched`).
+            // committed observers do not run here: a race firing mid-observer
+            // would drop it and write a second terminal. This attempt never
+            // existed and records no provenance, so `request_deduplication`
+            // keeps its lease (fail-closed), even when every earlier retry
+            // attempt was refused pre-wire.
             let mut outcome = write_plain_gateway_error_terminal(
                 stream,
                 plugins,
@@ -13206,6 +13209,7 @@ where
     let (mut normalized, mut translated) =
         normalize_reject_for_client(ctx, status, body, &headers, false);
     if run_committed_observers {
+        let authorization_latched = ctx.authorization_termination().is_some();
         run_cross_protocol_reject_committed_hooks_with(
             plugins,
             ctx,
@@ -13216,6 +13220,19 @@ where
             &mut translated,
         )
         .await;
+        // The credential's lifetime ended while an observer was pending: the
+        // runner dropped it and latched the termination, so the authorization
+        // terminal replaces the gateway's, under the bounded post-deadline
+        // grace rather than the unbounded reject writer.
+        if !authorization_latched && ctx.authorization_termination().is_some() {
+            return write_plain_authorization_expired_terminal(
+                stream,
+                ctx,
+                backend_start,
+                bytes_sent,
+            )
+            .await;
+        }
     }
     write_normalized_plain_gateway_reject(
         stream,

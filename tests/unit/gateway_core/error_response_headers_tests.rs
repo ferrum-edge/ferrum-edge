@@ -394,6 +394,44 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
         "the token must be written after the hooks, and the committed observers \
          must run over that terminal before the wire write"
     );
+    // The observers race the RPC / authorization deadline (not charged) and
+    // may never replace the gateway terminal (`replace_on_deadline: false`).
+    let writer_compact: String = writer.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        writer_compact.contains(
+            "run_cross_protocol_reject_committed_hooks_with(plugins,ctx,false,false,false,"
+        ),
+        "the gateway terminal's observers must race the deadline without replacing it"
+    );
+    // The pooled-client failure terminal is written inside the caller's
+    // deadline race, so it runs no observers.
+    let pool_body =
+        "Bytes::from_static(crate::proxy::CONNECTION_POOL_CLIENT_ERROR_BODY.as_bytes()),";
+    let pool_start = cross
+        .find(pool_body)
+        .expect("the pooled-client failure terminal body");
+    let pool_call: String = cross[pool_start..]
+        .split(".await?;")
+        .next()
+        .expect("the pooled-client failure terminal call")
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    assert!(
+        pool_call.contains("),true,false,backend_start,0,"),
+        "the raced pooled-client failure terminal must not run committed observers"
+    );
+    // An authorization expiry the observers latched is answered by the
+    // bounded authorization terminal, never the unbounded gateway reject.
+    let expired_after_observers = writer[committed..]
+        .find("return write_plain_authorization_expired_terminal(")
+        .map(|idx| committed + idx)
+        .expect("an authorization expiry during the observers is detected");
+    assert!(
+        expired_after_observers < write,
+        "the authorization terminal must be selected after the committed \
+         observers and before the gateway reject write"
+    );
     assert_eq!(
         writer.matches(token_writer).count(),
         1,
