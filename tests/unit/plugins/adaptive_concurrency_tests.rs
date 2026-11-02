@@ -2185,6 +2185,414 @@ fn adaptive_concurrency_ai_and_mcp_non_destination_changes_stay_compatible() {
     }
 }
 
+fn ai_federation_route_config(
+    adaptive_config: serde_json::Value,
+    federation_config: serde_json::Value,
+) -> GatewayConfig {
+    let mut config = cache_config("proxy", adaptive_config);
+    config.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "federation-1",
+            "namespace": "default",
+            "plugin_name": "ai_federation",
+            "scope": "proxy_group",
+            "enabled": true,
+            "config": federation_config
+        }))
+        .expect("ai_federation config should deserialize"),
+    );
+    config.proxies[0].plugins.push(
+        serde_json::from_value(json!({"plugin_config_id": "federation-1"}))
+            .expect("ai_federation association should deserialize"),
+    );
+    config
+}
+
+fn effective_route_proxy(config: &GatewayConfig, host: &str, port: u16) -> Proxy {
+    let mut proxy = config.proxies[0].clone();
+    proxy.backend_host = host.to_string();
+    proxy.backend_port = port;
+    proxy
+}
+
+#[test]
+fn adaptive_concurrency_ai_federation_streaming_destination_change_resets_key_space() {
+    // Each case moves the one destination a claimed stream would commit
+    // through `route_override_*`, via a different ai_federation endpoint
+    // input: an explicit `base_url` host or port, the provider-type default
+    // endpoint, and the Azure resource that names the endpoint host.
+    for (case, provider, replacement_provider, first, replacement) in [
+        (
+            "base_url host",
+            json!({
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": "https://first-ai.example/v1/chat/completions"
+            }),
+            json!({
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": "https://replacement-ai.example/v1/chat/completions"
+            }),
+            ("first-ai.example", 443),
+            ("replacement-ai.example", 443),
+        ),
+        (
+            "base_url port",
+            json!({
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": "https://ai.example:8443/v1/chat/completions"
+            }),
+            json!({
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": "https://ai.example:9443/v1/chat/completions"
+            }),
+            ("ai.example", 8443),
+            ("ai.example", 9443),
+        ),
+        (
+            "provider-type default endpoint",
+            json!({
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test"
+            }),
+            json!({
+                "name": "primary",
+                "provider_type": "mistral",
+                "api_key": "sk-test"
+            }),
+            ("api.openai.com", 443),
+            ("api.mistral.ai", 443),
+        ),
+        (
+            "azure resource",
+            json!({
+                "name": "primary",
+                "provider_type": "azure_openai",
+                "api_key": "azure-test",
+                "azure_resource": "first",
+                "azure_deployment": "gpt"
+            }),
+            json!({
+                "name": "primary",
+                "provider_type": "azure_openai",
+                "api_key": "azure-test",
+                "azure_resource": "replacement",
+                "azure_deployment": "gpt"
+            }),
+            ("first.openai.azure.com", 443),
+            ("replacement.openai.azure.com", 443),
+        ),
+    ] {
+        let config = ai_federation_route_config(
+            json!({
+                "max_tracked_keys": 1,
+                "min_limit": 1,
+                "initial_limit": 1,
+                "max_limit": 1
+            }),
+            json!({"providers": [provider], "streaming": {"enabled": true}}),
+        );
+        let cache = PluginCache::new(&config)
+            .unwrap_or_else(|error| panic!("{case}: initial cache should build: {error}"));
+        drop(expect_admitted(acquire_from_plugin(
+            &adaptive_plugin_from_cache(&cache),
+            &effective_route_proxy(&config, first.0, first.1),
+            None,
+        )));
+
+        let mut reloaded = config.clone();
+        reloaded.plugin_configs[1].config["providers"][0] = replacement_provider;
+        cache
+            .apply_delta(
+                &reloaded,
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+                &[],
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{case}: destination change should publish: {error}"));
+
+        let replacement_plugin = adaptive_plugin_from_cache(&cache);
+        let replacement_proxy = effective_route_proxy(&reloaded, replacement.0, replacement.1);
+        let held = match acquire_from_plugin(&replacement_plugin, &replacement_proxy, None) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("{case}: the replacement destination must start a fresh tracking space"),
+        };
+        assert_rejected(acquire_from_plugin(
+            &replacement_plugin,
+            &replacement_proxy,
+            None,
+        ));
+        drop(held);
+    }
+}
+
+#[test]
+fn adaptive_concurrency_ai_federation_multimodal_mode_change_resets_key_space() {
+    // Same destination set before and after: only which provider may take a
+    // multimodal stream changes. Image streams first fall through `reject` on
+    // the primary to the fallback; once the primary translates, they commit to
+    // the primary instead.
+    let provider = |name: &str, priority: u64, host: &str, mode: &str| {
+        json!({
+            "name": name,
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "priority": priority,
+            "base_url": format!("https://{host}/v1/chat/completions"),
+            "multimodal_mode": mode
+        })
+    };
+    let config = ai_federation_route_config(
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+        json!({
+            "providers": [
+                provider("primary", 1, "primary-ai.example", "reject"),
+                provider("fallback", 2, "fallback-ai.example", "translate")
+            ],
+            "streaming": {"enabled": true}
+        }),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &effective_route_proxy(&config, "fallback-ai.example", 443),
+        None,
+    )));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].config["providers"][0]["multimodal_mode"] = json!("translate");
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+            &[],
+            false,
+        )
+        .expect("multimodal policy change should publish");
+
+    let replacement_plugin = adaptive_plugin_from_cache(&cache);
+    let primary = effective_route_proxy(&reloaded, "primary-ai.example", 443);
+    let held = expect_admitted(acquire_from_plugin(&replacement_plugin, &primary, None));
+    assert_rejected(acquire_from_plugin(&replacement_plugin, &primary, None));
+    drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_route_override_trigger_change_resets_key_space() {
+    // The destination set is the same before and after: only which requests
+    // the federation claims changes. Streaming POSTs first miss a GET-only
+    // trigger and reach the proxy backend; once the trigger admits POST, they
+    // commit to the provider instead.
+    let mut config = ai_federation_route_config(
+        json!({
+            "max_tracked_keys": 1,
+            "min_limit": 1,
+            "initial_limit": 1,
+            "max_limit": 1
+        }),
+        json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": "https://ai.example/v1/chat/completions"
+            }],
+            "streaming": {"enabled": true}
+        }),
+    );
+    config.plugin_configs[1].trigger = Some(
+        serde_json::from_value(json!({"when": {"match": {"method": ["GET"]}}}))
+            .expect("trigger should deserialize"),
+    );
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    drop(expect_admitted(acquire_from_plugin(
+        &adaptive_plugin_from_cache(&cache),
+        &config.proxies[0],
+        None,
+    )));
+
+    let mut reloaded = config.clone();
+    reloaded.plugin_configs[1].trigger = Some(
+        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}}))
+            .expect("trigger should deserialize"),
+    );
+    cache
+        .apply_delta(
+            &reloaded,
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+            &[],
+            false,
+        )
+        .expect("trigger change should publish");
+
+    let replacement_plugin = adaptive_plugin_from_cache(&cache);
+    let provider = effective_route_proxy(&reloaded, "ai.example", 443);
+    let held = expect_admitted(acquire_from_plugin(&replacement_plugin, &provider, None));
+    assert_rejected(acquire_from_plugin(&replacement_plugin, &provider, None));
+    drop(held);
+}
+
+#[test]
+fn adaptive_concurrency_ai_federation_route_edits_without_stream_destination_stay_compatible() {
+    let streaming_openai = json!({
+        "providers": [{
+            "name": "primary",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "https://ai.example/v1/chat/completions"
+        }],
+        "streaming": {"enabled": true}
+    });
+    for (case, federation_config, edit) in [
+        (
+            // Buffered federation makes its own plugin-client call and never
+            // reaches proxy dispatch, so its endpoint is not a limiter key.
+            "buffered base_url",
+            json!({
+                "providers": [{
+                    "name": "primary",
+                    "provider_type": "openai",
+                    "api_key": "sk-test",
+                    "base_url": "https://first-ai.example/v1/chat/completions"
+                }]
+            }),
+            (
+                "/providers/0/base_url",
+                json!("https://replacement-ai.example/v1/chat/completions"),
+            ),
+        ),
+        (
+            "streaming disabled base_url",
+            json!({
+                "providers": [{
+                    "name": "primary",
+                    "provider_type": "openai",
+                    "api_key": "sk-test",
+                    "base_url": "https://first-ai.example/v1/chat/completions"
+                }],
+                "streaming": {"enabled": false}
+            }),
+            (
+                "/providers/0/base_url",
+                json!("https://replacement-ai.example/v1/chat/completions"),
+            ),
+        ),
+        (
+            "streaming read timeout",
+            streaming_openai.clone(),
+            ("/providers/0/read_timeout_seconds", json!(120)),
+        ),
+        (
+            "streaming event bound",
+            streaming_openai.clone(),
+            ("/streaming/max_event_bytes", json!(131_072)),
+        ),
+        (
+            "same destination spelled differently",
+            streaming_openai,
+            (
+                "/providers/0/base_url",
+                json!("https://AI.Example:443/v1/other/path"),
+            ),
+        ),
+        (
+            // Anthropic can never be committed for a stream, so only the
+            // eligible provider is a dispatch destination.
+            "streaming-ineligible provider endpoint",
+            json!({
+                "providers": [
+                    {
+                        "name": "primary",
+                        "provider_type": "openai",
+                        "api_key": "sk-test",
+                        "base_url": "https://ai.example/v1/chat/completions"
+                    },
+                    {
+                        "name": "claude",
+                        "provider_type": "anthropic",
+                        "api_key": "sk-ant-test",
+                        "base_url": "https://first-claude.example/v1/messages"
+                    }
+                ],
+                "streaming": {"enabled": true}
+            }),
+            (
+                "/providers/1/base_url",
+                json!("https://replacement-claude.example/v1/messages"),
+            ),
+        ),
+    ] {
+        let config = ai_federation_route_config(
+            json!({
+                "min_limit": 1,
+                "initial_limit": 2,
+                "max_limit": 2
+            }),
+            federation_config,
+        );
+        let cache = PluginCache::new(&config)
+            .unwrap_or_else(|error| panic!("{case}: initial cache should build: {error}"));
+        let effective_proxy =
+            if case.starts_with("buffered") || case.starts_with("streaming disabled") {
+                config.proxies[0].clone()
+            } else {
+                effective_route_proxy(&config, "ai.example", 443)
+            };
+        let held = expect_admitted(acquire_from_plugin(
+            &adaptive_plugin_from_cache(&cache),
+            &effective_proxy,
+            None,
+        ));
+
+        let mut reloaded = config.clone();
+        let (pointer, value) = edit;
+        let (parent, field) = pointer
+            .rsplit_once('/')
+            .expect("edit pointer should name a field");
+        reloaded.plugin_configs[1]
+            .config
+            .pointer_mut(parent)
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| panic!("{case}: edit parent should exist"))
+            .insert(field.to_string(), value);
+        cache
+            .apply_delta(
+                &reloaded,
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+                &[],
+                false,
+            )
+            .unwrap_or_else(|error| panic!("{case}: edit should publish: {error}"));
+
+        let replacement = adaptive_plugin_from_cache(&cache);
+        let second = match acquire_from_plugin(&replacement, &effective_proxy, None) {
+            BackendAdmissionDecision::Admit(permit) => permit,
+            _ => panic!("{case}: the shared limiter should still have one slot"),
+        };
+        match acquire_from_plugin(&replacement, &effective_proxy, None) {
+            BackendAdmissionDecision::Reject { status_code, .. } => {
+                assert_eq!(status_code, 503, "{case}");
+            }
+            _ => panic!("{case}: learned state must survive an edit that keeps every destination"),
+        }
+        drop(second);
+        drop(held);
+    }
+}
+
 #[test]
 fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
     let mut config = cache_config(

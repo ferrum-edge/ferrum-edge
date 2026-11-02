@@ -3840,6 +3840,10 @@ struct AdaptiveConcurrencyRouteOverride {
     proxy_key: String,
     plugin_name: String,
     effective_priority: u16,
+    /// The execution trigger decides which requests the route plugin rewrites
+    /// at all, so editing it can move traffic between destinations that are
+    /// all already route keys.
+    trigger: Option<crate::config::plugin_trigger::PluginTrigger>,
     destination_fingerprint: serde_json::Value,
 }
 
@@ -4177,6 +4181,7 @@ fn normalize_adaptive_concurrency_direct_host(host: &str) -> String {
 fn route_override_priority(pc: &PluginConfig) -> u16 {
     pc.priority_override
         .unwrap_or(match pc.plugin_name.as_str() {
+            "ai_federation" => crate::plugins::priority::AI_FEDERATION,
             "ai_stream_router" => crate::plugins::priority::AI_STREAM_ROUTER,
             "mcp_gateway" => crate::plugins::priority::MCP_GATEWAY,
             "mesh_route_dispatch" => crate::plugins::priority::MESH_ROUTE_DISPATCH,
@@ -4184,12 +4189,24 @@ fn route_override_priority(pc: &PluginConfig) -> u16 {
         })
 }
 
+/// Whether this plugin config can rewrite proxy dispatch through
+/// `route_override_*`.
+///
+/// `ai_federation` does so only on its streaming path (issue #3298); with
+/// `streaming` disabled it makes its own plugin-client call outside proxy
+/// dispatch, so it contributes no route destination.
+fn plugin_config_writes_route_overrides(pc: &PluginConfig) -> bool {
+    match pc.plugin_name.as_str() {
+        "ai_stream_router" | "mcp_gateway" | "mesh_route_dispatch" => true,
+        "ai_federation" => crate::plugins::ai_federation::stream_route_plan(&pc.config).is_some(),
+        _ => false,
+    }
+}
+
 fn effective_route_override_configs_for_proxy<'a>(
     proxy: &crate::config::types::Proxy,
     config: &'a GatewayConfig,
 ) -> Vec<&'a PluginConfig> {
-    const ROUTE_OVERRIDE_PLUGINS: &[&str] =
-        &["ai_stream_router", "mcp_gateway", "mesh_route_dispatch"];
     let mut route_configs = Vec::new();
 
     // Match PluginCache construction order before its stable
@@ -4206,7 +4223,7 @@ fn effective_route_override_configs_for_proxy<'a>(
         .iter()
         .filter(|pc| {
             pc.scope == PluginScope::Global
-                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_writes_route_overrides(pc)
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
         })
         .collect();
@@ -4217,7 +4234,7 @@ fn effective_route_override_configs_for_proxy<'a>(
         .iter()
         .filter(|pc| {
             pc.scope == PluginScope::Proxy
-                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_writes_route_overrides(pc)
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
         })
         .collect();
@@ -4228,7 +4245,7 @@ fn effective_route_override_configs_for_proxy<'a>(
             pc.id == association.plugin_config_id
                 && pc.namespace == proxy.namespace
                 && pc.scope == PluginScope::ProxyGroup
-                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_writes_route_overrides(pc)
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
         }) {
             route_configs.push(pc);
@@ -4337,6 +4354,9 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                 "rules": rules
             })
         }
+        "ai_federation" => crate::plugins::ai_federation::stream_route_plan(&pc.config)
+            .and_then(|plan| serde_json::to_value(plan).ok())
+            .unwrap_or_else(|| serde_json::json!({"streaming": false})),
         "ai_stream_router" => {
             let enabled = pc
                 .config
@@ -4490,6 +4510,19 @@ fn collect_route_override_destinations(
     upstream_routes: &mut Vec<AdaptiveConcurrencyUpstreamRoute>,
 ) {
     match route_pc.plugin_name.as_str() {
+        "ai_federation" => {
+            let Some(plan) = crate::plugins::ai_federation::stream_route_plan(&route_pc.config)
+            else {
+                return;
+            };
+            for destination in plan
+                .providers
+                .iter()
+                .filter_map(|provider| provider.destination.as_ref())
+            {
+                push_direct_route_key(keys, key_by, proxy, &destination.host, destination.port);
+            }
+        }
         "mesh_route_dispatch" => {
             let Some(rules) = route_pc
                 .config
@@ -4637,6 +4670,7 @@ fn adaptive_concurrency_route_definition(
                 proxy_key: proxy_runtime_key(proxy),
                 plugin_name: route_pc.plugin_name.clone(),
                 effective_priority: route_override_priority(route_pc),
+                trigger: route_pc.trigger.clone(),
                 destination_fingerprint: route_override_destination_fingerprint(route_pc),
             });
         }
