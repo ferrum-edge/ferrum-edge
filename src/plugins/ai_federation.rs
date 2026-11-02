@@ -150,6 +150,9 @@ const MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES: usize = 1024;
 
 // --- Streaming (issue #3298) -----------------------------------------------
 
+/// Azure OpenAI `api-version` used when a provider does not set one.
+const DEFAULT_AZURE_API_VERSION: &str = "2024-06-01";
+
 /// Default ceiling for one buffered SSE event on the streaming path.
 const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 256 * 1024;
 /// Hard upper bound an operator may configure for one SSE event.
@@ -1605,7 +1608,7 @@ impl AiFederation {
             let azure_resource = optional_str(pv, "azure_resource")?.map(String::from);
             let azure_deployment = optional_str(pv, "azure_deployment")?.map(String::from);
             let azure_api_version = optional_str(pv, "azure_api_version")?
-                .unwrap_or("2024-06-01")
+                .unwrap_or(DEFAULT_AZURE_API_VERSION)
                 .to_string();
 
             let google_project_id = optional_str(pv, "google_project_id")?.map(String::from);
@@ -7119,6 +7122,143 @@ fn stream_target_for(
         path,
         authority,
         endpoint_owns_query,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Streaming route destinations (adaptive_concurrency route fingerprints)
+// ---------------------------------------------------------------------------
+
+/// The `route_override_*` routing plan a streaming-enabled config can commit,
+/// derived without constructing the plugin.
+///
+/// `adaptive_concurrency` keys limiter state by the destination proxy dispatch
+/// actually dials, and a claimed stream dispatches to the committed provider
+/// (issue #3298), so that policy's reload compatibility needs every provider
+/// destination a stream could commit. Buffered federation makes its own
+/// plugin-client call outside proxy dispatch and contributes nothing.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct StreamRoutePlan {
+    pub(crate) fallback_enabled: bool,
+    pub(crate) fail_on_missing_model: bool,
+    pub(crate) fail_on_no_matching_provider: bool,
+    /// In the constructor's dispatch order: ascending priority, ties in
+    /// configuration order.
+    pub(crate) providers: Vec<StreamRouteProvider>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct StreamRouteProvider {
+    pub(crate) priority: u64,
+    pub(crate) weight: Option<u64>,
+    pub(crate) model_patterns: Vec<String>,
+    /// Effective `multimodal_mode`: it decides whether a provider may take a
+    /// stream with non-text content or yields it to the next one.
+    pub(crate) multimodal_mode: Option<&'static str>,
+    /// `None` when this provider can never be committed for a stream.
+    pub(crate) destination: Option<StreamRouteDestination>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct StreamRouteDestination {
+    pub(crate) scheme: &'static str,
+    /// The dial host exactly as [`stream_target_for`] commits it.
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
+/// Resolve the streaming routing plan of an `ai_federation` config, or `None`
+/// when `streaming` is not enabled and the plugin never writes a route
+/// override.
+///
+/// Uses the same endpoint resolution as the constructor and
+/// [`stream_target_for`]: provider-type defaults, `base_url`, and the Azure
+/// resource/deployment are rendered through [`build_url_template`]. Malformed
+/// fields resolve to no destination rather than an error because the
+/// constructor rejects the same config before it can publish.
+pub(crate) fn stream_route_plan(config: &Value) -> Option<StreamRoutePlan> {
+    if !parse_streaming_policy(config).is_ok_and(|policy| policy.enabled) {
+        return None;
+    }
+    let flag = |field: &'static str| optional_bool(config, field).ok().flatten();
+    let mut providers: Vec<StreamRouteProvider> = config
+        .get("providers")
+        .and_then(Value::as_array)
+        .map(|providers| {
+            providers
+                .iter()
+                .enumerate()
+                .map(|(index, provider)| StreamRouteProvider {
+                    priority: optional_u64(provider, "priority")
+                        .ok()
+                        .flatten()
+                        .unwrap_or((index as u64).saturating_add(1)),
+                    weight: optional_u64(provider, "weight").ok().flatten(),
+                    model_patterns: optional_string_vec(provider, "model_patterns")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                    multimodal_mode: stream_route_multimodal_mode(provider),
+                    destination: stream_route_destination(provider),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    providers.sort_by_key(|provider| provider.priority);
+    Some(StreamRoutePlan {
+        fallback_enabled: flag("fallback_enabled").unwrap_or(true),
+        fail_on_missing_model: flag("fail_on_missing_model").unwrap_or(true),
+        fail_on_no_matching_provider: flag("fail_on_no_matching_provider").unwrap_or(true),
+        providers,
+    })
+}
+
+fn stream_route_multimodal_mode(provider: &Value) -> Option<&'static str> {
+    let mode = match optional_str(provider, "multimodal_mode").ok()? {
+        Some(mode) => MultimodalMode::from_str(mode, "").ok()?,
+        None => MultimodalMode::default_for_provider(
+            ProviderType::from_str(optional_str(provider, "provider_type").ok()??).ok()?,
+        ),
+    };
+    Some(mode.as_str())
+}
+
+fn stream_route_destination(provider: &Value) -> Option<StreamRouteDestination> {
+    let provider_type =
+        ProviderType::from_str(optional_str(provider, "provider_type").ok()??).ok()?;
+    // Same eligibility gate as `stream_target_for`. Every OpenAI-compatible
+    // provider type authenticates with a static header, so the representation
+    // check alone decides whether a stream can ever be committed.
+    if !provider_type.is_openai_compatible() {
+        return None;
+    }
+    let field = |name: &'static str| optional_str(provider, name).ok().flatten();
+    let template = build_url_template(
+        provider_type,
+        field("base_url"),
+        field("azure_resource"),
+        field("azure_deployment"),
+        field("azure_api_version").unwrap_or(DEFAULT_AZURE_API_VERSION),
+        field("google_region"),
+        field("google_project_id"),
+        field("aws_region"),
+    )
+    .ok()?;
+    // Every eligible provider renders a model-independent endpoint; a
+    // model-templated one would have no single destination to key.
+    let UrlTemplate::Static(endpoint) = template else {
+        return None;
+    };
+    let url = validate_dispatch_url(&endpoint).ok()?;
+    let scheme = match url.scheme() {
+        "https" => "https",
+        "http" => "http",
+        _ => return None,
+    };
+    Some(StreamRouteDestination {
+        scheme,
+        host: normalized_url_hostname(&url)?,
+        port: url.port_or_known_default()?,
     })
 }
 
