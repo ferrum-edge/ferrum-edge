@@ -29,13 +29,20 @@ gateways, control planes, custom plugins, charts or contract consumers.
   token stripping, claim-header ownership or refusal. Waypoint slices now
   carry the RAs that select the destinations the waypoint fronts. NodeWaypoint
   Service routes apply the destination's RA set (JWT validation, stripping,
-  claim headers, refusal), and a route whose destinations disagree, or whose
-  provider union exceeds `jwks_auth`'s bounds, is refused with `503`. An
-  inbound HBONE relay, or a NodeWaypoint transparent-capture connection, to a
-  destination selected by a refused RA is refused with `503`
-  (`mesh_authz.deny_policy=request_authentication_refused`); this replaces the
-  blanket relay refusal a waypoint's own refused RA used to install. Sidecar
-  and Ambient slices are unchanged. The same change keys `mesh_authz`
+  claim headers), and a route whose destination has no usable JWT rule is
+  excluded from the waypoint's own RA instance. A route is refused with `503`
+  when its destination is selected by a refused RA, its reachable workloads
+  are selected by different RA sets, it reaches a modeled destination whose
+  workloads cannot be resolved while destination RAs exist, or its provider
+  union exceeds what one `jwks_auth` instance can verify. An inbound HBONE
+  relay, or a NodeWaypoint transparent-capture connection, to a destination
+  selected by a refused RA is refused with `503`
+  (`mesh_authz.deny_policy=request_authentication_refused`), as is a
+  NodeWaypoint relay whose destination cannot be resolved while any refused RA
+  is present. With the mesh-managed `mesh_authz`, this per-destination check
+  replaces the blanket relay refusal a waypoint's own refused RA used to
+  install; an operator `mesh_authz` that replaces the managed one also
+  replaces the check. Sidecar and Ambient slices are unchanged. The same change keys `mesh_authz`
   destination lookups by namespace as well as upstream id, so two Services
   whose generated upstream ids collide across namespaces (`a`/`b-c` and
   `a-b`/`c`) no longer resolve each other's workloads for destination
@@ -116,7 +123,9 @@ gateways, control planes, custom plugins, charts or contract consumers.
   admit path rechecks the current generation on every request and answers
   `403` once a pod is withdrawn, and raw TCP refuses a captured but no longer
   vouched-for stream at accept (counted in `/overload.node_waypoint_drops`)
-  instead of falling back to mesh-wide-only policy.
+  instead of falling back to mesh-wide-only policy. UDP/DTLS source
+  attribution is unchanged: a capture-only cross-namespace source's datagrams
+  stay unattributed.
 - **`adaptive_concurrency` now resets when a streaming `ai_federation` provider
   destination changes.** With `streaming.enabled`, `ai_federation` commits a
   provider through `route_override_*` and the ordinary proxy dispatch dials it,
@@ -242,21 +251,24 @@ gateways, control planes, custom plugins, charts or contract consumers.
 ### Performance
 - **Plugin-free HTTP requests dispatch from their wire headers** (#6981,
   issue #6671). A plain HTTP/1.x or HTTP/2 request on a route with no plugins,
-  no path-parameter captures and a header block that maps 1:1 skips building
-  the string header map and re-parsing it into the outbound request. Every
-  other request is unchanged.
+  no path-parameter captures, no egress-baggage stripping, a method other than
+  `OPTIONS` and a header block that maps 1:1 skips building the string header
+  map and re-parsing it into the outbound request. Every other request is
+  unchanged.
 - **The gRPC deadline response pump is skipped for responses that are
   already complete** (#6982, issue #6904). A deadline-bearing H1/H2 gRPC
   response whose upstream terminal is already buffered (bounded to 16 frames
-  or 64 KiB) is served from memory without the gateway-owned pump task, which
-  measured −17% to −21% throughput on deadline-bearing calls. Responses still
-  streaming keep the pump, so a client that withholds HTTP/2 credit still
-  cannot outlive its deadline.
+  or 64 KiB) is served from memory without the gateway-owned pump task; on
+  open routes the pump measured −17% to −21% throughput on deadline-bearing
+  unary and server-streaming calls (about −5% on `key_auth` routes). The
+  upload-side deadline timer is also armed lazily. Responses still streaming
+  keep the pump, so a client that withholds HTTP/2 credit still cannot outlive
+  its deadline.
 - **Undeclared plugin lifecycle hooks are skipped** (#6975, issue #6615).
   Built-in plugins declare which of `on_request_received`, `before_proxy`,
   `after_proxy` and `log` they implement, and the request path no longer
-  awaits a boxed no-op for the rest. Custom plugins default to every hook and
-  are unchanged.
+  awaits a boxed no-op for the rest. Custom plugins and triggered plugin
+  instances default to every hook and are unchanged.
 - **The streaming terminal logger moves its log metadata instead of cloning
   it** (#6980, issue #6793), saving one full metadata clone and drop per
   streamed response on proxies with any plugin.

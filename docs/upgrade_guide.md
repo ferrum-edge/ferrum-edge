@@ -54,12 +54,14 @@ target-ref attachments, `ext_authz_providers`, `request_authentications`,
 `peer_authentications`, `multi_cluster` and `node_waypoint_route_upstreams`.
 Remove misspelled or obsolete nested keys from stored plugin configs and
 config files before upgrading; operator-named maps such as header maps are
-unchanged. The closed mesh slice root and `PeerAuthentication` apply wherever
-they are decoded, so during a rolling upgrade a data plane still on 0.9.19
-refuses slices from a 0.9.20 control plane that carry a newly closed member
-and keeps serving its last-good slice until it is upgraded. Run control plane
-and data planes on the same build, as the
-[build identity gate](#build-identity-gate) already requires.
+unchanged. The mesh slice root and `PeerAuthentication` are now closed
+wherever they are decoded. A 0.9.19 data plane still tolerates unknown slice
+members, so it keeps applying slices from a 0.9.20 control plane. From 0.9.20
+on, a data plane refuses slices from a newer control plane that add a closed
+member and keeps serving its last-good slice until it is upgraded: MeshSubscribe
+admits any same major.minor peer, unlike ConfigSync's exact
+[build identity gate](#build-identity-gate). Upgrade mesh control planes and
+data planes together.
 
 ### Custom plugins must export `config_contract()` (#6967, issue #6616)
 
@@ -83,15 +85,17 @@ schema for policy `targetRefs` now requires `name` on every attachment and
 `namespace` on `service` / `gateway`, matching runtime admission; clients
 generated from the schema must send them.
 
-### HTTP/1.1 clients that stop reading are closed after 60 seconds (#6998)
+### Proxy clients whose sockets stop accepting bytes are closed after 60 seconds (#6998)
 
 The new `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (default `60`, `0`
 disables, at most `86400`) closes a proxy client connection whose socket
 accepts no bytes for that long while the gateway has bytes to write. Any
 accepted write re-arms it, and time spent waiting on a slow backend never
-counts. A client that genuinely pauses reading for more than a minute, such as
-a stalled long download, is now disconnected with a truncated response; raise
-the value or set `0` for such workloads. Values above `86400` are refused at
+counts. It applies to HTTP/1.1, to HTTP/2 connections whose socket stops
+accepting bytes, and to upgraded WebSockets. A client that genuinely pauses
+reading for more than a minute, such as a stalled long download, is now
+disconnected with a truncated response; raise the value or set `0` for such
+workloads. Values above `86400` are refused at
 startup. See [configuration](configuration.md) for HTTP/2 coverage limits.
 
 ### Waypoint RequestAuthentication follows the destination workload (#6961, issue #6670)
@@ -101,13 +105,25 @@ selected by the destination workload instead of the waypoint's own namespace
 and labels. A selector RA that names a destination workload starts enforcing
 JWT validation, token stripping and claim-header ownership on NodeWaypoint
 Service routes for that destination, so requests that RA rejects and that
-used to pass through the waypoint unchecked are now rejected. A route whose destination workloads
-disagree on their RA set, or whose provider union exceeds `jwks_auth`'s bounds
-(64 providers, 8 per issuer), is refused with `503`. An inbound HBONE relay,
-or a NodeWaypoint transparent-capture connection, to a destination selected
-by a refused RA gets `503`, while unrelated destinations keep flowing. Review
-selector RAs that name workloads behind a waypoint before upgrading. See
-[RequestAuthentication](mesh.md#requestauthentication).
+used to pass through the waypoint unchecked are now rejected. Conversely, a
+route whose destination is selected by no RA with a usable JWT rule is
+excluded from the waypoint's own RA instance, so a cross-namespace destination
+that relied on the waypoint namespace's RA loses that JWT validation; add an
+RA that selects the destination to keep it.
+
+A route is refused with `503` when its destination is selected by a refused
+RA, its reachable workloads are selected by different RA sets, it reaches a
+modeled destination whose workloads cannot be resolved while destination RAs
+exist, or its provider union exceeds what one `jwks_auth` instance can verify
+(64 providers in total; one issuer's providers plus providers without an
+`issuer` must total at most 8). An inbound HBONE relay, or a NodeWaypoint
+transparent-capture connection, to a destination selected by a refused RA gets
+`503`, and so does a NodeWaypoint relay whose destination cannot be resolved
+while any refused RA is present. With the mesh-managed `mesh_authz`, relays to
+other destinations now keep flowing instead of being blanket-refused; an
+operator `mesh_authz` that replaces the managed one also replaces this check.
+Review RAs that select workloads behind a waypoint, and the waypoint's own
+RAs, before upgrading. See [RequestAuthentication](mesh.md#requestauthentication).
 
 ### NodeWaypoint rechecks capture sources per request (#6964, issue #6800)
 
@@ -116,8 +132,11 @@ namespace instead of refusing them as `UnknownPod`. It also rechecks the
 source on every HTTP request and answers `403` once the pod is withdrawn, and
 it refuses a captured TCP stream whose source is withdrawn, conflicted or not
 yet enrolled at accept, counted in `/overload.node_waypoint_drops`, instead of
-evaluating it with mesh-wide policy only. No configuration change is
-required.
+evaluating it with mesh-wide policy only. This includes a stream from a pod
+whose enrollment is still propagating to the waypoint's slice, which is now
+refused until the slice arrives. UDP/DTLS source attribution is unchanged: a
+capture-only cross-namespace source's datagrams stay unattributed. No
+configuration change is required.
 
 ### gRPC and gRPC-Web pre-routing refusals on HTTP/1.1 and HTTP/2 (#6965, #6969, issue #6943)
 
