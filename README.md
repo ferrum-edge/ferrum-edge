@@ -570,7 +570,7 @@ Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
 Edge source. The current published Edge release is **v0.9.20**. Its matching
 Contracts tag is
-[`contracts-edge-0.9.20`](https://github.com/ferrum-edge/ferrum-contracts/tree/39da322083044c2e92617209e62983c92387f0ad)
+[`contracts-edge-0.9.20`](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.20)
 on commit `39da322083044c2e92617209e62983c92387f0ad`, published on
 2026-11-03 for Edge release commit
 `e4a606a00352674daaef08636e3e359e6c48ba18`. It is the first SSH-signed
