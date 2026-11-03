@@ -15,10 +15,7 @@ Companion documents:
 > **Build-out status.** Ferrum Edge is pre-1.0 and publishes semver releases on
 > the `v0.9.x` channel (see the [Releases
 > page](https://github.com/ferrum-edge/ferrum-edge/releases) for the current
-> tag). The latest published release is **v0.9.19**, which replaces the
-> v0.9.18 tag that was never published (see the
-> [changelog](../CHANGELOG.md#0919---2026-10-27)). **v0.9.20** is the current
-> release candidate (see the
+> tag). The latest published release is **v0.9.20** (see the
 > [changelog](../CHANGELOG.md#0920---2026-11-02)). Read
 > [support_policy.md](support_policy.md) before treating any item here as a
 > stability commitment.

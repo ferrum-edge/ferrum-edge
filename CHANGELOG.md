@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.20] - 2026-11-02
 
-This patch release follows published 0.9.19. It closes plugin and mesh
+This patch release follows published 0.9.19. It was published on 2026-11-03
+from commit `e4a606a00352674daaef08636e3e359e6c48ba18`; see the
+[publication record](docs/releases/v0.9.20-publication.md). It closes plugin and mesh
 Telemetry configuration at every depth, scopes waypoint RequestAuthentication
 to the destination workload, and fixes strict DTLS 1.3 client-certificate
 handshakes, HTTP/1.1 slow-read and HTTP/2 flow-control stall exhaustion, the
