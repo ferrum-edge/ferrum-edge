@@ -649,7 +649,7 @@ spec:
     spec:
       containers:
         - name: ferrum-edge
-          image: docker.io/ferrumedge/ferrum-edge:0.9.19
+          image: docker.io/ferrumedge/ferrum-edge:0.9.20
           ports:
             - containerPort: 8000  # Proxy
             - containerPort: 9000  # Admin API

@@ -31,6 +31,119 @@ on `main` but not yet released, including breaking ones, are listed under
 `[Unreleased]` in [CHANGELOG.md](../CHANGELOG.md); review that section before
 deploying a build from `main`.
 
+## Upgrading to 0.9.20
+
+0.9.20 was prepared on 2026-11-02 UTC from `main` and follows published
+0.9.19 directly. It closes plugin and mesh Telemetry configuration at every
+depth and collects mesh, gRPC and HTTP correctness fixes. Some sections below
+refuse configuration or traffic that 0.9.19 accepted, so review every section
+before upgrading. The `V001` baseline checksum is unchanged from 0.9.19, so a
+0.9.19 database is not refused on migration-history grounds. Stored
+configuration the sections below now refuse still fails validation when it is
+loaded, so fix or remove it first. CP/DP must run the same build, and the
+ConfigSync revision remains `3`. The matching `contracts-edge-0.9.20` release
+must be cut from the verified release commit; move downstream contract pins
+when each consumer adopts 0.9.20.
+
+### Plugin configs reject unknown keys in nested objects (#6967, issue #6616)
+
+Plugin configs were already closed at their root. Nested objects that used to
+ignore unknown keys now reject them, including `workload_metrics` tracing
+providers, metrics and `tag_overrides`, and `mesh_authz` policy scopes,
+target-ref attachments, `ext_authz_providers`, `request_authentications`,
+`peer_authentications`, `multi_cluster` and `node_waypoint_route_upstreams`.
+Remove misspelled or obsolete nested keys from stored plugin configs and
+config files before upgrading; operator-named maps such as header maps are
+unchanged. The closed mesh slice root and `PeerAuthentication` apply wherever
+they are decoded, so during a rolling upgrade a data plane still on 0.9.19
+refuses slices from a 0.9.20 control plane that carry a newly closed member
+and keeps serving its last-good slice until it is upgraded. Run control plane
+and data planes on the same build, as the
+[build identity gate](#build-identity-gate) already requires.
+
+### Custom plugins must export `config_contract()` (#6967, issue #6616)
+
+Every custom plugin must export
+`config_contract() -> crate::plugins::PluginConfigContract` with example
+configs, plus any free-form maps or embedded documents it accepts. A plugin
+without it no longer compiles. The plugin test sweep validates each example,
+rejects an unknown key injected into any nested object, and fails if
+validation needs a Tokio runtime or spawns a task. Start background work in
+`commit_background_tasks`, not the constructor. See
+[Config contract](../CUSTOM_PLUGINS.md#config-contract).
+
+### Mesh Telemetry documents and policy `targetRefs` are closed (#6972, issue #6616)
+
+On native, file and Ferrum xDS mesh slices, a Telemetry resource rejects
+unknown members at every level: the resource and its `config`, the `tracing`,
+`metrics` and `access_logging` sections, tracing provider envelopes and their
+`config`, `tag_overrides` entries and their `operation`, and the access-log
+`filter`. Remove unknown members from Telemetry documents first. The OpenAPI
+schema for policy `targetRefs` now requires `name` on every attachment and
+`namespace` on `service` / `gateway`, matching runtime admission; clients
+generated from the schema must send them.
+
+### HTTP/1.1 clients that stop reading are closed after 60 seconds (#6998)
+
+The new `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (default `60`, `0`
+disables, at most `86400`) closes a proxy client connection whose socket
+accepts no bytes for that long while the gateway has bytes to write. Any
+accepted write re-arms it, and time spent waiting on a slow backend never
+counts. A client that genuinely pauses reading for more than a minute, such as
+a stalled long download, is now disconnected with a truncated response; raise
+the value or set `0` for such workloads. Values above `86400` are refused at
+startup. See [configuration](configuration.md) for HTTP/2 coverage limits.
+
+### Waypoint RequestAuthentication follows the destination workload (#6961, issue #6670)
+
+On a shared NodeWaypoint or ServiceWaypoint, RequestAuthentication is now
+selected by the destination workload instead of the waypoint's own namespace
+and labels. A selector RA that names a destination workload starts enforcing
+JWT validation, token stripping and claim-header ownership on NodeWaypoint
+Service routes for that destination, so requests that RA rejects and that
+used to pass through the waypoint unchecked are now rejected. A route whose destination workloads
+disagree on their RA set, or whose provider union exceeds `jwks_auth`'s bounds
+(64 providers, 8 per issuer), is refused with `503`. An inbound HBONE relay,
+or a NodeWaypoint transparent-capture connection, to a destination selected
+by a refused RA gets `503`, while unrelated destinations keep flowing. Review
+selector RAs that name workloads behind a waypoint before upgrading. See
+[RequestAuthentication](mesh.md#requestauthentication).
+
+### NodeWaypoint rechecks capture sources per request (#6964, issue #6800)
+
+A NodeWaypoint now resolves enrolled sources outside its subscription
+namespace instead of refusing them as `UnknownPod`. It also rechecks the
+source on every HTTP request and answers `403` once the pod is withdrawn, and
+it refuses a captured TCP stream whose source is withdrawn, conflicted or not
+yet enrolled at accept, counted in `/overload.node_waypoint_drops`, instead of
+evaluating it with mesh-wide policy only. No configuration change is
+required.
+
+### gRPC and gRPC-Web pre-routing refusals on HTTP/1.1 and HTTP/2 (#6965, #6969, issue #6943)
+
+HTTP/1.1 and HTTP/2 pre-routing refusals now answer native gRPC with a
+Trailers-Only status and gRPC-Web with a framed trailer status, matching
+HTTP/3: URL length and native gRPC header limits (`RESOURCE_EXHAUSTED`),
+query-parameter count, the protocol-header guard and Host/`:authority`
+problems (`INVALID_ARGUMENT`), the per-IP concurrency limit
+(`RESOURCE_EXHAUSTED`), 0-RTT and the retired listener (`UNAVAILABLE`), and
+TRACE (`UNIMPLEMENTED`). gRPC-Web header-limit refusals keep the JSON `431`.
+Clients that parsed the JSON `400` / `414` / `429` bodies for these gRPC
+requests must read `grpc-status` instead. A CONNECT is never treated as gRPC:
+refusals keep their HTTP status and JSON body, and a mesh HBONE CONNECT that
+declares a gRPC or gRPC-Web Content-Type is refused with a plain `400`. No
+configuration changes are required.
+
+### gRPC failures observed after the client deadline report `DEADLINE_EXCEEDED` (#6973, #6979, issues #6022 / #6976)
+
+A backend failure observed at or after a gRPC client deadline, such as a
+grpc-java `CANCEL` that beats a late gateway timer, now ends as
+`DEADLINE_EXCEEDED` instead of `UNAVAILABLE` and is not charged to circuit
+breakers, passive health or the backend's HTTP/3 capability. Where two bounds
+race, the earlier one owns the outcome. Alerts keyed on `UNAVAILABLE` for
+deadline-bound calls may see fewer events. No configuration changes are
+required.
+
 ## Upgrading to 0.9.19
 
 0.9.19 was published on 2026-10-27 UTC from commit
