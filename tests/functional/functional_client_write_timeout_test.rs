@@ -383,6 +383,191 @@ async fn functional_client_write_timeout_releases_backend_of_non_reading_h2_clie
     gateway.shutdown();
 }
 
+/// Opens one HTTP/2 stream for the endless response on `io` and returns its
+/// body plus the connection driver. The client advertises the RFC 9113 default
+/// windows and keeps reading its socket, so nothing ever parks the gateway's
+/// transport; only HTTP/2 flow control can.
+async fn open_h2_stream<T>(io: T, authority: &str) -> (h2::RecvStream, JoinHandle<()>)
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (send_request, connection) = h2::client::Builder::new()
+        .initial_window_size(65_535)
+        .initial_connection_window_size(65_535)
+        .handshake::<_, Bytes>(io)
+        .await
+        .expect("HTTP/2 handshake with the gateway");
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(format!("{authority}/stream/events"))
+        .body(())
+        .expect("build h2 request");
+    let mut send_request = send_request.ready().await.expect("h2 stream slot");
+    let (response, _send_body) = send_request
+        .send_request(request, true)
+        .expect("send h2 request");
+    let response = tokio::time::timeout(Duration::from_secs(10), response)
+        .await
+        .expect("response head")
+        .expect("response head");
+    assert_eq!(response.status().as_u16(), 200);
+    (response.into_body(), driver)
+}
+
+/// Reads the stream's DATA frames without ever releasing their flow-control
+/// capacity, so the client sends no `WINDOW_UPDATE`. Returns how many bytes it
+/// received and the reset that ended the stream, or `None` if the stream was
+/// still open after `within`.
+async fn drain_without_window_update(
+    body: &mut h2::RecvStream,
+    within: Duration,
+) -> (usize, Option<h2::Reason>) {
+    let mut received = 0;
+    let ended = tokio::time::timeout(within, async {
+        loop {
+            match body.data().await {
+                Some(Ok(data)) => received += data.len(),
+                Some(Err(err)) => return err.reason(),
+                None => return None,
+            }
+        }
+    })
+    .await;
+    match ended {
+        Ok(reason) => (received, Some(reason.unwrap_or(h2::Reason::NO_ERROR))),
+        Err(_) => (received, None),
+    }
+}
+
+/// The client keeps reading its socket and answering PINGs, but never sends a
+/// `WINDOW_UPDATE`. The gateway's response pipe parks on HTTP/2 send capacity
+/// before any transport write blocks, so the transport bound never sees a
+/// stall. The response pipe's own bound must reset the stream and let go of
+/// the backend.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_client_write_timeout_releases_backend_of_h2_client_withholding_window_update() {
+    let mut backend = spawn_endless_backend().await;
+    let mut gateway = spawn_gateway(backend.port, "2").await;
+
+    let tcp = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect to proxy");
+    let (mut body, driver) =
+        open_h2_stream(tcp, &format!("http://127.0.0.1:{}", gateway.proxy_port)).await;
+
+    let (received, reset) = drain_without_window_update(&mut body, RELEASE_GRACE).await;
+    let logs = gateway.read_combined_captured_output().unwrap_or_default();
+    assert_eq!(
+        reset,
+        Some(h2::Reason::CANCEL),
+        "a client that never sends WINDOW_UPDATE must have its stream reset with CANCEL \
+         (received {received} bytes); logs:\n{logs}"
+    );
+    assert!(
+        received <= 65_535,
+        "the gateway sent past the client's window: {received} bytes"
+    );
+    let released = wait_for_release(&mut backend, RELEASE_GRACE)
+        .await
+        .unwrap_or_else(|| {
+            panic!("the backend connection outlived the stream reset; logs:\n{logs}")
+        });
+    assert!(
+        released >= Duration::from_secs(2),
+        "the bound fired before a whole stall window: {released:?}"
+    );
+
+    driver.abort();
+    gateway.shutdown();
+}
+
+/// With the bound disabled, the same flow-control stall holds the exchange.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_client_write_timeout_zero_keeps_h2_client_withholding_window_update() {
+    let mut backend = spawn_endless_backend().await;
+    let mut gateway = spawn_gateway(backend.port, "0").await;
+
+    let tcp = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect to proxy");
+    let (mut body, driver) =
+        open_h2_stream(tcp, &format!("http://127.0.0.1:{}", gateway.proxy_port)).await;
+    wait_for_started(&backend).await;
+
+    let (received, reset) = drain_without_window_update(&mut body, DISABLED_HOLD).await;
+    assert!(
+        reset.is_none(),
+        "with the bound disabled the stalled stream must stay open, got {reset:?}"
+    );
+    assert!(
+        received > 0,
+        "the stream must have carried data before it stalled"
+    );
+    assert!(
+        wait_for_release(&mut backend, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "with the bound disabled the backend connection must stay open"
+    );
+
+    driver.abort();
+    gateway.shutdown();
+}
+
+/// A client that grants window slowly but steadily is never cut, however long
+/// it keeps going. It returns one DATA frame's capacity every 500 ms; h2 sends
+/// a `WINDOW_UPDATE` once half the window is released, so about one per
+/// second against a 2 s bound.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_client_write_timeout_keeps_h2_client_granting_window_slowly() {
+    let mut backend = spawn_endless_backend().await;
+    let mut gateway = spawn_gateway(backend.port, "2").await;
+
+    let tcp = TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .expect("connect to proxy");
+    let (mut body, driver) =
+        open_h2_stream(tcp, &format!("http://127.0.0.1:{}", gateway.proxy_port)).await;
+
+    let started = Instant::now();
+    let mut received = 0usize;
+    while started.elapsed() < Duration::from_secs(7) {
+        let data = tokio::time::timeout(Duration::from_secs(5), body.data())
+            .await
+            .expect("a slowly granting client must keep receiving data")
+            .expect("the stream must not end")
+            .unwrap_or_else(|err| {
+                panic!(
+                    "a client granting window steadily was cut after {:?}: {err}; logs:\n{}",
+                    started.elapsed(),
+                    gateway.read_combined_captured_output().unwrap_or_default()
+                )
+            });
+        received += data.len();
+        // Hold every frame before granting its window back.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        body.flow_control()
+            .release_capacity(data.len())
+            .expect("release capacity");
+    }
+    assert!(received > 0, "no data in 7 s");
+    assert!(
+        wait_for_release(&mut backend, Duration::from_millis(100))
+            .await
+            .is_none(),
+        "the backend connection must stay open for a client that keeps granting window"
+    );
+
+    driver.abort();
+    gateway.shutdown();
+}
+
 /// Accepts any server certificate: the test drives the gateway's own
 /// self-signed `tests/certs/server.crt`.
 #[derive(Debug)]

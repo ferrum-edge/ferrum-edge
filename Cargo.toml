@@ -97,7 +97,11 @@ tokio-stream = { version = "0.1", features = ["full"] }
 
 # HTTP
 hyper = { version = "=1.10.0", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
+# `ferrum-h2-response-write-timeout` exists only in the vendored hyper-util
+# (patch 002): it forwards hyper patch 008's HTTP/2 response write-stall bound
+# from the frontends' auto builder. Dropping the vendored copy fails the build
+# here instead of silently losing the bound.
+hyper-util = { version = "0.1", features = ["full", "ferrum-h2-response-write-timeout"] }
 # ACME wraps hyper-rustls around Ferrum's policy-aware connector so the
 # original hostname remains the SNI/certificate identity while only screened
 # resolved addresses are dialed.
