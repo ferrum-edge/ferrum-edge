@@ -11,6 +11,9 @@ Deliberate fork with no upstream filing yet, governed by the
 Owner: Ferrum Edge maintainers. It exists for
 [Hyper patch 005](../../upstream-hyper-patches/005-h2-small-window-coalescing/README.md)
 and retires with it.
+[Hyper patch 008](../../upstream-hyper-patches/008-h2-response-write-timeout/README.md),
+in the same co-retirement group, also reads the assigned value: its server
+response bound counts only a stream with no window assigned.
 
 ## Problem
 
