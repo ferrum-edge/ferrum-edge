@@ -12,9 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This patch release follows published 0.9.19. It closes plugin and mesh
 Telemetry configuration at every depth, scopes waypoint RequestAuthentication
 to the destination workload, and fixes strict DTLS 1.3 client-certificate
-handshakes, HTTP/1.1 slow-read exhaustion, the credential log filter's
-per-request CPU regression, gRPC deadline settlement and several plugin
-correctness defects. Some changes refuse configuration or traffic that 0.9.19
+handshakes, HTTP/1.1 slow-read and HTTP/2 flow-control stall exhaustion, the
+credential log filter's per-request CPU regression, gRPC deadline settlement
+and several plugin correctness defects. Some changes refuse configuration or traffic that 0.9.19
 accepted, and every custom plugin must export a config contract. The `V001`
 baseline checksum is unchanged from 0.9.19. Read
 [Upgrading to 0.9.20](docs/upgrade_guide.md#upgrading-to-0920) before updating

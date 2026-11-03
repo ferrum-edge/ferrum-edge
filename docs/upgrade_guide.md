@@ -85,18 +85,25 @@ schema for policy `targetRefs` now requires `name` on every attachment and
 `namespace` on `service` / `gateway`, matching runtime admission; clients
 generated from the schema must send them.
 
-### Proxy clients whose sockets stop accepting bytes are closed after 60 seconds (#6998)
+### Stalled proxy clients are cut after 60 seconds (#6998, #7005)
 
 The new `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (default `60`, `0`
-disables, at most `86400`) closes a proxy client connection whose socket
-accepts no bytes for that long while the gateway has bytes to write. Any
-accepted write re-arms it, and time spent waiting on a slow backend never
-counts. It applies to HTTP/1.1, to HTTP/2 connections whose socket stops
-accepting bytes, and to upgraded WebSockets. A client that genuinely pauses
-reading for more than a minute, such as a stalled long download, is now
-disconnected with a truncated response; raise the value or set `0` for such
-workloads. Values above `86400` are refused at
-startup. See [configuration](configuration.md) for HTTP/2 coverage limits.
+disables, at most `86400`) bounds how long a proxy client can stall a response:
+
+- It closes a client connection whose socket accepts no bytes for that long
+  while the gateway has bytes to write: HTTP/1.1, HTTP/2 connections whose
+  socket stops accepting bytes, and upgraded WebSockets. Any accepted write
+  re-arms it, and time spent waiting on a slow backend never counts.
+- On the HTTP/2 frontends (h2c and ALPN `h2`) it also resets, with
+  `RST_STREAM(CANCEL)`, a stream whose response has a chunk ready but gets no
+  flow-control window from the client for that long. The connection and its
+  other streams continue.
+
+A client that genuinely pauses reading, or withholds HTTP/2 `WINDOW_UPDATE`,
+for more than a minute, such as a stalled long download, now gets a truncated
+response or a reset stream; raise the value or set `0` for such workloads.
+Values above `86400` are refused at startup. HTTP/3 and admin listeners are
+unchanged. See [configuration](configuration.md) for the exact rules.
 
 ### Waypoint RequestAuthentication follows the destination workload (#6961, issue #6670)
 
