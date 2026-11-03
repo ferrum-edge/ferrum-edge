@@ -568,20 +568,25 @@ publishes them in
 [ferrum-edge/ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts).
 Consumers (Nexus, Foundry, Anvil, Alloy, GitForgeOps) pin the
 `contracts-edge-<edge-version>` tags from that repository rather than reading
-Edge source. The current published Edge release is **v0.9.19**. Its matching
+Edge source. The current published Edge release is **v0.9.20**. Its matching
 Contracts tag is
+[`contracts-edge-0.9.20`](https://github.com/ferrum-edge/ferrum-contracts/tree/39da322083044c2e92617209e62983c92387f0ad)
+on commit `39da322083044c2e92617209e62983c92387f0ad`, published on
+2026-11-03 for Edge release commit
+`e4a606a00352674daaef08636e3e359e6c48ba18`. It is the first SSH-signed
+Contracts tag; verify it as described in the Contracts
+[release signing](https://github.com/ferrum-edge/ferrum-contracts/blob/main/docs/release-signing.md)
+guide. The v0.9.19 pairing is
 [`contracts-edge-0.9.19`](https://github.com/ferrum-edge/ferrum-contracts/tree/d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b)
-at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, published on
-2026-10-27 for Edge release commit
-`510ce7121c3d9754110d330a30a3bd9b7a7b278e`. No `contracts-edge-0.9.18` tag
+at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`. No `contracts-edge-0.9.18` tag
 exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
 
-The **v0.9.20 candidate** follows published v0.9.19 with security and
-correctness fixes, closed plugin and mesh Telemetry configuration, and the
-strict-client DTLS 1.3 client-certificate fix. Its protected production
-release and the matching `contracts-edge-0.9.20` publication must succeed
-before consumers move their pins. See the
+**v0.9.20** follows published v0.9.19 with security and correctness fixes,
+closed plugin and mesh Telemetry configuration, and the strict-client DTLS 1.3
+client-certificate fix. Consumers move their pins to `contracts-edge-0.9.20`
+when they adopt Edge v0.9.20. See the
+[publication record](docs/releases/v0.9.20-publication.md) and the
 [upgrade guide](docs/upgrade_guide.md#upgrading-to-0920).
 
 **v0.9.19** carries the plugin production-launch hardening from tagged but

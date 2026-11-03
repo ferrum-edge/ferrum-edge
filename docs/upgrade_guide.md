@@ -33,17 +33,19 @@ deploying a build from `main`.
 
 ## Upgrading to 0.9.20
 
-0.9.20 was prepared on 2026-11-02 UTC from `main` and follows published
-0.9.19 directly. It closes plugin and mesh Telemetry configuration at every
+0.9.20 was published on 2026-11-03 UTC from commit
+`e4a606a00352674daaef08636e3e359e6c48ba18` and follows published 0.9.19
+directly; see the [publication record](releases/v0.9.20-publication.md). It closes plugin and mesh Telemetry configuration at every
 depth and collects mesh, gRPC and HTTP correctness fixes. Some sections below
 refuse configuration or traffic that 0.9.19 accepted, so review every section
 before upgrading. The `V001` baseline checksum is unchanged from 0.9.19, so a
 0.9.19 database is not refused on migration-history grounds. Stored
 configuration the sections below now refuse still fails validation when it is
 loaded, so fix or remove it first. CP/DP must run the same build, and the
-ConfigSync revision remains `3`. The matching `contracts-edge-0.9.20` release
-must be cut from the verified release commit; move downstream contract pins
-when each consumer adopts 0.9.20.
+ConfigSync revision remains `3`. The matching
+[`contracts-edge-0.9.20`](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.20)
+release was published on 2026-11-03. Move downstream contract pins when
+each consumer adopts 0.9.20.
 
 ### Plugin configs reject unknown keys in nested objects (#6967, issue #6616)
 
