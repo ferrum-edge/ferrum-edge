@@ -446,10 +446,10 @@ ferrum-edge version [OPTIONS]
 
 ```bash
 $ ferrum-edge version
-ferrum-edge 0.9.19 (aarch64-apple-darwin)
+ferrum-edge 0.9.20 (aarch64-apple-darwin)
 
 $ ferrum-edge version --json
-{"version":"0.9.19","target":"aarch64-apple-darwin"}
+{"version":"0.9.20","target":"aarch64-apple-darwin"}
 ```
 
 ## ambient-udp-preflight

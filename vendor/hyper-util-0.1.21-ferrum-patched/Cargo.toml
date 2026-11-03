@@ -79,6 +79,11 @@ client-proxy-system = [
     "dep:windows-registry",
 ]
 default = []
+# FERRUM PATCH 002: forwards `Http2Builder::response_write_timeout` to the
+# builder Ferrum's vendored hyper adds (hyper patch 008). Not part of `full`:
+# stock hyper has no such method, and the standalone regression run resolves
+# stock hyper.
+ferrum-h2-response-write-timeout = ["server-auto"]
 full = [
     "client",
     "client-legacy",

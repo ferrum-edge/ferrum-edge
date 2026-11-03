@@ -52,8 +52,10 @@
 //! RFC 9113 default window is 65,535 bytes) parks hyper's response pipe on
 //! send capacity before any transport write blocks, and a client that keeps
 //! reading its socket but withholds one stream's `WINDOW_UPDATE` never stalls
-//! the transport at all. Those HTTP/2 stream-capacity stalls are NOT bounded
-//! here; authenticated streams stay bounded by the authorization lifetime.
+//! the transport at all. The same setting bounds those HTTP/2 stream-capacity
+//! stalls one layer up: the frontends pass
+//! [`h2_response_write_timeout`] to hyper's response pipe (hyper patch 008),
+//! which resets a stream whose ready chunk the client grants no window for.
 //! HTTP/3 has its own QUIC idle timeout and flow control and does not use
 //! this wrapper. Admin and injector listeners are not wrapped.
 //!
@@ -68,6 +70,12 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+/// The HTTP/2 response flow-control stall bound for the same setting
+/// (hyper patch 008): `0` disables it, as it disables the transport bound.
+pub fn h2_response_write_timeout(timeout_seconds: u64) -> Option<Duration> {
+    (timeout_seconds > 0).then(|| Duration::from_secs(timeout_seconds))
+}
 
 /// Fixed message for the stall error. Compiled in; echoes nothing from the
 /// client.
