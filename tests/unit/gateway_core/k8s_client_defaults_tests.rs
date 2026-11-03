@@ -96,7 +96,7 @@ fn exec_plugin_parse_errors_are_redacted_in_the_client_stack() {
     let kube::config::KubeconfigError::Parse(inner) = saphyr_parse_error() else {
         panic!("expected a YAML parse error");
     };
-    let auth = kube::client::AuthError::AuthExecParse(*inner);
+    let auth = kube::client::AuthError::AuthExecParse(inner);
     let boxed: tower::BoxError = Box::new(auth);
 
     let mapped = redact_kube_auth_error(boxed);
