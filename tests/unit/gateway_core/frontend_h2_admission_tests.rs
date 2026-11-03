@@ -53,7 +53,23 @@ impl ProxyHarness {
         tls_config: Option<Arc<rustls::ServerConfig>>,
         backend_port: u16,
     ) -> Self {
-        let env = ferrum_edge::config::EnvConfig {
+        Self::start_with_env(
+            header_read_timeout_seconds,
+            tls_config,
+            backend_port,
+            |_| {},
+        )
+        .await
+    }
+
+    /// [`Self::start`] with a final adjustment to the gateway's `EnvConfig`.
+    pub(super) async fn start_with_env(
+        header_read_timeout_seconds: u64,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
+        backend_port: u16,
+        configure: impl FnOnce(&mut ferrum_edge::config::EnvConfig),
+    ) -> Self {
+        let mut env = ferrum_edge::config::EnvConfig {
             mode: ferrum_edge::config::env_config::OperatingMode::File,
             log_level: "error".into(),
             proxy_http_port: 0,
@@ -65,6 +81,7 @@ impl ProxyHarness {
             shutdown_drain_seconds: 2,
             ..ferrum_edge::config::EnvConfig::default()
         };
+        configure(&mut env);
         let proxy: Proxy = serde_json::from_value(json!({
             "id": "h2-admission",
             "listen_path": "/slow",

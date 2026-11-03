@@ -59,8 +59,9 @@ and `try_recv` found nothing.
 
 The base is the crates.io `hyper-util` 0.1.21 source (package checksum
 `ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff`, upstream
-commit `23a868965964c1d6bb1b94f30ba4c420a4bebe7c`). Only
-`src/client/legacy/client.rs` differs; the unified diff is
+commit `23a868965964c1d6bb1b94f30ba4c420a4bebe7c`). This patch changes only
+`src/client/legacy/client.rs` ([patch 002](../002-forward-h2-response-write-timeout/README.md)
+adds a server-builder forward on top); the unified diff is
 [`hyper-util-release-h1-sender-on-dispatch-close.patch`](hyper-util-release-h1-sender-on-dispatch-close.patch).
 The crate's `.github/`, `Cargo.lock`, `Cargo.toml.orig`, `.gitignore` and
 `.cargo_vcs_info.json` are not vendored. `examples/` and `tests/` are kept
