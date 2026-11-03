@@ -8,6 +8,7 @@
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::collections::HashMap;
+use std::ffi::CString;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use std::fs::{self, File};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -374,7 +375,8 @@ impl EbpfBackend for AyaEbpfBackend {
             TcAttachDirection::Egress => TcAttachType::Egress,
         };
 
-        let link_id = prog.attach(iface, attach_type).map_err(|e| {
+        let iface_name = interface_cstring(iface)?;
+        let link_id = prog.attach(&iface_name, attach_type).map_err(|e| {
             format!(
                 "Failed to attach '{program}' to '{iface}' {}: {e}",
                 direction.as_str()
@@ -427,13 +429,13 @@ impl EbpfBackend for AyaEbpfBackend {
             // Capture the netlink filter identity before `detach` consumes the
             // link, so a failure can be retried.
             let rebuild = match (
-                link.attach_type(),
+                link.parent(),
                 link.priority(),
                 link.handle(),
                 link.classid(),
             ) {
-                (Ok(attach_type), Ok(priority), Ok(handle), Ok(classid)) => {
-                    Some((attach_type, priority, handle, classid))
+                (Ok(parent), Ok(priority), Ok(handle), Ok(classid)) => {
+                    Some((parent, priority, handle, classid))
                 }
                 // A TCX fd link, whose detach is infallible.
                 _ => None,
@@ -444,8 +446,9 @@ impl EbpfBackend for AyaEbpfBackend {
             // Rebuilding fails when the interface no longer exists, and the
             // kernel removed its filters with the device. Anything that still
             // resolves keeps a handle and is reported, so the removal retries.
-            let rebuilt = rebuild.and_then(|(attach_type, priority, handle, classid)| {
-                SchedClassifierLink::attached(&iface, attach_type, priority, handle, classid).ok()
+            let rebuilt = rebuild.and_then(|(parent, priority, handle, classid)| {
+                let name = CString::new(iface.as_str()).ok()?;
+                SchedClassifierLink::attached(&name, parent, priority, handle, classid).ok()
             });
             if let Some(link) = rebuilt {
                 errors.push(format!("{iface}: {e}"));
@@ -526,9 +529,12 @@ impl EbpfBackend for AyaEbpfBackend {
         // `bpf_sk_assign` is ingress-only, so this classifier is never attached
         // on egress. Attaching it there would silently no-op the redirect while
         // still consuming a filter slot.
-        let link_id = prog.attach(iface, TcAttachType::Ingress).map_err(|e| {
-            format!("Failed to attach '{INGRESS_REDIRECT_PROGRAM}' to '{iface}' ingress: {e}")
-        })?;
+        let iface_name = interface_cstring(iface)?;
+        let link_id = prog
+            .attach(&iface_name, TcAttachType::Ingress)
+            .map_err(|e| {
+                format!("Failed to attach '{INGRESS_REDIRECT_PROGRAM}' to '{iface}' ingress: {e}")
+            })?;
         // Take ownership of the link immediately. See [`IngressRedirectLink`]:
         // a link id alone is single-use, so keeping it in the program's map
         // would make a failed detach unrecoverable and unobservable.
@@ -595,13 +601,13 @@ impl EbpfBackend for AyaEbpfBackend {
             // link. `Link::detach` takes `self`, so without this the handle is
             // gone the moment the netlink delete fails.
             let rebuild = match (
-                link.attach_type(),
+                link.parent(),
                 link.priority(),
                 link.handle(),
                 link.classid(),
             ) {
-                (Ok(attach_type), Ok(priority), Ok(handle), Ok(classid)) => {
-                    Some((attach_type, priority, handle, classid))
+                (Ok(parent), Ok(priority), Ok(handle), Ok(classid)) => {
+                    Some((parent, priority, handle, classid))
                 }
                 // A TCX fd link, whose detach is infallible — it can never reach
                 // the rebuild path below.
@@ -614,15 +620,9 @@ impl EbpfBackend for AyaEbpfBackend {
                 ),
                 Err(e) => {
                     errors.push(format!("{iface}: {e}"));
-                    let rebuilt = rebuild.and_then(|(attach_type, priority, handle, classid)| {
-                        SchedClassifierLink::attached(
-                            &iface,
-                            attach_type,
-                            priority,
-                            handle,
-                            classid,
-                        )
-                        .ok()
+                    let rebuilt = rebuild.and_then(|(parent, priority, handle, classid)| {
+                        let name = CString::new(iface.as_str()).ok()?;
+                        SchedClassifierLink::attached(&name, parent, priority, handle, classid).ok()
                     });
                     if rebuilt.is_none() {
                         warn!(
@@ -1078,6 +1078,11 @@ fn remove_pin_if_present(pin_path: &str) -> Result<(), String> {
 /// `ebpf-live` CI job. CI sets `FERRUM_LIVE_TESTS_REQUIRED=1`, so prerequisite
 /// gaps fail there instead of passing as skips; local ad-hoc runs still
 /// self-skip when the kernel lacks the prerequisites.
+/// aya identifies interfaces by C string; reject names with an interior NUL.
+fn interface_cstring(iface: &str) -> Result<CString, String> {
+    CString::new(iface).map_err(|_| format!("Interface name '{iface}' contains a NUL byte"))
+}
+
 #[cfg(test)]
 mod live_kernel_tests {
     use super::AyaEbpfBackend;
@@ -1414,7 +1419,10 @@ mod live_kernel_tests {
         if filters.contains("ferrum_tc_ingress_redirect") || filters.contains("bpf") {
             return true;
         }
-        match SchedClassifier::query_tcx(iface, TcAttachType::Ingress) {
+        let Ok(iface_name) = std::ffi::CString::new(iface) else {
+            return false;
+        };
+        match SchedClassifier::query_tcx(&iface_name, TcAttachType::Ingress) {
             Ok((_revision, programs)) => !programs.is_empty(),
             Err(_) => false,
         }

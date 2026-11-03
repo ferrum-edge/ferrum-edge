@@ -386,7 +386,7 @@ impl BpfMaps {
             capture_flags: info.capture_flags,
         };
         let map = &mut self.pod_ips;
-        map.insert(key, value, 0)
+        map.insert(&key, &value, 0)
             .map_err(|e| format!("Failed to insert pod IP {ip}: {e}"))
     }
 
@@ -403,7 +403,7 @@ impl BpfMaps {
             capture_flags: info.capture_flags,
         };
         let map = &mut self.pod_ips6;
-        map.insert(key, value, 0)
+        map.insert(&key, &value, 0)
             .map_err(|e| format!("Failed to insert pod IPv6 {ip}: {e}"))
     }
 
@@ -419,7 +419,7 @@ impl BpfMaps {
         };
         let key = ipv4_to_nbo_key(ip);
         node_ips
-            .insert(key, 1u8, 0)
+            .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node IP {ip}: {e}"))
     }
 
@@ -429,7 +429,7 @@ impl BpfMaps {
         };
         let key = CidrKey6::host(ipv6_to_nbo_words(ip));
         node_ips6
-            .insert(key, 1u8, 0)
+            .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node IPv6 {ip}: {e}"))
     }
 
@@ -439,7 +439,7 @@ impl BpfMaps {
         };
         let key = NodeProbePortKey4::new(ipv4_to_nbo_key(ip), port);
         node_probe_ports
-            .insert(key, 1u8, 0)
+            .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node probe port {ip}:{port}: {e}"))
     }
 
@@ -459,7 +459,7 @@ impl BpfMaps {
         };
         let key = NodeProbePortKey6::new(ipv6_to_nbo_words(ip), port);
         node_probe_ports6
-            .insert(key, 1u8, 0)
+            .insert(&key, &1u8, 0)
             .map_err(|e| format!("Failed to insert node IPv6 probe port {ip}:{port}: {e}"))
     }
 
@@ -527,7 +527,7 @@ impl BpfMaps {
 
         for port in ports {
             pod_inbound_ports
-                .insert(InboundRedirectKey4::new(addr, *port), 1u8, 0)
+                .insert(&InboundRedirectKey4::new(addr, *port), &1u8, 0)
                 .map_err(|e| format!("Failed to insert inbound redirect port {ip}:{port}: {e}"))?;
         }
         Ok(())
@@ -570,7 +570,7 @@ impl BpfMaps {
 
         for port in ports {
             pod_inbound_ports6
-                .insert(InboundRedirectKey6::new(addr, *port), 1u8, 0)
+                .insert(&InboundRedirectKey6::new(addr, *port), &1u8, 0)
                 .map_err(|e| {
                     format!("Failed to insert IPv6 inbound redirect port {ip}:{port}: {e}")
                 })?;
@@ -591,7 +591,7 @@ impl BpfMaps {
         } else {
             UDP_REPLY_SOURCE_GATE_DISABLED
         };
-        gate.set(UDP_REPLY_SOURCE_GATE_KEY, value, 0).map_err(|e| {
+        gate.set(UDP_REPLY_SOURCE_GATE_KEY, &value, 0).map_err(|e| {
             format!(
                 "Failed to {} NodeWaypoint UDP/DTLS reply-source authorization gate: {e}",
                 if enabled { "enable" } else { "disable" }
@@ -716,7 +716,7 @@ impl BpfMaps {
             })?;
         }
         for key in cgroup_ids {
-            map.insert(*key, 1u8, 0).map_err(|e| {
+            map.insert(key, &1u8, 0).map_err(|e| {
                 format!(
                     "Failed to authorize a NodeWaypoint UDP relay cgroup in \
                      {BPF_MAP_UDP_RELAY_CGROUPS}: {e}"
@@ -728,7 +728,7 @@ impl BpfMaps {
 
     pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {
         let map = &mut self.bypass_uids;
-        map.insert(uid, 1u8, 0)
+        map.insert(&uid, &1u8, 0)
             .map_err(|e| format!("Failed to insert bypass UID {uid}: {e}"))
     }
 
@@ -736,12 +736,12 @@ impl BpfMaps {
         match parse_cidr_to_lpm_key(cidr)? {
             ParsedLpmKey::V4(key) => {
                 let map = &mut self.cidr_exclude4;
-                map.insert(&key, 1u8, 0)
+                map.insert(&key, &1u8, 0)
                     .map_err(|e| format!("Failed to insert exclude CIDR '{cidr}': {e}"))
             }
             ParsedLpmKey::V6(key) => {
                 let map = &mut self.cidr_exclude6;
-                map.insert(&key, 1u8, 0)
+                map.insert(&key, &1u8, 0)
                     .map_err(|e| format!("Failed to insert exclude CIDR '{cidr}': {e}"))
             }
         }
@@ -751,12 +751,12 @@ impl BpfMaps {
         match parse_cidr_to_lpm_key(cidr)? {
             ParsedLpmKey::V4(key) => {
                 let map = &mut self.cidr_include4;
-                map.insert(&key, 1u8, 0)
+                map.insert(&key, &1u8, 0)
                     .map_err(|e| format!("Failed to insert include CIDR '{cidr}': {e}"))
             }
             ParsedLpmKey::V6(key) => {
                 let map = &mut self.cidr_include6;
-                map.insert(&key, 1u8, 0)
+                map.insert(&key, &1u8, 0)
                     .map_err(|e| format!("Failed to insert include CIDR '{cidr}': {e}"))
             }
         }
@@ -764,7 +764,7 @@ impl BpfMaps {
 
     pub fn insert_port_exclude(&mut self, port: u16) -> Result<(), String> {
         let map = &mut self.port_exclude;
-        map.insert(port, 1u8, 0)
+        map.insert(&port, &1u8, 0)
             .map_err(|e| format!("Failed to insert exclude port {port}: {e}"))
     }
 
@@ -776,7 +776,7 @@ impl BpfMaps {
             return Ok(());
         };
         capture_config
-            .insert(FERRUM_CAPTURE_CONFIG_KEY, *config, 0)
+            .insert(&FERRUM_CAPTURE_CONFIG_KEY, config, 0)
             .map_err(|e| format!("Failed to update capture config: {e}"))
     }
 
@@ -792,7 +792,7 @@ impl BpfMaps {
             return Ok(());
         };
         include_ports
-            .insert(cgroup_id, *policy, 0)
+            .insert(&cgroup_id, policy, 0)
             .map_err(|e| format!("Failed to insert include-ports for cgroup {cgroup_id}: {e}"))
     }
 
@@ -825,7 +825,7 @@ impl BpfMaps {
             return Ok(());
         };
         workload_identity
-            .insert(cgroup_id, *identity, 0)
+            .insert(&cgroup_id, identity, 0)
             .map_err(|e| format!("Failed to insert workload identity for cgroup {cgroup_id}: {e}"))
     }
 
@@ -892,7 +892,7 @@ where
         tolerate_missing_map_remove(map.remove(&key), || format!("a withdrawn {map_name} entry"))?;
     }
     for key in desired {
-        map.insert(*key, 1u8, 0).map_err(|e| {
+        map.insert(key, &1u8, 0).map_err(|e| {
             format!("Failed to authorize a NodeWaypoint UDP/DTLS reply source in {map_name}: {e}")
         })?;
     }
