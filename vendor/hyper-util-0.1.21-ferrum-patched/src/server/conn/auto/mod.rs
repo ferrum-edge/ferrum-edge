@@ -1087,6 +1087,18 @@ impl<E> Http2Builder<'_, E> {
         self
     }
 
+    /// FERRUM PATCH 002: bound how long an HTTP/2 response body may wait for
+    /// the client to open its flow-control window.
+    ///
+    /// Forwards to the `response_write_timeout` that Ferrum's vendored hyper
+    /// adds to `hyper::server::conn::http2::Builder` (hyper patch 008); see
+    /// it for the semantics. It needs a [`timer`](Self::timer).
+    #[cfg(feature = "ferrum-h2-response-write-timeout")]
+    pub fn response_write_timeout(&mut self, timeout: impl Into<Option<Duration>>) -> &mut Self {
+        self.inner.http2.response_write_timeout(timeout);
+        self
+    }
+
     /// Set whether the `date` header should be included in HTTP responses.
     ///
     /// Note that including the `date` header is recommended by RFC 7231.

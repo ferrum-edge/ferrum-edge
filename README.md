@@ -577,6 +577,13 @@ at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, published on
 exists because Edge v0.9.18 was tagged but never published. Earlier contract
 tags remain unchanged.
 
+The **v0.9.20 candidate** follows published v0.9.19 with security and
+correctness fixes, closed plugin and mesh Telemetry configuration, and the
+strict-client DTLS 1.3 client-certificate fix. Its protected production
+release and the matching `contracts-edge-0.9.20` publication must succeed
+before consumers move their pins. See the
+[upgrade guide](docs/upgrade_guide.md#upgrading-to-0920).
+
 **v0.9.19** carries the plugin production-launch hardening from tagged but
 unpublished v0.9.18 and adds the [ARM64 OOM
 recovery](docs/releases/v0.9.18-arm64-recovery.md). Consumers move their pins
