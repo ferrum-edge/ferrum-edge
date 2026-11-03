@@ -15658,8 +15658,13 @@ async fn handle_connection(
     builder
         .http2()
         // Bounds the response body pipe's small-window coalescing wait
-        // (hyper patch 005, issue #6033).
+        // (hyper patch 005, issue #6033) and its flow-control stall bound.
         .timer(hyper_util::rt::TokioTimer::new())
+        // Resets a stream whose client grants no window for a ready response
+        // chunk (hyper patch 008); the socket bound above cannot see that.
+        .response_write_timeout(client_write_stall::h2_response_write_timeout(
+            state.env_config.http_client_write_timeout_seconds,
+        ))
         .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)
@@ -25303,8 +25308,13 @@ async fn handle_tls_connection(
     builder
         .http2()
         // Bounds the response body pipe's small-window coalescing wait
-        // (hyper patch 005, issue #6033).
+        // (hyper patch 005, issue #6033) and its flow-control stall bound.
         .timer(hyper_util::rt::TokioTimer::new())
+        // Resets a stream whose client grants no window for a ready response
+        // chunk (hyper patch 008); the socket bound above cannot see that.
+        .response_write_timeout(client_write_stall::h2_response_write_timeout(
+            state.env_config.http_client_write_timeout_seconds,
+        ))
         .max_header_list_size(h2_parser_max_header_list_size(state.max_header_size_bytes))
         .initial_stream_window_size(state.env_config.frontend_h2_initial_stream_window_size)
         .initial_connection_window_size(state.env_config.frontend_h2_initial_connection_window_size)

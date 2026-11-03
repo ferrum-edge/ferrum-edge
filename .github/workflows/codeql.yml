@@ -1,0 +1,97 @@
+name: CodeQL
+
+# CodeQL advanced setup. Replaces the repository's CodeQL *default setup*,
+# which scanned every language on every PR and has no way to opt a single
+# language out of PR scans.
+#
+# Why Rust is not a PR check: the Rust analysis takes ~2h on a standard
+# runner (~15m extraction, ~100m in the shared type-inference / data-flow
+# stage over ~2.7M lines of Rust). That cost scales with codebase size, not
+# with the PR diff, so it cannot be made PR-sized. Rust runs daily against
+# main instead, so a newly introduced alert surfaces within a day of merge.
+#
+# actions / python / c-cpp each finish in ~1m and keep running on PRs and on
+# pushes to main.
+#
+# Default setup MUST be disabled (Settings → Code security → CodeQL analysis →
+# Switch to advanced) for this workflow's uploads to be accepted.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Daily 01:11 UTC — clear of the 02:00–07:41 maintenance crons. Rust runs
+    # only from this tick (and manual dispatch); the fast languages also run
+    # here so their weekly-minimum freshness is preserved on quiet weeks.
+    - cron: "11 1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, c-cpp, python]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}
+
+  analyze-rust:
+    name: Analyze (rust)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: rust
+          build-mode: none
+          # tests/ is ~1.3M of the ~2.7M Rust lines and is not shipped code.
+          # Dropping it roughly halves the database the data-flow stage
+          # evaluates. vendor/ stays in: the patched networking crates ship
+          # in the gateway binary.
+          config: |
+            paths-ignore:
+              - tests
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:rust
