@@ -7,7 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.20] - 2026-11-02
+
+This patch release follows published 0.9.19. It closes plugin and mesh
+Telemetry configuration at every depth, scopes waypoint RequestAuthentication
+to the destination workload, and fixes strict DTLS 1.3 client-certificate
+handshakes, HTTP/1.1 slow-read and HTTP/2 flow-control stall exhaustion, the
+credential log filter's per-request CPU regression, gRPC deadline settlement
+and several plugin correctness defects. Some changes refuse configuration or traffic that 0.9.19
+accepted, and every custom plugin must export a config contract. The `V001`
+baseline checksum is unchanged from 0.9.19. Read
+[Upgrading to 0.9.20](docs/upgrade_guide.md#upgrading-to-0920) before updating
+gateways, control planes, custom plugins, charts or contract consumers.
+
 ### Changed
+- **Waypoint RequestAuthentication follows the destination workload**
+  (#6961, issue #6670). On a shared NodeWaypoint or ServiceWaypoint,
+  RequestAuthentication was selected by the waypoint's own namespace and
+  labels, so a selector RA naming a destination workload (`app=api`) never
+  matched and requests the waypoint served for it got no JWT validation,
+  token stripping, claim-header ownership or refusal. Waypoint slices now
+  carry the RAs that select the destinations the waypoint fronts. NodeWaypoint
+  Service routes apply the destination's RA set (JWT validation, stripping,
+  claim headers), and a route whose destination has no usable JWT rule is
+  excluded from the waypoint's own RA instance. A route is refused with `503`
+  when its destination is selected by a refused RA, its reachable workloads
+  are selected by different RA sets, it reaches a modeled destination whose
+  workloads cannot be resolved while destination RAs exist, or its provider
+  union exceeds what one `jwks_auth` instance can verify. An inbound HBONE
+  relay, or a NodeWaypoint transparent-capture connection, to a destination
+  selected by a refused RA is refused with `503`
+  (`mesh_authz.deny_policy=request_authentication_refused`), as is a
+  NodeWaypoint relay whose destination cannot be resolved while any refused RA
+  is present. With the mesh-managed `mesh_authz`, this per-destination check
+  replaces the blanket relay refusal a waypoint's own refused RA used to
+  install; an operator `mesh_authz` that replaces the managed one also
+  replaces the check. Sidecar and Ambient slices are unchanged. The same change keys `mesh_authz`
+  destination lookups by namespace as well as upstream id, so two Services
+  whose generated upstream ids collide across namespaces (`a`/`b-c` and
+  `a-b`/`c`) no longer resolve each other's workloads for destination
+  AuthorizationPolicy scoping.
+- **HTTP/1.1 and HTTP/2 pre-routing refusals are framed for gRPC and gRPC-Web
+  clients** (#6965, issue #6943). URL length, query-parameter count, the
+  protocol-header guard, Host/`:authority` disagreement and malformed
+  authority, the canonical path, the per-IP concurrency `429`, 0-RTT `425`
+  and the retired-listener `421` now answer native gRPC with Trailers-Only and
+  gRPC-Web with a framed trailer status, with the same codes and messages as
+  HTTP/3. Native gRPC header-limit refusals are Trailers-Only
+  `RESOURCE_EXHAUSTED`; gRPC-Web keeps the JSON `431`, as on HTTP/3. TRACE
+  answers gRPC and gRPC-Web with `UNIMPLEMENTED`. Other clients, and a WebSocket Upgrade or Extended CONNECT that carries a
+  gRPC Content-Type, keep the JSON answers.
+- **A CONNECT is never treated as a gRPC call** (#6969). Every CONNECT that is
+  not a WebSocket Extended CONNECT is classified as plain HTTP on HTTP/1.1,
+  HTTP/2 and HTTP/3, so a refused CONNECT that carries a gRPC Content-Type
+  keeps its HTTP status and JSON body instead of a `200` that clients and
+  hyper read as an established tunnel. A mesh HBONE CONNECT that declares a
+  gRPC or gRPC-Web Content-Type is now refused before routing with a plain
+  `400` `{"error":"gRPC requires POST method"}`; no tunnel is opened.
 - **GHCR images are public.** `ghcr.io/ferrum-edge/ferrum-edge` is now
   anonymously pullable like Docker Hub, and the release workflow's anonymous
   pull smoke fails the release if either registry refuses an anonymous pull
@@ -57,6 +113,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these examples. See [Config contract](CUSTOM_PLUGINS.md#config-contract).
 
 ### Fixed
+- **NodeWaypoint resolves enrolled sources outside its subscription
+  namespace** (#6964, issue #6800). A NodeWaypoint captures outbound TCP for
+  every pod enrolled on it, but its outbound identity resolver was seeded only
+  from the namespace-narrowed `workloads`, so enrolled cross-namespace sources
+  failed closed as `UnknownPod`. The resolver is now also seeded from the
+  NodeWaypoint capture inventory, binding each capture source to its exact
+  pod UID; records that disagree about one pod UID never resolve. The HTTP
+  admit path rechecks the current generation on every request and answers
+  `403` once a pod is withdrawn, and raw TCP refuses a captured but no longer
+  vouched-for stream at accept (counted in `/overload.node_waypoint_drops`)
+  instead of falling back to mesh-wide-only policy. UDP/DTLS source
+  attribution is unchanged: a capture-only cross-namespace source's datagrams
+  stay unattributed.
 - **`adaptive_concurrency` now resets when a streaming `ai_federation` provider
   destination changes.** With `streaming.enabled`, `ai_federation` commits a
   provider through `route_override_*` and the ordinary proxy dispatch dials it,
@@ -192,6 +261,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response-header bound wins an exact tie, as the direct HTTP/1.1 pool already
   attributed it. Gateway-owned terminals (an oversized upload, a
   `maxConnections` refusal, a write watermark) keep precedence.
+
+### Performance
+- **Plugin-free HTTP requests dispatch from their wire headers** (#6981,
+  issue #6671). A plain HTTP/1.x or HTTP/2 request on a route with no plugins,
+  no path-parameter captures, no egress-baggage stripping, a method other than
+  `OPTIONS` and a header block that maps 1:1 skips building the string header
+  map and re-parsing it into the outbound request. Every other request is
+  unchanged.
+- **The gRPC deadline response pump is skipped for responses that are
+  already complete** (#6982, issue #6904). A deadline-bearing H1/H2 gRPC
+  response whose upstream terminal is already buffered (bounded to 16 frames
+  or 64 KiB) is served from memory without the gateway-owned pump task; on
+  open routes the pump measured −17% to −21% throughput on deadline-bearing
+  unary and server-streaming calls (about −5% on `key_auth` routes). The
+  upload-side deadline timer is also armed lazily. Responses still streaming
+  keep the pump, so a client that withholds HTTP/2 credit still cannot outlive
+  its deadline.
+- **Undeclared plugin lifecycle hooks are skipped** (#6975, issue #6615).
+  Built-in plugins declare which of `on_request_received`, `before_proxy`,
+  `after_proxy` and `log` they implement, and the request path no longer
+  awaits a boxed no-op for the rest. Custom plugins and triggered plugin
+  instances default to every hook and are unchanged.
+- **The streaming terminal logger moves its log metadata instead of cloning
+  it** (#6980, issue #6793), saving one full metadata clone and drop per
+  streamed response on proxies with any plugin.
 
 ## [0.9.19] - 2026-10-27
 
@@ -11761,7 +11855,8 @@ published release notes.
   remediate these rows before upgrade; see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#tcp-connection-throttle-validation-hardening).
 
-[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.19...HEAD
+[Unreleased]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.20...HEAD
+[0.9.20]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.19...v0.9.20
 [0.9.19]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.19
 [0.9.18]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.17...v0.9.18
 [0.9.17]: https://github.com/ferrum-edge/ferrum-edge/compare/v0.9.15...v0.9.17
