@@ -680,10 +680,7 @@ impl<M: PoolManager> Drop for PendingCreationGuard<'_, M> {
 /// A creator that is cancelled, panics, or gives up against its own deadline
 /// publishes nothing and the next waiter is elected as a fresh creator.
 pub struct SharedCreationSlot<T> {
-    /// `Arc` only so [`SharedCreationSlot::try_claim_owned`] can hand a
-    /// detached growth task a guard that outlives the caller's borrow; every
-    /// other path locks it exactly as a plain mutex.
-    lock: Arc<tokio::sync::Mutex<()>>,
+    lock: tokio::sync::Mutex<()>,
     failures: watch::Sender<Option<T>>,
 }
 
@@ -691,7 +688,7 @@ impl<T> SharedCreationSlot<T> {
     pub fn new() -> Self {
         let (failures, _initial_rx) = watch::channel(None);
         Self {
-            lock: Arc::new(tokio::sync::Mutex::new(())),
+            lock: tokio::sync::Mutex::new(()),
             failures,
         }
     }
@@ -722,32 +719,6 @@ impl<T> SharedCreationSlot<T> {
             _guard: guard,
         })
     }
-
-    /// [`Self::try_claim`] for a growth dial that runs on a detached task.
-    ///
-    /// The lease owns the key's creation lock AND the slot itself, so it can
-    /// move into `tokio::spawn` while keeping the same single-flight guarantee
-    /// as a borrowed lease: no other grower or cold creator for the key runs
-    /// until it drops, and holding the slot keeps the pools' idle prune
-    /// (`Arc::strong_count(slot) > 1`) from discarding it mid-dial. It cannot
-    /// publish a failure: nobody joins a growth attempt as its cohort, so a
-    /// failed growth dial releases the lock and queued cold callers dial for
-    /// themselves, exactly as when a borrowed growth lease drops.
-    pub fn try_claim_owned(self: &Arc<Self>) -> Option<OwnedSharedCreationLease<T>> {
-        let guard = Arc::clone(&self.lock).try_lock_owned().ok()?;
-        Some(OwnedSharedCreationLease {
-            _guard: guard,
-            _slot: Arc::clone(self),
-        })
-    }
-}
-
-/// A key's creation lock held by a detached growth task
-/// ([`SharedCreationSlot::try_claim_owned`]). Dropping it releases the lock
-/// without publishing anything.
-pub struct OwnedSharedCreationLease<T> {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-    _slot: Arc<SharedCreationSlot<T>>,
 }
 
 impl<T> Default for SharedCreationSlot<T> {
@@ -869,66 +840,15 @@ pub struct GenericPool<M: PoolManager> {
     /// Budget for speculative background creates, separate from `inflight`:
     /// a slow or blackholed background create never holds a request-path
     /// permit or queues ahead of a request-path create.
-    background_inflight: BackgroundCreateBudget,
+    background_inflight: Arc<Semaphore>,
     pending_creations: Arc<DashMap<String, Arc<PendingCreation>>>,
 }
 
 /// One permit from a pool's background-create budget
-/// ([`GenericPool::try_background_create_permit`],
-/// [`BackgroundCreateBudget::try_acquire`]). Held for the whole background
-/// create, so the budget bounds how many run at once.
+/// ([`GenericPool::try_background_create_permit`]). Held for the whole
+/// background create, so the budget bounds how many run at once.
 pub struct BackgroundCreatePermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-/// Request-path creation permits per pool: available parallelism clamped to
-/// 4..=256 (32 when it cannot be read).
-fn request_create_limit() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().clamp(4, 256))
-        .unwrap_or(32)
-}
-
-/// A pool's never-waiting budget for speculative background creates: a
-/// quarter of its request-path creation limit, at least 1 and at most 4.
-///
-/// [`GenericPool`] holds one for its shard fills; the mesh HBONE pool, which
-/// keeps several transports per key outside `GenericPool`, holds one for its
-/// detached growth dials.
-pub struct BackgroundCreateBudget {
-    permits: Arc<Semaphore>,
-}
-
-impl BackgroundCreateBudget {
-    pub fn new() -> Self {
-        Self::for_request_limit(request_create_limit())
-    }
-
-    fn for_request_limit(request_limit: usize) -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new((request_limit / 4).clamp(1, 4))),
-        }
-    }
-
-    /// Take a permit if one is free. Never waits: `None` means skip the
-    /// speculative create and let a later caller start it.
-    pub fn try_acquire(&self) -> Option<BackgroundCreatePermit> {
-        self.permits
-            .clone()
-            .try_acquire_owned()
-            .ok()
-            .map(|permit| BackgroundCreatePermit { _permit: permit })
-    }
-
-    pub fn available_permits(&self) -> usize {
-        self.permits.available_permits()
-    }
-}
-
-impl Default for BackgroundCreateBudget {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Which creation budget a physical create draws from.
@@ -953,16 +873,19 @@ impl<M: PoolManager> GenericPool<M> {
     ) -> Arc<Self> {
         // Cold-path connection establishment is bounded per pool so a burst of
         // cache misses cannot fan out into unbounded concurrent dials.
-        let inflight_limit = request_create_limit();
+        let inflight_limit = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().clamp(4, 256))
+            .unwrap_or(32);
+        // Background creates get a small budget of their own, at most a
+        // quarter of the request-path one and never more than 4.
+        let background_limit = (inflight_limit / 4).clamp(1, 4);
         let pool = Arc::new(Self {
             manager,
             entries: Arc::new(DashMap::with_shard_amount(shards)),
             cfg: Arc::new(cfg),
             cleanup_interval,
             inflight: Arc::new(Semaphore::new(inflight_limit)),
-            // Background creates get a small budget of their own, at most a
-            // quarter of the request-path one and never more than 4.
-            background_inflight: BackgroundCreateBudget::for_request_limit(inflight_limit),
+            background_inflight: Arc::new(Semaphore::new(background_limit)),
             pending_creations: Arc::new(DashMap::with_shard_amount(shards)),
         });
         pool.clone().spawn_cleanup();
@@ -1006,7 +929,11 @@ impl<M: PoolManager> GenericPool<M> {
     /// Take a background-create permit if one is free. Never waits: a caller
     /// that gets `None` skips its speculative create and tries again later.
     pub fn try_background_create_permit(&self) -> Option<BackgroundCreatePermit> {
-        self.background_inflight.try_acquire()
+        self.background_inflight
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| BackgroundCreatePermit { _permit: permit })
     }
 
     pub fn stats(&self) -> PoolStats {

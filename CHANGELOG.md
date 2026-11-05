@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
   one "rejected" flag: every CNI ADD for an enrolled pod then failed its GC
@@ -53,26 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
-
-### Performance
-- **HBONE pool growth no longer delays the tunnel that triggers it.** When a
-  loaded HBONE (Ambient/waypoint) destination widened by one connection, the
-  checkout that noticed the load waited for the whole TCP + mTLS + HTTP/2
-  dial, up to the connect timeout against a peer that blackholes new
-  connections, although it already held a ready connection with room under
-  the peer's stream cap. That tunnel now opens on the connection it has, and
-  the dial runs on a detached task, the way gRPC shard fills already do. The
-  checkout first re-reads the peer's current stream cap and reserves its
-  stream slot; if the connection is full (the peer lowered its cap, or a
-  concurrent tunnel took the last slot), the tunnel waits for the new
-  connection and uses it, as before.
-  Growth stays single-flight per destination and draws on a small budget (a
-  quarter of the CPU count, 1 to 4 dials at once) that it never waits for.
-  The new connection serves later tunnels once it is pooled. In both the
-  HBONE and the Sidecar mesh-mTLS pools, the 10 s backoff after a failed
-  growth dial is now measured from the failure; it used to start with the
-  dial, so a dial that ran a 10 s or longer connect timeout got no backoff.
-  Sidecar mesh-mTLS growth is still awaited by the triggering request.
 
 ## [0.9.20] - 2026-11-02
 

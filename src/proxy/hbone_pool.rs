@@ -15,14 +15,14 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(test)]
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tracing::{Instrument, debug, error};
+use tracing::{debug, error};
 
 use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
@@ -32,10 +32,7 @@ use crate::modes::mesh::hbone::{
     BAGGAGE_HEADER, ISTIO_HBONE_PORT, UdpSourceIdentity, baggage_header_for_source,
     baggage_header_for_udp_source,
 };
-use crate::pool::{
-    BackgroundCreateBudget, OwnedSharedCreationLease, PoolCreateCaller, SharedCreationRole,
-    SharedCreationSlot,
-};
+use crate::pool::{PoolCreateCaller, SharedCreationRole, SharedCreationSlot};
 use crate::proxy::mesh_trust_registry::{
     MESH_KEEPALIVE_FAILED_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
     MeshTrustRegistry,
@@ -222,57 +219,10 @@ impl HboneConnectionLoad {
             .peer_max_streams
             .store(sender.current_max_send_streams(), Ordering::Relaxed);
     }
-
-    /// Reserve one CONNECT slot on this connection against the peer's LIVE
-    /// stream cap, or `None` when it is full. Pressure checkouts only.
-    ///
-    /// The cached cap moves on CONNECT responses, so a peer that has since
-    /// lowered `SETTINGS_MAX_CONCURRENT_STREAMS` leaves a connection the cache
-    /// still calls available; this re-samples it first (taking h2's connection
-    /// lock, so callers hold no pool lock here). The slot is taken with a
-    /// compare-exchange, so two pressured checkouts can never both claim the
-    /// last slot and leave one of them queued pending-open behind the cap
-    /// while a background dial widens the pool. The lease is the stream's own
-    /// accounting: `open_h2_connect_stream_reserved` adopts it instead of
-    /// counting the stream again, and dropping it on any error or
-    /// cancellation path releases the slot exactly once.
-    fn try_reserve(&self, sender: &SendRequest<Bytes>) -> Option<HboneStreamLease> {
-        self.record_peer_max_streams(sender);
-        let cap = self.peer_max_streams();
-        let mut current = self.active_streams();
-        loop {
-            if current >= cap {
-                return None;
-            }
-            match self.0.active_streams.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(HboneStreamLease(self.clone())),
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    fn is_same_connection(&self, other: &HboneConnectionLoad) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
 }
 
 /// RAII decrement for [`HboneConnectionLoad::active_streams`].
 pub(crate) struct HboneStreamLease(HboneConnectionLoad);
-
-impl std::fmt::Debug for HboneStreamLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("HboneStreamLease")
-    }
-}
-
-/// A checked-out HBONE connection plus, for a pressured checkout, the stream
-/// slot already reserved on it (`HboneConnectionLoad::try_reserve`).
-type HboneSenderCheckout = (MeshH2Transport, Option<HboneStreamLease>);
 
 impl Drop for HboneStreamLease {
     fn drop(&mut self) {
@@ -866,36 +816,6 @@ const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
 /// must not grow unbounded either.
 const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
 
-/// Settles one pressure-growth attempt however
-/// [`HboneConnectionPool::try_grow_sender`] ends. A dial that unwinds (a panic
-/// under `dial_and_publish`, in a build that unwinds; release builds abort)
-/// still backs the key off as a failed dial does, then the creation lease is
-/// released and the attempt is counted. The detached task's `JoinHandle` is
-/// dropped, so without this a panic would skip all three and the next
-/// pressured checkout would dial again at once. A cancelled attempt (runtime
-/// shutdown, or a by-value pool's caller going away) releases the lease
-/// without a backoff, as a cancelled inline grower always did.
-struct HboneGrowthAttempt<'a> {
-    pool: &'a HboneConnectionPool,
-    key: &'a str,
-    creation_lease: Option<OwnedSharedCreationLease<Arc<HbonePoolError>>>,
-}
-
-impl Drop for HboneGrowthAttempt<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.pool.growth_backoff_until.insert(
-                self.key.to_string(),
-                unix_secs() + HBONE_GROWTH_BACKOFF_SECS,
-            );
-        }
-        drop(self.creation_lease.take());
-        self.pool
-            .growth_attempts_finished
-            .fetch_add(1, Ordering::Release);
-    }
-}
-
 pub struct HboneConnectionPool {
     entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
     /// Per-key creation slots: the serialization mutex the pool has always
@@ -907,18 +827,6 @@ pub struct HboneConnectionPool {
     /// retried (issue #5465). Written only when growth fails; pruned with the
     /// idle sweep.
     growth_backoff_until: DashMap<String, u64>,
-    /// Never-waiting budget for detached growth dials, shared by every key:
-    /// bounds how many run at once across destinations.
-    background_growth: BackgroundCreateBudget,
-    /// Growth dials that have finished, published or failed and backed off.
-    /// Read only by tests, which have no other way to know a detached dial
-    /// is done.
-    growth_attempts_finished: AtomicUsize,
-    /// The `Arc` this pool lives in, set by [`HboneConnectionPool::into_shared`]
-    /// so a growth dial can run on a detached task that owns the pool. Unset
-    /// for a pool used by value (focused tests, standalone callers), which
-    /// grows inline instead.
-    self_handle: OnceLock<Weak<HboneConnectionPool>>,
     gateway_svid: SharedSvidBundle,
     crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<HboneSvidIdentityCache>>,
@@ -1075,9 +983,6 @@ impl HboneConnectionPool {
             entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
-            background_growth: BackgroundCreateBudget::new(),
-            growth_attempts_finished: AtomicUsize::new(0),
-            self_handle: OnceLock::new(),
             gateway_svid,
             crls,
             svid_identity_cache: ArcSwap::new(Arc::new(None)),
@@ -1095,24 +1000,6 @@ impl HboneConnectionPool {
             ),
             request_epoch: OnceLock::new(),
         }
-    }
-
-    /// Share this pool behind an `Arc` and remember that `Arc`, so pressure
-    /// growth runs on a detached task instead of making the checkout that
-    /// triggered it wait for the dial. `ProxyState` builds its pool this way.
-    pub fn into_shared(self) -> Arc<Self> {
-        let pool = Arc::new(self);
-        let _ = pool.self_handle.set(Arc::downgrade(&pool));
-        pool
-    }
-
-    /// Pressure-growth dials that have run to completion (pooled, refused,
-    /// failed, or timed out), counted after the backoff is recorded and the
-    /// creation lock released. Lets tests wait for a detached dial instead of
-    /// racing it.
-    #[doc(hidden)]
-    pub fn growth_attempts_finished_for_test(&self) -> usize {
-        self.growth_attempts_finished.load(Ordering::Acquire)
     }
 
     /// Install the published request epoch so inner leases can be keyed by the
@@ -1329,8 +1216,8 @@ impl HboneConnectionPool {
         );
 
         // A capability probe is one short-lived stream: it never widens the key.
-        let (sender, reserved) = if let Some(checkout) = fast_sender {
-            (checkout.transport, None)
+        let sender = if let Some(checkout) = fast_sender {
+            checkout.transport
         } else {
             let key = with_hbone_pool_key(
                 dial_host,
@@ -1365,7 +1252,7 @@ impl HboneConnectionPool {
         };
         tokio::time::timeout(
             connect_timeout,
-            self.open_connect_stream(sender, reserved, app_host, app_port, &source_identity),
+            self.open_connect_stream(sender, app_host, app_port, &source_identity),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
@@ -1625,36 +1512,15 @@ impl HboneConnectionPool {
                 |key| self.try_cached_sender_read(key),
             );
 
-            // A pressured checkout (the only kind that grows) reserves its
-            // stream slot against the peer's LIVE cap before it may keep this
-            // connection: the cached cap lags a peer that lowered it, and two
-            // pressured checkouts must not both take the last slot. Without a
-            // slot, the tunnel takes the write path, where a saturated key
-            // with room dials on the request path (or joins the growth dial in
-            // flight) and hands the new connection to this tunnel, instead of
-            // queueing here behind the cap. Unpressured checkouts reserve
-            // nothing; their CONNECT counts itself when it is sent.
-            let fast_sender = fast_sender.and_then(|checkout| {
-                if checkout.live_connections >= max_entries
-                    || checkout.active_streams < HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
-                {
-                    return Some((checkout, None));
-                }
-                let reserved = checkout
-                    .transport
-                    .load
-                    .try_reserve(&checkout.transport.sender)?;
-                Some((checkout, Some(reserved)))
-            });
-            let (sender, reserved) = if let Some((checkout, reserved)) = fast_sender {
+            let sender = if let Some(checkout) = fast_sender {
                 // The least-loaded connection is carrying at least the growth
-                // threshold of open tunnels and the key has room: widen
-                // (issue #5465). This tunnel stays on the ready connection it
-                // already has, which still has room under the peer's stream
-                // cap; the dial runs detached and publishes for later
-                // checkouts. A busy creation lock, a backoff, a spent growth
-                // budget, or a failed dial all just leave the width as is.
-                if let Some(reserved) = reserved {
+                // threshold of open tunnels and the key has room: try to widen
+                // (issue #5465). Growth is opportunistic — a busy creation
+                // lock, a backoff, or a failed dial all leave this tunnel on
+                // the connection it already has.
+                if checkout.live_connections < max_entries
+                    && checkout.active_streams >= HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
+                {
                     let key = with_hbone_pool_key(
                         dial_host,
                         app_port,
@@ -1668,7 +1534,7 @@ impl HboneConnectionPool {
                         |key| key.to_string(),
                     );
                     match self
-                        .grow_for_pressure(
+                        .try_grow_sender(
                             proxy,
                             dial_host,
                             app_host,
@@ -1685,13 +1551,11 @@ impl HboneConnectionPool {
                         )
                         .await
                     {
-                        // A by-value pool grew inline: the tunnel moves to the
-                        // new connection and the old slot is released.
-                        Some(grown) => (grown, None),
-                        None => (checkout.transport, Some(reserved)),
+                        Some(grown) => grown,
+                        None => checkout.transport,
                     }
                 } else {
-                    (checkout.transport, None)
+                    checkout.transport
                 }
             } else {
                 let key = with_hbone_pool_key(
@@ -1725,13 +1589,7 @@ impl HboneConnectionPool {
             };
             tokio::time::timeout(
                 connect_timeout,
-                self.open_connect_stream(
-                    sender,
-                    reserved,
-                    app_host,
-                    app_port,
-                    hbone_source_identity,
-                ),
+                self.open_connect_stream(sender, app_host, app_port, hbone_source_identity),
             )
             .await
             .map_err(|_| HbonePoolError::ConnectStream {
@@ -2069,7 +1927,7 @@ impl HboneConnectionPool {
         pool_config: &PoolConfig,
         connect_timeout_override: Option<Duration>,
         caller: PoolCreateCaller,
-    ) -> Result<HboneSenderCheckout, HbonePoolError> {
+    ) -> Result<MeshH2Transport, HbonePoolError> {
         self.maybe_prune_idle_entries();
         let max_entries = pool_config.http2_connections_per_host.max(1);
         let effective_connect_timeout_ms = connect_timeout_override
@@ -2082,41 +1940,29 @@ impl HboneConnectionPool {
                 live_connections,
                 active_streams,
             } => {
-                if live_connections >= max_entries
-                    || active_streams < HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
+                if live_connections < max_entries
+                    && active_streams >= HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
+                    && let Some(grown) = self
+                        .try_grow_sender(
+                            proxy,
+                            dial_host,
+                            app_host,
+                            app_port,
+                            app_policy_port,
+                            hbone_port,
+                            expected_peer,
+                            expected_trust_domain,
+                            sni_override,
+                            key,
+                            pool_config,
+                            max_entries,
+                            connect_timeout,
+                        )
+                        .await
                 {
-                    return Ok((transport, None));
+                    return Ok(grown);
                 }
-                // Pressure: as in `get_tunnel_via`, reserve the stream slot
-                // against the peer's live cap first. With a slot, grow in the
-                // background and keep this connection; without one, fall
-                // through to the coalesced cold path below, which re-checks
-                // under the creation lock and dials if it must.
-                if let Some(reserved) = transport.load.try_reserve(&transport.sender) {
-                    return Ok(
-                        match self
-                            .grow_for_pressure(
-                                proxy,
-                                dial_host,
-                                app_host,
-                                app_port,
-                                app_policy_port,
-                                hbone_port,
-                                expected_peer,
-                                expected_trust_domain,
-                                sni_override,
-                                key,
-                                pool_config,
-                                max_entries,
-                                connect_timeout,
-                            )
-                            .await
-                        {
-                            Some(grown) => (grown, None),
-                            None => (transport, Some(reserved)),
-                        },
-                    );
-                }
+                return Ok(transport);
             }
             HboneCheckout::Saturated {
                 transport,
@@ -2137,7 +1983,7 @@ impl HboneConnectionPool {
                     peer_max_streams = transport.load.peer_max_streams(),
                     "Every pooled HBONE HTTP/2 connection is at the peer's stream cap; queueing on the least-loaded one"
                 );
-                return Ok((transport, None));
+                return Ok(transport);
             }
             // Saturated with room to widen, or no connection at all: dial one,
             // coalescing with every other caller that reached the same
@@ -2170,11 +2016,11 @@ impl HboneConnectionPool {
         // Double-check under the creation lock: a coalesced waiter may find the
         // creator's connection already inserted, or the width filled meanwhile.
         match self.cached_sender(key) {
-            HboneCheckout::Available { transport, .. } => return Ok((transport, None)),
+            HboneCheckout::Available { transport, .. } => return Ok(transport),
             HboneCheckout::Saturated {
                 transport,
                 live_connections,
-            } if live_connections >= max_entries => return Ok((transport, None)),
+            } if live_connections >= max_entries => return Ok(transport),
             HboneCheckout::Saturated { .. } | HboneCheckout::Empty => {}
         }
 
@@ -2206,7 +2052,6 @@ impl HboneConnectionPool {
             effective_connect_timeout_ms,
         )
         .await
-        .map(|transport| (transport, None))
     }
 
     fn creation_slot(&self, key: &str) -> Arc<HboneCreationSlot> {
@@ -2216,25 +2061,13 @@ impl HboneConnectionPool {
             .clone()
     }
 
-    /// Add one physical connection to a key whose least-loaded connection is
-    /// under pressure (issue #5465), without making the caller wait for the
-    /// dial: it keeps the usable connection it already selected.
-    ///
-    /// Everything that bounds growth runs here, before anything is spawned:
-    /// the per-key failure backoff, the key's creation lock (taken only if
-    /// free, and owned by the dial until it finishes, so a growth dial never
-    /// overlaps another growth or cold dial for the key), the width re-check
-    /// under that lock, and the pool's background-growth budget, which is
-    /// never waited for. The dial itself is the cold path's
-    /// `dial_and_publish`, so `maxConnections` admission, SVID/CRL pinning,
-    /// and the post-dial rotation, drain and trust-withdrawal checks apply
-    /// unchanged.
-    ///
-    /// Returns `Some` only for a pool used by value (no
-    /// [`Self::into_shared`] handle): with no `Arc` for a detached task to
-    /// own, it dials inline and serves the caller on the new connection.
+    /// Add one physical connection to a key that already has a usable one
+    /// (issue #5465). Returns the new transport, or `None` whenever growth is
+    /// not possible right now — the caller then opens its tunnel on the
+    /// connection it already selected. Never waits for the creation lock: a
+    /// cold dial or another grower in flight means "not now", not "queue".
     #[allow(clippy::too_many_arguments)]
-    async fn grow_for_pressure(
+    async fn try_grow_sender(
         &self,
         proxy: &Proxy,
         dial_host: &str,
@@ -2257,9 +2090,10 @@ impl HboneConnectionPool {
         {
             return None;
         }
-        let creation_lease = self.creation_slot(key).try_claim_owned()?;
+        let creation_slot = self.creation_slot(key);
+        let creation_lease = creation_slot.try_claim()?;
         // Re-check under the lock: another grower may have widened the key
-        // (or a prune may have narrowed it) since the checkout.
+        // (or a prune may have narrowed it) since the fast-path read.
         let live_connections = self
             .entries
             .get(key)
@@ -2268,108 +2102,6 @@ impl HboneConnectionPool {
         if live_connections >= max_entries {
             return None;
         }
-        let Some(handle) = self.self_handle.get() else {
-            return self
-                .try_grow_sender(
-                    creation_lease,
-                    proxy,
-                    dial_host,
-                    app_host,
-                    app_port,
-                    app_policy_port,
-                    hbone_port,
-                    expected_peer,
-                    expected_trust_domain,
-                    sni_override,
-                    key,
-                    pool_config,
-                    max_entries,
-                    live_connections,
-                    connect_timeout,
-                )
-                .await;
-        };
-        let permit = self.background_growth.try_acquire()?;
-        let pool = handle.upgrade()?;
-        // The dial shares nothing with the caller's tunnel, which rides a
-        // connection that is ready and under the peer's stream cap. Owned
-        // copies are made once per growth event (single-flight per key and
-        // backed off after a failure), never per request.
-        let proxy = proxy.clone();
-        let dial_host = dial_host.to_owned();
-        let app_host = app_host.to_owned();
-        let expected_peer = expected_peer.cloned();
-        let expected_trust_domain = expected_trust_domain.cloned();
-        let sni_override = sni_override.map(str::to_owned);
-        let key = key.to_owned();
-        let pool_config = pool_config.clone();
-        // The task's logs carry the destination and, through the span's
-        // parent, the request that started the growth.
-        let span = tracing::debug_span!(
-            "hbone_pool_growth",
-            dial_host = %dial_host,
-            app_port,
-            hbone_port,
-            key = %key
-        );
-        let growth = async move {
-            let _permit = permit;
-            // A pooled connection stays in `entries`; one built under rotated
-            // material is not pooled and closes when this drops it.
-            let _grown = pool
-                .try_grow_sender(
-                    creation_lease,
-                    &proxy,
-                    &dial_host,
-                    &app_host,
-                    app_port,
-                    app_policy_port,
-                    hbone_port,
-                    expected_peer.as_ref(),
-                    expected_trust_domain.as_ref(),
-                    sni_override.as_deref(),
-                    &key,
-                    &pool_config,
-                    max_entries,
-                    live_connections,
-                    connect_timeout,
-                )
-                .await;
-        };
-        tokio::spawn(growth.instrument(span));
-        None
-    }
-
-    /// The growth dial itself, run while `creation_lease` holds the key's
-    /// creation lock. A failure never reaches a request: it is counted by
-    /// `dial_and_publish` (`record_pool_failure`), logged, and backs the key
-    /// off for `HBONE_GROWTH_BACKOFF_SECS` before the lock is released. A
-    /// [`HboneGrowthAttempt`] guard settles the attempt even if the dial
-    /// unwinds.
-    #[allow(clippy::too_many_arguments)]
-    async fn try_grow_sender(
-        &self,
-        creation_lease: OwnedSharedCreationLease<Arc<HbonePoolError>>,
-        proxy: &Proxy,
-        dial_host: &str,
-        app_host: &str,
-        app_port: u16,
-        app_policy_port: u16,
-        hbone_port: u16,
-        expected_peer: Option<&crate::identity::SpiffeId>,
-        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
-        sni_override: Option<&str>,
-        key: &str,
-        pool_config: &PoolConfig,
-        max_entries: usize,
-        live_connections: usize,
-        connect_timeout: Duration,
-    ) -> Option<MeshH2Transport> {
-        let attempt = HboneGrowthAttempt {
-            pool: self,
-            key,
-            creation_lease: Some(creation_lease),
-        };
         let effective_connect_timeout_ms = connect_timeout.as_millis().min(u64::MAX as u128) as u64;
         let dialed = self
             .dial_and_publish(
@@ -2422,7 +2154,7 @@ impl HboneConnectionPool {
                 None
             }
         };
-        drop(attempt);
+        drop(creation_lease);
         grown
     }
 
@@ -2783,7 +2515,6 @@ impl HboneConnectionPool {
     async fn open_connect_stream(
         &self,
         transport: MeshH2Transport,
-        reserved: Option<HboneStreamLease>,
         target_host: &str,
         target_port: u16,
         source_identity: &crate::identity::SpiffeId,
@@ -2792,9 +2523,8 @@ impl HboneConnectionPool {
         // carrying the source workload identity; the shared opener handles the
         // rest of the CONNECT exchange.
         let baggage = baggage_header_for_source(source_identity);
-        open_h2_connect_stream_reserved(
+        open_h2_connect_stream(
             transport,
-            reserved,
             target_host,
             target_port,
             Some(&baggage),
@@ -3306,29 +3036,6 @@ pub(crate) async fn open_h2_connect_stream(
     baggage: Option<&str>,
     marker: Option<&'static str>,
 ) -> Result<H2ConnectTunnel, HbonePoolError> {
-    open_h2_connect_stream_reserved(transport, None, target_host, target_port, baggage, marker)
-        .await
-}
-
-/// [`open_h2_connect_stream`] for a stream whose slot a pressured checkout
-/// already reserved on `transport` (`HboneConnectionLoad::try_reserve`):
-/// the stream adopts that lease instead of counting itself a second time. A
-/// failure or cancellation before the stream exists drops it, releasing the
-/// slot.
-pub(crate) async fn open_h2_connect_stream_reserved(
-    transport: MeshH2Transport,
-    reserved: Option<HboneStreamLease>,
-    target_host: &str,
-    target_port: u16,
-    baggage: Option<&str>,
-    marker: Option<&'static str>,
-) -> Result<H2ConnectTunnel, HbonePoolError> {
-    debug_assert!(
-        reserved
-            .as_ref()
-            .is_none_or(|lease| lease.0.is_same_connection(&transport.load)),
-        "a reserved stream slot must belong to the connection it opens on"
-    );
     let authority = authority_for_host_port(target_host, target_port);
     // Synchronous refusal: a transport retired between checkout and CONNECT may
     // not open a new stream, even though its socket has not finished closing.
@@ -3391,9 +3098,8 @@ pub(crate) async fn open_h2_connect_stream_reserved(
         });
     }
     // Counted from the send: a CONNECT parked pending-open behind the peer's
-    // stream cap is load too. A failed open drops the lease on the way out. A
-    // pressured checkout's reservation already counts this stream.
-    let stream_lease = reserved.unwrap_or_else(|| load.lease());
+    // stream cap is load too. A failed open drops the lease on the way out.
+    let stream_lease = load.lease();
     let (response_fut, send_stream) =
         sender
             .send_request(request, false)

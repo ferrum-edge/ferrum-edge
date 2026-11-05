@@ -16,7 +16,7 @@
 //! failure published afterwards is observable by all of them whether or not
 //! they have reached the lock yet.
 
-use ferrum_edge::pool::{BackgroundCreateBudget, SharedCreationRole, SharedCreationSlot};
+use ferrum_edge::pool::{SharedCreationRole, SharedCreationSlot};
 use ferrum_edge::proxy::hbone_pool::HbonePoolError;
 use ferrum_edge::retry::ErrorClass;
 use ferrum_edge::tls::spiffe::SpiffeTlsError;
@@ -494,73 +494,4 @@ async fn try_claim_lease_does_not_broadcast_unless_asked() {
         outcome.is_ok(),
         "a growth dial that gives up must not fail the cold cohort: {outcome:?}"
     );
-}
-
-// ===== detached growth: an owned lease (EDGE-DP-1 / EDGE-DP-2) =====
-
-#[tokio::test]
-async fn owned_lease_is_single_flight_while_a_detached_task_holds_it() {
-    let slot = Arc::new(FailureSlot::new());
-    let lease = slot.try_claim_owned().expect("a free slot is claimed");
-    assert!(slot.try_claim().is_none(), "a borrowed claim declines");
-    assert!(slot.try_claim_owned().is_none(), "a second grower declines");
-    assert_eq!(
-        Arc::strong_count(&slot),
-        2,
-        "the lease holds the slot, so the pools' idle prune keeps it"
-    );
-
-    // The lease moves into a detached task and outlives this borrow of the
-    // slot; the key stays claimed until the task finishes.
-    let (finish, finished) = oneshot::channel::<()>();
-    let grower = tokio::spawn(async move {
-        let _lease = lease;
-        let _ = finished.await;
-    });
-    let cold = {
-        let slot = Arc::clone(&slot);
-        tokio::spawn(async move {
-            match slot.join().wait().await {
-                SharedCreationRole::Creator(_) => Ok(()),
-                SharedCreationRole::Failed(shared) => Err(shared.clone_for_broadcast()),
-            }
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(slot.try_claim_owned().is_none(), "still held by the task");
-    assert!(!cold.is_finished(), "a cold caller waits behind the grower");
-
-    finish.send(()).expect("grower still running");
-    grower.await.expect("grower task");
-    let outcome = tokio::time::timeout(Duration::from_secs(2), cold)
-        .await
-        .expect("cold caller resolves")
-        .expect("cold task");
-    assert!(
-        outcome.is_ok(),
-        "a growth lease publishes no failure, so the cold caller dials itself: {outcome:?}"
-    );
-    assert!(
-        slot.try_claim_owned().is_some(),
-        "released for the next grower"
-    );
-}
-
-#[test]
-fn background_create_budget_never_waits_and_refills_on_release() {
-    let budget = BackgroundCreateBudget::new();
-    let size = budget.available_permits();
-    assert!(
-        (1..=4).contains(&size),
-        "a quarter of the request-path limit, 1 to 4: {size}"
-    );
-    let held: Vec<_> = (0..size)
-        .map(|_| budget.try_acquire().expect("permit within the budget"))
-        .collect();
-    assert!(
-        budget.try_acquire().is_none(),
-        "a spent budget declines instead of waiting"
-    );
-    drop(held);
-    assert_eq!(budget.available_permits(), size);
 }
