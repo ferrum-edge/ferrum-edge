@@ -902,8 +902,8 @@ pub fn tls_acme_max_accounts_from_env() -> Result<usize, String> {
 
 /// Pure parse for `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY`.
 ///
-/// `0` is valid and means retain no terminal order history (active/recoverable
-/// orders are never pruned by this setting).
+/// `0` is valid and means retain no terminal order history (active orders are
+/// never pruned by this setting).
 pub fn parse_tls_acme_terminal_order_history(raw: Option<&str>) -> Result<usize, String> {
     parse_bounded_usize_setting(
         TLS_ACME_TERMINAL_ORDER_HISTORY_KEY,

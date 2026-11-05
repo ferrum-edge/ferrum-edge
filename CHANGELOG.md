@@ -31,6 +31,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphaned handshake markers only when `/health` was ready, so an unproved
   ingress topology or a withheld migration proof left producers for removed
   pods waiting. Both now depend only on the completed pod relist.
+- **ACME order finalization no longer overwrites concurrent work or revives
+  terminal orders** (#7020). `POST /admin/tls/acme/orders/{id}/finalize` read
+  the order, spent up to its poll timeout on CA I/O, then wrote its result back
+  blind. That could overwrite a renewal that completed the same order meanwhile
+  (putting the cleared private key/CSR back), recreate an order deleted in that
+  window, or turn a `failed` order into `valid`. The order lifecycle is now an
+  explicit state machine: only `pending_challenges`, `ready` and `processing`
+  can be finalized, and `valid`, `failed` and `cancelled` can never be left.
+  Finalizing a terminal order returns `409` before any CA request. The final
+  `valid` or `failed` write is a compare-and-set on the order as it was read;
+  if anything changed it in between, the order is left as it is. For a
+  successful finalization the endpoint then returns `409` (a certificate
+  already stored stays stored); a CA-invalid result still returns `502` with
+  the CA's error, whether or not its best-effort `failed` write applied. An order
+  is marked `failed` only when the CA reports it `invalid`, as on the renewal
+  path; network errors, poll timeouts and local certificate-validation
+  failures now leave it active so the same request can be retried. Finalizing
+  into a certificate whose latest order is another active order returns `409`,
+  since the finalized order would otherwise hide that order from renewal.
+  `failed` orders drop their key/CSR, and terminal orders that still carry
+  one are pruned as ordinary history under
+  `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
 ## [0.9.20] - 2026-11-02
 

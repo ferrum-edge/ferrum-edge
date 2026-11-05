@@ -685,6 +685,19 @@ pub(super) async fn handle_finalize_acme_order(
             Ok(order) => order,
             Err(error) => return Ok(acme_error_response(error)),
         };
+        // Only an active order can be finalized. `valid`, `failed` and
+        // `cancelled` are terminal (`AcmeOrderStatus::transition_to`), so this
+        // is refused before any CA I/O rather than turning a terminal order
+        // back into `valid`.
+        if !order.status.is_active() {
+            return Ok(super::json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": format!(
+                    "ACME order '{}' is no longer active and cannot be finalized; create a new order",
+                    order.id
+                )}),
+            ));
+        }
         let certificate_id = match acme_finalize_certificate_id(&order, &request) {
             Ok(certificate_id) => certificate_id,
             Err(error) => {
@@ -694,6 +707,26 @@ pub(super) async fn handle_finalize_acme_order(
                 ));
             }
         };
+        // The final write would stamp this order as the newest one for the
+        // certificate it is persisted under, hiding another active order there
+        // from the renewal planner; the store's compare-and-set refuses that.
+        // Refuse the predictable case here, before CA I/O and before the
+        // certificate record is written; the compare-and-set stays authoritative
+        // for anything that changes in between.
+        match order_store.latest_order_for_certificate(&certificate_id) {
+            Ok(Some(latest)) if latest.id != order.id && latest.status.is_active() => {
+                return Ok(super::json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!(
+                        "ACME certificate '{certificate_id}' has another active order '{}'; \
+                         finalize or delete that order first",
+                        latest.id
+                    )}),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Ok(acme_error_response(error)),
+        }
         // Only consult the shared account store when the order does not already
         // carry credentials, and treat a store failure as a store failure: an
         // unreachable account store must not be reported as "this order has no
@@ -781,12 +814,16 @@ pub(super) async fn handle_finalize_acme_order(
         } {
             Ok(completed) => completed,
             Err(error) => {
-                persist_failed_acme_order(
-                    Arc::clone(&order_store),
-                    order.clone(),
-                    error.to_string(),
-                )
-                .await;
+                // Same rule as the renewal path: only the CA's authoritative
+                // `invalid` order state makes the order terminal. A transient
+                // failure (network, poll timeout) leaves it active, so this
+                // endpoint can resume it from the CA's current state.
+                if matches!(
+                    error,
+                    crate::tls::acme::client::AcmeClientError::TerminalInvalidOrder
+                ) {
+                    persist_ca_invalid_acme_order(Arc::clone(&order_store), order.clone()).await;
+                }
                 return Ok(super::json_response(
                     StatusCode::BAD_GATEWAY,
                     &json!({"error": error.to_string()}),
@@ -802,7 +839,8 @@ pub(super) async fn handle_finalize_acme_order(
                 .cert_expiry_warning_days
                 .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS),
         ) {
-            persist_failed_acme_order(Arc::clone(&order_store), order.clone(), error.clone()).await;
+            // The CA order itself is fine; the order stays active so a retry
+            // (for example with `allow_expired`) can retrieve the certificate.
             return Ok(super::json_response(
                 StatusCode::BAD_GATEWAY,
                 &json!({"error": error}),
@@ -841,16 +879,15 @@ pub(super) async fn handle_finalize_acme_order(
             Err(error) => return Ok(acme_error_response(error)),
         };
 
-        let mut updated_order = order;
-        updated_order.certificate_id = Some(certificate_id);
-        updated_order.status = AcmeOrderStatus::Valid;
-        updated_order.error = None;
-        // The certificate is durably published above and the order is about to
-        // become terminal, so the finalization material has nothing left to
-        // recover. Same retention rule as the renewal path.
-        updated_order.finalization = None;
+        // Compare-and-set against the snapshot read before the CA I/O: a
+        // renewal that completed this order meanwhile, an operator delete, or
+        // any other write wins, and the order is left as it is. The store
+        // clears the finalization material in the same `valid` write, the same
+        // retention rule as the renewal path.
+        let order_id = order.id.clone();
+        let published_certificate_id = certificate_id.clone();
         let stored_order = match offload_store_write("acme_order_upsert", move || {
-            order_store.upsert_order(updated_order, true)
+            order_store.complete_order_if_current(&order, certificate_id)
         })
         .await
         {
@@ -858,7 +895,21 @@ pub(super) async fn handle_finalize_acme_order(
             Err(response) => return Ok(*response),
         };
         let updated_order = match stored_order {
-            Ok(record) => record,
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                // The certificate above is published, so watchers must still
+                // re-pull it; only the order record was left untouched.
+                request_managed_source_reloads();
+                return Ok(super::json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!(
+                        "ACME order '{order_id}' changed, or certificate \
+                         '{published_certificate_id}' gained another active order, while \
+                         finalization was in flight; the certificate was stored, but the order \
+                         record was left unchanged"
+                    )}),
+                ));
+            }
             Err(error) => return Ok(acme_error_response(error)),
         };
         persist_acme_account_credentials(&updated_order).await;
@@ -2395,20 +2446,33 @@ fn acme_order_finalization_for_finalize(
     Ok(finalization.clone())
 }
 
-/// Record an order's terminal failure. Best effort: the caller is already
-/// returning the underlying failure to the operator, so a store problem here
-/// must not replace that diagnostic — but it is offloaded like every other
-/// locking store write, and a failure is accounted for rather than dropped.
+/// Record the CA's terminal `invalid` verdict on the order snapshot admin
+/// finalize read. Best effort: the caller is already returning the underlying
+/// failure to the operator, so a store problem here must not replace that
+/// diagnostic — but it is offloaded like every other locking store write, and a
+/// failure is accounted for rather than dropped.
+///
+/// Goes through the same compare-and-set as the renewal path, so an order that
+/// a renewal completed, an operator deleted, or anything else rewrote during
+/// the CA I/O is left as it is rather than overwritten from the stale snapshot.
 #[cfg(feature = "acme")]
-async fn persist_failed_acme_order(
+async fn persist_ca_invalid_acme_order(
     store: Arc<crate::tls::acme::AcmeOrderStore>,
-    mut record: AcmeOrderRecord,
-    error: String,
+    expected: AcmeOrderRecord,
 ) {
-    record.status = AcmeOrderStatus::Failed;
-    record.error = Some(error);
-    let persisted = offload_secondary_store_write("acme_failed_order_persist", move || {
-        store.upsert_order(record, true).is_ok()
+    let persisted = offload_secondary_store_write("acme_failed_order_persist", move || match store
+        .fail_ca_invalid_order_if_current(&expected)
+    {
+        Ok(failed) => {
+            if !failed {
+                warn!(
+                    order_id = %expected.id,
+                    "CA-invalid ACME order changed during admin finalize; left unchanged"
+                );
+            }
+            true
+        }
+        Err(_) => false,
     })
     .await;
     if !persisted {

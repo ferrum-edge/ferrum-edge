@@ -799,3 +799,110 @@ mod audience_binding {
         cp_c.shutdown().await;
     }
 }
+
+/// `RemoteEndpointStore::remove` vs. an in-flight FIRST-SIGHT install.
+///
+/// `install` re-checks the cluster generation inside its `inner.rcu` closure
+/// and then CASes against the snapshot pointer it read. When `remove` retires
+/// the generation in that gap and has no cached entry to drop, it must still
+/// publish a NEW snapshot pointer; otherwise the install's CAS succeeds and
+/// commits endpoints for a retired cluster that nothing ever reaps. The CAS
+/// window itself is not reachable from outside the store, so this pins the
+/// observable half of the fix: retiring a registered-but-never-installed
+/// cluster republishes the snapshot (mirroring `FederationStore`).
+mod remove_fences_first_sight_install {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ferrum_edge::grpc::dp_client::GrpcJwtSecret;
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
+    use ferrum_edge::modes::mesh::multicluster::{
+        RemoteClusterPollContext, RemoteDiscoveryCandidate, RemoteDiscoveryConfig,
+        RemoteDiscoveryManager, RemoteDiscoveryTlsConfig, RemoteEndpointStore, RemoteServiceSource,
+    };
+    use ferrum_edge::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
+
+    const CREDENTIAL_REF: &str = "west-discovery";
+
+    /// A poll that never completes: the cluster stays registered with no
+    /// endpoints installed, which is exactly the first-sight state.
+    struct NeverCompletes;
+
+    #[async_trait::async_trait]
+    impl RemoteServiceSource for NeverCompletes {
+        async fn fetch(&self) -> Result<RemoteDiscoveryCandidate, String> {
+            std::future::pending().await
+        }
+    }
+
+    fn declared_west() -> MultiClusterConfig {
+        MultiClusterConfig {
+            remote_clusters: vec![RemoteCluster {
+                name: "west".to_string(),
+                trust_domain: TrustDomain::new("remote.local").expect("trust domain"),
+                network: Some("net2".to_string()),
+                control_plane_url: Some("https://cp.remote.example:15010".to_string()),
+                federation_endpoint: None,
+                discovery_credential_ref: Some(CREDENTIAL_REF.to_string()),
+            }],
+            ..MultiClusterConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_a_registered_cluster_without_endpoints_republishes_the_snapshot() {
+        let store = RemoteEndpointStore::new();
+        let config = RemoteDiscoveryConfig {
+            poll_interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(5),
+            max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
+            production_mode: false,
+            // Filled per cluster from the resolved discovery credential.
+            jwt_secret: None,
+            node_id: "dp-poller".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
+        };
+        let credentials = Arc::new(HashMap::from([(
+            CREDENTIAL_REF.to_string(),
+            GrpcJwtSecret::new("remote-discovery-test-secret-000000".to_string()),
+        )]));
+        let mut manager = RemoteDiscoveryManager::new(
+            Some(config),
+            store.clone(),
+            |_ctx: &RemoteClusterPollContext| -> Arc<dyn RemoteServiceSource> {
+                Arc::new(NeverCompletes)
+            },
+        )
+        .with_credentials(credentials);
+        let trust_domains: HashSet<TrustDomain> =
+            HashSet::from([TrustDomain::new("remote.local").expect("trust domain")]);
+
+        let before = store.snapshot();
+        manager.reconcile(Some(&declared_west()), trust_domains.clone());
+        assert!(
+            Arc::ptr_eq(&before, &store.snapshot()),
+            "registering a poller publishes no endpoints"
+        );
+
+        // Withdraw the cluster while its first poll is still in flight.
+        manager.reconcile(Some(&MultiClusterConfig::default()), trust_domains);
+        let after = store.snapshot();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "retiring a generation must republish the snapshot so an in-flight first-sight \
+             install's CAS against the old pointer fails and re-checks the retired generation"
+        );
+        assert!(after.clusters.is_empty());
+
+        // A second removal of the now-untracked cluster is a true no-op.
+        let untracked = store.snapshot();
+        store.remove("west");
+        assert!(Arc::ptr_eq(&untracked, &store.snapshot()));
+
+        manager.shutdown();
+    }
+}

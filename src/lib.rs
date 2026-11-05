@@ -5149,14 +5149,14 @@ pub mod _test_support {
         response_status: u16,
         connection_error: bool,
         error_class: Option<crate::retry::ErrorClass>,
-        is_half_open_probe: bool,
+        ticket: crate::circuit_breaker::ProbeTicket,
     ) {
         crate::proxy::backend_dispatch::apply_circuit_breaker_outcome(
             cb,
             response_status,
             connection_error,
             error_class,
-            is_half_open_probe,
+            ticket,
         )
     }
 
@@ -19273,13 +19273,13 @@ pub mod _test_support {
         cb: &crate::circuit_breaker::CircuitBreaker,
         status: hyper::StatusCode,
         policy_refusal: bool,
-        is_half_open_probe: bool,
+        ticket: crate::circuit_breaker::ProbeTicket,
     ) {
         crate::proxy::settle_hbone_backend_connect_circuit_breaker_outcome(
             cb,
             status,
             policy_refusal,
-            is_half_open_probe,
+            ticket,
         )
     }
 

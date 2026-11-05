@@ -2,7 +2,7 @@
 //!
 //! Covers exact-limit and limit+1 whole-document I/O, previous-state preservation
 //! on oversized candidate writes, managed create vs overwrite/delete at the
-//! logical record limit, ACME active/recoverable retention with bounded terminal
+//! logical record limit, ACME active-order retention with bounded terminal
 //! history across thousands of renewal cycles, bounded event-log load/compaction,
 //! secret-safe oversized diagnostics, true OS-process atomic visibility, FIFO
 //! open fail-closed without hang, replica record-count gauge refresh, and
@@ -417,7 +417,7 @@ fn acme_terminal_history_stays_bounded_across_thousands_of_cycles_without_droppi
     let dir = tempfile::tempdir().expect("tempdir");
     let store = AcmeOrderStore::open_with_limits(dir.path(), 3, None).expect("open");
 
-    // Active/recoverable orders must survive unbounded renewal cycles.
+    // Active orders must survive unbounded renewal cycles.
     for status in [
         AcmeOrderStatus::PendingChallenges,
         AcmeOrderStatus::Ready,
@@ -429,15 +429,18 @@ fn acme_terminal_history_stays_bounded_across_thousands_of_cycles_without_droppi
             .expect("active upsert");
     }
 
-    // Valid + finalization material is crash-recovery state and must be retained.
-    let mut recoverable = sample_order("valid-recoverable", "cert-a", AcmeOrderStatus::Valid);
-    recoverable.finalization = Some(
+    // A terminal order that still carries key/CSR material has no recovery
+    // path (it can be neither finalized nor resumed), so it is ordinary
+    // history: written first, it is the oldest and must be pruned, private key
+    // material included.
+    let mut stale = sample_order("valid-with-material", "cert-a", AcmeOrderStatus::Valid);
+    stale.finalization = Some(
         AcmeOrderFinalization::generate(&["example.test".to_string()])
             .expect("generate finalization"),
     );
     store
-        .upsert_order(recoverable, false)
-        .expect("recoverable valid upsert");
+        .upsert_order(stale, false)
+        .expect("valid with material upsert");
 
     for cycle in 0..2_500 {
         let id = format!("term-{cycle}");
@@ -477,23 +480,21 @@ fn acme_terminal_history_stays_bounded_across_thousands_of_cycles_without_droppi
             matches!(
                 order.status,
                 AcmeOrderStatus::Failed | AcmeOrderStatus::Cancelled
-            ) || (order.status == AcmeOrderStatus::Valid && order.id != "valid-recoverable")
+            ) || order.status == AcmeOrderStatus::Valid
         })
         .count();
-    assert_eq!(active, 3, "active/recoverable orders must be retained");
+    assert_eq!(active, 3, "active orders must be retained");
     assert!(
-        store
-            .get_order("valid-recoverable")
-            .expect("recoverable valid order")
-            .finalization
-            .is_some(),
-        "valid orders with finalization material must be retained"
+        matches!(
+            store.get_order("valid-with-material"),
+            Err(AcmeError::OrderNotFound(_))
+        ),
+        "a terminal order is pruned as history even when it carries key/CSR material"
     );
     assert_eq!(
         terminal, 3,
         "terminal history must stay at the configured bound"
     );
-    assert!(store.get_order("valid-recoverable").is_ok());
     assert!(
         store.get_order("active-0").is_ok()
             || store.get_order("active-1").is_ok()

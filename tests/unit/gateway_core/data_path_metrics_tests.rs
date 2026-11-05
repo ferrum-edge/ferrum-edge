@@ -16,7 +16,7 @@ use ferrum_edge::config::types::{
 use ferrum_edge::data_path_metrics;
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::LoadBalancerCache;
-use ferrum_edge::overload::OverloadState;
+use ferrum_edge::overload::{OverloadState, RequestAdmissionEvent};
 use ferrum_edge::service_discovery::merge_targets;
 use std::sync::atomic::Ordering;
 
@@ -68,7 +68,9 @@ fn samples<'a>(text: &'a str, metric: &str) -> Vec<&'a str> {
 #[test]
 fn overload_families_render_the_live_shedding_state() {
     let overload = OverloadState::new();
-    overload.reject_new_requests.store(true, Ordering::Relaxed);
+    overload
+        .request_admission
+        .apply(RequestAdmissionEvent::RequestPressure { reject: true });
     overload.disable_keepalive.store(true, Ordering::Relaxed);
     overload.port_exhaustion_events.store(7, Ordering::Relaxed);
     overload.active_requests.store(41, Ordering::Relaxed);

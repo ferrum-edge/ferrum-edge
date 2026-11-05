@@ -9,7 +9,7 @@
 //! connections and waits up to a configurable drain period for them to complete.
 
 use crossbeam_utils::CachePadded;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -104,6 +104,72 @@ pub enum OverloadLevel {
     Critical,
 }
 
+/// Why new requests/streams are refused, as ONE atomic bitset (OV-1).
+///
+/// Request admission has two independent owners: shutdown drain, which is
+/// one-way, and the overload monitor's request-pressure verdict, which comes
+/// and goes. With a single shared `bool` the monitor computed
+/// `draining || pressure` from a load, then stored the result; a
+/// `begin_drain` landing between that load and that store was overwritten
+/// with `false`, so a draining gateway kept admitting requests until the next
+/// monitor tick. Each owner now sets only its own bit through
+/// [`Self::apply`], so the monitor can never clear the drain bit, and the hot
+/// path still decides with a single load.
+pub struct RequestAdmissionGate(AtomicU8);
+
+/// One input to the [`RequestAdmissionGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAdmissionEvent {
+    /// Shutdown drain began. Latches; nothing clears it.
+    DrainBegun,
+    /// The overload monitor's request-pressure verdict for this sample.
+    RequestPressure { reject: bool },
+}
+
+impl RequestAdmissionGate {
+    const DRAIN: u8 = 1 << 0;
+    const PRESSURE: u8 = 1 << 1;
+
+    pub const fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    /// Whether new requests/streams must be rejected (drain OR pressure).
+    /// `Acquire` pairs with the `Release` half of [`Self::apply`], so an
+    /// admission that observes the drain bit also observes every store
+    /// `begin_drain` made before it.
+    #[inline]
+    pub fn rejects(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
+    }
+
+    /// Apply one event, touching only the bit its owner holds. Returns whether
+    /// requests were rejected before and after the event (for transition logs).
+    pub fn apply(&self, event: RequestAdmissionEvent) -> (bool, bool) {
+        let (previous, now) = match event {
+            RequestAdmissionEvent::DrainBegun => {
+                let previous = self.0.fetch_or(Self::DRAIN, Ordering::AcqRel);
+                (previous, previous | Self::DRAIN)
+            }
+            RequestAdmissionEvent::RequestPressure { reject: true } => {
+                let previous = self.0.fetch_or(Self::PRESSURE, Ordering::AcqRel);
+                (previous, previous | Self::PRESSURE)
+            }
+            RequestAdmissionEvent::RequestPressure { reject: false } => {
+                let previous = self.0.fetch_and(!Self::PRESSURE, Ordering::AcqRel);
+                (previous, previous & !Self::PRESSURE)
+            }
+        };
+        (previous != 0, now != 0)
+    }
+}
+
+impl Default for RequestAdmissionGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Atomic overload state read by the proxy hot path.
 ///
 /// The background monitor writes these flags; request threads only read.
@@ -111,7 +177,7 @@ pub enum OverloadLevel {
 /// for overload signals (a few ms of stale state is harmless).
 ///
 /// Hot-path atomics (`disable_keepalive`, `reject_new_connections`,
-/// `reject_new_requests`, `active_connections`, `active_requests`,
+/// `request_admission`, `active_connections`, `active_requests`,
 /// `red_drop_probability`, `red_request_counter`) are wrapped in
 /// [`CachePadded`] to prevent false sharing across cores: at 1M conn/sec
 /// churn, an unpadded layout puts the read-mostly action flags on the same
@@ -130,10 +196,12 @@ pub struct OverloadState {
     pub disable_keepalive: CachePadded<AtomicBool>,
     /// When true, new connections are rejected with 503 before routing.
     pub reject_new_connections: CachePadded<AtomicBool>,
-    /// When true, new requests/streams are rejected with 503 before processing.
-    /// Independent of `reject_new_connections` — connections track sockets,
-    /// requests track multiplexed H2/H3/gRPC streams.
-    pub reject_new_requests: CachePadded<AtomicBool>,
+    /// When it [`rejects`](RequestAdmissionGate::rejects), new requests/streams
+    /// are rejected with 503 before processing. Independent of
+    /// `reject_new_connections` — connections track sockets, requests track
+    /// multiplexed H2/H3/gRPC streams. Drain and request pressure each own one
+    /// bit (OV-1), so the monitor cannot clear a drain.
+    pub request_admission: CachePadded<RequestAdmissionGate>,
 
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
@@ -241,7 +309,7 @@ impl OverloadState {
         Self {
             disable_keepalive: CachePadded::new(AtomicBool::new(false)),
             reject_new_connections: CachePadded::new(AtomicBool::new(false)),
-            reject_new_requests: CachePadded::new(AtomicBool::new(false)),
+            request_admission: CachePadded::new(RequestAdmissionGate::new()),
             draining: AtomicBool::new(false),
             drain_wait_ended: AtomicBool::new(false),
             drain_wait_ended_token: CancellationToken::new(),
@@ -272,9 +340,7 @@ impl OverloadState {
 
     /// Current overload level derived from the action flags.
     pub fn level(&self) -> OverloadLevel {
-        if self.reject_new_connections.load(Ordering::Relaxed)
-            || self.reject_new_requests.load(Ordering::Relaxed)
-        {
+        if self.reject_new_connections.load(Ordering::Relaxed) || self.request_admission.rejects() {
             OverloadLevel::Critical
         } else if self.disable_keepalive.load(Ordering::Relaxed) {
             OverloadLevel::Pressure
@@ -441,7 +507,7 @@ impl OverloadState {
             actions: ActionSnapshot {
                 disable_keepalive: self.disable_keepalive.load(Ordering::Relaxed),
                 reject_new_connections: self.reject_new_connections.load(Ordering::Relaxed),
-                reject_new_requests: self.reject_new_requests.load(Ordering::Relaxed),
+                reject_new_requests: self.request_admission.rejects(),
             },
         }
     }
@@ -1287,14 +1353,10 @@ pub fn start_monitor(
 
             // Request-level overload rejection only triggers when
             // FERRUM_MAX_REQUESTS is configured (non-zero). Shutdown drain is
-            // also a request-admission rejection source: once begin_drain()
-            // has published draining=true with Release ordering, the monitor
-            // must preserve that state instead of clearing reject_new_requests
-            // during a low-pressure sample.
+            // the other request-admission rejection source; it owns its own bit
+            // in `request_admission`, which the monitor never writes (OV-1).
             let should_reject_requests_due_to_pressure =
                 max_requests > 0 && req_ratio >= config.req_critical_threshold;
-            let should_reject_requests =
-                state.draining.load(Ordering::Acquire) || should_reject_requests_due_to_pressure;
 
             // ── RED-style smooth ramp between pressure and critical thresholds ──
             // For BOTH fd and connection pressure, compute probability independently
@@ -1326,7 +1388,6 @@ pub fn start_monitor(
 
             // Transition logging — only log when state changes
             let was_rejecting = state.reject_new_connections.load(Ordering::Relaxed);
-            let was_rejecting_requests = state.reject_new_requests.load(Ordering::Acquire);
             let was_keepalive_disabled = state.disable_keepalive.load(Ordering::Relaxed);
 
             // Issue #4542: one call writes the hot-path atomic H1/H2 reads and
@@ -1337,9 +1398,14 @@ pub fn start_monitor(
             state
                 .reject_new_connections
                 .store(should_reject, Ordering::Relaxed);
-            state
-                .reject_new_requests
-                .store(should_reject_requests, Ordering::Release);
+            // Only the pressure bit is written: a concurrent `begin_drain`
+            // cannot be overwritten (OV-1).
+            let (was_rejecting_requests, should_reject_requests) =
+                state
+                    .request_admission
+                    .apply(RequestAdmissionEvent::RequestPressure {
+                        reject: should_reject_requests_due_to_pressure,
+                    });
 
             if should_reject && !was_rejecting {
                 warn!(
@@ -1747,11 +1813,13 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 
 /// Mark the overload state as draining and refuse new request admission.
 ///
-/// Sets both `draining` and `reject_new_requests` together so they are observed
-/// atomically with respect to each other from the shutdown trigger task. Stores
-/// use `Ordering::Release` so any loader that does an `Acquire` load (proxy hot
-/// path keepalive-close decision, request admission control, guard drop drain
-/// notification) sees the post-shutdown state in a happens-before relationship.
+/// Sets `draining`, then the drain bit of `request_admission`. Both writes
+/// release, so any loader that does an `Acquire` load (proxy hot path
+/// keepalive-close decision, request admission control, guard drop drain
+/// notification) sees the post-shutdown state in a happens-before
+/// relationship. The drain bit is owned here alone: the overload monitor writes
+/// only the pressure bit, so a monitor sample racing this call cannot re-admit
+/// requests (OV-1).
 ///
 /// Called by every serving mode at the START of the post-listener-exit phase,
 /// regardless of `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
@@ -1764,7 +1832,7 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 /// join is deliberate and must not be collapsed by setting these flags ahead
 /// of the broadcast: the HTTP/3 listener runs its own bounded GOAWAY drain
 /// before its handle returns, and during that window accepted H3 streams and
-/// CONNECT-UDP tunnels keep being served. Setting `reject_new_requests` and
+/// CONNECT-UDP tunnels keep being served. Setting the drain admission bit and
 /// `drain_started` earlier would reject those streams and end those tunnels
 /// (see `docs/http3.md`). In the gap, HTTP/1.1 keep-alive is already off
 /// through hyper's `graceful_shutdown()`. [`begin_shutdown_drain`] logs
@@ -1776,7 +1844,7 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 /// 1. **`draining=true`** — `Connection: close` is injected on HTTP/1.1 responses
 ///    so keepalive clients release connections instead of holding them open
 ///    until process exit. Also gates the guard-drop `drain_complete` notify.
-/// 2. **`reject_new_requests=true`** — new requests/streams arriving on
+/// 2. **`request_admission` drain bit** — new requests/streams arriving on
 ///    EXISTING connections (especially H2/H3 multiplexed streams that have no
 ///    `Connection: close` analogue and keepalive H1 streams that race the
 ///    close hint) are rejected with 503 / gRPC UNAVAILABLE before processing.
@@ -1790,7 +1858,9 @@ pub fn classify_shutdown_signal(observed_count: u32) -> ShutdownSignalAction {
 /// [PR #569]: https://github.com/ferrum-edge/ferrum-edge/pull/569
 pub fn begin_drain(state: &Arc<OverloadState>) {
     state.draining.store(true, Ordering::Release);
-    state.reject_new_requests.store(true, Ordering::Release);
+    state
+        .request_admission
+        .apply(RequestAdmissionEvent::DrainBegun);
     state.drain_started.cancel();
 }
 
@@ -1875,7 +1945,7 @@ pub const SHUTDOWN_DRAIN_BEGUN_LOG: &str =
 /// [`ShutdownSender`], so time spent joining listeners (including H3's drain
 /// and endpoint close) is never granted again.
 ///
-/// This function does NOT toggle `draining` / `reject_new_requests` — that is
+/// This function does NOT toggle `draining` / the drain admission bit — that is
 /// [`begin_drain`]'s job, run unconditionally on shutdown so the close hint
 /// fires even when the operator has set `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` to
 /// disable the wait loop.

@@ -225,7 +225,7 @@ fn charged_to_backend(response: &BackendResponse) -> bool {
         response.status_code,
         response.connection_error,
         response.error_class,
-        false,
+        ferrum_edge::circuit_breaker::ProbeTicket::NonProbe,
     );
     cb.failure_count() > 0 || cb.state_name() == "open"
 }

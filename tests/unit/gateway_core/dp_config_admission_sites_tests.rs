@@ -43,7 +43,7 @@ fn http1_and_http2_admission_checks_the_gate_before_the_acme_early_return() {
         .find("crate::tls::acme::http01_key_authorization_for_path")
         .expect("ACME HTTP-01 early return");
     let overload = PROXY_MOD
-        .find(".reject_new_requests")
+        .find(".request_admission.rejects()")
         .expect("overload admission gate");
 
     assert!(

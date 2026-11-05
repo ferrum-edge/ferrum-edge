@@ -213,7 +213,7 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
-use crate::circuit_breaker::{CircuitBreakerCache, scoped_cache_key};
+use crate::circuit_breaker::{BreakerOutcome, CircuitBreakerCache, ProbeTicket, scoped_cache_key};
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
@@ -5869,9 +5869,10 @@ impl Drop for StreamLbSetupFailureGuard {
 ///
 /// This guard makes the release structural rather than conventional:
 ///
-/// * [`Self::take_slot`] hands the slot to exactly one explicit outcome record.
-///   It returns the `is_half_open_probe` argument `record_success` /
-///   `record_failure` / `record_neutral` take and disarms the guard in the same
+/// * [`Self::take_slot`] hands the slot to exactly one explicit
+///   [`CircuitBreaker::settle`](crate::circuit_breaker::CircuitBreaker::settle).
+///   It returns the admission's [`ProbeTicket`] — the slot together with the
+///   open generation it was claimed in — and disarms the guard in the same
 ///   call, so a slot cannot be released twice (a double release decrements a
 ///   DIFFERENT probe's slot and over-admits).
 /// * [`Self::release_neutral`] settles a gateway-side refusal. Such a refusal is
@@ -5881,9 +5882,11 @@ impl Drop for StreamLbSetupFailureGuard {
 ///   client drive a healthy backend to OPEN.
 /// * [`Drop`] does the same for every path that settles nothing at all — above
 ///   all a service future dropped under the gateway by a client disconnect.
-/// * Both neutral releases are bound to the open generation the slot was
-///   admitted in (#6177). A reopen already zeroes the old cycle's slots, so a
-///   guard that outlives it must not free a slot a LATER cycle's probe holds.
+/// * Every settlement — success, failure, or neutral — is bound to the open
+///   generation the slot was admitted in (#6177, CB-1), because the ticket
+///   carries it into the breaker's own CAS. A reopen already zeroes the old
+///   cycle's slots, so a guard that outlives it can neither free a slot a LATER
+///   cycle's probe holds nor close/reopen that later cycle.
 /// * [`Self::rearm`] re-points the guard at the breaker of a rotated retry
 ///   target after the previous target's slot has been settled.
 ///
@@ -5908,26 +5911,49 @@ pub struct HalfOpenProbeGuard {
     ///
     /// Interior-mutable so a retry can re-point a guard it only borrows
     /// ([`Self::rearm`]). A guard belongs to ONE request task and is never
-    /// settled concurrently, so the three fields need not change as one unit.
+    /// settled concurrently, so `cb` and `slot` need not change as one unit.
     cb: arc_swap::ArcSwapOption<crate::circuit_breaker::CircuitBreaker>,
-    /// The open generation the attempt was admitted in, as returned by the
-    /// admitting CAS itself — never a pre- or post-admission snapshot. Neutral
-    /// releases are no-ops once the breaker has left this generation (#6177).
-    admission_generation: AtomicU64,
-    /// Whether this guard still owns an unsettled probe slot.
-    armed: AtomicBool,
+    /// The unsettled [`ProbeTicket`], encoded so taking it is ONE atomic swap:
+    /// `0` is "no slot held" (a CLOSED admission, or already settled), and
+    /// `PROBE_SLOT_HELD | generation` is a slot of that open generation, as
+    /// returned by the admitting CAS itself. The flag and the generation can
+    /// therefore never be observed apart.
+    slot: AtomicU64,
+}
+
+/// Marks [`HalfOpenProbeGuard::slot`] as holding a probe slot; the low 32 bits
+/// carry the slot's open generation.
+const PROBE_SLOT_HELD: u64 = 1 << 32;
+
+#[inline]
+const fn encode_probe_slot(ticket: ProbeTicket) -> u64 {
+    match ticket {
+        ProbeTicket::NonProbe => 0,
+        ProbeTicket::Probe { generation } => PROBE_SLOT_HELD | generation as u64,
+    }
+}
+
+#[inline]
+const fn decode_probe_slot(slot: u64) -> ProbeTicket {
+    if slot & PROBE_SLOT_HELD == 0 {
+        ProbeTicket::NonProbe
+    } else {
+        // Truncation keeps exactly the low 32 bits `encode_probe_slot` wrote.
+        ProbeTicket::Probe {
+            generation: slot as u32,
+        }
+    }
 }
 
 /// One attempt's circuit-breaker settlement: the breaker instance that admitted
-/// it plus whether it holds a HALF_OPEN probe slot. Built from the attempt's
+/// it plus the [`ProbeTicket`] it settles with. Built from the attempt's
 /// [`HalfOpenProbeGuard`] (taking the slot) and handed to the shared outcome
 /// recorder, which settles it only while that instance is still the cached
 /// breaker and otherwise releases the slot on the admitting breaker and drops
 /// the outcome as stale (issue #6799).
 pub struct BreakerSettlement {
     pub(crate) breaker: Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
-    pub(crate) is_half_open_probe: bool,
-    pub(crate) admission_generation: u64,
+    pub(crate) ticket: ProbeTicket,
 }
 
 impl BreakerSettlement {
@@ -5935,8 +5961,7 @@ impl BreakerSettlement {
     pub const fn none() -> Self {
         Self {
             breaker: None,
-            is_half_open_probe: false,
-            admission_generation: 0,
+            ticket: ProbeTicket::NonProbe,
         }
     }
 }
@@ -5946,59 +5971,62 @@ impl HalfOpenProbeGuard {
     pub fn none() -> Self {
         Self {
             cb: arc_swap::ArcSwapOption::empty(),
-            admission_generation: AtomicU64::new(0),
-            armed: AtomicBool::new(false),
+            slot: AtomicU64::new(0),
         }
     }
 
     /// Own the admission `check_circuit_breaker` just returned: the admitting
-    /// breaker (`None` when no breaker is configured), whether it admitted a
-    /// HALF_OPEN probe, and the generation that same admission returned.
+    /// breaker (`None` when no breaker is configured) and that same admission's
+    /// [`ProbeTicket`].
     pub fn new(
         admitted: Option<&Arc<crate::circuit_breaker::CircuitBreaker>>,
-        is_half_open_probe: bool,
-        admission_generation: u64,
+        ticket: ProbeTicket,
     ) -> Self {
         match admitted {
-            Some(cb) => Self::for_admitted_probe(cb, is_half_open_probe, admission_generation),
+            Some(cb) => Self::for_admitted_probe(cb, ticket),
             None => Self::none(),
         }
     }
 
     /// Own an admission on an already-resolved breaker — the retry and stream
     /// paths, which admit through `can_execute*` and get the `Arc` back
-    /// directly. `is_half_open_probe` and `admission_generation` are that
-    /// admission's own verdict and generation. The breaker is kept for a
-    /// CLOSED admission too, so its outcome settles on the same instance.
+    /// directly. `ticket` is that admission's own verdict and generation. The
+    /// breaker is kept for a CLOSED admission too, so its outcome settles on the
+    /// same instance.
     pub fn for_admitted_probe(
         cb: &Arc<crate::circuit_breaker::CircuitBreaker>,
-        is_half_open_probe: bool,
-        admission_generation: u64,
+        ticket: ProbeTicket,
     ) -> Self {
         Self {
             cb: arc_swap::ArcSwapOption::new(Some(Arc::clone(cb))),
-            admission_generation: AtomicU64::new(admission_generation),
-            armed: AtomicBool::new(is_half_open_probe),
+            slot: AtomicU64::new(encode_probe_slot(ticket)),
         }
     }
 
     /// Does this guard still own an unsettled probe slot? A plain read — use
     /// [`Self::take_slot`] anywhere the answer is about to settle the slot.
     pub fn holds_slot(&self) -> bool {
-        self.armed.load(Ordering::Acquire)
+        self.held_ticket().is_probe()
     }
 
-    /// Hand the slot to ONE explicit `record_success` / `record_failure` /
-    /// `record_neutral`, returning the `is_half_open_probe` argument it takes.
-    /// Every later caller — `Drop` included — sees `false`.
-    pub fn take_slot(&self) -> bool {
-        self.armed.swap(false, Ordering::AcqRel)
+    /// The ticket this guard still holds, WITHOUT taking it — for a caller that
+    /// hands the slot to a deferred recorder and then [`Self::disarm`]s.
+    pub fn held_ticket(&self) -> ProbeTicket {
+        decode_probe_slot(self.slot.load(Ordering::Acquire))
+    }
+
+    /// Hand the slot to ONE explicit
+    /// [`CircuitBreaker::settle`](crate::circuit_breaker::CircuitBreaker::settle),
+    /// returning the ticket it settles. Every later caller — `Drop` included —
+    /// sees [`ProbeTicket::NonProbe`].
+    pub fn take_slot(&self) -> ProbeTicket {
+        decode_probe_slot(self.slot.swap(0, Ordering::AcqRel))
     }
 
     /// Give the slot up without recording anything, for a caller that has handed
     /// ownership to a deferred recorder which will settle it later.
     pub fn disarm(&self) {
-        self.armed.store(false, Ordering::Release);
+        self.slot.store(0, Ordering::Release);
     }
 
     /// The breaker that admitted this attempt, ONLY while it is still the cached
@@ -6024,8 +6052,7 @@ impl HalfOpenProbeGuard {
     pub fn settle(&self) -> BreakerSettlement {
         BreakerSettlement {
             breaker: self.cb.load_full(),
-            is_half_open_probe: self.take_slot(),
-            admission_generation: self.admission_generation.load(Ordering::Acquire),
+            ticket: self.take_slot(),
         }
     }
 
@@ -6034,8 +6061,7 @@ impl HalfOpenProbeGuard {
     pub fn settlement_without_slot(&self) -> BreakerSettlement {
         BreakerSettlement {
             breaker: self.cb.load_full(),
-            is_half_open_probe: false,
-            admission_generation: self.admission_generation.load(Ordering::Acquire),
+            ticket: ProbeTicket::NonProbe,
         }
     }
 
@@ -6043,11 +6069,11 @@ impl HalfOpenProbeGuard {
     /// backend outcome existed, so the breaker's health must not move. A no-op
     /// once a reopen has retired the slot's admission generation.
     pub fn release_neutral(&self) {
-        if self.take_slot()
+        let ticket = self.take_slot();
+        if ticket.is_probe()
             && let Some(cb) = &*self.cb.load()
         {
-            let admission_generation = self.admission_generation.load(Ordering::Acquire);
-            cb.record_neutral_for_admission(true, admission_generation);
+            cb.settle(ticket, BreakerOutcome::Neutral);
         }
     }
 
@@ -6056,19 +6082,13 @@ impl HalfOpenProbeGuard {
     /// NEUTRAL first: callers settle it before rotating, and releasing here
     /// rather than dropping the reference is what keeps a future reordering from
     /// silently reintroducing the leak this type exists to close.
-    pub fn rearm(
-        &self,
-        cb: &Arc<crate::circuit_breaker::CircuitBreaker>,
-        is_half_open_probe: bool,
-        admission_generation: u64,
-    ) {
+    pub fn rearm(&self, cb: &Arc<crate::circuit_breaker::CircuitBreaker>, ticket: ProbeTicket) {
         self.release_neutral();
         // Disarmed by the release above, so no slot is attributed to the new
-        // breaker before its own admission's verdict is stored.
+        // breaker before its own admission's ticket is stored.
         self.cb.store(Some(Arc::clone(cb)));
-        self.admission_generation
-            .store(admission_generation, Ordering::Release);
-        self.armed.store(is_half_open_probe, Ordering::Release);
+        self.slot
+            .store(encode_probe_slot(ticket), Ordering::Release);
     }
 
     /// A retry's admission was REFUSED: settle any slot still held neutrally
@@ -6102,8 +6122,8 @@ pub(crate) fn admit_retry_attempt(
         target_key,
         cb_config,
     ) {
-        Ok((cb, is_half_open_probe, admission_generation)) => {
-            cb_probe.rearm(&cb, is_half_open_probe, admission_generation);
+        Ok((cb, probe_ticket, _admission_generation)) => {
+            cb_probe.rearm(&cb, probe_ticket);
             true
         }
         Err(_) => {
@@ -6116,11 +6136,11 @@ pub(crate) fn admit_retry_attempt(
 
 impl Drop for HalfOpenProbeGuard {
     fn drop(&mut self) {
-        if self.armed.swap(false, Ordering::AcqRel)
+        let ticket = decode_probe_slot(self.slot.swap(0, Ordering::AcqRel));
+        if ticket.is_probe()
             && let Some(cb) = &*self.cb.load()
         {
-            let admission_generation = self.admission_generation.load(Ordering::Acquire);
-            cb.record_neutral_for_admission(true, admission_generation);
+            cb.settle(ticket, BreakerOutcome::Neutral);
         }
     }
 }
@@ -6130,19 +6150,23 @@ impl Drop for HalfOpenProbeGuard {
 /// as `grpc-status` trailers over HTTP 200 (not a transport failure), so a
 /// status outside `failure_status_codes` is a success that advances HALF_OPEN
 /// recovery; only a genuine HTTP failure status (e.g. a sandwiched LB /
-/// overloaded backend 5xx) trips the breaker. `record_failure` with a
-/// non-failure status only releases the probe slot, so it cannot stand in for
-/// `record_success` on a 2xx HALF_OPEN probe.
+/// overloaded backend 5xx) trips the breaker. A `Failure` with a non-failure
+/// status only releases the probe slot, so it cannot stand in for `Success` on
+/// a 2xx HALF_OPEN probe.
 fn record_grpc_backend_status_outcome(
     cb: &crate::circuit_breaker::CircuitBreaker,
     backend_status: u16,
-    is_half_open_probe: bool,
+    ticket: ProbeTicket,
 ) {
-    if cb.config().failure_status_codes.contains(&backend_status) {
-        cb.record_failure(backend_status, false, is_half_open_probe);
+    let outcome = if cb.config().failure_status_codes.contains(&backend_status) {
+        BreakerOutcome::Failure {
+            status_code: backend_status,
+            connection_error: false,
+        }
     } else {
-        cb.record_success(is_half_open_probe);
-    }
+        BreakerOutcome::Success
+    };
+    cb.settle(ticket, outcome);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6321,8 +6345,10 @@ fn h3_success_on_drop_after_response_bytes(
 ///  * **Probe-slot release** (HALF_OPEN only) happens at the join of
 ///    `headers_seen` + `upload_terminated` (or the post-header upload guard) —
 ///    the #1640 timing, so the single slot is freed as soon as the upload ends
-///    and never pinned for a long-lived response stream. It is a NEUTRAL release
-///    (`record_neutral`), decoupled from the health outcome.
+///    and never pinned for a long-lived response stream. It is a NEUTRAL
+///    settlement of the admission's [`ProbeTicket`], decoupled from the health
+///    outcome, so it is a no-op once a reopen has retired the ticket's cycle
+///    (CB-1): a stream that outlives a reopen cannot free a later cycle's slot.
 ///  * **A backend FAILURE** (post-wire body error / non-OK grpc-status trailer)
 ///    is recorded as soon as the response terminates — a real failure should trip
 ///    promptly and need not wait for the upload — UNLESS the client upload
@@ -6340,7 +6366,9 @@ fn h3_success_on_drop_after_response_bytes(
 /// [`grpc_proxy::GrpcUploadTerminationObserver`].
 struct GrpcStreamingProbeRecorder {
     cb: Arc<crate::circuit_breaker::CircuitBreaker>,
-    is_half_open_probe: bool,
+    /// The admission's ticket. Only its probe slot is settled through it (the
+    /// health outcome settles as a non-probe, epoch-checked below).
+    ticket: ProbeTicket,
     /// Shared with `GrpcBody::Streaming.exceeded`: a late client-upload overflow.
     /// Re-read at every settle point so an overflow that trips after a clean
     /// response is still classified NEUTRAL.
@@ -6380,14 +6408,14 @@ struct GrpcStreamingProbeRecorder {
 impl GrpcStreamingProbeRecorder {
     fn new(
         cb: Arc<crate::circuit_breaker::CircuitBreaker>,
-        is_half_open_probe: bool,
+        ticket: ProbeTicket,
         request_body_exceeded: Arc<std::sync::atomic::AtomicBool>,
         post_header_upload_timeout_ms: Option<u64>,
         admission_open_epoch: u64,
     ) -> Self {
         Self {
             cb,
-            is_half_open_probe,
+            ticket,
             request_body_exceeded,
             headers_seen: std::sync::atomic::AtomicBool::new(false),
             upload_terminated: std::sync::atomic::AtomicBool::new(false),
@@ -6420,7 +6448,7 @@ impl GrpcStreamingProbeRecorder {
     /// Release the HALF_OPEN probe slot (NEUTRAL) at the join of headers + upload
     /// termination, exactly once. Decoupled from the health outcome.
     fn try_release_slot(&self) {
-        if !self.is_half_open_probe {
+        if !self.ticket.is_probe() {
             return;
         }
         if !self.headers_seen.load(Ordering::Acquire)
@@ -6431,7 +6459,7 @@ impl GrpcStreamingProbeRecorder {
         if self.slot_released.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.cb.record_neutral(true);
+        self.cb.settle(self.ticket, BreakerOutcome::Neutral);
     }
 
     /// Record a clean SUCCESS at the join of a clean response + upload
@@ -6463,7 +6491,7 @@ impl GrpcStreamingProbeRecorder {
             self.clean_response_status.load(Ordering::Acquire),
             false,
             None,
-            false,
+            ProbeTicket::NonProbe,
             self.admission_open_epoch,
         );
     }
@@ -6505,8 +6533,8 @@ impl GrpcStreamingProbeRecorder {
         // any concurrent upload-termination join observes it.
         self.upload_guard_expired.store(true, Ordering::Release);
         // Release the slot the unended upload is pinning (NEUTRAL), once.
-        if self.is_half_open_probe && !self.slot_released.swap(true, Ordering::AcqRel) {
-            self.cb.record_neutral(true);
+        if self.ticket.is_probe() && !self.slot_released.swap(true, Ordering::AcqRel) {
+            self.cb.settle(self.ticket, BreakerOutcome::Neutral);
         }
         // #1649 round-4 finding A: only CONSUME the health outcome when the
         // response already completed CLEAN — that clean success cannot be
@@ -6544,13 +6572,13 @@ impl Drop for GrpcStreamingProbeRecorder {
     /// `slot_released` is the same exactly-once CAS every other release path
     /// takes.
     fn drop(&mut self) {
-        if !self.is_half_open_probe || !self.headers_seen.load(Ordering::Acquire) {
+        if !self.ticket.is_probe() || !self.headers_seen.load(Ordering::Acquire) {
             return;
         }
         if self.slot_released.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.cb.record_neutral(true);
+        self.cb.settle(self.ticket, BreakerOutcome::Neutral);
     }
 }
 
@@ -6603,7 +6631,7 @@ impl crate::proxy::body::GrpcResponseTerminalObserver for GrpcStreamingProbeReco
                     response_status,
                     connection_error,
                     error_class,
-                    false,
+                    ProbeTicket::NonProbe,
                     self.admission_open_epoch,
                 );
             }
@@ -17078,10 +17106,12 @@ async fn handle_websocket_request_authenticated(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                     ) {
-                        cb.record_failure(
-                            ws_failure_status.as_u16(),
-                            ws_is_pre_wire,
+                        cb.settle(
                             cb_probe.take_slot(),
+                            BreakerOutcome::Failure {
+                                status_code: ws_failure_status.as_u16(),
+                                connection_error: ws_is_pre_wire,
+                            },
                         );
                         cb_failure_already_recorded = true;
                     }
@@ -17205,12 +17235,12 @@ async fn handle_websocket_request_authenticated(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((cb, is_half_open_probe, admission_generation)) => {
+                            Ok((cb, probe_ticket, _admission_generation)) => {
                                 // Re-point the probe guard at the rotated target's
                                 // breaker: the prior target's slot was taken by the
                                 // intermediate failure record above, and this retry
                                 // may itself have been admitted as a probe.
-                                cb_probe.rearm(&cb, is_half_open_probe, admission_generation);
+                                cb_probe.rearm(&cb, probe_ticket);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
@@ -17273,12 +17303,14 @@ async fn handle_websocket_request_authenticated(
                         // admitted HALF_OPEN probe slot NEUTRALLY (no failure count)
                         // so the breaker can recover, rather than leaking it by
                         // skipping the record entirely.
-                        cb.record_neutral(cb_probe.take_slot());
+                        cb.settle(cb_probe.take_slot(), BreakerOutcome::Neutral);
                     } else {
-                        cb.record_failure(
-                            ws_failure_status.as_u16(),
-                            ws_is_pre_wire,
+                        cb.settle(
                             cb_probe.take_slot(),
+                            BreakerOutcome::Failure {
+                                status_code: ws_failure_status.as_u16(),
+                                connection_error: ws_is_pre_wire,
+                            },
                         );
                     }
                 }
@@ -17430,7 +17462,7 @@ async fn handle_websocket_request_authenticated(
         &proxy.id,
         current_cb_target_key.as_deref(),
     ) {
-        cb.record_success(cb_probe.take_slot());
+        cb.settle(cb_probe.take_slot(), BreakerOutcome::Success);
     }
 
     if ws_session_deadline.at <= tokio::time::Instant::now() {
@@ -35029,11 +35061,7 @@ async fn admit_proxy_request_on_frontend_port(
     // OR when shutdown drain has begun (set by `overload::begin_drain` via
     // Release; loaded here with Acquire to synchronize-with that store and
     // also reject new H2/H3 streams on existing connections during drain).
-    if state
-        .overload
-        .reject_new_requests
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    if state.overload.request_admission.rejects() {
         let is_grpc = crate::proxy::backend_dispatch::detect_http_flavor(&req) == HttpFlavor::Grpc;
         record_request(&state, 503);
         crate::diagnostic_ref::record_admission_fence(
@@ -39130,7 +39158,7 @@ async fn handle_proxy_request_inner(
     // and direct-H2 retry loops below) so a deferred streaming outcome is
     // stale-checked against the FINAL admitted target's generation, not the initial
     // target's (#1649 R6 findings 1 & 2).
-    let (cb_target_key, cb_admitted, cb_is_half_open_probe, mut cb_admission_open_epoch) =
+    let (cb_target_key, cb_admitted, cb_probe_ticket, mut cb_admission_open_epoch) =
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -39177,11 +39205,7 @@ async fn handle_proxy_request_inner(
     // those sites. Dropping `cb_probe` then releases the slot NEUTRALLY, so the
     // breaker can admit the next probe instead of wedging at
     // `(HALF_OPEN, count = 1)` for the rest of the process lifetime.
-    let cb_probe = HalfOpenProbeGuard::new(
-        cb_admitted.as_ref(),
-        cb_is_half_open_probe,
-        cb_admission_open_epoch,
-    );
+    let cb_probe = HalfOpenProbeGuard::new(cb_admitted.as_ref(), cb_probe_ticket);
 
     // For ordinary response-policy reevaluation, finalize the body only after
     // fail-fast routing and breaker gates have admitted the request. This
@@ -40346,7 +40370,7 @@ async fn handle_proxy_request_inner(
                     // release that probe slot so the breaker can admit the next
                     // probe (the retry path and HTTP/WS/H3 paths do the same).
                     // `release_neutral` TAKES the slot, so the guard's own Drop
-                    // cannot fire a second `record_neutral(true)` on the same
+                    // cannot fire a second NEUTRAL settlement on the same
                     // breaker — that spurious extra decrement would free a
                     // DIFFERENT in-flight probe's slot, over-admitting probes.
                     cb_probe.release_neutral();
@@ -40474,7 +40498,7 @@ async fn handle_proxy_request_inner(
                 // circuit-breaker outcome, settling it at the join of request-upload
                 // termination and response-body completion so a clean SUCCESS waits
                 // for the overflow flag to be final while a body FAILURE trips
-                // promptly (#1649 item 3 / #1640). `is_half_open_probe` controls
+                // promptly (#1649 item 3 / #1640). The probe ticket controls
                 // only the probe-slot release; CLOSED-state requests still defer the
                 // health outcome to the join.
                 let upload_observer: Option<Arc<dyn grpc_proxy::GrpcUploadTerminationObserver>> =
@@ -40500,7 +40524,7 @@ async fn handle_proxy_request_inner(
                                 );
                             let recorder = Arc::new(GrpcStreamingProbeRecorder::new(
                                 cb,
-                                cb_probe.holds_slot(),
+                                cb_probe.held_ticket(),
                                 Arc::clone(&body_size_exceeded),
                                 post_header_upload_timeout_ms,
                                 cb_admission_open_epoch,
@@ -40995,9 +41019,15 @@ async fn handle_proxy_request_inner(
                     // post-dispatch record below would decrement it again.
                     let grpc_retry_probe_slot = cb_probe.take_slot();
                     if backend_dispatch::client_side_no_backend_signal(grpc_retry_error_class) {
-                        cb.record_neutral(grpc_retry_probe_slot);
+                        cb.settle(grpc_retry_probe_slot, BreakerOutcome::Neutral);
                     } else {
-                        cb.record_failure(502, true, grpc_retry_probe_slot);
+                        cb.settle(
+                            grpc_retry_probe_slot,
+                            BreakerOutcome::Failure {
+                                status_code: 502,
+                                connection_error: true,
+                            },
+                        );
                     }
                 }
 
@@ -41177,7 +41207,7 @@ async fn handle_proxy_request_inner(
                             grpc_current_cb_key.as_deref(),
                             cb_config,
                         ) {
-                        Ok((cb, is_half_open_probe, admission_open_epoch)) => {
+                        Ok((cb, probe_ticket, admission_open_epoch)) => {
                             // #1649 R6 finding 1: re-capture the admission epoch for
                             // the rotated target so the deferred body-completion
                             // outcome is stale-checked against THIS target's
@@ -41193,7 +41223,7 @@ async fn handle_proxy_request_inner(
                             // finished uploading, so header-flush release (guard
                             // `Drop`) is the correct timing; the eager-record arms
                             // below take the slot instead.
-                            cb_probe.rearm(&cb, is_half_open_probe, admission_open_epoch);
+                            cb_probe.rearm(&cb, probe_ticket);
                         }
                         Err(_) => {
                             // Rotated/retried target's breaker rejected: don't
@@ -41458,7 +41488,7 @@ async fn handle_proxy_request_inner(
                     | GrpcProxyError::Internal(_)
                     | GrpcProxyError::AuthorizationExpired { .. },
                 ) => {
-                    cb.record_neutral(cb_probe.take_slot());
+                    cb.settle(cb_probe.take_slot(), BreakerOutcome::Neutral);
                 }
                 Err(e) => {
                     let grpc_final_probe_slot = cb_probe.take_slot();
@@ -41484,9 +41514,15 @@ async fn handle_proxy_request_inner(
                     // destination.
                     let grpc_error_class = retry::classify_grpc_proxy_error(e);
                     if backend_dispatch::client_side_no_backend_signal(Some(grpc_error_class)) {
-                        cb.record_neutral(grpc_final_probe_slot);
+                        cb.settle(grpc_final_probe_slot, BreakerOutcome::Neutral);
                     } else {
-                        cb.record_failure(502, connection_error, grpc_final_probe_slot);
+                        cb.settle(
+                            grpc_final_probe_slot,
+                            BreakerOutcome::Failure {
+                                status_code: 502,
+                                connection_error,
+                            },
+                        );
                     }
                 }
             }
@@ -41677,7 +41713,11 @@ async fn handle_proxy_request_inner(
                     &proxy.id,
                     grpc_final_cb_key.as_deref(),
                 ) {
-                    record_grpc_backend_status_outcome(&cb, grpc_backend_dispatch_status, false);
+                    record_grpc_backend_status_outcome(
+                        &cb,
+                        grpc_backend_dispatch_status,
+                        ProbeTicket::NonProbe,
+                    );
                     if let Some(recorder) = &grpc_streaming_probe_recorder {
                         recorder.mark_health_recorded();
                     }
@@ -44250,12 +44290,14 @@ async fn handle_proxy_request_inner(
                 // dropped during the backoff must not release a second slot.
                 let retry_probe_slot = cb_probe.take_slot();
                 if backend_dispatch::client_side_no_backend_signal(result.error_class) {
-                    cb.record_neutral(retry_probe_slot);
+                    cb.settle(retry_probe_slot, BreakerOutcome::Neutral);
                 } else {
-                    cb.record_failure(
-                        result.status_code,
-                        result.connection_error,
+                    cb.settle(
                         retry_probe_slot,
+                        BreakerOutcome::Failure {
+                            status_code: result.status_code,
+                            connection_error: result.connection_error,
+                        },
                     );
                 }
             }
@@ -44576,10 +44618,10 @@ async fn handle_proxy_request_inner(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     ) {
-                    Ok((cb, is_half_open_probe, admission_open_epoch)) => {
+                    Ok((cb, probe_ticket, admission_open_epoch)) => {
                         // Adopt the rotated target's probe slot (the prior
                         // target's was taken by the intermediate record above).
-                        cb_probe.rearm(&cb, is_half_open_probe, admission_open_epoch);
+                        cb_probe.rearm(&cb, probe_ticket);
                         // #1649 R6 finding 2: re-capture the admission epoch for the
                         // rotated target so the deferred StreamingH2 body-completion
                         // outcome is stale-checked against THIS target's generation,
@@ -45119,7 +45161,7 @@ async fn handle_proxy_request_inner(
     // no-body responses on the eager header-time record. The HALF_OPEN probe slot
     // is still RELEASED here (same timing as the eager record), only the health
     // *outcome* is deferred — so a long-lived stream never pins the slot, and the
-    // deferred record runs as a non-probe (`is_half_open_probe = false`).
+    // deferred record runs as a non-probe (`ProbeTicket::NonProbe`).
     //
     // HBONE (`current_dispatch_hbone`) and mesh-mTLS
     // (`current_dispatch_mesh_mtls`) flow through the same `StreamingH2` arm.
@@ -68305,9 +68347,13 @@ mod tests {
             // Capture the breaker's current open generation as the admission epoch,
             // matching the runtime (`check_circuit_breaker`).
             let admission_open_epoch = cb.open_epoch();
+            // The probe was admitted in the breaker's current cycle.
+            let ticket = crate::circuit_breaker::ProbeTicket::Probe {
+                generation: admission_open_epoch as u32,
+            };
             Arc::new(super::super::GrpcStreamingProbeRecorder::new(
                 cb,
-                true,
+                ticket,
                 overflow,
                 post_header_upload_timeout_ms,
                 admission_open_epoch,
@@ -68580,6 +68626,52 @@ mod tests {
                 "open",
                 "a stale clean stream from a prior generation must not heal the reopened breaker"
             );
+        }
+
+        #[test]
+        fn stale_recorder_slot_release_cannot_free_a_later_cycles_slot() {
+            // CB-1: the recorder used to release its slot with the
+            // generation-blind `record_neutral(true)`, so a stream that outlived
+            // a reopen freed one of the NEXT cycle's slots and over-admitted
+            // past `half_open_max_requests`. Its release now settles the
+            // admission's ticket, which the breaker checks in the same CAS.
+            let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+                half_open_max_requests: 2,
+                ..half_open_probe_config()
+            }));
+            cb.record_failure(500, false, false);
+            let (a, a_epoch) = cb.admit().expect("A admitted");
+            let recorder = Arc::new(super::super::GrpcStreamingProbeRecorder::new(
+                Arc::clone(&cb),
+                a,
+                no_overflow(),
+                None,
+                a_epoch,
+            ));
+            // Sibling probe B fails: reopen, then C/D take the next cycle's slots.
+            let (b, _) = cb.admit().expect("B admitted");
+            cb.settle(
+                b,
+                crate::circuit_breaker::BreakerOutcome::Failure {
+                    status_code: 500,
+                    connection_error: false,
+                },
+            );
+            assert_eq!(cb.state_name(), "open");
+            assert!(cb.can_execute().unwrap());
+            assert!(cb.can_execute().unwrap());
+            assert_eq!(cb.half_open_in_flight(), 2);
+
+            // A's stream reaches the headers + upload-termination join.
+            recorder.note_headers_arrived();
+            GrpcUploadTerminationObserver::on_upload_terminated(recorder.as_ref());
+            drop(recorder);
+            assert_eq!(
+                cb.half_open_in_flight(),
+                2,
+                "a stale stream's slot release must not free a current-cycle slot"
+            );
+            assert!(cb.can_execute().is_err(), "no third probe past the cap");
         }
 
         #[test]
