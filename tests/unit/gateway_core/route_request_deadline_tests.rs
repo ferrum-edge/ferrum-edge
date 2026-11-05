@@ -32,9 +32,10 @@ use ferrum_edge::_test_support::{
     await_offered_response_write_for_test, await_route_request_deadline_for_test,
     h3_plain_bridge_backend_request_for_test, h3_route_attempt_bounds_for_test,
     h3_route_deadline_reset_code_for_test, h3_route_deadline_terminal_for_test,
-    h3_route_deadlines_armed_for_test, proxy_body_streaming_for_test,
-    proxy_body_with_client_grpc_deadline_for_test, proxy_body_with_route_request_deadline_for_test,
-    route_deadline_expiry_response_for_test, route_request_deadline_outcome_for_test,
+    h3_route_deadline_wire_bits_for_test, h3_route_deadlines_armed_for_test,
+    proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_for_test,
+    proxy_body_with_route_request_deadline_for_test, route_deadline_expiry_response_for_test,
+    route_request_deadline_outcome_for_test,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::proxy::auth_lifetime::{
@@ -269,6 +270,38 @@ fn native_http3_answers_a_route_expiry_before_the_head_like_proxy_core() {
             ResponseBody::Buffered(bytes) => assert_eq!(&bytes[..], body.as_bytes(), "{expiry}"),
             _ => panic!("proxy core's route terminal must be buffered"),
         }
+    }
+}
+
+/// A total deadline spent before the attempt started dialed nothing, so every
+/// native HTTP/3 surface must report it as never on the wire, exactly as proxy
+/// core does (`handed_to_backend == false`). It must still not count as a
+/// connection failure. Before the typed handoff, the H3 pool error, the
+/// buffered retry-loop result, and the cross-protocol bridge response all
+/// reported `request_on_wire == true` for it, so the request context recorded
+/// an `AmbiguousFailure` that dedup and caching treat as possibly executed.
+#[test]
+fn native_http3_reports_a_route_deadline_spent_before_dispatch_as_never_on_the_wire() {
+    for (expiry, on_wire) in [
+        ("not_started", false),
+        ("in_flight", true),
+        ("attempt_budget", true),
+    ] {
+        let surfaces = ["pool error", "buffered result", "bridge response"];
+        for (surface, (request_on_wire, connection_error)) in surfaces
+            .into_iter()
+            .zip(h3_route_deadline_wire_bits_for_test(expiry))
+        {
+            assert_eq!(request_on_wire, on_wire, "{expiry}: {surface}");
+            assert!(
+                !connection_error,
+                "{expiry}: {surface} must never read as a connection failure"
+            );
+        }
+        // Proxy core's response for the same handoff carries the same bits.
+        let (core, _) = route_deadline_expiry_response_for_test(expiry, on_wire);
+        assert_eq!(core.request_on_wire, on_wire, "{expiry}: proxy core");
+        assert!(!core.connection_error, "{expiry}: proxy core");
     }
 }
 

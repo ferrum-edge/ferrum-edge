@@ -42,6 +42,7 @@ use super::peer_identity::{
 };
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
+use crate::http3::client::H3AttemptHandoff;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, ResponseStreamAction,
@@ -10603,7 +10604,7 @@ async fn handle_h3_request(
             mut response_headers,
             mut response_trailers,
             h3_error_class,
-            h3_request_on_wire,
+            h3_handoff,
             final_cb_target_key,
             final_target,
         ) = if let Some(retry_config) = &proxy.retry {
@@ -10690,14 +10691,14 @@ async fn handle_h3_request(
                 &crate::retry::BackendResponse {
                     status_code: result.status,
                     connection_error: h3_connection_error(
-                        result.request_on_wire,
+                        result.handoff.request_on_wire(),
                         result.error_class,
                     ),
                     body: crate::retry::ResponseBody::buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
                     error_class: result.error_class,
-                    request_on_wire: result.request_on_wire,
+                    request_on_wire: result.handoff.request_on_wire(),
                     buffered_trailers: None,
                 },
                 attempt,
@@ -10707,7 +10708,10 @@ async fn handle_h3_request(
                 if crate::http3::route_deadline::total_expiry_recorded(route, &ctx) {
                     break;
                 }
-                ctx.record_backend_dispatch_outcome(result.error_class, result.request_on_wire);
+                ctx.record_backend_dispatch_outcome(
+                    result.error_class,
+                    result.handoff.request_on_wire(),
+                );
                 // Re-check the CURRENT target's DestinationRule maxRetries
                 // before authorizing another retry — use the original route
                 // ceiling so a looser rotated candidate may continue up to
@@ -10791,7 +10795,7 @@ async fn handle_h3_request(
                 record_h3_backend_admission_outcome(
                     &mut backend_admission_permits,
                     result.status,
-                    h3_connection_error(result.request_on_wire, result.error_class),
+                    h3_connection_error(result.handoff.request_on_wire(), result.error_class),
                     result.error_class,
                     backend_admission_start.elapsed(),
                 );
@@ -10827,7 +10831,7 @@ async fn handle_h3_request(
                             crate::circuit_breaker::BreakerOutcome::Failure {
                                 status_code: result.status,
                                 connection_error: h3_connection_error(
-                                    result.request_on_wire,
+                                    result.handoff.request_on_wire(),
                                     result.error_class,
                                 ),
                             },
@@ -10839,7 +10843,7 @@ async fn handle_h3_request(
                 // settled and a retry replaces it.
                 ctx.record_backend_attempt(
                     result.error_class,
-                    result.request_on_wire,
+                    result.handoff.request_on_wire(),
                     Some(result.status),
                 );
                 last_attempt_recorded = true;
@@ -10918,7 +10922,7 @@ async fn handle_h3_request(
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
-                        request_on_wire: false,
+                        handoff: H3AttemptHandoff::PreWire,
                     };
                     sticky_dispatch_refused = true;
                     break;
@@ -10947,7 +10951,7 @@ async fn handle_h3_request(
                         )]),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
-                        request_on_wire: false,
+                        handoff: H3AttemptHandoff::PreWire,
                     };
                     sticky_dispatch_refused = true;
                     break;
@@ -10998,7 +11002,7 @@ async fn handle_h3_request(
                     proxy_id = %proxy.id,
                     attempt = attempt,
                     max_retries = retry_config.max_retries,
-                    connection_error = h3_connection_error(result.request_on_wire, result.error_class),
+                    connection_error = h3_connection_error(result.handoff.request_on_wire(), result.error_class),
                     native_h3 = current_dispatch_h3,
                     "Retrying backend request (HTTP/3 frontend)"
                 );
@@ -11134,7 +11138,7 @@ async fn handle_h3_request(
                 result.headers,
                 result.trailers,
                 result.error_class,
-                result.request_on_wire,
+                result.handoff,
                 current_cb_target_key,
                 current_target,
             )
@@ -11145,7 +11149,7 @@ async fn handle_h3_request(
                 result.headers,
                 result.trailers,
                 result.error_class,
-                result.request_on_wire,
+                result.handoff,
                 cb_target_key,
                 upstream_target.clone(),
             )
@@ -11195,7 +11199,7 @@ async fn handle_h3_request(
                 result.headers,
                 result.trailers,
                 result.error_class,
-                result.request_on_wire,
+                result.handoff,
                 cb_target_key,
                 upstream_target.clone(),
             )
@@ -11204,6 +11208,10 @@ async fn handle_h3_request(
         // Dispatch and every retry are done: release the replay copy, and with
         // it the request-buffer charge, before the response is relayed (#6009).
         drop(body_data);
+        // Both outcome bits come from the one typed handoff: a route deadline
+        // spent before dispatch is neither on the wire nor a connection failure.
+        let h3_request_on_wire = h3_handoff.request_on_wire();
+        let h3_connection_failure = h3_handoff.connection_error();
 
         // A route timeout `504` is gateway-authored: no backend answered within
         // the rule's deadline, so it must not mint session affinity (#5646).
@@ -11228,7 +11236,7 @@ async fn handle_h3_request(
             final_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
-            !h3_request_on_wire,
+            h3_connection_failure,
             h3_error_class,
             cb_probe.settle(),
             false,
@@ -11237,7 +11245,7 @@ async fn handle_h3_request(
         record_h3_backend_admission_outcome(
             &mut backend_admission_permits,
             response_status,
-            !h3_request_on_wire,
+            h3_connection_failure,
             h3_error_class,
             backend_admission_start.elapsed(),
         );
@@ -11617,7 +11625,7 @@ async fn handle_h3_request(
 
         // Restore the gateway-owned token at the same post-hook / pre-wire
         // boundary as H1/H2's response builder. Classification is the original
-        // typed `h3_request_on_wire` signal; status is the client-visible one
+        // typed `h3_handoff` signal; status is the client-visible one
         // after after_proxy, body, final-client-visible, and committed hooks.
         // Context-aware token: an output-ceiling refusal reads `overload` and a
         // route-deadline `504` no backend held reads `request_timeout`.
@@ -11625,7 +11633,7 @@ async fn handle_h3_request(
             &ctx,
             state.via_header_http3.as_deref(),
             &mut response_headers,
-            !h3_request_on_wire,
+            h3_connection_failure,
             response_status,
         );
 
@@ -13159,7 +13167,8 @@ async fn proxy_to_backend_h3_refined_response(
         Ok(response) => response,
         Err(error) => {
             error!("Backend request failed (HTTP/3 refined): {}", error);
-            let request_on_wire = error.request_on_wire();
+            let handoff = error.handoff();
+            let request_on_wire = handoff.request_on_wire();
             let h3_error_class = classify_h3_error(&error);
             if let Some(termination) = error.authorization_expiry() {
                 ctx.record_authorization_termination_once(
@@ -13185,12 +13194,12 @@ async fn proxy_to_backend_h3_refined_response(
                     body: Bytes::from_static(reject_body.as_bytes()),
                     headers: h3_backend_failure_headers_for_request(
                         ctx,
-                        !request_on_wire,
+                        handoff.connection_error(),
                         reject_status.as_u16(),
                     ),
                     trailers: None,
                     error_class: Some(h3_error_class),
-                    request_on_wire,
+                    handoff,
                 }));
             }
             // No retry loop follows: this failure ends the attempt.
@@ -13211,7 +13220,7 @@ async fn proxy_to_backend_h3_refined_response(
                 ctx,
                 reject_status,
                 reject_body,
-                !request_on_wire,
+                handoff.connection_error(),
             )
             .await
             .is_ok();
@@ -13324,7 +13333,7 @@ async fn proxy_to_backend_h3_refined_response(
                 headers: h3_backend_failure_headers_for_request(ctx, false, status.as_u16()),
                 trailers: None,
                 error_class: Some(classify_h3_error(&error)),
-                request_on_wire: error.request_on_wire(),
+                handoff: error.handoff(),
             }
         }
         Err(()) => h3_route_deadline_buffered_result(ctx, route.body_expiry()),
@@ -13353,7 +13362,7 @@ async fn collect_h3_open_response_body(
             headers: response_headers,
             trailers: None,
             error_class: None,
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
         };
     }
     // Parsed per comma-folded member so a repeated identical declaration is
@@ -13374,7 +13383,7 @@ async fn collect_h3_open_response_body(
             headers: HashMap::new(),
             trailers: None,
             error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
         };
     }
 
@@ -13413,7 +13422,7 @@ async fn collect_h3_open_response_body(
                         headers: h3_backend_failure_headers(false, status),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
-                        request_on_wire: true,
+                        handoff: H3AttemptHandoff::OnWire,
                     };
                 }
             }
@@ -13435,7 +13444,7 @@ async fn collect_h3_open_response_body(
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
-                        request_on_wire: true,
+                        handoff: H3AttemptHandoff::OnWire,
                     };
                 }
                 response_body.extend_from_slice(&chunk_bytes);
@@ -13462,7 +13471,7 @@ async fn collect_h3_open_response_body(
                         headers: h3_backend_failure_headers(false, 502),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
-                        request_on_wire: true,
+                        handoff: H3AttemptHandoff::OnWire,
                     };
                 }
                 break;
@@ -13499,7 +13508,7 @@ async fn collect_h3_open_response_body(
                     headers: h3_backend_failure_headers(false, status),
                     trailers: None,
                     error_class: Some(h3_error_class),
-                    request_on_wire: true,
+                    handoff: H3AttemptHandoff::OnWire,
                 };
             }
         }
@@ -13537,7 +13546,7 @@ async fn collect_h3_open_response_body(
                 headers: h3_backend_failure_headers(false, status),
                 trailers: None,
                 error_class: Some(h3_error_class),
-                request_on_wire: true,
+                handoff: H3AttemptHandoff::OnWire,
             };
         }
     };
@@ -13548,7 +13557,7 @@ async fn collect_h3_open_response_body(
         headers: response_headers,
         trailers: response_trailers,
         error_class: None,
-        request_on_wire: true,
+        handoff: H3AttemptHandoff::OnWire,
     }
 }
 
@@ -18313,6 +18322,7 @@ async fn proxy_to_backend_h3_streaming(
             // backend — the typed signal correctly reports `false` for
             // that case.
             let request_on_wire = e.request_on_wire();
+            let connection_error = e.connection_error();
             let h3_error_class = classify_h3_error(&e);
             if let Some(termination) = e.authorization_expiry() {
                 ctx.record_authorization_termination_once(
@@ -18344,7 +18354,7 @@ async fn proxy_to_backend_h3_streaming(
                 ctx,
                 reject_status,
                 reject_body,
-                !request_on_wire,
+                connection_error,
             )
             .await
             .is_ok();
@@ -19076,7 +19086,11 @@ struct H3BufferedDispatchResult {
     /// and `None` for a successful response that carried no trailers.
     trailers: Option<http::HeaderMap>,
     error_class: Option<crate::retry::ErrorClass>,
-    request_on_wire: bool,
+    /// How far the attempt got toward the backend. `request_on_wire()` and
+    /// `connection_error()` are both derived from it, so a route deadline
+    /// spent before dispatch is neither a possibly-executed request nor a
+    /// connection failure.
+    handoff: H3AttemptHandoff,
 }
 
 /// The buffered result for a backend attempt that a matched route rule's
@@ -19106,8 +19120,22 @@ fn h3_route_deadline_buffered_result(
         headers,
         trailers: None,
         error_class: Some(crate::http3::route_deadline::expiry_error_class(expiry)),
-        request_on_wire: true,
+        handoff: crate::http3::route_deadline::expiry_handoff(expiry),
     }
+}
+
+/// Drive the production [`h3_route_deadline_buffered_result`] without a socket
+/// and return its `(request_on_wire, connection_error)` pair.
+#[doc(hidden)]
+pub(crate) fn h3_route_deadline_buffered_wire_bits_for_test(
+    ctx: &mut RequestContext,
+    expiry: crate::proxy::RouteDeadlineExpiry,
+) -> (bool, bool) {
+    let result = h3_route_deadline_buffered_result(ctx, expiry);
+    (
+        result.handoff.request_on_wire(),
+        result.handoff.connection_error(),
+    )
 }
 
 /// The buffered result for a matched route rule's total deadline (#5646) that
@@ -19130,7 +19158,7 @@ fn h3_route_backoff_timeout_result(ctx: &mut RequestContext) -> H3BufferedDispat
         headers,
         trailers: None,
         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
-        request_on_wire: true,
+        handoff: H3AttemptHandoff::OnWire,
     }
 }
 
@@ -19143,7 +19171,7 @@ fn h3_route_backoff_timeout_result(ctx: &mut RequestContext) -> H3BufferedDispat
 fn h3_buffered_result_from_backend_response(
     response: crate::retry::BackendResponse,
 ) -> H3BufferedDispatchResult {
-    let request_on_wire = response.request_on_wire;
+    let handoff = H3AttemptHandoff::from_request_on_wire(response.request_on_wire);
     let body = match response.body {
         crate::retry::ResponseBody::Buffered(bytes) => bytes,
         // `proxy_to_backend_retry(..., stream_response = false)` always returns
@@ -19155,10 +19183,10 @@ fn h3_buffered_result_from_backend_response(
             return H3BufferedDispatchResult {
                 status: 502,
                 body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
-                headers: h3_backend_failure_headers(!request_on_wire, 502),
+                headers: h3_backend_failure_headers(handoff.connection_error(), 502),
                 trailers: None,
                 error_class: Some(crate::retry::ErrorClass::ProtocolError),
-                request_on_wire,
+                handoff,
             };
         }
     };
@@ -19168,7 +19196,7 @@ fn h3_buffered_result_from_backend_response(
         headers: response.headers,
         trailers: None,
         error_class: response.error_class,
-        request_on_wire,
+        handoff,
     }
 }
 
@@ -19286,7 +19314,7 @@ async fn proxy_to_backend_h3(
                     // discovering the size violation; the request reached
                     // the wire. The 502 we synthesize here is a gateway-
                     // side policy rejection.
-                    request_on_wire: true,
+                    handoff: H3AttemptHandoff::OnWire,
                 };
             }
 
@@ -19302,7 +19330,7 @@ async fn proxy_to_backend_h3(
                 // Successful response — the request was committed and
                 // the response was received. `request_on_wire=true` means
                 // `connection_error=false` at every consumer site.
-                request_on_wire: true,
+                handoff: H3AttemptHandoff::OnWire,
             }
         }
         Err(e) => {
@@ -19319,7 +19347,7 @@ async fn proxy_to_backend_h3(
             // `classify_http3_error` can label a connect-phase QUIC
             // reset as `ConnectionReset` (post-wire) when the typed
             // signal correctly reports `false` (no commitment).
-            let request_on_wire = e.request_on_wire();
+            let handoff = e.handoff();
             let h3_error_class = classify_h3_error(&e);
             crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
@@ -19334,10 +19362,13 @@ async fn proxy_to_backend_h3(
             H3BufferedDispatchResult {
                 status: reject_status.as_u16(),
                 body: Bytes::from_static(reject_body.as_bytes()),
-                headers: h3_backend_failure_headers(!request_on_wire, reject_status.as_u16()),
+                headers: h3_backend_failure_headers(
+                    handoff.connection_error(),
+                    reject_status.as_u16(),
+                ),
                 trailers: None,
                 error_class: Some(h3_error_class),
-                request_on_wire,
+                handoff,
             }
         }
     }
