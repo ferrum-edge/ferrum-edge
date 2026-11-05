@@ -338,3 +338,129 @@ fn orders_without_a_certificate_are_not_superseded_by_each_other() {
             .is_some()
     );
 }
+
+#[test]
+fn finalize_commit_can_move_an_order_away_from_a_superseded_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let older = seed(
+        &store,
+        order("older", Some(CERTIFICATE_ID), AcmeOrderStatus::Processing),
+    );
+    seed(
+        &store,
+        order(
+            "newer",
+            Some(CERTIFICATE_ID),
+            AcmeOrderStatus::PendingChallenges,
+        ),
+    );
+
+    // Finalize with an explicit `certificate_id` override: the order is
+    // persisted under the other certificate, which has no competing order, and
+    // leaving the original certificate cannot hide its newer order.
+    let committed = store
+        .complete_order_if_current(&older, "other-cert".to_string())
+        .unwrap()
+        .expect("the destination certificate has no competing order");
+    assert_eq!(committed.status, AcmeOrderStatus::Valid);
+    assert_eq!(committed.certificate_id.as_deref(), Some("other-cert"));
+    assert!(committed.finalization.is_none());
+    assert_eq!(
+        store
+            .latest_order_for_certificate(CERTIFICATE_ID)
+            .unwrap()
+            .unwrap()
+            .id,
+        "newer"
+    );
+    assert_eq!(
+        store
+            .latest_order_for_certificate("other-cert")
+            .unwrap()
+            .unwrap()
+            .id,
+        "older"
+    );
+}
+
+#[test]
+fn finalize_commit_refuses_moving_an_order_onto_a_certificate_with_an_active_order() {
+    // The destination's active order is refused whether it is older or newer
+    // than the moving order: either way it is that certificate's latest order
+    // until the commit would stamp the moving one newer.
+    for destination_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        if destination_first {
+            seed(
+                &store,
+                order("renewal", Some("other-cert"), AcmeOrderStatus::Processing),
+            );
+        }
+        let moving = seed(&store, order("moving", None, AcmeOrderStatus::Ready));
+        if !destination_first {
+            seed(
+                &store,
+                order("renewal", Some("other-cert"), AcmeOrderStatus::Processing),
+            );
+        }
+        let version = store.store_version().unwrap();
+
+        assert!(
+            store
+                .complete_order_if_current(&moving, "other-cert".to_string())
+                .unwrap()
+                .is_none(),
+            "destination_first={destination_first}"
+        );
+        assert_eq!(store.store_version().unwrap(), version);
+        let untouched = store.get_order("moving").unwrap();
+        assert_eq!(untouched.status, AcmeOrderStatus::Ready);
+        assert!(untouched.certificate_id.is_none());
+        assert!(untouched.finalization.is_some());
+        assert_eq!(
+            store
+                .latest_order_for_certificate("other-cert")
+                .unwrap()
+                .unwrap()
+                .id,
+            "renewal"
+        );
+    }
+}
+
+#[test]
+fn a_newer_terminal_order_does_not_block_completing_an_order() {
+    // The planner already plans a fresh order behind a terminal latest order,
+    // so committing this one hides nothing — in its own certificate or in one
+    // it is moved onto.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let own = seed(
+        &store,
+        order("own", Some(CERTIFICATE_ID), AcmeOrderStatus::Processing),
+    );
+    let moving = seed(&store, order("moving", None, AcmeOrderStatus::Processing));
+    seed(
+        &store,
+        order("done", Some(CERTIFICATE_ID), AcmeOrderStatus::Failed),
+    );
+    seed(
+        &store,
+        order("other-done", Some("other-cert"), AcmeOrderStatus::Valid),
+    );
+
+    assert!(
+        store
+            .complete_order_if_current(&own, CERTIFICATE_ID.to_string())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .complete_order_if_current(&moving, "other-cert".to_string())
+            .unwrap()
+            .is_some()
+    );
+}

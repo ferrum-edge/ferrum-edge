@@ -962,7 +962,10 @@ paths:
         compare-and-set on the order as read before the directory I/O: if it was
         completed by a renewal, deleted, or otherwise rewritten meanwhile, the
         order is left unchanged and `409` is returned (an already stored
-        certificate stays stored).
+        certificate stays stored). `409` is also returned, before any directory
+        request, when the certificate the order is persisted under (the
+        request's `certificate_id`, else the order's) already has another
+        active order as its latest order.
         Usability requires exactly one parseable private key PEM record, a complete
         CSR DER whose signature verifies, matching private-key/CSR public keys, and
         a CSR DNS SAN set that exactly matches the order domains. The endpoint

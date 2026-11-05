@@ -1058,9 +1058,10 @@ impl AcmeOrderStore {
     /// Applies `target` (plus `apply`'s field updates) only when the stored
     /// order still matches `expected` (`order_matches_snapshot`), the move is
     /// legal (`AcmeOrderStatus::transition_to`, so terminal states are never
-    /// left), and the write would not make an older order hide a newer one for
-    /// the same certificate from the renewal planner. Otherwise nothing is
-    /// written and `Ok(None)` is returned.
+    /// left), and the record as it would be persisted — including a
+    /// `certificate_id` that `apply` reassigns — would not hide another active
+    /// order from the renewal planner (`commit_would_hide_active_order`).
+    /// Otherwise nothing is written and `Ok(None)` is returned.
     fn transition_order_if_current(
         &self,
         expected: &AcmeOrderRecord,
@@ -1076,18 +1077,19 @@ impl AcmeOrderStore {
             let Some(next) = current.status.transition_to(target) else {
                 return Ok((false, (None, 0)));
             };
-            if !order_matches_snapshot(current, expected)
-                || order_is_superseded_for_certificate(document, expected)
-            {
+            if !order_matches_snapshot(current, expected) {
                 return Ok((false, (None, 0)));
             }
-            let Some(current) = document.orders.get_mut(&expected.id) else {
+            let mut committed = current.clone();
+            committed.status = next;
+            apply(&mut committed);
+            if commit_would_hide_active_order(document, &committed) {
                 return Ok((false, (None, 0)));
-            };
-            current.status = next;
-            apply(&mut *current);
-            current.updated_at = Utc::now();
-            let committed = current.clone();
+            }
+            committed.updated_at = Utc::now();
+            document
+                .orders
+                .insert(committed.id.clone(), committed.clone());
             let pruned = prune_terminal_order_history(document, terminal_history);
             Ok((true, (Some(committed), pruned)))
         })?;
@@ -1724,20 +1726,6 @@ fn validate_acme_terminal_history(terminal_history: usize) -> Result<usize, Acme
     Ok(terminal_history.min(crate::config::env_config::HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY))
 }
 
-/// Whether an order is still active or recoverable and must not be pruned.
-///
-/// Pending/ready/processing orders are always retained, including their
-/// finalization packages. `Valid` orders that still carry finalization material
-/// are also retained (corrupt/partial states). Terminal history is
-/// `Failed`/`Cancelled`, plus `Valid` once finalization has been cleared.
-fn order_is_active_or_recoverable(order: &AcmeOrderRecord) -> bool {
-    match order.status {
-        status if status.is_active() => true,
-        AcmeOrderStatus::Valid => order.finalization.is_some(),
-        _ => false,
-    }
-}
-
 /// Whether `current` is still exactly the order a caller read as `expected`.
 ///
 /// `updated_at` is stamped by every store write and `created_at` by the write
@@ -1752,17 +1740,24 @@ fn order_matches_snapshot(current: &AcmeOrderRecord, expected: &AcmeOrderRecord)
         && current.status == expected.status
 }
 
-/// Whether a newer order exists for `expected`'s certificate.
+/// Whether persisting `candidate` would hide another active order from
+/// `plan_renewal_order`.
 ///
-/// A write stamps `updated_at = now`, so committing an older order would make
-/// it the latest for its certificate and hide the newer one from
-/// `plan_renewal_order`. Orders without a certificate are never planned, so
-/// they cannot hide anything.
-fn order_is_superseded_for_certificate(
+/// The write stamps `updated_at = now`, so `candidate` becomes the latest order
+/// for the certificate it is persisted under — the *destination*, which may
+/// differ from the one the order was read with. The planner only looks at that
+/// latest order, so the commit hides an active order exactly when, before the
+/// commit, the destination's latest order is an active order other than this
+/// one: a newer competing order in the order's own certificate, or any current
+/// active order in a certificate it is being moved into. Moving an order away
+/// from its certificate leaves that certificate's other orders visible, and
+/// orders without a certificate are never planned, so neither can hide
+/// anything.
+fn commit_would_hide_active_order(
     document: &AcmeOrderStoreFile,
-    expected: &AcmeOrderRecord,
+    candidate: &AcmeOrderRecord,
 ) -> bool {
-    let Some(certificate_id) = expected.certificate_id.as_deref() else {
+    let Some(certificate_id) = candidate.certificate_id.as_deref() else {
         return false;
     };
     document
@@ -1770,12 +1765,17 @@ fn order_is_superseded_for_certificate(
         .values()
         .filter(|order| order.certificate_id.as_deref() == Some(certificate_id))
         .max_by_key(|order| order.updated_at)
-        .is_none_or(|order| order.id != expected.id)
+        .is_some_and(|latest| latest.id != candidate.id && latest.status.is_active())
 }
 
-/// Retain all active/recoverable orders plus at most `max_terminal` newest
-/// terminal orders per certificate (or orphan bucket). Returns how many were
-/// removed. Runs under the exclusive mutation lock of the order store.
+/// Retain all active orders plus at most `max_terminal` newest terminal orders
+/// per certificate (or orphan bucket). Returns how many were removed. Runs
+/// under the exclusive mutation lock of the order store.
+///
+/// Only active orders are resumable, so only they keep their key/CSR beyond the
+/// history bound. A terminal order that still carries finalization material
+/// (only a hand-written record can) has no recovery path — it can be neither
+/// finalized nor resumed — and is history like any other terminal order.
 fn prune_terminal_order_history(document: &mut AcmeOrderStoreFile, max_terminal: usize) -> usize {
     use std::collections::HashMap;
 
@@ -1784,7 +1784,7 @@ fn prune_terminal_order_history(document: &mut AcmeOrderStoreFile, max_terminal:
     let mut terminal_by_group: HashMap<Option<String>, Vec<(String, DateTime<Utc>)>> =
         HashMap::new();
     for (id, order) in &document.orders {
-        if order_is_active_or_recoverable(order) {
+        if order.status.is_active() {
             continue;
         }
         terminal_by_group

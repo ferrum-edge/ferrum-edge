@@ -707,6 +707,26 @@ pub(super) async fn handle_finalize_acme_order(
                 ));
             }
         };
+        // The final write would stamp this order as the newest one for the
+        // certificate it is persisted under, hiding another active order there
+        // from the renewal planner; the store's compare-and-set refuses that.
+        // Refuse the predictable case here, before CA I/O and before the
+        // certificate record is written; the compare-and-set stays authoritative
+        // for anything that changes in between.
+        match order_store.latest_order_for_certificate(&certificate_id) {
+            Ok(Some(latest)) if latest.id != order.id && latest.status.is_active() => {
+                return Ok(super::json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!(
+                        "ACME certificate '{certificate_id}' has another active order '{}'; \
+                         finalize or delete that order first",
+                        latest.id
+                    )}),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => return Ok(acme_error_response(error)),
+        }
         // Only consult the shared account store when the order does not already
         // carry credentials, and treat a store failure as a store failure: an
         // unreachable account store must not be reported as "this order has no
@@ -883,8 +903,9 @@ pub(super) async fn handle_finalize_acme_order(
                 return Ok(super::json_response(
                     StatusCode::CONFLICT,
                     &json!({"error": format!(
-                        "ACME order '{order_id}' changed while finalization was in flight; \
-                         certificate '{published_certificate_id}' was stored, but the order \
+                        "ACME order '{order_id}' changed, or certificate \
+                         '{published_certificate_id}' gained another active order, while \
+                         finalization was in flight; the certificate was stored, but the order \
                          record was left unchanged"
                     )}),
                 ));
