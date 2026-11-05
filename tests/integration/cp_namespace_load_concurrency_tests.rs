@@ -2,13 +2,15 @@
 //! keeping the boundary-before-load phase barrier, namespace-ordered merges and
 //! per-namespace failure isolation (#2983).
 //!
-//! Every scripted call waits at a barrier sized to the namespace count, so a
-//! phase can only finish when all of its namespace calls are in flight at
-//! once. The old serial loops parked on the first call forever; the timeout
-//! turns that into a test failure.
+//! The two-namespace tests make every scripted call wait at a barrier sized to
+//! the namespace count, so a phase can only finish when all of its namespace
+//! calls are in flight at once. The old serial loops parked on the first call
+//! forever; the timeout turns that into a test failure. The counting tests pin
+//! the per-phase budget with more namespaces than it allows.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,8 +19,8 @@ use ferrum_edge::config::db_backend::{FullConfigLoadPurpose, IncrementalResult};
 use ferrum_edge::config::types::{GatewayConfig, Proxy};
 use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::modes::control_plane::{
-    CpFullLoadSource, CpIncrementalLoadSource, load_full_config_multi_with_sequence_for_test,
-    load_incremental_config_multi_for_test,
+    CpFullLoadSource, CpIncrementalLoadSource, cp_namespace_load_concurrency,
+    load_full_config_multi_with_sequence_for_test, load_incremental_config_multi_for_test,
 };
 use tokio::sync::{Barrier, Notify};
 
@@ -260,7 +262,7 @@ async fn incremental_poll_overlaps_namespaces_and_merges_in_namespace_order() {
     let after = HashMap::from([("alpha".to_string(), 10), ("beta".to_string(), 20)]);
     let outcome = tokio::time::timeout(
         GATE_TIMEOUT,
-        load_incremental_config_multi_for_test(&source, &namespaces(), &after),
+        load_incremental_config_multi_for_test(&source, &namespaces(), &after, 4),
     )
     .await
     .expect("namespace delta loads must be in flight together")
@@ -290,7 +292,7 @@ async fn incremental_poll_failure_stays_isolated_to_its_namespace() {
     let after = HashMap::from([("alpha".to_string(), 10), ("beta".to_string(), 20)]);
     let outcome = tokio::time::timeout(
         GATE_TIMEOUT,
-        load_incremental_config_multi_for_test(&source, &namespaces(), &after),
+        load_incremental_config_multi_for_test(&source, &namespaces(), &after, 4),
     )
     .await
     .expect("namespace delta loads must be in flight together")
@@ -313,4 +315,166 @@ async fn incremental_poll_failure_stays_isolated_to_its_namespace() {
         proxy_ids(&outcome.result.added_or_modified_proxies),
         vec!["beta-changed"]
     );
+}
+
+#[test]
+fn sql_budget_is_a_quarter_of_the_pool_between_one_and_four() {
+    for (pool, expected) in [
+        (1, 1),
+        (3, 1),
+        (7, 1),
+        (8, 2),
+        (11, 2),
+        (12, 3),
+        (15, 3),
+        (16, 4),
+        (32, 4),
+        (u32::MAX, 4),
+    ] {
+        for db_type in ["postgres", "mysql", "sqlite"] {
+            assert_eq!(
+                cp_namespace_load_concurrency(db_type, pool),
+                expected,
+                "{db_type} pool of {pool}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mongodb_budget_ignores_the_sql_pool_setting() {
+    for pool in [1, 8, 32] {
+        assert_eq!(cp_namespace_load_concurrency("mongodb", pool), 4);
+    }
+}
+
+/// Records the peak number of scripted calls in flight at once. Each call
+/// yields a few times before finishing, so every call the poll admits is
+/// pending at the same time.
+#[derive(Default)]
+struct CountingSource {
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+    calls: AtomicUsize,
+}
+
+impl CountingSource {
+    async fn track(&self) {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl CpFullLoadSource for CountingSource {
+    async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        _purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        self.track().await;
+        Ok(GatewayConfig {
+            proxies: vec![proxy(namespace, "fresh")],
+            loaded_at: ts(100),
+            ..Default::default()
+        })
+    }
+
+    async fn latest_change_sequence(&self, _namespace: &str) -> Result<u64, anyhow::Error> {
+        self.track().await;
+        Ok(1)
+    }
+
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        Ok(1)
+    }
+}
+
+#[async_trait]
+impl CpIncrementalLoadSource for CountingSource {
+    async fn load_incremental_config(
+        &self,
+        namespace: &str,
+        after_sequence: u64,
+    ) -> Result<IncrementalResult, anyhow::Error> {
+        self.track().await;
+        Ok(IncrementalResult {
+            added_or_modified_proxies: vec![proxy(namespace, "changed")],
+            removed_proxy_ids: Vec::new(),
+            added_or_modified_consumers: Vec::new(),
+            removed_consumer_ids: Vec::new(),
+            added_or_modified_plugin_configs: Vec::new(),
+            removed_plugin_config_ids: Vec::new(),
+            added_or_modified_upstreams: Vec::new(),
+            removed_upstream_ids: Vec::new(),
+            sequence_cursor: after_sequence + 1,
+            poll_timestamp: ts(100),
+        })
+    }
+}
+
+fn many_namespaces() -> Vec<String> {
+    (0..7).map(|index| format!("ns-{index}")).collect()
+}
+
+#[tokio::test]
+async fn full_reload_never_exceeds_the_maximum_budget() {
+    let source = CountingSource::default();
+    let namespaces = many_namespaces();
+    let outcome = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &namespaces,
+        &GatewayConfig::default(),
+        &CpScope::Set(namespaces.iter().cloned().collect()),
+        None,
+        0,
+    )
+    .await
+    .expect("full reload");
+
+    assert_eq!(outcome.refreshed_namespaces, namespaces);
+    assert_eq!(
+        source.calls(),
+        2 * namespaces.len(),
+        "one boundary and one load per namespace"
+    );
+    assert_eq!(
+        source.peak(),
+        4,
+        "boundaries and loads run four at a time, never more"
+    );
+}
+
+#[tokio::test]
+async fn incremental_poll_honours_the_pool_derived_budget() {
+    let namespaces = many_namespaces();
+    for (pool, expected_peak) in [(32, 4), (8, 2), (1, 1)] {
+        let budget = cp_namespace_load_concurrency("postgres", pool);
+        let source = CountingSource::default();
+        let outcome =
+            load_incremental_config_multi_for_test(&source, &namespaces, &HashMap::new(), budget)
+                .await
+                .expect("incremental poll");
+
+        assert_eq!(outcome.next_sequences.len(), namespaces.len());
+        assert_eq!(source.calls(), namespaces.len());
+        assert_eq!(
+            source.peak(),
+            expected_peak,
+            "pool of {pool} must cap in-flight namespace loads at {expected_peak}"
+        );
+    }
 }

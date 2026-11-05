@@ -58,8 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Multi-namespace control planes load their namespaces concurrently.** With
   `FERRUM_CP_NAMESPACES` set to a list or `*`, each incremental poll, each
   set of pre-load change-sequence boundary reads and each full reload used to
-  query one namespace at a time. Each of those phases now runs up to 4
-  namespace loads at once. Every boundary is still captured before any
+  query one namespace at a time. Each of those phases now runs several
+  namespace loads at once: on SQL, a quarter of
+  `FERRUM_DB_POOL_MAX_CONNECTIONS` between 1 and 4 (pools below 8 stay
+  serial); on MongoDB, up to 4. Every boundary is still captured before any
   resource load starts, results are merged in namespace order, and a failing
   namespace is still isolated (#2983). A multi-namespace full snapshot is now
   stamped with the earliest namespace load time rather than the first one in

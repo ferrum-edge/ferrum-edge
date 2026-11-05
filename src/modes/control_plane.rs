@@ -146,13 +146,33 @@ where
     }
 }
 
-/// Upper bound on concurrent per-namespace database loads within one phase of
-/// a multi-namespace CP poll (incremental deltas, pre-load change-sequence
-/// boundaries, full reloads). Each in-flight load holds one primary pool
-/// connection, a full load for its whole snapshot transaction, so this stays
-/// well below the default `FERRUM_DB_POOL_MAX_CONNECTIONS` (32) and leaves
-/// headroom for admin traffic.
-const CP_NAMESPACE_LOAD_CONCURRENCY: usize = 4;
+/// Most per-namespace database loads one phase of a multi-namespace CP poll
+/// (incremental deltas, pre-load change-sequence boundaries, full reloads)
+/// runs at once. See [`cp_namespace_load_concurrency`] for the per-backend
+/// budget actually used.
+const CP_NAMESPACE_LOAD_CONCURRENCY_MAX: usize = 4;
+
+/// Per-phase namespace-load budget for a multi-namespace CP poll.
+///
+/// - SQL: each in-flight full load holds one primary pool connection for its
+///   whole snapshot transaction, and every buffered sibling starts its
+///   `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` deadline as soon as it is
+///   polled. On a small pool, a namespace that would have loaded serially
+///   could time out waiting for a sibling's transaction. The budget is a
+///   quarter of `FERRUM_DB_POOL_MAX_CONNECTIONS` (leaving the rest for admin
+///   traffic), capped at [`CP_NAMESPACE_LOAD_CONCURRENCY_MAX`]. Pools below 8
+///   connections load serially, as before; the default pool of 32 gets 4.
+/// - MongoDB ignores `FERRUM_DB_POOL_*` (pool size is the URI `maxPoolSize`,
+///   driver default 10), and the driver's checkout waits without a deadline,
+///   so over-subscription only queues. It uses the fixed maximum.
+#[doc(hidden)]
+pub fn cp_namespace_load_concurrency(db_type: &str, pool_max_connections: u32) -> usize {
+    if db_type == "mongodb" {
+        return CP_NAMESPACE_LOAD_CONCURRENCY_MAX;
+    }
+    let quarter_of_pool = (pool_max_connections / 4) as usize;
+    quarter_of_pool.clamp(1, CP_NAMESPACE_LOAD_CONCURRENCY_MAX)
+}
 
 /// Stream of admitted CP gRPC connections handed to tonic's
 /// `serve_with_incoming_shutdown`.
@@ -660,7 +680,8 @@ fn retained_polled_namespaces(config: &GatewayConfig) -> Vec<String> {
 }
 
 /// Multi-namespace incremental poll. Calls `load_incremental_config` once
-/// per namespace, up to [`CP_NAMESPACE_LOAD_CONCURRENCY`] at a time. Load
+/// per namespace, up to `concurrency` at a time (see
+/// [`cp_namespace_load_concurrency`]). Load
 /// failures for one namespace are isolated: other namespaces continue and the
 /// failing namespace keeps its prior cursor (#2983).
 ///
@@ -672,6 +693,7 @@ async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
     db: &B,
     namespaces: &[String],
     after_sequences: &HashMap<String, u64>,
+    concurrency: usize,
 ) -> Result<IncrementalMultiLoad, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
@@ -718,7 +740,7 @@ async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
         .map(|ns| db.load_incremental_config(ns, after_sequences.get(ns).copied().unwrap_or(0)))
         .collect();
     let outcomes: Vec<Result<IncrementalResult, anyhow::Error>> = futures_util::stream::iter(loads)
-        .buffered(CP_NAMESPACE_LOAD_CONCURRENCY)
+        .buffered(concurrency.max(1))
         .collect()
         .await;
     for (ns, outcome) in namespaces.iter().zip(outcomes) {
@@ -812,6 +834,7 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
     db: &B,
     namespaces: &[String],
     previous: &GatewayConfig,
+    concurrency: usize,
 ) -> Result<FullLoadMultiOutcome, anyhow::Error> {
     if namespaces.len() <= 1 {
         let ns = namespaces.first().map(|s| s.as_str()).unwrap_or("ferrum");
@@ -848,7 +871,7 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
         .map(|ns| db.load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane))
         .collect();
     let outcomes: Vec<Result<GatewayConfig, anyhow::Error>> = futures_util::stream::iter(loads)
-        .buffered(CP_NAMESPACE_LOAD_CONCURRENCY)
+        .buffered(concurrency.max(1))
         .collect()
         .await;
 
@@ -1129,6 +1152,7 @@ async fn load_full_config_multi_with_sequence(
     scope: &CpScope,
     mesh_authority: Option<&str>,
     mesh_sequence_floor: u64,
+    concurrency: usize,
 ) -> Result<(FullLoadMultiOutcome, HashMap<String, u64>), anyhow::Error> {
     let boundary_namespaces = if namespaces.is_empty() {
         vec!["ferrum".to_string()]
@@ -1166,7 +1190,7 @@ async fn load_full_config_multi_with_sequence(
         .map(|ns| db.latest_change_sequence(ns))
         .collect();
     let boundaries: Vec<Result<u64, anyhow::Error>> = futures_util::stream::iter(boundary_reads)
-        .buffered(CP_NAMESPACE_LOAD_CONCURRENCY)
+        .buffered(concurrency.max(1))
         .collect()
         .await;
 
@@ -1219,7 +1243,7 @@ async fn load_full_config_multi_with_sequence(
             failed_namespaces: Vec::new(),
         }
     } else {
-        load_full_config_multi(db, &load_namespaces, previous)
+        load_full_config_multi(db, &load_namespaces, previous, concurrency)
             .await
             .inspect_err(|_| forget_consumer_quarantine_states(db, &load_namespaces))?
     };
@@ -1302,7 +1326,8 @@ pub struct CpFullLoadSequenceOutcomeForTest {
 }
 
 /// Exercise the production full-load boundary orchestration from external
-/// integration tests with a scripted [`CpFullLoadSource`].
+/// integration tests with a scripted [`CpFullLoadSource`]. Runs at the
+/// maximum per-phase budget (the default SQL pool's and MongoDB's).
 ///
 /// `#[allow(dead_code)]` because only external integration tests call this;
 /// the binary target does not, and clippy runs with `-D warnings`.
@@ -1323,6 +1348,7 @@ pub async fn load_full_config_multi_with_sequence_for_test(
         scope,
         mesh_authority,
         mesh_sequence_floor,
+        CP_NAMESPACE_LOAD_CONCURRENCY_MAX,
     )
     .await?;
     Ok(CpFullLoadSequenceOutcomeForTest {
@@ -1357,8 +1383,9 @@ pub async fn load_incremental_config_multi_for_test(
     db: &(impl CpIncrementalLoadSource + ?Sized),
     namespaces: &[String],
     after_sequences: &HashMap<String, u64>,
+    concurrency: usize,
 ) -> Result<CpIncrementalMultiLoadOutcomeForTest, anyhow::Error> {
-    let load = load_incremental_config_multi(db, namespaces, after_sequences).await?;
+    let load = load_incremental_config_multi(db, namespaces, after_sequences, concurrency).await?;
     Ok(CpIncrementalMultiLoadOutcomeForTest {
         result: load.result,
         next_sequences: load.next_sequences,
@@ -2282,6 +2309,11 @@ pub async fn run(
     // full reload — advertises the same authority.
     let mesh_config_authority = resolve_mesh_config_authority(&env_config);
     let empty_previous = GatewayConfig::default();
+    // Per-phase namespace-load budget: sized from the SQL pool (fixed for
+    // MongoDB) so concurrent namespace loads cannot starve one another or admin
+    // traffic of pooled connections. Used by startup and every poll phase.
+    let namespace_load_concurrency =
+        cp_namespace_load_concurrency(db_type, env_config.db_pool_max_connections);
     let (full_load, initial_change_sequences) = load_full_config_multi_with_sequence(
         db.as_ref(),
         &polled_namespaces,
@@ -2289,6 +2321,7 @@ pub async fn run(
         &cp_scope,
         mesh_config_authority.as_deref(),
         0,
+        namespace_load_concurrency,
     )
     .await?;
     // Startup fails CLOSED. Per-namespace isolation (#2983) exists so a broken
@@ -3418,6 +3451,7 @@ pub async fn run(
                             &poll_scope,
                             poll_mesh_config_authority.as_deref(),
                             published_mesh_sequence(&config_poll),
+                            namespace_load_concurrency,
                         )
                         .await
                         {
@@ -3519,6 +3553,7 @@ pub async fn run(
                             db_poll.as_ref(),
                             &nslist,
                             &last_change_sequences,
+                            namespace_load_concurrency,
                         )
                         .await;
                         let load_elapsed = load_started.elapsed();
@@ -3758,6 +3793,7 @@ pub async fn run(
                                             &poll_scope,
                                             poll_mesh_config_authority.as_deref(),
                                             published_mesh_sequence(&config_poll),
+                                            namespace_load_concurrency,
                                         )
                                         .await
                                         {
@@ -3895,6 +3931,7 @@ pub async fn run(
                                     &poll_scope,
                                     poll_mesh_config_authority.as_deref(),
                                     published_mesh_sequence(&config_poll),
+                                    namespace_load_concurrency,
                                 )
                                 .await
                                 {
@@ -3992,6 +4029,7 @@ pub async fn run(
                                                     &poll_scope,
                                                     poll_mesh_config_authority.as_deref(),
                                                     published_mesh_sequence(&config_poll),
+                                                    namespace_load_concurrency,
                                                 )
                                                 .await
                                                 {
@@ -4777,7 +4815,13 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect();
-        let result = load_incremental_config_multi(&source, &namespaces, &HashMap::new()).await;
+        let result = load_incremental_config_multi(
+            &source,
+            &namespaces,
+            &HashMap::new(),
+            CP_NAMESPACE_LOAD_CONCURRENCY_MAX,
+        )
+        .await;
         let Err(error) = result else {
             panic!("an escalating namespace must fail the multi-namespace incremental poll");
         };

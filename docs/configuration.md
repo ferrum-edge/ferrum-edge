@@ -428,7 +428,7 @@ SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver co
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_DB_POOL_MAX_CONNECTIONS` | No | `32` | Maximum SQL pool connections |
+| `FERRUM_DB_POOL_MAX_CONNECTIONS` | No | `32` | Maximum SQL pool connections. A multi-namespace CP loads up to a quarter of this many namespaces at once per poll phase (1 to 4; pools below 8 load serially) |
 | `FERRUM_DB_POOL_MIN_CONNECTIONS` | No | `1` | Minimum idle SQL pool connections |
 | `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | No | `30` | Max wait for a pool connection |
 | `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | No | `600` | Max idle age before a SQL connection is closed |
