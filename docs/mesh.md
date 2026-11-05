@@ -5327,7 +5327,7 @@ Status subresources are written for GatewayClass, Gateway, ListenerSet, the rout
 
 ### Bounded status writes
 
-A status patch batch runs inline on the single serialized reconcile loop, so while it runs no other object's status is published (issue #4239). The Gateway API and Istio batches of one reconcile run concurrently, so the loop is held for the slower of the two rather than their sum. The bounds:
+A status patch batch runs inline on the single serialized reconcile loop, so while it runs no other object's status is published (issue #4239). Both writers plan first (Gateway API, then Istio, with no API calls), and then the Gateway API and Istio patch batches run concurrently, so the loop is held for the slower of the two rather than their sum. They share one Kubernetes client and service account, and every budget below includes time spent queued, so each writer keeps at most 32 status requests in flight. The bounds:
 
 | Bound | Value |
 |---|---|
@@ -5335,6 +5335,7 @@ A status patch batch runs inline on the single serialized reconcile loop, so whi
 | Per object read-modify-write | 10 s |
 | Per writer batch (also clamps the two above) | 15 s |
 | Reconciler backstop around the batch | 20 s |
+| Status requests in flight per writer batch | 32 (`STATUS_PATCH_PARALLELISM`, Gateway API and Istio) |
 | Gateway API status plan budget per reconcile | 256 candidates (rotating cursor; Istio status planning is unlimited) |
 | Consecutive failed batches before the cursor advances anyway | 3 (`STATUS_WINDOW_MAX_FAILED_BATCHES`, issue #6370) |
 | Route/policy `409 Conflict` retry attempts | 5, with jitter |
@@ -5415,7 +5416,7 @@ Mesh consumers key services by `(namespace, name)`. A plain hyphen join of paren
 
 ## Istio CRD Status
 
-When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Istio CRD watching is enabled (`FERRUM_K8S_WATCH_ISTIO_CRDS=true`, the in-pod default), the controller writes a `status.conditions[]` block to every Istio CRD it translates so `kubectl describe <kind> <name>` shows how Ferrum interpreted the resource. All ten translated kinds are covered: `AuthorizationPolicy`, `PeerAuthentication`, `RequestAuthentication`, `DestinationRule`, `VirtualService`, `ServiceEntry`, `WorkloadEntry`, `Sidecar`, `Telemetry`, and `ProxyConfig`. Istio status planning shares the same primary-translation reuse path as Gateway API status (one materialization plus skip errors; no per-object filtered retranslate) and remains unlimited — the rotating 256-candidate budget is Gateway API only.
+When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Istio CRD watching is enabled (`FERRUM_K8S_WATCH_ISTIO_CRDS=true`, the in-pod default), the controller writes a `status.conditions[]` block to every Istio CRD it translates so `kubectl describe <kind> <name>` shows how Ferrum interpreted the resource. All ten translated kinds are covered: `AuthorizationPolicy`, `PeerAuthentication`, `RequestAuthentication`, `DestinationRule`, `VirtualService`, `ServiceEntry`, `WorkloadEntry`, `Sidecar`, `Telemetry`, and `ProxyConfig`. Istio status planning shares the same primary-translation reuse path as Gateway API status (one materialization plus skip errors; no per-object filtered retranslate) and remains unlimited — the rotating 256-candidate budget is Gateway API only. Patching is bounded: at most 32 Istio status writes are in flight at once.
 
 Each resource gets a single Ferrum-owned `FerrumAccepted` condition (field manager `ferrum.io/istio-controller`) alongside a `status.ferrum.translation` detail block:
 

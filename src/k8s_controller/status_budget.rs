@@ -3,9 +3,10 @@
 //!
 //! Gateway API and Istio status patch batches are awaited *inline* on the single
 //! reconcile task: while a batch runs, no watch event and no full-sync tick can
-//! produce a new reconcile, so no other object's status can be published. The
-//! two writers' batches run concurrently with each other, so one reconcile is
-//! held for the slower batch, not their sum. Before
+//! produce a new reconcile, so no other object's status can be published. Both
+//! writers plan first, then their patch batches run concurrently with each
+//! other (each bounded to [`STATUS_PATCH_PARALLELISM`] requests in flight), so
+//! one reconcile is held for the slower batch, not their sum. Before
 //! #4239 the only bound on that batch was a single 60-second whole-batch
 //! timeout, and the individual API requests inside it were unbounded (the shared
 //! kube client's read timeout is measured in minutes and cannot be lowered
@@ -64,6 +65,14 @@ pub const STATUS_BATCH_BUDGET: Duration = Duration::from_secs(15);
 /// bounds itself with [`STATUS_BATCH_BUDGET`], so reaching this means a patch
 /// path escaped its own budget — worth a distinct counter and warning.
 pub const STATUS_BATCH_BACKSTOP: Duration = Duration::from_secs(20);
+
+/// Most status requests one writer's batch keeps in flight at once.
+///
+/// The Gateway API and Istio batches of one reconcile run concurrently on the
+/// same kube client and service account, and every budget above includes time
+/// spent queued behind the other writer. Bounding both writers keeps a large
+/// Istio batch from crowding out the Gateway API batch (and the reverse).
+pub const STATUS_PATCH_PARALLELISM: usize = 32;
 
 /// A batch that completes but takes longer than this is reported, so a
 /// degrading cluster is visible before it starts costing whole reconciles.

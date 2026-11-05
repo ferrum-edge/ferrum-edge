@@ -59,8 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Kubernetes reconcile loop used to wait for the Gateway API status batch and
   then for the Istio status batch. The two writers patch disjoint objects, so
   they now run together and a reconcile is held for the slower batch rather
-  than both (worst case about 20 s instead of 40 s). Clusters that watch only
-  one of the two are unchanged.
+  than both (worst case about 20 s instead of 40 s). Both writers plan before
+  either sends a request, and the Istio writer now keeps at most 32 status
+  writes in flight (it used to send every write at once), matching the Gateway
+  API writer so a large Istio batch cannot crowd out Gateway API status on the
+  shared Kubernetes client. Clusters that watch only one of the two are
+  otherwise unchanged.
 
 ## [0.9.20] - 2026-11-02
 

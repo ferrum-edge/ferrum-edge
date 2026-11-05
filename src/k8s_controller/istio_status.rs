@@ -86,7 +86,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use futures_util::future::join_all;
+use futures_util::StreamExt;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
@@ -103,7 +103,8 @@ use crate::config_sources::k8s::{
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::status::StatusTranslationReuse;
 use crate::k8s_controller::status_budget::{
-    STATUS_BATCH_BUDGET, STATUS_UPDATE_BUDGET, StatusOperation, await_status_operation,
+    STATUS_BATCH_BUDGET, STATUS_PATCH_PARALLELISM, STATUS_UPDATE_BUDGET, StatusOperation,
+    await_status_operation,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -169,9 +170,10 @@ impl IstioStatusWriter {
     /// subresource, not-found, recreate, or a transient API-server hiccup)
     /// are logged and skipped — they never abort reconcile. Exhausted
     /// conflicts return a retryable error so the caller can alert without
-    /// falling back to an unversioned write. Returns the first error so
-    /// callers can metric / alert on the failure rate without losing the
-    /// rest of the batch.
+    /// falling back to an unversioned write. Returns the first error to
+    /// complete so callers can metric / alert on the failure rate without
+    /// losing the rest of the batch. At most `STATUS_PATCH_PARALLELISM`
+    /// updates are in flight at once.
     pub async fn patch_updates(&self, updates: Vec<IstioStatusUpdate>) -> Result<(), kube::Error> {
         // One deadline for the whole batch (issue #4239): this is awaited inline
         // on the serialized reconcile loop, so an unbounded per-object write
@@ -220,7 +222,12 @@ impl IstioStatusWriter {
             })
         });
         let mut first_error: Option<kube::Error> = None;
-        for (kind, namespace, name, result) in join_all(futures).await {
+        // Bounded like the Gateway API writer: both batches share one kube
+        // client and run concurrently, and every per-request budget includes
+        // queueing time. `first_error` is the first failure to complete.
+        let mut results =
+            futures_util::stream::iter(futures).buffer_unordered(STATUS_PATCH_PARALLELISM);
+        while let Some((kind, namespace, name, result)) = results.next().await {
             if let Err(error) = result {
                 warn!(
                     %kind,

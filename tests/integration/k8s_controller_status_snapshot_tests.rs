@@ -134,26 +134,22 @@ fn json_response(status: StatusCode, value: Value) -> Response<Body> {
 }
 
 fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
-    mock_kube_client_with_gate(state, None)
+    mock_kube_client_with_gates(state, None)
 }
 
-fn mock_kube_client_with_gate(
+/// Mock API server dispatched by path. Live reads and patch responses echo the
+/// object's name and its `uid-{name}` UID (the fixtures' UID scheme), so both
+/// writers' identity guards pass and their PATCHes land. With `gates`
+/// (Gateway API gate, Istio gate), every request first meets its writer's
+/// rendezvous, so one client can serve both writers as in production.
+fn mock_kube_client_with_gates(
     state: Arc<Mutex<MockKubeState>>,
-    gate: Option<Arc<WriterGate>>,
+    gates: Option<(Arc<WriterGate>, Arc<WriterGate>)>,
 ) -> Client {
     let service = service_fn(move |request: Request<Body>| {
         let state = state.clone();
-        let gate = gate.clone();
+        let gates = gates.clone();
         async move {
-            if let Some(gate) = gate {
-                gate.arrived.cancel();
-                if tokio::time::timeout(PEER_WAIT, gate.peer.cancelled())
-                    .await
-                    .is_ok()
-                {
-                    gate.overlapped.store(true, Ordering::SeqCst);
-                }
-            }
             let method = request.method().clone();
             let path = request.uri().path().to_string();
             let kind = if path.contains("/virtualservices/") {
@@ -167,6 +163,28 @@ fn mock_kube_client_with_gate(
             } else {
                 "Unknown"
             };
+            let name = path
+                .trim_end_matches("/status")
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let uid = format!("uid-{name}");
+
+            let gate = gates.and_then(|(gateway, istio)| match kind {
+                "GatewayClass" | "HTTPRoute" => Some(gateway),
+                "VirtualService" | "DestinationRule" => Some(istio),
+                _ => None,
+            });
+            if let Some(gate) = gate {
+                gate.arrived.cancel();
+                if tokio::time::timeout(PEER_WAIT, gate.peer.cancelled())
+                    .await
+                    .is_ok()
+                {
+                    gate.overlapped.store(true, Ordering::SeqCst);
+                }
+            }
 
             let _body = request
                 .into_body()
@@ -196,8 +214,9 @@ fn mock_kube_client_with_gate(
                                 "apiVersion": "v1",
                                 "kind": kind,
                                 "metadata": {
-                                    "name": "resource",
+                                    "name": name,
                                     "namespace": "default",
+                                    "uid": uid,
                                     "resourceVersion": "1"
                                 },
                                 "status": {}
@@ -225,8 +244,9 @@ fn mock_kube_client_with_gate(
                                 "apiVersion": "v1",
                                 "kind": kind,
                                 "metadata": {
-                                    "name": "resource",
+                                    "name": name,
                                     "namespace": "default",
+                                    "uid": uid,
                                     "resourceVersion": "2"
                                 },
                                 "status": {}
@@ -356,21 +376,19 @@ async fn istio_writer_failure_does_not_block_gateway_plan_from_shared_snapshot()
 #[tokio::test]
 async fn reconcile_dispatch_runs_gateway_and_istio_batches_concurrently() {
     // EDGE-CP-3: the reconcile loop must be held for the slower batch, not the
-    // sum. Each mock API request waits for the other writer's batch to reach
-    // the API server; a sequential dispatch would let the Gateway API batch
-    // finish before the Istio batch issues anything.
+    // sum. As in production, both writers share one kube client and one
+    // metrics Arc. Each mock API request waits for the other writer's batch
+    // to reach the API server; a sequential dispatch would let the Gateway API
+    // batch finish before the Istio batch issues anything.
     let (gateway_gate, istio_gate) = writer_gates();
-    let gateway_state = Arc::new(Mutex::new(MockKubeState::default()));
-    let istio_state = Arc::new(Mutex::new(MockKubeState::default()));
-    let gateway_writer = GatewayApiStatusWriter::new(mock_kube_client_with_gate(
-        gateway_state.clone(),
-        Some(gateway_gate.clone()),
-    ));
-    let istio_writer = IstioStatusWriter::new(mock_kube_client_with_gate(
-        istio_state.clone(),
-        Some(istio_gate.clone()),
-    ));
-    let metrics = ControllerMetrics::new();
+    let state = Arc::new(Mutex::new(MockKubeState::default()));
+    let client = mock_kube_client_with_gates(
+        state.clone(),
+        Some((gateway_gate.clone(), istio_gate.clone())),
+    );
+    let metrics = Arc::new(ControllerMetrics::new());
+    let gateway_writer = GatewayApiStatusWriter::new(client.clone()).with_metrics(metrics.clone());
+    let istio_writer = IstioStatusWriter::new(client).with_metrics(metrics.clone());
 
     run_status_patchers_for_test(
         Some(gateway_writer),
@@ -389,28 +407,39 @@ async fn reconcile_dispatch_runs_gateway_and_istio_batches_concurrently() {
         istio_gate.overlapped.load(Ordering::SeqCst),
         "the Istio batch's requests must observe the Gateway API batch's requests"
     );
+    let state = state.lock().expect("lock mock Kubernetes state");
     assert!(
-        !gateway_state
-            .lock()
-            .expect("lock gateway mock state")
+        state
             .patches
-            .is_empty(),
-        "Gateway API status patches must land"
+            .iter()
+            .any(|kind| kind == "GatewayClass" || kind == "HTTPRoute"),
+        "Gateway API status patches must land: {:?}",
+        state.patches
     );
-    // The mock's live reads carry no UID, so the Istio writer stops at its
-    // UID guard after the read; reaching the API server is what matters here.
     assert!(
-        !istio_state
-            .lock()
-            .expect("lock istio mock state")
-            .gets
-            .is_empty(),
-        "the Istio batch must reach the API server"
+        state
+            .patches
+            .iter()
+            .any(|kind| kind == "VirtualService" || kind == "DestinationRule"),
+        "Istio status patches must land: {:?}",
+        state.patches
     );
     assert_eq!(
         metrics.status_batch_timeouts.load(Ordering::Relaxed),
         0,
         "neither batch may hit the reconciler backstop"
+    );
+    assert_eq!(
+        metrics.status_request_timeouts.load(Ordering::Relaxed),
+        0,
+        "no status request may exhaust its budget"
+    );
+    assert_eq!(
+        metrics
+            .gateway_api_status_window_failed_batches
+            .load(Ordering::Relaxed),
+        0,
+        "the Gateway API batch must succeed"
     );
 }
 
@@ -456,8 +485,8 @@ async fn reconcile_dispatch_keeps_writer_failures_isolated_when_concurrent() {
         !istio_state
             .lock()
             .expect("lock istio mock state")
-            .gets
+            .patches
             .is_empty(),
-        "the Istio batch must still run despite the Gateway API failure"
+        "Istio status patches must land despite the Gateway API failure"
     );
 }
