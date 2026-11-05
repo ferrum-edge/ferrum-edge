@@ -35,7 +35,7 @@ use crate::capture::{
     XTABLES_LOCK_WAIT_SECONDS, include_outbound_ports_from_annotations,
 };
 use crate::cni::ownership::{
-    DurableCniCleanupSnapshot, DurableCniOwnershipRecord, cni_ownership_store_is_rejected,
+    DurableCniCleanupSnapshot, DurableCniOwnershipRecord, cni_ownership_store_state,
     configure_cni_ownership_store, is_safe_cni_pod_uid, load_configured_cni_ownership,
     load_durable_cni_ownership, ownership_store_path_for_socket, persist_configured_cni_ownership,
 };
@@ -1711,10 +1711,6 @@ async fn run_with_backend(
         config.node_name.clone(),
         config.capture_contract.ingress_capture_supports_ipv6,
     );
-    let topology_ready = Arc::new(AtomicBool::new(
-        !config.capture_contract.ingress_redirect_enabled(),
-    ));
-
     // `initialize_backend` is transactional: any post-`load_programs` failure
     // rolls back via `cleanup_all` before returning. Once it succeeds, THIS
     // function owns cleanup exactly once through `InitializedBackendOwner`
@@ -1773,15 +1769,11 @@ async fn run_with_backend(
             diagnostic: "inbound ingress redirect is disabled".to_string(),
         }
     };
-    let topology_publication_ok = apply_ingress_topology_outcome(
+    let initial_topology_application = apply_ingress_topology_outcome(
         owner.backend_mut(),
         config,
         metrics.as_ref(),
-        topology_ready.as_ref(),
-        startup_ready.as_ref(),
         false,
-        false,
-        udp_migration_generation.is_none(),
         &initial_topology,
         "startup",
     );
@@ -1832,8 +1824,7 @@ async fn run_with_backend(
         cni_config,
         Some(client),
         topology_monitor,
-        topology_ready,
-        topology_publication_ok,
+        initial_topology_application,
         udp_migration_generation,
         udp_node_uid,
         pod_stream,
@@ -1842,15 +1833,147 @@ async fn run_with_backend(
     .await
 }
 
-fn set_node_agent_startup_readiness(
-    startup_ready: &AtomicBool,
-    initial_pod_sync_complete: bool,
+/// Pod-watch synchronization phase. kube-rs emits `Init`, `InitApply`*, then
+/// `InitDone` for every (re)list; only a completed relist makes `pod_states`
+/// authoritative enough to treat an absent UID as removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PodSyncState {
+    /// No relist has completed since the last `Init`, or this run just started.
+    Unsynced,
+    /// A relist is in progress; the UIDs observed so far feed the `InitDone`
+    /// stale sweep.
+    Relisting(HashSet<String>),
+    /// The last relist completed and `pod_states` is authoritative.
+    Synced,
+}
+
+impl PodSyncState {
+    fn is_synced(&self) -> bool {
+        match self {
+            Self::Synced => true,
+            Self::Unsynced | Self::Relisting(_) => false,
+        }
+    }
+}
+
+/// Ambient UDP migration registry-synchronization proof (issue #3809):
+/// the `.udp-registry-synced` marker this loop publishes for the migration
+/// cleanup phase and the privileged preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRegistryProof {
+    /// No migration generation is configured; the proof does not gate
+    /// readiness and no lane retracts or publishes it.
+    NotRequired,
+    /// The marker is durably absent: never published, retracted, or withheld
+    /// until inventory converges.
+    Withheld,
+    /// A marker bound to the current pod inventory is published.
+    Published,
+    /// A retraction failed, so a stale marker may still be visible. It is
+    /// never a valid proof: readiness and the CNI capture gate treat it like
+    /// `Withheld`, and every capture mutation stays fenced until a retraction
+    /// succeeds.
+    RetractionPending,
+}
+
+/// Completed marker operation that moves [`UdpRegistryProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpRegistryProofEvent {
+    /// The marker is durably absent (a retraction or publication rollback
+    /// succeeded).
+    Absent,
+    /// Publication was declined because inventory has not converged; the
+    /// marker was not touched.
+    PublicationDeclined,
+    /// A fresh marker was published for the current pod inventory.
+    Published,
+    /// Retracting the marker failed; it may still be visible.
+    RetractionFailed,
+}
+
+impl UdpRegistryProof {
+    fn for_generation(generation: Option<&str>) -> Self {
+        match generation {
+            Some(_) => Self::Withheld,
+            None => Self::NotRequired,
+        }
+    }
+
+    /// The single transition function. `NotRequired` is absorbing: without a
+    /// migration generation the marker never gates readiness or mutations.
+    /// A declined publication leaves the marker untouched, so a marker that
+    /// was (or may still be) visible stays a stale proof awaiting retraction.
+    fn transition(self, event: UdpRegistryProofEvent) -> Self {
+        match (self, event) {
+            (Self::NotRequired, _) => Self::NotRequired,
+            (_, UdpRegistryProofEvent::Absent) => Self::Withheld,
+            (_, UdpRegistryProofEvent::Published) => Self::Published,
+            (_, UdpRegistryProofEvent::RetractionFailed) => Self::RetractionPending,
+            (Self::Withheld, UdpRegistryProofEvent::PublicationDeclined) => Self::Withheld,
+            (
+                Self::Published | Self::RetractionPending,
+                UdpRegistryProofEvent::PublicationDeclined,
+            ) => Self::RetractionPending,
+        }
+    }
+
+    /// Whether the proof satisfies `/health` readiness and the CNI
+    /// ADD/CHECK/STATUS capture gate.
+    fn admits_readiness(self) -> bool {
+        match self {
+            Self::NotRequired | Self::Published => true,
+            Self::Withheld | Self::RetractionPending => false,
+        }
+    }
+
+    fn retraction_pending(self) -> bool {
+        match self {
+            Self::RetractionPending => true,
+            Self::NotRequired | Self::Withheld | Self::Published => false,
+        }
+    }
+}
+
+/// The node-agent's published `/health` readiness and every input it is
+/// derived from. `startup_ready` is written only by [`Self::publish`], always
+/// from [`Self::readiness`], so no caller chooses which inputs to pass.
+#[derive(Debug)]
+struct NodeAgentReadiness {
+    startup_ready: Arc<AtomicBool>,
+    pod_sync: PodSyncState,
     topology_ready: bool,
-    udp_migration_ready: bool,
-) -> bool {
-    let ready = initial_pod_sync_complete && topology_ready && udp_migration_ready;
-    startup_ready.store(ready, Ordering::Release);
-    ready
+    udp_proof: UdpRegistryProof,
+}
+
+impl NodeAgentReadiness {
+    fn readiness(&self) -> bool {
+        self.pod_sync.is_synced() && self.topology_ready && self.udp_proof.admits_readiness()
+    }
+
+    /// Store the derived readiness. Call after every transition of any input;
+    /// publishing more often than needed is always correct.
+    fn publish(&self) -> bool {
+        let ready = self.readiness();
+        self.startup_ready.store(ready, Ordering::Release);
+        ready
+    }
+
+    fn set_topology_ready(&mut self, topology_ready: bool) {
+        self.topology_ready = topology_ready;
+        self.publish();
+    }
+
+    fn record_udp_proof(&mut self, event: UdpRegistryProofEvent) {
+        self.udp_proof = self.udp_proof.transition(event);
+        self.publish();
+    }
+
+    /// Teardown begins: `pod_states` stops being the authoritative capture
+    /// view, so readiness is withdrawn before the potentially slow cleanup.
+    fn begin_shutdown(&mut self) {
+        self.pod_sync = PodSyncState::Unsynced;
+        self.publish();
+    }
 }
 
 #[allow(dead_code)] // External unit tests cover the combined readiness boundary.
@@ -1859,30 +1982,41 @@ pub(crate) fn set_node_agent_startup_readiness_for_test(
     topology_ready: bool,
     udp_migration_ready: bool,
 ) -> bool {
-    let startup_ready = AtomicBool::new(false);
-    set_node_agent_startup_readiness(
-        &startup_ready,
-        initial_pod_sync_complete,
+    NodeAgentReadiness {
+        startup_ready: Arc::new(AtomicBool::new(false)),
+        pod_sync: if initial_pod_sync_complete {
+            PodSyncState::Synced
+        } else {
+            PodSyncState::Unsynced
+        },
         topology_ready,
-        udp_migration_ready,
-    )
+        udp_proof: if udp_migration_ready {
+            UdpRegistryProof::Published
+        } else {
+            UdpRegistryProof::Withheld
+        },
+    }
+    .publish()
 }
 
-// This publication boundary deliberately receives each independent readiness
-// input explicitly so callers cannot hide capture or startup state in defaults.
-#[allow(clippy::too_many_arguments)]
+/// Result of publishing one ingress-topology outcome to the BPF capture map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IngressTopologyApplication {
+    /// The topology is proved and its quarantine state reached the datapath.
+    topology_ready: bool,
+    /// The capture-map update succeeded (or redirect is disabled). `false`
+    /// arms the bounded datapath publication retry.
+    datapath_published: bool,
+}
+
 fn apply_ingress_topology_outcome(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
-    topology_ready: &AtomicBool,
-    startup_ready: &AtomicBool,
-    initial_sync_complete: bool,
     capture_failures_pending: bool,
-    udp_migration_ready: bool,
     outcome: &IngressTopologyOutcome,
     phase: &'static str,
-) -> bool {
+) -> IngressTopologyApplication {
     let previous_snapshot = metrics.snapshot();
     let previous = previous_snapshot.ingress_topology;
     let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
@@ -1909,13 +2043,6 @@ fn apply_ingress_topology_outcome(
     };
     metrics.set_ingress_topology(status);
     let ready = requested_ready && datapath_update_ok;
-    topology_ready.store(ready, Ordering::Release);
-    set_node_agent_startup_readiness(
-        startup_ready,
-        initial_sync_complete,
-        ready,
-        udp_migration_ready,
-    );
     if ready {
         if previous_snapshot.capture_state
             == NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE
@@ -1957,40 +2084,37 @@ fn apply_ingress_topology_outcome(
             );
         }
     }
-    datapath_update_ok
+    IngressTopologyApplication {
+        topology_ready: ready,
+        datapath_published: datapath_update_ok,
+    }
 }
 
 /// Narrow external-test seam for the production topology outcome transition.
-/// It exposes only the two readiness bits; BPF-map and metrics effects remain
-/// observable through the existing mock backend and metrics snapshots.
+/// It exposes only the topology bit and the readiness derived from it (with no
+/// UDP migration generation); BPF-map and metrics effects remain observable
+/// through the existing mock backend and metrics snapshots.
 #[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) fn apply_ingress_topology_outcome_for_test(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
-    topology_ready: bool,
-    startup_ready: bool,
     initial_sync_complete: bool,
     outcome: &IngressTopologyOutcome,
 ) -> (bool, bool) {
-    let topology_ready = AtomicBool::new(topology_ready);
-    let startup_ready = AtomicBool::new(startup_ready);
-    let _ = apply_ingress_topology_outcome(
-        backend,
-        config,
-        metrics,
-        &topology_ready,
-        &startup_ready,
-        initial_sync_complete,
-        false,
-        true,
-        outcome,
-        "test",
-    );
-    (
-        topology_ready.load(Ordering::Acquire),
-        startup_ready.load(Ordering::Acquire),
-    )
+    let application =
+        apply_ingress_topology_outcome(backend, config, metrics, false, outcome, "test");
+    let readiness = NodeAgentReadiness {
+        startup_ready: Arc::new(AtomicBool::new(false)),
+        pod_sync: if initial_sync_complete {
+            PodSyncState::Synced
+        } else {
+            PodSyncState::Unsynced
+        },
+        topology_ready: application.topology_ready,
+        udp_proof: UdpRegistryProof::NotRequired,
+    };
+    (application.topology_ready, readiness.publish())
 }
 
 /// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
@@ -2020,7 +2144,6 @@ where
         enabled: false,
         socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
     };
-    let topology_ready = Arc::new(AtomicBool::new(true));
     run_with_pod_stream(
         &mut owner,
         config,
@@ -2030,8 +2153,10 @@ where
         cni_config,
         None,
         None,
-        topology_ready,
-        true,
+        IngressTopologyApplication {
+            topology_ready: true,
+            datapath_published: true,
+        },
         None,
         None,
         pod_stream,
@@ -2043,6 +2168,8 @@ where
 /// Inject completed topology outcomes into the production pod/CNI select loop.
 /// Kubernetes and host I/O stay outside this seam; it exists solely so external
 /// tests can exercise the real outcome arm and readiness/quarantine wiring.
+/// `startup_ready` is the loop's published `/health` bit, and a
+/// `udp_migration_generation` requires `config.node_waypoint_pod_registry_dir`.
 #[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
@@ -2050,6 +2177,8 @@ pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
     shutdown_tx: &crate::overload::ShutdownSender,
+    startup_ready: Arc<AtomicBool>,
+    udp_migration_generation: Option<String>,
     pod_stream: S,
     initial_topology: IngressTopologyOutcome,
     mut topology_stream: T,
@@ -2065,17 +2194,11 @@ where
         }
     });
     let monitor = IngressTopologyMonitor { outcomes, task };
-    let startup_ready = Arc::new(AtomicBool::new(false));
-    let topology_ready = Arc::new(AtomicBool::new(false));
-    let topology_publication_ok = apply_ingress_topology_outcome(
+    let initial_topology_application = apply_ingress_topology_outcome(
         backend,
         config,
         metrics.as_ref(),
-        topology_ready.as_ref(),
-        startup_ready.as_ref(),
         false,
-        false,
-        true,
         &initial_topology,
         "test_startup",
     );
@@ -2092,9 +2215,8 @@ where
         },
         None,
         Some(monitor),
-        topology_ready,
-        topology_publication_ok,
-        None,
+        initial_topology_application,
+        udp_migration_generation,
         None,
         pod_stream,
         std::iter::empty(),
@@ -2112,8 +2234,7 @@ async fn run_with_pod_stream<S, I>(
     cni_config: CniListenerConfig,
     kube_client: Option<Client>,
     mut topology_monitor: Option<IngressTopologyMonitor>,
-    topology_ready: Arc<AtomicBool>,
-    mut topology_publication_ok: bool,
+    initial_topology: IngressTopologyApplication,
     udp_migration_generation: Option<String>,
     // This node-agent incarnation's AUTHORITATIVELY resolved
     // `Node.metadata.uid`, or `None` when it could not prove one. It binds every
@@ -2145,22 +2266,26 @@ where
     }
 
     let mut shutdown_rx = shutdown_tx.subscribe();
-    let mut init_seen: Option<HashSet<String>> = None;
     if udp_migration_generation.is_some() && config.node_waypoint_pod_registry_dir.is_none() {
         anyhow::bail!(
             "Ambient UDP migration generation requires the node-waypoint pod registry directory"
         );
     }
-    let mut udp_registry_sync_published = false;
-    let mut udp_registry_sync_retraction_pending = false;
+    let mut topology_publication_ok = initial_topology.datapath_published;
+    let mut readiness = NodeAgentReadiness {
+        startup_ready,
+        pod_sync: PodSyncState::Unsynced,
+        topology_ready: initial_topology.topology_ready,
+        udp_proof: UdpRegistryProof::for_generation(udp_migration_generation.as_deref()),
+    };
+    readiness.publish();
     let mut pending_pod_event = None;
-    let mut initial_pod_sync_complete = false;
     if udp_migration_generation.is_some()
         && let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref()
         && let Err(error) =
             crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir)
     {
-        udp_registry_sync_retraction_pending = true;
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
         warn!(
             error = %crate::startup::sanitize_startup_scalar(&error),
             "Ambient UDP registry proof retraction failed at startup; keeping capture mutations and readiness fenced while retrying"
@@ -2184,10 +2309,17 @@ where
         };
         configure_cni_ownership_store(Some(ownership_store_path));
         if let Err(error) = rehydrate_cni_owned_attachments(&pod_states) {
-            error!(
-                error = %crate::startup::sanitize_startup_scalar(&error),
-                "Failed to rehydrate durable Ferrum CNI ownership; GC will fail closed"
-            );
+            if cni_ownership_store_state().load_is_retryable() {
+                warn!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Durable Ferrum CNI ownership state is unavailable; CNI ADD, GC, and STATUS fail closed and the load is retried before each CNI request"
+                );
+            } else {
+                error!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Durable Ferrum CNI ownership state rejected; CNI ADD, GC, and STATUS fail closed until the store is repaired and the node-agent restarts"
+                );
+            }
         }
         Some(spawn_cni_listener(
             cni_config.socket_path.clone(),
@@ -2259,22 +2391,19 @@ where
                     Some(event) => Some(Ok(event)),
                     None => pod_stream.next().await,
                 }
-            }, if !udp_registry_sync_retraction_pending => {
+            }, if !readiness.udp_proof.retraction_pending() => {
                 match event {
                     Some(Ok(Event::Apply(pod))) => {
                         let refresh_udp_registry_sync = match
                             retract_udp_migration_registry_sync_for_mutation(
-                                udp_migration_generation.as_deref(),
-                                initial_pod_sync_complete && init_seen.is_none(),
+                                readiness.pod_sync.is_synced(),
                                 config,
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                                 UdpRegistryMutationLane::WatchApply,
                             )
                         {
                             Ok(refresh) => refresh,
                             Err(error) => {
-                                startup_ready.store(false, Ordering::Release);
                                 pending_pod_event = Some(Event::Apply(pod));
                                 warn!(
                                     error = %crate::startup::sanitize_startup_scalar(&error),
@@ -2283,9 +2412,6 @@ where
                                 continue;
                             }
                         };
-                        if refresh_udp_registry_sync {
-                            startup_ready.store(false, Ordering::Release);
-                        }
                         handle_kube_pod_applied(
                             owner.backend_mut(),
                             &pod_states,
@@ -2295,7 +2421,6 @@ where
                         );
                         if refresh_udp_registry_sync {
                             let Some(generation) = udp_migration_generation.as_deref() else {
-                                startup_ready.store(false, Ordering::Release);
                                 warn!(
                                     "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
                                 );
@@ -2306,31 +2431,21 @@ where
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
+                                &mut readiness,
                             );
                         }
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         let refresh_udp_registry_sync = match
                             retract_udp_migration_registry_sync_for_mutation(
-                                udp_migration_generation.as_deref(),
-                                initial_pod_sync_complete && init_seen.is_none(),
+                                readiness.pod_sync.is_synced(),
                                 config,
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                                 UdpRegistryMutationLane::WatchDelete,
                             )
                         {
                             Ok(refresh) => refresh,
                             Err(error) => {
-                                startup_ready.store(false, Ordering::Release);
                                 pending_pod_event = Some(Event::Delete(pod));
                                 warn!(
                                     error = %crate::startup::sanitize_startup_scalar(&error),
@@ -2339,15 +2454,11 @@ where
                                 continue;
                             }
                         };
-                        if refresh_udp_registry_sync {
-                            startup_ready.store(false, Ordering::Release);
-                        }
                         if let Some(uid) = pod_uid(&pod) {
                             handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                         if refresh_udp_registry_sync {
                             let Some(generation) = udp_migration_generation.as_deref() else {
-                                startup_ready.store(false, Ordering::Release);
                                 warn!(
                                     "Ambient UDP migration generation disappeared during registry refresh; readiness remains fenced"
                                 );
@@ -2358,27 +2469,17 @@ where
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
+                                &mut readiness,
                             );
                         }
                     }
                     Some(Ok(Event::Init)) => {
                         if let Err(error) = retract_udp_migration_registry_sync_for_mutation(
-                            udp_migration_generation.as_deref(),
                             true,
                             config,
-                            &mut udp_registry_sync_published,
-                            &mut udp_registry_sync_retraction_pending,
+                            &mut readiness,
                             UdpRegistryMutationLane::WatchRelist,
                         ) {
-                            startup_ready.store(false, Ordering::Release);
                             pending_pod_event = Some(Event::Init);
                             warn!(
                                 error = %crate::startup::sanitize_startup_scalar(&error),
@@ -2386,9 +2487,8 @@ where
                             );
                             continue;
                         }
-                        init_seen = Some(HashSet::new());
-                        initial_pod_sync_complete = false;
-                        startup_ready.store(false, Ordering::Release);
+                        readiness.pod_sync = PodSyncState::Relisting(HashSet::new());
+                        readiness.publish();
                     }
                     Some(Ok(Event::InitApply(pod))) => {
                         if let Some(uid) = handle_kube_pod_applied(
@@ -2397,12 +2497,16 @@ where
                             config,
                             metrics.as_ref(),
                             &pod,
-                        ) && let Some(seen) = &mut init_seen {
+                        ) && let PodSyncState::Relisting(seen) = &mut readiness.pod_sync {
                             seen.insert(uid);
                         }
                     }
                     Some(Ok(Event::InitDone)) => {
-                        if let Some(seen) = init_seen.take() {
+                        // `InitDone` makes `pod_states` authoritative; only a
+                        // relist that recorded its seen set runs the sweep.
+                        if let PodSyncState::Relisting(seen) =
+                            std::mem::replace(&mut readiness.pod_sync, PodSyncState::Synced)
+                        {
                             let stale_uids = watcher_init_stale_uids(&pod_states, &seen);
                             for uid in stale_uids {
                                 handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
@@ -2418,32 +2522,22 @@ where
                                 &seen,
                             );
                         }
-                        initial_pod_sync_complete = true;
                         if let Some(generation) = udp_migration_generation.as_deref() {
                             publish_udp_migration_registry_sync_with_recovery(
                                 generation,
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                             );
-                            if !udp_registry_sync_published {
+                            if !readiness.udp_proof.admits_readiness() {
                                 warn!(
                                     "Withholding Ambient UDP registry synchronization marker until all relisted pod registry entries and cleanup ownership converge"
                                 );
                             }
                         }
-                        let topology_is_ready = topology_ready.load(Ordering::Acquire);
-                        let udp_migration_ready =
-                            udp_migration_generation.is_none() || udp_registry_sync_published;
-                        let ready = set_node_agent_startup_readiness(
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
-                            topology_is_ready,
-                            udp_migration_ready,
-                        );
-                        if ready {
+                        let topology_is_ready = readiness.topology_ready;
+                        if readiness.publish() {
                             info!(
                                 "Node agent initial pod sync, ingress topology proof, and UDP migration proof complete; /health now reports ready"
                             );
@@ -2483,9 +2577,9 @@ where
                         };
                         if let Some(reason) = cni_capture_readiness_rejection(
                             work.request.verb,
-                            initial_pod_sync_complete,
-                            topology_ready.load(Ordering::Acquire),
-                            udp_migration_generation.is_none() || udp_registry_sync_published,
+                            readiness.pod_sync.is_synced(),
+                            readiness.topology_ready,
+                            readiness.udp_proof.admits_readiness(),
                         ) {
                             // Durable cleanup snapshots may name IP/map keys
                             // now owned by a replacement pod. Until InitDone,
@@ -2505,19 +2599,14 @@ where
                         );
                         let refresh_udp_registry_sync = match
                             retract_udp_migration_registry_sync_for_mutation(
-                                udp_migration_generation.as_deref(),
-                                cni_mutates_capture
-                                    && initial_pod_sync_complete
-                                    && init_seen.is_none(),
+                                cni_mutates_capture && readiness.pod_sync.is_synced(),
                                 config,
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
+                                &mut readiness,
                                 UdpRegistryMutationLane::Cni,
                             )
                         {
                             Ok(refresh) => refresh,
                             Err(error) => {
-                                startup_ready.store(false, Ordering::Release);
                                 let _ = work.respond.send(CniRpcResponse::Error {
                                     reason: "CNI capture mutation deferred while the node-agent retracts stale UDP migration proof"
                                         .to_string(),
@@ -2530,9 +2619,6 @@ where
                                 continue;
                             }
                         };
-                        if refresh_udp_registry_sync {
-                            startup_ready.store(false, Ordering::Release);
-                        }
                         let enrolled_uid = process_cni_work_item(
                             owner.backend_mut(),
                             &pod_states,
@@ -2541,10 +2627,9 @@ where
                             client,
                             work,
                         ).await;
-                        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
+                        mark_relist_seen_from_cni_add(&mut readiness.pod_sync, enrolled_uid.as_deref());
                         if refresh_udp_registry_sync {
                             let Some(generation) = udp_migration_generation.as_deref() else {
-                                startup_ready.store(false, Ordering::Release);
                                 warn!(
                                     "Ambient UDP migration generation disappeared during CNI registry refresh; readiness remains fenced"
                                 );
@@ -2555,14 +2640,7 @@ where
                                 &pod_states,
                                 config,
                                 udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
+                                &mut readiness,
                             );
                         }
                     }
@@ -2575,44 +2653,31 @@ where
                     }
                 }
             }
-            _ = udp_registry_retraction_retry.tick(), if udp_registry_sync_retraction_pending => {
-                match retract_udp_migration_registry_sync_for_mutation(
-                    udp_migration_generation.as_deref(),
+            _ = udp_registry_retraction_retry.tick(), if readiness.udp_proof.retraction_pending() => {
+                // A failed retraction leaves the proof `RetractionPending`,
+                // which already withholds readiness; only success continues.
+                // A deferred watcher mutation must run before a fresh proof is
+                // published. With no queued mutation, restore the proof
+                // immediately once the authoritative initial snapshot already
+                // completed.
+                if retract_udp_migration_registry_sync_for_mutation(
                     false,
                     config,
-                    &mut udp_registry_sync_published,
-                    &mut udp_registry_sync_retraction_pending,
+                    &mut readiness,
                     UdpRegistryMutationLane::RetryTick,
-                ) {
-                    Ok(_) => {
-                        // A deferred watcher mutation must run before a fresh
-                        // proof is published. With no queued mutation, restore
-                        // the proof immediately once the authoritative initial
-                        // snapshot already completed.
-                        if pending_pod_event.is_none()
-                            && initial_pod_sync_complete
-                            && init_seen.is_none()
-                            && let Some(generation) = udp_migration_generation.as_deref()
-                        {
-                            publish_udp_migration_registry_sync_with_recovery(
-                                generation,
-                                &pod_states,
-                                config,
-                                udp_node_uid.as_deref(),
-                                &mut udp_registry_sync_published,
-                                &mut udp_registry_sync_retraction_pending,
-                            );
-                            set_node_agent_startup_readiness(
-                                startup_ready.as_ref(),
-                                initial_pod_sync_complete,
-                                topology_ready.load(Ordering::Acquire),
-                                udp_registry_sync_published,
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        startup_ready.store(false, Ordering::Release);
-                    }
+                )
+                .is_ok()
+                    && pending_pod_event.is_none()
+                    && readiness.pod_sync.is_synced()
+                    && let Some(generation) = udp_migration_generation.as_deref()
+                {
+                    publish_udp_migration_registry_sync_with_recovery(
+                        generation,
+                        &pod_states,
+                        config,
+                        udp_node_uid.as_deref(),
+                        &mut readiness,
+                    );
                 }
             }
             _ = retry_interval.tick() => {
@@ -2636,13 +2701,13 @@ where
                                 registry_dir,
                             ) {
                                 Ok(()) => {
-                                    udp_registry_sync_published = false;
-                                    udp_registry_sync_retraction_pending = false;
+                                    readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
                                     Ok(())
                                 }
                                 Err(error) => {
-                                    udp_registry_sync_published = false;
-                                    udp_registry_sync_retraction_pending = true;
+                                    readiness.record_udp_proof(
+                                        UdpRegistryProofEvent::RetractionFailed,
+                                    );
                                     Err(error)
                                 }
                             }
@@ -2668,13 +2733,12 @@ where
                             }
                         }
                         refresh => {
-                            let retracted = refresh.registry_sync_was_retracted();
+                            // A retraction during the refresh already moved
+                            // the proof (and therefore readiness) through
+                            // the closure above.
                             udp_node_uid = refresh.uid().map(str::to_string);
-                            if retracted {
-                                startup_ready.store(false, Ordering::Release);
-                            }
                             if matches!(refresh, NodeIdentityRefresh::Fenced { .. })
-                                && udp_registry_sync_retraction_pending
+                                && readiness.udp_proof.retraction_pending()
                             {
                                 warn!(
                                     "Deferring capture retry tick until node identity and Ambient UDP registry proof retraction recover"
@@ -2690,29 +2754,19 @@ where
                 // no-ops when none are pending.
                 let retry_mutates_udp_registry = has_failed_pod_enrollments(&pod_states)
                     || has_pending_capture_failures(&pod_states);
-                let refresh_udp_registry_sync =
-                    match retract_udp_migration_registry_sync_for_mutation(
-                        udp_migration_generation.as_deref(),
-                        retry_mutates_udp_registry
-                            && initial_pod_sync_complete
-                            && init_seen.is_none(),
-                        config,
-                        &mut udp_registry_sync_published,
-                        &mut udp_registry_sync_retraction_pending,
-                        UdpRegistryMutationLane::RetryTick,
-                    ) {
-                        Ok(refresh) => refresh,
-                        Err(error) => {
-                            startup_ready.store(false, Ordering::Release);
-                            warn!(
-                                error = %crate::startup::sanitize_startup_scalar(&error),
-                                "Deferring capture retry tick until the stale Ambient UDP registry proof is retracted"
-                            );
-                            continue;
-                        }
-                    };
-                if refresh_udp_registry_sync {
-                    startup_ready.store(false, Ordering::Release);
+                // A successful retraction leaves the proof `Withheld`; the
+                // publication step below republishes it once retries converge.
+                if let Err(error) = retract_udp_migration_registry_sync_for_mutation(
+                    retry_mutates_udp_registry && readiness.pod_sync.is_synced(),
+                    config,
+                    &mut readiness,
+                    UdpRegistryMutationLane::RetryTick,
+                ) {
+                    warn!(
+                        error = %crate::startup::sanitize_startup_scalar(&error),
+                        "Deferring capture retry tick until the stale Ambient UDP registry proof is retracted"
+                    );
+                    continue;
                 }
                 retry_backed_off_pod_enrollments(
                     owner.backend_mut(),
@@ -2750,8 +2804,8 @@ where
                     config,
                     metrics.as_ref(),
                 );
-                if initial_pod_sync_complete
-                    && !udp_registry_sync_published
+                if readiness.pod_sync.is_synced()
+                    && readiness.udp_proof != UdpRegistryProof::Published
                     && let Some(generation) = udp_migration_generation.as_deref()
                 {
                     publish_udp_migration_registry_sync_with_recovery(
@@ -2759,21 +2813,12 @@ where
                         &pod_states,
                         config,
                         udp_node_uid.as_deref(),
-                        &mut udp_registry_sync_published,
-                        &mut udp_registry_sync_retraction_pending,
+                        &mut readiness,
                     );
-                    if udp_registry_sync_published {
-                        set_node_agent_startup_readiness(
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
-                            topology_ready.load(Ordering::Acquire),
-                            true,
-                        );
+                    if readiness.udp_proof == UdpRegistryProof::Published {
                         info!(
                             "Ambient UDP registry synchronization marker published after relist recovery converged"
                         );
-                    } else if refresh_udp_registry_sync {
-                        startup_ready.store(false, Ordering::Release);
                     }
                 }
             }
@@ -2790,19 +2835,17 @@ where
                             continue;
                         };
                         let outcome = monitor.outcomes.borrow_and_update().clone();
-                        topology_publication_ok = apply_ingress_topology_outcome(
+                        let application = apply_ingress_topology_outcome(
                             owner.backend_mut(),
                             config,
                             metrics.as_ref(),
-                            topology_ready.as_ref(),
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
                             has_failed_pod_enrollments(&pod_states)
                                 || has_pending_capture_failures(&pod_states),
-                            udp_migration_generation.is_none() || udp_registry_sync_published,
                             &outcome,
                             "runtime_revalidation",
                         );
+                        topology_publication_ok = application.datapath_published;
+                        readiness.set_topology_ready(application.topology_ready);
                         last_topology_outcome = Some(outcome);
                     }
                     Err(_) => {
@@ -2810,38 +2853,34 @@ where
                         let outcome = IngressTopologyOutcome::monitor_stopped(
                             config.capture_contract.ingress_redirect_ifaces.len(),
                         );
-                        topology_publication_ok = apply_ingress_topology_outcome(
+                        let application = apply_ingress_topology_outcome(
                             owner.backend_mut(),
                             config,
                             metrics.as_ref(),
-                            topology_ready.as_ref(),
-                            startup_ready.as_ref(),
-                            initial_pod_sync_complete,
                             has_failed_pod_enrollments(&pod_states)
                                 || has_pending_capture_failures(&pod_states),
-                            udp_migration_generation.is_none() || udp_registry_sync_published,
                             &outcome,
                             "runtime_revalidation",
                         );
+                        topology_publication_ok = application.datapath_published;
+                        readiness.set_topology_ready(application.topology_ready);
                         last_topology_outcome = Some(outcome);
                     }
                 }
             }
             _ = topology_datapath_retry.tick(), if !topology_publication_ok => {
                 if let Some(outcome) = last_topology_outcome.as_ref() {
-                    topology_publication_ok = apply_ingress_topology_outcome(
+                    let application = apply_ingress_topology_outcome(
                         owner.backend_mut(),
                         config,
                         metrics.as_ref(),
-                        topology_ready.as_ref(),
-                        startup_ready.as_ref(),
-                        initial_pod_sync_complete,
                         has_failed_pod_enrollments(&pod_states)
                             || has_pending_capture_failures(&pod_states),
-                        udp_migration_generation.is_none() || udp_registry_sync_published,
                         outcome,
                         "datapath_publication_retry",
                     );
+                    topology_publication_ok = application.datapath_published;
+                    readiness.set_topology_ready(application.topology_ready);
                 }
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
@@ -2851,7 +2890,10 @@ where
                     config,
                     metrics.as_ref(),
                     &mut udp_ready_uids,
-                    startup_ready.load(Ordering::Acquire),
+                    // Close-ack and orphan-reap safety depend only on whether
+                    // `pod_states` is authoritative, not on topology or the
+                    // UDP migration proof that also gate `/health`.
+                    readiness.pod_sync.is_synced(),
                 );
             }
             _ = udp_reply_source_interval.tick(),
@@ -2872,7 +2914,7 @@ where
     // shutdown. Drop readiness before the potentially slow CNI join so probes
     // do not keep reporting ready while capture is tearing down.
     //
-    startup_ready.store(false, Ordering::Release);
+    readiness.begin_shutdown();
     shutdown_tx.shutdown();
 
     info!(
@@ -2884,11 +2926,9 @@ where
         "Node agent shutting down, detaching BPF programs"
     );
     let registry_proof_retracted = match retract_udp_migration_registry_sync_for_mutation(
-        udp_migration_generation.as_deref(),
         udp_migration_generation.is_some(),
         config,
-        &mut udp_registry_sync_published,
-        &mut udp_registry_sync_retraction_pending,
+        &mut readiness,
         UdpRegistryMutationLane::Shutdown,
     ) {
         Ok(_) => true,
@@ -3064,12 +3104,6 @@ impl NodeIdentityRefresh {
             Self::Fenced { uid } | Self::Interrupted { uid } => uid.as_deref(),
             Self::Unresolved => None,
         }
-    }
-
-    /// Whether this outcome retracted the registry-synchronization marker and
-    /// the caller must republish only after inventory converges.
-    pub fn registry_sync_was_retracted(&self) -> bool {
-        !matches!(self, Self::Unchanged { .. } | Self::Interrupted { .. })
     }
 }
 
@@ -3348,18 +3382,14 @@ fn publish_udp_migration_registry_sync_with_recovery(
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
     node_uid: Option<&str>,
-    published: &mut bool,
-    retraction_pending: &mut bool,
+    readiness: &mut NodeAgentReadiness,
 ) {
     match publish_udp_migration_registry_sync_if_ready(generation, pod_states, config, node_uid) {
-        Ok(was_published) => {
-            *published = was_published;
-            *retraction_pending = false;
-        }
+        Ok(true) => readiness.record_udp_proof(UdpRegistryProofEvent::Published),
+        Ok(false) => readiness.record_udp_proof(UdpRegistryProofEvent::PublicationDeclined),
         Err(error) => {
-            *published = false;
             let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
-                *retraction_pending = true;
+                readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
                 warn!(
                     error = %crate::startup::sanitize_startup_scalar(&error),
                     "Ambient UDP registry proof publication failed without a registry directory; keeping mutation fence closed"
@@ -3368,14 +3398,14 @@ fn publish_udp_migration_registry_sync_with_recovery(
             };
             match crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir) {
                 Ok(()) => {
-                    *retraction_pending = false;
+                    readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
                     warn!(
                         error = %crate::startup::sanitize_startup_scalar(&error),
                         "Ambient UDP registry proof publication failed; proof remains withheld and will be retried"
                     );
                 }
                 Err(retraction_error) => {
-                    *retraction_pending = true;
+                    readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
                     warn!(
                         error = %crate::startup::sanitize_startup_scalar(&error),
                         retraction_error = %crate::startup::sanitize_startup_scalar(&retraction_error),
@@ -3391,26 +3421,23 @@ fn publish_udp_migration_registry_sync_with_recovery(
 /// mutation can attach, detach, or rewrite pod capture ownership. The caller
 /// republishes only after the mutation and all retry/failure state converge.
 /// During the initial relist the marker is already retracted by `Event::Init`,
-/// so individual `InitApply` events deliberately do not churn it.
+/// so individual `InitApply` events deliberately do not churn it. A pending
+/// retraction is retried by every lane, mutating or not. Returns whether the
+/// caller must republish after its mutation.
 fn retract_udp_migration_registry_sync_for_mutation(
-    generation: Option<&str>,
     mutation_requires_refresh: bool,
     config: &NodeAgentConfig,
-    published: &mut bool,
-    retraction_pending: &mut bool,
+    readiness: &mut NodeAgentReadiness,
     lane: UdpRegistryMutationLane,
 ) -> Result<bool, String> {
-    if generation.is_none() {
-        return Ok(false);
-    }
-    if !mutation_requires_refresh && !*retraction_pending {
-        return Ok(false);
-    }
-    if !*published && !*retraction_pending {
-        return Ok(mutation_requires_refresh);
+    match readiness.udp_proof {
+        UdpRegistryProof::NotRequired => return Ok(false),
+        UdpRegistryProof::Withheld => return Ok(mutation_requires_refresh),
+        UdpRegistryProof::Published if !mutation_requires_refresh => return Ok(false),
+        UdpRegistryProof::Published | UdpRegistryProof::RetractionPending => {}
     }
     let Some(registry_dir) = config.node_waypoint_pod_registry_dir.as_deref() else {
-        *retraction_pending = true;
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
         return Err(
             "Ambient UDP migration generation requires the node-waypoint pod registry directory"
                 .to_string(),
@@ -3419,7 +3446,7 @@ fn retract_udp_migration_registry_sync_for_mutation(
     if let Err(error) =
         crate::proxy::udp_placement_migration::clear_registry_sync_marker(registry_dir)
     {
-        *retraction_pending = true;
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
         return Err(format!(
             "{} mutation lane could not retract the Ambient UDP registry proof: {error}",
             match lane {
@@ -3432,8 +3459,7 @@ fn retract_udp_migration_registry_sync_for_mutation(
             }
         ));
     }
-    *published = false;
-    *retraction_pending = false;
+    readiness.record_udp_proof(UdpRegistryProofEvent::Absent);
     Ok(mutation_requires_refresh)
 }
 
@@ -3484,11 +3510,8 @@ fn prune_failed_enrollments_from_relist(
     clear_partial_capture_state_if_recovered(pod_states, metrics);
 }
 
-fn mark_relist_seen_from_cni_add(
-    init_seen: &mut Option<HashSet<String>>,
-    enrolled_uid: Option<&str>,
-) {
-    if let (Some(seen), Some(uid)) = (init_seen.as_mut(), enrolled_uid) {
+fn mark_relist_seen_from_cni_add(pod_sync: &mut PodSyncState, enrolled_uid: Option<&str>) {
+    if let (PodSyncState::Relisting(seen), Some(uid)) = (pod_sync, enrolled_uid) {
         seen.insert(uid.to_string());
     }
 }
@@ -3546,6 +3569,7 @@ async fn apply_cni_request_with_kube_metadata(
     if let Err(reason) = request.validate() {
         return (CniRpcResponse::Error { reason }, None);
     }
+    retry_transient_cni_ownership_load(pod_states);
     if request.verb == RpcVerb::Status {
         // CNI 1.1: STATUS must fail when an external service needed for ADD is
         // unavailable. Initial sync (`startup_ready`) is gated in the main loop
@@ -3594,6 +3618,32 @@ async fn apply_cni_request_with_kube_metadata(
                 None,
             )
         }
+    }
+}
+
+/// Re-attempt a durable ownership load that failed on a transient I/O error, so
+/// one failed startup read cannot fence ADD, GC, and STATUS for the lifetime of
+/// the process. Runs on the serialized CNI work path before the request is
+/// applied; content rejection is terminal and is never re-read here.
+fn retry_transient_cni_ownership_load(pod_states: &DashMap<String, PodAttachmentState>) {
+    if !cni_ownership_store_state().load_is_retryable() {
+        return;
+    }
+    // Warn only on a state change: recovery, or content now rejected. A load
+    // that stays unavailable was already reported at startup and repeats on
+    // every CNI request, so it is debug-level here.
+    match rehydrate_cni_owned_attachments(pod_states) {
+        Ok(()) => info!(
+            "Durable Ferrum CNI ownership state loaded after a transient failure; CNI ADD, GC, and STATUS resume"
+        ),
+        Err(error) if cni_ownership_store_state().load_is_retryable() => debug!(
+            error = %crate::startup::sanitize_startup_scalar(&error),
+            "Durable Ferrum CNI ownership state is still unavailable; CNI ADD, GC, and STATUS remain fail-closed"
+        ),
+        Err(error) => warn!(
+            error = %crate::startup::sanitize_startup_scalar(&error),
+            "Durable Ferrum CNI ownership state rejected on retry; CNI ADD, GC, and STATUS fail closed until the store is repaired and the node-agent restarts"
+        ),
     }
 }
 
@@ -3890,7 +3940,17 @@ pub fn apply_cni_request(
             // additionally proves live Kubernetes ADD-dependency readiness in
             // `apply_cni_request_with_kube_metadata` (after the main-loop
             // initial-sync gate). This pure path carries no attachment work.
-            CniRpcResponse::Ok
+            // ADD must durably claim GC ownership for every enrolled
+            // attachment and fails closed while the store refuses claims, so
+            // STATUS cannot report ADD serviceable in that state (CNI 1.1).
+            match cni_ownership_store_state().refusal() {
+                Some(refusal) => CniRpcResponse::Error {
+                    reason: format!(
+                        "durable Ferrum CNI ownership state is {refusal}; ADD cannot record GC ownership"
+                    ),
+                },
+                None => CniRpcResponse::Ok,
+            }
         }
         RpcVerb::Gc => {
             // Re-validate on the node-agent side so a hostile or buggy CNI
@@ -4795,10 +4855,10 @@ fn remember_cni_owned_attachment(
             "refusing CNI ownership claim for unsafe containerID, ifname, or pod UID".to_string(),
         );
     }
-    if cni_ownership_store_is_rejected() {
-        return Err(
-            "refusing CNI ownership claim while durable ownership state is rejected".to_string(),
-        );
+    if let Some(refusal) = cni_ownership_store_state().refusal() {
+        return Err(format!(
+            "refusing CNI ownership claim while durable ownership state is {refusal}"
+        ));
     }
     let Some(state_entry) = pod_states.get(pod_uid) else {
         // Cleanup keys cannot be reconstructed after the sandbox dies; refuse
@@ -4931,13 +4991,10 @@ fn rehydrate_cni_owned_attachments(
     let records = match load_configured_cni_ownership() {
         Ok(None) => return Ok(()),
         Ok(Some(records)) => records,
-        Err(err) => {
-            warn!(
-                error = %crate::startup::sanitize_startup_scalar(&err),
-                "Durable Ferrum CNI ownership state rejected; GC will fail closed until the store is repaired"
-            );
-            return Err(err.to_string());
-        }
+        // Callers log: startup once, and the transient retry only when the
+        // store changes state, so a persistent failure is not logged per
+        // CNI request.
+        Err(err) => return Err(err.to_string()),
     };
     let prefix = pod_state_key_prefix(pod_states);
     // Drop only this generation's keys before installing durable records.
@@ -5050,9 +5107,9 @@ fn apply_cni_gc(
     network_name: &str,
     valid_attachments: &[CniValidAttachment],
 ) -> CniRpcResponse {
-    if cni_ownership_store_is_rejected() {
+    if let Some(refusal) = cni_ownership_store_state().refusal() {
         return CniRpcResponse::Error {
-            reason: "gc refused because durable Ferrum CNI ownership state is rejected".to_string(),
+            reason: format!("gc refused because durable Ferrum CNI ownership state is {refusal}"),
         };
     }
 
@@ -16885,6 +16942,15 @@ mod tests {
         );
     }
 
+    fn synced_readiness_with_udp_proof(udp_proof: UdpRegistryProof) -> NodeAgentReadiness {
+        NodeAgentReadiness {
+            startup_ready: Arc::new(AtomicBool::new(false)),
+            pod_sync: PodSyncState::Synced,
+            topology_ready: true,
+            udp_proof,
+        }
+    }
+
     #[test]
     fn udp_migration_marker_retracts_before_post_relist_mutation() {
         let registry = tempfile::tempdir().unwrap();
@@ -16908,21 +16974,19 @@ mod tests {
             trust_domain: "cluster.local".to_string(),
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
-        let mut published = true;
-        let mut retraction_pending = false;
+        let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::Published);
 
         assert!(
             retract_udp_migration_registry_sync_for_mutation(
-                Some("generation-1"),
                 true,
                 &config,
-                &mut published,
-                &mut retraction_pending,
+                &mut readiness,
                 UdpRegistryMutationLane::WatchApply,
             )
             .unwrap()
         );
-        assert!(!published);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::Withheld);
+        assert!(!readiness.startup_ready.load(Ordering::Acquire));
         assert!(!registry.path().join(".udp-registry-synced").exists());
 
         assert!(
@@ -16936,11 +17000,9 @@ mod tests {
         );
         assert!(
             !retract_udp_migration_registry_sync_for_mutation(
-                Some("generation-1"),
                 false,
                 &config,
-                &mut published,
-                &mut retraction_pending,
+                &mut readiness,
                 UdpRegistryMutationLane::WatchDelete,
             )
             .unwrap()
@@ -16964,19 +17026,17 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
         let pod_states = DashMap::new();
-        let mut published = false;
-        let mut retraction_pending = false;
+        let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::Withheld);
 
         publish_udp_migration_registry_sync_with_recovery(
             "generation-1",
             &pod_states,
             &config,
             None,
-            &mut published,
-            &mut retraction_pending,
+            &mut readiness,
         );
-        assert!(!published);
-        assert!(!retraction_pending);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::Withheld);
+        assert!(!readiness.startup_ready.load(Ordering::Acquire));
         assert!(!registry.path().join(".udp-registry-synced").exists());
 
         std::fs::remove_dir(registry.path().join("hostile-entry")).unwrap();
@@ -16985,11 +17045,10 @@ mod tests {
             &pod_states,
             &config,
             None,
-            &mut published,
-            &mut retraction_pending,
+            &mut readiness,
         );
-        assert!(published);
-        assert!(!retraction_pending);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::Published);
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
         assert!(registry.path().join(".udp-registry-synced").is_file());
     }
 
@@ -17032,8 +17091,10 @@ mod tests {
             },
             None,
             None,
-            Arc::new(AtomicBool::new(true)),
-            true,
+            IngressTopologyApplication {
+                topology_ready: true,
+                datapath_published: true,
+            },
             Some("generation-1".to_string()),
             None,
             events,
@@ -17088,8 +17149,10 @@ mod tests {
             },
             None,
             None,
-            Arc::new(AtomicBool::new(true)),
-            true,
+            IngressTopologyApplication {
+                topology_ready: true,
+                datapath_published: true,
+            },
             Some("generation-1".to_string()),
             None,
             events,
@@ -17153,8 +17216,10 @@ mod tests {
                 },
                 None,
                 None,
-                Arc::new(AtomicBool::new(true)),
-                true,
+                IngressTopologyApplication {
+                    topology_ready: true,
+                    datapath_published: true,
+                },
                 Some("generation-1".to_string()),
                 None,
                 events,
@@ -17198,40 +17263,118 @@ mod tests {
                 trust_domain: "cluster.local".to_string(),
                 node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
             };
-            let mut published = true;
-            let mut retraction_pending = false;
+            let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::Published);
+            assert!(readiness.publish());
 
             assert!(
                 retract_udp_migration_registry_sync_for_mutation(
-                    Some("generation-1"),
                     true,
                     &config,
-                    &mut published,
-                    &mut retraction_pending,
+                    &mut readiness,
                     lane,
                 )
                 .is_err(),
                 "{lane:?} must refuse its mutation when marker retraction fails"
             );
-            assert!(retraction_pending);
-            assert!(published);
+            // A possibly-visible stale marker is never a valid proof.
+            assert_eq!(readiness.udp_proof, UdpRegistryProof::RetractionPending);
+            assert!(!readiness.readiness());
+            assert!(!readiness.startup_ready.load(Ordering::Acquire));
 
             std::fs::remove_dir(registry.path().join(".udp-registry-synced")).unwrap();
             assert!(
                 retract_udp_migration_registry_sync_for_mutation(
-                    Some("generation-1"),
                     true,
                     &config,
-                    &mut published,
-                    &mut retraction_pending,
+                    &mut readiness,
                     lane,
                 )
                 .unwrap(),
                 "{lane:?} must resume only after retraction succeeds"
             );
-            assert!(!retraction_pending);
-            assert!(!published);
+            assert_eq!(readiness.udp_proof, UdpRegistryProof::Withheld);
+            assert!(!readiness.startup_ready.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn udp_registry_proof_transition_table() {
+        use UdpRegistryProof::{NotRequired, Published, RetractionPending, Withheld};
+        use UdpRegistryProofEvent::{Absent, PublicationDeclined, RetractionFailed};
+        let published = UdpRegistryProofEvent::Published;
+        for (from, event, to) in [
+            (NotRequired, Absent, NotRequired),
+            (NotRequired, PublicationDeclined, NotRequired),
+            (NotRequired, published, NotRequired),
+            (NotRequired, RetractionFailed, NotRequired),
+            (Withheld, Absent, Withheld),
+            (Withheld, PublicationDeclined, Withheld),
+            (Withheld, published, Published),
+            (Withheld, RetractionFailed, RetractionPending),
+            (Published, Absent, Withheld),
+            (Published, PublicationDeclined, RetractionPending),
+            (Published, published, Published),
+            (Published, RetractionFailed, RetractionPending),
+            (RetractionPending, Absent, Withheld),
+            (RetractionPending, PublicationDeclined, RetractionPending),
+            (RetractionPending, published, Published),
+            (RetractionPending, RetractionFailed, RetractionPending),
+        ] {
+            assert_eq!(from.transition(event), to, "{from:?} --{event:?}-->");
+        }
+    }
+
+    /// Without a migration generation the marker never gates readiness or
+    /// mutations. On the base, the node-identity refresh's failed marker clear
+    /// still set `retraction_pending`: `/health` was withdrawn and the pod
+    /// event arm (gated on that flag) stalled for good, because the retry
+    /// lane returned early for a missing generation without clearing it.
+    #[test]
+    fn udp_proof_failures_without_a_migration_generation_keep_readiness_and_pod_events() {
+        let registry = tempfile::tempdir().unwrap();
+        // A directory at the marker path makes every clear attempt fail.
+        std::fs::create_dir(registry.path().join(".udp-registry-synced")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::for_generation(None));
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(readiness.publish());
+
+        // The identity-refresh closure records exactly this event when its
+        // marker clear fails.
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(
+            !readiness.udp_proof.retraction_pending(),
+            "the pod event arm and retraction retry are gated on a pending retraction"
+        );
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
+
+        // Every mutation lane proceeds without touching the marker.
+        for mutation_requires_refresh in [false, true] {
+            assert!(
+                !retract_udp_migration_registry_sync_for_mutation(
+                    mutation_requires_refresh,
+                    &config,
+                    &mut readiness,
+                    UdpRegistryMutationLane::WatchApply,
+                )
+                .expect("no generation means no marker fence"),
+                "no generation means nothing to republish"
+            );
+        }
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
+        assert!(registry.path().join(".udp-registry-synced").is_dir());
     }
 
     #[test]
@@ -17693,12 +17836,14 @@ mod tests {
     fn cni_add_during_relist_marks_tracked_pod_seen() {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
-        let mut init_seen = Some(HashSet::new());
+        let mut pod_sync = PodSyncState::Relisting(HashSet::new());
 
         // The CNI apply path reports the UID it actually enrolled.
-        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-1"));
+        mark_relist_seen_from_cni_add(&mut pod_sync, Some("pod-uid-1"));
 
-        let seen = init_seen.take().expect("relist in progress");
+        let PodSyncState::Relisting(seen) = pod_sync else {
+            panic!("relist in progress");
+        };
         assert!(
             watcher_init_stale_uids(&pod_states, &seen).is_empty(),
             "CNI-enrolled pod should survive the current watcher InitDone sweep"
@@ -17709,12 +17854,14 @@ mod tests {
     fn unrelated_cni_add_during_relist_does_not_mask_stale_pod() {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         pod_states.insert("pod-uid-1".to_string(), enrolled_pod_state("pod-uid-1"));
-        let mut init_seen = Some(HashSet::new());
+        let mut pod_sync = PodSyncState::Relisting(HashSet::new());
 
         // A CNI ADD that enrolled a *different* pod marks only that UID.
-        mark_relist_seen_from_cni_add(&mut init_seen, Some("pod-uid-2"));
+        mark_relist_seen_from_cni_add(&mut pod_sync, Some("pod-uid-2"));
 
-        let seen = init_seen.take().expect("relist in progress");
+        let PodSyncState::Relisting(seen) = pod_sync else {
+            panic!("relist in progress");
+        };
         assert_eq!(
             watcher_init_stale_uids(&pod_states, &seen),
             vec!["pod-uid-1".to_string()],
@@ -17792,9 +17939,11 @@ mod tests {
         assert!(pod_states.contains_key("api-uid-x"));
 
         // And it survives the InitDone sweep once marked.
-        let mut init_seen = Some(HashSet::new());
-        mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
-        let seen = init_seen.take().expect("relist in progress");
+        let mut pod_sync = PodSyncState::Relisting(HashSet::new());
+        mark_relist_seen_from_cni_add(&mut pod_sync, enrolled_uid.as_deref());
+        let PodSyncState::Relisting(seen) = pod_sync else {
+            panic!("relist in progress");
+        };
         assert!(watcher_init_stale_uids(&pod_states, &seen).is_empty());
         CNI_OWNED_ATTACHMENTS.remove(&cni_owned_attachment_key(
             &pod_states,
@@ -18016,6 +18165,9 @@ mod tests {
     fn apply_cni_request_status_succeeds_without_attachment_fields() {
         use crate::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 
+        // STATUS consults the process-global durable ownership store.
+        let _cni_guard = lock_cni_ownership_tests();
+        crate::cni::ownership::reset_cni_ownership_store_for_tests();
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
@@ -18825,7 +18977,10 @@ mod tests {
             err.contains("invalid"),
             "expected sanitized rejection: {err}"
         );
-        assert!(cni_ownership_store_is_rejected());
+        assert!(matches!(
+            cni_ownership_store_state(),
+            crate::cni::ownership::CniOwnershipStoreState::Rejected { .. }
+        ));
 
         let mut backend = MockEbpfBackend::default();
         backend

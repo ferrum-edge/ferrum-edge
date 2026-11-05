@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferrum_edge::_test_support::{
-    apply_bounded_node_topology_sequence_for_test,
+    NodeAgentPodWatcherEventForTest, apply_bounded_node_topology_sequence_for_test,
     apply_node_agent_ingress_topology_outcome_for_test,
     node_agent_cni_capture_readiness_rejection_for_test,
     node_agent_cni_topology_readiness_rejection_for_test,
@@ -28,7 +29,7 @@ use ferrum_edge::ebpf::{
 };
 use ferrum_edge::modes::node_agent::NodeAgentConfig;
 use futures::{StreamExt, stream};
-use k8s_openapi::api::core::v1::Node;
+use k8s_openapi::api::core::v1::{Node, Pod};
 use kube::runtime::watcher::Event;
 use serde_json::json;
 use tempfile::tempdir;
@@ -1058,8 +1059,6 @@ fn topology_outcome_application_arms_and_quarantines_the_bpf_redirect() {
         &mut backend,
         &config,
         &metrics,
-        false,
-        false,
         true,
         &ready_outcome(),
     );
@@ -1077,8 +1076,6 @@ fn topology_outcome_application_arms_and_quarantines_the_bpf_redirect() {
         &config,
         &metrics,
         true,
-        true,
-        true,
         &unavailable_outcome(),
     );
     assert_eq!(flags, (false, false));
@@ -1094,8 +1091,6 @@ fn topology_outcome_application_arms_and_quarantines_the_bpf_redirect() {
         &mut backend,
         &config,
         &metrics,
-        false,
-        false,
         true,
         &unavailable_outcome(),
     );
@@ -1130,8 +1125,6 @@ fn disabled_ingress_topology_skips_map_republication_and_does_not_gate_readiness
         &mut backend,
         &config,
         &metrics,
-        true,
-        false,
         true,
         &outcome,
     );
@@ -1316,6 +1309,8 @@ async fn production_select_loop_applies_synthetic_ready_to_unavailable_transitio
         &config,
         metrics.clone(),
         &shutdown_tx,
+        Arc::new(AtomicBool::new(false)),
+        None,
         pod_events,
         ready_outcome(),
         Box::pin(transitions),
@@ -1374,4 +1369,197 @@ fn ended_node_watch_forces_a_paced_fresh_snapshot() {
         NodeWatchCacheDecision::CommitSnapshot,
     );
     assert_eq!(recovery.relist_backoff_secs(), 1);
+}
+
+/// Poll `condition` on real time until it holds or `deadline` elapses.
+async fn wait_until(deadline: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        if condition() {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+const LOOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Yield to the loop until `condition` holds, without advancing a paused
+/// clock: while this task keeps yielding the runtime is never idle, so no
+/// interval inside the loop can fire between the observed transition and the
+/// caller's next assertion.
+async fn yield_until(mut condition: impl FnMut() -> bool) -> bool {
+    for _ in 0..10_000 {
+        if condition() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    condition()
+}
+
+/// Regression (explicit-state audit C1, conflict 1). A failed retraction of a
+/// PUBLISHED Ambient UDP registry proof used to set `retraction_pending` while
+/// leaving `published == true`. Pod events then stalled behind the mutation
+/// fence, but the next topology outcome recomputed readiness from the stale
+/// `published` bit and re-advertised `/health` ready. `RetractionPending` now
+/// implies "not published", so no readiness input can restore it until the
+/// retraction succeeds and the deferred mutation republishes the proof.
+///
+/// Time is paused and only advanced explicitly, so the 1 s retraction-retry
+/// tick (whose failure path also withdrew readiness on the old code) cannot
+/// run between the topology recovery and the readiness assertion.
+#[tokio::test(start_paused = true)]
+async fn failed_udp_proof_retraction_keeps_readiness_withdrawn_across_topology_outcomes() {
+    let registry = tempdir().expect("registry dir");
+    let marker = registry.path().join(".udp-registry-synced");
+    let mut config = node_waypoint_config();
+    config.node_waypoint_pod_registry_dir = Some(registry.path().to_path_buf());
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let mut backend = MockEbpfBackend::default();
+    let (shutdown_tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+    let stop = shutdown_tx.clone();
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let (pod_tx, pod_rx) = futures::channel::mpsc::unbounded::<NodeAgentPodWatcherEventForTest>();
+    let (topology_tx, topology_rx) = futures::channel::mpsc::unbounded::<IngressTopologyOutcome>();
+
+    let run = run_with_node_agent_topology_outcome_stream_for_test(
+        &mut backend,
+        &config,
+        metrics.clone(),
+        &shutdown_tx,
+        startup_ready.clone(),
+        Some("generation-1".to_string()),
+        pod_rx,
+        ready_outcome(),
+        topology_rx,
+    );
+    let drive = async {
+        pod_tx.unbounded_send(Ok(Event::Init)).expect("send Init");
+        pod_tx
+            .unbounded_send(Ok(Event::InitDone))
+            .expect("send InitDone");
+        assert!(
+            yield_until(|| startup_ready.load(Ordering::Acquire)).await,
+            "sync, proved topology, and a published UDP proof must report ready"
+        );
+        assert!(marker.is_file(), "InitDone publishes the registry proof");
+
+        // A directory at the marker path makes every retraction fail.
+        fs::remove_file(&marker).expect("remove published marker");
+        fs::create_dir(&marker).expect("block marker retraction");
+        pod_tx
+            .unbounded_send(Ok(Event::Apply(Pod::default())))
+            .expect("send Apply");
+        assert!(
+            yield_until(|| !startup_ready.load(Ordering::Acquire)).await,
+            "a failed proof retraction must withdraw readiness"
+        );
+
+        // The topology monitor republishes outcomes on its own cadence. A
+        // loss-then-recovery pair proves the outcome arm ran with a proved
+        // topology while the retraction is still pending.
+        topology_tx
+            .unbounded_send(unavailable_outcome())
+            .expect("send topology loss");
+        assert!(
+            yield_until(|| {
+                metrics.snapshot().ingress_topology.reason
+                    == IngressTopologyReason::KubernetesUnavailable
+            })
+            .await,
+            "topology loss outcome applied"
+        );
+        topology_tx
+            .unbounded_send(ready_outcome())
+            .expect("send topology recovery");
+        assert!(
+            yield_until(|| {
+                metrics.snapshot().ingress_topology.reason == IngressTopologyReason::Valid
+            })
+            .await,
+            "topology recovery outcome applied"
+        );
+        assert!(
+            !startup_ready.load(Ordering::Acquire),
+            "a proved topology must not re-advertise readiness while a stale UDP proof retraction is pending"
+        );
+
+        // Once retraction succeeds on the next retry tick, the deferred Apply
+        // runs and republishes.
+        fs::remove_dir(&marker).expect("unblock marker retraction");
+        tokio::time::advance(std::time::Duration::from_millis(1_100)).await;
+        assert!(
+            yield_until(|| startup_ready.load(Ordering::Acquire)).await,
+            "readiness returns only after retraction recovers and the proof is republished"
+        );
+        assert!(
+            marker.is_file(),
+            "the deferred mutation republished the proof"
+        );
+        stop.shutdown();
+        // End the outcome stream so the loop can join the monitor task.
+        drop(topology_tx);
+    };
+
+    let (result, ()) = tokio::join!(run, drive);
+    result.expect("watcher exits cleanly after shutdown");
+}
+
+/// Regression (explicit-state audit C1, conflict 2). The UDP readiness tick
+/// passed the conjunctive `/health` bit where the close-ack responder expects
+/// "initial pod sync complete". While the ingress topology (or the UDP
+/// migration proof) was unproved, a synced node-agent therefore never answered
+/// a removed pod's durable close request even with cleaned-gate proof.
+#[tokio::test]
+async fn removed_pod_close_ack_follows_pod_sync_not_health_readiness() {
+    const REMOVED_UID: &str = "c3d1f00d-0000-4000-8000-00000000c1a2";
+    let registry = tempdir().expect("registry dir");
+    for marker_dir in [".udp-ack-required", ".udp-gate-cleaned"] {
+        let dir = registry.path().join(marker_dir);
+        fs::create_dir_all(&dir).expect("handshake marker dir");
+        fs::write(dir.join(REMOVED_UID), b"").expect("handshake marker");
+    }
+    let ack = registry.path().join(".udp-not-ready").join(REMOVED_UID);
+    let mut config = node_waypoint_config();
+    config.capture_config.udp_capture_enabled = true;
+    config.node_waypoint_pod_registry_dir = Some(registry.path().to_path_buf());
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let mut backend = MockEbpfBackend::default();
+    let (shutdown_tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+    let stop = shutdown_tx.clone();
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let pod_events =
+        stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)]).chain(stream::pending());
+
+    let run = run_with_node_agent_topology_outcome_stream_for_test(
+        &mut backend,
+        &config,
+        metrics,
+        &shutdown_tx,
+        startup_ready.clone(),
+        None,
+        pod_events,
+        unavailable_outcome(),
+        stream::empty::<IngressTopologyOutcome>(),
+    );
+    let drive = async {
+        assert!(
+            wait_until(LOOP_DEADLINE, || ack.is_file()).await,
+            "a synced node-agent must answer a removed pod's close request with cleaned-gate proof"
+        );
+        assert!(
+            !startup_ready.load(Ordering::Acquire),
+            "readiness stays withheld while the ingress topology is unproved"
+        );
+        stop.shutdown();
+    };
+
+    let (result, ()) = tokio::join!(run, drive);
+    result.expect("watcher exits cleanly after shutdown");
 }

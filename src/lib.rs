@@ -18978,8 +18978,6 @@ pub mod _test_support {
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
         metrics: &crate::ebpf::NodeAgentMetrics,
-        topology_ready: bool,
-        startup_ready: bool,
         initial_sync_complete: bool,
         outcome: &crate::ebpf::ingress_topology::IngressTopologyOutcome,
     ) -> (bool, bool) {
@@ -18987,8 +18985,6 @@ pub mod _test_support {
             backend,
             config,
             metrics,
-            topology_ready,
-            startup_ready,
             initial_sync_complete,
             outcome,
         )
@@ -19037,11 +19033,16 @@ pub mod _test_support {
         .await
     }
 
+    /// `startup_ready` is the loop's published `/health` bit; a
+    /// `udp_migration_generation` requires `config.node_waypoint_pod_registry_dir`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_with_node_agent_topology_outcome_stream_for_test<S, T>(
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
         metrics: Arc<crate::ebpf::NodeAgentMetrics>,
         shutdown_tx: &crate::overload::ShutdownSender,
+        startup_ready: Arc<std::sync::atomic::AtomicBool>,
+        udp_migration_generation: Option<String>,
         pod_stream: S,
         initial_topology: NodeAgentIngressTopologyOutcomeForTest,
         topology_stream: T,
@@ -19058,6 +19059,8 @@ pub mod _test_support {
             config,
             metrics,
             shutdown_tx,
+            startup_ready,
+            udp_migration_generation,
             pod_stream,
             initial_topology,
             topology_stream,
