@@ -2148,8 +2148,11 @@ impl HboneConnectionPool {
             Err(err) => {
                 // Measured from the failure, not the dial start, so a dial
                 // that used its whole connect timeout still backs off the full
-                // window. Recorded before the lock is released, so no other
-                // caller can start a second dial for the key in between.
+                // window. Recorded before the lock is released, and re-checked
+                // after every claim, so once a dial has failed no other caller
+                // starts a second one for the key in between. A dial whose
+                // future is dropped (cancellation) records no backoff, as on
+                // main.
                 self.growth_backoff_until
                     .insert(key.to_string(), unix_secs() + HBONE_GROWTH_BACKOFF_SECS);
                 debug!(
