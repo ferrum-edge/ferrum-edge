@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 const APP_PORT: u16 = 8080;
@@ -175,12 +176,16 @@ fn proxy_for_test() -> Proxy {
 /// never get a TLS handshake, so a dial hangs until its own connect timeout;
 /// they are not tracked as pooled connections, and `blackholed_closed` counts
 /// those the client has since given up on.
+///
+/// While `hold_first` is set, CONNECTs on the first accepted connection are
+/// counted as open but not answered until it is cleared.
 struct Peer {
     port: u16,
     accepted: Arc<AtomicUsize>,
     per_connection_active: Arc<Mutex<Vec<Arc<AtomicUsize>>>>,
     blackhole: Arc<AtomicBool>,
     blackholed_closed: Arc<AtomicUsize>,
+    hold_first: watch::Sender<bool>,
 }
 
 impl Peer {
@@ -198,6 +203,7 @@ impl Peer {
         let blackholed_closed = Arc::new(AtomicUsize::new(0));
         let blackhole_for_task = blackhole.clone();
         let blackholed_closed_for_task = blackholed_closed.clone();
+        let (hold_first, hold_first_rx) = watch::channel(false);
         tokio::spawn(async move {
             let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
                 .expect("server config");
@@ -206,7 +212,7 @@ impl Peer {
                 let Ok((tcp, _)) = listener.accept().await else {
                     return;
                 };
-                accepted_for_task.fetch_add(1, Ordering::SeqCst);
+                let connection_index = accepted_for_task.fetch_add(1, Ordering::SeqCst);
                 if blackhole_for_task.load(Ordering::SeqCst) {
                     let closed = blackholed_closed_for_task.clone();
                     tokio::spawn(async move {
@@ -228,6 +234,7 @@ impl Peer {
                     .expect("peer registry")
                     .push(active.clone());
                 let acceptor = acceptor.clone();
+                let hold_first_rx = hold_first_rx.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
@@ -248,8 +255,12 @@ impl Peer {
                             continue;
                         }
                         let active = active.clone();
+                        let mut hold_first_rx = hold_first_rx.clone();
                         tokio::spawn(async move {
                             active.fetch_add(1, Ordering::SeqCst);
+                            if connection_index == 0 {
+                                let _ = hold_first_rx.wait_for(|hold| !*hold).await;
+                            }
                             let mut recv = request.into_body();
                             let response = Response::builder()
                                 .status(StatusCode::OK)
@@ -276,7 +287,12 @@ impl Peer {
             per_connection_active,
             blackhole,
             blackholed_closed,
+            hold_first,
         }
+    }
+
+    fn hold_first_connection(&self, hold: bool) {
+        self.hold_first.send_replace(hold);
     }
 
     fn accepted(&self) -> usize {
@@ -670,4 +686,55 @@ async fn by_value_pool_grows_inline_and_serves_the_trigger_on_the_new_connection
         .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION, 1])
         .await;
     held.push(grown);
+}
+
+/// The pool's cached stream cap only moves on CONNECT responses, so a
+/// connection can look available while h2 already enforces a lower cap from
+/// the peer's SETTINGS (a peer that lowered it mid-connection looks the same).
+/// A pressured checkout re-reads the live cap: a connection that is saturated
+/// after all sends the tunnel down the awaited growth path, which hands it the
+/// new connection, instead of queueing it behind the cap while a background
+/// dial widens the pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn pressured_tunnel_rereads_a_stale_stream_cap_and_lands_on_the_new_connection() {
+    let threshold = HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION;
+    // The peer allows exactly the growth threshold of streams per connection
+    // and answers nothing on its first connection, so the pool never samples
+    // that cap there and still caches it as unlimited.
+    let mut fixture = Fixture::new(2, threshold as u32).await;
+    // Long enough that the held tunnels outlive the test steps below.
+    fixture.proxy.backend_connect_timeout_ms = 30_000;
+    let fixture = Arc::new(fixture);
+    fixture.peer.hold_first_connection(true);
+    let mut parked = Vec::new();
+    for _ in 0..threshold {
+        let fixture = Arc::clone(&fixture);
+        parked.push(tokio::spawn(async move { fixture.open().await }));
+    }
+    fixture.peer.wait_for_active(&[threshold]).await;
+    // Let the client's h2 driver apply the peer's SETTINGS.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Trusting the cached cap, this tunnel would queue pending-open on the
+    // first connection until a held tunnel closed (30 s here).
+    let mut tunnel = fixture.open_within(Duration::from_secs(5)).await;
+    assert_eq!(
+        fixture.peer.accepted(),
+        2,
+        "the tunnel dialed a new connection"
+    );
+    assert_eq!(fixture.pool.pool_size(), 2);
+    echo_round_trip(&mut tunnel).await;
+    fixture.peer.wait_for_active(&[threshold, 1]).await;
+
+    fixture.peer.hold_first_connection(false);
+    for task in parked {
+        let mut held = tokio::time::timeout(OPEN_TIMEOUT, task)
+            .await
+            .expect("held tunnel opens once released")
+            .expect("open task")
+            .expect("held tunnel");
+        echo_round_trip(&mut held).await;
+    }
+    drop(tunnel);
 }

@@ -222,6 +222,18 @@ impl HboneConnectionLoad {
             .peer_max_streams
             .store(sender.current_max_send_streams(), Ordering::Relaxed);
     }
+
+    /// Re-read the peer's live stream cap and say whether one more CONNECT
+    /// still fits on this connection. Pressure checkouts only: the cached cap
+    /// moves on CONNECT responses, so a peer that has since LOWERED
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` leaves a connection that the cache
+    /// still calls available, and a tunnel that trusted it would queue
+    /// pending-open behind the peer's cap. Takes h2's connection lock, so
+    /// callers hold no pool lock here.
+    fn refresh_has_room(&self, sender: &SendRequest<Bytes>) -> bool {
+        self.record_peer_max_streams(sender);
+        !self.is_saturated()
+    }
 }
 
 /// RAII decrement for [`HboneConnectionLoad::active_streams`].
@@ -1578,6 +1590,20 @@ impl HboneConnectionPool {
                 |key| self.try_cached_sender_read(key),
             );
 
+            // A pressured checkout (the only kind that grows) first re-reads
+            // the peer's live stream cap. If the peer lowered it since the
+            // last CONNECT response, this connection is saturated after all:
+            // the tunnel takes the write path, where a saturated key with room
+            // dials on the request path and hands the new connection to this
+            // tunnel, instead of queueing here behind a background dial.
+            let fast_sender = fast_sender.filter(|checkout| {
+                checkout.live_connections >= max_entries
+                    || checkout.active_streams < HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
+                    || checkout
+                        .transport
+                        .load
+                        .refresh_has_room(&checkout.transport.sender)
+            });
             let sender = if let Some(checkout) = fast_sender {
                 // The least-loaded connection is carrying at least the growth
                 // threshold of open tunnels and the key has room: widen
@@ -2008,31 +2034,41 @@ impl HboneConnectionPool {
                 live_connections,
                 active_streams,
             } => {
-                // Same detached growth as the fast path in `get_tunnel_via`:
-                // this caller keeps the connection it selected.
-                if live_connections < max_entries
-                    && active_streams >= HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
-                    && let Some(grown) = self
-                        .grow_for_pressure(
-                            proxy,
-                            dial_host,
-                            app_host,
-                            app_port,
-                            app_policy_port,
-                            hbone_port,
-                            expected_peer,
-                            expected_trust_domain,
-                            sni_override,
-                            key,
-                            pool_config,
-                            max_entries,
-                            connect_timeout,
-                        )
-                        .await
+                if live_connections >= max_entries
+                    || active_streams < HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
                 {
-                    return Ok(grown);
+                    return Ok(transport);
                 }
-                return Ok(transport);
+                // Pressure: as in `get_tunnel_via`, re-read the peer's live
+                // stream cap first. With room, grow in the background and keep
+                // this connection; saturated after all (the peer lowered its
+                // cap), fall through to the coalesced cold path below, which
+                // re-checks under the creation lock and dials if it must.
+                if transport.load.refresh_has_room(&transport.sender) {
+                    return Ok(
+                        match self
+                            .grow_for_pressure(
+                                proxy,
+                                dial_host,
+                                app_host,
+                                app_port,
+                                app_policy_port,
+                                hbone_port,
+                                expected_peer,
+                                expected_trust_domain,
+                                sni_override,
+                                key,
+                                pool_config,
+                                max_entries,
+                                connect_timeout,
+                            )
+                            .await
+                        {
+                            Some(grown) => grown,
+                            None => transport,
+                        },
+                    );
+                }
             }
             HboneCheckout::Saturated {
                 transport,
