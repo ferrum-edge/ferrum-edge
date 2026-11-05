@@ -350,7 +350,7 @@ Out of scope: the `recv_data` Err path is recovered by `drain_h3_response_body` 
 - **Non-idempotent methods (POST / PUT / DELETE / PATCH)**: NOT retried under any default config — replaying a request the backend may have processed risks duplicate side effects. Operators who want retry-on-502 for POST must explicitly opt in via both `retryable_status_codes: [502]` AND adding the method to `retryable_methods`.
 - **Pre-wire failures (DNS / TLS / connect refused)** honor `retry_on_connect_failure` regardless of method.
 
-The same `request_reached_wire`-derived predicate drives the circuit breaker (`record_failure(connection_error=false)`) and the load-balancer outcome reporting in `record_backend_outcome`, so a graceful close does not trip `failure_threshold` counters as a transport fault and the target's least-latency EWMA receives its real backend-processing latency. Every other post-wire class (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout`) is likewise not a connection error.
+The same `request_reached_wire`-derived predicate drives the circuit breaker (`BreakerOutcome::Failure { connection_error: false, .. }`) and the load-balancer outcome reporting in `record_backend_outcome`, so a graceful close does not trip `failure_threshold` counters as a transport fault and the target's least-latency EWMA receives its real backend-processing latency. Every other post-wire class (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout`) is likewise not a connection error.
 
 **Per-target dispatch contract**: The retry loop in `proxy_to_backend_inner` (see [src/proxy/mod.rs](../src/proxy/mod.rs)) captures the dispatch decision per current target and threads it through every attempt:
 

@@ -914,28 +914,290 @@ fn every_probe_outcome_kind_releases_the_half_open_slot() {
     }
 }
 
-/// `text` with every column-0 `#[cfg(test)] mod name { ... }` block removed
-/// (rustfmt closes such a block with a column-0 `}`). An out-of-line
-/// `#[cfg(test)] mod name;` declaration is dropped on its own.
-fn without_cfg_test_modules(text: &str) -> String {
-    const MARKER: &str = "\n#[cfg(test)]\nmod ";
-    let mut production = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(MARKER) {
-        production.push_str(&rest[..start]);
-        let module = &rest[start + 1..];
-        let header_end = module.find('\n').unwrap_or(module.len());
-        if module[..header_end].trim_end().ends_with(';') {
-            rest = &module[header_end..];
+/// Whether `byte` can continue an identifier (non-ASCII bytes count, so a
+/// multibyte identifier never looks like a literal prefix).
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
+/// Length of the comment, string, raw string, byte string or char literal
+/// starting at `at` — the tokens that can hide brackets or `#[` — or `None`
+/// when `at` starts ordinary code (a lifetime's quote included).
+fn opaque_token_len(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = &bytes[at..];
+    let after_ident = at > 0 && is_ident_byte(bytes[at - 1]);
+    if rest.starts_with(b"//") {
+        return Some(rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len()));
+    }
+    if rest.starts_with(b"/*") {
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i..].starts_with(b"/*") {
+                depth += 1;
+                i += 2;
+            } else if rest[i..].starts_with(b"*/") {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        return Some(rest.len());
+    }
+    if !after_ident {
+        let raw_prefix = if rest.starts_with(b"br") {
+            Some(2)
+        } else if rest.starts_with(b"r") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(prefix) = raw_prefix {
+            let hashes = rest[prefix..].iter().take_while(|&&b| b == b'#').count();
+            if rest.get(prefix + hashes) == Some(&b'"') {
+                let mut closing = vec![b'"'];
+                closing.resize(1 + hashes, b'#');
+                let body = prefix + hashes + 1;
+                return Some(
+                    rest[body..]
+                        .windows(closing.len())
+                        .position(|window| window == closing.as_slice())
+                        .map_or(rest.len(), |p| body + p + closing.len()),
+                );
+            }
+        }
+    }
+    let string_prefix = if rest.starts_with(b"\"") {
+        Some(0)
+    } else if !after_ident && rest.starts_with(b"b\"") {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(prefix) = string_prefix {
+        let mut i = prefix + 1;
+        while i < rest.len() {
+            match rest[i] {
+                b'\\' => i += 2,
+                b'"' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        return Some(rest.len());
+    }
+    let quote = if rest.starts_with(b"'") {
+        Some(0)
+    } else if !after_ident && rest.starts_with(b"b'") {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(q) = quote {
+        if rest.get(q + 1) == Some(&b'\\') {
+            // '\n', '\'', '\u{..}': the escaped byte sits at q + 2.
+            return Some(
+                rest.get(q + 3..)
+                    .and_then(|tail| tail.iter().position(|&b| b == b'\''))
+                    .map_or(rest.len(), |p| q + 3 + p + 1),
+            );
+        }
+        let width = match rest.get(q + 1) {
+            Some(&b) if b < 0x80 => 1,
+            Some(&b) if b >= 0xF0 => 4,
+            Some(&b) if b >= 0xE0 => 3,
+            Some(_) => 2,
+            None => return None,
+        };
+        if rest.get(q + 1 + width) == Some(&b'\'') {
+            return Some(q + 2 + width);
+        }
+        // A lifetime or label: ordinary code.
+    }
+    None
+}
+
+/// Index just past the bracket matching the one at `open_at`.
+fn after_matching_close(bytes: &[u8], open_at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut at = open_at;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
             continue;
         }
-        rest = match module.find("\n}\n") {
-            Some(end) => &module[end + 2..],
-            None => "",
-        };
+        match bytes[at] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at + 1;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
     }
-    production.push_str(rest);
+    bytes.len()
+}
+
+/// Index just past the item that follows an attribute ending at `from`: its
+/// further attributes, then either a `;` (an out-of-line `mod name;`, a `use`)
+/// or the `{ .. }` body that closes it.
+fn end_of_annotated_item(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        match bytes[at] {
+            b';' => return at + 1,
+            b'{' => return after_matching_close(bytes, at),
+            b'(' | b'[' => at = after_matching_close(bytes, at),
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Whether an attribute body (between `#[` and `]`) compiles its item only
+/// under test: `cfg(test)` or `cfg(all(.., test, ..))`. `cfg(not(test))`,
+/// `cfg(any(..))` and `cfg_attr` gate nothing out of production.
+fn cfg_is_test_only(attribute: &str) -> bool {
+    let compact: String = attribute.split_whitespace().collect();
+    let Some(predicate) = compact
+        .strip_prefix("cfg(")
+        .and_then(|p| p.strip_suffix(')'))
+    else {
+        return false;
+    };
+    if predicate == "test" {
+        return true;
+    }
+    let Some(args) = predicate
+        .strip_prefix("all(")
+        .and_then(|p| p.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut top_level = Vec::new();
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                top_level.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    top_level.push(&args[start..]);
+    top_level.contains(&"test")
+}
+
+/// `text` with every item gated by a test-only `cfg` removed — inline and
+/// out-of-line modules, helper fns, impls — at any indentation, including one
+/// at byte zero. Comments, strings and char literals are lexed, so a brace or
+/// `#[cfg(test)]` inside one changes nothing. Everything else is kept.
+fn without_cfg_test_items(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut production = String::with_capacity(text.len());
+    let mut copied_to = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        if bytes[at..].starts_with(b"#[") {
+            let attribute_end = after_matching_close(bytes, at + 1);
+            let body = text
+                .get(at + 2..attribute_end.saturating_sub(1))
+                .unwrap_or("");
+            if cfg_is_test_only(body) {
+                let item_end = end_of_annotated_item(bytes, attribute_end);
+                production.push_str(&text[copied_to..at]);
+                copied_to = item_end;
+                at = item_end;
+            } else {
+                at = attribute_end;
+            }
+            continue;
+        }
+        at += 1;
+    }
+    production.push_str(&text[copied_to..]);
     production
+}
+
+#[test]
+fn cfg_test_item_stripper_keeps_every_production_item() {
+    // Every `PROD_n` item must survive and every `TEST_ONLY_n` item must go.
+    // The former column-0 `"\n#[cfg(test)]\nmod "` splitter lost PROD_1 and
+    // PROD_2 (an out-of-line `mod name;` swallowed the production code after
+    // it: a false negative for the parity scan) and kept TEST_ONLY_1
+    // (attribute at byte zero), TEST_ONLY_3 (`cfg(all(test, ..))`),
+    // TEST_ONLY_4 (indented) and TEST_ONLY_5 (a test-only fn). The string,
+    // raw-string, char and comment braces inside `linux_only` pin the lexing.
+    let fixture = r##"#[cfg(test)]
+mod at_byte_zero { fn t() { TEST_ONLY_1(); } }
+#[cfg(test)]
+mod out_of_line;
+fn production_after_out_of_line() { PROD_1(); }
+#[cfg(test)]
+#[path = "pump_tests.rs"]
+mod pathed;
+fn production_after_path() { PROD_2(); }
+#[cfg(all(test, target_os = "linux"))]
+mod linux_only {
+    const TRICKY: &str = "
+}
+{";
+    const ESCAPED: &str = "\"}";
+    const RAW: &str = r#"}"#;
+    const BRACE: char = '}';
+    fn t<'a>(x: &'a str) { /* } */ TEST_ONLY_3(); }
+}
+fn production_after_tricky_module() { PROD_3(); }
+#[cfg(not(test))]
+fn production_not_test() { PROD_4(); }
+impl Production {
+    #[cfg(test)]
+    fn indented_helper(&self) { TEST_ONLY_4(); }
+    fn production_method(&self) { PROD_5(); }
+}
+#[cfg(test)]
+fn test_helper(a: [u8; 3]) -> u8 { TEST_ONLY_5(); a[0] }
+// #[cfg(test)] in a comment gates nothing
+fn production_tail() { PROD_6(); }
+"##;
+    let production = without_cfg_test_items(fixture);
+    for kept in ["PROD_1", "PROD_2", "PROD_3", "PROD_4", "PROD_5", "PROD_6"] {
+        assert!(
+            production.contains(kept),
+            "{kept} is production code and must survive the stripper:\n{production}"
+        );
+    }
+    for dropped in [
+        "TEST_ONLY_1",
+        "TEST_ONLY_3",
+        "TEST_ONLY_4",
+        "TEST_ONLY_5",
+        "mod out_of_line",
+        "mod pathed",
+    ] {
+        assert!(
+            !production.contains(dropped),
+            "{dropped} is test-only and must be stripped:\n{production}"
+        );
+    }
 }
 
 /// CB-1: every production settlement of a circuit-breaker admission goes
@@ -957,7 +1219,7 @@ fn no_production_path_settles_a_breaker_without_its_probe_ticket() {
             continue;
         }
         scanned += 1;
-        let production: String = without_cfg_test_modules(&text).split_whitespace().collect();
+        let production: String = without_cfg_test_items(&text).split_whitespace().collect();
         for blind in [
             ".record_success(",
             ".record_failure(",

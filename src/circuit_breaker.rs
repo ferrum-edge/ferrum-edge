@@ -342,6 +342,19 @@ impl CircuitBreaker {
     /// A [`ProbeTicket::NonProbe`] holds no slot and keeps the pre-ticket
     /// semantics: it is applied against whatever state the breaker is in now.
     ///
+    /// Residual (pre-existing, not closed by the ticket): `success_count` and
+    /// `failure_count` live outside the packed word, so their increments are
+    /// cycle-checked by a preceding load, not inside a CAS. If, between that
+    /// check and the `fetch_add`, a sibling reopens the breaker and (with
+    /// `timeout_seconds = 0`) a new HALF_OPEN cycle resets `success_count`, the
+    /// increment lands in the NEW cycle and can close it one success early. The
+    /// CLOSED arm has the same window for `failure_count` across a
+    /// reopen→recover cycle. The ticket's own transition CASes (slot release,
+    /// close, reopen, CLOSED→OPEN) still re-check its cycle, so a stale ticket
+    /// never itself publishes a transition; it can only add one count to the
+    /// next cycle. Closing this needs the counters folded into a
+    /// generation-tagged word.
+    ///
     /// Settlement is one Acquire load plus at most a few CASes on the packed
     /// state word — no locks, no allocation.
     pub fn settle(&self, ticket: ProbeTicket, outcome: BreakerOutcome) {
@@ -410,6 +423,8 @@ impl CircuitBreaker {
                 if packed_state(current) != STATE_HALF_OPEN || !ticket.in_cycle_of(current) {
                     return;
                 }
+                // Not atomic with the check above: see the residual on
+                // `settle`. The close CAS below re-checks the cycle.
                 let successes = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if successes >= self.config.success_threshold {
                     // HALF_OPEN → CLOSED, clearing the in-flight count in the
@@ -492,6 +507,8 @@ impl CircuitBreaker {
                 // by construction and reopens even if it then races a sibling
                 // close.
                 self.release_slot(ticket);
+                // Not atomic with the cycle check above: see the residual on
+                // `settle`. The CLOSED→OPEN CAS below re-checks the cycle.
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
                     // Re-read the counter before and after the transition attempt.
