@@ -2,7 +2,9 @@
 //!
 //! Drives `start_xds_client_with_shutdown` against a scripted ADS server so
 //! RPC-open header withholding, incomplete-frame starvation, revision-gate
-//! refusal, and NACK-breaker refusal are classified on the production path.
+//! refusal, and NACK-breaker refusal are classified on the production path,
+//! and a NACK of a later response cannot discard an already-ACKed coherent
+//! generation staged in the debounce window.
 
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -43,11 +45,16 @@ enum AdsBehaviour {
     IncompleteForever,
     CoherentUnversioned,
     InvalidRdsForever,
+    /// Sends one coherent `v1` generation for every required type and, in the
+    /// same burst right behind the last of them, a structurally invalid ECDS
+    /// `v2` that the client must NACK while `v1` is still debounced.
+    CoherentThenInvalidEcds,
 }
 
 #[derive(Clone)]
 struct ScriptedPrivateAds {
     streams: Arc<AtomicUsize>,
+    nacks: Arc<AtomicUsize>,
     behaviour: AdsBehaviour,
 }
 
@@ -55,12 +62,17 @@ impl ScriptedPrivateAds {
     fn new(behaviour: AdsBehaviour) -> Self {
         Self {
             streams: Arc::new(AtomicUsize::new(0)),
+            nacks: Arc::new(AtomicUsize::new(0)),
             behaviour,
         }
     }
 
     fn stream_count(&self) -> usize {
         self.streams.load(Ordering::SeqCst)
+    }
+
+    fn nack_count(&self) -> usize {
+        self.nacks.load(Ordering::SeqCst)
     }
 }
 
@@ -127,6 +139,7 @@ impl AggregatedDiscoveryService for ScriptedPrivateAds {
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
         self.streams.fetch_add(1, Ordering::SeqCst);
         let behaviour = self.behaviour;
+        let nacks = Arc::clone(&self.nacks);
         if behaviour == AdsBehaviour::WithholdHeaders {
             let _held = request.into_inner();
             return std::future::pending().await;
@@ -206,6 +219,74 @@ impl AggregatedDiscoveryService for ScriptedPrivateAds {
                         };
                         if tx.send(Ok(response)).await.is_err() {
                             return;
+                        }
+                    }
+                }
+                AdsBehaviour::CoherentThenInvalidEcds => {
+                    let mut sent = std::collections::HashSet::new();
+                    let mut sent_invalid_ecds = false;
+                    while let Ok(Some(discovery_request)) = inbound.message().await {
+                        if discovery_request.error_detail.is_some() {
+                            nacks.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        let type_url = discovery_request.type_url.clone();
+                        let response = match type_url.as_str() {
+                            CDS_TYPE_URL if sent.insert(CDS_TYPE_URL) => typed_response(
+                                CDS_TYPE_URL,
+                                "v1",
+                                "cds-n1",
+                                &["cluster/default/api/8080"],
+                            ),
+                            EDS_TYPE_URL if sent.insert(EDS_TYPE_URL) => typed_response(
+                                EDS_TYPE_URL,
+                                "v1",
+                                "eds-n1",
+                                &["cluster/default/api/8080"],
+                            ),
+                            LDS_TYPE_URL if sent.insert(LDS_TYPE_URL) => typed_response(
+                                LDS_TYPE_URL,
+                                "v1",
+                                "lds-n1",
+                                &["listener/default/api/8080"],
+                            ),
+                            RDS_TYPE_URL if sent.insert(RDS_TYPE_URL) => {
+                                typed_response(RDS_TYPE_URL, "v1", "rds-n1", &["route/default/api"])
+                            }
+                            ECDS_TYPE_URL if sent.insert(ECDS_TYPE_URL) => DiscoveryResponse {
+                                version_info: "v1".to_string(),
+                                resources: Vec::new(),
+                                canary: false,
+                                type_url: ECDS_TYPE_URL.to_string(),
+                                nonce: "ecds-n1".to_string(),
+                                control_plane: None,
+                            },
+                            _ => continue,
+                        };
+                        if tx.send(Ok(response)).await.is_err() {
+                            return;
+                        }
+                        if sent.len() == 5 && !sent_invalid_ecds {
+                            sent_invalid_ecds = true;
+                            // Right behind the response that completed the
+                            // coherent `v1` set: an ECDS `v2` whose resource
+                            // claims the CDS type URL. `apply_sotw_response`
+                            // refuses the mismatch, so the client NACKs it and
+                            // rolls back to the ACKed `v1` ECDS.
+                            let invalid = DiscoveryResponse {
+                                version_info: "v2".to_string(),
+                                resources: vec![ferrum_resource(
+                                    CDS_TYPE_URL,
+                                    "cluster/default/api/8080",
+                                )],
+                                canary: false,
+                                type_url: ECDS_TYPE_URL.to_string(),
+                                nonce: "ecds-n2".to_string(),
+                                control_plane: None,
+                            };
+                            if tx.send(Ok(invalid)).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -460,6 +541,52 @@ async fn private_xds_nack_breaker_is_policy_rejected_not_liveness() {
     assert_eq!(
         status.state, "never_received_slice",
         "NACK-breaker refusal must not be labelled stream_liveness_failed"
+    );
+    harness.shutdown_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nack_inside_debounce_keeps_the_acked_coherent_generation() {
+    let (primary, primary_url) = serve(AdsBehaviour::CoherentThenInvalidEcds).await;
+    let harness = XdsHarness::start(
+        vec![primary_url],
+        MeshRuntimeState::new(),
+        MeshStreamTimings {
+            first_frame: Duration::from_secs(10),
+            first_slice: Duration::from_secs(15),
+            ..MeshStreamTimings::production()
+        },
+    );
+
+    // The script never resends `v1` after the NACK (state-of-the-world does not
+    // resend an ACKed version), so the only way the slice can install inside
+    // this window — well before the 15 s first-slice reconnect — is by
+    // committing the generation that was staged before the NACK arrived.
+    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    let installed = loop {
+        if let Some(slice) = harness.state.snapshot().as_ref().clone() {
+            break slice;
+        }
+        assert!(
+            tokio::time::Instant::now() < until,
+            "the ACKed coherent v1 generation must install despite the later ECDS NACK; \
+             nacks={} streams={} status={:?}",
+            primary.nack_count(),
+            primary.stream_count(),
+            harness.state.config_stream_status()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    assert_eq!(installed.version, "v1");
+    assert!(
+        primary.nack_count() >= 1,
+        "the invalid ECDS v2 must have been NACKed, or this test proves nothing"
+    );
+    assert_eq!(
+        primary.stream_count(),
+        1,
+        "the slice must install on the original stream, not via a reconnect"
     );
     harness.shutdown_and_join().await;
 }

@@ -13,6 +13,9 @@ use super::common::{
     refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry, tonic_tls_config,
     wait_for_shutdown, wait_optional_tls_reload,
 };
+use super::pending_generation::{
+    PendingGeneration, PendingGenerationAction, PendingGenerationEvent,
+};
 use super::stream_lifecycle::{
     MeshConfigStreamCredential, MeshStreamAttachment, MeshStreamAttempt, MeshStreamAttemptProgress,
     MeshStreamRetirement, MeshStreamTimings, MeshStreamTracker,
@@ -1071,9 +1074,9 @@ async fn run_ads_stream_with_auth(
 
     let debounce = tokio::time::sleep(Duration::from_secs(60 * 60 * 24));
     tokio::pin!(debounce);
-    let mut debounce_active = false;
-    let mut pending_since: Option<tokio::time::Instant> = None;
-    let mut pending_slice: Option<PendingXdsSlice> = None;
+    // Owns the debounce arming: the timer is polled only while a complete,
+    // ACKed generation is staged.
+    let mut pending: PendingGeneration<PendingXdsSlice> = PendingGeneration::NoPending;
 
     // ── issue #3854: bounded liveness for an ESTABLISHED stream ──
     // HTTP/2 + TCP keepalive (applied on the endpoint) fail a blackholed
@@ -1106,19 +1109,22 @@ async fn run_ads_stream_with_auth(
                     break MeshStreamAttempt::FirstSliceTimeout;
                 }
             }
-            _ = &mut debounce, if debounce_active => {
-                if let Some(pending) = pending_slice.take() {
-                    apply_pending_xds_slice(consumer, config, pending)?;
-                    *delivered_usable_state = true;
-                    awaiting_first_slice = false;
-                    // This exact stream installed usable state.
-                    tracker.record_usable_state();
-                    consumer.state().set_config_stream_status(
-                        tracker.status(consumer.state().has_first_slice()),
-                    );
+            _ = &mut debounce, if pending.is_staged() => {
+                match pending.transition(PendingGenerationEvent::Commit) {
+                    PendingGenerationAction::Commit(staged) => {
+                        apply_pending_xds_slice(consumer, config, staged)?;
+                        *delivered_usable_state = true;
+                        awaiting_first_slice = false;
+                        // This exact stream installed usable state.
+                        tracker.record_usable_state();
+                        consumer.state().set_config_stream_status(
+                            tracker.status(consumer.state().has_first_slice()),
+                        );
+                    }
+                    // `Commit` never re-arms; `None` means nothing was staged.
+                    PendingGenerationAction::None
+                    | PendingGenerationAction::ArmDebounce { .. } => {}
                 }
-                debounce_active = false;
-                pending_since = None;
             }
             response = response_stream.message() => {
                 let Some(response) = response? else {
@@ -1139,27 +1145,22 @@ async fn run_ads_stream_with_auth(
                     &mut stream_state.accumulator,
                     &mut stream_state.nack_circuit_breaker,
                 ).await {
-                    Ok(Some(pending)) => {
-                        pending_slice = Some(pending);
-                        let now = tokio::time::Instant::now();
-                        let first_pending_at = *pending_since.get_or_insert(now);
-                        debounce
-                            .as_mut()
-                            .reset(next_xds_apply_deadline(now, first_pending_at));
-                        debounce_active = true;
+                    Ok(Some(staged)) => {
+                        let action = pending.transition(PendingGenerationEvent::Stage {
+                            generation: staged,
+                            now: tokio::time::Instant::now(),
+                        });
+                        arm_xds_debounce(debounce.as_mut(), action);
                     }
                     Ok(None) => {
                         if stream_state
                             .nack_circuit_breaker
                             .nacked_since(&response_type_url, nack_count_before)
                         {
-                            discard_pending_xds_slice_after_nack(
-                                config,
-                                &mut pending_slice,
-                                &response_type_url,
-                            );
-                            debounce_active = false;
-                            pending_since = None;
+                            // The NACK rejected only this response; the staged
+                            // generation (if any) is ACKed and coherent, so it
+                            // keeps its debounce deadline.
+                            note_xds_nack_with_pending(config, &mut pending, &response_type_url);
                         }
                     }
                     Err(e) => {
@@ -1167,17 +1168,16 @@ async fn run_ads_stream_with_auth(
                             .nack_circuit_breaker
                             .nacked_since(&response_type_url, nack_count_before)
                         {
-                            discard_pending_xds_slice_after_nack(
-                                config,
-                                &mut pending_slice,
-                                &response_type_url,
-                            );
-                            return Err(e);
+                            note_xds_nack_with_pending(config, &mut pending, &response_type_url);
                         }
+                        // Publish the already-ACKed staged generation before the
+                        // stream closes so reconnect version hints cannot
+                        // advance past the local runtime — including when the
+                        // NACK circuit breaker tripped on a DIFFERENT response.
                         return flush_pending_xds_slice_before_error(
                             consumer,
                             config,
-                            &mut pending_slice,
+                            &mut pending,
                             tracker,
                             delivered_usable_state,
                             e,
@@ -1196,42 +1196,63 @@ async fn run_ads_stream_with_auth(
         }
     };
 
-    // Only a COMPLETE, version-coherent generation ever reaches `pending_slice`
+    // Only a COMPLETE, version-coherent generation is ever staged
     // (`try_build_mesh_slice` gates on the required-type versions), so an EOF
     // mid-convergence leaves the last good slice serving and fails over rather
     // than publishing a mixed generation.
-    if matches!(ended, MeshStreamAttempt::RemoteEof)
-        && let Some(pending) = pending_slice.take()
-    {
-        apply_pending_xds_slice(consumer, config, pending)?;
-        *delivered_usable_state = true;
-        tracker.record_usable_state();
+    if matches!(ended, MeshStreamAttempt::RemoteEof) {
+        match pending.transition(PendingGenerationEvent::Commit) {
+            PendingGenerationAction::Commit(staged) => {
+                apply_pending_xds_slice(consumer, config, staged)?;
+                *delivered_usable_state = true;
+                tracker.record_usable_state();
+            }
+            PendingGenerationAction::None | PendingGenerationAction::ArmDebounce { .. } => {}
+        }
     }
 
     Ok(ended)
 }
 
-fn discard_pending_xds_slice_after_nack(
+/// Re-arm the debounce timer when a transition asks for it.
+fn arm_xds_debounce(
+    debounce: std::pin::Pin<&mut tokio::time::Sleep>,
+    action: PendingGenerationAction<PendingXdsSlice>,
+) {
+    match action {
+        PendingGenerationAction::ArmDebounce {
+            now,
+            first_staged_at,
+        } => debounce.reset(next_xds_apply_deadline(now, first_staged_at)),
+        // `Stage` always arms; nothing to commit from a stage.
+        PendingGenerationAction::None | PendingGenerationAction::Commit(_) => {}
+    }
+}
+
+/// Feed a NACK into the pending-generation machine.
+///
+/// The NACK restored the accumulator to exactly the state the staged
+/// generation was built from, so the staged generation stays: discarding it
+/// would leave the data plane serving the previous generation while the
+/// control plane holds ACKs for the staged one, and state-of-the-world never
+/// resends after an ACK. Returns whether a staged generation was retained.
+fn note_xds_nack_with_pending(
     config: &XdsClientConfig,
-    pending_slice: &mut Option<PendingXdsSlice>,
+    pending: &mut PendingGeneration<PendingXdsSlice>,
     nacked_type_url: &str,
 ) -> bool {
-    let discarded = pending_slice.take().is_some();
-    if discarded {
-        warn!(
-            node_id = %crate::startup::sanitize_startup_cause(
-                format!("{:?}", config.node_id.to_string()),
-                &[]
-            ),
-            namespace = %crate::startup::sanitize_startup_cause(
-                format!("{:?}", config.namespace.to_string()),
-                &[]
-            ),
+    // `ResponseNacked` never re-arms or commits: the staged generation keeps
+    // its existing debounce deadline.
+    let _ = pending.transition(PendingGenerationEvent::ResponseNacked);
+    let retained = pending.is_staged();
+    if retained {
+        debug!(
+            node_id = %sanitize_startup_scalar(config.node_id.as_str()),
             type_url = xds_type_url_log_label(nacked_type_url),
-            "Discarded debounced xDS slice after NACK to avoid applying mixed-version resources"
+            "Retaining the ACKed debounced xDS slice after a NACK of a later response"
         );
     }
-    discarded
+    retained
 }
 
 /// Publish an already-complete debounced generation before surfacing a stream
@@ -1245,18 +1266,21 @@ fn discard_pending_xds_slice_after_nack(
 fn flush_pending_xds_slice_before_error(
     consumer: &XdsConfigConsumer,
     config: &XdsClientConfig,
-    pending_slice: &mut Option<PendingXdsSlice>,
+    pending: &mut PendingGeneration<PendingXdsSlice>,
     tracker: &mut MeshStreamTracker,
     delivered_usable_state: &mut bool,
     error: XdsAttemptError,
 ) -> Result<MeshStreamAttempt, XdsAttemptError> {
-    if let Some(pending) = pending_slice.take() {
-        apply_pending_xds_slice(consumer, config, pending)?;
-        *delivered_usable_state = true;
-        tracker.record_usable_state();
-        consumer
-            .state()
-            .set_config_stream_status(tracker.status(consumer.state().has_first_slice()));
+    match pending.transition(PendingGenerationEvent::Commit) {
+        PendingGenerationAction::Commit(staged) => {
+            apply_pending_xds_slice(consumer, config, staged)?;
+            *delivered_usable_state = true;
+            tracker.record_usable_state();
+            consumer
+                .state()
+                .set_config_stream_status(tracker.status(consumer.state().has_first_slice()));
+        }
+        PendingGenerationAction::None | PendingGenerationAction::ArmDebounce { .. } => {}
     }
     Err(error)
 }
@@ -4080,7 +4104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_ecds_nack_discards_existing_debounced_pending_slice() {
+    async fn invalid_ecds_nack_retains_existing_debounced_pending_slice() {
         use crate::xds::carrier::{
             FERRUM_ECDS_PEER_AUTH_TYPE_URL, carrier_resource_name_for_type_url,
         };
@@ -4089,16 +4113,20 @@ mod tests {
         let mut state = ClientSubscriptionState::new();
         let mut accumulator = ResourceAccumulator::new();
         let mut nack_circuit_breaker = NackCircuitBreaker::default();
-        let mut pending_slice = Some(PendingXdsSlice {
-            slice: MeshSlice {
-                node_id: "node-a".to_string(),
-                namespace: "default".to_string(),
-                version: "pending".to_string(),
-                ..MeshSlice::default()
+        let mut pending = PendingGeneration::NoPending;
+        let _ = pending.transition(PendingGenerationEvent::Stage {
+            generation: PendingXdsSlice {
+                slice: MeshSlice {
+                    node_id: "node-a".to_string(),
+                    namespace: "default".to_string(),
+                    version: "pending".to_string(),
+                    ..MeshSlice::default()
+                },
+                type_url: CDS_TYPE_URL.to_string(),
+                all_types_ready: true,
+                version_skew: false,
             },
-            type_url: CDS_TYPE_URL.to_string(),
-            all_types_ready: true,
-            version_skew: false,
+            now: tokio::time::Instant::now(),
         });
         let carrier_name =
             carrier_resource_name_for_type_url(FERRUM_ECDS_PEER_AUTH_TYPE_URL).expect("name");
@@ -4126,14 +4154,15 @@ mod tests {
 
         assert!(result.is_none());
         assert!(nack_circuit_breaker.nacked_since(ECDS_TYPE_URL, nack_count_before));
-        assert!(discard_pending_xds_slice_after_nack(
+        assert!(note_xds_nack_with_pending(
             &test_config(),
-            &mut pending_slice,
+            &mut pending,
             ECDS_TYPE_URL
         ));
-        assert!(
-            pending_slice.is_none(),
-            "a known-type NACK must clear any debounced pending slice"
+        assert_eq!(
+            pending.staged().map(|staged| staged.slice.version.as_str()),
+            Some("pending"),
+            "a NACK rejects only the offending response; the ACKed staged slice survives"
         );
         let nack = rx.recv().await.expect("NACK sent");
         assert_eq!(nack.type_url, ECDS_TYPE_URL);
@@ -4691,14 +4720,18 @@ mod tests {
         let config = test_config();
         let state = MeshRuntimeState::new();
         let consumer = XdsConfigConsumer::new(config.clone(), state.clone());
-        let mut pending_slice = Some(PendingXdsSlice {
-            slice: MeshSlice {
-                version: "v-pending".to_string(),
-                ..MeshSlice::default()
+        let mut pending = PendingGeneration::NoPending;
+        let _ = pending.transition(PendingGenerationEvent::Stage {
+            generation: PendingXdsSlice {
+                slice: MeshSlice {
+                    version: "v-pending".to_string(),
+                    ..MeshSlice::default()
+                },
+                type_url: CDS_TYPE_URL.to_string(),
+                all_types_ready: true,
+                version_skew: false,
             },
-            type_url: CDS_TYPE_URL.to_string(),
-            all_types_ready: true,
-            version_skew: false,
+            now: tokio::time::Instant::now(),
         });
         let mut tracker = MeshStreamTracker::new(
             "xds",
@@ -4712,7 +4745,7 @@ mod tests {
         let err = flush_pending_xds_slice_before_error(
             &consumer,
             &config,
-            &mut pending_slice,
+            &mut pending,
             &mut tracker,
             &mut delivered_usable_state,
             XdsAttemptError::transport(anyhow::anyhow!("breaker")),
@@ -4720,7 +4753,7 @@ mod tests {
         .expect_err("error is preserved after flush");
 
         assert_eq!(err.to_string(), "breaker");
-        assert!(pending_slice.is_none());
+        assert!(!pending.is_staged());
         assert!(
             delivered_usable_state,
             "a successful flush is progress even though the attempt still fails"

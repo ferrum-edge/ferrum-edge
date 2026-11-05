@@ -614,6 +614,67 @@ async fn stock_invalid_response_is_nacked_and_the_last_good_slice_keeps_serving(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn stock_nack_inside_the_debounce_window_keeps_the_staged_slice() {
+    // The ACK for the first EDS response is what completes the gating set and
+    // stages the slice; that same ACK releases this structurally invalid EDS
+    // push (two assignments sharing a name), so its NACK lands while the staged
+    // slice is still inside the 25 ms debounce window. Nothing is queued after
+    // it: a state-of-the-world control plane does not resend what it already
+    // saw ACKed, so the staged slice is the only way to converge.
+    let mut script = converged_script();
+    script
+        .get_mut(EDS_TYPE_URL)
+        .expect("EDS queue")
+        .push(ScriptedResponse {
+            type_url: EDS_TYPE_URL.to_string(),
+            version: "eds-v2".to_string(),
+            nonce: "eds-n2".to_string(),
+            resources: vec![
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+            ],
+        });
+    let harness = StockHarness::start(script).await;
+
+    let slice = harness
+        .wait_for_slice(
+            "the staged slice survives a NACK of a later push",
+            |slice| slice.services.len() == 2,
+        )
+        .await;
+    let mut addresses: Vec<String> = slice
+        .workloads
+        .iter()
+        .flat_map(|workload| workload.addresses.clone())
+        .collect();
+    addresses.sort();
+    assert_eq!(
+        addresses,
+        vec!["10.1.2.3".to_string(), "10.1.2.4".to_string()],
+        "the installed slice is the ACKed eds-v1 view, never the NACKed push"
+    );
+
+    let nack = {
+        let mut found = None;
+        for _ in 0..250 {
+            if let Some(request) = harness
+                .recorder
+                .for_type(EDS_TYPE_URL)
+                .into_iter()
+                .find(|request| request.error_detail.is_some())
+            {
+                found = Some(request);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        found.expect("the invalid EDS push was NACKed, or this test proves nothing")
+    };
+    assert_eq!(nack.response_nonce, "eds-n2");
+    assert_eq!(nack.version_info, "eds-v1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stock_partial_eds_push_keeps_the_untouched_clusters_dialable() {
     // EDS is subscribed BY NAME, so a state-of-the-world response for it may
     // legitimately carry only the assignments a push touched — istiod skips
