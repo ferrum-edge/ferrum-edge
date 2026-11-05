@@ -1387,6 +1387,20 @@ async fn wait_until(deadline: std::time::Duration, mut condition: impl FnMut() -
 
 const LOOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Yield to the loop until `condition` holds, without advancing a paused
+/// clock: while this task keeps yielding the runtime is never idle, so no
+/// interval inside the loop can fire between the observed transition and the
+/// caller's next assertion.
+async fn yield_until(mut condition: impl FnMut() -> bool) -> bool {
+    for _ in 0..10_000 {
+        if condition() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    condition()
+}
+
 /// Regression (explicit-state audit C1, conflict 1). A failed retraction of a
 /// PUBLISHED Ambient UDP registry proof used to set `retraction_pending` while
 /// leaving `published == true`. Pod events then stalled behind the mutation
@@ -1394,7 +1408,11 @@ const LOOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// `published` bit and re-advertised `/health` ready. `RetractionPending` now
 /// implies "not published", so no readiness input can restore it until the
 /// retraction succeeds and the deferred mutation republishes the proof.
-#[tokio::test]
+///
+/// Time is paused and only advanced explicitly, so the 1 s retraction-retry
+/// tick (whose failure path also withdrew readiness on the old code) cannot
+/// run between the topology recovery and the readiness assertion.
+#[tokio::test(start_paused = true)]
 async fn failed_udp_proof_retraction_keeps_readiness_withdrawn_across_topology_outcomes() {
     let registry = tempdir().expect("registry dir");
     let marker = registry.path().join(".udp-registry-synced");
@@ -1426,7 +1444,7 @@ async fn failed_udp_proof_retraction_keeps_readiness_withdrawn_across_topology_o
             .unbounded_send(Ok(Event::InitDone))
             .expect("send InitDone");
         assert!(
-            wait_until(LOOP_DEADLINE, || startup_ready.load(Ordering::Acquire)).await,
+            yield_until(|| startup_ready.load(Ordering::Acquire)).await,
             "sync, proved topology, and a published UDP proof must report ready"
         );
         assert!(marker.is_file(), "InitDone publishes the registry proof");
@@ -1438,7 +1456,7 @@ async fn failed_udp_proof_retraction_keeps_readiness_withdrawn_across_topology_o
             .unbounded_send(Ok(Event::Apply(Pod::default())))
             .expect("send Apply");
         assert!(
-            wait_until(LOOP_DEADLINE, || !startup_ready.load(Ordering::Acquire)).await,
+            yield_until(|| !startup_ready.load(Ordering::Acquire)).await,
             "a failed proof retraction must withdraw readiness"
         );
 
@@ -1449,7 +1467,7 @@ async fn failed_udp_proof_retraction_keeps_readiness_withdrawn_across_topology_o
             .unbounded_send(unavailable_outcome())
             .expect("send topology loss");
         assert!(
-            wait_until(LOOP_DEADLINE, || {
+            yield_until(|| {
                 metrics.snapshot().ingress_topology.reason
                     == IngressTopologyReason::KubernetesUnavailable
             })
@@ -1460,7 +1478,7 @@ async fn failed_udp_proof_retraction_keeps_readiness_withdrawn_across_topology_o
             .unbounded_send(ready_outcome())
             .expect("send topology recovery");
         assert!(
-            wait_until(LOOP_DEADLINE, || {
+            yield_until(|| {
                 metrics.snapshot().ingress_topology.reason == IngressTopologyReason::Valid
             })
             .await,
@@ -1471,10 +1489,12 @@ async fn failed_udp_proof_retraction_keeps_readiness_withdrawn_across_topology_o
             "a proved topology must not re-advertise readiness while a stale UDP proof retraction is pending"
         );
 
-        // Once retraction succeeds, the deferred Apply runs and republishes.
+        // Once retraction succeeds on the next retry tick, the deferred Apply
+        // runs and republishes.
         fs::remove_dir(&marker).expect("unblock marker retraction");
+        tokio::time::advance(std::time::Duration::from_millis(1_100)).await;
         assert!(
-            wait_until(LOOP_DEADLINE, || startup_ready.load(Ordering::Acquire)).await,
+            yield_until(|| startup_ready.load(Ordering::Acquire)).await,
             "readiness returns only after retraction recovers and the proof is republished"
         );
         assert!(

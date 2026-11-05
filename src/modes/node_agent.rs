@@ -2647,33 +2647,30 @@ where
                 }
             }
             _ = udp_registry_retraction_retry.tick(), if readiness.udp_proof.retraction_pending() => {
-                match retract_udp_migration_registry_sync_for_mutation(
+                // A failed retraction leaves the proof `RetractionPending`,
+                // which already withholds readiness; only success continues.
+                // A deferred watcher mutation must run before a fresh proof is
+                // published. With no queued mutation, restore the proof
+                // immediately once the authoritative initial snapshot already
+                // completed.
+                if retract_udp_migration_registry_sync_for_mutation(
                     false,
                     config,
                     &mut readiness,
                     UdpRegistryMutationLane::RetryTick,
-                ) {
-                    Ok(_) => {
-                        // A deferred watcher mutation must run before a fresh
-                        // proof is published. With no queued mutation, restore
-                        // the proof immediately once the authoritative initial
-                        // snapshot already completed.
-                        if pending_pod_event.is_none()
-                            && readiness.pod_sync.is_synced()
-                            && let Some(generation) = udp_migration_generation.as_deref()
-                        {
-                            publish_udp_migration_registry_sync_with_recovery(
-                                generation,
-                                &pod_states,
-                                config,
-                                udp_node_uid.as_deref(),
-                                &mut readiness,
-                            );
-                        }
-                    }
-                    // The failed retraction already left the proof
-                    // `RetractionPending`, which withholds readiness.
-                    Err(_) => {}
+                )
+                .is_ok()
+                    && pending_pod_event.is_none()
+                    && readiness.pod_sync.is_synced()
+                    && let Some(generation) = udp_migration_generation.as_deref()
+                {
+                    publish_udp_migration_registry_sync_with_recovery(
+                        generation,
+                        &pod_states,
+                        config,
+                        udp_node_uid.as_deref(),
+                        &mut readiness,
+                    );
                 }
             }
             _ = retry_interval.tick() => {
