@@ -10,16 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 - **Cold DNS misses query SRV and A together.** With the default
   `FERRUM_DNS_ORDER` (`CACHE,SRV,A,CNAME`), a hostname with no cached answer
-  used to wait a full SRV round trip (or an SRV timeout during a resolver
-  outage) before sending its A query. A cold miss now starts the leading record
-  types up to the first address type together and still takes the first
-  non-empty answer in configured order; CNAME stays a serial fallback.
-  Hostnames whose answering type is already cached keep the sequential walk,
-  so steady-state refreshes send the same queries as before. An A/AAAA result
-  (success or failure) that completed while the SRV query was still pending
-  is looked up once more when SRV yields nothing. That recheck is answered
-  from the resolver's cache while the result is still within its TTL or
-  negative TTL. An answer is cached only for what remains of its TTL.
+  used to wait a full SRV round trip before sending its A query. A cold miss
+  now sends SRV and the address query right after it together, and still takes
+  the first non-empty answer in configured order; CNAME stays a serial
+  fallback. Hostnames whose answering type is already cached keep the
+  sequential walk, so steady-state refreshes send the same queries as before.
+  The speculative address query bypasses the resolver cache. If it finishes
+  before SRV with a failure or an expired answer, it is queried again at its
+  sequential position, so it never replaces what the sequential walk would
+  have seen. A live answer is cached only for what remains of its TTL.
 
 ### Fixed
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).

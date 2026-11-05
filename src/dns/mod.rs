@@ -197,12 +197,13 @@ fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
 /// never joins, since its `lookup_ip` re-issues A/AAAA and would duplicate the
 /// address query. Returns 0 when there is nothing to overlap.
 fn cold_miss_concurrent_prefix_len(query_types: &[CachedRecordType]) -> usize {
-    let srv_run = query_types
-        .iter()
-        .take_while(|record_type| **record_type == CachedRecordType::Srv)
-        .count();
-    match query_types.get(srv_run) {
-        Some(CachedRecordType::A | CachedRecordType::Aaaa) if srv_run > 0 => srv_run + 1,
+    // `query_types` is deduplicated, so SRV appears at most once.
+    match query_types {
+        [
+            CachedRecordType::Srv,
+            CachedRecordType::A | CachedRecordType::Aaaa,
+            ..,
+        ] => 2,
         _ => 0,
     }
 }
@@ -732,6 +733,8 @@ pub struct DnsCache {
     /// Resolver dedicated to security-sensitive connection establishment.
     /// Its internal cache is disabled and it always queries A and AAAA so a
     /// caller cannot reuse a previously permitted answer after a DNS rebind.
+    /// `do_resolve` also sends its cold-miss speculative A/AAAA query through
+    /// it, so that query leaves nothing in `resolver`'s cache.
     dial_resolver: Arc<Resolver<TokioRuntimeProvider>>,
     dns_order: Vec<DnsRecordOrder>,
     /// When set, ALL records use this fixed TTL regardless of DNS response.
@@ -1803,6 +1806,11 @@ impl DnsCache {
         // answer in that order still wins; dropping the rest cancels them.
         // A row with a known answering type stays serial, so steady-state
         // refreshes send the same queries as before.
+        //
+        // SRV goes through the cached resolver as on main. The speculative
+        // address query goes through the uncached dial resolver, so a query
+        // the sequential walk might never have sent (SRV wins) or would have
+        // sent later leaves nothing in hickory's cache for later lookups.
         let concurrent_len = if row_record_type.is_none() {
             cold_miss_concurrent_prefix_len(&query_types)
         } else {
@@ -1812,40 +1820,51 @@ impl DnsCache {
         if !concurrent.is_empty() {
             let mut lookups: FuturesOrdered<_> = concurrent
                 .iter()
-                .map(|&record_type| async move {
-                    let answer = self.lookup_record_type(hostname, record_type).await;
-                    (record_type, answer, Instant::now())
+                .enumerate()
+                .map(|(index, &record_type)| {
+                    let resolver: &Resolver<TokioRuntimeProvider> = if index == 0 {
+                        &self.resolver
+                    } else {
+                        &self.dial_resolver
+                    };
+                    async move {
+                        let answer =
+                            Self::lookup_record_type(resolver, hostname, record_type).await;
+                        (record_type, answer, Instant::now())
+                    }
                 })
                 .collect();
             // When the latest lookup earlier in the order finished.
             let mut preferred_done_at: Option<Instant> = None;
             while let Some((record_type, answer, completed_at)) = lookups.next().await {
-                // A result that completed while a preferred lookup was still
-                // pending is older than what the sequential walk would have
-                // seen: that walk sends this query only after the preferred
-                // one fails. Ask once more now, success or failure. The
-                // resolver keeps hickory's cache, so a result still within
-                // its TTL (or negative TTL) comes straight back from it; an
-                // expired one, a TTL-0 answer included, goes to the network.
+                // A speculative result that completed while the preferred
+                // lookup was still pending is older than what the sequential
+                // walk would have seen. A live answer is used as is: its TTL
+                // is taken from its absolute deadline below, so the wait is
+                // not added on top. A failure or an expired answer (TTL 0
+                // included) is looked up again at its serial position through
+                // the cached resolver, exactly as the sequential walk would.
                 let waited = preferred_done_at.is_some_and(|done| completed_at < done);
-                let answer = if waited {
-                    self.lookup_record_type(hostname, record_type).await
+                let stale = answer
+                    .as_ref()
+                    .is_none_or(|answer| answer.valid_until <= Instant::now());
+                let answer = if waited && stale {
+                    Self::lookup_record_type(&self.resolver, hostname, record_type).await
                 } else {
                     answer
                 };
                 match answer {
                     Some(answer) => return Ok(self.publishable_answer(answer)),
-                    None => {
-                        let done_at = if waited { Instant::now() } else { completed_at };
-                        preferred_done_at = preferred_done_at.max(Some(done_at));
-                    }
+                    None => preferred_done_at = Some(Instant::now()),
                 }
             }
         }
 
         // Try each remaining record type in order
         for &record_type in serial {
-            if let Some(answer) = self.lookup_record_type(hostname, record_type).await {
+            if let Some(answer) =
+                Self::lookup_record_type(&self.resolver, hostname, record_type).await
+            {
                 return Ok(self.publishable_answer(answer));
             }
         }
@@ -1869,17 +1888,17 @@ impl DnsCache {
         (answer.addrs, Some(answer.record_type), native_ttl)
     }
 
-    /// Query one record type for `hostname`. Returns the answer, or `None`
-    /// when the lookup failed or answered with no usable address (the caller
-    /// then tries the next type).
+    /// Query one record type for `hostname` through `resolver`. Returns the
+    /// answer, or `None` when the lookup failed or answered with no usable
+    /// address (the caller then tries the next type).
     async fn lookup_record_type(
-        &self,
+        resolver: &Resolver<TokioRuntimeProvider>,
         hostname: &str,
         record_type: CachedRecordType,
     ) -> Option<RecordTypeAnswer> {
         match record_type {
             CachedRecordType::A => {
-                let lookup = self.resolver.ipv4_lookup(hostname).await.ok()?;
+                let lookup = resolver.ipv4_lookup(hostname).await.ok()?;
                 let addrs: Vec<IpAddr> = lookup
                     .answers()
                     .iter()
@@ -1898,7 +1917,7 @@ impl DnsCache {
                 ))
             }
             CachedRecordType::Aaaa => {
-                let lookup = self.resolver.ipv6_lookup(hostname).await.ok()?;
+                let lookup = resolver.ipv6_lookup(hostname).await.ok()?;
                 let addrs: Vec<IpAddr> = lookup
                     .answers()
                     .iter()
@@ -1917,7 +1936,7 @@ impl DnsCache {
                 ))
             }
             CachedRecordType::Srv => {
-                let srv_lookup = self.resolver.srv_lookup(hostname).await.ok()?;
+                let srv_lookup = resolver.srv_lookup(hostname).await.ok()?;
                 let srv_valid_until = srv_lookup.valid_until();
                 // ADDRESS-ONLY SRV mode. This resolver path answers "what IPs
                 // back this hostname"; the caller dials the proxy's own
@@ -1949,7 +1968,7 @@ impl DnsCache {
                     if is_rfc2782_root_target(&target) {
                         continue;
                     }
-                    if let Ok(ip_lookup) = self.resolver.lookup_ip(&target).await {
+                    if let Ok(ip_lookup) = resolver.lookup_ip(&target).await {
                         let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
                         if !addrs.is_empty() {
                             // Use the shorter of SRV TTL and A/AAAA TTL
@@ -1966,7 +1985,7 @@ impl DnsCache {
             }
             CachedRecordType::Cname => {
                 // For CNAME, use lookup_ip which follows CNAME chains automatically
-                let lookup = self.resolver.lookup_ip(hostname).await.ok()?;
+                let lookup = resolver.lookup_ip(hostname).await.ok()?;
                 let addrs: Vec<IpAddr> = lookup.iter().collect();
                 if addrs.is_empty() {
                     return None;
