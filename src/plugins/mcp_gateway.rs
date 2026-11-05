@@ -8935,7 +8935,13 @@ async fn delete_upstream_session(
 /// one per upstream server. That is safe because each record names a distinct
 /// (server, upstream session) pair, no `DELETE` reads another's result, every
 /// failure is only logged, and the sessions are already out of the store; the
-/// reaper's cleanup worker already runs these same calls concurrently.
+/// reaper's cleanup worker already runs these same calls concurrently. Each
+/// call is bounded by [`REAPER_TEARDOWN_TIMEOUT`] like the reaper's, so hung
+/// upstreams cost a request at most one timeout per wave.
+///
+/// The calls overlap, so their individual durations are NOT summed into the
+/// request's external-I/O accumulator (that would report more I/O than
+/// wall-clock time); the batch's wall-clock wait is recorded once instead.
 async fn delete_upstream_session_set(
     http_client: &PluginHttpClient,
     servers: &HashMap<String, McpServerConfig>,
@@ -8952,18 +8958,36 @@ async fn delete_upstream_session_set(
             Some((server, teardown))
         })
         .collect();
+    if deletes.is_empty() {
+        return;
+    }
+    // Per-call durations land here and are discarded; see above.
+    let overlapping_call_ns = AtomicU64::new(0);
+    let overlapping_call_ns = &overlapping_call_ns;
+    let started = Instant::now();
     futures_util::stream::iter(deletes)
-        .for_each_concurrent(MAX_CONCURRENT_REAPER_TEARDOWNS, |(server, teardown)| {
-            delete_upstream_session(
-                http_client,
-                server,
-                upstream_session_header,
-                teardown,
-                hops,
-                accumulator,
-            )
-        })
+        .for_each_concurrent(
+            MAX_CONCURRENT_REAPER_TEARDOWNS,
+            move |(server, teardown)| async move {
+                let delete = delete_upstream_session(
+                    http_client,
+                    server,
+                    upstream_session_header,
+                    teardown,
+                    hops,
+                    overlapping_call_ns,
+                );
+                if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, delete)
+                    .await
+                    .is_err()
+                {
+                    warn_sampled!("MCP request-path upstream session delete timed out");
+                }
+            },
+        )
         .await;
+    let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    accumulator.fetch_add(waited_ns, Ordering::Relaxed);
 }
 
 /// Shortest and longest period of the background session expiry sweep. The

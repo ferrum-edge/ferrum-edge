@@ -3649,13 +3649,19 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let increment = u64_to_i64_saturating(tokens);
                 // One `MULTI`/`EXEC` reads the previous window and charges the
                 // current one: the read never depended on the charge's reply,
-                // so a second round trip bought nothing. `Reserve` is only
-                // built for `reserved_tokens > 0`, so the primitive's
-                // `amount.max(1)` clamp never changes `increment`, and the
-                // deny rollback below still subtracts exactly what was added.
-                let (prev_count, new_curr_count) = redis
-                    .sliding_window_increment_by(&prev_key, &curr_key, increment, ttl)
-                    .await?;
+                // so a second round trip bought nothing. That primitive clamps
+                // its amount to at least 1, so a zero reservation (public op;
+                // `admit` itself sends `CheckBudget` instead) takes the
+                // read-only pair and charges nothing, exactly as `INCRBY 0`
+                // did. The deny rollback below therefore always subtracts
+                // exactly what was added.
+                let (prev_count, new_curr_count) = if increment > 0 {
+                    redis
+                        .sliding_window_increment_by(&prev_key, &curr_key, increment, ttl)
+                        .await?
+                } else {
+                    redis.get_two_counters(&prev_key, &curr_key).await?
+                };
                 let weighted = weighted_window_count(prev_count, new_curr_count, elapsed_fraction);
                 let usage = weighted.max(0.0) as u64;
                 let remaining = limit.saturating_sub(usage);
@@ -3668,10 +3674,12 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // re-reserve the full limit — the exact bypass class the
                     // floor closes for the reconciliation path. Surface a failed
                     // rollback (Redis blip) so a leaked reservation is
-                    // observable rather than silently charged until TTL.
-                    if let Err(()) = redis
-                        .incrby_with_expire_floor_zero(&curr_key, -increment, ttl)
-                        .await
+                    // observable rather than silently charged until TTL. A zero
+                    // reservation charged nothing, so it has nothing to hand back.
+                    if increment > 0
+                        && let Err(()) = redis
+                            .incrby_with_expire_floor_zero(&curr_key, -increment, ttl)
+                            .await
                     {
                         // `curr_key` embeds the caller-supplied identity
                         // dimension, so it is not logged.

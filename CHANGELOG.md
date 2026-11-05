@@ -56,21 +56,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - **Centralized `ai_rate_limiter` reservations take one Redis round trip**
-  (#7035).
-  A Redis-backed token reservation charged the current window in one
-  transaction and then re-read both window counters in a second pipeline. It
-  now reads the previous window and charges the current one in a single
-  `MULTI`/`EXEC` (the transaction `ws_rate_limiting` already uses), saving one
-  Redis round trip per admitted AI request. The command set, key layout,
-  weighted estimate, deny rollback and `redis_failure_policy` handling are
-  unchanged; an unreadable counter still fails the reservation closed.
+  (#7035). A Redis-backed token reservation charged the current window in one
+  `MULTI`/`EXEC` (`INCRBY` + `EXPIRE`) and then read the previous and current
+  counters in a second `GETRANGE` pipeline, discarding the current one. It now
+  reads the previous window and charges the current one in a single
+  `MULTI`/`EXEC` (`GETRANGE` prev + `INCRBY` + `EXPIRE`, the transaction
+  `ws_rate_limiting` already uses), so the redundant `GETRANGE` of the current
+  counter is gone and each admitted AI request saves one Redis round trip. The
+  ACL command set, key layout, weighted estimate, deny rollback and
+  `redis_failure_policy` handling are unchanged, and an unreadable counter
+  still fails the reservation closed. A zero-token reservation charges nothing,
+  as before.
 - **`mcp_gateway` request-path session teardown deletes upstream sessions
-  concurrently** (#7035). A client `DELETE`, an expired session presented again, and an
-  `initialize` that reclaims sessions used to `DELETE` each upstream MCP session
-  one server at a time before answering. They now run concurrently, at most 8
-  in flight across every reclaimed session (the background reaper's bound), so
-  the client waits about one upstream round trip per 8 servers instead of one
-  per server. Failures are still logged and never change the client's answer.
+  concurrently** (#7035). A client `DELETE` and an expired session presented
+  again used to `DELETE` the session's upstream MCP sessions one server at a
+  time before answering; an `initialize` that reclaimed sessions ran those
+  per-session loops concurrently across sessions but still one server at a
+  time within each, with no overall bound. All three now share one fan-out of
+  at most 8 upstream `DELETE`s in flight (the background reaper's bound), so a
+  session spanning N servers costs about ceil(N/8) upstream round trips instead
+  of N. Each request-path `DELETE` is now also bounded at 10 seconds, like the
+  reaper's: a hung upstream costs a request at most 10 seconds per wave of 8
+  instead of the plugin HTTP client's 60-second timeout, and a timed-out
+  teardown is logged and abandoned (best-effort, as before). The trade-off is
+  that a mass-expiry `initialize` reclaiming many sessions at once now runs at
+  most 8 teardowns at a time instead of one per session. Failures are still
+  logged and never change the client's answer. The overlapping calls count
+  their wall-clock wait once toward `latency_plugin_external_io_ms` instead of
+  summing each call.
 
 ## [0.9.20] - 2026-11-02
 

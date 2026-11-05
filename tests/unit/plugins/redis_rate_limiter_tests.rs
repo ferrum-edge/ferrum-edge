@@ -3310,6 +3310,80 @@ async fn an_ai_token_reservation_fails_closed_on_an_unreadable_previous_counter(
     let _ = server.shutdown.send(());
 }
 
+/// A zero-token reservation (a public op; `admit` itself sends `CheckBudget`
+/// for zero) charges nothing on Redis, exactly as the old `INCRBY 0` did. The
+/// single-transaction primitive clamps its amount to at least 1, so a zero
+/// reservation must not reach it: a refusal at the limit would otherwise
+/// strand a phantom token that the zero-sized rollback never hands back.
+#[tokio::test]
+async fn a_zero_token_redis_reservation_charges_nothing() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm, two_window_ttl_seconds,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let ttl = two_window_ttl_seconds(window_seconds);
+    let algorithm = AiTokenRateAlgorithm::new(1_000, window_seconds);
+    let zero = AiRateLimitOp::Reserve { tokens: 0 };
+
+    for attempt in 0..3 {
+        let key = format!("consumer:zero-reservation-{attempt}");
+        let current = RedisRateLimitClient::window_progress(window_seconds).index;
+        let current_key = client.make_slot_key(&key, &[&current.to_string()]);
+
+        let fresh = algorithm
+            .check_redis(&client, &key, &zero)
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let fresh_count = server.counter(&current_key);
+
+        client
+            .incrby_with_expire(&current_key, 1_000, ttl)
+            .await
+            .expect("fill the window to its limit");
+        let at_limit = algorithm
+            .check_redis(&client, &key, &zero)
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let at_limit_count = server.counter(&current_key);
+
+        client
+            .incrby_with_expire(&current_key, 1, ttl)
+            .await
+            .expect("push the window past its limit");
+        let incrs_before = server.incrs();
+        let over = algorithm
+            .check_redis(&client, &key, &zero)
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let over_writes = server.incrs() - incrs_before;
+        let over_count = server.counter(&current_key);
+
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert!(fresh.allowed);
+        assert_eq!(fresh_count, 0, "a zero reservation charges nothing");
+        assert!(
+            at_limit.allowed,
+            "usage == limit still admits a zero reservation"
+        );
+        assert_eq!(at_limit.usage, Some(1_000));
+        assert_eq!(at_limit_count, 1_000, "no phantom token at the limit");
+        assert!(!over.allowed, "usage over the limit refuses");
+        assert_eq!(
+            over_writes, 0,
+            "nothing was charged, so nothing is handed back"
+        );
+        assert_eq!(over_count, 1_001);
+        let _ = server.shutdown.send(());
+        return;
+    }
+    panic!("the window index rolled over during every attempt");
+}
+
 /// Two requests that select adjacent sub-buckets must not both be admitted
 /// against a one-request quota, even when the NEWER ladder executes first.
 ///
