@@ -72,18 +72,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again used to `DELETE` the session's upstream MCP sessions one server at a
   time before answering; an `initialize` that reclaimed sessions ran those
   per-session loops concurrently across sessions but still one server at a
-  time within each, with no overall bound. All three now share one fan-out of
-  at most 8 upstream `DELETE`s in flight (the background reaper's bound), so a
-  session spanning N servers costs about ceil(N/8) upstream round trips instead
-  of N. Each request-path `DELETE` is now also bounded at 10 seconds, like the
-  reaper's: a hung upstream costs a request at most 10 seconds per wave of 8
-  instead of the plugin HTTP client's 60-second timeout, and a timed-out
-  teardown is logged and abandoned (best-effort, as before). The trade-off is
-  that a mass-expiry `initialize` reclaiming many sessions at once now runs at
-  most 8 teardowns at a time instead of one per session. Failures are still
-  logged and never change the client's answer. The overlapping calls count
-  their wall-clock wait once toward `latency_plugin_external_io_ms` instead of
-  summing each call, including when the client aborts mid-teardown.
+  time within each. Each session's upstream `DELETE`s now run concurrently, at
+  most 8 in flight (the background reaper's bound), and reclaimed sessions
+  still run concurrently with each other, so a session spanning N servers
+  costs about ceil(N/8) upstream round trips instead of N, and a reclaiming
+  `initialize` is never slower than before. Each request-path `DELETE` is now
+  also bounded at 10 seconds, like the reaper's: a hung upstream costs a
+  request at most 10 seconds per wave of 8 instead of the plugin HTTP client's
+  60-second timeout, and a timed-out teardown is logged with its `server_id`
+  and abandoned (best-effort, as before). Failures are still logged and never
+  change the client's answer. The overlapping calls count their wall-clock
+  wait once toward `latency_plugin_external_io_ms` instead of summing each
+  call, including when the client aborts mid-teardown.
+- **A reclaiming `initialize` no longer returns an already-expired session**
+  (#7035). The session `initialize` admits is inserted before it awaits the
+  reclaimed sessions' upstream teardown; when that teardown outlasted
+  `sessions.session_ttl_seconds`, the returned id had already expired (or been
+  reaped) and its first request got `404`. The new session's idle clock now
+  starts when `initialize` returns (or is cancelled).
 
 ## [0.9.20] - 2026-11-02
 
