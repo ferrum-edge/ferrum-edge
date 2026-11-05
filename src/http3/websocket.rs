@@ -101,11 +101,11 @@
 //! accounting as the H1/H2 path so backend isolation and target-level
 //! connection counts stay consistent across frontends:
 //!
-//! - Backend connect failure → `record_failure(502, is_pre_wire, is_half_open_probe)`
+//! - Backend connect failure → `settle(ticket, Failure { 502, is_pre_wire })`
 //!   using the same `request_reached_wire` boundary as the H1/H2 retry
 //!   loop. A backend that received the upgrade and rejected it (post-wire)
 //!   does NOT charge passive health as a connect-class failure.
-//! - Successful 200 upgrade response → `record_success(is_half_open_probe)`
+//! - Successful 200 upgrade response → `settle(ticket, Success)`
 //!   so a half-open probe that bootstraps a WebSocket counts as a
 //!   recovery sample.
 //! - Pre-wire backend connect failures honor the proxy retry policy and
@@ -1319,10 +1319,12 @@ pub(crate) async fn handle_h3_websocket(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                     ) {
-                        cb.record_failure(
-                            ws_failure_status.as_u16(),
-                            ws_is_pre_wire,
+                        cb.settle(
                             cb_probe.take_slot(),
+                            crate::circuit_breaker::BreakerOutcome::Failure {
+                                status_code: ws_failure_status.as_u16(),
+                                connection_error: ws_is_pre_wire,
+                            },
                         );
                         cb_failure_already_recorded = true;
                     }
@@ -1424,11 +1426,11 @@ pub(crate) async fn handle_h3_websocket(
                             retry_cb_target_key.as_deref(),
                             cb_config,
                         ) {
-                            Ok((cb, is_half_open_probe, admission_generation)) => {
+                            Ok((cb, probe_ticket, _admission_generation)) => {
                                 // Re-point the probe guard at the rotated target's
                                 // breaker: the prior target's slot was taken by the
                                 // intermediate failure record above.
-                                cb_probe.rearm(&cb, is_half_open_probe, admission_generation);
+                                cb_probe.rearm(&cb, probe_ticket);
                             }
                             Err(_) => {
                                 retry_admitted_by_cb = false;
@@ -1489,12 +1491,17 @@ pub(crate) async fn handle_h3_websocket(
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
                         // recover, rather than leaking it by skipping the record.
-                        cb.record_neutral(cb_probe.take_slot());
-                    } else {
-                        cb.record_failure(
-                            ws_failure_status.as_u16(),
-                            ws_is_pre_wire,
+                        cb.settle(
                             cb_probe.take_slot(),
+                            crate::circuit_breaker::BreakerOutcome::Neutral,
+                        );
+                    } else {
+                        cb.settle(
+                            cb_probe.take_slot(),
+                            crate::circuit_breaker::BreakerOutcome::Failure {
+                                status_code: ws_failure_status.as_u16(),
+                                connection_error: ws_is_pre_wire,
+                            },
                         );
                     }
                 }
@@ -1552,7 +1559,10 @@ pub(crate) async fn handle_h3_websocket(
         &proxy.id,
         current_cb_target_key.as_deref(),
     ) {
-        cb.record_success(cb_probe.take_slot());
+        cb.settle(
+            cb_probe.take_slot(),
+            crate::circuit_breaker::BreakerOutcome::Success,
+        );
     }
 
     if ws_session_deadline.at <= tokio::time::Instant::now() {

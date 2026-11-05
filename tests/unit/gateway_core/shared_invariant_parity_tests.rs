@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_edge::circuit_breaker::CircuitBreaker;
+use ferrum_edge::circuit_breaker::{BreakerOutcome, CircuitBreaker, ProbeTicket};
 use ferrum_edge::config::types::{CircuitBreakerConfig, Proxy, UpstreamTarget};
 use ferrum_edge::config::{BackendEgressPolicy, EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
@@ -429,11 +429,11 @@ const DIRECT_PROBE_ADMISSION_SITES: &[(&str, &str, usize)] = &[
 ];
 
 /// What each direct-cache admission arm must contain, whitespace-stripped: the
-/// guard is bound to the generation that SAME admission returned (#6177).
-const DIRECT_ADMISSION_ARM: &str = "Ok((cb,is_half_open_probe,admission_generation))";
-const DIRECT_ADMISSION_GUARD: &str =
-    "HalfOpenProbeGuard::for_admitted_probe(&cb,is_half_open_probe,admission_generation";
-const DIRECT_ADMISSION_REARM: &str = "cb_probe.rearm(&cb,is_half_open_probe,admission_generation";
+/// guard owns the `ProbeTicket` that SAME admission returned, so the slot and
+/// its open generation travel as one value (#6177, CB-1).
+const DIRECT_ADMISSION_ARM: &str = "Ok((cb,probe_ticket,_admission_generation))";
+const DIRECT_ADMISSION_GUARD: &str = "HalfOpenProbeGuard::for_admitted_probe(&cb,probe_ticket";
+const DIRECT_ADMISSION_REARM: &str = "cb_probe.rearm(&cb,probe_ticket";
 
 /// Files that must own a guard rather than re-deriving the release: the
 /// admission sites plus every module they hand the guard to.
@@ -449,27 +449,28 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
 ];
 
 /// Every settle path on the shared guard:
-/// `(label, signature, terminator, neutral release it must reach)`. The guard's
-/// own releases are bound to the slot's admission generation (#6177), so a guard
-/// that outlives a reopen cannot free a later cycle's slot.
+/// `(label, signature, terminator, neutral release it must reach)`. Each release
+/// settles the admission's `ProbeTicket`, whose generation the breaker checks
+/// in the releasing CAS (#6177, CB-1), so a guard or recorder that outlives a
+/// reopen cannot free a later cycle's slot.
 const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str, &str)] = &[
     (
         "explicit gateway-side refusal",
         "    pub fn release_neutral(&self) {",
         "\n    }\n",
-        "record_neutral_for_admission(true, admission_generation)",
+        "cb.settle(ticket, BreakerOutcome::Neutral)",
     ),
     (
         "dropped future (client disconnect)",
         "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
-        "record_neutral_for_admission(true, admission_generation)",
+        "cb.settle(ticket, BreakerOutcome::Neutral)",
     ),
     (
         "gRPC streaming recorder handoff",
         "impl Drop for GrpcStreamingProbeRecorder {",
         "\n}\n",
-        "record_neutral(",
+        "self.cb.settle(self.ticket, BreakerOutcome::Neutral)",
     ),
 ];
 
@@ -588,18 +589,22 @@ fn every_probe_guard_settle_path_releases_neutrally() {
 #[test]
 fn taking_the_probe_slot_is_what_disarms_the_guard() {
     // The exactly-once property the whole design rests on: every explicit
-    // `record_*` argument comes from `take_slot`, which atomically clears the
-    // armed flag, so no path can release the same slot twice (a double release
+    // `settle` ticket comes from `take_slot`, which atomically clears the held
+    // ticket, so no path can release the same slot twice (a double release
     // decrements a DIFFERENT probe's slot and over-admits).
     let text = source("src/proxy/mod.rs");
-    let take = item_body(&text, "    pub fn take_slot(&self) -> bool {", "\n    }\n");
+    let take = item_body(
+        &text,
+        "    pub fn take_slot(&self) -> ProbeTicket {",
+        "\n    }\n",
+    );
     assert!(
-        take.contains("self.armed.swap(false"),
-        "`take_slot` must atomically clear the armed flag as it hands the slot over"
+        take.contains("self.slot.swap(0"),
+        "`take_slot` must atomically clear the held ticket as it hands the slot over"
     );
     let drop_body = item_body(&text, "impl Drop for HalfOpenProbeGuard {", "\n}\n");
     assert!(
-        drop_body.contains("self.armed.swap(false"),
+        drop_body.contains("self.slot.swap(0"),
         "the guard's `Drop` must claim the slot with the same atomic swap so it \
          cannot race an explicit release"
     );
@@ -750,7 +755,7 @@ fn every_http3_retry_loop_admits_each_attempt_through_the_circuit_breaker() {
     let admission = source("src/proxy/mod.rs");
     let helper = item_body(&admission, "pub(crate) fn admit_retry_attempt(", "\n}\n");
     assert!(helper.contains("circuit_breaker_cache.can_execute("));
-    assert!(helper.contains("cb_probe.rearm(&cb, is_half_open_probe, admission_generation)"));
+    assert!(helper.contains("cb_probe.rearm(&cb, probe_ticket)"));
     assert!(helper.contains("cb_probe.retire()"));
 }
 
@@ -844,10 +849,30 @@ fn record_probe_neutral(cb: &CircuitBreaker) {
     cb.record_neutral(true);
 }
 
-fn record_probe_neutral_for_admission(cb: &CircuitBreaker) {
-    // `breaker_holding_one_probe` admits with no concurrent transition, so the
-    // current generation is the probe's admission generation.
-    cb.record_neutral_for_admission(true, cb.open_epoch());
+/// The probe's own ticket. `breaker_holding_one_probe` admits with no
+/// concurrent transition, so the current generation is the admission's.
+fn admitted_probe_ticket(cb: &CircuitBreaker) -> ProbeTicket {
+    ProbeTicket::Probe {
+        generation: u32::try_from(cb.open_epoch()).expect("generation is a u32 field"),
+    }
+}
+
+fn settle_probe_success(cb: &CircuitBreaker) {
+    cb.settle(admitted_probe_ticket(cb), BreakerOutcome::Success);
+}
+
+fn settle_probe_tripping_failure(cb: &CircuitBreaker) {
+    cb.settle(
+        admitted_probe_ticket(cb),
+        BreakerOutcome::Failure {
+            status_code: 500,
+            connection_error: false,
+        },
+    );
+}
+
+fn settle_probe_neutral(cb: &CircuitBreaker) {
+    cb.settle(admitted_probe_ticket(cb), BreakerOutcome::Neutral);
 }
 
 /// One probe outcome: its label and the breaker call that reports it.
@@ -869,10 +894,9 @@ const PROBE_OUTCOMES: &[ProbeOutcome] = &[
         record_probe_connection_failure,
     ),
     ("record_neutral", record_probe_neutral),
-    (
-        "record_neutral_for_admission",
-        record_probe_neutral_for_admission,
-    ),
+    ("settle(Success)", settle_probe_success),
+    ("settle(Failure)", settle_probe_tripping_failure),
+    ("settle(Neutral)", settle_probe_neutral),
 ];
 
 #[test]
@@ -888,6 +912,77 @@ fn every_probe_outcome_kind_releases_the_half_open_slot() {
             "{label} must release the HALF_OPEN probe slot"
         );
     }
+}
+
+/// `text` with every column-0 `#[cfg(test)] mod name { ... }` block removed
+/// (rustfmt closes such a block with a column-0 `}`). An out-of-line
+/// `#[cfg(test)] mod name;` declaration is dropped on its own.
+fn without_cfg_test_modules(text: &str) -> String {
+    const MARKER: &str = "\n#[cfg(test)]\nmod ";
+    let mut production = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(MARKER) {
+        production.push_str(&rest[..start]);
+        let module = &rest[start + 1..];
+        let header_end = module.find('\n').unwrap_or(module.len());
+        if module[..header_end].trim_end().ends_with(';') {
+            rest = &module[header_end..];
+            continue;
+        }
+        rest = match module.find("\n}\n") {
+            Some(end) => &module[end + 2..],
+            None => "",
+        };
+    }
+    production.push_str(rest);
+    production
+}
+
+/// CB-1: every production settlement of a circuit-breaker admission goes
+/// through `CircuitBreaker::settle` with the admission's own `ProbeTicket`.
+/// The `bool` conveniences (`record_success` / `record_failure` /
+/// `record_neutral`) settle against whatever cycle is current at the call, so a
+/// probe that outlived a reopen would free a LATER cycle's slot (over-admitting
+/// past `half_open_max_requests`) or close/reopen a cycle it never probed —
+/// exactly what the TCP relay end and the gRPC streaming recorder used to do.
+/// They exist for unit tests only.
+#[test]
+fn no_production_path_settles_a_breaker_without_its_probe_ticket() {
+    let mut scanned = 0usize;
+    for (path, text) in production_sources() {
+        if !(path.starts_with("src/proxy/")
+            || path.starts_with("src/http3/")
+            || path.starts_with("src/grpc/"))
+        {
+            continue;
+        }
+        scanned += 1;
+        let production: String = without_cfg_test_modules(&text).split_whitespace().collect();
+        for blind in [
+            ".record_success(",
+            ".record_failure(",
+            ".record_neutral(",
+            ".record_neutral_for_admission(",
+        ] {
+            assert!(
+                !production.contains(blind),
+                "{path} settles a circuit breaker through the generation-blind `{blind}`; \
+                 settle the admission's `ProbeTicket` with `CircuitBreaker::settle` instead"
+            );
+        }
+    }
+    assert!(scanned > 0, "the proxy/http3/grpc sources must be scanned");
+    // The one production entry point checks the ticket's cycle in the CAS.
+    let breaker = source("src/circuit_breaker.rs");
+    let release = item_body(
+        &breaker,
+        "    fn release_slot(&self, ticket: ProbeTicket) {",
+        "\n    }\n",
+    );
+    assert!(
+        release.contains("packed_generation(packed) != generation"),
+        "the slot release must compare the ticket's generation inside its CAS"
+    );
 }
 
 // ---------------------------------------------------------------------------

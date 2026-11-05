@@ -37,7 +37,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::circuit_breaker::CircuitBreakerCache;
+use crate::circuit_breaker::{BreakerOutcome, CircuitBreakerCache};
 use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::consumer_index::ConsumerIndex;
@@ -7858,12 +7858,8 @@ async fn handle_dtls_client_inner(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((cb, is_half_open_probe, admission_generation)) => {
-                cb_probe = HalfOpenProbeGuard::for_admitted_probe(
-                    &cb,
-                    is_half_open_probe,
-                    admission_generation,
-                );
+            Ok((cb, probe_ticket, _admission_generation)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, probe_ticket);
             }
             Err(_) => {
                 warn!(
@@ -7916,9 +7912,15 @@ async fn handle_dtls_client_inner(
                 cb_target_key.as_deref(),
             ) {
                 if crate::dns::is_egress_policy_denial(&e) {
-                    cb.record_neutral(cb_probe.take_slot());
+                    cb.settle(cb_probe.take_slot(), BreakerOutcome::Neutral);
                 } else {
-                    cb.record_failure(502, true, cb_probe.take_slot());
+                    cb.settle(
+                        cb_probe.take_slot(),
+                        BreakerOutcome::Failure {
+                            status_code: 502,
+                            connection_error: true,
+                        },
+                    );
                 }
             }
             return Err(stream_dns_setup_error(&backend_host, e));
@@ -7965,7 +7967,13 @@ async fn handle_dtls_client_inner(
                 proxy_id,
                 cb_target_key.as_deref(),
             ) {
-                cb.record_failure(502, true, cb_probe.take_slot());
+                cb.settle(
+                    cb_probe.take_slot(),
+                    BreakerOutcome::Failure {
+                        status_code: 502,
+                        connection_error: true,
+                    },
+                );
             }
             return Err(error);
         }
@@ -8009,7 +8017,7 @@ async fn handle_dtls_client_inner(
         proxy_id,
         cb_target_key.as_deref(),
     ) {
-        cb.record_success(cb_probe.take_slot());
+        cb.settle(cb_probe.take_slot(), BreakerOutcome::Success);
     }
 
     debug!(
@@ -8816,12 +8824,8 @@ async fn create_session(
             cb_target_key.as_deref(),
             cb_config,
         ) {
-            Ok((cb, is_half_open_probe, admission_generation)) => {
-                cb_probe = HalfOpenProbeGuard::for_admitted_probe(
-                    &cb,
-                    is_half_open_probe,
-                    admission_generation,
-                );
+            Ok((cb, probe_ticket, _admission_generation)) => {
+                cb_probe = HalfOpenProbeGuard::for_admitted_probe(&cb, probe_ticket);
             }
             Err(_) => {
                 warn!(
@@ -8870,9 +8874,15 @@ async fn create_session(
                 cb_target_key.as_deref(),
             ) {
                 if crate::dns::is_egress_policy_denial(&e) {
-                    cb.record_neutral(cb_probe.take_slot());
+                    cb.settle(cb_probe.take_slot(), BreakerOutcome::Neutral);
                 } else {
-                    cb.record_failure(502, true, cb_probe.take_slot());
+                    cb.settle(
+                        cb_probe.take_slot(),
+                        BreakerOutcome::Failure {
+                            status_code: 502,
+                            connection_error: true,
+                        },
+                    );
                 }
             }
             return Err(stream_dns_setup_error(&backend_host, e));
@@ -8888,7 +8898,13 @@ async fn create_session(
                     proxy_id,
                     cb_target_key.as_deref(),
                 ) {
-                    cb.record_failure(502, true, cb_probe.take_slot());
+                    cb.settle(
+                        cb_probe.take_slot(),
+                        BreakerOutcome::Failure {
+                            status_code: 502,
+                            connection_error: true,
+                        },
+                    );
                 }
                 return Err(StreamSetupError::new(
                     StreamSetupKind::NoHealthyTargets,
@@ -8946,7 +8962,13 @@ async fn create_session(
                 proxy_id,
                 cb_target_key.as_deref(),
             ) {
-                cb.record_failure(502, true, cb_probe.take_slot());
+                cb.settle(
+                    cb_probe.take_slot(),
+                    BreakerOutcome::Failure {
+                        status_code: 502,
+                        connection_error: true,
+                    },
+                );
             }
             return Err(error);
         }
@@ -8986,7 +9008,7 @@ async fn create_session(
         proxy_id,
         cb_target_key.as_deref(),
     ) {
-        cb.record_success(cb_probe.take_slot());
+        cb.settle(cb_probe.take_slot(), BreakerOutcome::Success);
     }
 
     // Admission preceded DNS and backend setup. Re-check immediately before

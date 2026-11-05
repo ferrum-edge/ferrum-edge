@@ -1049,13 +1049,13 @@ for this H3 behavior.
 H3 WebSocket sessions participate in the same backend-isolation +
 session-accounting infrastructure the H1/H2 path uses:
 
-- **Circuit breaker** — backend connect failure records
-  `record_failure(502, is_pre_wire, is_half_open_probe)` against
+- **Circuit breaker** — backend connect failure settles the admission's
+  probe ticket as `Failure { 502, connection_error: is_pre_wire }` against
   the resolved target, where `is_pre_wire` follows the unified
   `retry::request_reached_wire` boundary (a backend that received the
   upgrade and rejected it post-wire does NOT charge the breaker's
-  connect-error counter). Successful 200 upgrades record
-  `record_success(is_half_open_probe)` so a half-open probe that
+  connect-error counter). Successful 200 upgrades settle the ticket as
+  `Success` so a half-open probe that
   bootstraps a WebSocket counts as a recovery sample.
 - **Load balancer** — `LoadBalancerConnectionGuard` increments the
   final selected target's connection count on construction (just before
