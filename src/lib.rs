@@ -18352,6 +18352,26 @@ pub mod _test_support {
         )
     }
 
+    /// Test-only view of the crate-private reconcile status dispatch: plans
+    /// and patches both writers' batches exactly as a reconcile does (no route
+    /// conflicts, no translation reuse, default Gateway API status context).
+    pub async fn run_status_patchers_for_test(
+        gateway_writer: Option<crate::k8s_controller::status::GatewayApiStatusWriter>,
+        istio_writer: Option<crate::k8s_controller::istio_status::IstioStatusWriter>,
+        objects: Vec<crate::config_sources::k8s::K8sObject>,
+        options: crate::config_sources::k8s::K8sTranslationOptions,
+        metrics: &crate::k8s_controller::metrics::ControllerMetrics,
+    ) {
+        crate::k8s_controller::reconciler::run_status_patchers_for_test(
+            gateway_writer,
+            istio_writer,
+            objects,
+            options,
+            metrics,
+        )
+        .await
+    }
+
     /// One-shot GET/PATCH intercept for the live Istio status competing-writer
     /// lane. After the first identity-matching GET, Ferrum waits until `resume`
     /// is completed before PATCHing.

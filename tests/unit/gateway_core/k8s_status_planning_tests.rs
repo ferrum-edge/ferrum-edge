@@ -171,6 +171,13 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
     // invariant (#2397, #6370): every cursor write goes through the one
     // bounded-retry helper; empty plans and successful patches advance, patch
     // errors and batch timeouts record a failed batch.
+    // Planning (with the empty-plan cursor record) runs synchronously before
+    // the patch phase so concurrent writers' clocks never include it.
+    let planner = RECONCILER_SRC
+        .split("fn plan_gateway_api_status_batch(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn patch_gateway_api_statuses(").next())
+        .expect("plan_gateway_api_status_batch body");
     let body = RECONCILER_SRC
         .split("async fn patch_gateway_api_statuses(")
         .nth(1)
@@ -199,8 +206,8 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         "record_gateway_api_status_batch must be the only status-plan cursor writer"
     );
 
-    let empty_return = body
-        .split("if updates.is_empty()")
+    let empty_return = planner
+        .split("if outcome.updates.is_empty()")
         .nth(1)
         .and_then(|rest| rest.split("if outcome.eligible_candidates").next())
         .expect("empty-updates branch");
@@ -259,9 +266,10 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .next()
         .expect("pre-patch region");
     assert_eq!(
-        before_patch
-            .matches("record_gateway_api_status_batch(")
-            .count(),
+        planner.matches("record_gateway_api_status_batch(").count()
+            + before_patch
+                .matches("record_gateway_api_status_batch(")
+                .count(),
         1,
         "only the empty-plan branch may record the cursor before patch_updates"
     );

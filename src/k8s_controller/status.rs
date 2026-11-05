@@ -30,8 +30,8 @@ use crate::k8s_controller::metrics::{
     ControllerMetrics, record_route_status_publication, unix_now_ms,
 };
 use crate::k8s_controller::status_budget::{
-    STATUS_BATCH_BUDGET, STATUS_BATCH_SLOW_WARN, STATUS_REQUEST_BUDGET, STATUS_UPDATE_BUDGET,
-    StatusOperation, await_status_operation, status_operation_budget,
+    STATUS_BATCH_BUDGET, STATUS_BATCH_SLOW_WARN, STATUS_PATCH_PARALLELISM, STATUS_REQUEST_BUDGET,
+    STATUS_UPDATE_BUDGET, StatusOperation, await_status_operation, status_operation_budget,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -47,7 +47,6 @@ pub use crate::config_sources::k8s::FERRUM_GATEWAY_CONTROLLER_NAME;
 /// Using the Gateway API controller name keeps ownership stable across restarts
 /// and replicas without inventing a pod- or process-specific identity.
 const GATEWAY_API_STATUS_FIELD_MANAGER: &str = FERRUM_GATEWAY_CONTROLLER_NAME;
-const GATEWAY_API_STATUS_PATCH_PARALLELISM: usize = 32;
 const ROUTE_STATUS_PATCH_MAX_ATTEMPTS: usize = 5;
 const ROUTE_STATUS_PATCH_RETRY_BASE_MS: u64 = 10;
 
@@ -164,8 +163,8 @@ impl GatewayApiStatusWriter {
         let mut first_error: Option<kube::Error> = None;
         // Patch Gateway API status updates with bounded concurrency so bursty
         // reconcile rounds cannot fan out unbounded API requests.
-        let mut stream = futures_util::stream::iter(futures)
-            .buffer_unordered(GATEWAY_API_STATUS_PATCH_PARALLELISM);
+        let mut stream =
+            futures_util::stream::iter(futures).buffer_unordered(STATUS_PATCH_PARALLELISM);
         while let Some((kind, namespace, name, result)) = stream.next().await {
             match result {
                 Err(error) if gateway_api_status_error_is_not_found(&error) => {

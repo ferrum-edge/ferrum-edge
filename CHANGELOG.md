@@ -80,6 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the client aborts mid-teardown. Session reclamation during `initialize` is
   unchanged. The background reaper's and failed-`initialize` cleanup's timeout
   warnings now include `server_id`.
+- **Gateway API and Istio status batches run concurrently** (#7034). The
+  Kubernetes reconcile loop used to wait for the Gateway API status batch and
+  then for the Istio status batch. The two writers patch disjoint objects, so
+  they now run together and a reconcile is held for the slower batch rather
+  than both (worst case about 20 s instead of 40 s). Both writers plan before
+  either sends a request. The batches overlap only when the Istio batch has at
+  most 32 updates; a larger Istio batch still runs after the Gateway API batch,
+  so it cannot crowd out Gateway API status on the shared Kubernetes client.
+  Each writer's own batch behaves as before, and clusters that watch only one
+  of the two are unchanged.
 
 ## [0.9.20] - 2026-11-02
 
