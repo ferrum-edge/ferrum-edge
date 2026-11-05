@@ -1599,8 +1599,17 @@ impl MeshMtlsConnectionPool {
         }
         let creation_slot = self.creation_slot(key);
         let creation_lease = creation_slot.try_claim()?;
-        // Re-check under the lock: another grower may have widened the key
-        // (or a prune may have narrowed it) since the fast-path read.
+        // Re-check under the lock: a grower that failed between the read above
+        // and this claim has published its backoff before releasing the lease,
+        // and another grower may have widened the key (or a prune may have
+        // narrowed it) since the fast-path read.
+        if self
+            .growth_backoff_until
+            .get(key)
+            .is_some_and(|until| *until.value() > unix_secs())
+        {
+            return None;
+        }
         let live_connections = self
             .entries
             .get(key)
