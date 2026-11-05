@@ -1814,33 +1814,32 @@ impl DnsCache {
                 .iter()
                 .map(|&record_type| async move {
                     let answer = self.lookup_record_type(hostname, record_type).await;
-                    (answer, Instant::now())
+                    (record_type, answer, Instant::now())
                 })
                 .collect();
             // When the latest lookup earlier in the order finished.
             let mut preferred_done_at: Option<Instant> = None;
-            while let Some((answer, completed_at)) = lookups.next().await {
-                let Some(answer) = answer else {
-                    preferred_done_at = preferred_done_at.max(Some(completed_at));
-                    continue;
-                };
-                // An answer that completed while a preferred lookup was still
-                // pending waited here. Its TTL is taken from its absolute
-                // deadline at selection, so the wait is not added on top. If
-                // the deadline has passed (including a TTL-0 answer), ask
-                // again, as the sequential walk would have after the preferred
-                // lookup, rather than cache an address the upstream may have
-                // rotated. An answer that did not wait keeps main's behaviour.
+            while let Some((record_type, answer, completed_at)) = lookups.next().await {
+                // A result that completed while a preferred lookup was still
+                // pending is older than what the sequential walk would have
+                // seen: that walk sends this query only after the preferred
+                // one fails. Ask once more now, success or failure. The
+                // resolver keeps hickory's cache, so a result still within
+                // its TTL (or negative TTL) comes straight back from it; an
+                // expired one, a TTL-0 answer included, goes to the network.
                 let waited = preferred_done_at.is_some_and(|done| completed_at < done);
-                let answer = if waited && answer.valid_until <= Instant::now() {
-                    match self.lookup_record_type(hostname, answer.record_type).await {
-                        Some(fresh) => fresh,
-                        None => continue,
-                    }
+                let answer = if waited {
+                    self.lookup_record_type(hostname, record_type).await
                 } else {
                     answer
                 };
-                return Ok(self.publishable_answer(answer));
+                match answer {
+                    Some(answer) => return Ok(self.publishable_answer(answer)),
+                    None => {
+                        let done_at = if waited { Instant::now() } else { completed_at };
+                        preferred_done_at = preferred_done_at.max(Some(done_at));
+                    }
+                }
             }
         }
 

@@ -59,6 +59,10 @@ struct Behavior {
     answer_a: bool,
     /// Answer the host's second and later A queries with `ROTATED_HOST_IP`.
     rotate_host_a: bool,
+    /// Answer the first A query for each host name NOERROR with no records
+    /// (NODATA), as if the record were published just after it. Per name, so
+    /// search-list expansions cannot answer in its place.
+    negative_first_host_a: bool,
     ttl: u32,
 }
 
@@ -70,6 +74,7 @@ impl ColdMissDnsServer {
             srv_delay_after_a,
             answer_a,
             rotate_host_a,
+            negative_first_host_a,
             ttl,
         } = behavior;
         let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
@@ -87,6 +92,7 @@ impl ColdMissDnsServer {
             let mut held: Vec<(Message, SocketAddr)> = Vec::new();
             let mut address_seen = false;
             let mut host_a_queries = 0usize;
+            let mut answered_host_names = std::collections::HashSet::new();
             loop {
                 let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
                     break;
@@ -99,6 +105,7 @@ impl ColdMissDnsServer {
                     continue;
                 };
                 let mut host_ip = HOST_IP;
+                let mut answer_addresses = answer_a;
                 match query_type {
                     RecordType::SRV => {
                         task_srv_queries.fetch_add(1, Ordering::SeqCst);
@@ -116,6 +123,10 @@ impl ColdMissDnsServer {
                                 if rotate_host_a && host_a_queries > 0 {
                                     host_ip = ROTATED_HOST_IP;
                                 }
+                                if negative_first_host_a && answered_host_names.insert(name.clone())
+                                {
+                                    answer_addresses = false;
+                                }
                                 host_a_queries += 1;
                             }
                             task_a_query_names.lock().expect("A query log").push(name);
@@ -123,7 +134,7 @@ impl ColdMissDnsServer {
                     }
                     _ => {}
                 }
-                let reply = answer(request, srv_target.as_ref(), answer_a, host_ip, ttl);
+                let reply = answer(request, srv_target.as_ref(), answer_addresses, host_ip, ttl);
                 if let Some(encoded) = reply {
                     let _ = socket.send_to(&encoded, peer).await;
                 }
@@ -170,6 +181,16 @@ impl ColdMissDnsServer {
 
     fn srv_queries(&self) -> usize {
         self.srv_queries.load(Ordering::SeqCst)
+    }
+
+    /// A queries for exactly `fqdn` (lowercase, with the trailing dot).
+    fn a_queries_named(&self, fqdn: &str) -> usize {
+        self.a_query_names
+            .lock()
+            .expect("A query log")
+            .iter()
+            .filter(|name| name.as_str() == fqdn)
+            .count()
     }
 
     /// A queries for names under `hostname` (search-list expansions included).
@@ -237,6 +258,7 @@ async fn cold_miss_sends_srv_and_a_queries_together() {
         srv_delay_after_a: None,
         answer_a: true,
         rotate_host_a: false,
+        negative_first_host_a: false,
         ttl: 60,
     })
     .await;
@@ -271,6 +293,7 @@ async fn buffered_answer_expired_behind_srv_is_requeried() {
         srv_delay_after_a: Some(Duration::from_secs(2)),
         answer_a: true,
         rotate_host_a: true,
+        negative_first_host_a: false,
         ttl: 1,
     })
     .await;
@@ -306,6 +329,7 @@ async fn cold_miss_keeps_srv_preference_when_a_answers_first() {
         srv_delay_after_a: None,
         answer_a: true,
         rotate_host_a: false,
+        negative_first_host_a: false,
         ttl: 60,
     })
     .await;
@@ -336,6 +360,7 @@ async fn buffered_zero_ttl_answer_behind_srv_is_requeried() {
         srv_delay_after_a: Some(Duration::from_secs(1)),
         answer_a: true,
         rotate_host_a: true,
+        negative_first_host_a: false,
         ttl: 0,
     })
     .await;
@@ -362,6 +387,51 @@ async fn buffered_zero_ttl_answer_behind_srv_is_requeried() {
 }
 
 #[tokio::test]
+async fn buffered_negative_answer_behind_srv_is_rechecked() {
+    // A answers NODATA at once; the record is published right after, and the
+    // preferred SRV query answers (empty) 2 s later. The sequential walk would
+    // have asked for A only after SRV and found it, so the buffered failure
+    // must be checked again instead of failing the resolve. The 1 s error TTL
+    // also bounds hickory's negative cache, so the recheck reaches the server.
+    let dns = ColdMissDnsServer::spawn(Behavior {
+        srv_target: None,
+        hold_srv_until_a: true,
+        srv_delay_after_a: Some(Duration::from_secs(2)),
+        answer_a: true,
+        rotate_host_a: false,
+        negative_first_host_a: true,
+        ttl: 60,
+    })
+    .await;
+    let cache = DnsCache::new(DnsConfig {
+        resolver_addresses: Some(dns.addr.to_string()),
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 0,
+        error_ttl_seconds: 1,
+        ..DnsConfig::default()
+    });
+
+    let resolved = tokio::time::timeout(
+        Duration::from_secs(4),
+        cache.resolve("cold-negative.test", None, None),
+    )
+    .await
+    .expect("the delayed SRV reply arrives well inside the resolver timeout")
+    .expect("the rechecked A query must find the newly published record");
+
+    assert_eq!(resolved, IpAddr::V4(HOST_IP));
+    assert_eq!(
+        dns.a_queries_named("cold-negative.test."),
+        2,
+        "the buffered NODATA answer must be checked once more"
+    );
+    assert!(
+        !cache.is_cached_error("cold-negative.test"),
+        "a speculative failure must not install an error row"
+    );
+}
+
+#[tokio::test]
 async fn cold_miss_overlaps_srv_and_aaaa_when_aaaa_follows_srv() {
     // `SRV,AAAA`: the address type after SRV is AAAA, so AAAA is the query
     // sent alongside SRV. The held SRV reply is released by the AAAA query.
@@ -371,6 +441,7 @@ async fn cold_miss_overlaps_srv_and_aaaa_when_aaaa_follows_srv() {
         srv_delay_after_a: None,
         answer_a: true,
         rotate_host_a: false,
+        negative_first_host_a: false,
         ttl: 60,
     })
     .await;
@@ -399,6 +470,7 @@ async fn cold_miss_with_no_answers_still_fails() {
         srv_delay_after_a: None,
         answer_a: false,
         rotate_host_a: false,
+        negative_first_host_a: false,
         ttl: 60,
     })
     .await;
@@ -441,6 +513,7 @@ async fn assert_known_srv_row_refresh_sends_no_speculative_a(
         srv_delay_after_a: None,
         answer_a: true,
         rotate_host_a: false,
+        negative_first_host_a: false,
         ttl: 1,
     })
     .await;

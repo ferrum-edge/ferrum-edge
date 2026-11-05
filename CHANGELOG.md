@@ -15,10 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   types up to the first address type together and still takes the first
   non-empty answer in configured order; CNAME stays a serial fallback.
   Hostnames whose answering type is already cached keep the sequential walk,
-  so steady-state refreshes send the same queries as before. An A/AAAA answer
-  that waits behind a slower SRV query is cached only for what remains of its
-  TTL, and is queried again if its deadline has passed when it is selected
-  (TTL-0 answers included).
+  so steady-state refreshes send the same queries as before. An A/AAAA result
+  (success or failure) that completed while the SRV query was still pending
+  is looked up once more when SRV yields nothing. That recheck is answered
+  from the resolver's cache while the result is still within its TTL or
+  negative TTL. An answer is cached only for what remains of its TTL.
 
 ### Fixed
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
