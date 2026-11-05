@@ -1540,7 +1540,7 @@ async fn removed_pod_close_ack_follows_pod_sync_not_health_readiness() {
     let run = run_with_node_agent_topology_outcome_stream_for_test(
         &mut backend,
         &config,
-        metrics.clone(),
+        metrics,
         &shutdown_tx,
         startup_ready.clone(),
         None,

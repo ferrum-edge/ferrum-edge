@@ -2309,10 +2309,17 @@ where
         };
         configure_cni_ownership_store(Some(ownership_store_path));
         if let Err(error) = rehydrate_cni_owned_attachments(&pod_states) {
-            error!(
-                error = %crate::startup::sanitize_startup_scalar(&error),
-                "Failed to rehydrate durable Ferrum CNI ownership; CNI ADD, GC, and STATUS will fail closed"
-            );
+            if cni_ownership_store_state().load_is_retryable() {
+                warn!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Durable Ferrum CNI ownership state is unavailable; CNI ADD, GC, and STATUS fail closed and the load is retried before each CNI request"
+                );
+            } else {
+                error!(
+                    error = %crate::startup::sanitize_startup_scalar(&error),
+                    "Durable Ferrum CNI ownership state rejected; CNI ADD, GC, and STATUS fail closed until the store is repaired and the node-agent restarts"
+                );
+            }
         }
         Some(spawn_cni_listener(
             cni_config.socket_path.clone(),
@@ -3622,10 +3629,21 @@ fn retry_transient_cni_ownership_load(pod_states: &DashMap<String, PodAttachment
     if !cni_ownership_store_state().load_is_retryable() {
         return;
     }
-    if rehydrate_cni_owned_attachments(pod_states).is_ok() {
-        info!(
+    // Warn only on a state change: recovery, or content now rejected. A load
+    // that stays unavailable was already reported at startup and repeats on
+    // every CNI request, so it is debug-level here.
+    match rehydrate_cni_owned_attachments(pod_states) {
+        Ok(()) => info!(
             "Durable Ferrum CNI ownership state loaded after a transient failure; CNI ADD, GC, and STATUS resume"
-        );
+        ),
+        Err(error) if cni_ownership_store_state().load_is_retryable() => debug!(
+            error = %crate::startup::sanitize_startup_scalar(&error),
+            "Durable Ferrum CNI ownership state is still unavailable; CNI ADD, GC, and STATUS remain fail-closed"
+        ),
+        Err(error) => warn!(
+            error = %crate::startup::sanitize_startup_scalar(&error),
+            "Durable Ferrum CNI ownership state rejected on retry; CNI ADD, GC, and STATUS fail closed until the store is repaired and the node-agent restarts"
+        ),
     }
 }
 
@@ -4973,20 +4991,10 @@ fn rehydrate_cni_owned_attachments(
     let records = match load_configured_cni_ownership() {
         Ok(None) => return Ok(()),
         Ok(Some(records)) => records,
-        Err(err) => {
-            if err.is_transient() {
-                warn!(
-                    error = %crate::startup::sanitize_startup_scalar(&err),
-                    "Durable Ferrum CNI ownership state is unavailable; CNI ADD, GC, and STATUS fail closed and the load is retried on the next CNI request"
-                );
-            } else {
-                warn!(
-                    error = %crate::startup::sanitize_startup_scalar(&err),
-                    "Durable Ferrum CNI ownership state rejected; CNI ADD, GC, and STATUS fail closed until the store is repaired and the node-agent restarts"
-                );
-            }
-            return Err(err.to_string());
-        }
+        // Callers log: startup once, and the transient retry only when the
+        // store changes state, so a persistent failure is not logged per
+        // CNI request.
+        Err(err) => return Err(err.to_string()),
     };
     let prefix = pod_state_key_prefix(pod_states);
     // Drop only this generation's keys before installing durable records.
@@ -17287,6 +17295,86 @@ mod tests {
             assert_eq!(readiness.udp_proof, UdpRegistryProof::Withheld);
             assert!(!readiness.startup_ready.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn udp_registry_proof_transition_table() {
+        use UdpRegistryProof::{NotRequired, Published, RetractionPending, Withheld};
+        use UdpRegistryProofEvent::{Absent, PublicationDeclined, RetractionFailed};
+        let published = UdpRegistryProofEvent::Published;
+        for (from, event, to) in [
+            (NotRequired, Absent, NotRequired),
+            (NotRequired, PublicationDeclined, NotRequired),
+            (NotRequired, published, NotRequired),
+            (NotRequired, RetractionFailed, NotRequired),
+            (Withheld, Absent, Withheld),
+            (Withheld, PublicationDeclined, Withheld),
+            (Withheld, published, Published),
+            (Withheld, RetractionFailed, RetractionPending),
+            (Published, Absent, Withheld),
+            (Published, PublicationDeclined, RetractionPending),
+            (Published, published, Published),
+            (Published, RetractionFailed, RetractionPending),
+            (RetractionPending, Absent, Withheld),
+            (RetractionPending, PublicationDeclined, RetractionPending),
+            (RetractionPending, published, Published),
+            (RetractionPending, RetractionFailed, RetractionPending),
+        ] {
+            assert_eq!(from.transition(event), to, "{from:?} --{event:?}-->");
+        }
+    }
+
+    /// Without a migration generation the marker never gates readiness or
+    /// mutations. On the base, the node-identity refresh's failed marker clear
+    /// still set `retraction_pending`: `/health` was withdrawn and the pod
+    /// event arm (gated on that flag) stalled for good, because the retry
+    /// lane returned early for a missing generation without clearing it.
+    #[test]
+    fn udp_proof_failures_without_a_migration_generation_keep_readiness_and_pod_events() {
+        let registry = tempfile::tempdir().unwrap();
+        // A directory at the marker path makes every clear attempt fail.
+        std::fs::create_dir(registry.path().join(".udp-registry-synced")).unwrap();
+        let config = NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config: CaptureConfig::explicit(15006, 15001),
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/nonexistent".to_string(),
+            fallback_mode: FallbackMode::Fail,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+        };
+        let mut readiness = synced_readiness_with_udp_proof(UdpRegistryProof::for_generation(None));
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(readiness.publish());
+
+        // The identity-refresh closure records exactly this event when its
+        // marker clear fails.
+        readiness.record_udp_proof(UdpRegistryProofEvent::RetractionFailed);
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(
+            !readiness.udp_proof.retraction_pending(),
+            "the pod event arm and retraction retry are gated on a pending retraction"
+        );
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
+
+        // Every mutation lane proceeds without touching the marker.
+        for mutation_requires_refresh in [false, true] {
+            assert!(
+                !retract_udp_migration_registry_sync_for_mutation(
+                    mutation_requires_refresh,
+                    &config,
+                    &mut readiness,
+                    UdpRegistryMutationLane::WatchApply,
+                )
+                .expect("no generation means no marker fence"),
+                "no generation means nothing to republish"
+            );
+        }
+        assert_eq!(readiness.udp_proof, UdpRegistryProof::NotRequired);
+        assert!(readiness.startup_ready.load(Ordering::Acquire));
+        assert!(registry.path().join(".udp-registry-synced").is_dir());
     }
 
     #[test]

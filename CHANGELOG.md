@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
+  Any load error for the node-agent's durable CNI ownership file used to latch
+  one "rejected" flag: every CNI ADD for an enrolled pod then failed its GC
+  ownership claim while STATUS kept answering `Ok`, so the install
+  rollback-watch treated the node as Ready. STATUS now fails (CNI error 50)
+  while the store is unavailable or rejected. A filesystem I/O failure while
+  loading is retried before each CNI request and recovers without a restart;
+  malformed or invalid content stays rejected until the file is repaired and
+  the node-agent restarts.
+- **Node-agent readiness stays withdrawn while an Ambient UDP registry proof
+  retraction is pending** (#7024). A failed retraction of a published
+  `.udp-registry-synced` marker left the proof counted as published, so the
+  next ingress-topology outcome re-advertised `/health` ready while pod events
+  were stalled behind the retraction fence. Readiness is now derived from pod
+  sync, topology and proof state in one place; a pending retraction never
+  counts as proof, and CNI ADD/CHECK/STATUS are refused until it succeeds.
+  Without a migration generation, a node-identity refresh no longer withdraws
+  `/health`, and a failed marker clear no longer stalls pod events.
+- **Removed pods' Ambient UDP close requests are answered once pod sync
+  completes** (#7024). The node-agent answered close requests and reaped
+  orphaned handshake markers only when `/health` was ready, so an unproved
+  ingress topology or a withheld migration proof left producers for removed
+  pods waiting. Both now depend only on the completed pod relist.
+
 ## [0.9.20] - 2026-11-02
 
 This patch release follows published 0.9.19. It was published on 2026-11-03
