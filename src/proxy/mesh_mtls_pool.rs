@@ -680,6 +680,10 @@ pub struct MeshMtlsConnectionPool {
     /// Never-waiting budget for detached growth dials, shared by every key:
     /// bounds how many run at once across destinations.
     background_growth: BackgroundCreateBudget,
+    /// Growth dials that have finished, published or failed and backed off.
+    /// Read only by tests, which have no other way to know a detached dial
+    /// is done.
+    growth_attempts_finished: AtomicUsize,
     /// The `Arc` this pool lives in, set by
     /// [`MeshMtlsConnectionPool::into_shared`] so a growth dial can run on a
     /// detached task that owns the pool. Unset for a pool used by value
@@ -789,6 +793,7 @@ impl MeshMtlsConnectionPool {
             entries: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
             background_growth: BackgroundCreateBudget::new(),
+            growth_attempts_finished: AtomicUsize::new(0),
             self_handle: OnceLock::new(),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
@@ -821,6 +826,15 @@ impl MeshMtlsConnectionPool {
         let pool = Arc::new(self);
         let _ = pool.self_handle.set(Arc::downgrade(&pool));
         pool
+    }
+
+    /// Pressure-growth dials that have run to completion (pooled, refused,
+    /// failed, or timed out), counted after the backoff is recorded and the
+    /// creation lock released. Lets tests wait for a detached dial instead of
+    /// racing it.
+    #[doc(hidden)]
+    pub fn growth_attempts_finished_for_test(&self) -> usize {
+        self.growth_attempts_finished.load(Ordering::Acquire)
     }
 
     fn trust_registry(&self) -> Option<&Arc<MeshTrustRegistry>> {
@@ -1719,7 +1733,6 @@ impl MeshMtlsConnectionPool {
         max_entries: usize,
         live_connections: usize,
     ) -> Option<MeshMtlsTransport> {
-        let now = unix_secs();
         let effective_connect_timeout_ms =
             self.effective_connect_timeout_ms(proxy, app_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
@@ -1754,10 +1767,12 @@ impl MeshMtlsConnectionPool {
                 Some(transport)
             }
             Err(err) => {
-                // Backed off before the lock is released, so no other caller
-                // can start a second dial for the key in between.
+                // Measured from the failure, not the dial start, so a dial
+                // that used its whole connect timeout still backs off the full
+                // window. Recorded before the lock is released, so no other
+                // caller can start a second dial for the key in between.
                 self.growth_backoff_until
-                    .insert(key.to_string(), now + MESH_MTLS_GROWTH_BACKOFF_SECS);
+                    .insert(key.to_string(), unix_secs() + MESH_MTLS_GROWTH_BACKOFF_SECS);
                 debug!(
                     target_host,
                     mtls_port,
@@ -1769,6 +1784,8 @@ impl MeshMtlsConnectionPool {
             }
         };
         drop(creation_lease);
+        self.growth_attempts_finished
+            .fetch_add(1, Ordering::Release);
         grown
     }
 

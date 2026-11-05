@@ -254,7 +254,8 @@ impl HoldingPeer {
 /// Poll `done` until it holds; growth publishes from a detached task, so
 /// width is asserted by polling rather than right after a checkout.
 async fn wait_until(done: impl Fn() -> bool, what: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Longer than `BLACKHOLED_GROWTH_TIMEOUT_MS`, which one wait spans.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     while !done() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -359,7 +360,12 @@ struct Fixture {
     limiter: Arc<BackendConnectionLimiter>,
 }
 
+/// A pool shared like `ProxyState`'s, so growth runs detached.
 async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
+    fixture_with(width, max_connections, true).await
+}
+
+async fn fixture_with(width: usize, max_connections: Option<u32>, shared: bool) -> Fixture {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let td = TrustDomain::new("cluster.local").unwrap();
     let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
@@ -380,14 +386,18 @@ async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
         http2_connections_per_host: width,
         ..PoolConfig::default()
     };
-    // Shared like `ProxyState`'s pool, so growth runs detached.
     let pool = MeshMtlsConnectionPool::new(
         pool_config,
         DnsCache::new(DnsConfig::default()),
         gateway_slot,
         4,
-    )
-    .into_shared();
+    );
+    // `Arc::new` alone records no self handle: that pool grows inline.
+    let pool = if shared {
+        pool.into_shared()
+    } else {
+        Arc::new(pool)
+    };
     let limiter = Arc::new(BackendConnectionLimiter::new());
     pool.attach_backend_conn_limit(Arc::clone(&limiter));
     Fixture {
@@ -425,6 +435,16 @@ impl Fixture {
 
     async fn wait_for_pool_size(&self, expected: usize) {
         wait_until(|| self.pool.pool_size() == expected, "pool width").await;
+    }
+
+    /// Wait until `expected` growth dials have finished (pooled, refused, or
+    /// failed and backed off), so assertions never race a detached dial.
+    async fn wait_for_growth_attempts(&self, expected: usize) {
+        wait_until(
+            || self.pool.growth_attempts_finished_for_test() == expected,
+            "finished growth dials",
+        )
+        .await;
     }
 }
 
@@ -624,6 +644,10 @@ async fn growth_never_bypasses_destination_rule_max_connections() {
 
     let parked = park(&fixture, threshold).await;
     let served = fixture.checkout().await;
+    // The growth dial is detached: wait for its admission verdict before
+    // judging it. A dial that bypassed the cap would have connected (and been
+    // pooled) by now.
+    fixture.wait_for_growth_attempts(1).await;
     assert_eq!(
         fixture.pool.pool_size(),
         1,
@@ -637,6 +661,11 @@ async fn growth_never_bypasses_destination_rule_max_connections() {
     // Later pressured checkouts stay on the existing connection too (backoff
     // after the refusal), and the requests themselves keep working.
     let _ = fixture.checkout().await;
+    assert_eq!(
+        fixture.pool.growth_attempts_finished_for_test(),
+        1,
+        "the refusal backed the key off"
+    );
     assert_eq!(fixture.pool.pool_size(), 1);
     assert_eq!(
         fixture.peer.accepted(),
@@ -662,6 +691,8 @@ async fn uncapped_connections_are_counted_when_a_cap_is_applied_later() {
     let mut parked = park(&fixture, threshold).await;
     let _ = fixture.checkout().await;
     fixture.wait_for_pool_size(2).await;
+    // The grower releases the key's creation lock just after publishing.
+    fixture.wait_for_growth_attempts(1).await;
     for _ in 0..threshold {
         parked.push(dispatch(&fixture).await);
     }
@@ -671,11 +702,14 @@ async fn uncapped_connections_are_counted_when_a_cap_is_applied_later() {
 
     fixture.proxy = proxy_for_test(Some(1));
     let _ = fixture.checkout().await;
+    // Judge the detached third dial only once its admission has run.
+    fixture.wait_for_growth_attempts(2).await;
     assert_eq!(
         fixture.peer.accepted(),
         2,
         "the newly applied cap must observe uncapped resident connections"
     );
+    assert_eq!(fixture.pool.pool_size(), 2);
 
     fixture.peer.release_all();
     for (_, future) in parked {
@@ -695,6 +729,7 @@ async fn failed_growth_dial_keeps_serving_on_the_existing_connection() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (sender, future) = dispatch(&fixture).await;
+    fixture.wait_for_growth_attempts(1).await;
     assert_eq!(
         fixture.pool.pool_size(),
         1,
@@ -713,19 +748,24 @@ async fn failed_growth_dial_keeps_serving_on_the_existing_connection() {
     }
 }
 
+/// At least `MESH_MTLS_GROWTH_BACKOFF_SECS` (10 s), so a backoff measured from
+/// the dial's start instead of its failure would already have expired.
+const BLACKHOLED_GROWTH_TIMEOUT_MS: u64 = 11_000;
+
 /// Pool growth never makes a request wait for the dial (EDGE-DP-2). Against a
 /// peer that blackholes new connections, the old inline growth held the
 /// pressured checkout for the whole connect timeout before falling back to
-/// the connection it already had.
+/// the connection it already had. The connect timeout outlasts the 10 s
+/// growth backoff, which must therefore be measured from the dial's failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn pressured_checkout_never_waits_for_a_blackholed_growth_dial() {
     let mut fixture = fixture(4, None).await;
-    fixture.proxy.backend_connect_timeout_ms = 2_000;
+    fixture.proxy.backend_connect_timeout_ms = BLACKHOLED_GROWTH_TIMEOUT_MS;
     let threshold = MESH_MTLS_GROWTH_PENDING_PER_CONNECTION;
     let mut parked = park(&fixture, threshold).await;
     fixture.peer.blackhole_new_connections(true);
 
-    // Well inside the 2 s connect timeout the growth dial is stuck in.
+    // Well inside the connect timeout the growth dial is stuck in.
     let mut served = fixture.checkout_within(Duration::from_millis(1_000)).await;
     assert_eq!(
         served.pending_requests(),
@@ -748,14 +788,44 @@ async fn pressured_checkout_never_waits_for_a_blackholed_growth_dial() {
     );
 
     // The dial gives up at its own connect timeout. The failure reaches no
-    // request, adds no connection, and backs the key off: with the peer
-    // healthy again, a pressured checkout still dials nothing.
+    // request, adds no connection, and backs the key off for the full window
+    // from that failure: with the peer healthy again, a pressured checkout
+    // still dials nothing.
+    fixture.wait_for_growth_attempts(1).await;
     fixture.peer.wait_for_blackholed_closed(1).await;
     fixture.peer.blackhole_new_connections(false);
     let _ = fixture.checkout().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(fixture.peer.accepted(), 2, "a failed growth dial backs off");
+    assert_eq!(fixture.pool.growth_attempts_finished_for_test(), 1);
     assert_eq!(fixture.pool.pool_size(), 1);
+
+    fixture.peer.release_all();
+    for (_, future) in parked {
+        expect_ok(future).await;
+    }
+}
+
+/// A pool used by value has no `Arc` a detached task could own, so it keeps
+/// the inline growth: the pressured checkout dials and is served on the new
+/// connection before it returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn by_value_pool_grows_inline_and_serves_the_trigger_on_the_new_connection() {
+    let fixture = fixture_with(2, None, false).await;
+    let threshold = MESH_MTLS_GROWTH_PENDING_PER_CONNECTION;
+    let parked = park(&fixture, threshold).await;
+    assert_eq!(fixture.peer.accepted(), 1);
+
+    let grown = fixture.checkout().await;
+    // No polling: the dial finished inside the checkout.
+    assert_eq!(fixture.pool.growth_attempts_finished_for_test(), 1);
+    assert_eq!(fixture.pool.pool_size(), 2);
+    assert_eq!(fixture.peer.accepted(), 2);
+    assert_eq!(
+        grown.pending_requests(),
+        0,
+        "the checkout that grew the pool is served on the new connection"
+    );
 
     fixture.peer.release_all();
     for (_, future) in parked {

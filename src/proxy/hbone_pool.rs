@@ -833,6 +833,10 @@ pub struct HboneConnectionPool {
     /// Never-waiting budget for detached growth dials, shared by every key:
     /// bounds how many run at once across destinations.
     background_growth: BackgroundCreateBudget,
+    /// Growth dials that have finished, published or failed and backed off.
+    /// Read only by tests, which have no other way to know a detached dial
+    /// is done.
+    growth_attempts_finished: AtomicUsize,
     /// The `Arc` this pool lives in, set by [`HboneConnectionPool::into_shared`]
     /// so a growth dial can run on a detached task that owns the pool. Unset
     /// for a pool used by value (focused tests, standalone callers), which
@@ -995,6 +999,7 @@ impl HboneConnectionPool {
             creation_locks: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
             background_growth: BackgroundCreateBudget::new(),
+            growth_attempts_finished: AtomicUsize::new(0),
             self_handle: OnceLock::new(),
             gateway_svid,
             crls,
@@ -1022,6 +1027,15 @@ impl HboneConnectionPool {
         let pool = Arc::new(self);
         let _ = pool.self_handle.set(Arc::downgrade(&pool));
         pool
+    }
+
+    /// Pressure-growth dials that have run to completion (pooled, refused,
+    /// failed, or timed out), counted after the backoff is recorded and the
+    /// creation lock released. Lets tests wait for a detached dial instead of
+    /// racing it.
+    #[doc(hidden)]
+    pub fn growth_attempts_finished_for_test(&self) -> usize {
+        self.growth_attempts_finished.load(Ordering::Acquire)
     }
 
     /// Install the published request epoch so inner leases can be keyed by the
@@ -2224,7 +2238,6 @@ impl HboneConnectionPool {
         live_connections: usize,
         connect_timeout: Duration,
     ) -> Option<MeshH2Transport> {
-        let now = unix_secs();
         let effective_connect_timeout_ms = connect_timeout.as_millis().min(u64::MAX as u128) as u64;
         let dialed = self
             .dial_and_publish(
@@ -2260,10 +2273,12 @@ impl HboneConnectionPool {
                 Some(transport)
             }
             Err(err) => {
-                // Backed off before the lock is released, so no other caller
-                // can start a second dial for the key in between.
+                // Measured from the failure, not the dial start, so a dial
+                // that used its whole connect timeout still backs off the full
+                // window. Recorded before the lock is released, so no other
+                // caller can start a second dial for the key in between.
                 self.growth_backoff_until
-                    .insert(key.to_string(), now + HBONE_GROWTH_BACKOFF_SECS);
+                    .insert(key.to_string(), unix_secs() + HBONE_GROWTH_BACKOFF_SECS);
                 debug!(
                     dial_host,
                     app_host,
@@ -2276,6 +2291,8 @@ impl HboneConnectionPool {
             }
         };
         drop(creation_lease);
+        self.growth_attempts_finished
+            .fetch_add(1, Ordering::Release);
         grown
     }
 
