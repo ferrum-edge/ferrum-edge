@@ -128,6 +128,24 @@ impl CniOwnershipStoreError {
             Self::InvalidRecord => "cni ownership store contains an invalid record",
         }
     }
+
+    /// Whether a load that failed with this error may succeed on retry without
+    /// operator repair. Only a failed filesystem operation is transient; every
+    /// other variant classifies the durable file's location, shape, or content,
+    /// which re-reading cannot change.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Io => true,
+            Self::Path
+            | Self::Symlink
+            | Self::NotRegular
+            | Self::Oversized
+            | Self::TruncatedOrInvalid
+            | Self::UnsupportedVersion
+            | Self::TooManyAttachments
+            | Self::InvalidRecord => false,
+        }
+    }
 }
 
 impl std::fmt::Display for CniOwnershipStoreError {
@@ -444,22 +462,115 @@ pub fn store_durable_cni_ownership(
         .map_err(|_| CniOwnershipStoreError::Io)
 }
 
-/// Process-global durable store configuration and load fence for the live
+/// Lifecycle of the process-global durable ownership store for the live
 /// node-agent CNI generation.
-#[derive(Debug, Default)]
-struct CniOwnershipRuntime {
-    path: Option<PathBuf>,
-    /// `true` when the configured durable state was rejected; GC must fail
-    /// closed without sweeping.
-    rejected: bool,
+///
+/// ```text
+/// configure(None) ──▶ Disabled
+/// configure(Some) ──▶ Configured ──load ok──────────────▶ Loaded
+///                         │      ──load, transient I/O──▶ Unavailable ──load──▶ Loaded | Unavailable | Rejected
+///                         └──────load, invalid content──▶ Rejected (never re-read)
+/// ```
+///
+/// Only `Disabled`, `Configured`, and `Loaded` admit ownership claims, GC, and
+/// CNI STATUS ([`Self::refusal`]). `Configured` exists only between
+/// configuration and the startup rehydrate that immediately follows it.
+/// `Unavailable` keeps the load retryable; `Rejected` means the durable file
+/// itself is invalid, so only operator repair plus a node-agent restart (which
+/// reconfigures the store) can clear it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CniOwnershipStoreState {
+    /// Durable persistence is disabled (in-memory ownership only).
+    Disabled,
+    /// A durable path is configured but has not been loaded yet.
+    Configured { path: PathBuf },
+    /// The durable state at `path` was loaded and is authoritative.
+    Loaded { path: PathBuf },
+    /// The last load failed on a filesystem operation; a later load may succeed.
+    Unavailable {
+        path: PathBuf,
+        error: CniOwnershipStoreError,
+    },
+    /// The durable state's shape or content was rejected.
+    Rejected {
+        path: PathBuf,
+        error: CniOwnershipStoreError,
+    },
 }
 
-static CNI_OWNERSHIP_RUNTIME: Mutex<CniOwnershipRuntime> = Mutex::new(CniOwnershipRuntime {
-    path: None,
-    rejected: false,
-});
+impl CniOwnershipStoreState {
+    /// Configured durable path, if any.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Disabled => None,
+            Self::Configured { path }
+            | Self::Loaded { path }
+            | Self::Unavailable { path, .. }
+            | Self::Rejected { path, .. } => Some(path.as_path()),
+        }
+    }
 
-fn lock_runtime() -> std::sync::MutexGuard<'static, CniOwnershipRuntime> {
+    /// Sanitized reason this store refuses ownership claims, GC, and STATUS,
+    /// or `None` when it admits them. Never carries the path or file content.
+    pub fn refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::Disabled | Self::Configured { .. } | Self::Loaded { .. } => None,
+            Self::Unavailable { .. } => Some("unavailable"),
+            Self::Rejected { .. } => Some("rejected"),
+        }
+    }
+
+    /// Whether a later load may leave this state without operator repair.
+    pub fn load_is_retryable(&self) -> bool {
+        match self {
+            Self::Unavailable { .. } => true,
+            Self::Disabled
+            | Self::Configured { .. }
+            | Self::Loaded { .. }
+            | Self::Rejected { .. } => false,
+        }
+    }
+
+    /// The load transition. Reads the configured durable file and returns the
+    /// next state with the load outcome: `Ok(None)` when durability is
+    /// disabled, `Ok(Some(records))` on success (a missing file is empty),
+    /// `Unavailable` on a transient I/O error, and `Rejected` on invalid shape
+    /// or content. A `Rejected` store is never re-read.
+    pub fn load(&self) -> (Self, CniOwnershipLoad) {
+        let path = match self {
+            Self::Disabled => return (Self::Disabled, Ok(None)),
+            Self::Rejected { error, .. } => return (self.clone(), Err(error.clone())),
+            Self::Configured { path } | Self::Loaded { path } | Self::Unavailable { path, .. } => {
+                path.clone()
+            }
+        };
+        match load_durable_cni_ownership(&path) {
+            Ok(records) => (Self::Loaded { path }, Ok(Some(records))),
+            Err(error) if error.is_transient() => (
+                Self::Unavailable {
+                    path,
+                    error: error.clone(),
+                },
+                Err(error),
+            ),
+            Err(error) => (
+                Self::Rejected {
+                    path,
+                    error: error.clone(),
+                },
+                Err(error),
+            ),
+        }
+    }
+}
+
+/// Outcome of [`CniOwnershipStoreState::load`].
+pub type CniOwnershipLoad = Result<Option<Vec<DurableCniOwnershipRecord>>, CniOwnershipStoreError>;
+
+static CNI_OWNERSHIP_RUNTIME: Mutex<CniOwnershipStoreState> =
+    Mutex::new(CniOwnershipStoreState::Disabled);
+
+fn lock_runtime() -> std::sync::MutexGuard<'static, CniOwnershipStoreState> {
     CNI_OWNERSHIP_RUNTIME
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -468,62 +579,52 @@ fn lock_runtime() -> std::sync::MutexGuard<'static, CniOwnershipRuntime> {
 /// Configure the durable ownership path for this node-agent CNI generation.
 ///
 /// Passing `None` disables durable persistence (in-memory ownership only). Used
-/// by production startup and tests; resets the load fence.
+/// by production startup and tests; discards any previous load outcome.
 pub fn configure_cni_ownership_store(path: Option<PathBuf>) {
-    let mut runtime = lock_runtime();
-    runtime.path = path;
-    runtime.rejected = false;
+    *lock_runtime() = match path {
+        Some(path) => CniOwnershipStoreState::Configured { path },
+        None => CniOwnershipStoreState::Disabled,
+    };
 }
 
 /// Test/helper: current configured durable path.
 #[cfg(test)]
 #[allow(dead_code)]
 pub fn configured_cni_ownership_store_path() -> Option<PathBuf> {
-    lock_runtime().path.clone()
+    lock_runtime().path().map(Path::to_path_buf)
 }
 
-/// Whether durable state was rejected for the current configuration.
-pub fn cni_ownership_store_is_rejected() -> bool {
-    lock_runtime().rejected
+/// Snapshot of the durable store lifecycle for the current configuration.
+pub fn cni_ownership_store_state() -> CniOwnershipStoreState {
+    lock_runtime().clone()
 }
 
-/// Load durable records for the configured path, updating the load fence.
-///
-/// Returns `Ok(None)` when durability is disabled. Returns `Ok(Some(records))`
-/// on a successful load (including missing-file empty). Returns `Err` after
-/// marking the store rejected so GC fails closed.
-pub fn load_configured_cni_ownership()
--> Result<Option<Vec<DurableCniOwnershipRecord>>, CniOwnershipStoreError> {
+/// Load durable records for the configured path and advance the process-global
+/// store state through [`CniOwnershipStoreState::load`]. Either error makes
+/// claims, GC, and STATUS fail closed.
+pub fn load_configured_cni_ownership() -> CniOwnershipLoad {
     let mut runtime = lock_runtime();
-    let Some(path) = runtime.path.clone() else {
-        runtime.rejected = false;
-        return Ok(None);
-    };
-    match load_durable_cni_ownership(&path) {
-        Ok(records) => {
-            runtime.rejected = false;
-            Ok(Some(records))
-        }
-        Err(err) => {
-            runtime.rejected = true;
-            Err(err)
-        }
-    }
+    let (next, outcome) = runtime.load();
+    *runtime = next;
+    outcome
 }
 
 /// Persist `records` to the configured path. No-op success when durability is
-/// disabled. Fails closed without mutating the rejection fence on I/O errors
-/// (callers retain in-memory ownership and retry).
+/// disabled. Refuses with the load error while the store is unavailable or
+/// rejected; a failed write leaves the store state unchanged (callers retain
+/// in-memory ownership and retry).
 pub fn persist_configured_cni_ownership(
     records: &[DurableCniOwnershipRecord],
 ) -> Result<(), CniOwnershipStoreError> {
     let runtime = lock_runtime();
-    let Some(path) = runtime.path.as_ref() else {
-        return Ok(());
+    let path = match &*runtime {
+        CniOwnershipStoreState::Disabled => return Ok(()),
+        CniOwnershipStoreState::Configured { path } | CniOwnershipStoreState::Loaded { path } => {
+            path
+        }
+        CniOwnershipStoreState::Unavailable { error, .. }
+        | CniOwnershipStoreState::Rejected { error, .. } => return Err(error.clone()),
     };
-    if runtime.rejected {
-        return Err(CniOwnershipStoreError::TruncatedOrInvalid);
-    }
     store_durable_cni_ownership(path, records)
 }
 

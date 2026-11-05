@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use ferrum_edge::cni::ownership::{
     CNI_OWNERSHIP_STORE_FILENAME_PREFIX, CNI_OWNERSHIP_STORE_FILENAME_SUFFIX,
-    DurableCniCleanupSnapshot, DurableCniOwnershipRecord, MAX_CNI_OWNERSHIP_STORE_BYTES,
-    configure_cni_ownership_store, load_durable_cni_ownership, ownership_store_id_for_socket,
-    ownership_store_path_for_socket, parse_durable_cni_ownership_bytes,
-    reset_cni_ownership_store_for_tests, store_durable_cni_ownership,
+    CniOwnershipStoreError, CniOwnershipStoreState, DurableCniCleanupSnapshot,
+    DurableCniOwnershipRecord, MAX_CNI_OWNERSHIP_STORE_BYTES, configure_cni_ownership_store,
+    load_durable_cni_ownership, ownership_store_id_for_socket, ownership_store_path_for_socket,
+    parse_durable_cni_ownership_bytes, reset_cni_ownership_store_for_tests,
+    store_durable_cni_ownership,
 };
 use ferrum_edge::cni::spec::MAX_CNI_ATTACHMENT_FIELD_BYTES;
 
@@ -304,4 +305,134 @@ fn oversized_existing_store_is_rejected_before_replacement() {
         (MAX_CNI_OWNERSHIP_STORE_BYTES + 1) as u64,
         "rejected prior state must not be replaced"
     );
+}
+
+// ── Store lifecycle (explicit-state audit C3) ──────────────────────────────
+//
+// These drive the pure `CniOwnershipStoreState::load` transition, not the
+// process-global store, so concurrently running node-agent loop tests in this
+// binary (which reconfigure the global store) cannot perturb them. STATUS
+// wiring against the global store is covered in `tests/integration/cni_tests.rs`.
+
+#[test]
+fn only_filesystem_io_failures_are_transient_ownership_load_errors() {
+    for (error, transient) in [
+        (CniOwnershipStoreError::Io, true),
+        (CniOwnershipStoreError::Path, false),
+        (CniOwnershipStoreError::Symlink, false),
+        (CniOwnershipStoreError::NotRegular, false),
+        (CniOwnershipStoreError::Oversized, false),
+        (CniOwnershipStoreError::TruncatedOrInvalid, false),
+        (CniOwnershipStoreError::UnsupportedVersion, false),
+        (CniOwnershipStoreError::TooManyAttachments, false),
+        (CniOwnershipStoreError::InvalidRecord, false),
+    ] {
+        assert_eq!(error.is_transient(), transient, "{error:?}");
+    }
+}
+
+#[test]
+fn ownership_store_refusal_covers_exactly_the_failed_load_states() {
+    let path = PathBuf::from("/var/run/ferrum/cni-owned-attachments.test.v2");
+    let cases = [
+        (CniOwnershipStoreState::Disabled, None, false),
+        (
+            CniOwnershipStoreState::Configured { path: path.clone() },
+            None,
+            false,
+        ),
+        (
+            CniOwnershipStoreState::Loaded { path: path.clone() },
+            None,
+            false,
+        ),
+        (
+            CniOwnershipStoreState::Unavailable {
+                path: path.clone(),
+                error: CniOwnershipStoreError::Io,
+            },
+            Some("unavailable"),
+            true,
+        ),
+        (
+            CniOwnershipStoreState::Rejected {
+                path,
+                error: CniOwnershipStoreError::TruncatedOrInvalid,
+            },
+            Some("rejected"),
+            false,
+        ),
+    ];
+    for (state, refusal, retryable) in cases {
+        assert_eq!(state.refusal(), refusal, "{state:?}");
+        assert_eq!(state.load_is_retryable(), retryable, "{state:?}");
+    }
+    assert_eq!(
+        CniOwnershipStoreState::Disabled.load(),
+        (CniOwnershipStoreState::Disabled, Ok(None)),
+    );
+}
+
+/// Before C3 any load error latched one `rejected` flag, so a transient read
+/// failure was as terminal as corrupt content. A filesystem failure now leaves
+/// the store `Unavailable` and a later load recovers without a restart.
+#[cfg(unix)]
+#[test]
+fn transient_ownership_load_failure_is_retryable_until_the_store_loads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A regular file where the parent directory should be makes the open fail
+    // with ENOTDIR (an I/O error, deterministic even as root).
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, b"").expect("seed blocker file");
+    let path = blocker.join("cni-owned-attachments.test.v2");
+
+    let (state, outcome) = CniOwnershipStoreState::Configured { path: path.clone() }.load();
+    assert_eq!(outcome, Err(CniOwnershipStoreError::Io));
+    assert_eq!(
+        state,
+        CniOwnershipStoreState::Unavailable {
+            path: path.clone(),
+            error: CniOwnershipStoreError::Io,
+        }
+    );
+    assert_eq!(state.refusal(), Some("unavailable"));
+    assert!(state.load_is_retryable());
+
+    let (state, outcome) = state.load();
+    assert!(
+        matches!(state, CniOwnershipStoreState::Unavailable { .. }),
+        "an unrepaired transient failure stays retryable: {state:?}"
+    );
+    assert!(outcome.is_err());
+
+    std::fs::remove_file(&blocker).expect("remove blocker");
+    std::fs::create_dir(&blocker).expect("restore parent directory");
+    let (state, outcome) = state.load();
+    assert_eq!(outcome, Ok(Some(Vec::new())));
+    assert_eq!(state, CniOwnershipStoreState::Loaded { path });
+    assert_eq!(state.refusal(), None);
+}
+
+/// Invalid content is terminal for the configured generation: even a repaired
+/// file is not re-read until the store is reconfigured (node-agent restart).
+#[test]
+fn rejected_ownership_content_is_terminal_until_reconfigured() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cni-owned-attachments.test.v2");
+    std::fs::write(&path, b"{not json").expect("seed corrupt store");
+
+    let (state, outcome) = CniOwnershipStoreState::Configured { path: path.clone() }.load();
+    assert_eq!(outcome, Err(CniOwnershipStoreError::TruncatedOrInvalid));
+    assert!(matches!(state, CniOwnershipStoreState::Rejected { .. }));
+    assert_eq!(state.refusal(), Some("rejected"));
+    assert!(!state.load_is_retryable());
+
+    store_durable_cni_ownership(&path, &[]).expect("operator repair");
+    let (still, outcome) = state.load();
+    assert_eq!(still, state, "a rejected store is never re-read");
+    assert_eq!(outcome, Err(CniOwnershipStoreError::TruncatedOrInvalid));
+
+    let (reconfigured, outcome) = CniOwnershipStoreState::Configured { path: path.clone() }.load();
+    assert_eq!(outcome, Ok(Some(Vec::new())));
+    assert_eq!(reconfigured, CniOwnershipStoreState::Loaded { path });
 }

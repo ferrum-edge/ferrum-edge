@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -36,6 +36,10 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::cni::client::send_rpc;
+use ferrum_edge::cni::ownership::{
+    configure_cni_ownership_store, load_configured_cni_ownership,
+    reset_cni_ownership_store_for_tests, store_durable_cni_ownership,
+};
 use ferrum_edge::cni::rpc::{CniRpcRequest, CniRpcResponse, RpcVerb};
 use ferrum_edge::ebpf::{
     CaptureContract, FallbackMode, MockEbpfBackend, NodeAgentMetrics, PodAttachmentState,
@@ -1445,7 +1449,20 @@ fn assert_sanitized_status_error(response: &CniRpcResponse) {
     );
 }
 
+/// STATUS consults the process-global durable CNI ownership store. Tests that
+/// expect STATUS success, or that drive that store, serialize on this lock so a
+/// parallel test cannot leave it refusing (or admitting) mid-assertion.
+static CNI_OWNERSHIP_STORE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn run_status_with_client(
+    kube_client: &Client,
+) -> (CniRpcResponse, DashMap<String, PodAttachmentState>) {
+    let _ownership_store = CNI_OWNERSHIP_STORE_LOCK.lock().await;
+    run_status_with_client_holding_store_lock(kube_client).await
+}
+
+async fn run_status_with_client_holding_store_lock(
     kube_client: &Client,
 ) -> (CniRpcResponse, DashMap<String, PodAttachmentState>) {
     let mut backend = MockEbpfBackend::default();
@@ -1579,6 +1596,71 @@ async fn cni_status_kube_dependency_recovers_after_outage() {
     let (second, _) = run_status_with_client(&client).await;
     assert_eq!(second, CniRpcResponse::Ok);
     assert_eq!(state.lock().expect("lock").hits, 2);
+}
+
+fn assert_status_ownership_refusal(response: &CniRpcResponse, refusal: &str) {
+    let CniRpcResponse::Error { reason } = response else {
+        panic!("expected STATUS Error while durable ownership is {refusal}, got {response:?}");
+    };
+    assert!(
+        reason.contains(&format!("durable Ferrum CNI ownership state is {refusal}")),
+        "unexpected STATUS reason: {reason}"
+    );
+    assert!(
+        !reason.contains("cni-owned-attachments") && !reason.contains('/'),
+        "STATUS must not echo the durable store path: {reason}"
+    );
+}
+
+/// Regression (explicit-state audit C3). Any durable ownership load error used
+/// to latch `rejected`, after which every CNI ADD for an enrolled pod failed
+/// its ownership claim while STATUS still answered Ok, so the install
+/// rollback-watch accepted the node as Ready. STATUS now fails closed while the
+/// store refuses claims; a transient I/O failure is retried on the CNI request
+/// path, while rejected content stays terminal until the store is reconfigured.
+#[cfg(unix)]
+#[tokio::test]
+async fn cni_status_fails_closed_while_durable_ownership_refuses_claims() {
+    /// Restores the default (disabled) store even when an assertion fails, so
+    /// later STATUS tests in this binary are not left refused.
+    struct ResetOwnershipStore;
+    impl Drop for ResetOwnershipStore {
+        fn drop(&mut self) {
+            reset_cni_ownership_store_for_tests();
+        }
+    }
+
+    let _ownership_store = CNI_OWNERSHIP_STORE_LOCK.lock().await;
+    let _reset = ResetOwnershipStore;
+    let client = mock_status_probe_client(Arc::new(Mutex::new(MockStatusProbeState::default())));
+    let dir = tempdir().expect("tempdir");
+
+    // Transient: a regular file where the store's parent directory belongs
+    // makes the load fail with ENOTDIR.
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, b"").expect("seed blocker file");
+    configure_cni_ownership_store(Some(blocker.join("cni-owned-attachments.test.v2")));
+    load_configured_cni_ownership().expect_err("startup load fails on a filesystem error");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_status_ownership_refusal(&response, "unavailable");
+
+    // Repairing the filesystem lets the next CNI request reload the store
+    // without a node-agent restart.
+    std::fs::remove_file(&blocker).expect("remove blocker");
+    std::fs::create_dir(&blocker).expect("restore parent directory");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_eq!(response, CniRpcResponse::Ok);
+
+    // Terminal: invalid content is never re-read for this configuration.
+    let corrupt = dir.path().join("cni-owned-attachments.corrupt.v2");
+    std::fs::write(&corrupt, b"{not json").expect("seed corrupt store");
+    configure_cni_ownership_store(Some(corrupt.clone()));
+    load_configured_cni_ownership().expect_err("startup load rejects corrupt content");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_status_ownership_refusal(&response, "rejected");
+    store_durable_cni_ownership(&corrupt, &[]).expect("operator repair");
+    let (response, _) = run_status_with_client_holding_store_lock(&client).await;
+    assert_status_ownership_refusal(&response, "rejected");
 }
 
 /// Install / uninstall / rollback lifecycle for the chained CNI artifacts
