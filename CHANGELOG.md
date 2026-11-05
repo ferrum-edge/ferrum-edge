@@ -67,33 +67,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `redis_failure_policy` handling are unchanged, and an unreadable counter
   still fails the reservation closed. A zero-token reservation charges nothing,
   as before.
-- **`mcp_gateway` request-path session teardown deletes upstream sessions
-  concurrently** (#7035). A client `DELETE` and an expired session presented
-  again used to `DELETE` the session's upstream MCP sessions one server at a
-  time before answering; they now run concurrently, at most 8 in flight per
-  request (the background reaper's bound), so a session spanning N servers
-  costs about ceil(N/8) upstream round trips instead of N. An `initialize`
-  that reclaims sessions used to run one serial loop per reclaimed session,
-  all concurrently and with no overall bound; it now gives the whole reclaimed
-  batch one budget of 8: the first 8 upstream `DELETE`s run before it answers
-  and the rest are handed to the reaper's bounded background cleanup queue
-  (anything the queue cannot take still runs inline under the same bound), so
-  a mass-expiry backlog neither bursts unboundedly nor holds the `initialize`.
-  Queued teardowns are background work: they carry no hop count and are not
-  counted in the request's `latency_plugin_external_io_ms`. Each request-path
-  `DELETE` is also bounded at 10 seconds, like the reaper's: a hung upstream
-  costs a request at most 10 seconds per wave of 8 instead of the plugin HTTP
-  client's 60-second timeout, and a timed-out teardown is logged with its
-  `server_id` and abandoned (best-effort, as before). Failures are still
-  logged and never change the client's answer. The overlapping calls count
-  their wall-clock wait once toward `latency_plugin_external_io_ms` instead of
-  summing each call, including when the client aborts mid-teardown.
-- **A reclaiming `initialize` no longer returns an already-expired session**
-  (#7035). The session `initialize` admits is inserted before it awaits the
-  reclaimed sessions' upstream teardown; when that teardown outlasted
-  `sessions.session_ttl_seconds`, the returned id had already expired (or been
-  reaped) and its first request got `404`. The new session's idle clock now
-  starts when `initialize` returns (or is cancelled).
+- **`mcp_gateway` session `DELETE` and expired-session teardown delete
+  upstream sessions concurrently** (#7035). A client `DELETE` and an expired
+  session presented again used to `DELETE` the session's upstream MCP
+  sessions one server at a time before answering. They now run concurrently,
+  at most 8 in flight per request (the background reaper's bound), so a
+  session spanning N servers costs about ceil(N/8) upstream round trips
+  instead of N. Failures are still logged and never change the client's
+  answer, and the plugin HTTP client's timeout still applies to each call. The
+  overlapping calls count their wall-clock wait once toward
+  `latency_plugin_external_io_ms` instead of summing each call, including when
+  the client aborts mid-teardown. Session reclamation during `initialize` is
+  unchanged. The background reaper's and failed-`initialize` cleanup's timeout
+  warnings now include `server_id`.
 
 ## [0.9.20] - 2026-11-02
 

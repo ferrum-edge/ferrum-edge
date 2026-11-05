@@ -3007,17 +3007,7 @@ impl McpGateway {
                         upstream_sessions,
                         catalog: Arc::clone(&catalog),
                         catalog_refresh_lock: Arc::new(Mutex::new(())),
-                        // While this initialize awaits the reclaimed sessions'
-                        // teardown below, the session it admits must not age
-                        // out before its id is even returned: hold its idle
-                        // clock in the future (expiry and the reaper read
-                        // `last_seen.elapsed()`, which saturates to zero) and
-                        // start it when initialize returns or is cancelled.
-                        last_seen: if evicted.is_empty() {
-                            Instant::now()
-                        } else {
-                            pinned_admission_last_seen()
-                        },
+                        last_seen: Instant::now(),
                     },
                 );
                 self.session_catalogs_by_hash
@@ -3034,17 +3024,17 @@ impl McpGateway {
             evicted
         };
 
-        // Tear down evicted sessions' upstreams outside the lock, so eviction never
-        // serializes new sessions behind upstream DELETE round trips. One bounded
-        // wave runs inline and the rest goes to the reaper's bounded cleanup queue
-        // (see `reclaim_upstream_sessions`). This still runs when broker admission
-        // refused the new session: those sessions are already out of the store.
+        // Tear down evicted sessions' upstreams concurrently, outside the lock, so
+        // eviction never serializes new sessions behind upstream DELETE round trips.
+        // This still runs when broker admission refused the new session: those
+        // sessions are already out of the store either way.
         if !evicted.is_empty() {
-            let _ttl_start = AdmissionTtlStart {
-                session_store: &self.session_store,
-                downstream_session_id: &downstream_session_id,
-            };
-            self.reclaim_upstream_sessions(evicted, ctx).await;
+            futures_util::future::join_all(
+                evicted
+                    .into_iter()
+                    .map(|session| self.delete_upstream_sessions(session, ctx)),
+            )
+            .await;
         }
 
         match sse_admission_error {
@@ -3395,61 +3385,13 @@ impl McpGateway {
     }
 
     /// Issue the upstream `DELETE` for each initialized upstream session of an
-    /// already-removed downstream session, concurrently and bounded (see
-    /// [`delete_upstream_teardowns`]). Failures are logged, not fatal.
+    /// already-removed downstream session. Failures are logged, not fatal.
     async fn delete_upstream_sessions(&self, session: DownstreamMcpSession, ctx: &RequestContext) {
-        self.delete_teardowns(upstream_session_teardowns(session), ctx)
-            .await;
-    }
-
-    /// Upstream teardown for the sessions an `initialize` reclaimed.
-    ///
-    /// The whole reclaimed batch shares ONE budget of
-    /// [`MAX_CONCURRENT_REAPER_TEARDOWNS`]: the first wave runs inline, so a
-    /// typical eviction still finishes before `initialize` answers, and the rest
-    /// is handed to the reaper's bounded cleanup queue (global bound, its own
-    /// timeout, no hop count) so a mass-expiry backlog neither bursts unboundedly
-    /// nor holds the request. Records the queue cannot take — it is full, or no
-    /// reaper is running for this instance — stay inline under the same bound,
-    /// so none is dropped. The admitted session's TTL is pinned meanwhile
-    /// ([`AdmissionTtlStart`]). Queued work is background, not request I/O, so it
-    /// is not credited to the request.
-    async fn reclaim_upstream_sessions(
-        &self,
-        evicted: Vec<DownstreamMcpSession>,
-        ctx: &RequestContext,
-    ) {
-        use tokio::sync::mpsc::error::TrySendError;
-
-        let mut inline: Vec<UpstreamSessionTeardown> = evicted
-            .into_iter()
-            .flat_map(upstream_session_teardowns)
-            .collect();
-        if inline.len() > MAX_CONCURRENT_REAPER_TEARDOWNS
-            && let Some(reaper) = self.session_reaper.get()
-        {
-            let spilled = inline.split_off(MAX_CONCURRENT_REAPER_TEARDOWNS);
-            for teardown in spilled {
-                if let Err(TrySendError::Full(teardown) | TrySendError::Closed(teardown)) =
-                    reaper.cleanup_queue.try_send(teardown)
-                {
-                    inline.push(teardown);
-                }
-            }
-        }
-        self.delete_teardowns(inline, ctx).await;
-    }
-
-    async fn delete_teardowns(
-        &self,
-        teardowns: Vec<UpstreamSessionTeardown>,
-        ctx: &RequestContext,
-    ) {
-        delete_upstream_teardowns(
+        delete_upstream_session_set(
             &self.http_client,
             &self.servers,
             &self.sessions.upstream_session_header,
-            teardowns,
+            session,
             crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
             &ctx.plugin_http_call_ns,
         )
@@ -3464,7 +3406,19 @@ impl McpGateway {
         let Some(session) = self.take_downstream_session(downstream_session_id) else {
             return false;
         };
-        self.delete_upstream_sessions(session, ctx).await;
+        // One session's request-path teardown (client `DELETE`, expiry on
+        // touch): its upstreams are torn down concurrently and bounded. The
+        // multi-session `initialize` eviction path keeps the sequential
+        // per-session teardown above.
+        delete_one_session_upstreams_concurrently(
+            &self.http_client,
+            &self.servers,
+            &self.sessions.upstream_session_header,
+            session,
+            crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+            &ctx.plugin_http_call_ns,
+        )
+        .await;
         true
     }
 
@@ -8985,37 +8939,67 @@ async fn delete_upstream_session(
     }
 }
 
-/// Issue request-scoped upstream session `DELETE`s (session `DELETE`, expiry
-/// on touch, the inline part of `initialize` reclamation), carrying the
-/// request's hop count.
+/// Issue the upstream `DELETE` for each initialized upstream session of an
+/// already-removed downstream session, one server at a time. Used by
+/// `initialize` eviction, which runs one of these per evicted session
+/// concurrently; the single-session request paths use
+/// [`delete_one_session_upstreams_concurrently`]. Request-scoped teardown
+/// passes the request's hop count.
+async fn delete_upstream_session_set(
+    http_client: &PluginHttpClient,
+    servers: &HashMap<String, McpServerConfig>,
+    upstream_session_header: &str,
+    session: DownstreamMcpSession,
+    hops: Option<u8>,
+    accumulator: &AtomicU64,
+) {
+    for teardown in upstream_session_teardowns(session) {
+        let Some(server) = servers.get(&teardown.server_id) else {
+            continue;
+        };
+        delete_upstream_session(
+            http_client,
+            server,
+            upstream_session_header,
+            teardown,
+            hops,
+            accumulator,
+        )
+        .await;
+    }
+}
+
+/// Issue the upstream `DELETE` for each initialized upstream session of ONE
+/// already-removed downstream session on its request path (session `DELETE`,
+/// expiry on touch), passing the request's hop count.
 ///
 /// The `DELETE`s run concurrently, at most [`MAX_CONCURRENT_REAPER_TEARDOWNS`]
-/// in flight for the whole batch, so the request waits about one upstream round
-/// trip per wave rather than one per upstream server. That is safe because each
-/// record names a distinct (server, upstream session) pair, no `DELETE` reads
-/// another's result, every failure is only logged, and the sessions are already
-/// out of the store; the reaper's cleanup worker already runs these same calls
-/// concurrently. Each call is bounded by [`REAPER_TEARDOWN_TIMEOUT`] like the
-/// reaper's.
+/// in flight, so the request waits about one upstream round trip per wave of 8
+/// rather than one per upstream server. That is safe because each record names
+/// a distinct (server, upstream session) pair, no `DELETE` reads another's
+/// result, every failure is only logged, and the session is already out of the
+/// store; the reaper's cleanup worker already runs these same calls
+/// concurrently.
 ///
 /// The calls overlap, so their individual durations are NOT summed into the
 /// request's external-I/O accumulator (that would report more I/O than
 /// wall-clock time); the batch's wall-clock wait is recorded once.
-async fn delete_upstream_teardowns(
+async fn delete_one_session_upstreams_concurrently(
     http_client: &PluginHttpClient,
     servers: &HashMap<String, McpServerConfig>,
     upstream_session_header: &str,
-    teardowns: Vec<UpstreamSessionTeardown>,
+    session: DownstreamMcpSession,
     hops: Option<u8>,
     accumulator: &AtomicU64,
 ) {
-    let deletes: Vec<(&McpServerConfig, UpstreamSessionTeardown)> = teardowns
-        .into_iter()
-        .filter_map(|teardown| {
-            let server = servers.get(&teardown.server_id)?;
-            Some((server, teardown))
-        })
-        .collect();
+    let deletes: Vec<(&McpServerConfig, UpstreamSessionTeardown)> =
+        upstream_session_teardowns(session)
+            .into_iter()
+            .filter_map(|teardown| {
+                let server = servers.get(&teardown.server_id)?;
+                Some((server, teardown))
+            })
+            .collect();
     if deletes.is_empty() {
         return;
     }
@@ -9031,55 +9015,18 @@ async fn delete_upstream_teardowns(
     futures_util::stream::iter(deletes)
         .for_each_concurrent(
             MAX_CONCURRENT_REAPER_TEARDOWNS,
-            move |(server, teardown)| async move {
-                let delete = delete_upstream_session(
+            move |(server, teardown)| {
+                delete_upstream_session(
                     http_client,
                     server,
                     upstream_session_header,
                     teardown,
                     hops,
                     overlapping_call_ns,
-                );
-                if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, delete)
-                    .await
-                    .is_err()
-                {
-                    warn_sampled!(
-                        server_id = %server.server_id,
-                        "MCP request-path upstream session delete timed out"
-                    );
-                }
+                )
             },
         )
         .await;
-}
-
-/// How far ahead an admitted session's idle clock is held while its
-/// `initialize` awaits reclaimed sessions' upstream teardown. Only has to
-/// outlast that teardown (each `DELETE` is bounded by
-/// [`REAPER_TEARDOWN_TIMEOUT`]); [`AdmissionTtlStart`] always resets it.
-const ADMISSION_TTL_PIN: Duration = Duration::from_secs(24 * 60 * 60);
-
-fn pinned_admission_last_seen() -> Instant {
-    let now = Instant::now();
-    now.checked_add(ADMISSION_TTL_PIN).unwrap_or(now)
-}
-
-/// Starts a just-admitted session's idle TTL on drop — when its `initialize`
-/// returns after reclaimed-session teardown, or is cancelled during it — so a
-/// teardown that outlasts `sessions.session_ttl_seconds` cannot hand the
-/// client an already-expired (or already-reaped) session id.
-struct AdmissionTtlStart<'a> {
-    session_store: &'a DashMap<String, DownstreamMcpSession>,
-    downstream_session_id: &'a str,
-}
-
-impl Drop for AdmissionTtlStart<'_> {
-    fn drop(&mut self) {
-        if let Some(mut session) = self.session_store.get_mut(self.downstream_session_id) {
-            session.last_seen = Instant::now();
-        }
-    }
 }
 
 /// Credits one request-path teardown batch's wall-clock wait to the request's
@@ -9116,10 +9063,6 @@ const REAPER_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 struct McpSessionReaperGuard {
     sweep: tokio::task::JoinHandle<()>,
     cleanup: tokio::task::JoinHandle<()>,
-    /// The cleanup worker's bounded queue, which a reclaiming `initialize`
-    /// also feeds (`McpGateway::reclaim_upstream_sessions`). Holding it keeps
-    /// the worker alive with the guard; the guard's drop aborts it anyway.
-    cleanup_queue: tokio::sync::mpsc::Sender<UpstreamSessionTeardown>,
 }
 
 impl Drop for McpSessionReaperGuard {
@@ -9166,7 +9109,6 @@ fn spawn_session_reaper(
     let interval = (session_ttl / 2).clamp(MIN_SESSION_REAP_INTERVAL, MAX_SESSION_REAP_INTERVAL);
     let (sender, mut receiver) =
         tokio::sync::mpsc::channel::<UpstreamSessionTeardown>(MAX_PENDING_REAPER_TEARDOWNS);
-    let cleanup_queue = sender.clone();
     let sweep = runtime.spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
@@ -9233,11 +9175,7 @@ fn spawn_session_reaper(
         }
         while in_flight.join_next().await.is_some() {}
     });
-    Some(McpSessionReaperGuard {
-        sweep,
-        cleanup,
-        cleanup_queue,
-    })
+    Some(McpSessionReaperGuard { sweep, cleanup })
 }
 
 /// Remove every downstream session idle for at least `session_ttl`, with its
