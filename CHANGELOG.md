@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hostnames whose answering type is already cached keep the sequential walk,
   so steady-state refreshes send the same queries as before. An A/AAAA answer
   that waits behind a slower SRV query is cached only for what remains of its
-  TTL, and is queried again if it expired while waiting.
+  TTL, and is queried again if its deadline has passed when it is selected
+  (TTL-0 answers included).
 
 ### Fixed
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).

@@ -215,8 +215,6 @@ struct RecordTypeAnswer {
     /// the SRV and target-address deadlines). Kept absolute so an answer
     /// buffered behind a slower lookup is not given its full TTL again.
     valid_until: Instant,
-    /// When the lookup finished.
-    completed_at: Instant,
 }
 
 impl RecordTypeAnswer {
@@ -225,16 +223,7 @@ impl RecordTypeAnswer {
             addrs,
             record_type,
             valid_until,
-            completed_at: Instant::now(),
         }
-    }
-
-    /// Valid when it completed but expired by `now`. An answer that arrived
-    /// already expired (a TTL hickory clamped to zero) is not "buffered"
-    /// stale: re-asking would get the same answer, so it keeps the
-    /// `min_ttl` fallback instead.
-    fn expired_while_buffered(&self, now: Instant) -> bool {
-        self.valid_until > self.completed_at && self.valid_until <= now
     }
 }
 
@@ -1823,17 +1812,27 @@ impl DnsCache {
         if !concurrent.is_empty() {
             let mut lookups: FuturesOrdered<_> = concurrent
                 .iter()
-                .map(|&record_type| self.lookup_record_type(hostname, record_type))
+                .map(|&record_type| async move {
+                    let answer = self.lookup_record_type(hostname, record_type).await;
+                    (answer, Instant::now())
+                })
                 .collect();
-            while let Some(answer) = lookups.next().await {
+            // When the latest lookup earlier in the order finished.
+            let mut preferred_done_at: Option<Instant> = None;
+            while let Some((answer, completed_at)) = lookups.next().await {
                 let Some(answer) = answer else {
+                    preferred_done_at = preferred_done_at.max(Some(completed_at));
                     continue;
                 };
-                // A completed answer can wait here behind a slower, preferred
-                // lookup. Its TTL is measured from its absolute deadline now,
-                // at selection, so the wait is not added on top. If it expired
-                // while waiting, ask again rather than cache a stale address.
-                let answer = if answer.expired_while_buffered(Instant::now()) {
+                // An answer that completed while a preferred lookup was still
+                // pending waited here. Its TTL is taken from its absolute
+                // deadline at selection, so the wait is not added on top. If
+                // the deadline has passed (including a TTL-0 answer), ask
+                // again, as the sequential walk would have after the preferred
+                // lookup, rather than cache an address the upstream may have
+                // rotated. An answer that did not wait keeps main's behaviour.
+                let waited = preferred_done_at.is_some_and(|done| completed_at < done);
+                let answer = if waited && answer.valid_until <= Instant::now() {
                     match self.lookup_record_type(hostname, answer.record_type).await {
                         Some(fresh) => fresh,
                         None => continue,
@@ -3725,6 +3724,29 @@ mod tests {
             .collect();
         assert_eq!(first, vec![SocketAddr::new(a, 0), SocketAddr::new(b, 0)]);
         assert_eq!(second, vec![SocketAddr::new(b, 0), SocketAddr::new(a, 0)]);
+    }
+
+    #[test]
+    fn cold_miss_concurrent_prefix_len_overlaps_only_srv_then_address() {
+        use super::CachedRecordType::{A, Aaaa, Cname, Srv};
+        let cases: [(&[CachedRecordType], usize); 9] = [
+            (&[Srv, A, Cname], 2),
+            (&[Srv, Aaaa, A], 2),
+            (&[Srv, A], 2),
+            (&[A, Srv, Cname], 0),
+            (&[Aaaa, A], 0),
+            (&[Srv, Cname, A], 0),
+            (&[Cname, A], 0),
+            (&[Srv], 0),
+            (&[], 0),
+        ];
+        for (query_types, expected) in cases {
+            assert_eq!(
+                cold_miss_concurrent_prefix_len(query_types),
+                expected,
+                "{query_types:?}"
+            );
+        }
     }
 
     #[test]
