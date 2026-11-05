@@ -1317,6 +1317,7 @@ jobs:
               integration::cp_dp_grpc_tests
               integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests
+              integration::cp_namespace_load_concurrency_tests
               integration::cp_tenant_trust_binding_tests
               integration::cp_trust_reload_health_tests
               integration::connection_pool_tests
