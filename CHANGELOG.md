@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   most 8 teardowns at a time instead of one per session. Failures are still
   logged and never change the client's answer. The overlapping calls count
   their wall-clock wait once toward `latency_plugin_external_io_ms` instead of
-  summing each call.
+  summing each call, including when the client aborts mid-teardown.
 
 ## [0.9.20] - 2026-11-02
 

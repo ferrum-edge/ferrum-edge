@@ -3744,7 +3744,7 @@ async fn start_gated_session_delete_server(
 }
 
 /// A tools-only aggregate config with one upstream server per mock.
-fn multi_server_tools_config(servers: &[MockServer]) -> Value {
+fn gated_servers_tools_config(servers: &[MockServer]) -> Value {
     let mut config = tools_only_aggregate_config(&format!("{}/mcp", servers[0].uri()));
     for (index, server) in servers.iter().enumerate().skip(1) {
         let server_id = format!("server{index}");
@@ -3773,7 +3773,7 @@ async fn aggregate_delete_tears_down_every_upstream_session_concurrently() {
         start_gated_session_delete_server(sessions[0], 200, &gate).await,
         start_gated_session_delete_server(sessions[1], 500, &gate).await,
     ];
-    let plugin = create_plugin("mcp_gateway", &multi_server_tools_config(&servers))
+    let plugin = create_plugin("mcp_gateway", &gated_servers_tools_config(&servers))
         .unwrap()
         .unwrap();
     let session_id = initialize(&plugin).await;
@@ -3824,7 +3824,7 @@ async fn expired_session_presented_again_tears_down_upstreams_concurrently() {
         start_gated_session_delete_server(sessions[0], 200, &gate).await,
         start_gated_session_delete_server(sessions[1], 200, &gate).await,
     ];
-    let mut config = multi_server_tools_config(&servers);
+    let mut config = gated_servers_tools_config(&servers);
     config["sessions"] = json!({ "session_ttl_seconds": 1 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
@@ -3849,6 +3849,86 @@ async fn expired_session_presented_again_tears_down_upstreams_concurrently() {
     }
 }
 
+/// A mock upstream that mints `upstream_session` on every POST and answers its
+/// session `DELETE` with 200 after `delete_delay`. wiremock delays are async,
+/// so a long one holds only that response, never the mock server.
+async fn start_delayed_session_delete_server(
+    upstream_session: &str,
+    delete_delay: std::time::Duration,
+) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", upstream_session)
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "upstream",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": { "name": "delayed-session-delete", "version": "1" },
+                        "tools": [{ "name": "create_pr", "inputSchema": { "type": "object" } }]
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_delay(delete_delay))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// EDGE-PL-2: a client that aborts mid-teardown still has the teardown's
+/// wall-clock wait counted as external I/O. One upstream `DELETE` finishes at
+/// once while the other is still held when the request future is dropped; the
+/// credit must not depend on the whole batch completing.
+#[tokio::test]
+async fn cancelled_session_delete_still_counts_its_teardown_wait() {
+    let sessions = ["prompt-delete", "held-delete"];
+    let servers = [
+        start_delayed_session_delete_server(sessions[0], std::time::Duration::ZERO).await,
+        start_delayed_session_delete_server(sessions[1], std::time::Duration::from_secs(30)).await,
+    ];
+    let plugin = create_plugin("mcp_gateway", &gated_servers_tools_config(&servers))
+        .unwrap()
+        .unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1135).await;
+
+    let mut ctx = create_test_context();
+    ctx.method = "DELETE".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
+    let started = std::time::Instant::now();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        plugin.before_proxy(&mut ctx, &mut headers),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(cancelled.is_err(), "the request is dropped mid-teardown");
+
+    assert_eq!(
+        deletes_for(&servers[0], sessions[0]).await,
+        1,
+        "the prompt upstream DELETE completed before the abort"
+    );
+    let recorded = std::time::Duration::from_nanos(ctx.plugin_http_call_ns.load(Ordering::Relaxed));
+    assert!(
+        recorded > std::time::Duration::ZERO,
+        "a dropped teardown batch still credits its wait"
+    );
+    assert!(
+        recorded <= elapsed,
+        "the credit is the batch's wall-clock wait: {recorded:?} of external I/O in {elapsed:?}"
+    );
+}
+
 /// EDGE-PL-2: an `initialize` that reclaims several expired sessions drives
 /// all of their upstream `DELETE`s through ONE bounded fan-out: the bound is
 /// reached and never exceeded, however many sessions and servers there are.
@@ -3864,7 +3944,7 @@ async fn reclaiming_initialize_shares_one_bounded_teardown_fan_out() {
             start_gated_session_delete_server(&format!("reclaimed-{index}"), 200, &gate).await,
         );
     }
-    let mut config = multi_server_tools_config(&servers);
+    let mut config = gated_servers_tools_config(&servers);
     config["sessions"] = json!({ "session_ttl_seconds": 2 });
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     for request_id in 0..RECLAIMED_SESSIONS {

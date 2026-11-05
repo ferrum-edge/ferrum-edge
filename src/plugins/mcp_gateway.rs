@@ -8964,7 +8964,12 @@ async fn delete_upstream_session_set(
     // Per-call durations land here and are discarded; see above.
     let overlapping_call_ns = AtomicU64::new(0);
     let overlapping_call_ns = &overlapping_call_ns;
-    let started = Instant::now();
+    // Credits the batch's wall-clock wait when this future completes OR is
+    // dropped mid-batch (client abort), so completed DELETEs stay counted.
+    let _wait_credit = TeardownWaitCredit {
+        accumulator,
+        started: Instant::now(),
+    };
     futures_util::stream::iter(deletes)
         .for_each_concurrent(
             MAX_CONCURRENT_REAPER_TEARDOWNS,
@@ -8981,13 +8986,29 @@ async fn delete_upstream_session_set(
                     .await
                     .is_err()
                 {
-                    warn_sampled!("MCP request-path upstream session delete timed out");
+                    warn_sampled!(
+                        server_id = %server.server_id,
+                        "MCP request-path upstream session delete timed out"
+                    );
                 }
             },
         )
         .await;
-    let waited_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    accumulator.fetch_add(waited_ns, Ordering::Relaxed);
+}
+
+/// Credits one request-path teardown batch's wall-clock wait to the request's
+/// external-I/O accumulator exactly once, on drop: when the batch completes
+/// and when the request future is dropped mid-batch.
+struct TeardownWaitCredit<'a> {
+    accumulator: &'a AtomicU64,
+    started: Instant,
+}
+
+impl Drop for TeardownWaitCredit<'_> {
+    fn drop(&mut self) {
+        let waited_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.accumulator.fetch_add(waited_ns, Ordering::Relaxed);
+    }
 }
 
 /// Shortest and longest period of the background session expiry sweep. The
@@ -9112,7 +9133,10 @@ fn spawn_session_reaper(
                     .await
                     .is_err()
                 {
-                    warn_sampled!("MCP session reaper upstream session delete timed out");
+                    warn_sampled!(
+                        server_id = %server.server_id,
+                        "MCP session reaper upstream session delete timed out"
+                    );
                 }
             });
         }
