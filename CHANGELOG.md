@@ -62,8 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connections, although it already held a ready connection with room under
   the peer's stream cap. That tunnel now opens on the connection it has, and
   the dial runs on a detached task, the way gRPC shard fills already do. The
-  checkout first re-reads the peer's current stream cap; if the peer has
-  lowered it so the connection is full, the tunnel waits for the new
+  checkout first re-reads the peer's current stream cap and reserves its
+  stream slot; if the connection is full (the peer lowered its cap, or a
+  concurrent tunnel took the last slot), the tunnel waits for the new
   connection and uses it, as before.
   Growth stays single-flight per destination and draws on a small budget (a
   quarter of the CPU count, 1 to 4 dials at once) that it never waits for.
