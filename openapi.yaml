@@ -961,8 +961,9 @@ paths:
         return `502` and leave it active for a retry. The final order write is a
         compare-and-set on the order as read before the directory I/O: if it was
         completed by a renewal, deleted, or otherwise rewritten meanwhile, the
-        order is left unchanged and `409` is returned (an already stored
-        certificate stays stored). `409` is also returned, before any directory
+        order is left unchanged; a successful finalization then returns `409`
+        (an already stored certificate stays stored), while a directory-reported
+        `invalid` result still returns `502`. `409` is also returned, before any directory
         request, when the certificate the order is persisted under (the
         request's `certificate_id`, else the order's) already has another
         active order as its latest order.

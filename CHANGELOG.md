@@ -18,8 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can be finalized, and `valid`, `failed` and `cancelled` can never be left.
   Finalizing a terminal order returns `409` before any CA request. The final
   `valid` or `failed` write is a compare-and-set on the order as it was read;
-  if anything changed it in between, the order is left as it is and the
-  endpoint returns `409` (a certificate already stored stays stored). An order
+  if anything changed it in between, the order is left as it is. For a
+  successful finalization the endpoint then returns `409` (a certificate
+  already stored stays stored); a CA-invalid result still returns `502` with
+  the CA's error, whether or not its best-effort `failed` write applied. An order
   is marked `failed` only when the CA reports it `invalid`, as on the renewal
   path; network errors, poll timeouts and local certificate-validation
   failures now leave it active so the same request can be retried. Finalizing

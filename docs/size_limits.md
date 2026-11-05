@@ -21,7 +21,7 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 | `FERRUM_TLS_MANAGED_MAX_RECORDS` | `usize` | `1024` | Logical create ceiling for managed-TLS records; overwrite/delete remain available. |
 | `FERRUM_TLS_ACME_MAX_CERTIFICATES` | `usize` | `1024` | Logical create ceiling for ACME certificates. |
 | `FERRUM_TLS_ACME_MAX_ACCOUNTS` | `usize` | `256` | Logical create ceiling for ACME accounts. |
-| `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` | `usize` | `16` | Per-certificate terminal ACME order history retention; active/recoverable orders are never pruned. |
+| `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` | `usize` | `16` | Per-certificate terminal ACME order history retention; active orders are never pruned. |
 | `FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES` | `usize` | `4194304` (4MB) | Per-response Kubernetes/Consul discovery success-body ceiling. Hard maximum 16 MiB; `0` is rejected (not unlimited). See [Service Discovery Response Body Ceilings](#service-discovery-response-body-ceilings). |
 | `FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES` | `usize` | `4096` (4KB) | Independent discovery error-body ceiling. Hard maximum 64 KiB; must be `<=` the success ceiling; `0` is rejected. |
 | `FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES` | `usize` | `33554432` (32MB) | Concurrent discovery-body budget across pollers. Hard maximum 256 MiB; must be `>=` the success ceiling; `0` is rejected. |

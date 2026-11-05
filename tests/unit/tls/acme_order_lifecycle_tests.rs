@@ -464,3 +464,22 @@ fn a_newer_terminal_order_does_not_block_completing_an_order() {
             .is_some()
     );
 }
+
+#[test]
+fn a_newer_terminal_order_does_not_block_recording_a_ca_invalid_order() {
+    // The CA-invalid fail path shares the completion guard: a terminal latest
+    // order hides nothing, so the older order is still recorded `failed` and
+    // renewal does not keep resuming an order the CA has already rejected.
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_store(&dir);
+    let own = seed(
+        &store,
+        order("own", Some(CERTIFICATE_ID), AcmeOrderStatus::Processing),
+    );
+    seed(
+        &store,
+        order("done", Some(CERTIFICATE_ID), AcmeOrderStatus::Valid),
+    );
+
+    assert!(store.fail_ca_invalid_order_if_current(&own).unwrap());
+}
