@@ -54,6 +54,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
+### Performance
+- **Multi-namespace control planes load their namespaces concurrently.** With
+  `FERRUM_CP_NAMESPACES` set to a list or `*`, each incremental poll, each
+  set of pre-load change-sequence boundary reads and each full reload used to
+  query one namespace at a time. Each of those phases now runs up to 4
+  namespace loads at once. Every boundary is still captured before any
+  resource load starts, results are merged in namespace order, and a failing
+  namespace is still isolated (#2983). A multi-namespace full snapshot is now
+  stamped with the earliest namespace load time rather than the first one in
+  namespace order. Single-namespace CPs are unchanged.
+- **An admin-read replica no longer delays database and CP startup.**
+  `FERRUM_DB_READ_REPLICA_URL` used to be dialed (connect plus `SELECT 1`, up to
+  `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS`) before migrations and the initial
+  primary load. It now connects in the background through the same reconnect
+  path the poll loop uses. Admin reads use primary until the replica pool is
+  up, as they already did whenever the replica was unavailable.
+
 ## [0.9.20] - 2026-11-02
 
 This patch release follows published 0.9.19. It was published on 2026-11-03

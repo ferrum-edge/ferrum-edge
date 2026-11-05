@@ -2284,6 +2284,52 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
     );
 }
 
+#[tokio::test]
+async fn set_read_replica_url_defers_the_dial_to_the_reconnect_path() {
+    // Startup records the replica URL without dialing it, so an unreachable
+    // replica cannot delay the authoritative primary load, and then connects it
+    // in the background through the same `reconnect_read_replica` path the poll
+    // scheduler uses. Until then admin reads stay on primary.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_url = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("primary.db").to_string_lossy()
+    );
+    let replica_url = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("replica.db").to_string_lossy()
+    );
+    seed_sqlite_namespace(&primary_url, "primary-ns").await;
+    seed_sqlite_namespace(&replica_url, "replica-ns").await;
+
+    let mut store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    store.set_read_replica_url(&replica_url);
+    assert!(
+        !store.read_replica_available(),
+        "recording the replica URL must not dial it"
+    );
+    assert!(
+        !store.read_replica_suppressed(),
+        "a recorded replica on the primary topology must stay eligible for reconnect"
+    );
+    let before = store.list_namespaces().await.unwrap();
+    assert!(
+        before.contains(&"primary-ns".to_string()) && !before.contains(&"replica-ns".to_string()),
+        "admin reads must use primary until the replica connects: {before:?}"
+    );
+
+    store.reconnect_read_replica(&replica_url).await.unwrap();
+    assert!(store.read_replica_available());
+    let after = store.list_namespaces().await.unwrap();
+    assert!(
+        after.contains(&"replica-ns".to_string()) && !after.contains(&"primary-ns".to_string()),
+        "admin reads must use the replica once its pool is published: {after:?}"
+    );
+}
+
 // ---- list_namespaces_paginated ----
 
 async fn connect_namespaces_test_store(dir: &tempfile::TempDir, name: &str) -> DatabaseStore {

@@ -118,6 +118,42 @@ where
     }
 }
 
+/// Narrow incremental-load source used by the CP multi-namespace poll, so its
+/// per-namespace concurrency and merge order are testable with a scripted
+/// source. Production stores receive the blanket implementation below.
+#[doc(hidden)]
+#[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
+#[async_trait::async_trait]
+pub trait CpIncrementalLoadSource: Send + Sync {
+    async fn load_incremental_config(
+        &self,
+        namespace: &str,
+        after_sequence: u64,
+    ) -> Result<IncrementalResult, anyhow::Error>;
+}
+
+#[async_trait::async_trait]
+impl<T> CpIncrementalLoadSource for T
+where
+    T: DatabaseBackend + ?Sized,
+{
+    async fn load_incremental_config(
+        &self,
+        namespace: &str,
+        after_sequence: u64,
+    ) -> Result<IncrementalResult, anyhow::Error> {
+        DatabaseBackend::load_incremental_config(self, namespace, after_sequence).await
+    }
+}
+
+/// Upper bound on concurrent per-namespace database loads within one phase of
+/// a multi-namespace CP poll (incremental deltas, pre-load change-sequence
+/// boundaries, full reloads). Each in-flight load holds one primary pool
+/// connection, a full load for its whole snapshot transaction, so this stays
+/// well below the default `FERRUM_DB_POOL_MAX_CONNECTIONS` (32) and leaves
+/// headroom for admin traffic.
+const CP_NAMESPACE_LOAD_CONCURRENCY: usize = 4;
+
 /// Stream of admitted CP gRPC connections handed to tonic's
 /// `serve_with_incoming_shutdown`.
 pub type CpGrpcIncomingStream =
@@ -624,15 +660,16 @@ fn retained_polled_namespaces(config: &GatewayConfig) -> Vec<String> {
 }
 
 /// Multi-namespace incremental poll. Calls `load_incremental_config` once
-/// per namespace. Load failures for one namespace are isolated: other namespaces
-/// continue and the failing namespace keeps its prior cursor (#2983).
+/// per namespace, up to [`CP_NAMESPACE_LOAD_CONCURRENCY`] at a time. Load
+/// failures for one namespace are isolated: other namespaces continue and the
+/// failing namespace keeps its prior cursor (#2983).
 ///
 /// Returns `Err` only when every namespace fails with a non-validation error
 /// (connectivity / full-reload-required), so the poll loop can escalate to a
 /// full fallback. A mix of successes and failures returns `Ok` with
 /// `load_failures` populated.
-async fn load_incremental_config_multi(
-    db: &dyn DatabaseBackend,
+async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
+    db: &B,
     namespaces: &[String],
     after_sequences: &HashMap<String, u64>,
 ) -> Result<IncrementalMultiLoad, anyhow::Error> {
@@ -669,9 +706,23 @@ async fn load_incremental_config_multi(
     };
     let mut any_success = false;
     let mut last_hard_error: Option<anyhow::Error> = None;
-    for ns in namespaces {
-        let after_sequence = after_sequences.get(ns).copied().unwrap_or(0);
-        match db.load_incremental_config(ns, after_sequence).await {
+    // Each namespace's delta is a separate namespace-predicated, read-only
+    // query sequence with no transaction and no input from another namespace's
+    // result, so the loads can overlap. `buffered` keeps namespace order, and
+    // every load runs to completion before the merge (no fail-fast drop of an
+    // in-flight sqlx/Mongo query), so the merge below sees exactly the outcomes
+    // the serial loop did. A namespace after an escalating one is now read and
+    // discarded instead of skipped.
+    let loads: Vec<_> = namespaces
+        .iter()
+        .map(|ns| db.load_incremental_config(ns, after_sequences.get(ns).copied().unwrap_or(0)))
+        .collect();
+    let outcomes: Vec<Result<IncrementalResult, anyhow::Error>> = futures_util::stream::iter(loads)
+        .buffered(CP_NAMESPACE_LOAD_CONCURRENCY)
+        .collect()
+        .await;
+    for (ns, outcome) in namespaces.iter().zip(outcomes) {
+        match outcome {
             Ok(mut delta) => {
                 any_success = true;
                 next_sequences.insert(ns.clone(), delta.sequence_cursor);
@@ -784,11 +835,25 @@ async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
     let mut acc = MultiNsFullLoadAcc::new();
     let mut last_hard_error: Option<anyhow::Error> = None;
 
-    for ns in namespaces {
-        match db
-            .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
-            .await
-        {
+    // Each namespace's full load is its own namespace-scoped, read-only
+    // snapshot transaction/session on its own pool connection, and the
+    // consumer-quarantine state it records is keyed by namespace, so the loads
+    // can overlap. Every load runs to completion (no fail-fast drop of an
+    // in-flight transaction) and outcomes are applied in namespace order, so
+    // resource order, the namespace lists and `last_hard_error` match the
+    // serial loop. Validation below still runs on this task, one namespace at
+    // a time.
+    let loads: Vec<_> = namespaces
+        .iter()
+        .map(|ns| db.load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane))
+        .collect();
+    let outcomes: Vec<Result<GatewayConfig, anyhow::Error>> = futures_util::stream::iter(loads)
+        .buffered(CP_NAMESPACE_LOAD_CONCURRENCY)
+        .collect()
+        .await;
+
+    for (ns, outcome) in namespaces.iter().zip(outcomes) {
+        match outcome {
             Ok(raw) => match prepare_cp_full_snapshot(raw) {
                 Ok(next) => {
                     acc.apply_success(ns, next);
@@ -842,14 +907,16 @@ fn forget_consumer_quarantine_states<B: CpFullLoadSource + ?Sized>(db: &B, names
 /// Not `Debug`: the combined `GatewayConfig` carries consumer credentials.
 struct MultiNsFullLoadAcc {
     combined: Option<GatewayConfig>,
-    /// `loaded_at` of the first namespace that actually loaded. A published CP
-    /// FULL_SNAPSHOT carries `ConfigUpdate.version = config.loaded_at`, which is
-    /// the DP's monotonic ordering watermark and its cross-source staleness
-    /// fence. When the first namespaces in the list fail, `combined` is seeded
-    /// from `previous` — so without this the snapshot would be broadcast under
-    /// the *already applied* stamp, leaving the DP watermark stuck behind
-    /// content that did change. Taken from the load (not `Utc::now()`) so the
-    /// stamp still precedes every query, preserving the full-load safety margin.
+    /// Earliest `loaded_at` among the namespaces that actually loaded. A
+    /// published CP FULL_SNAPSHOT carries `ConfigUpdate.version =
+    /// config.loaded_at`, which is the DP's monotonic ordering watermark and its
+    /// cross-source staleness fence. When the first namespaces in the list fail,
+    /// `combined` is seeded from `previous` — so without this the snapshot would
+    /// be broadcast under the *already applied* stamp, leaving the DP watermark
+    /// stuck behind content that did change. Taken from the loads (not
+    /// `Utc::now()`) so the stamp still precedes every query, preserving the
+    /// full-load safety margin. The minimum, not the first in namespace order,
+    /// because namespace loads run concurrently and may stamp in any order.
     fresh_loaded_at: Option<chrono::DateTime<chrono::Utc>>,
     rejected_namespaces: Vec<(String, String)>,
     refreshed_namespaces: Vec<String>,
@@ -882,9 +949,10 @@ impl MultiNsFullLoadAcc {
     fn apply_success(&mut self, ns: &str, mut next: GatewayConfig) {
         self.any_success = true;
         self.refreshed_namespaces.push(ns.to_string());
-        if self.fresh_loaded_at.is_none() {
-            self.fresh_loaded_at = Some(next.loaded_at);
-        }
+        self.fresh_loaded_at = Some(
+            self.fresh_loaded_at
+                .map_or(next.loaded_at, |earliest| earliest.min(next.loaded_at)),
+        );
         match &mut self.combined {
             None => self.combined = Some(next),
             Some(acc) => {
@@ -934,7 +1002,7 @@ impl MultiNsFullLoadAcc {
         }
 
         let mut config = self.combined.unwrap_or_else(|| previous.clone());
-        // Stamp the snapshot with the first successful load's timestamp even when
+        // Stamp the snapshot with the earliest successful load's timestamp even when
         // the accumulator was seeded from `previous`, so the broadcast
         // `ConfigUpdate.version` advances with the content it describes.
         if let Some(loaded_at) = self.fresh_loaded_at {
@@ -1088,10 +1156,24 @@ async fn load_full_config_multi_with_sequence(
         0
     };
 
+    // Boundary reads are independent per-namespace autocommit reads. The
+    // required order is between phases (store-global watermark, then every
+    // namespace boundary, then every resource load), not within one, so read
+    // them with bounded concurrency and finish the whole phase before any
+    // resource load starts. Results are applied in namespace order.
+    let boundary_reads: Vec<_> = boundary_namespaces
+        .iter()
+        .map(|ns| db.latest_change_sequence(ns))
+        .collect();
+    let boundaries: Vec<Result<u64, anyhow::Error>> = futures_util::stream::iter(boundary_reads)
+        .buffered(CP_NAMESPACE_LOAD_CONCURRENCY)
+        .collect()
+        .await;
+
     let mut sequences = HashMap::new();
     let mut boundary_failed_namespaces = Vec::new();
-    for ns in &boundary_namespaces {
-        match db.latest_change_sequence(ns).await {
+    for (ns, boundary) in boundary_namespaces.iter().zip(boundaries) {
+        match boundary {
             Ok(sequence) => {
                 sequences.insert(ns.clone(), sequence);
             }
@@ -1248,6 +1330,39 @@ pub async fn load_full_config_multi_with_sequence_for_test(
         sequences,
         refreshed_namespaces: outcome.refreshed_namespaces,
         failed_namespaces: outcome.failed_namespaces,
+    })
+}
+
+/// External-test view of the CP multi-namespace incremental poll.
+///
+/// Not `Debug`: `IncrementalResult` carries consumer credentials.
+/// `#[allow(dead_code)]` because only external integration tests construct
+/// it; the binary target does not, and clippy runs with `-D warnings`.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub struct CpIncrementalMultiLoadOutcomeForTest {
+    pub result: IncrementalResult,
+    pub next_sequences: HashMap<String, u64>,
+    pub load_failures: Vec<(String, String)>,
+}
+
+/// Exercise the production multi-namespace incremental poll from external
+/// integration tests with a scripted [`CpIncrementalLoadSource`].
+///
+/// `#[allow(dead_code)]` because only external integration tests call this;
+/// the binary target does not, and clippy runs with `-D warnings`.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn load_incremental_config_multi_for_test(
+    db: &(impl CpIncrementalLoadSource + ?Sized),
+    namespaces: &[String],
+    after_sequences: &HashMap<String, u64>,
+) -> Result<CpIncrementalMultiLoadOutcomeForTest, anyhow::Error> {
+    let load = load_incremental_config_multi(db, namespaces, after_sequences).await?;
+    Ok(CpIncrementalMultiLoadOutcomeForTest {
+        result: load.result,
+        next_sequences: load.next_sequences,
+        load_failures: load.load_failures,
     })
 }
 
@@ -2012,6 +2127,10 @@ pub async fn run(
         names
     };
 
+    // SQL admin-read replica to dial in the background once the store is
+    // shared (see below); `None` when unset, suppressed, or MongoDB.
+    let mut startup_replica_url: Option<String> = None;
+
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
         "mongodb" => {
@@ -2084,24 +2203,33 @@ pub async fn run(
             retention_policy.log_if_enabled();
             store.set_audit_retention_policy(retention_policy);
 
+            // The admin-read replica is never authoritative, so it is dialed in
+            // the background below instead of delaying the primary load; admin
+            // reads use primary until its pool is published.
             if let Some(ref replica_url) = effective_replica_url {
-                match store.connect_read_replica(replica_url).await {
-                    Ok(()) if store.read_replica_suppressed() => {
-                        info!("Read replica configured but suppressed until primary failback")
-                    }
-                    Ok(()) => info!("Read replica connected for admin reads"),
-                    Err(_error) => {
-                        warn!(
-                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds",
-                            sanitize_startup_scalar(replica_url)
-                        );
-                    }
+                store.set_read_replica_url(replica_url);
+                if store.read_replica_suppressed() {
+                    info!("Read replica configured but suppressed until primary failback");
+                } else {
+                    startup_replica_url = Some(replica_url.clone());
                 }
             }
             Box::new(store)
         }
     };
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
+    // Single-flight guard shared with the poll task, so its first tick cannot
+    // double-dial while the startup replica connect is in flight.
+    let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
+    if let Some(replica_url) = startup_replica_url {
+        crate::modes::spawn_admin_read_replica_reconnect(
+            db.clone(),
+            replica_url,
+            replica_reconnect_in_flight.clone(),
+            "startup",
+            None,
+        );
+    }
     let db_tls_reload_handle = crate::modes::db_tls_reload::start_db_tls_reload_task(
         env_config.clone(),
         db.clone(),
@@ -3172,7 +3300,6 @@ pub async fn run(
             Arc::new(tokio::sync::Mutex::new(None));
         let mut force_full_reload = false;
         let mut last_polled_namespaces = initial_polled_namespaces;
-        let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
         let mut rejected_delta_tracker =
             CpRejectedDeltaTracker::new(rejected_delta_full_reload_threshold);
         // The poll task is the sole owner. Any pool topology swap resets this
@@ -4598,6 +4725,69 @@ mod tests {
                 .contains("CP configuration validation failed"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Scripted incremental source for the escalation case. Inline because
+    /// `IncrementalFullReloadRequired`'s constructors are crate-private.
+    struct EscalatingIncrementalSource {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CpIncrementalLoadSource for EscalatingIncrementalSource {
+        async fn load_incremental_config(
+            &self,
+            namespace: &str,
+            after_sequence: u64,
+        ) -> Result<IncrementalResult, anyhow::Error> {
+            self.calls.lock().unwrap().push(namespace.to_string());
+            match namespace {
+                "ns-a" => Err(anyhow::anyhow!("scripted connectivity failure")),
+                "ns-b" => Err(anyhow::Error::new(
+                    crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
+                        namespace,
+                    ),
+                )),
+                _ => Ok(IncrementalResult {
+                    added_or_modified_proxies: Vec::new(),
+                    removed_proxy_ids: Vec::new(),
+                    added_or_modified_consumers: Vec::new(),
+                    removed_consumer_ids: Vec::new(),
+                    added_or_modified_plugin_configs: Vec::new(),
+                    removed_plugin_config_ids: Vec::new(),
+                    added_or_modified_upstreams: Vec::new(),
+                    removed_upstream_ids: Vec::new(),
+                    sequence_cursor: after_sequence + 1,
+                    poll_timestamp: Utc::now(),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_multi_ns_incremental_escalation_still_wins_over_hard_errors() {
+        // A hard failure in ns-a, an escalation in ns-b and a success in ns-c:
+        // the escalation must still surface as the poll's error (so the CP
+        // runs its same-tick full reload), exactly as the serial loop did.
+        // Concurrency means ns-c is read and discarded rather than skipped.
+        let source = EscalatingIncrementalSource {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let namespaces: Vec<String> = ["ns-a", "ns-b", "ns-c"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let result = load_incremental_config_multi(&source, &namespaces, &HashMap::new()).await;
+        let Err(error) = result else {
+            panic!("an escalating namespace must fail the multi-namespace incremental poll");
+        };
+        assert!(
+            crate::config::db_backend::is_incremental_full_reload_required(&error),
+            "the escalation, not ns-a's earlier hard error, must win: {error}"
+        );
+        let mut calls = source.calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(calls, namespaces, "every namespace load runs to completion");
     }
 
     #[test]

@@ -81,6 +81,14 @@ is printed in the CP startup log (`CP mode: serving single namespace ...`,
 Whitespace is trimmed; duplicates are deduplicated; `*` cannot be combined
 with explicit entries (validation error).
 
+For `Set` and `All`, the CP loads up to 4 namespaces at once within each
+polling phase: incremental deltas, the pre-load change-sequence boundaries,
+and full reloads. A phase finishes before the next one starts, so every
+boundary is captured before any resource load. Results are merged in
+namespace order, and one namespace's load failure never blocks the others.
+Each in-flight load holds one primary pool connection, so keep
+`FERRUM_DB_POOL_MAX_CONNECTIONS` comfortably above that plus admin traffic.
+
 ## Per-namespace broadcast partitioning
 
 A single broadcast channel shared by every DP would leak other namespaces'
