@@ -54,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
+### Performance
+- **Gateway API and Istio status batches run concurrently** (#7034). The
+  Kubernetes reconcile loop used to wait for the Gateway API status batch and
+  then for the Istio status batch. The two writers patch disjoint objects, so
+  they now run together and a reconcile is held for the slower batch rather
+  than both (worst case about 20 s instead of 40 s). Clusters that watch only
+  one of the two are unchanged.
+
 ## [0.9.20] - 2026-11-02
 
 This patch release follows published 0.9.19. It was published on 2026-11-03
