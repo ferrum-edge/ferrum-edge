@@ -15,7 +15,7 @@
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use futures_util::stream::{self, FuturesOrdered, StreamExt};
+use futures_util::stream::{self, StreamExt};
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{
     ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig,
@@ -192,19 +192,19 @@ fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
     name
 }
 
-/// How many leading `query_types` a cold-miss resolve starts together: the
-/// leading SRV query plus the address type (A or AAAA) right after it. CNAME
-/// never joins, since its `lookup_ip` re-issues A/AAAA and would duplicate the
-/// address query. Returns 0 when there is nothing to overlap.
-fn cold_miss_concurrent_prefix_len(query_types: &[CachedRecordType]) -> usize {
-    // `query_types` is deduplicated, so SRV appears at most once.
+/// The address type a cold-miss resolve may query speculatively beside SRV:
+/// the A or AAAA right after a leading SRV. `None` for any other order. CNAME
+/// never qualifies, since its `lookup_ip` re-issues A/AAAA.
+fn cold_miss_speculative_address_type(
+    query_types: &[CachedRecordType],
+) -> Option<CachedRecordType> {
     match query_types {
         [
             CachedRecordType::Srv,
-            CachedRecordType::A | CachedRecordType::Aaaa,
+            address_type @ (CachedRecordType::A | CachedRecordType::Aaaa),
             ..,
-        ] => 2,
-        _ => 0,
+        ] => Some(*address_type),
+        _ => None,
     }
 }
 
@@ -1799,69 +1799,55 @@ impl DnsCache {
             query_types = vec![CachedRecordType::A, CachedRecordType::Aaaa];
         }
 
-        // Cold miss: send the leading SRV and A/AAAA queries together, so the
-        // default `SRV,A` order does not wait an SRV round trip before sending
-        // A. The lookups are independent (each takes only `hostname`), and
-        // `FuturesOrdered` yields in configured order, so the first non-empty
-        // answer in that order still wins; dropping the rest cancels them.
-        // A row with a known answering type stays serial, so steady-state
-        // refreshes send the same queries as before.
-        //
-        // SRV goes through the cached resolver as on main. The speculative
-        // address query goes through the uncached dial resolver, so a query
-        // the sequential walk might never have sent (SRV wins) or would have
-        // sent later leaves nothing in hickory's cache for later lookups.
-        let concurrent_len = if row_record_type.is_none() {
-            cold_miss_concurrent_prefix_len(&query_types)
-        } else {
-            0
-        };
-        let (concurrent, serial) = query_types.split_at(concurrent_len);
-        if !concurrent.is_empty() {
-            let mut lookups: FuturesOrdered<_> = concurrent
-                .iter()
-                .enumerate()
-                .map(|(index, &record_type)| {
-                    let resolver: &Resolver<TokioRuntimeProvider> = if index == 0 {
-                        &self.resolver
-                    } else {
-                        &self.dial_resolver
-                    };
-                    async move {
-                        let answer =
-                            Self::lookup_record_type(resolver, hostname, record_type).await;
-                        (record_type, answer, Instant::now())
+        // Cold miss under an `SRV,A` / `SRV,AAAA` leading order: query the
+        // address type speculatively while SRV runs, so a live address answer
+        // need not wait an SRV round trip. Speculation may only contribute an
+        // early success. SRV runs on the cached resolver as on main; the
+        // speculative query runs on the uncached dial resolver, so it leaves
+        // nothing in the shared cache. If SRV answers, it wins. If SRV yields
+        // nothing, a live speculative answer already in hand is used (cached
+        // only for its remaining TTL); otherwise the speculative lookup is
+        // dropped unawaited and the sequential walk below resumes at the
+        // address type, through the cached resolver, exactly as on main.
+        // A row with a known answering type is not a cold miss and walks
+        // sequentially from the start.
+        let mut resume_at = 0;
+        if row_record_type.is_none()
+            && let Some(address_type) = cold_miss_speculative_address_type(&query_types)
+        {
+            let srv = Self::lookup_record_type(&self.resolver, hostname, CachedRecordType::Srv);
+            let speculative = Self::lookup_record_type(&self.dial_resolver, hostname, address_type);
+            tokio::pin!(srv);
+            tokio::pin!(speculative);
+            let mut speculative_done: Option<Option<RecordTypeAnswer>> = None;
+            let srv_answer = loop {
+                tokio::select! {
+                    biased;
+                    answer = &mut srv => break answer,
+                    answer = &mut speculative, if speculative_done.is_none() => {
+                        speculative_done = Some(answer);
                     }
-                })
-                .collect();
-            // When the latest lookup earlier in the order finished.
-            let mut preferred_done_at: Option<Instant> = None;
-            while let Some((record_type, answer, completed_at)) = lookups.next().await {
-                // A speculative result that completed while the preferred
-                // lookup was still pending is older than what the sequential
-                // walk would have seen. A live answer is used as is: its TTL
-                // is taken from its absolute deadline below, so the wait is
-                // not added on top. A failure or an expired answer (TTL 0
-                // included) is looked up again at its serial position through
-                // the cached resolver, exactly as the sequential walk would.
-                let waited = preferred_done_at.is_some_and(|done| completed_at < done);
-                let stale = answer
-                    .as_ref()
-                    .is_none_or(|answer| answer.valid_until <= Instant::now());
-                let answer = if waited && stale {
-                    Self::lookup_record_type(&self.resolver, hostname, record_type).await
-                } else {
-                    answer
-                };
-                match answer {
-                    Some(answer) => return Ok(self.publishable_answer(answer)),
-                    None => preferred_done_at = Some(Instant::now()),
                 }
+            };
+            if let Some(answer) = srv_answer {
+                return Ok(self.publishable_answer(answer));
             }
+            // One non-blocking poll catches a speculative answer that became
+            // ready in the same wakeup as SRV; it never waits.
+            let speculative_answer = match speculative_done {
+                Some(answer) => answer,
+                None => futures_util::FutureExt::now_or_never(speculative.as_mut()).flatten(),
+            };
+            if let Some(answer) = speculative_answer
+                && answer.valid_until > Instant::now()
+            {
+                return Ok(self.publishable_answer(answer));
+            }
+            // SRV was tried; resume the sequential walk at the address type.
+            resume_at = 1;
         }
 
-        // Try each remaining record type in order
-        for &record_type in serial {
+        for &record_type in &query_types[resume_at..] {
             if let Some(answer) =
                 Self::lookup_record_type(&self.resolver, hostname, record_type).await
             {
@@ -3745,22 +3731,22 @@ mod tests {
     }
 
     #[test]
-    fn cold_miss_concurrent_prefix_len_overlaps_only_srv_then_address() {
+    fn cold_miss_speculative_address_type_only_follows_a_leading_srv() {
         use super::CachedRecordType::{A, Aaaa, Cname, Srv};
-        let cases: [(&[CachedRecordType], usize); 9] = [
-            (&[Srv, A, Cname], 2),
-            (&[Srv, Aaaa, A], 2),
-            (&[Srv, A], 2),
-            (&[A, Srv, Cname], 0),
-            (&[Aaaa, A], 0),
-            (&[Srv, Cname, A], 0),
-            (&[Cname, A], 0),
-            (&[Srv], 0),
-            (&[], 0),
+        let cases: [(&[CachedRecordType], Option<CachedRecordType>); 9] = [
+            (&[Srv, A, Cname], Some(A)),
+            (&[Srv, Aaaa, A], Some(Aaaa)),
+            (&[Srv, A], Some(A)),
+            (&[A, Srv, Cname], None),
+            (&[Aaaa, A], None),
+            (&[Srv, Cname, A], None),
+            (&[Cname, A], None),
+            (&[Srv], None),
+            (&[], None),
         ];
         for (query_types, expected) in cases {
             assert_eq!(
-                cold_miss_concurrent_prefix_len(query_types),
+                cold_miss_speculative_address_type(query_types),
                 expected,
                 "{query_types:?}"
             );

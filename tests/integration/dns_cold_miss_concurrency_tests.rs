@@ -1,15 +1,15 @@
 //! Cold-miss DNS record-type concurrency (`DnsCache::do_resolve`).
 //!
-//! On a cold miss the default `CACHE,SRV,A,CNAME` order starts the SRV and A
-//! queries together and still takes the first non-empty answer in configured
-//! order. A hostname whose answering record type is already cached stays
-//! serial, so steady-state refreshes send no speculative queries.
+//! On a cold miss the default `CACHE,SRV,A,CNAME` order sends the A query
+//! speculatively beside SRV. Speculation may only contribute an early
+//! success: if SRV answers it wins, and if SRV answers empty a live
+//! speculative answer already in hand is used. Every other case resumes
+//! main's sequential walk at A, through the cached resolver. A hostname whose
+//! answering record type is already cached stays sequential.
 //!
-//! The fixture is a UDP DNS server that can hold every SRV reply until it has
-//! seen an A query. Sequential code never sends that A query while the SRV
-//! query is pending, so it waits out the resolver timeout instead. It can also
-//! delay the released SRV reply past a short A TTL, to pin that an answer
-//! buffered behind SRV is not cached beyond its real deadline.
+//! The fixture is a UDP DNS server that can hold or delay SRV replies, hold,
+//! fail or rotate A replies, and answer AAAA. Exact query counts use absolute
+//! names (trailing dot), so search-list and `ndots` settings cannot skew them.
 
 use crate::scaffolding::port_registry::TestSocket;
 
@@ -66,6 +66,10 @@ struct Behavior {
     /// Never answer A queries for the host itself (SRV-target A queries are
     /// still answered).
     hold_host_a: bool,
+    /// Never answer the first A query for each host name; answer later ones.
+    hold_first_host_a: bool,
+    /// Answer the first A query for each host name; never answer later ones.
+    hold_repeat_host_a: bool,
     ttl: u32,
 }
 
@@ -79,6 +83,8 @@ impl ColdMissDnsServer {
             rotate_host_a,
             negative_first_host_a,
             hold_host_a,
+            hold_first_host_a,
+            hold_repeat_host_a,
             ttl,
         } = behavior;
         let socket = tokio::net::UdpSocket::bind_test("127.0.0.1:0")
@@ -127,12 +133,15 @@ impl ColdMissDnsServer {
                                 if rotate_host_a && host_a_queries > 0 {
                                     host_ip = ROTATED_HOST_IP;
                                 }
-                                if negative_first_host_a && answered_host_names.insert(name.clone())
-                                {
+                                let first_for_name = answered_host_names.insert(name.clone());
+                                if negative_first_host_a && first_for_name {
                                     answer_addresses = false;
                                 }
                                 host_a_queries += 1;
-                                if hold_host_a {
+                                if hold_host_a
+                                    || (hold_first_host_a && first_for_name)
+                                    || (hold_repeat_host_a && !first_for_name)
+                                {
                                     task_a_query_names.lock().expect("A query log").push(name);
                                     continue;
                                 }
@@ -200,16 +209,6 @@ impl ColdMissDnsServer {
             .filter(|name| name.as_str() == fqdn)
             .count()
     }
-
-    /// A queries for names under `hostname` (search-list expansions included).
-    fn a_queries_for(&self, hostname: &str) -> usize {
-        self.a_query_names
-            .lock()
-            .expect("A query log")
-            .iter()
-            .filter(|name| name.starts_with(hostname))
-            .count()
-    }
 }
 
 impl Drop for ColdMissDnsServer {
@@ -230,7 +229,9 @@ fn answer(
     let name = query.name().clone();
     match query.query_type() {
         RecordType::SRV => {
-            if let Some(target) = srv_target {
+            // A name is never its own SRV target, so the target's SRV query
+            // answers empty.
+            if let Some(target) = srv_target.filter(|target| **target != name) {
                 let data = RData::SRV(SRV::new(10, 10, 443, target.clone()));
                 response.add_answer(Record::from_rdata(name, ttl, data));
             }
@@ -268,6 +269,8 @@ async fn cold_miss_sends_srv_and_a_queries_together() {
         rotate_host_a: false,
         negative_first_host_a: false,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 60,
     })
     .await;
@@ -275,7 +278,7 @@ async fn cold_miss_sends_srv_and_a_queries_together() {
 
     let resolved = tokio::time::timeout(
         OVERLAP_BUDGET,
-        cache.resolve("cold-overlap.test", None, None),
+        cache.resolve("cold-overlap.test.", None, None),
     )
     .await
     .expect("a cold miss must not wait for the SRV reply before sending the A query")
@@ -284,14 +287,14 @@ async fn cold_miss_sends_srv_and_a_queries_together() {
     assert_eq!(resolved, IpAddr::V4(HOST_IP));
     assert!(dns.srv_queries() >= 1, "SRV is still queried first");
     assert_eq!(
-        dns.a_queries_for("cold-overlap.test"),
+        dns.a_queries_named("cold-overlap.test."),
         1,
         "a buffered A answer still within its TTL is used without re-querying"
     );
 }
 
 #[tokio::test]
-async fn buffered_answer_expired_behind_srv_is_requeried() {
+async fn expired_speculative_answer_resumes_the_sequential_walk() {
     // A answers at once with a 1 s TTL, but the preferred SRV query answers
     // (empty) only 2 s later. By then the buffered A answer has expired, so it
     // must be asked for again rather than cached for a fresh TTL. The fixture
@@ -304,6 +307,8 @@ async fn buffered_answer_expired_behind_srv_is_requeried() {
         rotate_host_a: true,
         negative_first_host_a: false,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 1,
     })
     .await;
@@ -311,16 +316,16 @@ async fn buffered_answer_expired_behind_srv_is_requeried() {
 
     let resolved = tokio::time::timeout(
         Duration::from_secs(4),
-        cache.resolve("cold-ttl.test", None, None),
+        cache.resolve("cold-ttl.test.", None, None),
     )
     .await
     .expect("the delayed SRV reply arrives well inside the resolver timeout")
-    .expect("the re-queried A answer must resolve the host");
+    .expect("the resumed A lookup must resolve the host");
 
     assert_eq!(
-        dns.a_queries_for("cold-ttl.test"),
+        dns.a_queries_named("cold-ttl.test."),
         2,
-        "the expired buffered A answer must be re-queried once"
+        "the expired speculative answer must give way to the resumed A lookup"
     );
     assert_eq!(
         resolved,
@@ -341,13 +346,15 @@ async fn cold_miss_keeps_srv_preference_when_a_answers_first() {
         rotate_host_a: false,
         negative_first_host_a: false,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 60,
     })
     .await;
     let cache = dns.cache();
 
     let resolved =
-        tokio::time::timeout(OVERLAP_BUDGET, cache.resolve("cold-pref.test", None, None))
+        tokio::time::timeout(OVERLAP_BUDGET, cache.resolve("cold-pref.test.", None, None))
             .await
             .expect("cold-miss resolve must finish within the overlap budget")
             .expect("the SRV target must resolve");
@@ -360,7 +367,7 @@ async fn cold_miss_keeps_srv_preference_when_a_answers_first() {
 }
 
 #[tokio::test]
-async fn buffered_zero_ttl_answer_behind_srv_is_requeried() {
+async fn zero_ttl_speculative_answer_resumes_the_sequential_walk() {
     // A answers at once with TTL 0, then the upstream rotates the address,
     // and the preferred SRV query answers (empty) 1 s later. The sequential
     // walk would have asked for A only after SRV and got the rotated address,
@@ -373,6 +380,8 @@ async fn buffered_zero_ttl_answer_behind_srv_is_requeried() {
         rotate_host_a: true,
         negative_first_host_a: false,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 0,
     })
     .await;
@@ -380,16 +389,16 @@ async fn buffered_zero_ttl_answer_behind_srv_is_requeried() {
 
     let resolved = tokio::time::timeout(
         Duration::from_secs(4),
-        cache.resolve("cold-ttl-zero.test", None, None),
+        cache.resolve("cold-ttl-zero.test.", None, None),
     )
     .await
     .expect("the delayed SRV reply arrives well inside the resolver timeout")
-    .expect("the re-queried A answer must resolve the host");
+    .expect("the resumed A lookup must resolve the host");
 
     assert_eq!(
-        dns.a_queries_for("cold-ttl-zero.test"),
+        dns.a_queries_named("cold-ttl-zero.test."),
         2,
-        "the buffered TTL-0 A answer must be re-queried once"
+        "the TTL-0 speculative answer must give way to the resumed A lookup"
     );
     assert_eq!(
         resolved,
@@ -399,13 +408,14 @@ async fn buffered_zero_ttl_answer_behind_srv_is_requeried() {
 }
 
 #[tokio::test]
-async fn buffered_negative_answer_behind_srv_is_rechecked() {
+async fn speculative_nodata_does_not_poison_the_resumed_walk() {
     // A answers NODATA at once; the record is published right after, and the
     // preferred SRV query answers (empty) 2 s later. The sequential walk would
     // have asked for A only after SRV and found it, so the buffered failure
-    // must be checked again instead of failing the resolve. The default 5 s
-    // error TTL is also hickory's negative-cache TTL: the speculative query
-    // must not have seeded that cache, or the recheck would replay NODATA.
+    // must not fail the resolve: the walk resumes with its own A lookup. The
+    // default 5 s error TTL is also hickory's negative-cache TTL, so the
+    // speculative query must not have seeded that cache, or the resumed
+    // lookup would replay NODATA.
     let dns = ColdMissDnsServer::spawn(Behavior {
         srv_target: None,
         hold_srv_until_a: true,
@@ -414,6 +424,8 @@ async fn buffered_negative_answer_behind_srv_is_rechecked() {
         rotate_host_a: false,
         negative_first_host_a: true,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 60,
     })
     .await;
@@ -421,20 +433,20 @@ async fn buffered_negative_answer_behind_srv_is_rechecked() {
 
     let resolved = tokio::time::timeout(
         Duration::from_secs(4),
-        cache.resolve("cold-negative.test", None, None),
+        cache.resolve("cold-negative.test.", None, None),
     )
     .await
     .expect("the delayed SRV reply arrives well inside the resolver timeout")
-    .expect("the rechecked A query must find the newly published record");
+    .expect("the resumed A lookup must find the newly published record");
 
     assert_eq!(resolved, IpAddr::V4(HOST_IP));
     assert_eq!(
         dns.a_queries_named("cold-negative.test."),
         2,
-        "the buffered NODATA answer must be checked once more"
+        "after SRV-empty the walk must resume with its own A lookup"
     );
     assert!(
-        !cache.is_cached_error("cold-negative.test"),
+        !cache.is_cached_error("cold-negative.test."),
         "a speculative failure must not install an error row"
     );
 }
@@ -451,19 +463,21 @@ async fn cold_miss_overlaps_srv_and_aaaa_when_aaaa_follows_srv() {
         rotate_host_a: false,
         negative_first_host_a: false,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 60,
     })
     .await;
     let cache = dns.cache_with_order(Some("SRV,AAAA"));
 
-    let resolved = tokio::time::timeout(OVERLAP_BUDGET, cache.resolve("cold-v6.test", None, None))
+    let resolved = tokio::time::timeout(OVERLAP_BUDGET, cache.resolve("cold-v6.test.", None, None))
         .await
         .expect("a cold miss must not wait for the SRV reply before sending the AAAA query")
         .expect("the AAAA answer must resolve the host once SRV answers empty");
 
     assert_eq!(resolved, IpAddr::V6(HOST_IP6));
     assert_eq!(
-        dns.a_queries_for("cold-v6.test"),
+        dns.a_queries_named("cold-v6.test."),
         0,
         "an SRV,AAAA order sends no A query"
     );
@@ -482,18 +496,105 @@ async fn srv_answer_returns_while_the_speculative_a_query_is_unanswered() {
         rotate_host_a: false,
         negative_first_host_a: false,
         hold_host_a: true,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 60,
     })
     .await;
     let cache = dns.cache();
 
     let resolved =
-        tokio::time::timeout(OVERLAP_BUDGET, cache.resolve("cold-hold.test", None, None))
+        tokio::time::timeout(OVERLAP_BUDGET, cache.resolve("cold-hold.test.", None, None))
             .await
             .expect("an SRV answer must not wait for the speculative A query")
             .expect("the SRV target must resolve");
 
     assert_eq!(resolved, IpAddr::V4(SRV_TARGET_IP));
+}
+
+#[tokio::test]
+async fn srv_empty_resumes_through_a_resolver_cache_hit_not_the_speculative_query() {
+    // Resolving `seed.dns-seed.test.` follows its SRV record to the target
+    // and caches the target's A record in the resolver. The target itself
+    // then misses Ferrum's cache: its SRV answers empty at once, while its
+    // speculative A query is never answered. The resumed sequential walk must
+    // find the cached A record, as main does, without waiting for or relying
+    // on the speculative query. The target has five dots, so even an
+    // `ndots:5` search list resolves it as absolute first.
+    const TARGET: &str = "cached.a.b.c.dns-seed.test.";
+    let dns = ColdMissDnsServer::spawn(Behavior {
+        srv_target: Some(TARGET),
+        hold_srv_until_a: false,
+        srv_delay_after_a: None,
+        answer_a: true,
+        rotate_host_a: false,
+        negative_first_host_a: false,
+        hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: true,
+        ttl: 60,
+    })
+    .await;
+    let cache = dns.cache_with_order(Some("SRV,A"));
+
+    let seeded = cache
+        .resolve("seed.dns-seed.test.", None, None)
+        .await
+        .expect("the seed host resolves through its SRV target");
+    assert_eq!(seeded, IpAddr::V4(HOST_IP));
+    assert_eq!(
+        dns.a_queries_named(TARGET),
+        1,
+        "the SRV target A lookup seeds the cache"
+    );
+
+    let resolved = tokio::time::timeout(OVERLAP_BUDGET, cache.resolve(TARGET, None, None))
+        .await
+        .expect("SRV-empty must resume the walk without waiting for the speculative A query")
+        .expect("the resolver's cached A record must answer the resumed walk");
+
+    assert_eq!(resolved, IpAddr::V4(HOST_IP));
+    assert_eq!(
+        dns.a_queries_named(TARGET),
+        2,
+        "only the speculative query reaches the server; the resumed walk hits the cache"
+    );
+    assert!(
+        !cache.is_cached_error(TARGET),
+        "a cached answer must not be replaced by an error row"
+    );
+}
+
+#[tokio::test]
+async fn srv_empty_does_not_wait_for_a_pending_speculative_query() {
+    // SRV answers empty at once and the first (speculative) A query is never
+    // answered. The resolve must resume with its own A lookup and return
+    // promptly, as the sequential walk would.
+    let dns = ColdMissDnsServer::spawn(Behavior {
+        srv_target: None,
+        hold_srv_until_a: false,
+        srv_delay_after_a: None,
+        answer_a: true,
+        rotate_host_a: false,
+        negative_first_host_a: false,
+        hold_host_a: false,
+        hold_first_host_a: true,
+        hold_repeat_host_a: false,
+        ttl: 60,
+    })
+    .await;
+    let cache = dns.cache();
+
+    let resolved = tokio::time::timeout(
+        OVERLAP_BUDGET,
+        cache.resolve("cold-pending.test.", None, None),
+    )
+    .await
+    .expect("SRV-empty must not wait for the pending speculative A query")
+    .expect("the resumed A lookup must resolve the host");
+
+    assert_eq!(resolved, IpAddr::V4(HOST_IP));
+    assert_eq!(dns.a_queries_named("cold-pending.test."), 2);
 }
 
 #[tokio::test]
@@ -508,33 +609,41 @@ async fn cold_miss_with_no_answers_still_fails() {
         rotate_host_a: false,
         negative_first_host_a: false,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 60,
     })
     .await;
     let cache = dns.cache();
 
-    let result = tokio::time::timeout(OVERLAP_BUDGET, cache.resolve("cold-empty.test", None, None))
-        .await
-        .expect("an all-empty cold miss must finish within the overlap budget");
+    let result = tokio::time::timeout(
+        OVERLAP_BUDGET,
+        cache.resolve("cold-empty.test.", None, None),
+    )
+    .await
+    .expect("an all-empty cold miss must finish within the overlap budget");
 
     assert!(result.is_err(), "no record type answered, got {result:?}");
     assert!(
-        cache.is_cached_error("cold-empty.test"),
+        cache.is_cached_error("cold-empty.test."),
         "the failure must still be negatively cached"
     );
 }
 
 #[tokio::test]
 async fn known_record_type_refresh_stays_serial() {
-    assert_known_srv_row_refresh_sends_no_speculative_a("steady-srv.test", None).await;
+    assert_known_srv_row_refresh_sends_no_speculative_a("steady-srv.test.", None).await;
 }
 
 #[tokio::test]
 async fn known_record_type_refresh_stays_serial_without_cache_token() {
     // Without `CACHE` the cached type does not lead the order, but the row
     // still records SRV, so the re-resolve is not a cold miss.
-    assert_known_srv_row_refresh_sends_no_speculative_a("steady-nocache.test", Some("SRV,A,CNAME"))
-        .await;
+    assert_known_srv_row_refresh_sends_no_speculative_a(
+        "steady-nocache.test.",
+        Some("SRV,A,CNAME"),
+    )
+    .await;
 }
 
 /// After SRV answers once, the row remembers it. The next synchronous resolve
@@ -552,6 +661,8 @@ async fn assert_known_srv_row_refresh_sends_no_speculative_a(
         rotate_host_a: false,
         negative_first_host_a: false,
         hold_host_a: false,
+        hold_first_host_a: false,
+        hold_repeat_host_a: false,
         ttl: 1,
     })
     .await;
@@ -567,7 +678,7 @@ async fn assert_known_srv_row_refresh_sends_no_speculative_a(
     // Snapshot after the wait so the cold miss's dropped A query is counted.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let srv_before = dns.srv_queries();
-    let a_before = dns.a_queries_for(hostname);
+    let a_before = dns.a_queries_named(hostname);
 
     let second = cache
         .resolve(hostname, None, Some(1))
@@ -579,7 +690,7 @@ async fn assert_known_srv_row_refresh_sends_no_speculative_a(
         "the second resolve must reach the DNS server"
     );
     assert_eq!(
-        dns.a_queries_for(hostname),
+        dns.a_queries_named(hostname),
         a_before,
         "a known record type must not trigger a speculative A query"
     );
