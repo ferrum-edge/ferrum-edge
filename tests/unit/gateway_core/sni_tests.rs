@@ -2235,7 +2235,13 @@ fn assert_sni_admission_taxonomy(error: &anyhow::Error, expected_message: &str) 
     // Defence in depth: even if a later path recorded this class, it is
     // health-neutral — including when `connection_error` is true.
     let cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-    apply_circuit_breaker_outcome_for_test(&cb, 0, true, summary.error_class, false);
+    apply_circuit_breaker_outcome_for_test(
+        &cb,
+        0,
+        true,
+        summary.error_class,
+        ferrum_edge::circuit_breaker::ProbeTicket::NonProbe,
+    );
     assert_eq!(cb.failure_count(), 0);
     assert_eq!(cb.state_name(), "closed");
 }

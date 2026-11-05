@@ -829,7 +829,7 @@ pub(crate) fn concretize_wildcard_target_for_request(
 
 /// Check whether the circuit breaker allows this request to proceed.
 ///
-/// Returns `Ok((cb_target_key, admitted_breaker, is_half_open_probe,
+/// Returns `Ok((cb_target_key, admitted_breaker, probe_ticket,
 /// admission_generation))` when the request is allowed, or `Err(())` when the
 /// circuit is open and the request should be rejected with 503. The caller
 /// hands the admission to a `HalfOpenProbeGuard`, which settles the attempt's
@@ -861,13 +861,8 @@ pub(crate) fn check_circuit_breaker(
             // Keep the admitting breaker: the attempt's outcome and probe slot
             // settle on exactly this instance (issue #6799), never on one
             // re-resolved later from the request's captured config.
-            Ok((cb, is_half_open_probe, admission_open_epoch)) => {
-                return Ok((
-                    cb_target_key,
-                    Some(cb),
-                    is_half_open_probe,
-                    admission_open_epoch,
-                ));
+            Ok((cb, probe_ticket, admission_open_epoch)) => {
+                return Ok((cb_target_key, Some(cb), probe_ticket, admission_open_epoch));
             }
             Err(_) => {
                 warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
@@ -876,16 +871,21 @@ pub(crate) fn check_circuit_breaker(
         }
     }
 
-    Ok((cb_target_key, None, false, 0))
+    Ok((
+        cb_target_key,
+        None,
+        crate::circuit_breaker::ProbeTicket::NonProbe,
+        0,
+    ))
 }
 
 /// What [`check_circuit_breaker`] admitted: the breaker key, the admitting
-/// breaker instance (`None` when the proxy configures none), whether it admitted
-/// a HALF_OPEN probe, and the open generation the admission was decided in.
+/// breaker instance (`None` when the proxy configures none), the admission's
+/// probe ticket, and the open generation the admission was decided in.
 pub(crate) type CircuitBreakerAdmission = (
     Option<String>,
     Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
-    bool,
+    crate::circuit_breaker::ProbeTicket,
     u64,
 );
 
@@ -1119,7 +1119,7 @@ pub(crate) fn record_backend_outcome_no_conn_end(
 ///   ceiling is the operator's own gateway-side policy, so counting it against
 ///   the destination would let a saturated cap eject a perfectly healthy
 ///   backend (and, with several targets saturated, every target at once). The
-///   raw-TCP over-cap path records `cb.record_neutral()` for exactly this
+///   raw-TCP over-cap path settles the breaker `Neutral` for exactly this
 ///   reason; this keeps the HTTP-family pooled transports identical. Unlike the
 ///   classes above it is still pre-wire, so `retry_on_connect_failure` may
 ///   rotate to another target with its own admission lane.
@@ -1283,19 +1283,30 @@ pub(crate) fn apply_circuit_breaker_outcome(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    ticket: crate::circuit_breaker::ProbeTicket,
 ) {
-    if client_side_no_backend_signal(error_class) {
-        cb.record_neutral(is_half_open_probe);
+    use crate::circuit_breaker::BreakerOutcome;
+    let outcome = if client_side_no_backend_signal(error_class) {
+        BreakerOutcome::Neutral
     } else if connection_error {
-        cb.record_failure(response_status, true, is_half_open_probe);
+        BreakerOutcome::Failure {
+            status_code: response_status,
+            connection_error: true,
+        }
     } else if cb.config().failure_status_codes.contains(&response_status) {
-        cb.record_failure(response_status, false, is_half_open_probe);
+        BreakerOutcome::Failure {
+            status_code: response_status,
+            connection_error: false,
+        }
     } else if error_class_is_post_wire_backend_failure(error_class) {
-        cb.record_failure(response_status, true, is_half_open_probe);
+        BreakerOutcome::Failure {
+            status_code: response_status,
+            connection_error: true,
+        }
     } else {
-        cb.record_success(is_half_open_probe);
-    }
+        BreakerOutcome::Success
+    };
+    cb.settle(ticket, outcome);
 }
 
 /// Like [`apply_circuit_breaker_outcome`], but for a DEFERRED streaming outcome:
@@ -1310,20 +1321,14 @@ pub(crate) fn apply_deferred_circuit_breaker_outcome(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    ticket: crate::circuit_breaker::ProbeTicket,
     admission_open_epoch: u64,
 ) {
     if cb.open_epoch() != admission_open_epoch {
-        cb.record_neutral(is_half_open_probe);
+        cb.settle(ticket, crate::circuit_breaker::BreakerOutcome::Neutral);
         return;
     }
-    apply_circuit_breaker_outcome(
-        cb,
-        response_status,
-        connection_error,
-        error_class,
-        is_half_open_probe,
-    );
+    apply_circuit_breaker_outcome(cb, response_status, connection_error, error_class, ticket);
 }
 
 /// Whether [`apply_circuit_breaker_outcome`] would record a backend FAILURE (as
@@ -1425,12 +1430,12 @@ fn record_backend_outcome_inner(
                 response_status,
                 connection_error,
                 error_class,
-                cb_settlement.is_half_open_probe,
+                cb_settlement.ticket,
             );
         } else {
-            cb.record_neutral_for_admission(
-                cb_settlement.is_half_open_probe,
-                cb_settlement.admission_generation,
+            cb.settle(
+                cb_settlement.ticket,
+                crate::circuit_breaker::BreakerOutcome::Neutral,
             );
         }
     }
@@ -2713,15 +2718,11 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (final_cb_target_key, admitted, is_half_open_probe, admission_open_epoch) =
+        let (final_cb_target_key, admitted, probe_ticket, _admission_open_epoch) =
             check_circuit_breaker(proxy, &state, None).expect("timeout=0 admits a probe");
-        let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
-            admitted.as_ref(),
-            is_half_open_probe,
-            admission_open_epoch,
-        );
+        let cb_probe = crate::proxy::HalfOpenProbeGuard::new(admitted.as_ref(), probe_ticket);
         assert!(
-            is_half_open_probe,
+            probe_ticket.is_probe(),
             "the request must own a HALF_OPEN probe slot"
         );
         assert_eq!(cb.state_name(), "half_open");

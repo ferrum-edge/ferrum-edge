@@ -350,7 +350,7 @@ Out of scope: the `recv_data` Err path is recovered by `drain_h3_response_body` 
 - **Non-idempotent methods (POST / PUT / DELETE / PATCH)**: NOT retried under any default config — replaying a request the backend may have processed risks duplicate side effects. Operators who want retry-on-502 for POST must explicitly opt in via both `retryable_status_codes: [502]` AND adding the method to `retryable_methods`.
 - **Pre-wire failures (DNS / TLS / connect refused)** honor `retry_on_connect_failure` regardless of method.
 
-The same `request_reached_wire`-derived predicate drives the circuit breaker (`record_failure(connection_error=false)`) and the load-balancer outcome reporting in `record_backend_outcome`, so a graceful close does not trip `failure_threshold` counters as a transport fault and the target's least-latency EWMA receives its real backend-processing latency. Every other post-wire class (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout`) is likewise not a connection error.
+The same `request_reached_wire`-derived predicate drives the circuit breaker (`BreakerOutcome::Failure { connection_error: false, .. }`) and the load-balancer outcome reporting in `record_backend_outcome`, so a graceful close does not trip `failure_threshold` counters as a transport fault and the target's least-latency EWMA receives its real backend-processing latency. Every other post-wire class (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout`) is likewise not a connection error.
 
 **Per-target dispatch contract**: The retry loop in `proxy_to_backend_inner` (see [src/proxy/mod.rs](../src/proxy/mod.rs)) captures the dispatch decision per current target and threads it through every attempt:
 
@@ -1049,13 +1049,13 @@ for this H3 behavior.
 H3 WebSocket sessions participate in the same backend-isolation +
 session-accounting infrastructure the H1/H2 path uses:
 
-- **Circuit breaker** — backend connect failure records
-  `record_failure(502, is_pre_wire, is_half_open_probe)` against
+- **Circuit breaker** — backend connect failure settles the admission's
+  probe ticket as `Failure { 502, connection_error: is_pre_wire }` against
   the resolved target, where `is_pre_wire` follows the unified
   `retry::request_reached_wire` boundary (a backend that received the
   upgrade and rejected it post-wire does NOT charge the breaker's
-  connect-error counter). Successful 200 upgrades record
-  `record_success(is_half_open_probe)` so a half-open probe that
+  connect-error counter). Successful 200 upgrades settle the ticket as
+  `Success` so a half-open probe that
   bootstraps a WebSocket counts as a recovery sample.
 - **Load balancer** — `LoadBalancerConnectionGuard` increments the
   final selected target's connection count on construction (just before

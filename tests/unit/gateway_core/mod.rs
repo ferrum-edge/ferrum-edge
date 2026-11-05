@@ -149,6 +149,7 @@ mod mesh_dual_stack_capture_tests;
 mod mesh_host_udp_capture_plan_tests;
 mod mesh_injector_ca_crd_helm_tests;
 mod mesh_listener_direction_ports_tests;
+mod mesh_pending_generation_tests;
 mod mesh_pool_shared_creation_tests;
 mod mesh_relayed_upload_reset_tests;
 mod mesh_revision_gate_tests;

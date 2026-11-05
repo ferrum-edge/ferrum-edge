@@ -941,7 +941,13 @@ fn record_cross_protocol_retry_failure(
         &proxy.id,
         cb_target_key,
     ) {
-        cb.record_failure(response_status, connection_error, cb_probe.take_slot());
+        cb.settle(
+            cb_probe.take_slot(),
+            crate::circuit_breaker::BreakerOutcome::Failure {
+                status_code: response_status,
+                connection_error,
+            },
+        );
     }
 }
 
@@ -15766,11 +15772,11 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (admitted, is_half_open_probe, admission_generation) = state
+        let (admitted, probe_ticket, _admission_generation) = state
             .circuit_breaker_cache
             .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
             .expect("half-open probe should be admitted");
-        assert!(is_half_open_probe);
+        assert!(probe_ticket.is_probe());
         assert_eq!(cb.half_open_in_flight(), 1);
         assert!(
             state
@@ -15780,12 +15786,7 @@ mod tests {
             "single probe slot should be occupied before neutral release"
         );
 
-        crate::proxy::HalfOpenProbeGuard::new(
-            Some(&admitted),
-            is_half_open_probe,
-            admission_generation,
-        )
-        .release_neutral();
+        crate::proxy::HalfOpenProbeGuard::new(Some(&admitted), probe_ticket).release_neutral();
 
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");

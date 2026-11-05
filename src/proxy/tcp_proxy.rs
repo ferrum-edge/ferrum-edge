@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::backend_conn_limit::{
     BackendConnectionGuard, BackendConnectionLimitExceeded, BackendConnectionLimiter,
 };
-use crate::circuit_breaker::CircuitBreakerCache;
+use crate::circuit_breaker::{BreakerOutcome, CircuitBreakerCache};
 use crate::config::db_backend::NamespacedResourceId;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendTlsConfigBuilder;
@@ -4196,19 +4196,12 @@ async fn handle_tcp_connection_inner(
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
                     ) {
-                        Ok((cb, is_half_open_probe, admission_generation)) => {
+                        Ok((cb, probe_ticket, _admission_generation)) => {
                             if attempt == 0 {
-                                cb_info.cb_probe = HalfOpenProbeGuard::for_admitted_probe(
-                                    &cb,
-                                    is_half_open_probe,
-                                    admission_generation,
-                                );
+                                cb_info.cb_probe =
+                                    HalfOpenProbeGuard::for_admitted_probe(&cb, probe_ticket);
                             } else {
-                                cb_info.cb_probe.rearm(
-                                    &cb,
-                                    is_half_open_probe,
-                                    admission_generation,
-                                );
+                                cb_info.cb_probe.rearm(&cb, probe_ticket);
                             }
                             admitted_cb = Some(cb);
                         }
@@ -4269,7 +4262,13 @@ async fn handle_tcp_connection_inner(
                             if crate::dns::is_egress_policy_denial(&e) {
                                 cb_info.cb_probe.release_neutral();
                             } else {
-                                cb.record_failure(502, true, cb_info.cb_probe.take_slot());
+                                cb.settle(
+                                    cb_info.cb_probe.take_slot(),
+                                    BreakerOutcome::Failure {
+                                        status_code: 502,
+                                        connection_error: true,
+                                    },
+                                );
                             }
                         }
                         return Err(stream_dns_setup_error(&params.backend_host, e));
@@ -4377,7 +4376,13 @@ async fn handle_tcp_connection_inner(
                                     cb_info.cb_target_key.as_deref(),
                                 )
                             {
-                                cb.record_failure(502, true, cb_info.cb_probe.take_slot());
+                                cb.settle(
+                                    cb_info.cb_probe.take_slot(),
+                                    BreakerOutcome::Failure {
+                                        status_code: 502,
+                                        connection_error: true,
+                                    },
+                                );
                             }
                         })?,
                 };
@@ -4617,8 +4622,14 @@ async fn handle_tcp_connection_inner(
                 Some(failure) if relay_failure_is_client_facing(failure) => {
                     cb_info.cb_probe.release_neutral();
                 }
-                Some(_) => cb.record_failure(502, true, cb_info.cb_probe.take_slot()),
-                None => cb.record_success(cb_info.cb_probe.take_slot()),
+                Some(_) => cb.settle(
+                    cb_info.cb_probe.take_slot(),
+                    BreakerOutcome::Failure {
+                        status_code: 502,
+                        connection_error: true,
+                    },
+                ),
+                None => cb.settle(cb_info.cb_probe.take_slot(), BreakerOutcome::Success),
             }
         }
 
@@ -5027,7 +5038,13 @@ async fn handle_tcp_connection_inner(
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
             ) {
-                cb.record_failure(502, true, cb_info.cb_probe.take_slot());
+                cb.settle(
+                    cb_info.cb_probe.take_slot(),
+                    BreakerOutcome::Failure {
+                        status_code: 502,
+                        connection_error: true,
+                    },
+                );
             }
         };
 
@@ -5091,19 +5108,12 @@ async fn handle_tcp_connection_inner(
                 current_cb_info.cb_target_key.as_deref(),
                 cb_config,
             ) {
-                Ok((cb, is_half_open_probe, admission_generation)) => {
+                Ok((cb, probe_ticket, _admission_generation)) => {
                     if attempt == 0 {
-                        current_cb_info.cb_probe = HalfOpenProbeGuard::for_admitted_probe(
-                            &cb,
-                            is_half_open_probe,
-                            admission_generation,
-                        );
+                        current_cb_info.cb_probe =
+                            HalfOpenProbeGuard::for_admitted_probe(&cb, probe_ticket);
                     } else {
-                        current_cb_info.cb_probe.rearm(
-                            &cb,
-                            is_half_open_probe,
-                            admission_generation,
-                        );
+                        current_cb_info.cb_probe.rearm(&cb, probe_ticket);
                     }
                 }
                 Err(_) => {
@@ -5970,8 +5980,17 @@ async fn handle_tcp_connection_inner(
             Some(failure) if relay_failure_is_client_facing(failure) => {
                 current_cb_info.cb_probe.release_neutral();
             }
-            Some(_) => cb.record_failure(502, true, current_cb_info.cb_probe.take_slot()),
-            None => cb.record_success(current_cb_info.cb_probe.take_slot()),
+            Some(_) => cb.settle(
+                current_cb_info.cb_probe.take_slot(),
+                BreakerOutcome::Failure {
+                    status_code: 502,
+                    connection_error: true,
+                },
+            ),
+            None => cb.settle(
+                current_cb_info.cb_probe.take_slot(),
+                BreakerOutcome::Success,
+            ),
         }
     }
 
@@ -8080,10 +8099,16 @@ async fn write_outbound_proxy_v2_header(
 /// handled pre-admission and never reach this helper.
 fn record_admitted_cb_proxy_v2_write_failure(
     admitted_cb: Option<&crate::circuit_breaker::CircuitBreaker>,
-    is_half_open_probe: bool,
+    ticket: crate::circuit_breaker::ProbeTicket,
 ) {
     if let Some(cb) = admitted_cb {
-        cb.record_failure(502, true, is_half_open_probe);
+        cb.settle(
+            ticket,
+            BreakerOutcome::Failure {
+                status_code: 502,
+                connection_error: true,
+            },
+        );
     }
 }
 
@@ -8202,8 +8227,8 @@ mod outbound_proxy_v2_passthrough_cb_tests {
         // Trip open, then admit the single half-open probe.
         admitted.record_failure(502, true, false);
         assert_eq!(admitted.state_name(), "open");
-        let is_probe = admitted.can_execute().expect("probe admission");
-        assert!(is_probe);
+        let (ticket, _) = admitted.admit().expect("probe admission");
+        assert!(ticket.is_probe());
         assert_eq!(admitted.half_open_in_flight(), 1);
 
         // Accept then abortively close so the PROXY write hits a reset/closed peer.
@@ -8233,17 +8258,20 @@ mod outbound_proxy_v2_passthrough_cb_tests {
             "write failure must be I/O-classified: {write_err}"
         );
 
-        record_admitted_cb_proxy_v2_write_failure(Some(admitted.as_ref()), is_probe);
+        record_admitted_cb_proxy_v2_write_failure(Some(admitted.as_ref()), ticket);
         assert_eq!(
             admitted.half_open_in_flight(),
             0,
             "write failure must release the admitted probe slot"
         );
         assert_eq!(admitted.state_name(), "open");
-        // Settling again must not use is_half_open_probe=true (that would be a
+        // Settling again must not reuse the probe ticket (that would be a
         // double-record). A non-probe failure leaves the slot at zero so the
         // next OPEN→HALF_OPEN cycle can admit.
-        record_admitted_cb_proxy_v2_write_failure(Some(admitted.as_ref()), false);
+        record_admitted_cb_proxy_v2_write_failure(
+            Some(admitted.as_ref()),
+            crate::circuit_breaker::ProbeTicket::NonProbe,
+        );
         assert_eq!(admitted.half_open_in_flight(), 0);
         assert!(
             admitted.can_execute().is_ok(),
@@ -8255,8 +8283,8 @@ mod outbound_proxy_v2_passthrough_cb_tests {
     async fn write_success_does_not_settle_breaker() {
         let admitted = probe_breaker();
         admitted.record_failure(502, true, false);
-        let is_probe = admitted.can_execute().expect("probe admission");
-        assert!(is_probe);
+        let (ticket, _) = admitted.admit().expect("probe admission");
+        assert!(ticket.is_probe());
         assert_eq!(admitted.half_open_in_flight(), 1);
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -8302,7 +8330,7 @@ mod outbound_proxy_v2_passthrough_cb_tests {
             "successful write must not settle the probe — relay records the outcome once"
         );
         // Production success path records success once after relay.
-        admitted.record_success(is_probe);
+        admitted.settle(ticket, crate::circuit_breaker::BreakerOutcome::Success);
         assert_eq!(admitted.half_open_in_flight(), 0);
         assert_eq!(admitted.state_name(), "closed");
     }

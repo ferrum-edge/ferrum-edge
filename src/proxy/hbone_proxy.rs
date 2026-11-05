@@ -341,12 +341,19 @@ pub(crate) fn settle_hbone_backend_connect_circuit_breaker_outcome(
     cb: &crate::circuit_breaker::CircuitBreaker,
     status: StatusCode,
     policy_refusal: bool,
-    is_half_open_probe: bool,
+    ticket: crate::circuit_breaker::ProbeTicket,
 ) {
+    use crate::circuit_breaker::BreakerOutcome;
     if policy_refusal {
-        cb.record_neutral(is_half_open_probe);
+        cb.settle(ticket, BreakerOutcome::Neutral);
     } else {
-        cb.record_failure(status.as_u16(), true, is_half_open_probe);
+        cb.settle(
+            ticket,
+            BreakerOutcome::Failure {
+                status_code: status.as_u16(),
+                connection_error: true,
+            },
+        );
     }
 }
 
@@ -1244,8 +1251,8 @@ pub(super) async fn handle_hbone_request(
 
     // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
     // responses are excluded from the deferred-dispatch path, #1649); the
-    // admission generation only binds the probe guard's neutral release (#6177).
-    let (cb_target_key, cb_admitted, cb_is_half_open_probe, cb_admission_generation) =
+    // admission's probe ticket binds every settlement to its cycle (#6177, CB-1).
+    let (cb_target_key, cb_admitted, cb_probe_ticket, _cb_admission_generation) =
         match backend_dispatch::check_circuit_breaker(proxy, state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -1282,11 +1289,7 @@ pub(super) async fn handle_hbone_request(
     // client's upgrade handle and the backend dial, and a peer that vanishes in
     // that window drops this future without running either settle site. Dropping
     // the guard releases the slot NEUTRALLY instead of wedging the breaker.
-    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
-        cb_admitted.as_ref(),
-        cb_is_half_open_probe,
-        cb_admission_generation,
-    );
+    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(cb_admitted.as_ref(), cb_probe_ticket);
 
     let hbone_on_upgrade = match client_request_body {
         ClientRequestBody::Streaming(request) => {
@@ -1444,7 +1447,10 @@ pub(super) async fn handle_hbone_request(
         &proxy.id,
         cb_target_key.as_deref(),
     ) {
-        cb.record_success(cb_probe.take_slot());
+        cb.settle(
+            cb_probe.take_slot(),
+            crate::circuit_breaker::BreakerOutcome::Success,
+        );
     }
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())
         && let Some(upstream) = LoadBalancerCache::get_upstream_from(

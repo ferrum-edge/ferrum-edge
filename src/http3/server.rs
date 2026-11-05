@@ -3404,11 +3404,7 @@ async fn handle_h3_request(
     // Global request admission control (HTTP/3). Match H1/H2: acquire pairs
     // with begin_drain's release store when rejecting new streams on
     // already-established connections.
-    if state
-        .overload
-        .reject_new_requests
-        .load(std::sync::atomic::Ordering::Acquire)
-    {
+    if state.overload.request_admission.rejects() {
         record_h3_flavor_aware_reject(&state, http_flavor, 503);
         if grpc_web_response_content_type.is_some() {
             send_h3_error_flavor_aware(
@@ -7124,7 +7120,7 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::CircuitBreakerAdmission,
         (),
     > = if is_connect_udp_request {
-        Ok((None, None, false, 0))
+        Ok((None, None, crate::circuit_breaker::ProbeTicket::NonProbe, 0))
     } else {
         crate::proxy::backend_dispatch::check_circuit_breaker(
             &proxy,
@@ -7132,7 +7128,7 @@ async fn handle_h3_request(
             upstream_target.as_deref(),
         )
     };
-    let (cb_target_key, cb_admitted, cb_is_half_open_probe, cb_admission_generation) =
+    let (cb_target_key, cb_admitted, cb_probe_ticket, _cb_admission_generation) =
         match circuit_breaker_admission {
             Ok(result) => result,
             Err(()) => {
@@ -7233,11 +7229,7 @@ async fn handle_h3_request(
     // `?` return from a failed client write reaches none of those sites either,
     // and the leaked slot wedges the breaker just the same. Dropping `cb_probe`
     // releases the slot NEUTRALLY on every such path.
-    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
-        cb_admitted.as_ref(),
-        cb_is_half_open_probe,
-        cb_admission_generation,
-    );
+    let cb_probe = crate::proxy::HalfOpenProbeGuard::new(cb_admitted.as_ref(), cb_probe_ticket);
 
     // Preserve fail-fast breaker behavior for ordinary request-body plugins:
     // only drain/transform their H3 body after the selected target's breaker
@@ -10829,15 +10821,20 @@ async fn handle_h3_request(
                     // return during the backoff must not release a second slot.
                     let retry_probe_slot = cb_probe.take_slot();
                     if client_side_no_backend_signal(result.error_class) {
-                        cb.record_neutral(retry_probe_slot);
-                    } else {
-                        cb.record_failure(
-                            result.status,
-                            h3_connection_error(
-                                result.handoff.request_on_wire(),
-                                result.error_class,
-                            ),
+                        cb.settle(
                             retry_probe_slot,
+                            crate::circuit_breaker::BreakerOutcome::Neutral,
+                        );
+                    } else {
+                        cb.settle(
+                            retry_probe_slot,
+                            crate::circuit_breaker::BreakerOutcome::Failure {
+                                status_code: result.status,
+                                connection_error: h3_connection_error(
+                                    result.handoff.request_on_wire(),
+                                    result.error_class,
+                                ),
+                            },
                         );
                     }
                 }

@@ -76,6 +76,14 @@ pub const MESH_SUBSCRIBE_MAX_SILENCE_SECS: u64 = 150;
 /// updates); it must never be able to outrank stream retirement.
 pub const MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS: u64 = 15;
 
+/// ADS apply debounce: a burst of per-type responses for one logical change is
+/// collapsed into a single apply once the stream has been quiet this long.
+pub const MESH_CONFIG_APPLY_DEBOUNCE_MS: u64 = 25;
+
+/// Cap on how long continuous ADS churn may postpone applying the first staged
+/// generation of a burst.
+pub const MESH_CONFIG_APPLY_MAX_DELAY_MS: u64 = 500;
+
 /// Per-invocation mesh configuration-stream timing policy.
 ///
 /// Production always uses [`MeshStreamTimings::production`]. The value is
@@ -107,6 +115,12 @@ pub struct MeshStreamTimings {
     /// request enqueue, or the native status-report unary RPC). See
     /// [`MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS`].
     pub outbound: Duration,
+    /// ADS apply debounce (`xds` and `stock_xds`). See
+    /// [`MESH_CONFIG_APPLY_DEBOUNCE_MS`].
+    pub apply_debounce: Duration,
+    /// ADS apply max-delay cap (`xds` and `stock_xds`). See
+    /// [`MESH_CONFIG_APPLY_MAX_DELAY_MS`].
+    pub apply_max_delay: Duration,
 }
 
 impl MeshStreamTimings {
@@ -121,7 +135,23 @@ impl MeshStreamTimings {
             ),
             keepalive_timeout: Duration::from_secs(MESH_CONFIG_STREAM_HTTP2_KEEPALIVE_TIMEOUT_SECS),
             outbound: Duration::from_secs(MESH_CONFIG_STREAM_OUTBOUND_TIMEOUT_SECS),
+            apply_debounce: Duration::from_millis(MESH_CONFIG_APPLY_DEBOUNCE_MS),
+            apply_max_delay: Duration::from_millis(MESH_CONFIG_APPLY_MAX_DELAY_MS),
         }
+    }
+
+    /// Debounce deadline for a generation staged at `now` whose burst began at
+    /// `first_staged_at`: quiet for [`Self::apply_debounce`], but never later
+    /// than [`Self::apply_max_delay`] after the burst began.
+    pub fn apply_deadline(
+        self,
+        now: tokio::time::Instant,
+        first_staged_at: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        std::cmp::min(
+            now + self.apply_debounce,
+            first_staged_at + self.apply_max_delay,
+        )
     }
 
     /// Upper bound on detecting a half-open established transport under *this*

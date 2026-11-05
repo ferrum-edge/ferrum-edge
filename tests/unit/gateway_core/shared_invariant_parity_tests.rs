@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use ferrum_edge::circuit_breaker::CircuitBreaker;
+use ferrum_edge::circuit_breaker::{BreakerOutcome, CircuitBreaker, ProbeTicket};
 use ferrum_edge::config::types::{CircuitBreakerConfig, Proxy, UpstreamTarget};
 use ferrum_edge::config::{BackendEgressPolicy, EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
@@ -429,11 +429,11 @@ const DIRECT_PROBE_ADMISSION_SITES: &[(&str, &str, usize)] = &[
 ];
 
 /// What each direct-cache admission arm must contain, whitespace-stripped: the
-/// guard is bound to the generation that SAME admission returned (#6177).
-const DIRECT_ADMISSION_ARM: &str = "Ok((cb,is_half_open_probe,admission_generation))";
-const DIRECT_ADMISSION_GUARD: &str =
-    "HalfOpenProbeGuard::for_admitted_probe(&cb,is_half_open_probe,admission_generation";
-const DIRECT_ADMISSION_REARM: &str = "cb_probe.rearm(&cb,is_half_open_probe,admission_generation";
+/// guard owns the `ProbeTicket` that SAME admission returned, so the slot and
+/// its open generation travel as one value (#6177, CB-1).
+const DIRECT_ADMISSION_ARM: &str = "Ok((cb,probe_ticket,_admission_generation))";
+const DIRECT_ADMISSION_GUARD: &str = "HalfOpenProbeGuard::for_admitted_probe(&cb,probe_ticket";
+const DIRECT_ADMISSION_REARM: &str = "cb_probe.rearm(&cb,probe_ticket";
 
 /// Files that must own a guard rather than re-deriving the release: the
 /// admission sites plus every module they hand the guard to.
@@ -449,27 +449,28 @@ const PROBE_GUARD_HOLDERS: &[&str] = &[
 ];
 
 /// Every settle path on the shared guard:
-/// `(label, signature, terminator, neutral release it must reach)`. The guard's
-/// own releases are bound to the slot's admission generation (#6177), so a guard
-/// that outlives a reopen cannot free a later cycle's slot.
+/// `(label, signature, terminator, neutral release it must reach)`. Each release
+/// settles the admission's `ProbeTicket`, whose generation the breaker checks
+/// in the releasing CAS (#6177, CB-1), so a guard or recorder that outlives a
+/// reopen cannot free a later cycle's slot.
 const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str, &str)] = &[
     (
         "explicit gateway-side refusal",
         "    pub fn release_neutral(&self) {",
         "\n    }\n",
-        "record_neutral_for_admission(true, admission_generation)",
+        "cb.settle(ticket, BreakerOutcome::Neutral)",
     ),
     (
         "dropped future (client disconnect)",
         "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
-        "record_neutral_for_admission(true, admission_generation)",
+        "cb.settle(ticket, BreakerOutcome::Neutral)",
     ),
     (
         "gRPC streaming recorder handoff",
         "impl Drop for GrpcStreamingProbeRecorder {",
         "\n}\n",
-        "record_neutral(",
+        "self.cb.settle(self.ticket, BreakerOutcome::Neutral)",
     ),
 ];
 
@@ -588,18 +589,22 @@ fn every_probe_guard_settle_path_releases_neutrally() {
 #[test]
 fn taking_the_probe_slot_is_what_disarms_the_guard() {
     // The exactly-once property the whole design rests on: every explicit
-    // `record_*` argument comes from `take_slot`, which atomically clears the
-    // armed flag, so no path can release the same slot twice (a double release
+    // `settle` ticket comes from `take_slot`, which atomically clears the held
+    // ticket, so no path can release the same slot twice (a double release
     // decrements a DIFFERENT probe's slot and over-admits).
     let text = source("src/proxy/mod.rs");
-    let take = item_body(&text, "    pub fn take_slot(&self) -> bool {", "\n    }\n");
+    let take = item_body(
+        &text,
+        "    pub fn take_slot(&self) -> ProbeTicket {",
+        "\n    }\n",
+    );
     assert!(
-        take.contains("self.armed.swap(false"),
-        "`take_slot` must atomically clear the armed flag as it hands the slot over"
+        take.contains("self.slot.swap(0"),
+        "`take_slot` must atomically clear the held ticket as it hands the slot over"
     );
     let drop_body = item_body(&text, "impl Drop for HalfOpenProbeGuard {", "\n}\n");
     assert!(
-        drop_body.contains("self.armed.swap(false"),
+        drop_body.contains("self.slot.swap(0"),
         "the guard's `Drop` must claim the slot with the same atomic swap so it \
          cannot race an explicit release"
     );
@@ -750,7 +755,7 @@ fn every_http3_retry_loop_admits_each_attempt_through_the_circuit_breaker() {
     let admission = source("src/proxy/mod.rs");
     let helper = item_body(&admission, "pub(crate) fn admit_retry_attempt(", "\n}\n");
     assert!(helper.contains("circuit_breaker_cache.can_execute("));
-    assert!(helper.contains("cb_probe.rearm(&cb, is_half_open_probe, admission_generation)"));
+    assert!(helper.contains("cb_probe.rearm(&cb, probe_ticket)"));
     assert!(helper.contains("cb_probe.retire()"));
 }
 
@@ -844,10 +849,30 @@ fn record_probe_neutral(cb: &CircuitBreaker) {
     cb.record_neutral(true);
 }
 
-fn record_probe_neutral_for_admission(cb: &CircuitBreaker) {
-    // `breaker_holding_one_probe` admits with no concurrent transition, so the
-    // current generation is the probe's admission generation.
-    cb.record_neutral_for_admission(true, cb.open_epoch());
+/// The probe's own ticket. `breaker_holding_one_probe` admits with no
+/// concurrent transition, so the current generation is the admission's.
+fn admitted_probe_ticket(cb: &CircuitBreaker) -> ProbeTicket {
+    ProbeTicket::Probe {
+        generation: u32::try_from(cb.open_epoch()).expect("generation is a u32 field"),
+    }
+}
+
+fn settle_probe_success(cb: &CircuitBreaker) {
+    cb.settle(admitted_probe_ticket(cb), BreakerOutcome::Success);
+}
+
+fn settle_probe_tripping_failure(cb: &CircuitBreaker) {
+    cb.settle(
+        admitted_probe_ticket(cb),
+        BreakerOutcome::Failure {
+            status_code: 500,
+            connection_error: false,
+        },
+    );
+}
+
+fn settle_probe_neutral(cb: &CircuitBreaker) {
+    cb.settle(admitted_probe_ticket(cb), BreakerOutcome::Neutral);
 }
 
 /// One probe outcome: its label and the breaker call that reports it.
@@ -869,10 +894,9 @@ const PROBE_OUTCOMES: &[ProbeOutcome] = &[
         record_probe_connection_failure,
     ),
     ("record_neutral", record_probe_neutral),
-    (
-        "record_neutral_for_admission",
-        record_probe_neutral_for_admission,
-    ),
+    ("settle(Success)", settle_probe_success),
+    ("settle(Failure)", settle_probe_tripping_failure),
+    ("settle(Neutral)", settle_probe_neutral),
 ];
 
 #[test]
@@ -888,6 +912,339 @@ fn every_probe_outcome_kind_releases_the_half_open_slot() {
             "{label} must release the HALF_OPEN probe slot"
         );
     }
+}
+
+/// Whether `byte` can continue an identifier (non-ASCII bytes count, so a
+/// multibyte identifier never looks like a literal prefix).
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
+/// Length of the comment, string, raw string, byte string or char literal
+/// starting at `at` — the tokens that can hide brackets or `#[` — or `None`
+/// when `at` starts ordinary code (a lifetime's quote included).
+fn opaque_token_len(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = &bytes[at..];
+    let after_ident = at > 0 && is_ident_byte(bytes[at - 1]);
+    if rest.starts_with(b"//") {
+        return Some(rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len()));
+    }
+    if rest.starts_with(b"/*") {
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i..].starts_with(b"/*") {
+                depth += 1;
+                i += 2;
+            } else if rest[i..].starts_with(b"*/") {
+                depth -= 1;
+                i += 2;
+                if depth == 0 {
+                    return Some(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        return Some(rest.len());
+    }
+    if !after_ident {
+        let raw_prefix = if rest.starts_with(b"br") {
+            Some(2)
+        } else if rest.starts_with(b"r") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(prefix) = raw_prefix {
+            let hashes = rest[prefix..].iter().take_while(|&&b| b == b'#').count();
+            if rest.get(prefix + hashes) == Some(&b'"') {
+                let mut closing = vec![b'"'];
+                closing.resize(1 + hashes, b'#');
+                let body = prefix + hashes + 1;
+                return Some(
+                    rest[body..]
+                        .windows(closing.len())
+                        .position(|window| window == closing.as_slice())
+                        .map_or(rest.len(), |p| body + p + closing.len()),
+                );
+            }
+        }
+    }
+    let string_prefix = if rest.starts_with(b"\"") {
+        Some(0)
+    } else if !after_ident && rest.starts_with(b"b\"") {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(prefix) = string_prefix {
+        let mut i = prefix + 1;
+        while i < rest.len() {
+            match rest[i] {
+                b'\\' => i += 2,
+                b'"' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        return Some(rest.len());
+    }
+    let quote = if rest.starts_with(b"'") {
+        Some(0)
+    } else if !after_ident && rest.starts_with(b"b'") {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(q) = quote {
+        if rest.get(q + 1) == Some(&b'\\') {
+            // '\n', '\'', '\u{..}': the escaped byte sits at q + 2.
+            return Some(
+                rest.get(q + 3..)
+                    .and_then(|tail| tail.iter().position(|&b| b == b'\''))
+                    .map_or(rest.len(), |p| q + 3 + p + 1),
+            );
+        }
+        let width = match rest.get(q + 1) {
+            Some(&b) if b < 0x80 => 1,
+            Some(&b) if b >= 0xF0 => 4,
+            Some(&b) if b >= 0xE0 => 3,
+            Some(_) => 2,
+            None => return None,
+        };
+        if rest.get(q + 1 + width) == Some(&b'\'') {
+            return Some(q + 2 + width);
+        }
+        // A lifetime or label: ordinary code.
+    }
+    None
+}
+
+/// Index just past the bracket matching the one at `open_at`.
+fn after_matching_close(bytes: &[u8], open_at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut at = open_at;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        match bytes[at] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return at + 1;
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    bytes.len()
+}
+
+/// Index just past the item that follows an attribute ending at `from`: its
+/// further attributes, then either a `;` (an out-of-line `mod name;`, a `use`)
+/// or the `{ .. }` body that closes it.
+fn end_of_annotated_item(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        match bytes[at] {
+            b';' => return at + 1,
+            b'{' => return after_matching_close(bytes, at),
+            b'(' | b'[' => at = after_matching_close(bytes, at),
+            _ => at += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Whether an attribute body (between `#[` and `]`) compiles its item only
+/// under test: `cfg(test)` or `cfg(all(.., test, ..))`. `cfg(not(test))`,
+/// `cfg(any(..))` and `cfg_attr` gate nothing out of production.
+fn cfg_is_test_only(attribute: &str) -> bool {
+    let compact: String = attribute.split_whitespace().collect();
+    let Some(predicate) = compact
+        .strip_prefix("cfg(")
+        .and_then(|p| p.strip_suffix(')'))
+    else {
+        return false;
+    };
+    if predicate == "test" {
+        return true;
+    }
+    let Some(args) = predicate
+        .strip_prefix("all(")
+        .and_then(|p| p.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut top_level = Vec::new();
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                top_level.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    top_level.push(&args[start..]);
+    top_level.contains(&"test")
+}
+
+/// `text` with every item gated by a test-only `cfg` removed — inline and
+/// out-of-line modules, helper fns, impls — at any indentation, including one
+/// at byte zero. Comments, strings and char literals are lexed, so a brace or
+/// `#[cfg(test)]` inside one changes nothing. Everything else is kept.
+fn without_cfg_test_items(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut production = String::with_capacity(text.len());
+    let mut copied_to = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if let Some(len) = opaque_token_len(bytes, at) {
+            at += len;
+            continue;
+        }
+        if bytes[at..].starts_with(b"#[") {
+            let attribute_end = after_matching_close(bytes, at + 1);
+            let body = text
+                .get(at + 2..attribute_end.saturating_sub(1))
+                .unwrap_or("");
+            if cfg_is_test_only(body) {
+                let item_end = end_of_annotated_item(bytes, attribute_end);
+                production.push_str(&text[copied_to..at]);
+                copied_to = item_end;
+                at = item_end;
+            } else {
+                at = attribute_end;
+            }
+            continue;
+        }
+        at += 1;
+    }
+    production.push_str(&text[copied_to..]);
+    production
+}
+
+#[test]
+fn cfg_test_item_stripper_keeps_every_production_item() {
+    // Every `PROD_n` item must survive and every `TEST_ONLY_n` item must go.
+    // The former column-0 `"\n#[cfg(test)]\nmod "` splitter lost PROD_1 and
+    // PROD_2 (an out-of-line `mod name;` swallowed the production code after
+    // it: a false negative for the parity scan) and kept TEST_ONLY_1
+    // (attribute at byte zero), TEST_ONLY_3 (`cfg(all(test, ..))`),
+    // TEST_ONLY_4 (indented) and TEST_ONLY_5 (a test-only fn). The string,
+    // raw-string, char and comment braces inside `linux_only` pin the lexing.
+    let fixture = r##"#[cfg(test)]
+mod at_byte_zero { fn t() { TEST_ONLY_1(); } }
+#[cfg(test)]
+mod out_of_line;
+fn production_after_out_of_line() { PROD_1(); }
+#[cfg(test)]
+#[path = "pump_tests.rs"]
+mod pathed;
+fn production_after_path() { PROD_2(); }
+#[cfg(all(test, target_os = "linux"))]
+mod linux_only {
+    const TRICKY: &str = "
+}
+{";
+    const ESCAPED: &str = "\"}";
+    const RAW: &str = r#"}"#;
+    const BRACE: char = '}';
+    fn t<'a>(x: &'a str) { /* } */ TEST_ONLY_3(); }
+}
+fn production_after_tricky_module() { PROD_3(); }
+#[cfg(not(test))]
+fn production_not_test() { PROD_4(); }
+impl Production {
+    #[cfg(test)]
+    fn indented_helper(&self) { TEST_ONLY_4(); }
+    fn production_method(&self) { PROD_5(); }
+}
+#[cfg(test)]
+fn test_helper(a: [u8; 3]) -> u8 { TEST_ONLY_5(); a[0] }
+// #[cfg(test)] in a comment gates nothing
+fn production_tail() { PROD_6(); }
+"##;
+    let production = without_cfg_test_items(fixture);
+    for kept in ["PROD_1", "PROD_2", "PROD_3", "PROD_4", "PROD_5", "PROD_6"] {
+        assert!(
+            production.contains(kept),
+            "{kept} is production code and must survive the stripper:\n{production}"
+        );
+    }
+    for dropped in [
+        "TEST_ONLY_1",
+        "TEST_ONLY_3",
+        "TEST_ONLY_4",
+        "TEST_ONLY_5",
+        "mod out_of_line",
+        "mod pathed",
+    ] {
+        assert!(
+            !production.contains(dropped),
+            "{dropped} is test-only and must be stripped:\n{production}"
+        );
+    }
+}
+
+/// CB-1: every production settlement of a circuit-breaker admission goes
+/// through `CircuitBreaker::settle` with the admission's own `ProbeTicket`.
+/// The `bool` conveniences (`record_success` / `record_failure` /
+/// `record_neutral`) settle against whatever cycle is current at the call, so a
+/// probe that outlived a reopen would free a LATER cycle's slot (over-admitting
+/// past `half_open_max_requests`) or close/reopen a cycle it never probed —
+/// exactly what the TCP relay end and the gRPC streaming recorder used to do.
+/// They exist for unit tests only.
+#[test]
+fn no_production_path_settles_a_breaker_without_its_probe_ticket() {
+    let mut scanned = 0usize;
+    for (path, text) in production_sources() {
+        if !(path.starts_with("src/proxy/")
+            || path.starts_with("src/http3/")
+            || path.starts_with("src/grpc/"))
+        {
+            continue;
+        }
+        scanned += 1;
+        let production: String = without_cfg_test_items(&text).split_whitespace().collect();
+        for blind in [
+            ".record_success(",
+            ".record_failure(",
+            ".record_neutral(",
+            ".record_neutral_for_admission(",
+        ] {
+            assert!(
+                !production.contains(blind),
+                "{path} settles a circuit breaker through the generation-blind `{blind}`; \
+                 settle the admission's `ProbeTicket` with `CircuitBreaker::settle` instead"
+            );
+        }
+    }
+    assert!(scanned > 0, "the proxy/http3/grpc sources must be scanned");
+    // The one production entry point checks the ticket's cycle in the CAS.
+    let breaker = source("src/circuit_breaker.rs");
+    let release = item_body(
+        &breaker,
+        "    fn release_slot(&self, ticket: ProbeTicket) {",
+        "\n    }\n",
+    );
+    assert!(
+        release.contains("packed_generation(packed) != generation"),
+        "the slot release must compare the ticket's generation inside its CAS"
+    );
 }
 
 // ---------------------------------------------------------------------------

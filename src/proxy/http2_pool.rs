@@ -2435,7 +2435,7 @@ pub enum Http2PoolError {
     /// connection may be opened. Classified
     /// [`crate::retry::ErrorClass::BackendConnectionLimit`] — pre-wire AND
     /// health-neutral, matching the raw-TCP path where an over-cap dial fails
-    /// before relay, records `cb.record_neutral()`, and `retry_on_connect_failure`
+    /// before relay, settles the breaker `Neutral`, and `retry_on_connect_failure`
     /// may rotate to another LB target (with its own lane). `get_sender()` first
     /// falls back to any already-established shard, so a capped destination
     /// keeps serving by multiplexing rather than failing.
