@@ -50,7 +50,9 @@ pub const AWS_EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstrea
 /// Largest single SSE line retained while waiting for its line terminator. A
 /// longer line is discarded and the parser resynchronizes at the next line
 /// terminator, so a provider (or an attacker-controlled upstream) cannot turn
-/// one unterminated line into unbounded gateway memory.
+/// one unterminated line into unbounded gateway memory. A discarded `data`
+/// line abandons its whole event, exactly like an event whose joined `data`
+/// fields exceed this cap.
 pub const MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
 
 /// Largest AWS event-stream message retained whole. Larger messages are skipped
@@ -427,52 +429,86 @@ impl UsageAccumulator {
     }
 }
 
-/// Bounded assembly buffer for one SSE event's `data` fields.
+/// Bounded assembly state for one SSE event's `data` fields.
 ///
 /// Retention is capped by [`MAX_SSE_EVENT_BYTES`] across the WHOLE event, not
 /// just per line: without that, a provider could split unbounded bytes over
 /// many short, individually-legal `data` fields and grow this buffer without
-/// limit. An event that exceeds the cap is abandoned and the parser resumes at
-/// the next dispatch, exactly as an oversized single line already does — a
-/// usage event is never 64 KiB, so no real charge is lost.
+/// limit. An event whose `data` exceeds the cap, whether across fields or in
+/// one oversized `data` line, is abandoned and the parser resumes at the next
+/// dispatch. Dropping only the oversized field would dispatch the event's
+/// other fields as if they were the whole payload, which is not what a
+/// conforming parser reassembles. A usage event is never 64 KiB, so no real
+/// charge is lost.
 #[derive(Debug, Default)]
-struct SseEventBuffer {
-    data: String,
-    /// A `data` field was seen for this event. An explicitly empty one still
-    /// counts, so `data:\ndata:{...}` keeps its leading newline.
-    has_data: bool,
-    /// The cap was exceeded; drop the remainder of this event.
-    overflowed: bool,
+enum SseEventBuffer {
+    /// No `data` field since the last dispatch.
+    #[default]
+    Empty,
+    /// At least one `data` field, joined with `\n`. An explicitly empty field
+    /// still counts, so `data:\ndata:{...}` keeps its leading newline.
+    Assembling(String),
+    /// The cap was exceeded; the rest of this event is discarded and its
+    /// dispatch yields nothing.
+    Abandoned,
+}
+
+/// Input to [`SseEventBuffer::step`].
+#[derive(Debug, Clone, Copy)]
+enum SseEventStep<'a> {
+    /// A complete `data` field value under the line cap.
+    Data(&'a str),
+    /// A `data` line exceeded the line cap and was dropped unparsed.
+    OversizedData,
+    /// A blank line, or end of stream.
+    Dispatch,
 }
 
 impl SseEventBuffer {
-    fn push_data(&mut self, value: &str) {
-        if self.overflowed {
-            return;
-        }
-        let separator = usize::from(self.has_data);
-        if self.data.len() + separator + value.len() > MAX_SSE_EVENT_BYTES {
-            self.overflowed = true;
-            self.data = String::new();
-            self.has_data = true;
-            return;
-        }
-        if self.has_data {
-            self.data.push('\n');
-        }
-        self.data.push_str(value);
-        self.has_data = true;
+    /// The single transition function. Returns the payload to hand to the
+    /// accumulator, which only a `Dispatch` out of `Assembling` produces.
+    fn step(&mut self, step: SseEventStep<'_>) -> Option<String> {
+        let (next, dispatched) = match (std::mem::take(self), step) {
+            (Self::Empty, SseEventStep::Data(value)) => {
+                if value.len() > MAX_SSE_EVENT_BYTES {
+                    (Self::Abandoned, None)
+                } else {
+                    (Self::Assembling(value.to_owned()), None)
+                }
+            }
+            (Self::Assembling(mut data), SseEventStep::Data(value)) => {
+                if data.len() + 1 + value.len() > MAX_SSE_EVENT_BYTES {
+                    (Self::Abandoned, None)
+                } else {
+                    data.push('\n');
+                    data.push_str(value);
+                    (Self::Assembling(data), None)
+                }
+            }
+            (Self::Empty | Self::Assembling(_) | Self::Abandoned, SseEventStep::OversizedData)
+            | (Self::Abandoned, SseEventStep::Data(_)) => (Self::Abandoned, None),
+            (Self::Assembling(data), SseEventStep::Dispatch) => (Self::Empty, Some(data)),
+            (Self::Empty | Self::Abandoned, SseEventStep::Dispatch) => (Self::Empty, None),
+        };
+        *self = next;
+        dispatched
     }
 
-    /// Reset and return the dispatched payload, or `None` when this event
-    /// carried no usable `data` (no field at all, or an abandoned oversized
-    /// one).
-    fn take(&mut self) -> Option<String> {
-        let overflowed = std::mem::take(&mut self.overflowed);
-        let has_data = std::mem::take(&mut self.has_data);
-        let data = std::mem::take(&mut self.data);
-        (has_data && !overflowed).then_some(data)
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Assembling(data) => data.len(),
+            Self::Empty | Self::Abandoned => 0,
+        }
     }
+}
+
+/// Whether a line whose leading bytes are `head` followed by `tail` is an SSE
+/// `data` field. Judged from the field name alone, so an oversized line can be
+/// classified without joining or retaining it.
+fn sse_line_is_data_field(head: &[u8], tail: &[u8]) -> bool {
+    const DATA_FIELD: &[u8] = b"data:";
+    let (in_head, in_tail) = DATA_FIELD.split_at(head.len().min(DATA_FIELD.len()));
+    head.starts_with(in_head) && tail.starts_with(in_tail)
 }
 
 /// Wire framing an [`UsageStreamExtractor`] should decode.
@@ -540,7 +576,7 @@ impl UsageStreamExtractor {
     /// bounded-retention guarantee.
     #[allow(dead_code)] // used only by tests/, dead code in the bin target
     pub fn retained_bytes(&self) -> usize {
-        self.carry.len() + self.event.data.len()
+        self.carry.len() + self.event.retained_bytes()
     }
 
     /// Feed the next chunk of decoded response body bytes.
@@ -605,6 +641,9 @@ impl UsageStreamExtractor {
             // would allocate their combined size, bypassing the bounded-parser
             // guarantee even though neither survives after this iteration.
             if self.carry.len().saturating_add(line.len()) > MAX_SSE_EVENT_BYTES {
+                if sse_line_is_data_field(&self.carry, line) {
+                    self.event.step(SseEventStep::OversizedData);
+                }
                 self.carry.clear();
                 continue;
             }
@@ -623,7 +662,11 @@ impl UsageStreamExtractor {
         }
         if self.carry.len().saturating_add(rest.len()) > MAX_SSE_EVENT_BYTES {
             // Drop the oversized line entirely and resynchronize; a usage event
-            // is never 64 KiB, so this cannot silently lose a real charge.
+            // is never 64 KiB, so this cannot silently lose a real charge. An
+            // oversized `data` line abandons its whole event.
+            if sse_line_is_data_field(&self.carry, rest) {
+                self.event.step(SseEventStep::OversizedData);
+            }
             self.carry = Vec::new();
             self.resyncing = true;
             return;
@@ -671,12 +714,12 @@ impl UsageStreamExtractor {
         if field != "data" {
             return;
         }
-        self.event.push_data(value);
+        self.event.step(SseEventStep::Data(value));
     }
 
     /// Hand the assembled event payload to the accumulator and reset.
     fn dispatch_sse_event(&mut self) {
-        let Some(data) = self.event.take() else {
+        let Some(data) = self.event.step(SseEventStep::Dispatch) else {
             return;
         };
         self.usage.apply_sse_data(&data, self.configured_provider);

@@ -1079,16 +1079,76 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
 ///   attempt's commitment is preserved across the final error.
 /// - [`H3PoolError::route_deadline`] — a matched route rule's deadline, not
 ///   the backend transport, ended the attempt (#5646).
+///
+/// The wire state is stored as one `H3AttemptHandoff`, from which both
+/// `request_on_wire` and the H3 `connection_error` are derived.
 #[derive(Debug)]
 pub struct H3PoolError {
     inner: anyhow::Error,
-    request_on_wire: bool,
+    handoff: H3AttemptHandoff,
     graceful_close: bool,
     read_timeout: bool,
     route_deadline: Option<crate::proxy::RouteDeadlineExpiry>,
     authorization_expiry: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
     client_deadline_expired: bool,
     client_request_fault: Option<H3ClientRequestFault>,
+}
+
+/// How far one failed native-H3 backend attempt got toward the backend.
+///
+/// Proxy core keeps two bits on `BackendResponse`: `connection_error` and
+/// `request_on_wire`. The H3 outcomes derive both from this one value, so an H3
+/// outcome cannot claim the backend may have executed a request that was never
+/// dialed, and cannot count an attempt the gateway never started as a
+/// connection failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H3AttemptHandoff {
+    /// The gateway ended the attempt before polling it, because a route
+    /// deadline was already spent. Nothing was dialed, no request byte left
+    /// the gateway, and it is not a connection failure. This matches proxy
+    /// core's `route_deadline_expiry_response` with `handed_to_backend == false`.
+    NotDialed,
+    /// The request never reached the backend's application layer. DNS, TLS,
+    /// connect, session setup, or `send_request` failed, or the gateway refused
+    /// the target. The attempt is accounted as a connection failure.
+    PreWire,
+    /// The request was committed to the backend on an attempt this outcome
+    /// covers, so the backend may have executed it.
+    OnWire,
+}
+
+impl H3AttemptHandoff {
+    /// The handoff for a plain wire flag: `true` is [`Self::OnWire`], `false`
+    /// is [`Self::PreWire`].
+    pub(crate) const fn from_request_on_wire(request_on_wire: bool) -> Self {
+        if request_on_wire {
+            Self::OnWire
+        } else {
+            Self::PreWire
+        }
+    }
+
+    /// The single transition. Once an attempt covered by this outcome is
+    /// observed committing the request, the outcome is on the wire, whatever
+    /// stage it was raised at. It never demotes.
+    pub(crate) const fn promote_if(self, committed: bool) -> Self {
+        match (self, committed) {
+            (Self::NotDialed | Self::PreWire | Self::OnWire, true) => Self::OnWire,
+            (stage, false) => stage,
+        }
+    }
+
+    /// Whether the backend may have executed the request.
+    pub(crate) const fn request_on_wire(self) -> bool {
+        matches!(self, Self::OnWire)
+    }
+
+    /// Whether the outcome is a connect-phase (pre-wire) connection failure.
+    /// The H3 `BackendResponse::connection_error` before any class-based
+    /// neutralization. It is false for an attempt the gateway never started.
+    pub(crate) const fn connection_error(self) -> bool {
+        matches!(self, Self::PreWire)
+    }
 }
 
 /// Why reading the CLIENT's HTTP/3 request upload failed while the native-H3
@@ -1157,7 +1217,7 @@ impl H3PoolError {
     pub fn pre_wire(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: false,
+            handoff: H3AttemptHandoff::PreWire,
             graceful_close: false,
             read_timeout: false,
             route_deadline: None,
@@ -1174,7 +1234,7 @@ impl H3PoolError {
     pub fn post_wire(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
             graceful_close: false,
             read_timeout: false,
             route_deadline: None,
@@ -1198,7 +1258,7 @@ impl H3PoolError {
     pub fn graceful_close(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
             graceful_close: true,
             read_timeout: false,
             route_deadline: None,
@@ -1226,7 +1286,7 @@ impl H3PoolError {
     pub fn read_timeout(error: impl Into<anyhow::Error>) -> Self {
         Self {
             inner: error.into(),
-            request_on_wire: true,
+            handoff: H3AttemptHandoff::OnWire,
             graceful_close: false,
             read_timeout: true,
             route_deadline: None,
@@ -1251,13 +1311,16 @@ impl H3PoolError {
     /// `timeouts.backendRequest`).
     ///
     /// It carries the typed read-timeout signal, so every native dispatch
-    /// failure arm answers it with a `504` and records it as a post-wire
-    /// timeout rather than a connection failure, exactly like proxy core's
-    /// route deadline terminal (`connection_error: false`). Its class and
-    /// client-visible body come from the expiry instead of the transport:
-    /// see `classify_h3_error` and `h3_backend_failure_status_body`. A route
-    /// deadline never proves the backend lost QUIC, so it never downgrades
-    /// the cached H3 capability.
+    /// failure arm answers it with a `504` and never records it as a
+    /// connection failure, exactly like proxy core's route deadline terminal
+    /// (`connection_error: false`). Its handoff comes from the expiry
+    /// (`route_deadline::expiry_handoff`). A total deadline spent before the
+    /// attempt started is `NotDialed`, so it is not on the wire either. Every
+    /// other expiry ended an attempt the backend held, so it is `OnWire`. Its
+    /// class and client-visible body also come from the expiry instead of the
+    /// transport: see `classify_h3_error` and `h3_backend_failure_status_body`.
+    /// A route deadline never proves the backend lost QUIC, so it never
+    /// downgrades the cached H3 capability.
     pub(crate) fn route_deadline(expiry: crate::proxy::RouteDeadlineExpiry) -> Self {
         let inner = if expiry == crate::proxy::RouteDeadlineExpiry::AttemptBudget {
             anyhow::anyhow!("route attempt budget exceeded before the backend response head")
@@ -1266,7 +1329,7 @@ impl H3PoolError {
         };
         Self {
             inner,
-            request_on_wire: true,
+            handoff: crate::http3::route_deadline::expiry_handoff(expiry),
             graceful_close: false,
             read_timeout: true,
             route_deadline: Some(expiry),
@@ -1311,7 +1374,7 @@ impl H3PoolError {
         request_on_wire: bool,
     ) -> Self {
         let mut error = Self::client_request(fault, error);
-        error.request_on_wire = request_on_wire;
+        error.handoff = H3AttemptHandoff::from_request_on_wire(request_on_wire);
         error
     }
 
@@ -1360,10 +1423,22 @@ impl H3PoolError {
     }
 
     /// Returns `true` if the request was committed to the wire on any
-    /// attempt covered by this error. Drives `BackendResponse::connection_error`
-    /// at the gateway: `connection_error = !request_on_wire`.
+    /// attempt covered by this error, so the backend may have executed it.
     pub fn request_on_wire(&self) -> bool {
-        self.request_on_wire
+        self.handoff.request_on_wire()
+    }
+
+    /// Whether this error is a connect-phase connection failure: the H3
+    /// `BackendResponse::connection_error` before class-based neutralization.
+    /// Equal to `!request_on_wire()` except for an attempt the gateway never
+    /// started (a route deadline spent before dispatch), which is neither.
+    pub(crate) fn connection_error(&self) -> bool {
+        self.handoff.connection_error()
+    }
+
+    /// How far the failed attempt got toward the backend.
+    pub(crate) fn handoff(&self) -> H3AttemptHandoff {
+        self.handoff
     }
 
     /// Whether the failure is a gateway-side internal fault — the backend TLS
@@ -1419,9 +1494,7 @@ impl H3PoolError {
     /// prior on-wire observation with a later pre-wire error.
     #[allow(dead_code)] // Retained public utility for combining a prior on-wire observation with a later pre-wire error.
     pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
-        if condition {
-            self.request_on_wire = true;
-        }
+        self.handoff = self.handoff.promote_if(condition);
         self
     }
 

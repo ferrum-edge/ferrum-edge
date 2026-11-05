@@ -547,6 +547,97 @@ fn complete_oversized_sse_line_split_at_the_cap_is_not_merged_or_parsed() {
     assert_eq!(extractor.retained_bytes(), 0);
 }
 
+/// The first `data` field of an event that also carries an oversized `data`
+/// field. A conforming parser joins both into one payload that does not parse.
+fn usage_field_then_oversized_field(fill: u8) -> Vec<u8> {
+    let mut body =
+        br#"data: {"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#.to_vec();
+    body.extend_from_slice(b"\ndata: ");
+    body.extend(std::iter::repeat_n(
+        fill,
+        MAX_SSE_EVENT_BYTES.saturating_add(1),
+    ));
+    body.extend_from_slice(b"\n\n");
+    body
+}
+
+/// An oversized `data` line abandons its whole event. Dropping only that line
+/// would dispatch the event's other `data` field as if it were the complete
+/// payload and charge it. Before the explicit event state, the complete-line
+/// path did exactly that, and `total_tokens == 5` was observed.
+#[test]
+fn complete_oversized_data_field_abandons_the_whole_event() {
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&usage_field_then_oversized_field(b'x'));
+    extractor.finish();
+    assert!(
+        !extractor.usage().observed(),
+        "the usage field of an event with an oversized data field must not be charged"
+    );
+    assert_eq!(extractor.retained_bytes(), 0);
+}
+
+/// The same rule on the unterminated-tail path: the oversized field arrives in
+/// pieces and is resynchronized past. The parser must still recover for the
+/// next event.
+#[test]
+fn streamed_oversized_data_field_abandons_its_event_and_recovers_for_the_next() {
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor
+        .push(br#"data: {"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#);
+    extractor.push(b"\ndata: ");
+    for _ in 0..((MAX_SSE_EVENT_BYTES / 1024) + 4) {
+        extractor.push(&vec![b'y'; 1024]);
+        assert!(extractor.retained_bytes() <= MAX_SSE_EVENT_BYTES);
+    }
+    extractor.push(b"\n\n");
+    assert!(
+        !extractor.usage().observed(),
+        "the abandoned event must not dispatch its earlier usage field"
+    );
+    extractor.push(&sse(&[
+        &json!({"usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}})
+            .to_string(),
+    ]));
+    extractor.finish();
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), Some(7));
+}
+
+/// The field name is judged across the carry boundary: `da` + `ta: ...` is a
+/// `data` field even though neither half spells it.
+#[test]
+fn oversized_data_field_split_inside_its_name_still_abandons_the_event() {
+    let body = usage_field_then_oversized_field(b'z');
+    let name_split = body
+        .windows(b"\ndata: ".len())
+        .rposition(|window| window == b"\ndata: ")
+        .expect("second data field")
+        + b"\nda".len();
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body[..name_split]);
+    extractor.push(&body[name_split..]);
+    extractor.finish();
+    assert!(!extractor.usage().observed());
+}
+
+/// Only an oversized `data` field abandons the event. An oversized comment
+/// contributes nothing to the payload, so the event's usage is still charged.
+#[test]
+fn oversized_comment_line_does_not_abandon_the_event() {
+    let mut body =
+        br#"data: {"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#.to_vec();
+    body.extend_from_slice(b"\n: ");
+    body.extend(std::iter::repeat_n(
+        b'c',
+        MAX_SSE_EVENT_BYTES.saturating_add(1),
+    ));
+    body.extend_from_slice(b"\n\n");
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), Some(5));
+}
+
 #[test]
 fn sse_events_split_across_chunk_boundaries_are_reassembled() {
     let body = sse(&[

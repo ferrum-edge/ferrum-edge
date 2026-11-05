@@ -4,8 +4,10 @@
 //! Streaming terminal hooks and mirror summaries may still be running after
 //! the last proxy body releases its request guard. Once request drain is
 //! complete, [`shutdown`] closes external task admission, waits for already
-//! admitted terminal work (including internally spawned mirror work), then
-//! closes and awaits every registered queue worker under one absolute budget.
+//! admitted terminal work (including internally spawned mirror work), closes
+//! internal admission and waits once more so nothing admitted before that
+//! close is left running, then closes and awaits every registered queue worker
+//! under one absolute budget. The ordered phases live in `DeliveryPhase`.
 //!
 //! # Task admission budget
 //!
@@ -64,12 +66,123 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-/// One delivery generation is open for new tasks and workers.
-const GENERATION_OPEN: u8 = 0;
-/// Shutdown has started on this generation; admission is closing down.
-const GENERATION_DRAINING: u8 = 1;
-/// Shutdown finished; admission is permanently closed and the report cached.
-const GENERATION_CLOSED: u8 = 2;
+/// Drain phase of one delivery generation.
+///
+/// Every admission predicate is derived from this single phase, so a
+/// generation cannot hold an admission combination the drain never produces
+/// (external admission open after internal admission closed, abort while
+/// open, and so on). [`DeliveryPhase::after`] is the only transition function
+/// and the shutdown drain is the only caller that advances it, serialized by
+/// the cached-report mutex.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum DeliveryPhase {
+    /// Admits external tasks, internal tasks, and worker registration.
+    Open = 0,
+    /// External admission is closed. Already admitted terminal work may still
+    /// spawn internal mirror tasks and register workers during the first wait.
+    DrainingTasks = 1,
+    /// Task admission and worker registration are closed. The final task wait
+    /// runs in this phase, so nothing can be admitted after it observes an
+    /// empty registry.
+    SettlingTasks = 2,
+    /// Worker queues are closed and the drain awaits queue workers.
+    DrainingWorkers = 3,
+    /// The shared drain deadline expired; admitted tasks and unfinished
+    /// workers are hard-aborted.
+    Aborting = 4,
+    /// Drained within budget; the report is cached and admission stays closed.
+    Closed = 5,
+    /// Drained after a deadline abort; the report is cached and admission
+    /// stays closed.
+    ClosedAfterAbort = 6,
+}
+
+/// One step of the shutdown drain, applied through [`DeliveryPhase::after`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainStep {
+    CloseExternalTasks,
+    CloseInternalTasks,
+    CloseWorkerQueues,
+    AbortAtDeadline,
+    Finish,
+}
+
+impl DeliveryPhase {
+    /// The phase after `step`. The drain is monotonic: a step that would not
+    /// move this phase forward (repeated, out of order, or after close)
+    /// leaves it unchanged.
+    const fn after(self, step: DrainStep) -> Self {
+        use DeliveryPhase::{
+            Aborting, Closed, ClosedAfterAbort, DrainingTasks, DrainingWorkers, Open, SettlingTasks,
+        };
+        match (self, step) {
+            (Open, DrainStep::CloseExternalTasks) => DrainingTasks,
+            (Open | DrainingTasks, DrainStep::CloseInternalTasks) => SettlingTasks,
+            (Open | DrainingTasks | SettlingTasks, DrainStep::CloseWorkerQueues) => DrainingWorkers,
+            (
+                Open | DrainingTasks | SettlingTasks | DrainingWorkers,
+                DrainStep::AbortAtDeadline,
+            ) => Aborting,
+            (Open | DrainingTasks | SettlingTasks | DrainingWorkers, DrainStep::Finish) => Closed,
+            (Aborting, DrainStep::Finish) => ClosedAfterAbort,
+            (
+                DrainingTasks | SettlingTasks | DrainingWorkers | Aborting | Closed
+                | ClosedAfterAbort,
+                DrainStep::CloseExternalTasks,
+            )
+            | (
+                SettlingTasks | DrainingWorkers | Aborting | Closed | ClosedAfterAbort,
+                DrainStep::CloseInternalTasks,
+            )
+            | (
+                DrainingWorkers | Aborting | Closed | ClosedAfterAbort,
+                DrainStep::CloseWorkerQueues,
+            )
+            | (Aborting | Closed | ClosedAfterAbort, DrainStep::AbortAtDeadline)
+            | (Closed | ClosedAfterAbort, DrainStep::Finish) => self,
+        }
+    }
+
+    /// Decode the stored phase. Only [`DeliveryLifecycle::advance`] writes the
+    /// atomic, always from a valid variant, so the fallback arm is
+    /// unreachable; it fails closed rather than reopening admission.
+    const fn decode(raw: u8) -> Self {
+        match raw {
+            0 => Self::Open,
+            1 => Self::DrainingTasks,
+            2 => Self::SettlingTasks,
+            3 => Self::DrainingWorkers,
+            4 => Self::Aborting,
+            6 => Self::ClosedAfterAbort,
+            _ => Self::Closed,
+        }
+    }
+
+    const fn admits(self, admission: TaskAdmission) -> bool {
+        match (self, admission) {
+            (Self::Open, TaskAdmission::External | TaskAdmission::Internal)
+            | (Self::DrainingTasks, TaskAdmission::Internal) => true,
+            (Self::DrainingTasks, TaskAdmission::External)
+            | (
+                Self::SettlingTasks
+                | Self::DrainingWorkers
+                | Self::Aborting
+                | Self::Closed
+                | Self::ClosedAfterAbort,
+                TaskAdmission::External | TaskAdmission::Internal,
+            ) => false,
+        }
+    }
+
+    const fn admits_workers(self) -> bool {
+        matches!(self, Self::Open | Self::DrainingTasks)
+    }
+
+    const fn is_aborting(self) -> bool {
+        matches!(self, Self::Aborting | Self::ClosedAfterAbort)
+    }
+}
 
 static LIFECYCLE: OnceLock<DeliverySlot> = OnceLock::new();
 
@@ -193,7 +306,7 @@ impl DeliverySlot {
     pub fn begin_cycle(&self) -> u64 {
         loop {
             let current = self.current.load_full();
-            if current.state() == GENERATION_OPEN {
+            if current.phase() == DeliveryPhase::Open {
                 return current.generation;
             }
             if let Some(generation) = self.try_install_generation(&current) {
@@ -411,13 +524,14 @@ impl DeliveryTaskContext {
     /// because its shutdown drain deadline expired.
     #[inline]
     pub(crate) fn is_aborting_at_deadline(&self) -> bool {
-        self.lifecycle.cancelling_tasks.load(Ordering::Acquire)
+        self.lifecycle.phase().is_aborting()
     }
 }
 
 struct DeliveryLifecycle {
     generation: u64,
-    state: AtomicU8,
+    /// Encoded [`DeliveryPhase`]; read through [`DeliveryLifecycle::phase`].
+    phase: AtomicU8,
     max_tasks: usize,
     admitted_tasks: AtomicU64,
     /// Capacity-only rejection count. Kept separate from the aggregate
@@ -430,10 +544,6 @@ struct DeliveryLifecycle {
     /// the count gate alone only samples them, so a sustained flood could
     /// still scale warnings with rejected traffic.
     capacity_warn_last_ms: AtomicU64,
-    accepting_external_tasks: AtomicBool,
-    accepting_internal_tasks: AtomicBool,
-    accepting_workers: AtomicBool,
-    cancelling_tasks: AtomicBool,
     active_task_registrations: AtomicU64,
     next_task_id: AtomicU64,
     next_worker_id: AtomicU64,
@@ -451,22 +561,36 @@ impl DeliveryLifecycle {
         Self::with_limits(0, 1, crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT)
     }
 
-    fn state(&self) -> u8 {
-        self.state.load(Ordering::Acquire)
+    /// Admission and the drain form a store-buffer handshake: a spawn
+    /// increments `active_task_registrations` then reads the phase, and a
+    /// closing step writes the phase then reads the registrations. `SeqCst` on
+    /// all four accesses guarantees at least one side observes the other.
+    /// Either the spawn sees the closed phase, or the drain sees its
+    /// registration and waits for it. On x86-64 and AArch64 this costs the
+    /// same as acquire/release.
+    fn phase(&self) -> DeliveryPhase {
+        DeliveryPhase::decode(self.phase.load(Ordering::SeqCst))
+    }
+
+    /// Apply one drain step. The read-modify-write keeps the phase monotonic
+    /// even if a step ever raced another; today every caller holds the
+    /// cached-report mutex.
+    fn advance(&self, step: DrainStep) {
+        let _ = self
+            .phase
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |raw| {
+                Some(DeliveryPhase::decode(raw).after(step) as u8)
+            });
     }
 
     fn with_limits(pool_shard_override: usize, generation: u64, max_tasks: usize) -> Self {
         Self {
             generation,
-            state: AtomicU8::new(GENERATION_OPEN),
+            phase: AtomicU8::new(DeliveryPhase::Open as u8),
             max_tasks: clamp_max_tasks(max_tasks),
             admitted_tasks: AtomicU64::new(0),
             capacity_rejections: AtomicU64::new(0),
             capacity_warn_last_ms: AtomicU64::new(0),
-            accepting_external_tasks: AtomicBool::new(true),
-            accepting_internal_tasks: AtomicBool::new(true),
-            accepting_workers: AtomicBool::new(true),
-            cancelling_tasks: AtomicBool::new(false),
             active_task_registrations: AtomicU64::new(0),
             next_task_id: AtomicU64::new(1),
             next_worker_id: AtomicU64::new(1),
@@ -613,8 +737,9 @@ impl DeliveryLifecycle {
             self.counters.record_rejected(kind);
             return false;
         }
+        // `SeqCst`: the spawn side of the handshake documented on `phase`.
         self.active_task_registrations
-            .fetch_add(1, Ordering::AcqRel);
+            .fetch_add(1, Ordering::SeqCst);
         let _registration = TaskRegistration {
             lifecycle: self.as_ref(),
         };
@@ -651,7 +776,7 @@ impl DeliveryLifecycle {
         drop(task);
 
         self.tasks.insert(task_id, TrackedTask { kind, abort });
-        if self.cancelling_tasks.load(Ordering::Acquire) {
+        if self.phase().is_aborting() {
             if let Some((_, task)) = self.tasks.remove(&task_id) {
                 task.abort.abort();
                 // This removal owns the permit via `permit` drop below.
@@ -679,10 +804,7 @@ impl DeliveryLifecycle {
     }
 
     fn accepts(&self, admission: TaskAdmission) -> bool {
-        match admission {
-            TaskAdmission::External => self.accepting_external_tasks.load(Ordering::Acquire),
-            TaskAdmission::Internal => self.accepting_internal_tasks.load(Ordering::Acquire),
-        }
+        self.phase().admits(admission)
     }
 
     fn finish_task(&self, task_id: u64) {
@@ -706,7 +828,7 @@ impl DeliveryLifecycle {
         worker.register_completion_notify(&self.workers_changed);
         let registered = match self.workers.lock() {
             Ok(mut workers) => {
-                if !self.accepting_workers.load(Ordering::Acquire) {
+                if !self.phase().admits_workers() {
                     false
                 } else {
                     workers.retain(|_, registered| !registered.is_finished());
@@ -716,7 +838,7 @@ impl DeliveryLifecycle {
             }
             Err(poisoned) => {
                 let mut workers = poisoned.into_inner();
-                if !self.accepting_workers.load(Ordering::Acquire) {
+                if !self.phase().admits_workers() {
                     false
                 } else {
                     workers.retain(|_, registered| !registered.is_finished());
@@ -737,8 +859,12 @@ impl DeliveryLifecycle {
     async fn wait_for_tasks(&self, deadline: Instant) -> bool {
         loop {
             let changed = self.tasks_changed.notified();
-            if self.tasks.is_empty() && self.active_task_registrations.load(Ordering::Acquire) == 0
-            {
+            // Registrations first: a spawn inserts its registry entry before
+            // its registration guard drops, so observing zero registrations
+            // makes every such insert visible to the emptiness check. The
+            // reverse order could see an empty registry, then a registration
+            // that already inserted and dropped, and report a live task drained.
+            if self.active_task_registrations.load(Ordering::SeqCst) == 0 && self.tasks.is_empty() {
                 return true;
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
@@ -774,7 +900,7 @@ impl DeliveryLifecycle {
     }
 
     fn cancel_remaining(&self) {
-        self.cancelling_tasks.store(true, Ordering::Release);
+        self.advance(DrainStep::AbortAtDeadline);
         let task_ids = self
             .tasks
             .iter()
@@ -829,21 +955,25 @@ impl DeliveryLifecycle {
             return report;
         }
 
-        // Publish the draining state before closing admission so a serving
-        // cycle that starts during this drain installs a fresh generation
+        // Leaving `Open` both closes external admission and makes a serving
+        // cycle that starts during this drain install a fresh generation
         // instead of enqueueing into the one being closed here.
-        self.state.store(GENERATION_DRAINING, Ordering::Release);
-        self.accepting_external_tasks
-            .store(false, Ordering::Release);
+        self.advance(DrainStep::CloseExternalTasks);
         let deadline = Instant::now() + timeout;
         if let Some(tx) = admission_closed_tx {
             let _ = tx.send(());
         }
 
-        let tasks_drained = self.wait_for_tasks(deadline).await;
-        self.accepting_internal_tasks
-            .store(false, Ordering::Release);
-        self.accepting_workers.store(false, Ordering::Release);
+        // Admitted terminal work may still spawn mirror tasks and register
+        // workers while this first wait runs.
+        let terminal_drained = self.wait_for_tasks(deadline).await;
+        // Close internal admission, then wait again. A mirror admitted after
+        // the first wait observed an empty registry but before this close
+        // (a straggler request's inline `log_with_mirror`) must be drained or
+        // cancelled here, never left running behind a drained report.
+        self.advance(DrainStep::CloseInternalTasks);
+        let tasks_drained = terminal_drained && self.wait_for_tasks(deadline).await;
+        self.advance(DrainStep::CloseWorkerQueues);
         self.close_workers();
         let workers_drained = tasks_drained && self.wait_for_workers(deadline).await;
         if !tasks_drained || !workers_drained {
@@ -863,7 +993,7 @@ impl DeliveryLifecycle {
             );
         }
         *cached_report = Some(report);
-        self.state.store(GENERATION_CLOSED, Ordering::Release);
+        self.advance(DrainStep::Finish);
         report
     }
 
@@ -1176,7 +1306,9 @@ where
 ///
 /// Internal admission remains open while shutdown drains terminal work so a
 /// terminal task that reaches mirror collection after request drain is not
-/// spuriously rejected.
+/// spuriously rejected. It closes before shutdown's final task wait, so a
+/// mirror is either admitted and drained (or cancelled and counted) or
+/// rejected and counted.
 pub fn spawn_mirror<F>(future: F) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
@@ -1326,7 +1458,7 @@ mod tests {
         let shutdown_lifecycle = Arc::clone(&lifecycle);
         let shutdown =
             tokio::spawn(async move { shutdown_lifecycle.shutdown(Duration::from_secs(1)).await });
-        while lifecycle.accepting_external_tasks.load(Ordering::Acquire) {
+        while lifecycle.accepts(TaskAdmission::External) {
             tokio::task::yield_now().await;
         }
         release_terminal.notify_one();
@@ -1372,7 +1504,7 @@ mod tests {
         let shutdown_lifecycle = Arc::clone(&lifecycle);
         let shutdown =
             tokio::spawn(async move { shutdown_lifecycle.shutdown(Duration::from_secs(1)).await });
-        while lifecycle.accepting_external_tasks.load(Ordering::Acquire) {
+        while lifecycle.accepts(TaskAdmission::External) {
             tokio::task::yield_now().await;
         }
         release_terminal.notify_one();
@@ -1673,7 +1805,7 @@ mod tests {
     /// `DeliverySlot::shutdown` drains one captured lifecycle while
     /// `begin_cycle` may install a fresh open generation before that drain
     /// finishes. Hard-abort classification for tasks admitted on A must read
-    /// A's `cancelling_tasks`, not the slot's current B.
+    /// A's drain phase, not the slot's current B.
     #[tokio::test]
     async fn delivery_task_context_tracks_admitted_lifecycle_across_slot_replacement() {
         let slot = DeliverySlot::new(0);
@@ -1710,9 +1842,7 @@ mod tests {
         );
 
         // Real slot replacement path: draining A lets begin_cycle install B.
-        lifecycle_a
-            .state
-            .store(GENERATION_DRAINING, Ordering::Release);
+        lifecycle_a.advance(DrainStep::CloseExternalTasks);
         let generation_b = slot.begin_cycle();
         assert_ne!(
             generation_b, generation_a,
@@ -1721,7 +1851,7 @@ mod tests {
         let lifecycle_b = slot.snapshot();
         assert_eq!(lifecycle_b.generation, generation_b);
         assert!(
-            !lifecycle_b.cancelling_tasks.load(Ordering::Acquire),
+            !lifecycle_b.phase().is_aborting(),
             "fresh generation B must not be cancelling"
         );
 
@@ -1732,11 +1862,11 @@ mod tests {
             "captured context must still observe A's deadline abort after slot replacement"
         );
         assert!(
-            !lifecycle_b.cancelling_tasks.load(Ordering::Acquire),
+            !lifecycle_b.phase().is_aborting(),
             "slot current (B) must remain non-aborting while A cancels"
         );
         assert!(
-            !slot.snapshot().cancelling_tasks.load(Ordering::Acquire),
+            !slot.snapshot().phase().is_aborting(),
             "current-generation sample must not be used for A's abort classification"
         );
     }

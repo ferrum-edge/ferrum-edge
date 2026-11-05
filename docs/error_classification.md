@@ -79,7 +79,7 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 | TCP relay (stream) | [`classify_stream_error`](../src/proxy/tcp_proxy.rs) | `&anyhow::Error` | Thin wrapper over `classify_boxed_error` — same typed walk |
 | Streaming response body | [`classify_body_error`](../src/retry.rs) | `&dyn Error` | Typed walk for io/h2/hyper, returns `(ErrorClass, client_disconnected: bool)` |
 
-The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `request_on_wire()` flag is the **authoritative** body-on-wire signal — `connection_error` is derived directly from `!e.request_on_wire()` at H3 dispatch sites, NOT from the class. See [docs/http3.md](http3.md) for that contract.
+The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `H3AttemptHandoff` (`NotDialed`, `PreWire`, `OnWire`) is the **authoritative** body-on-wire signal — `connection_error` comes from `e.connection_error()` at H3 dispatch sites, NOT from the class. It equals `!e.request_on_wire()` except for a route deadline spent before dispatch (`NotDialed`), which is neither on the wire nor a connection failure, as in proxy core. See [docs/http3.md](http3.md) for that contract.
 
 Direct-H2 pool acquisition and pooled request dispatch have different phase boundaries. Acquisition errors are pre-wire. Once a pooled sender is acquired, `hyper::Error::is_canceled()` is the only typed proof that dispatch never occurred; every other known or unknown send failure is post-wire. In particular, a connect-only class inferred from an inner I/O source is normalized to `ProtocolError`, because an inner `ConnectionRefused` or port-exhaustion errno cannot prove that an already-pooled request was never sent.
 

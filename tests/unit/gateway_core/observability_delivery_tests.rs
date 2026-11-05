@@ -459,3 +459,105 @@ async fn task_budget_override_applies_to_the_next_generation() {
         "the updated task budget must take effect on the fresh generation"
     );
 }
+
+/// A mirror admitted at the drain boundary must be drained (or cancelled and
+/// counted), never left running behind a `tasks_drained` report.
+///
+/// A straggler request's inline `log_with_mirror` spawns mirror work through
+/// internal admission, which stays open while the drain waits for terminal
+/// work. The old lifecycle closed internal admission only after its single
+/// task wait had already observed an empty registry. A `spawn_mirror` that
+/// registered in that window was admitted (`spawn_mirror` returned `true`),
+/// yet shutdown reported `complete()` before that mirror ran. That task was
+/// neither awaited nor cancelled, so on process exit its record was lost
+/// without being counted. The old wait also checked the registry before the
+/// registration count, so a spawn that inserted and deregistered between the
+/// two reads was missed the same way.
+///
+/// The window is a few instructions wide and only another thread can land in
+/// it, so this races a mirror producer against many independent drains. The
+/// producer waits for the registry to look empty, which is the moment the
+/// drain re-checks it, then spawns after a varying delay. Each drain asserts
+/// the invariant itself: every mirror admitted at any point had finished when
+/// its complete report was returned. The phase machine closes internal
+/// admission before a second, final wait, so no iteration can break it.
+#[test]
+fn a_mirror_admitted_at_the_drain_boundary_is_never_left_behind_a_drained_report() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const ITERATIONS: usize = 1_000;
+    const MAX_MIRRORS_PER_ITERATION: usize = 256;
+    const MAX_EMPTY_WAIT: Duration = Duration::from_millis(1);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime builds");
+
+    for iteration in 0..ITERATIONS {
+        let slot = Arc::new(DeliverySlot::new(0));
+        let producer_started = Arc::new(AtomicBool::new(false));
+        let admitted = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicU64::new(0));
+
+        let producer = {
+            let slot = Arc::clone(&slot);
+            let handle = runtime.handle().clone();
+            let producer_started = Arc::clone(&producer_started);
+            let admitted = Arc::clone(&admitted);
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                // Spawning needs a runtime context; the producer stands in for
+                // a request task finishing on another worker.
+                let _entered = handle.enter();
+                for attempt in 0..MAX_MIRRORS_PER_ITERATION {
+                    let mirror_finished = Arc::clone(&finished);
+                    let accepted = slot.spawn_mirror(async move {
+                        tokio::task::yield_now().await;
+                        mirror_finished.fetch_add(1, Ordering::SeqCst);
+                    });
+                    producer_started.store(true, Ordering::Release);
+                    if !accepted {
+                        // Internal admission closed: every later spawn is
+                        // rejected and counted, so stop producing.
+                        return;
+                    }
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                    // Line the next spawn up with the drain's emptiness
+                    // check: wait for the registry to drain, then vary the
+                    // delay so the registration lands at different offsets
+                    // from that check.
+                    let empty_wait = std::time::Instant::now();
+                    while slot.active_tasks() != 0 && empty_wait.elapsed() < MAX_EMPTY_WAIT {
+                        std::hint::spin_loop();
+                    }
+                    for _ in 0..((attempt % 32) * 8) {
+                        std::hint::spin_loop();
+                    }
+                }
+            })
+        };
+        while !producer_started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let (report, finished_at_report) = runtime.block_on(async {
+            let report = slot.shutdown(Duration::from_secs(10)).await;
+            // Sampled as the report is returned: a mirror the drain left
+            // behind has not run yet.
+            (report, finished.load(Ordering::SeqCst))
+        });
+        producer.join().expect("mirror producer joins");
+
+        assert!(
+            report.complete(),
+            "iteration {iteration}: the bounded producer must let the drain finish in budget"
+        );
+        assert_eq!(
+            finished_at_report,
+            admitted.load(Ordering::SeqCst),
+            "iteration {iteration}: every admitted mirror must finish before a complete drain returns"
+        );
+    }
+}
