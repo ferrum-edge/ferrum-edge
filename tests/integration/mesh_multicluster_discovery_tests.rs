@@ -820,8 +820,9 @@ mod remove_fences_first_sight_install {
     use ferrum_edge::modes::mesh::config::{MultiClusterConfig, RemoteCluster};
     use ferrum_edge::modes::mesh::multicluster::{
         RemoteClusterPollContext, RemoteDiscoveryCandidate, RemoteDiscoveryConfig,
-        RemoteDiscoveryManager, RemoteEndpointStore, RemoteServiceSource,
+        RemoteDiscoveryManager, RemoteDiscoveryTlsConfig, RemoteEndpointStore, RemoteServiceSource,
     };
+    use ferrum_edge::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
 
     const CREDENTIAL_REF: &str = "west-discovery";
 
@@ -856,7 +857,14 @@ mod remove_fences_first_sight_install {
         let config = RemoteDiscoveryConfig {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(5),
-            ..RemoteDiscoveryConfig::default()
+            max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
+            production_mode: false,
+            // Filled per cluster from the resolved discovery credential.
+            jwt_secret: None,
+            node_id: "dp-poller".to_string(),
+            namespace: "default".to_string(),
+            tls_config: RemoteDiscoveryTlsConfig::default(),
         };
         let credentials = Arc::new(HashMap::from([(
             CREDENTIAL_REF.to_string(),

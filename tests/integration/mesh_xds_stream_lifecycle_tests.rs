@@ -545,6 +545,11 @@ async fn private_xds_nack_breaker_is_policy_rejected_not_liveness() {
     harness.shutdown_and_join().await;
 }
 
+/// Debounce window wide enough that the scripted NACK (sent in the same burst
+/// as the response that completes `v1`) is guaranteed to land while `v1` is
+/// still STAGED, independent of runner scheduling.
+const CONTROLLED_DEBOUNCE: Duration = Duration::from_secs(4);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn nack_inside_debounce_keeps_the_acked_coherent_generation() {
     let (primary, primary_url) = serve(AdsBehaviour::CoherentThenInvalidEcds).await;
@@ -553,22 +558,44 @@ async fn nack_inside_debounce_keeps_the_acked_coherent_generation() {
         MeshRuntimeState::new(),
         MeshStreamTimings {
             first_frame: Duration::from_secs(10),
-            first_slice: Duration::from_secs(15),
+            first_slice: Duration::from_secs(60),
+            apply_debounce: CONTROLLED_DEBOUNCE,
+            apply_max_delay: CONTROLLED_DEBOUNCE,
             ..MeshStreamTimings::production()
         },
     );
 
-    // The script never resends `v1` after the NACK (state-of-the-world does not
-    // resend an ACKed version), so the only way the slice can install inside
-    // this window — well before the 15 s first-slice reconnect — is by
+    // Phase 1: the server observes the NACK. The client sends it only after it
+    // has processed (and staged) the response that completed `v1`, because the
+    // responses arrive in order on one stream.
+    let nack_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while primary.nack_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < nack_deadline,
+            "the invalid ECDS v2 was never NACKed; streams={} status={:?}",
+            primary.stream_count(),
+            harness.state.config_stream_status()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // ...and nothing has been committed yet: the NACK landed inside the
+    // debounce window, with `v1` still staged.
+    assert!(
+        harness.state.snapshot().is_none(),
+        "the NACK must be observed before the debounce commits, or this test proves nothing"
+    );
+
+    // Phase 2: the script never resends `v1` after the NACK (state-of-the-world
+    // does not resend an ACKed version), so the slice can install only by
     // committing the generation that was staged before the NACK arrived.
-    let until = tokio::time::Instant::now() + Duration::from_secs(5);
+    let install_deadline =
+        tokio::time::Instant::now() + CONTROLLED_DEBOUNCE + Duration::from_secs(10);
     let installed = loop {
         if let Some(slice) = harness.state.snapshot().as_ref().clone() {
             break slice;
         }
         assert!(
-            tokio::time::Instant::now() < until,
+            tokio::time::Instant::now() < install_deadline,
             "the ACKed coherent v1 generation must install despite the later ECDS NACK; \
              nacks={} streams={} status={:?}",
             primary.nack_count(),
@@ -579,10 +606,6 @@ async fn nack_inside_debounce_keeps_the_acked_coherent_generation() {
     };
 
     assert_eq!(installed.version, "v1");
-    assert!(
-        primary.nack_count() >= 1,
-        "the invalid ECDS v2 must have been NACKed, or this test proves nothing"
-    );
     assert_eq!(
         primary.stream_count(),
         1,

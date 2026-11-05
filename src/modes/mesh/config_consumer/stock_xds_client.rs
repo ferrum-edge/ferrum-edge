@@ -128,8 +128,6 @@ use crate::xds::translator::{
 /// are subscribed later, by name, once their dependencies land.
 const STOCK_INITIAL_TYPE_URL_ORDER: [&str; 2] = [CDS_TYPE_URL, LDS_TYPE_URL];
 
-const STOCK_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
-const STOCK_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
 const STOCK_CONSECUTIVE_NACK_LIMIT: u32 = 5;
 /// Maximum distinct refusals logged per apply. Refusals are bounded input from
 /// the control plane, so the log line is capped rather than unbounded.
@@ -1639,18 +1637,17 @@ async fn run_stock_ads_stream(
                             generation: next,
                             now: tokio::time::Instant::now(),
                         });
-                        arm_stock_debounce(debounce.as_mut(), action);
+                        arm_stock_debounce(debounce.as_mut(), action, config.timings);
                     }
                     StockResponseOutcome::Acked => {}
                     StockResponseOutcome::Nacked => {
-                        // The NACK rolled the accumulator back to exactly the
-                        // state the staged slice (or policy rebuild) was built
-                        // from, so the staged generation is still the view this
-                        // client has acknowledged and keeps its deadline.
-                        // Dropping it would leave the previous slice serving
-                        // until the next unrelated discovery push.
+                        // The NACK rollback excludes only the NACKed response;
+                        // the staged slice (or policy rebuild) remains a
+                        // complete ACKed view and keeps its deadline. Dropping
+                        // it would leave the previous slice serving until the
+                        // next unrelated discovery push.
                         let action = pending.transition(PendingGenerationEvent::ResponseNacked);
-                        arm_stock_debounce(debounce.as_mut(), action);
+                        arm_stock_debounce(debounce.as_mut(), action, config.timings);
                         if pending.is_staged() {
                             debug!(
                                 node_id = %sanitize_startup_scalar(config.node_id.as_str()),
@@ -1694,29 +1691,32 @@ async fn run_stock_ads_stream(
                                 }),
                                 now: tokio::time::Instant::now(),
                             });
-                            arm_stock_debounce(debounce.as_mut(), action);
+                            arm_stock_debounce(debounce.as_mut(), action, config.timings);
                         }
                         Err(_) => {
+                            // Epoch-checked: a newer reload may have begun its
+                            // own recovery while this older baseline was being
+                            // rebuilt, and this failure must not cancel it.
+                            // A baseline without an epoch is not a recovery
+                            // candidate, so the failure is rejected outright.
+                            let config_rejected_raised = match baseline.recovery_epoch {
+                                Some(epoch) => recovery.mark_rejected_for_epoch(epoch),
+                                None => {
+                                    recovery.mark_rejected();
+                                    true
+                                }
+                            };
                             warn!(
                                 node_id = %crate::startup::sanitize_startup_cause(
                                     format!("{:?}", config.node_id.to_string()),
                                     &[]
                                 ),
                                 type_url = stock_log_type_label("policy-reload"),
+                                config_rejected_raised,
                                 "Reloaded mesh policy document failed slice construction; keeping \
-                                 the last good slice and raising config_rejected"
+                                 the last good slice (config_rejected is left to a newer pending \
+                                 policy recovery when this baseline is stale)"
                             );
-                            // Epoch-checked: a newer reload may have begun its
-                            // own recovery while this older baseline was being
-                            // rebuilt, and this failure must not cancel it.
-                            // A baseline without an epoch is not a recovery
-                            // candidate, so the failure is rejected outright.
-                            match baseline.recovery_epoch {
-                                Some(epoch) => {
-                                    recovery.mark_rejected_for_epoch(epoch);
-                                }
-                                None => recovery.mark_rejected(),
-                            }
                         }
                     }
                 }
@@ -1773,15 +1773,13 @@ async fn run_stock_ads_stream(
 fn arm_stock_debounce(
     debounce: std::pin::Pin<&mut tokio::time::Sleep>,
     action: PendingGenerationAction<Box<PendingStockSlice>>,
+    timings: MeshStreamTimings,
 ) {
     match action {
         PendingGenerationAction::ArmDebounce {
             now,
             first_staged_at,
-        } => debounce.reset(std::cmp::min(
-            now + STOCK_APPLY_DEBOUNCE,
-            first_staged_at + STOCK_APPLY_MAX_DELAY,
-        )),
+        } => debounce.reset(timings.apply_deadline(now, first_staged_at)),
         PendingGenerationAction::None | PendingGenerationAction::Commit(_) => {}
     }
 }

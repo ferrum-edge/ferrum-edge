@@ -66,9 +66,7 @@ const REQUIRED_MESH_SLICE_TYPE_URLS: [&str; 5] = [
     RDS_TYPE_URL,
     ECDS_TYPE_URL,
 ];
-const XDS_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 const XDS_CONSECUTIVE_NACK_LIMIT: u32 = 5;
-const XDS_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 /// Closed-set failure of one Ferrum-private ADS attempt.
 ///
@@ -1150,7 +1148,7 @@ async fn run_ads_stream_with_auth(
                             generation: staged,
                             now: tokio::time::Instant::now(),
                         });
-                        arm_xds_debounce(debounce.as_mut(), action);
+                        arm_xds_debounce(debounce.as_mut(), action, timings);
                     }
                     Ok(None) => {
                         if stream_state
@@ -1218,12 +1216,13 @@ async fn run_ads_stream_with_auth(
 fn arm_xds_debounce(
     debounce: std::pin::Pin<&mut tokio::time::Sleep>,
     action: PendingGenerationAction<PendingXdsSlice>,
+    timings: MeshStreamTimings,
 ) {
     match action {
         PendingGenerationAction::ArmDebounce {
             now,
             first_staged_at,
-        } => debounce.reset(next_xds_apply_deadline(now, first_staged_at)),
+        } => debounce.reset(timings.apply_deadline(now, first_staged_at)),
         // `Stage` always arms; nothing to commit from a stage.
         PendingGenerationAction::None | PendingGenerationAction::Commit(_) => {}
     }
@@ -1231,9 +1230,10 @@ fn arm_xds_debounce(
 
 /// Feed a NACK into the pending-generation machine.
 ///
-/// The NACK restored the accumulator to exactly the state the staged
-/// generation was built from, so the staged generation stays: discarding it
-/// would leave the data plane serving the previous generation while the
+/// The NACK rollback excludes only the NACKed response; the staged generation
+/// remains a coherent ACKed set (any ACKed-but-incoherent response since then
+/// never re-staged, so the staged set is unaffected), so it stays: discarding
+/// it would leave the data plane serving the previous generation while the
 /// control plane holds ACKs for the staged one, and state-of-the-world never
 /// resends after an ACK. Returns whether a staged generation was retained.
 fn note_xds_nack_with_pending(
@@ -1283,16 +1283,6 @@ fn flush_pending_xds_slice_before_error(
         PendingGenerationAction::None | PendingGenerationAction::ArmDebounce { .. } => {}
     }
     Err(error)
-}
-
-fn next_xds_apply_deadline(
-    now: tokio::time::Instant,
-    first_pending_at: tokio::time::Instant,
-) -> tokio::time::Instant {
-    std::cmp::min(
-        now + XDS_APPLY_DEBOUNCE,
-        first_pending_at + XDS_APPLY_MAX_DELAY,
-    )
 }
 
 #[derive(Debug)]
@@ -3343,13 +3333,15 @@ mod tests {
         let early_burst = first_pending_at + Duration::from_millis(100);
         let late_burst = first_pending_at + Duration::from_millis(490);
 
+        let timings = MeshStreamTimings::production();
+
         assert_eq!(
-            next_xds_apply_deadline(early_burst, first_pending_at),
-            early_burst + XDS_APPLY_DEBOUNCE
+            timings.apply_deadline(early_burst, first_pending_at),
+            early_burst + timings.apply_debounce
         );
         assert_eq!(
-            next_xds_apply_deadline(late_burst, first_pending_at),
-            first_pending_at + XDS_APPLY_MAX_DELAY
+            timings.apply_deadline(late_burst, first_pending_at),
+            first_pending_at + timings.apply_max_delay
         );
     }
 

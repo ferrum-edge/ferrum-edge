@@ -2,13 +2,20 @@
 //! (`xds`) and stock (`stock_xds`) ADS clients.
 //!
 //! An ADS client stages a complete, already-ACKed generation and commits it
-//! when the 25 ms debounce fires (bounded by the max-delay cap), at a clean
-//! stream end, or before surfacing a stream error. The generation is only ever
-//! staged once the client's own completeness gate held at ACK time, so it is
-//! independent of any LATER response: a NACK rolls the accumulator back to
-//! exactly the state the staged generation was built from and rejects only the
-//! offending response. Discarding the staged generation on that NACK would
-//! leave the data plane serving the previous generation while the control
+//! when the debounce fires (`MeshStreamTimings::apply_debounce`, bounded by
+//! `apply_max_delay`) or at a clean remote end of stream. Stream errors differ
+//! per client: the `xds` client also commits the staged generation before it
+//! surfaces any stream error (including a NACK-circuit-breaker trip), while the
+//! `stock_xds` client drops it on every stream error and keeps only the
+//! last-installed slice. The machine itself only decides WHAT is staged; each
+//! caller decides when to feed it [`PendingGenerationEvent::Commit`].
+//!
+//! A generation is only ever staged once the client's own completeness gate
+//! held at ACK time, so it is independent of any LATER response: a NACK's
+//! rollback excludes only the NACKed response, and the staged generation
+//! remains a coherent ACKed set (later ACKed responses that did not complete a
+//! new set never re-staged). Discarding the staged generation on that NACK
+//! would leave the data plane serving the previous generation while the control
 //! plane holds ACKs for the staged one (state-of-the-world never resends after
 //! an ACK), so [`PendingGenerationEvent::ResponseNacked`] retains it.
 //!
@@ -43,8 +50,9 @@ pub enum PendingGenerationEvent<T> {
     /// staged generation does not depend on the rejected response, so it is
     /// retained and the debounce stays armed at its existing deadline.
     ResponseNacked,
-    /// The debounce fired, the stream ended cleanly, or the stream is failing
-    /// and flushes what it already ACKed.
+    /// Commit what is staged: the debounce fired, the remote ended the stream
+    /// cleanly, or (`xds` only) the stream is failing and flushes what it
+    /// already ACKed.
     Commit,
 }
 
