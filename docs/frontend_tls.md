@@ -1590,6 +1590,10 @@ leaves an authoritative order behind in `pending_challenges`, `ready`, or
 
 If the CA reports the order itself as terminally `invalid`, the scheduler marks
 that unchanged active order `failed` inside the still-held renewal lease fence.
+Admin finalize applies the same rule and the same compare-and-set: it records
+`failed` only for an observed `invalid` order, and its `valid` write lands only
+on the exact order snapshot it read before its CA I/O, so a renewal that
+completed the order, an operator delete, or any other write in that window wins.
 The next due scan plans a new order; normal terminal-history pruning applies.
 Timeouts, network errors and other failures without an observed invalid order
 leave the existing order resumable. A lost claim, operator update, deletion or
@@ -1648,9 +1652,9 @@ order with the CA while the original remains active:
   summaries continue to expose the documented challenge-setup fields; account
   credentials remain excluded.
 - **Retention is tied to resumability.** The material is dropped in the same
-  write that sets the order `Valid`, which is exactly when the order stops being
-  resumable (`Valid` is terminal, so a later scan plans a fresh order with fresh
-  material). All four partial-publication outcomes stay recoverable: the two
+  write that sets the order `Valid` or `failed`, which is exactly when the order
+  stops being resumable (both are terminal, so a later scan plans a fresh order
+  with fresh material, and a terminal order can never be finalized again). All four partial-publication outcomes stay recoverable: the two
   where the order write lands reach `Valid` and no longer need it, and the two
   where the order write fails never touch the stored record, so a still-active
   order keeps the material its successor needs.

@@ -954,6 +954,15 @@ paths:
         creation time. An `invalid` order fails closed. An order whose persisted
         key/CSR material is missing or unusable is rejected with `400` before any
         directory request using a fixed response that never describes the material.
+        Only an active order (`pending_challenges`, `ready`, `processing`) can be
+        finalized; a `valid`, `failed`, or `cancelled` order is terminal and is
+        rejected with `409` before any directory request. The order is marked
+        `failed` only when the directory reports it `invalid`; transient failures
+        return `502` and leave it active for a retry. The final order write is a
+        compare-and-set on the order as read before the directory I/O: if it was
+        completed by a renewal, deleted, or otherwise rewritten meanwhile, the
+        order is left unchanged and `409` is returned (an already stored
+        certificate stays stored).
         Usability requires exactly one parseable private key PEM record, a complete
         CSR DER whose signature verifies, matching private-key/CSR public keys, and
         a CSR DNS SAN set that exactly matches the order domains. The endpoint

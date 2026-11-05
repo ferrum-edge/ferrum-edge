@@ -91,6 +91,35 @@ pub enum AcmeOrderStatus {
     Cancelled,
 }
 
+impl AcmeOrderStatus {
+    /// Whether the order is still in flight: it can be finalized, serves its
+    /// challenges, blocks a duplicate renewal order, and keeps its key/CSR.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::PendingChallenges | Self::Ready | Self::Processing
+        )
+    }
+
+    /// The lifecycle transition function: `Some(next)` when `self -> next` is a
+    /// legal move, `None` otherwise.
+    ///
+    /// Active states only move forward (`pending_challenges -> ready ->
+    /// processing`) or into a terminal state. `valid`, `failed` and `cancelled`
+    /// are terminal and can never be left, so a failed order cannot later be
+    /// finalized into `valid`. Re-entering the current state is not a
+    /// transition.
+    pub fn transition_to(self, next: Self) -> Option<Self> {
+        let legal = match (self, next) {
+            (Self::PendingChallenges, Self::Ready | Self::Processing)
+            | (Self::Ready, Self::Processing) => true,
+            (from, Self::Valid | Self::Failed | Self::Cancelled) => from.is_active(),
+            _ => false,
+        };
+        legal.then_some(next)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcmeCertificateRecord {
     pub id: String,
@@ -979,49 +1008,88 @@ impl AcmeOrderStore {
     }
 
     /// Persist authoritative CA-invalid evidence only for the same active
-    /// snapshot. Callers must also hold the certificate's renewal lease fence.
-    /// Never recreate a deleted order, overwrite an operator update, or make an
-    /// older failed order hide a newer order from the renewal planner.
+    /// snapshot. The renewal path also holds the certificate's renewal lease
+    /// fence; admin finalize, which takes no lease, relies on the snapshot
+    /// compare alone. Never recreate a deleted order, overwrite an operator
+    /// update, or make an older failed order hide a newer order from the
+    /// renewal planner.
+    ///
+    /// The order becomes terminal in this write, so its key/CSR is dropped with
+    /// it: a failed order is never resumed or finalized again.
     pub fn fail_ca_invalid_order_if_current(
         &self,
         expected: &AcmeOrderRecord,
     ) -> Result<bool, AcmeError> {
+        let failed =
+            self.transition_order_if_current(expected, AcmeOrderStatus::Failed, |order| {
+                order.error =
+                    Some("CA reports that the ACME order is terminally invalid".to_string());
+                order.finalization = None;
+            })?;
+        Ok(failed.is_some())
+    }
+
+    /// Commit `Valid` for an order finalized from the snapshot `expected`, and
+    /// only if the stored order is still exactly that snapshot.
+    ///
+    /// Admin finalize reads the order, then spends up to the poll timeout on CA
+    /// I/O without holding the renewal lease. Writing its result back blind
+    /// would overwrite a renewal that completed the same order meanwhile,
+    /// recreate an order an operator deleted, or move a terminal order to
+    /// `Valid`. Returns `Ok(None)` and writes nothing in each of those cases.
+    /// The finalization material is cleared in the same write, as on the
+    /// renewal path.
+    pub fn complete_order_if_current(
+        &self,
+        expected: &AcmeOrderRecord,
+        certificate_id: String,
+    ) -> Result<Option<AcmeOrderRecord>, AcmeError> {
+        validate_acme_id(&certificate_id)?;
+        self.transition_order_if_current(expected, AcmeOrderStatus::Valid, move |order| {
+            order.certificate_id = Some(certificate_id);
+            order.error = None;
+            order.finalization = None;
+        })
+    }
+
+    /// Compare-and-set lifecycle write shared by every writer that acts on an
+    /// earlier read of an order.
+    ///
+    /// Applies `target` (plus `apply`'s field updates) only when the stored
+    /// order still matches `expected` (`order_matches_snapshot`), the move is
+    /// legal (`AcmeOrderStatus::transition_to`, so terminal states are never
+    /// left), and the write would not make an older order hide a newer one for
+    /// the same certificate from the renewal planner. Otherwise nothing is
+    /// written and `Ok(None)` is returned.
+    fn transition_order_if_current(
+        &self,
+        expected: &AcmeOrderRecord,
+        target: AcmeOrderStatus,
+        apply: impl FnOnce(&mut AcmeOrderRecord),
+    ) -> Result<Option<AcmeOrderRecord>, AcmeError> {
         validate_acme_id(&expected.id)?;
-        let expected = expected.clone();
         let terminal_history = self.terminal_history;
-        let outcome = self.file.mutate_if::<_, AcmeError>(move |document| {
+        let outcome = self.file.mutate_if::<_, AcmeError>(|document| {
             let Some(current) = document.orders.get(&expected.id) else {
-                return Ok((false, (false, 0)));
+                return Ok((false, (None, 0)));
             };
-            let latest = document
-                .orders
-                .values()
-                .filter(|order| order.certificate_id == expected.certificate_id)
-                .max_by_key(|order| order.updated_at);
-            if current.created_at != expected.created_at
-                || current.updated_at != expected.updated_at
-                || current.order_url != expected.order_url
-                || current.certificate_id != expected.certificate_id
-                || current.status != expected.status
-                || !matches!(
-                    current.status,
-                    AcmeOrderStatus::PendingChallenges
-                        | AcmeOrderStatus::Ready
-                        | AcmeOrderStatus::Processing
-                )
-                || latest.is_none_or(|order| order.id != expected.id)
+            let Some(next) = current.status.transition_to(target) else {
+                return Ok((false, (None, 0)));
+            };
+            if !order_matches_snapshot(current, expected)
+                || order_is_superseded_for_certificate(document, expected)
             {
-                return Ok((false, (false, 0)));
+                return Ok((false, (None, 0)));
             }
             let Some(current) = document.orders.get_mut(&expected.id) else {
-                return Ok((false, (false, 0)));
+                return Ok((false, (None, 0)));
             };
-            current.status = AcmeOrderStatus::Failed;
-            current.error =
-                Some("CA reports that the ACME order is terminally invalid".to_string());
+            current.status = next;
+            apply(&mut *current);
             current.updated_at = Utc::now();
+            let committed = current.clone();
             let pruned = prune_terminal_order_history(document, terminal_history);
-            Ok((true, (true, pruned)))
+            Ok((true, (Some(committed), pruned)))
         })?;
         record_store_pruned(outcome.1 as u64);
         Ok(outcome.0)
@@ -1051,14 +1119,7 @@ impl AcmeOrderStore {
         document
             .orders
             .values()
-            .filter(|order| {
-                matches!(
-                    order.status,
-                    AcmeOrderStatus::PendingChallenges
-                        | AcmeOrderStatus::Ready
-                        | AcmeOrderStatus::Processing
-                )
-            })
+            .filter(|order| order.status.is_active())
             .flat_map(|order| order.http01_challenges.iter())
             .find(|challenge| challenge.token == token)
             .map(|challenge| challenge.key_authorization.clone())
@@ -1070,14 +1131,7 @@ impl AcmeOrderStore {
         document
             .orders
             .values()
-            .filter(|order| {
-                matches!(
-                    order.status,
-                    AcmeOrderStatus::PendingChallenges
-                        | AcmeOrderStatus::Ready
-                        | AcmeOrderStatus::Processing
-                )
-            })
+            .filter(|order| order.status.is_active())
             .flat_map(|order| order.tls_alpn01_challenges.iter())
             .find(|challenge| {
                 normalize_tls_alpn_identifier(&challenge.identifier) == Some(identifier.clone())
@@ -1678,12 +1732,45 @@ fn validate_acme_terminal_history(terminal_history: usize) -> Result<usize, Acme
 /// `Failed`/`Cancelled`, plus `Valid` once finalization has been cleared.
 fn order_is_active_or_recoverable(order: &AcmeOrderRecord) -> bool {
     match order.status {
-        AcmeOrderStatus::PendingChallenges
-        | AcmeOrderStatus::Ready
-        | AcmeOrderStatus::Processing => true,
+        status if status.is_active() => true,
         AcmeOrderStatus::Valid => order.finalization.is_some(),
-        AcmeOrderStatus::Failed | AcmeOrderStatus::Cancelled => false,
+        _ => false,
     }
+}
+
+/// Whether `current` is still exactly the order a caller read as `expected`.
+///
+/// `updated_at` is stamped by every store write and `created_at` by the write
+/// that created the id, so together they act as the record's version: an
+/// intervening update, a delete-and-recreate, or a completed renewal all fail
+/// this check.
+fn order_matches_snapshot(current: &AcmeOrderRecord, expected: &AcmeOrderRecord) -> bool {
+    current.created_at == expected.created_at
+        && current.updated_at == expected.updated_at
+        && current.order_url == expected.order_url
+        && current.certificate_id == expected.certificate_id
+        && current.status == expected.status
+}
+
+/// Whether a newer order exists for `expected`'s certificate.
+///
+/// A write stamps `updated_at = now`, so committing an older order would make
+/// it the latest for its certificate and hide the newer one from
+/// `plan_renewal_order`. Orders without a certificate are never planned, so
+/// they cannot hide anything.
+fn order_is_superseded_for_certificate(
+    document: &AcmeOrderStoreFile,
+    expected: &AcmeOrderRecord,
+) -> bool {
+    let Some(certificate_id) = expected.certificate_id.as_deref() else {
+        return false;
+    };
+    document
+        .orders
+        .values()
+        .filter(|order| order.certificate_id.as_deref() == Some(certificate_id))
+        .max_by_key(|order| order.updated_at)
+        .is_none_or(|order| order.id != expected.id)
 }
 
 /// Retain all active/recoverable orders plus at most `max_terminal` newest
@@ -2719,10 +2806,7 @@ pub(crate) fn plan_renewal_order(
     let Some(order) = order_store.latest_order_for_certificate(certificate_id)? else {
         return Ok(RenewalOrderPlan::NewOrder);
     };
-    if !matches!(
-        order.status,
-        AcmeOrderStatus::PendingChallenges | AcmeOrderStatus::Ready | AcmeOrderStatus::Processing
-    ) {
+    if !order.status.is_active() {
         return Ok(RenewalOrderPlan::NewOrder);
     }
     let Some(order_url) = order
