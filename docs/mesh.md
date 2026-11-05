@@ -5323,11 +5323,11 @@ Status subresources are written for GatewayClass, Gateway, ListenerSet, the rout
 - `Gateway.status.conditions` and route `status.parents[].conditions` carry Ferrum-authored `Accepted`, `Programmed`, `ResolvedRefs`, and `Conflicted`. Accepted routes report programmed from typed route-to-parent materialization records (never by parsing proxy IDs); rejected routes report unresolved references (missing `ReferenceGrant`, unsupported backend kinds); route collisions report `Conflicted=True`.
 - **`BackendTLSPolicy`** is translated onto Service-backed HTTPRoute/GRPCRoute backends and receives `PolicyStatus` (`status.ancestors[]`). Its ancestor is the targeted Service (the verdict takes no Gateway as input), so Ferrum contributes at most one entry, and only for a policy whose Service a managed Gateway effectively routes to. Conditions use the portable `PolicyConditionReason` vocabulary (`Accepted` / `Conflicted` / `Invalid` / `NoValidCACertificate` / `TargetNotFound`; `ResolvedRefs` / `InvalidCACertificateRef` / `InvalidKind` / `RefNotPermitted`).
 - **Full ancestor map:** if other controllers have filled a policy's 16-entry `ancestors` maximum, Ferrum publishes no entry, but the policy still translates (backend TLS, session persistence). The ceiling constrains only the status writer, so a controller with status-write access cannot disable the policy's effect.
-- When Istio status writing is also enabled, both writers observe the same Kubernetes object generation per reconcile (one shared snapshot) with independent update plans and failure handling. Status planning reuses the primary translation result instead of retranslating per object.
+- When Istio status writing is also enabled, both writers observe the same Kubernetes object generation per reconcile (one shared snapshot) with independent update plans and failure handling, and their patch batches run concurrently. Status planning reuses the primary translation result instead of retranslating per object.
 
 ### Bounded status writes
 
-A status patch batch runs inline on the single serialized reconcile loop, so while it runs no other object's status is published (issue #4239). The bounds:
+A status patch batch runs inline on the single serialized reconcile loop, so while it runs no other object's status is published (issue #4239). The Gateway API and Istio batches of one reconcile run concurrently, so the loop is held for the slower of the two rather than their sum. The bounds:
 
 | Bound | Value |
 |---|---|

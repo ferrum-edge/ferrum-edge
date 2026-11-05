@@ -3,7 +3,9 @@
 //!
 //! Gateway API and Istio status patch batches are awaited *inline* on the single
 //! reconcile task: while a batch runs, no watch event and no full-sync tick can
-//! produce a new reconcile, so no other object's status can be published. Before
+//! produce a new reconcile, so no other object's status can be published. The
+//! two writers' batches run concurrently with each other, so one reconcile is
+//! held for the slower batch, not their sum. Before
 //! #4239 the only bound on that batch was a single 60-second whole-batch
 //! timeout, and the individual API requests inside it were unbounded (the shared
 //! kube client's read timeout is measured in minutes and cannot be lowered

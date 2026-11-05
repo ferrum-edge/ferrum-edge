@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use futures_util::future::OptionFuture;
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
@@ -1340,6 +1341,9 @@ struct StatusPatchersRequest<'a> {
 /// handling. Writers are taken by value so they can be moved into the helper
 /// futures (required for `tokio::spawn`'s HRTB Send check — see the
 /// `Send is not general enough` history in `spawn_reconcile_loop`).
+///
+/// The two batches run concurrently, so the reconcile loop is held for the
+/// slower batch rather than for their sum.
 async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
     let StatusPatchersRequest {
         gateway_writer,
@@ -1357,28 +1361,61 @@ async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
         return;
     };
 
-    if let Some(writer) = gateway_writer {
-        patch_gateway_api_statuses(
-            writer,
-            Arc::clone(&snapshot),
-            options.clone(),
-            route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
-            gateway_api_status_context,
-            translation_reuse,
-            metrics,
-        )
-        .await;
-    }
-    if let Some(writer) = istio_writer {
-        patch_istio_statuses(
-            writer,
-            snapshot,
-            options.clone(),
-            translation_reuse,
-            metrics,
-        )
-        .await;
-    }
+    // Safe to run concurrently: the writers patch disjoint object sets
+    // (Gateway API kinds vs Istio kinds), read only the immutable snapshot,
+    // options and translation reuse, and neither result feeds the other. The
+    // Gateway API status-plan cursor is written only by the Gateway arm. Both
+    // arms swallow their own errors, so `join!` (not `try_join!`) keeps each
+    // batch's failure handling unchanged. Each arm is the same owned-writer
+    // helper future that was awaited sequentially before.
+    let gateway: OptionFuture<_> = gateway_writer
+        .map(|writer| {
+            patch_gateway_api_statuses(
+                writer,
+                Arc::clone(&snapshot),
+                options.clone(),
+                route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
+                gateway_api_status_context,
+                translation_reuse,
+                metrics,
+            )
+        })
+        .into();
+    let istio: OptionFuture<_> = istio_writer
+        .map(|writer| {
+            patch_istio_statuses(
+                writer,
+                snapshot,
+                options.clone(),
+                translation_reuse,
+                metrics,
+            )
+        })
+        .into();
+    tokio::join!(gateway, istio);
+}
+
+/// Test-only entry into [`run_status_patchers`] (no route conflicts, no
+/// translation reuse, default Gateway API status context) so integration
+/// tests drive the production dispatch.
+pub(crate) async fn run_status_patchers_for_test(
+    gateway_writer: Option<GatewayApiStatusWriter>,
+    istio_writer: Option<IstioStatusWriter>,
+    objects: Vec<K8sObject>,
+    options: K8sTranslationOptions,
+    metrics: &ControllerMetrics,
+) {
+    run_status_patchers(StatusPatchersRequest {
+        gateway_writer,
+        istio_writer,
+        objects,
+        options: &options,
+        route_conflicts: None,
+        gateway_api_status_context: GatewayApiStatusContext::default(),
+        translation_reuse: None,
+        metrics,
+    })
+    .await;
 }
 
 async fn patch_gateway_api_statuses(
