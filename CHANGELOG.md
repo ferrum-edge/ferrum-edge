@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
+### Performance
+- **Mesh pool growth no longer delays the request that triggers it.** When a
+  loaded HBONE (Ambient/waypoint) or Sidecar mesh-mTLS destination widened by
+  one connection, the checkout that noticed the load waited for the whole
+  TCP + mTLS + HTTP/2 dial, up to the connect timeout against a peer that
+  blackholes new connections, although it already held a ready connection
+  with room. That request now goes out on the connection it has, and the dial
+  runs on a detached task, the way gRPC shard fills already do. Growth stays
+  single-flight per destination, keeps the 10 s backoff after a failed dial,
+  and draws on a small per-pool budget (a quarter of the CPU count, 1 to 4
+  dials at once) that it never waits for. The new connection serves later
+  requests once it is pooled.
+
 ## [0.9.20] - 2026-11-02
 
 This patch release follows published 0.9.19. It was published on 2026-11-03

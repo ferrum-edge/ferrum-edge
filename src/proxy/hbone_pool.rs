@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -32,7 +32,10 @@ use crate::modes::mesh::hbone::{
     BAGGAGE_HEADER, ISTIO_HBONE_PORT, UdpSourceIdentity, baggage_header_for_source,
     baggage_header_for_udp_source,
 };
-use crate::pool::{PoolCreateCaller, SharedCreationRole, SharedCreationSlot};
+use crate::pool::{
+    BackgroundCreateBudget, OwnedSharedCreationLease, PoolCreateCaller, SharedCreationRole,
+    SharedCreationSlot,
+};
 use crate::proxy::mesh_trust_registry::{
     MESH_KEEPALIVE_FAILED_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
     MeshTrustRegistry,
@@ -827,6 +830,14 @@ pub struct HboneConnectionPool {
     /// retried (issue #5465). Written only when growth fails; pruned with the
     /// idle sweep.
     growth_backoff_until: DashMap<String, u64>,
+    /// Never-waiting budget for detached growth dials, shared by every key:
+    /// bounds how many run at once across destinations.
+    background_growth: BackgroundCreateBudget,
+    /// The `Arc` this pool lives in, set by [`HboneConnectionPool::into_shared`]
+    /// so a growth dial can run on a detached task that owns the pool. Unset
+    /// for a pool used by value (focused tests, standalone callers), which
+    /// grows inline instead.
+    self_handle: OnceLock<Weak<HboneConnectionPool>>,
     gateway_svid: SharedSvidBundle,
     crls: crate::tls::SharedCrlList,
     svid_identity_cache: ArcSwap<Option<HboneSvidIdentityCache>>,
@@ -983,6 +994,8 @@ impl HboneConnectionPool {
             entries: Arc::new(DashMap::with_shard_amount(shard_amount)),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
+            background_growth: BackgroundCreateBudget::new(),
+            self_handle: OnceLock::new(),
             gateway_svid,
             crls,
             svid_identity_cache: ArcSwap::new(Arc::new(None)),
@@ -1000,6 +1013,15 @@ impl HboneConnectionPool {
             ),
             request_epoch: OnceLock::new(),
         }
+    }
+
+    /// Share this pool behind an `Arc` and remember that `Arc`, so pressure
+    /// growth runs on a detached task instead of making the checkout that
+    /// triggered it wait for the dial. `ProxyState` builds its pool this way.
+    pub fn into_shared(self) -> Arc<Self> {
+        let pool = Arc::new(self);
+        let _ = pool.self_handle.set(Arc::downgrade(&pool));
+        pool
     }
 
     /// Install the published request epoch so inner leases can be keyed by the
@@ -1514,10 +1536,12 @@ impl HboneConnectionPool {
 
             let sender = if let Some(checkout) = fast_sender {
                 // The least-loaded connection is carrying at least the growth
-                // threshold of open tunnels and the key has room: try to widen
-                // (issue #5465). Growth is opportunistic — a busy creation
-                // lock, a backoff, or a failed dial all leave this tunnel on
-                // the connection it already has.
+                // threshold of open tunnels and the key has room: widen
+                // (issue #5465). This tunnel stays on the ready connection it
+                // already has, which still has room under the peer's stream
+                // cap; the dial runs detached and publishes for later
+                // checkouts. A busy creation lock, a backoff, a spent growth
+                // budget, or a failed dial all just leave the width as is.
                 if checkout.live_connections < max_entries
                     && checkout.active_streams >= HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
                 {
@@ -1534,7 +1558,7 @@ impl HboneConnectionPool {
                         |key| key.to_string(),
                     );
                     match self
-                        .try_grow_sender(
+                        .grow_for_pressure(
                             proxy,
                             dial_host,
                             app_host,
@@ -1940,10 +1964,12 @@ impl HboneConnectionPool {
                 live_connections,
                 active_streams,
             } => {
+                // Same detached growth as the fast path in `get_tunnel_via`:
+                // this caller keeps the connection it selected.
                 if live_connections < max_entries
                     && active_streams >= HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION
                     && let Some(grown) = self
-                        .try_grow_sender(
+                        .grow_for_pressure(
                             proxy,
                             dial_host,
                             app_host,
@@ -2061,13 +2087,25 @@ impl HboneConnectionPool {
             .clone()
     }
 
-    /// Add one physical connection to a key that already has a usable one
-    /// (issue #5465). Returns the new transport, or `None` whenever growth is
-    /// not possible right now — the caller then opens its tunnel on the
-    /// connection it already selected. Never waits for the creation lock: a
-    /// cold dial or another grower in flight means "not now", not "queue".
+    /// Add one physical connection to a key whose least-loaded connection is
+    /// under pressure (issue #5465), without making the caller wait for the
+    /// dial: it keeps the usable connection it already selected.
+    ///
+    /// Everything that bounds growth runs here, before anything is spawned:
+    /// the per-key failure backoff, the key's creation lock (taken only if
+    /// free, and owned by the dial until it finishes, so a growth dial never
+    /// overlaps another growth or cold dial for the key), the width re-check
+    /// under that lock, and the pool's background-growth budget, which is
+    /// never waited for. The dial itself is the cold path's
+    /// `dial_and_publish`, so `maxConnections` admission, SVID/CRL pinning,
+    /// and the post-dial rotation, drain and trust-withdrawal checks apply
+    /// unchanged.
+    ///
+    /// Returns `Some` only for a pool used by value (no
+    /// [`Self::into_shared`] handle): with no `Arc` for a detached task to
+    /// own, it dials inline and serves the caller on the new connection.
     #[allow(clippy::too_many_arguments)]
-    async fn try_grow_sender(
+    async fn grow_for_pressure(
         &self,
         proxy: &Proxy,
         dial_host: &str,
@@ -2083,18 +2121,16 @@ impl HboneConnectionPool {
         max_entries: usize,
         connect_timeout: Duration,
     ) -> Option<MeshH2Transport> {
-        let now = unix_secs();
         if self
             .growth_backoff_until
             .get(key)
-            .is_some_and(|until| *until.value() > now)
+            .is_some_and(|until| *until.value() > unix_secs())
         {
             return None;
         }
-        let creation_slot = self.creation_slot(key);
-        let creation_lease = creation_slot.try_claim()?;
+        let creation_lease = self.creation_slot(key).try_claim_owned()?;
         // Re-check under the lock: another grower may have widened the key
-        // (or a prune may have narrowed it) since the fast-path read.
+        // (or a prune may have narrowed it) since the checkout.
         let live_connections = self
             .entries
             .get(key)
@@ -2103,6 +2139,92 @@ impl HboneConnectionPool {
         if live_connections >= max_entries {
             return None;
         }
+        let Some(handle) = self.self_handle.get() else {
+            return self
+                .try_grow_sender(
+                    creation_lease,
+                    proxy,
+                    dial_host,
+                    app_host,
+                    app_port,
+                    app_policy_port,
+                    hbone_port,
+                    expected_peer,
+                    expected_trust_domain,
+                    sni_override,
+                    key,
+                    pool_config,
+                    max_entries,
+                    live_connections,
+                    connect_timeout,
+                )
+                .await;
+        };
+        let permit = self.background_growth.try_acquire()?;
+        let pool = handle.upgrade()?;
+        // The dial shares nothing with the caller's tunnel, which rides a
+        // connection that is ready and under the peer's stream cap. Owned
+        // copies are made once per growth event (single-flight per key and
+        // backed off after a failure), never per request.
+        let proxy = proxy.clone();
+        let dial_host = dial_host.to_owned();
+        let app_host = app_host.to_owned();
+        let expected_peer = expected_peer.cloned();
+        let expected_trust_domain = expected_trust_domain.cloned();
+        let sni_override = sni_override.map(str::to_owned);
+        let key = key.to_owned();
+        let pool_config = pool_config.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            // A pooled connection stays in `entries`; one built under rotated
+            // material is not pooled and closes when this drops it.
+            let _grown = pool
+                .try_grow_sender(
+                    creation_lease,
+                    &proxy,
+                    &dial_host,
+                    &app_host,
+                    app_port,
+                    app_policy_port,
+                    hbone_port,
+                    expected_peer.as_ref(),
+                    expected_trust_domain.as_ref(),
+                    sni_override.as_deref(),
+                    &key,
+                    &pool_config,
+                    max_entries,
+                    live_connections,
+                    connect_timeout,
+                )
+                .await;
+        });
+        None
+    }
+
+    /// The growth dial itself, run while `creation_lease` holds the key's
+    /// creation lock. A failure never reaches a request: it is counted by
+    /// `dial_and_publish` (`record_pool_failure`), logged, and backs the key
+    /// off for `HBONE_GROWTH_BACKOFF_SECS` before the lock is released.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_grow_sender(
+        &self,
+        creation_lease: OwnedSharedCreationLease<Arc<HbonePoolError>>,
+        proxy: &Proxy,
+        dial_host: &str,
+        app_host: &str,
+        app_port: u16,
+        app_policy_port: u16,
+        hbone_port: u16,
+        expected_peer: Option<&crate::identity::SpiffeId>,
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
+        key: &str,
+        pool_config: &PoolConfig,
+        max_entries: usize,
+        live_connections: usize,
+        connect_timeout: Duration,
+    ) -> Option<MeshH2Transport> {
+        let now = unix_secs();
         let effective_connect_timeout_ms = connect_timeout.as_millis().min(u64::MAX as u128) as u64;
         let dialed = self
             .dial_and_publish(
@@ -2124,8 +2246,7 @@ impl HboneConnectionPool {
                 effective_connect_timeout_ms,
             )
             .await;
-        drop(creation_lease);
-        match dialed {
+        let grown = match dialed {
             Ok(transport) => {
                 debug!(
                     dial_host,
@@ -2139,6 +2260,8 @@ impl HboneConnectionPool {
                 Some(transport)
             }
             Err(err) => {
+                // Backed off before the lock is released, so no other caller
+                // can start a second dial for the key in between.
                 self.growth_backoff_until
                     .insert(key.to_string(), now + HBONE_GROWTH_BACKOFF_SECS);
                 debug!(
@@ -2151,7 +2274,9 @@ impl HboneConnectionPool {
                 );
                 None
             }
-        }
+        };
+        drop(creation_lease);
+        grown
     }
 
     /// Dial one physical connection for `key` while holding its creation lock,

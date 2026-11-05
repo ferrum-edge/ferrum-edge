@@ -28,7 +28,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -170,10 +170,17 @@ fn proxy_for_test() -> Proxy {
 /// `200` and echoes the tunnel bytes, and tracks the number of open CONNECT
 /// streams on each accepted connection (in accept order — the same order the
 /// pool appends entries under one key).
+///
+/// While `blackhole` is set, new connections are accepted (and counted) but
+/// never get a TLS handshake, so a dial hangs until its own connect timeout;
+/// they are not tracked as pooled connections, and `blackholed_closed` counts
+/// those the client has since given up on.
 struct Peer {
     port: u16,
     accepted: Arc<AtomicUsize>,
     per_connection_active: Arc<Mutex<Vec<Arc<AtomicUsize>>>>,
+    blackhole: Arc<AtomicBool>,
+    blackholed_closed: Arc<AtomicUsize>,
 }
 
 impl Peer {
@@ -187,6 +194,10 @@ impl Peer {
             Arc::new(Mutex::new(Vec::new()));
         let accepted_for_task = accepted.clone();
         let per_connection_for_task = per_connection_active.clone();
+        let blackhole = Arc::new(AtomicBool::new(false));
+        let blackholed_closed = Arc::new(AtomicUsize::new(0));
+        let blackhole_for_task = blackhole.clone();
+        let blackholed_closed_for_task = blackholed_closed.clone();
         tokio::spawn(async move {
             let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
                 .expect("server config");
@@ -196,6 +207,21 @@ impl Peer {
                     return;
                 };
                 accepted_for_task.fetch_add(1, Ordering::SeqCst);
+                if blackhole_for_task.load(Ordering::SeqCst) {
+                    let closed = blackholed_closed_for_task.clone();
+                    tokio::spawn(async move {
+                        // Swallow the ClientHello and never answer it.
+                        let mut tcp = tcp;
+                        let mut buf = [0u8; 1024];
+                        while let Ok(read) = tcp.read(&mut buf).await {
+                            if read == 0 {
+                                break;
+                            }
+                        }
+                        closed.fetch_add(1, Ordering::SeqCst);
+                    });
+                    continue;
+                }
                 let active = Arc::new(AtomicUsize::new(0));
                 per_connection_for_task
                     .lock()
@@ -248,11 +274,29 @@ impl Peer {
             port,
             accepted,
             per_connection_active,
+            blackhole,
+            blackholed_closed,
         }
     }
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn blackhole_new_connections(&self, blackhole: bool) {
+        self.blackhole.store(blackhole, Ordering::SeqCst);
+    }
+
+    async fn wait_for_accepted(&self, expected: usize) {
+        wait_until(|| self.accepted() == expected, "peer connection count").await;
+    }
+
+    async fn wait_for_blackholed_closed(&self, expected: usize) {
+        wait_until(
+            || self.blackholed_closed.load(Ordering::SeqCst) == expected,
+            "abandoned blackholed dials",
+        )
+        .await;
     }
 
     fn active_per_connection(&self) -> Vec<usize> {
@@ -282,8 +326,21 @@ impl Peer {
     }
 }
 
+/// Poll `done` until it holds; growth publishes from a detached task, so
+/// width is asserted by polling rather than right after a checkout.
+async fn wait_until(done: impl Fn() -> bool, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 struct Fixture {
-    pool: HboneConnectionPool,
+    pool: Arc<HboneConnectionPool>,
     proxy: Proxy,
     peer: Peer,
     workload_id: SpiffeId,
@@ -311,12 +368,14 @@ impl Fixture {
             http2_connections_per_host: width,
             ..PoolConfig::default()
         };
+        // Shared like `ProxyState`'s pool, so growth runs detached.
         let pool = HboneConnectionPool::new(
             pool_config,
             DnsCache::new(DnsConfig::default()),
             gateway_slot,
             4,
-        );
+        )
+        .into_shared();
         Self {
             pool,
             proxy: proxy_for_test(),
@@ -344,10 +403,18 @@ impl Fixture {
     }
 
     async fn open_ok(&self) -> H2ConnectTunnel {
-        tokio::time::timeout(OPEN_TIMEOUT, self.open())
+        self.open_within(OPEN_TIMEOUT).await
+    }
+
+    async fn open_within(&self, budget: Duration) -> H2ConnectTunnel {
+        tokio::time::timeout(budget, self.open())
             .await
             .expect("timely tunnel open")
             .expect("open tunnel")
+    }
+
+    async fn wait_for_pool_size(&self, expected: usize) {
+        wait_until(|| self.pool.pool_size() == expected, "pool width").await;
     }
 }
 
@@ -411,29 +478,23 @@ async fn pressure_widens_only_up_to_the_bound() {
         .await;
     assert_eq!(fixture.peer.accepted(), 1);
     // The next checkout sees the threshold reached with room to widen: it
-    // dials a second connection and lands there; the following ones follow the
-    // least-loaded connection until both carry the threshold.
-    for _ in 0..HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION {
+    // opens on the connection it already has and a second connection is
+    // dialed in the background. The following tunnels follow the
+    // least-loaded connection until both carry the same load.
+    let busy = HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION + 1;
+    held.push(fixture.open_ok().await);
+    fixture.wait_for_pool_size(2).await;
+    fixture.peer.wait_for_active(&[busy, 0]).await;
+    assert_eq!(fixture.peer.accepted(), 2);
+    for _ in 0..busy {
         held.push(fixture.open_ok().await);
     }
-    fixture
-        .peer
-        .wait_for_active(&[
-            HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION,
-            HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION,
-        ])
-        .await;
+    fixture.peer.wait_for_active(&[busy, busy]).await;
     assert_eq!(fixture.peer.accepted(), 2);
     // At the configured width, pressure alone never adds a third connection;
     // an exact tie goes to the earliest connection.
     held.push(fixture.open_ok().await);
-    fixture
-        .peer
-        .wait_for_active(&[
-            HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION + 1,
-            HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION,
-        ])
-        .await;
+    fixture.peer.wait_for_active(&[busy + 1, busy]).await;
     assert_eq!(fixture.peer.accepted(), 2);
     assert_eq!(fixture.pool.pool_size(), 2);
 }
@@ -442,13 +503,16 @@ async fn pressure_widens_only_up_to_the_bound() {
 async fn checkouts_go_to_the_least_loaded_connection() {
     let fixture = Fixture::new(2, 1024).await;
     let mut first_connection = Vec::new();
-    for _ in 0..HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION {
+    // The last of these reaches the growth threshold: it still opens on the
+    // first connection and the second is dialed in the background.
+    for _ in 0..=HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION {
         first_connection.push(fixture.open_ok().await);
     }
+    fixture.wait_for_pool_size(2).await;
     let mut second_connection = vec![fixture.open_ok().await];
     fixture
         .peer
-        .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION, 1])
+        .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION + 1, 1])
         .await;
     // Release most of the first connection: it is now the lighter one, so the
     // next tunnels go back to it until the two are level again.
@@ -495,4 +559,57 @@ async fn saturated_and_bounded_key_queues_until_a_stream_frees() {
     fixture.peer.wait_for_active(&[2]).await;
     assert_eq!(fixture.peer.accepted(), 1);
     assert_eq!(fixture.pool.pool_size(), 1);
+}
+
+/// Pool growth never makes a tunnel wait for the dial (EDGE-DP-1). Against a
+/// peer that blackholes new connections, the old inline growth held the
+/// pressured tunnel for the whole connect timeout before falling back to the
+/// connection it already had.
+#[tokio::test(flavor = "multi_thread")]
+async fn pressured_tunnel_never_waits_for_a_blackholed_growth_dial() {
+    let mut fixture = Fixture::new(2, 1024).await;
+    fixture.proxy.backend_connect_timeout_ms = 2_000;
+    let mut held = Vec::new();
+    for _ in 0..HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION {
+        held.push(fixture.open_ok().await);
+    }
+    fixture
+        .peer
+        .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION])
+        .await;
+    fixture.peer.blackhole_new_connections(true);
+
+    // Well inside the 2 s connect timeout the growth dial is stuck in.
+    let mut tunnel = fixture.open_within(Duration::from_millis(1_000)).await;
+    echo_round_trip(&mut tunnel).await;
+    held.push(tunnel);
+    fixture.peer.wait_for_accepted(2).await;
+
+    // While that dial hangs, later pressured tunnels neither wait for it nor
+    // start a second one for the key.
+    for _ in 0..3 {
+        held.push(fixture.open_within(Duration::from_millis(1_000)).await);
+    }
+    fixture
+        .peer
+        .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION + 4])
+        .await;
+    assert_eq!(
+        fixture.peer.accepted(),
+        2,
+        "one growth dial per key at a time"
+    );
+
+    // The dial gives up at its own connect timeout. The failure reaches no
+    // tunnel, adds no connection, and backs the key off: with the peer
+    // healthy again, a pressured tunnel still dials nothing.
+    fixture.peer.wait_for_blackholed_closed(1).await;
+    fixture.peer.blackhole_new_connections(false);
+    held.push(fixture.open_ok().await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(fixture.peer.accepted(), 2, "a failed growth dial backs off");
+    assert_eq!(fixture.pool.pool_size(), 1);
+    for tunnel in held.iter_mut() {
+        echo_round_trip(tunnel).await;
+    }
 }
