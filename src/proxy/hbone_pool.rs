@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(test)]
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, error};
+use tracing::{Instrument, debug, error};
 
 use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
@@ -818,6 +818,36 @@ const MAX_RETIRED_SVID_GENERATIONS: usize = 16;
 /// (starved rotation consumer) funnels every rotation into one bucket, which
 /// must not grow unbounded either.
 const MAX_RETIRED_FINGERPRINTS_PER_GENERATION: usize = 8;
+
+/// Settles one pressure-growth attempt however
+/// [`HboneConnectionPool::try_grow_sender`] ends. A dial that unwinds (a panic
+/// under `dial_and_publish`, in a build that unwinds; release builds abort)
+/// still backs the key off as a failed dial does, then the creation lease is
+/// released and the attempt is counted. The detached task's `JoinHandle` is
+/// dropped, so without this a panic would skip all three and the next
+/// pressured checkout would dial again at once. A cancelled attempt (runtime
+/// shutdown, or a by-value pool's caller going away) releases the lease
+/// without a backoff, as a cancelled inline grower always did.
+struct HboneGrowthAttempt<'a> {
+    pool: &'a HboneConnectionPool,
+    key: &'a str,
+    creation_lease: Option<OwnedSharedCreationLease<Arc<HbonePoolError>>>,
+}
+
+impl Drop for HboneGrowthAttempt<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.pool.growth_backoff_until.insert(
+                self.key.to_string(),
+                unix_secs() + HBONE_GROWTH_BACKOFF_SECS,
+            );
+        }
+        drop(self.creation_lease.take());
+        self.pool
+            .growth_attempts_finished
+            .fetch_add(1, Ordering::Release);
+    }
+}
 
 pub struct HboneConnectionPool {
     entries: Arc<DashMap<String, Vec<HbonePoolEntry>>>,
@@ -2188,7 +2218,16 @@ impl HboneConnectionPool {
         let sni_override = sni_override.map(str::to_owned);
         let key = key.to_owned();
         let pool_config = pool_config.clone();
-        tokio::spawn(async move {
+        // The task's logs carry the destination and, through the span's
+        // parent, the request that started the growth.
+        let span = tracing::debug_span!(
+            "hbone_pool_growth",
+            dial_host = %dial_host,
+            app_port,
+            hbone_port,
+            key = %key
+        );
+        let growth = async move {
             let _permit = permit;
             // A pooled connection stays in `entries`; one built under rotated
             // material is not pooled and closes when this drops it.
@@ -2211,14 +2250,17 @@ impl HboneConnectionPool {
                     connect_timeout,
                 )
                 .await;
-        });
+        };
+        tokio::spawn(growth.instrument(span));
         None
     }
 
     /// The growth dial itself, run while `creation_lease` holds the key's
     /// creation lock. A failure never reaches a request: it is counted by
     /// `dial_and_publish` (`record_pool_failure`), logged, and backs the key
-    /// off for `HBONE_GROWTH_BACKOFF_SECS` before the lock is released.
+    /// off for `HBONE_GROWTH_BACKOFF_SECS` before the lock is released. A
+    /// [`HboneGrowthAttempt`] guard settles the attempt even if the dial
+    /// unwinds.
     #[allow(clippy::too_many_arguments)]
     async fn try_grow_sender(
         &self,
@@ -2238,6 +2280,11 @@ impl HboneConnectionPool {
         live_connections: usize,
         connect_timeout: Duration,
     ) -> Option<MeshH2Transport> {
+        let attempt = HboneGrowthAttempt {
+            pool: self,
+            key,
+            creation_lease: Some(creation_lease),
+        };
         let effective_connect_timeout_ms = connect_timeout.as_millis().min(u64::MAX as u128) as u64;
         let dialed = self
             .dial_and_publish(
@@ -2290,9 +2337,7 @@ impl HboneConnectionPool {
                 None
             }
         };
-        drop(creation_lease);
-        self.growth_attempts_finished
-            .fetch_add(1, Ordering::Release);
+        drop(attempt);
         grown
     }
 

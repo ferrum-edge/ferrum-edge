@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_rustls::TlsConnector;
@@ -39,9 +39,7 @@ use crate::config::PoolConfig;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::dns::DnsCache;
 use crate::identity::{SharedSvidBundle, SpiffeId, SvidBundle, TrustDomain};
-use crate::pool::{
-    BackgroundCreateBudget, OwnedSharedCreationLease, SharedCreationRole, SharedCreationSlot,
-};
+use crate::pool::{SharedCreationRole, SharedCreationSlot};
 use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
 use crate::proxy::mesh_trust_registry::{
     MESH_TRUST_WITHDRAWN_MESSAGE, MeshTransportGate, MeshTransportKind, MeshTransportRegistration,
@@ -677,18 +675,6 @@ pub struct MeshMtlsConnectionPool {
     /// key -> unix seconds before which no growth dial is attempted for the
     /// key. Written only when a growth dial fails; pruned with idle entries.
     growth_backoff_until: DashMap<String, u64>,
-    /// Never-waiting budget for detached growth dials, shared by every key:
-    /// bounds how many run at once across destinations.
-    background_growth: BackgroundCreateBudget,
-    /// Growth dials that have finished, published or failed and backed off.
-    /// Read only by tests, which have no other way to know a detached dial
-    /// is done.
-    growth_attempts_finished: AtomicUsize,
-    /// The `Arc` this pool lives in, set by
-    /// [`MeshMtlsConnectionPool::into_shared`] so a growth dial can run on a
-    /// detached task that owns the pool. Unset for a pool used by value
-    /// (focused tests, standalone callers), which grows inline instead.
-    self_handle: OnceLock<Weak<MeshMtlsConnectionPool>>,
     /// Per-key creation slots: the serialization mutex plus the failure
     /// broadcast that releases every caller queued behind a failed dial
     /// instead of letting each repeat it (issue #5046).
@@ -792,9 +778,6 @@ impl MeshMtlsConnectionPool {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
             growth_backoff_until: DashMap::new(),
-            background_growth: BackgroundCreateBudget::new(),
-            growth_attempts_finished: AtomicUsize::new(0),
-            self_handle: OnceLock::new(),
             creation_locks: DashMap::with_shard_amount(shard_amount),
             gateway_svid,
             crls,
@@ -817,24 +800,6 @@ impl MeshMtlsConnectionPool {
     /// withdrawn. Idempotent; later calls are ignored.
     pub fn attach_mesh_trust_registry(&self, registry: Arc<MeshTrustRegistry>) {
         let _ = self.mesh_trust_registry.set(registry);
-    }
-
-    /// Share this pool behind an `Arc` and remember that `Arc`, so pressure
-    /// growth runs on a detached task instead of making the checkout that
-    /// triggered it wait for the dial. `ProxyState` builds its pool this way.
-    pub fn into_shared(self) -> Arc<Self> {
-        let pool = Arc::new(self);
-        let _ = pool.self_handle.set(Arc::downgrade(&pool));
-        pool
-    }
-
-    /// Pressure-growth dials that have run to completion (pooled, refused,
-    /// failed, or timed out), counted after the backoff is recorded and the
-    /// creation lock released. Lets tests wait for a detached dial instead of
-    /// racing it.
-    #[doc(hidden)]
-    pub fn growth_attempts_finished_for_test(&self) -> usize {
-        self.growth_attempts_finished.load(Ordering::Acquire)
     }
 
     fn trust_registry(&self) -> Option<&Arc<MeshTrustRegistry>> {
@@ -1106,11 +1071,9 @@ impl MeshMtlsConnectionPool {
         if let Some((transport, live_connections)) = fast_sender {
             // The least-loaded connection is still carrying at least the
             // growth threshold of unanswered requests and the key has room:
-            // widen (issue #5043). This request stays on the live connection
-            // it already has (hyper multiplexes it with no hard stream cap
-            // here); the dial runs detached and publishes for later
-            // checkouts. A busy creation lock, a backoff, a spent growth
-            // budget, or a failed dial all just leave the width as is.
+            // try to widen (issue #5043). Growth is opportunistic — a busy
+            // creation lock, a backoff, or a failed dial all leave this
+            // request on the connection it already has.
             if live_connections < max_entries
                 && transport.pending_requests() >= MESH_MTLS_GROWTH_PENDING_PER_CONNECTION
             {
@@ -1127,7 +1090,7 @@ impl MeshMtlsConnectionPool {
                     |key| key.to_string(),
                 );
                 if let Some(grown) = self
-                    .grow_for_pressure(
+                    .try_grow_sender(
                         proxy,
                         target_host,
                         app_policy_port,
@@ -1608,25 +1571,13 @@ impl MeshMtlsConnectionPool {
             .clone()
     }
 
-    /// Add one physical connection to a key whose least-loaded connection is
-    /// under pressure (issue #5043), without making the caller wait for the
-    /// dial: it keeps the usable connection it already checked out.
-    ///
-    /// Everything that bounds growth runs here, before anything is spawned:
-    /// the per-key failure backoff, the key's creation lock (taken only if
-    /// free, and owned by the dial until it finishes, so a growth dial never
-    /// overlaps another growth or cold dial for the key), the width re-check
-    /// under that lock, and the pool's background-growth budget, which is
-    /// never waited for. The dial itself is the cold path's
-    /// `dial_and_publish`, so `maxConnections` admission, SVID/CRL pinning,
-    /// and the post-dial rotation, drain and trust-withdrawal checks apply
-    /// unchanged.
-    ///
-    /// Returns `Some` only for a pool used by value (no
-    /// [`Self::into_shared`] handle): with no `Arc` for a detached task to
-    /// own, it dials inline and serves the caller on the new connection.
+    /// Add one physical connection to a key that already has a usable one
+    /// (issue #5043). Returns the new transport, or `None` whenever growth is
+    /// not possible right now — the caller then serves on the connection it
+    /// already checked out. Never waits for the creation lock: a cold dial or
+    /// another grower in flight means "not now", not "queue".
     #[allow(clippy::too_many_arguments)]
-    async fn grow_for_pressure(
+    async fn try_grow_sender(
         &self,
         proxy: &Proxy,
         target_host: &str,
@@ -1646,9 +1597,10 @@ impl MeshMtlsConnectionPool {
         {
             return None;
         }
-        let creation_lease = self.creation_slot(key).try_claim_owned()?;
+        let creation_slot = self.creation_slot(key);
+        let creation_lease = creation_slot.try_claim()?;
         // Re-check under the lock: another grower may have widened the key
-        // (or a prune may have narrowed it) since the checkout.
+        // (or a prune may have narrowed it) since the fast-path read.
         let live_connections = self
             .entries
             .get(key)
@@ -1657,82 +1609,6 @@ impl MeshMtlsConnectionPool {
         if live_connections >= max_entries {
             return None;
         }
-        let Some(handle) = self.self_handle.get() else {
-            return self
-                .try_grow_sender(
-                    creation_lease,
-                    proxy,
-                    target_host,
-                    app_policy_port,
-                    mtls_port,
-                    expected_peer,
-                    expected_trust_domain,
-                    sni_override,
-                    key,
-                    pool_config,
-                    max_entries,
-                    live_connections,
-                )
-                .await;
-        };
-        let permit = self.background_growth.try_acquire()?;
-        let pool = handle.upgrade()?;
-        // The dial shares nothing with the caller's request, which rides a
-        // live connection to the same peer under the same pool key (same
-        // SVID, trust and pinned peer). Owned copies are made once per growth
-        // event (single-flight per key and backed off after a failure), never
-        // per request.
-        let proxy = proxy.clone();
-        let target_host = target_host.to_owned();
-        let expected_peer = expected_peer.cloned();
-        let expected_trust_domain = expected_trust_domain.cloned();
-        let sni_override = sni_override.map(str::to_owned);
-        let key = key.to_owned();
-        let pool_config = pool_config.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            // A pooled connection stays in `entries`; one built under rotated
-            // material is not pooled and closes when this drops it.
-            let _grown = pool
-                .try_grow_sender(
-                    creation_lease,
-                    &proxy,
-                    &target_host,
-                    app_policy_port,
-                    mtls_port,
-                    expected_peer.as_ref(),
-                    expected_trust_domain.as_ref(),
-                    sni_override.as_deref(),
-                    &key,
-                    &pool_config,
-                    max_entries,
-                    live_connections,
-                )
-                .await;
-        });
-        None
-    }
-
-    /// The growth dial itself, run while `creation_lease` holds the key's
-    /// creation lock. A failure never reaches a request: it is counted by
-    /// `dial_and_publish` (`record_pool_failure`), logged, and backs the key
-    /// off for `MESH_MTLS_GROWTH_BACKOFF_SECS` before the lock is released.
-    #[allow(clippy::too_many_arguments)]
-    async fn try_grow_sender(
-        &self,
-        creation_lease: OwnedSharedCreationLease<Arc<HbonePoolError>>,
-        proxy: &Proxy,
-        target_host: &str,
-        app_policy_port: u16,
-        mtls_port: u16,
-        expected_peer: Option<&SpiffeId>,
-        expected_trust_domain: Option<&TrustDomain>,
-        sni_override: Option<&str>,
-        key: &str,
-        pool_config: &PoolConfig,
-        max_entries: usize,
-        live_connections: usize,
-    ) -> Option<MeshMtlsTransport> {
         let effective_connect_timeout_ms =
             self.effective_connect_timeout_ms(proxy, app_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
@@ -1784,8 +1660,6 @@ impl MeshMtlsConnectionPool {
             }
         };
         drop(creation_lease);
-        self.growth_attempts_finished
-            .fetch_add(1, Ordering::Release);
         grown
     }
 

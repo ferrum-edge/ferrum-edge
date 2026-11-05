@@ -892,9 +892,9 @@ fn request_create_limit() -> usize {
 /// A pool's never-waiting budget for speculative background creates: a
 /// quarter of its request-path creation limit, at least 1 and at most 4.
 ///
-/// [`GenericPool`] holds one for its shard fills; the mesh HBONE and sidecar
-/// mesh-mTLS pools, which keep several transports per key outside
-/// `GenericPool`, hold one each for their detached growth dials.
+/// [`GenericPool`] holds one for its shard fills; the mesh HBONE pool, which
+/// keeps several transports per key outside `GenericPool`, holds one for its
+/// detached growth dials.
 pub struct BackgroundCreateBudget {
     permits: Arc<Semaphore>,
 }

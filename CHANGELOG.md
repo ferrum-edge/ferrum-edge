@@ -55,17 +55,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
 ### Performance
-- **Mesh pool growth no longer delays the request that triggers it.** When a
-  loaded HBONE (Ambient/waypoint) or Sidecar mesh-mTLS destination widened by
-  one connection, the checkout that noticed the load waited for the whole
-  TCP + mTLS + HTTP/2 dial, up to the connect timeout against a peer that
-  blackholes new connections, although it already held a ready connection
-  with room. That request now goes out on the connection it has, and the dial
-  runs on a detached task, the way gRPC shard fills already do. Growth stays
-  single-flight per destination, keeps the 10 s backoff after a failed dial,
-  and draws on a small per-pool budget (a quarter of the CPU count, 1 to 4
-  dials at once) that it never waits for. The new connection serves later
-  requests once it is pooled.
+- **HBONE pool growth no longer delays the tunnel that triggers it.** When a
+  loaded HBONE (Ambient/waypoint) destination widened by one connection, the
+  checkout that noticed the load waited for the whole TCP + mTLS + HTTP/2
+  dial, up to the connect timeout against a peer that blackholes new
+  connections, although it already held a ready connection with room under
+  the peer's stream cap. That tunnel now opens on the connection it has, and
+  the dial runs on a detached task, the way gRPC shard fills already do.
+  Growth stays single-flight per destination and draws on a small budget (a
+  quarter of the CPU count, 1 to 4 dials at once) that it never waits for.
+  The new connection serves later tunnels once it is pooled. In both the
+  HBONE and the Sidecar mesh-mTLS pools, the 10 s backoff after a failed
+  growth dial is now measured from the failure; it used to start with the
+  dial, so a dial that ran a 10 s or longer connect timeout got no backoff.
+  Sidecar mesh-mTLS growth is still awaited by the triggering request.
 
 ## [0.9.20] - 2026-11-02
 

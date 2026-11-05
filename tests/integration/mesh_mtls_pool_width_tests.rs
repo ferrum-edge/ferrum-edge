@@ -41,9 +41,8 @@ use rcgen::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
@@ -203,17 +202,11 @@ fn proxy_for_test(max_connections: Option<u32>) -> Proxy {
 /// SPIFFE-mTLS h2 server that answers every request with `200` once `release`
 /// is `true`, and parks the response until then. `connections` counts accepted
 /// TCP connections, i.e. how many physical connections the pool dialed.
-///
-/// While `blackhole` is set, new connections are accepted but never get a TLS
-/// handshake, so a dial hangs until its own connect timeout;
-/// `blackholed_closed` counts those the client has since given up on.
 struct HoldingPeer {
     addr: std::net::SocketAddr,
     connections: Arc<AtomicUsize>,
     release: watch::Sender<bool>,
     stop: watch::Sender<bool>,
-    blackhole: Arc<AtomicBool>,
-    blackholed_closed: Arc<AtomicUsize>,
 }
 
 impl HoldingPeer {
@@ -233,36 +226,6 @@ impl HoldingPeer {
     fn accepted(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
     }
-
-    fn blackhole_new_connections(&self, blackhole: bool) {
-        self.blackhole.store(blackhole, Ordering::SeqCst);
-    }
-
-    async fn wait_for_accepted(&self, expected: usize) {
-        wait_until(|| self.accepted() == expected, "peer connection count").await;
-    }
-
-    async fn wait_for_blackholed_closed(&self, expected: usize) {
-        wait_until(
-            || self.blackholed_closed.load(Ordering::SeqCst) == expected,
-            "abandoned blackholed dials",
-        )
-        .await;
-    }
-}
-
-/// Poll `done` until it holds; growth publishes from a detached task, so
-/// width is asserted by polling rather than right after a checkout.
-async fn wait_until(done: impl Fn() -> bool, what: &str) {
-    // Longer than `BLACKHOLED_GROWTH_TIMEOUT_MS`, which one wait spans.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-    while !done() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
@@ -274,10 +237,6 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
     let (release, release_rx) = watch::channel(true);
     let (stop, mut stop_rx) = watch::channel(false);
     let connections_for_task = connections.clone();
-    let blackhole = Arc::new(AtomicBool::new(false));
-    let blackholed_closed = Arc::new(AtomicUsize::new(0));
-    let blackhole_for_task = blackhole.clone();
-    let blackholed_closed_for_task = blackholed_closed.clone();
 
     tokio::spawn(async move {
         let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
@@ -290,21 +249,6 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
             };
             let Ok((tcp, _)) = accepted else { return };
             connections_for_task.fetch_add(1, Ordering::SeqCst);
-            if blackhole_for_task.load(Ordering::SeqCst) {
-                let closed = blackholed_closed_for_task.clone();
-                tokio::spawn(async move {
-                    // Swallow the ClientHello and never answer it.
-                    let mut tcp = tcp;
-                    let mut buf = [0u8; 1024];
-                    while let Ok(read) = tcp.read(&mut buf).await {
-                        if read == 0 {
-                            break;
-                        }
-                    }
-                    closed.fetch_add(1, Ordering::SeqCst);
-                });
-                continue;
-            }
             let acceptor = acceptor.clone();
             let release_rx = release_rx.clone();
             tokio::spawn(async move {
@@ -347,25 +291,18 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
         connections,
         release,
         stop,
-        blackhole,
-        blackholed_closed,
     }
 }
 
 struct Fixture {
-    pool: Arc<MeshMtlsConnectionPool>,
+    pool: MeshMtlsConnectionPool,
     proxy: Proxy,
     peer: HoldingPeer,
     peer_id: SpiffeId,
     limiter: Arc<BackendConnectionLimiter>,
 }
 
-/// A pool shared like `ProxyState`'s, so growth runs detached.
 async fn fixture(width: usize, max_connections: Option<u32>) -> Fixture {
-    fixture_with(width, max_connections, true).await
-}
-
-async fn fixture_with(width: usize, max_connections: Option<u32>, shared: bool) -> Fixture {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let td = TrustDomain::new("cluster.local").unwrap();
     let (root_der, root_pem, root_key_pem) = synthetic_root(&td);
@@ -392,12 +329,6 @@ async fn fixture_with(width: usize, max_connections: Option<u32>, shared: bool) 
         gateway_slot,
         4,
     );
-    // `Arc::new` alone records no self handle: that pool grows inline.
-    let pool = if shared {
-        pool.into_shared()
-    } else {
-        Arc::new(pool)
-    };
     let limiter = Arc::new(BackendConnectionLimiter::new());
     pool.attach_backend_conn_limit(Arc::clone(&limiter));
     Fixture {
@@ -411,12 +342,8 @@ async fn fixture_with(width: usize, max_connections: Option<u32>, shared: bool) 
 
 impl Fixture {
     async fn checkout(&self) -> MeshMtlsSender {
-        self.checkout_within(Duration::from_secs(15)).await
-    }
-
-    async fn checkout_within(&self, budget: Duration) -> MeshMtlsSender {
         tokio::time::timeout(
-            budget,
+            Duration::from_secs(15),
             self.pool.get_sender(
                 &self.proxy,
                 "127.0.0.1",
@@ -431,20 +358,6 @@ impl Fixture {
         .await
         .expect("timely checkout")
         .expect("mesh-mTLS sender")
-    }
-
-    async fn wait_for_pool_size(&self, expected: usize) {
-        wait_until(|| self.pool.pool_size() == expected, "pool width").await;
-    }
-
-    /// Wait until `expected` growth dials have finished (pooled, refused, or
-    /// failed and backed off), so assertions never race a detached dial.
-    async fn wait_for_growth_attempts(&self, expected: usize) {
-        wait_until(
-            || self.pool.growth_attempts_finished_for_test() == expected,
-            "finished growth dials",
-        )
-        .await;
     }
 }
 
@@ -557,28 +470,21 @@ async fn concurrent_pressure_widens_only_up_to_the_configured_bound() {
     assert_eq!(fixture.pool.pool_size(), 1);
     assert_eq!(fixture.peer.accepted(), 1);
 
-    // Reaching the threshold on the only connection: the next checkout is
-    // served on that connection at once and a second one is dialed in the
-    // background.
+    // Reaching the threshold on the only connection: the next checkout dials a
+    // second connection and returns it.
     parked.push(dispatch(&fixture).await);
     assert_eq!(parked[0].0.pending_requests(), threshold);
-    let trigger = fixture.checkout().await;
-    assert_eq!(
-        trigger.pending_requests(),
-        threshold,
-        "the checkout that starts growth keeps the connection it already has"
-    );
-    fixture.wait_for_pool_size(2).await;
+    let grown = fixture.checkout().await;
+    assert_eq!(fixture.pool.pool_size(), 2, "pressure adds a connection");
     assert_eq!(
         fixture.peer.accepted(),
         2,
         "the new connection is a real dial"
     );
-    let grown = fixture.checkout().await;
     assert_eq!(
         grown.pending_requests(),
         0,
-        "later checkouts are served on the new connection"
+        "the checkout that grew the pool is served on the new connection"
     );
 
     // Both connections at the threshold, bound reached: no third connection.
@@ -604,14 +510,10 @@ async fn checkouts_go_to_the_least_loaded_connection() {
     let fixture = fixture(2, None).await;
     let threshold = MESH_MTLS_GROWTH_PENDING_PER_CONNECTION;
 
-    // Grow to two connections: `threshold` parked on the first, one checkout
-    // that starts growth (and keeps the first), then one that lands on the
-    // fresh second connection.
+    // Grow to two connections: `threshold` parked on the first, then one
+    // checkout that lands on the fresh second connection.
     let mut parked = park(&fixture, threshold).await;
     let first = parked[0].0.clone();
-    let trigger = fixture.checkout().await;
-    assert_eq!(trigger.pending_requests(), threshold);
-    fixture.wait_for_pool_size(2).await;
     let second = fixture.checkout().await;
     assert_eq!(fixture.pool.pool_size(), 2);
     assert_eq!(first.pending_requests(), threshold);
@@ -644,10 +546,6 @@ async fn growth_never_bypasses_destination_rule_max_connections() {
 
     let parked = park(&fixture, threshold).await;
     let served = fixture.checkout().await;
-    // The growth dial is detached: wait for its admission verdict before
-    // judging it. A dial that bypassed the cap would have connected (and been
-    // pooled) by now.
-    fixture.wait_for_growth_attempts(1).await;
     assert_eq!(
         fixture.pool.pool_size(),
         1,
@@ -661,11 +559,6 @@ async fn growth_never_bypasses_destination_rule_max_connections() {
     // Later pressured checkouts stay on the existing connection too (backoff
     // after the refusal), and the requests themselves keep working.
     let _ = fixture.checkout().await;
-    assert_eq!(
-        fixture.pool.growth_attempts_finished_for_test(),
-        1,
-        "the refusal backed the key off"
-    );
     assert_eq!(fixture.pool.pool_size(), 1);
     assert_eq!(
         fixture.peer.accepted(),
@@ -690,9 +583,6 @@ async fn uncapped_connections_are_counted_when_a_cap_is_applied_later() {
     // both so the next checkout attempts to open a third connection.
     let mut parked = park(&fixture, threshold).await;
     let _ = fixture.checkout().await;
-    fixture.wait_for_pool_size(2).await;
-    // The grower releases the key's creation lock just after publishing.
-    fixture.wait_for_growth_attempts(1).await;
     for _ in 0..threshold {
         parked.push(dispatch(&fixture).await);
     }
@@ -702,14 +592,11 @@ async fn uncapped_connections_are_counted_when_a_cap_is_applied_later() {
 
     fixture.proxy = proxy_for_test(Some(1));
     let _ = fixture.checkout().await;
-    // Judge the detached third dial only once its admission has run.
-    fixture.wait_for_growth_attempts(2).await;
     assert_eq!(
         fixture.peer.accepted(),
         2,
         "the newly applied cap must observe uncapped resident connections"
     );
-    assert_eq!(fixture.pool.pool_size(), 2);
 
     fixture.peer.release_all();
     for (_, future) in parked {
@@ -729,7 +616,6 @@ async fn failed_growth_dial_keeps_serving_on_the_existing_connection() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let (sender, future) = dispatch(&fixture).await;
-    fixture.wait_for_growth_attempts(1).await;
     assert_eq!(
         fixture.pool.pool_size(),
         1,
@@ -743,91 +629,6 @@ async fn failed_growth_dial_keeps_serving_on_the_existing_connection() {
 
     fixture.peer.release_all();
     expect_ok(future).await;
-    for (_, future) in parked {
-        expect_ok(future).await;
-    }
-}
-
-/// At least `MESH_MTLS_GROWTH_BACKOFF_SECS` (10 s), so a backoff measured from
-/// the dial's start instead of its failure would already have expired.
-const BLACKHOLED_GROWTH_TIMEOUT_MS: u64 = 11_000;
-
-/// Pool growth never makes a request wait for the dial (EDGE-DP-2). Against a
-/// peer that blackholes new connections, the old inline growth held the
-/// pressured checkout for the whole connect timeout before falling back to
-/// the connection it already had. The connect timeout outlasts the 10 s
-/// growth backoff, which must therefore be measured from the dial's failure.
-#[tokio::test(flavor = "multi_thread")]
-async fn pressured_checkout_never_waits_for_a_blackholed_growth_dial() {
-    let mut fixture = fixture(4, None).await;
-    fixture.proxy.backend_connect_timeout_ms = BLACKHOLED_GROWTH_TIMEOUT_MS;
-    let threshold = MESH_MTLS_GROWTH_PENDING_PER_CONNECTION;
-    let mut parked = park(&fixture, threshold).await;
-    fixture.peer.blackhole_new_connections(true);
-
-    // Well inside the connect timeout the growth dial is stuck in.
-    let mut served = fixture.checkout_within(Duration::from_millis(1_000)).await;
-    assert_eq!(
-        served.pending_requests(),
-        threshold,
-        "the pressured request rides the connection that already exists"
-    );
-    let future = served.send_request(request()).expect("send");
-    parked.push((served, Box::pin(future)));
-    fixture.peer.wait_for_accepted(2).await;
-
-    // While that dial hangs, later pressured checkouts neither wait for it
-    // nor start a second one for the key.
-    for _ in 0..3 {
-        let _ = fixture.checkout_within(Duration::from_millis(1_000)).await;
-    }
-    assert_eq!(
-        fixture.peer.accepted(),
-        2,
-        "one growth dial per key at a time"
-    );
-
-    // The dial gives up at its own connect timeout. The failure reaches no
-    // request, adds no connection, and backs the key off for the full window
-    // from that failure: with the peer healthy again, a pressured checkout
-    // still dials nothing.
-    fixture.wait_for_growth_attempts(1).await;
-    fixture.peer.wait_for_blackholed_closed(1).await;
-    fixture.peer.blackhole_new_connections(false);
-    let _ = fixture.checkout().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(fixture.peer.accepted(), 2, "a failed growth dial backs off");
-    assert_eq!(fixture.pool.growth_attempts_finished_for_test(), 1);
-    assert_eq!(fixture.pool.pool_size(), 1);
-
-    fixture.peer.release_all();
-    for (_, future) in parked {
-        expect_ok(future).await;
-    }
-}
-
-/// A pool used by value has no `Arc` a detached task could own, so it keeps
-/// the inline growth: the pressured checkout dials and is served on the new
-/// connection before it returns.
-#[tokio::test(flavor = "multi_thread")]
-async fn by_value_pool_grows_inline_and_serves_the_trigger_on_the_new_connection() {
-    let fixture = fixture_with(2, None, false).await;
-    let threshold = MESH_MTLS_GROWTH_PENDING_PER_CONNECTION;
-    let parked = park(&fixture, threshold).await;
-    assert_eq!(fixture.peer.accepted(), 1);
-
-    let grown = fixture.checkout().await;
-    // No polling: the dial finished inside the checkout.
-    assert_eq!(fixture.pool.growth_attempts_finished_for_test(), 1);
-    assert_eq!(fixture.pool.pool_size(), 2);
-    assert_eq!(fixture.peer.accepted(), 2);
-    assert_eq!(
-        grown.pending_requests(),
-        0,
-        "the checkout that grew the pool is served on the new connection"
-    );
-
-    fixture.peer.release_all();
     for (_, future) in parked {
         expect_ok(future).await;
     }
