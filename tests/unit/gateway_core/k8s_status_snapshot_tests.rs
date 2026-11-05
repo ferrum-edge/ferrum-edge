@@ -39,9 +39,11 @@ fn run_status_patchers_shares_arc_slice_not_per_writer_to_vec() {
         run_fn.contains("shared_status_objects_snapshot("),
         "status patchers must build one shared generation helper"
     );
+    let run_fn_compact: String = run_fn.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        run_fn.contains("Arc::clone(&snapshot)"),
-        "gateway writer must receive an Arc clone of the shared generation"
+        run_fn_compact.contains("plan_gateway_api_status_batch(&snapshot,")
+            && run_fn_compact.contains("plan_istio_statuses(&snapshot,"),
+        "both planners must borrow the one shared generation"
     );
     assert!(
         !run_fn.contains("objects.to_vec()"),
@@ -52,8 +54,9 @@ fn run_status_patchers_shares_arc_slice_not_per_writer_to_vec() {
         "run_status_patchers must take ownership of the reconcile Vec"
     );
     assert!(
-        RECONCILER_SRC.contains("objects: Arc<[K8sObject]>"),
-        "both patch helpers must accept Arc<[K8sObject]> rather than owned Vec"
+        RECONCILER_SRC.contains("fn plan_gateway_api_status_batch(\n    objects: &[K8sObject],")
+            && RECONCILER_SRC.contains("fn plan_istio_statuses(\n    objects: &[K8sObject],"),
+        "both planners must borrow the shared generation rather than own a Vec"
     );
     assert!(
         RECONCILER_SRC.contains("Arc::<[K8sObject]>::from(objects)"),
