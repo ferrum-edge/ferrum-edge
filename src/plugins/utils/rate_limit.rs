@@ -3647,8 +3647,15 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
                 let ttl = two_window_ttl_seconds(self.window_seconds);
                 let increment = u64_to_i64_saturating(tokens);
-                let new_curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
-                let (prev_count, _) = redis.get_two_counters(&prev_key, &curr_key).await?;
+                // One `MULTI`/`EXEC` reads the previous window and charges the
+                // current one: the read never depended on the charge's reply,
+                // so a second round trip bought nothing. `Reserve` is only
+                // built for `reserved_tokens > 0`, so the primitive's
+                // `amount.max(1)` clamp never changes `increment`, and the
+                // deny rollback below still subtracts exactly what was added.
+                let (prev_count, new_curr_count) = redis
+                    .sliding_window_increment_by(&prev_key, &curr_key, increment, ttl)
+                    .await?;
                 let weighted = weighted_window_count(prev_count, new_curr_count, elapsed_fraction);
                 let usage = weighted.max(0.0) as u64;
                 let remaining = limit.saturating_sub(usage);

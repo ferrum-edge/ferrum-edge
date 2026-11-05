@@ -3026,15 +3026,12 @@ impl McpGateway {
 
         // Tear down evicted sessions' upstreams concurrently, outside the lock, so
         // eviction never serializes new sessions behind upstream DELETE round trips.
+        // Every evicted session's upstream DELETEs share ONE bounded fan-out, so an
+        // initialize that reclaims many expired sessions cannot burst unboundedly.
         // This still runs when broker admission refused the new session: those
         // sessions are already out of the store either way.
         if !evicted.is_empty() {
-            futures_util::future::join_all(
-                evicted
-                    .into_iter()
-                    .map(|session| self.delete_upstream_sessions(session, ctx)),
-            )
-            .await;
+            self.delete_upstream_sessions(evicted, ctx).await;
         }
 
         match sse_admission_error {
@@ -3384,14 +3381,19 @@ impl McpGateway {
         session
     }
 
-    /// Issue the upstream `DELETE` for each initialized upstream session of an
-    /// already-removed downstream session. Failures are logged, not fatal.
-    async fn delete_upstream_sessions(&self, session: DownstreamMcpSession, ctx: &RequestContext) {
+    /// Issue the upstream `DELETE` for each initialized upstream session of
+    /// already-removed downstream sessions, concurrently and bounded (see
+    /// [`delete_upstream_session_set`]). Failures are logged, not fatal.
+    async fn delete_upstream_sessions(
+        &self,
+        sessions: impl IntoIterator<Item = DownstreamMcpSession>,
+        ctx: &RequestContext,
+    ) {
         delete_upstream_session_set(
             &self.http_client,
             &self.servers,
             &self.sessions.upstream_session_header,
-            session,
+            sessions,
             crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
             &ctx.plugin_http_call_ns,
         )
@@ -3406,7 +3408,7 @@ impl McpGateway {
         let Some(session) = self.take_downstream_session(downstream_session_id) else {
             return false;
         };
-        self.delete_upstream_sessions(session, ctx).await;
+        self.delete_upstream_sessions([session], ctx).await;
         true
     }
 
@@ -8923,31 +8925,45 @@ async fn delete_upstream_session(
     }
 }
 
-/// Issue the upstream `DELETE` for each initialized upstream session of an
-/// already-removed downstream session. Request-scoped teardown (session
+/// Issue the upstream `DELETE` for each initialized upstream session of
+/// already-removed downstream sessions. Request-scoped teardown (session
 /// `DELETE`, expiry on touch, cap eviction) passes the request's hop count.
+///
+/// The `DELETE`s run concurrently, at most
+/// [`MAX_CONCURRENT_REAPER_TEARDOWNS`] in flight across every session passed
+/// in, so the request waits about one upstream round trip per wave rather than
+/// one per upstream server. That is safe because each record names a distinct
+/// (server, upstream session) pair, no `DELETE` reads another's result, every
+/// failure is only logged, and the sessions are already out of the store; the
+/// reaper's cleanup worker already runs these same calls concurrently.
 async fn delete_upstream_session_set(
     http_client: &PluginHttpClient,
     servers: &HashMap<String, McpServerConfig>,
     upstream_session_header: &str,
-    session: DownstreamMcpSession,
+    sessions: impl IntoIterator<Item = DownstreamMcpSession>,
     hops: Option<u8>,
     accumulator: &AtomicU64,
 ) {
-    for teardown in upstream_session_teardowns(session) {
-        let Some(server) = servers.get(&teardown.server_id) else {
-            continue;
-        };
-        delete_upstream_session(
-            http_client,
-            server,
-            upstream_session_header,
-            teardown,
-            hops,
-            accumulator,
-        )
+    let deletes: Vec<(&McpServerConfig, UpstreamSessionTeardown)> = sessions
+        .into_iter()
+        .flat_map(upstream_session_teardowns)
+        .filter_map(|teardown| {
+            let server = servers.get(&teardown.server_id)?;
+            Some((server, teardown))
+        })
+        .collect();
+    futures_util::stream::iter(deletes)
+        .for_each_concurrent(MAX_CONCURRENT_REAPER_TEARDOWNS, |(server, teardown)| {
+            delete_upstream_session(
+                http_client,
+                server,
+                upstream_session_header,
+                teardown,
+                hops,
+                accumulator,
+            )
+        })
         .await;
-    }
 }
 
 /// Shortest and longest period of the background session expiry sweep. The

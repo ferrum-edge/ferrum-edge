@@ -2534,6 +2534,11 @@ struct KeyspaceState {
     /// probe, counted apart from the `TIME` that rides inside a charge
     /// transaction. Zero proves a client never asked for the server clock.
     clock_probes: Arc<AtomicUsize>,
+    /// `EXEC`s answered: one per `MULTI`/`EXEC` round trip.
+    execs: Arc<AtomicUsize>,
+    /// `GET`/`GETRANGE` commands answered OUTSIDE a transaction — a read that
+    /// costs its own round trip rather than riding inside a `MULTI`.
+    standalone_reads: Arc<AtomicUsize>,
     /// The fixture's `TIME` behaviour, settable while the server is running so
     /// a test can revoke or restore the ACL under a LIVE client — which is the
     /// only way to exercise a clock-mode transition rather than a startup
@@ -2755,6 +2760,7 @@ impl KeyspaceState {
                 reply.extend_from_slice(b"+OK\r\n");
             }
             "EXEC" => {
+                self.execs.fetch_add(1, Ordering::Relaxed);
                 let batch = queued.take().unwrap_or_default();
                 let schedule = self.schedule_for(&batch);
                 if !schedule.hold.is_zero() && schedule.phase == HoldPhase::BeforeApply {
@@ -2787,7 +2793,12 @@ impl KeyspaceState {
                     batch.push(args);
                     reply.extend_from_slice(b"+QUEUED\r\n");
                 }
-                None => reply.extend_from_slice(&self.apply(&args, false)),
+                None => {
+                    if matches!(name.as_str(), "GET" | "GETRANGE") {
+                        self.standalone_reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    reply.extend_from_slice(&self.apply(&args, false));
+                }
             },
         }
         true
@@ -2847,6 +2858,16 @@ impl KeyspaceServer {
     /// Standalone `TIME` commands answered: the connection-screening probe.
     fn clock_probes(&self) -> usize {
         self.state.clock_probes.load(Ordering::Relaxed)
+    }
+
+    /// `MULTI`/`EXEC` transactions answered.
+    fn execs(&self) -> usize {
+        self.state.execs.load(Ordering::Relaxed)
+    }
+
+    /// Counter reads answered outside a transaction.
+    fn standalone_reads(&self) -> usize {
+        self.state.standalone_reads.load(Ordering::Relaxed)
     }
 
     /// Every key the fake keyspace holds.
@@ -2929,6 +2950,8 @@ async fn spawn_keyspace_redis_server(options: KeyspaceServerOptions) -> Keyspace
         compensations: Arc::new(AtomicUsize::new(0)),
         ops: Arc::new(std::sync::Mutex::new(Vec::new())),
         clock_probes: Arc::new(AtomicUsize::new(0)),
+        execs: Arc::new(AtomicUsize::new(0)),
+        standalone_reads: Arc::new(AtomicUsize::new(0)),
         time_mode: Arc::new(std::sync::Mutex::new(options.time_mode)),
         reply_barrier: Arc::new(ReplyBarrier::default()),
         options,
@@ -3161,6 +3184,130 @@ async fn an_aged_out_redis_token_reservation_charges_the_current_window() {
         return;
     }
     panic!("the window index rolled over during every attempt");
+}
+
+/// EDGE-PL-1: a centralized `ai_rate_limiter` reservation reads the previous
+/// window and charges the current one in ONE `MULTI`/`EXEC`. It used to charge
+/// in one transaction and then re-read both counters in a second, standalone
+/// pipeline, paying two sequential round trips per admitted AI request.
+#[tokio::test]
+async fn an_ai_token_reservation_is_one_redis_round_trip() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm, two_window_ttl_seconds,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let algorithm = AiTokenRateAlgorithm::new(1_000, window_seconds);
+
+    // Same rollover discipline as the aged-out test above: each attempt uses
+    // fresh keys and is accepted only when the window index did not move.
+    for attempt in 0..3 {
+        let key = format!("consumer:one-round-trip-{attempt}");
+        let progress = RedisRateLimitClient::window_progress(window_seconds);
+        let current = progress.index;
+        let current_key = client.make_slot_key(&key, &[&current.to_string()]);
+
+        // Warm the pooled connection (screening probes) before counting.
+        algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::CheckBudget)
+            .await
+            .expect("the budget read reaches the fake keyspace");
+        let execs_before = server.execs();
+        let reads_before = server.standalone_reads();
+
+        let outcome = algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::Reserve { tokens: 300 })
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        let execs = server.execs() - execs_before;
+        let reads = server.standalone_reads() - reads_before;
+        let charged = server.counter(&current_key);
+
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert_eq!(execs, 1, "the reservation is exactly one transaction");
+        assert_eq!(reads, 0, "no counter read pays its own round trip");
+        assert!(outcome.allowed);
+        assert_eq!(
+            outcome.usage,
+            Some(300),
+            "an empty previous window adds nothing"
+        );
+        assert_eq!(outcome.reserved_window_index, Some(current));
+        assert_eq!(charged, 300);
+
+        // The previous window is read inside that same transaction: a heavy
+        // previous window refuses, and the deny branch still hands back
+        // exactly the tokens it charged. The seed is large enough that its
+        // decayed share exceeds the limit at any point of the window but its
+        // last microseconds.
+        let previous_key = client.make_slot_key(&key, &[&current.saturating_sub(1).to_string()]);
+        client
+            .incrby_with_expire(
+                &previous_key,
+                1_000_000_000_000,
+                two_window_ttl_seconds(window_seconds),
+            )
+            .await
+            .expect("seed the previous window");
+        let refused = algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::Reserve { tokens: 300 })
+            .await
+            .expect("the reservation reaches the fake keyspace");
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert!(!refused.allowed, "the previous window's usage is counted");
+        assert_eq!(
+            server.counter(&current_key),
+            300,
+            "the refused charge is rolled back"
+        );
+        let _ = server.shutdown.send(());
+        return;
+    }
+    panic!("the window index rolled over during every attempt");
+}
+
+/// EDGE-PL-1: the single-transaction reservation keeps the fail-closed read:
+/// an unreadable previous counter is an unusable endpoint, never a zero, so
+/// `redis_failure_policy` decides rather than the reservation over-admitting.
+#[tokio::test]
+async fn an_ai_token_reservation_fails_closed_on_an_unreadable_previous_counter() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let algorithm = AiTokenRateAlgorithm::new(1_000, window_seconds);
+    let key = "consumer:unreadable-previous";
+    // Park garbage under the previous AND the current index, so a window
+    // rollover between here and the reservation still lands on a bad key.
+    let current = RedisRateLimitClient::window_progress(window_seconds).index;
+    for index in [current.saturating_sub(1), current] {
+        server.set_raw(
+            &client.make_slot_key(key, &[&index.to_string()]),
+            b"not-a-number".to_vec(),
+        );
+    }
+
+    assert!(
+        algorithm
+            .check_redis(&client, key, &AiRateLimitOp::Reserve { tokens: 300 })
+            .await
+            .is_err(),
+        "an unreadable previous counter must fail the reservation"
+    );
+    assert!(
+        !client.is_available(),
+        "an unreadable counter marks the endpoint unusable"
+    );
+    let _ = server.shutdown.send(());
 }
 
 /// Two requests that select adjacent sub-buckets must not both be admitted

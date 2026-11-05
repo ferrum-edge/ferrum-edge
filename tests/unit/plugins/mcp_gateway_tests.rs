@@ -3635,6 +3635,94 @@ async fn aggregate_delete_tears_down_upstream_session() {
     );
 }
 
+/// How long each upstream holds its session `DELETE` in the concurrent
+/// teardown test.
+const SLOW_UPSTREAM_DELETE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A mock upstream that mints `upstream_session` on every POST and answers its
+/// session `DELETE` with `delete_status` after [`SLOW_UPSTREAM_DELETE`].
+async fn start_slow_session_delete_server(
+    upstream_session: &str,
+    delete_status: u16,
+) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", upstream_session)
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "upstream",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": { "name": "slow-session-delete", "version": "1" },
+                        "tools": [{ "name": "create_pr", "inputSchema": { "type": "object" } }]
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(delete_status).set_delay(SLOW_UPSTREAM_DELETE))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// EDGE-PL-2: a client `DELETE` tears down the session's upstream sessions on
+/// every server concurrently, so it waits about one upstream round trip rather
+/// than one per server. One upstream's failed `DELETE` neither stops the other
+/// teardown nor changes the client's answer.
+#[tokio::test]
+async fn aggregate_delete_tears_down_every_upstream_session_concurrently() {
+    let one = start_slow_session_delete_server("upstream-one", 200).await;
+    let two = start_slow_session_delete_server("upstream-two", 500).await;
+    let mut config = tools_only_aggregate_config(&format!("{}/mcp", one.uri()));
+    config["servers"]["second"] = json!({
+        "upstream_url": format!("{}/mcp", two.uri()),
+        "namespace": "second",
+        "enabled": true,
+        "expose_tools": true,
+        "expose_resources": false,
+        "expose_prompts": false
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    // Discovery initializes the session on both upstreams.
+    let _ = aggregate_tool_names(&plugin, &session_id, 1130).await;
+
+    let mut ctx = create_test_context();
+    ctx.method = "DELETE".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
+    let started = std::time::Instant::now();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let elapsed = started.elapsed();
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body, json!({}));
+
+    for (server, upstream_session) in [(&one, "upstream-one"), (&two, "upstream-two")] {
+        assert_eq!(
+            deletes_for(server, upstream_session).await,
+            1,
+            "{upstream_session}: every initialized upstream session is deleted once"
+        );
+    }
+    assert!(
+        elapsed >= SLOW_UPSTREAM_DELETE,
+        "the client DELETE still awaits its upstream teardown, took {elapsed:?}"
+    );
+    // Serial teardown takes at least two delays; concurrent takes about one.
+    assert!(
+        elapsed < SLOW_UPSTREAM_DELETE + SLOW_UPSTREAM_DELETE / 2,
+        "upstream DELETEs to distinct servers must overlap, took {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn aggregate_tool_call_rejects_invalid_arguments_as_json_rpc_error() {
     let server = start_mcp_catalog_server().await;
