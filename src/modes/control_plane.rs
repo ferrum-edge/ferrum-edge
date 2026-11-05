@@ -730,20 +730,26 @@ async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
     let mut last_hard_error: Option<anyhow::Error> = None;
     // Each namespace's delta is a separate namespace-predicated, read-only
     // query sequence with no transaction and no input from another namespace's
-    // result, so the loads can overlap. `buffered` keeps namespace order, and
-    // every load runs to completion before the merge (no fail-fast drop of an
-    // in-flight sqlx/Mongo query), so the merge below sees exactly the outcomes
-    // the serial loop did. A namespace after an escalating one is now read and
-    // discarded instead of skipped.
-    let loads: Vec<_> = namespaces
-        .iter()
-        .map(|ns| db.load_incremental_config(ns, after_sequences.get(ns).copied().unwrap_or(0)))
-        .collect();
-    let outcomes: Vec<Result<IncrementalResult, anyhow::Error>> = futures_util::stream::iter(loads)
-        .buffered(concurrency.max(1))
-        .collect()
-        .await;
-    for (ns, outcome) in namespaces.iter().zip(outcomes) {
+    // result, so the loads can overlap. A window of at most `concurrency` loads
+    // is in flight; `FuturesOrdered` yields outcomes in admission order, which
+    // is namespace order, so the merge below sees exactly the sequence the
+    // serial loop did. A new load is admitted only after the oldest outcome is
+    // merged, so once an escalation is seen nothing further is admitted; at
+    // most `concurrency - 1` later loads that had already started are drained.
+    let concurrency = concurrency.max(1);
+    let mut unadmitted = namespaces.iter();
+    let mut in_flight = futures_util::stream::FuturesOrdered::new();
+    for ns in unadmitted.by_ref().take(concurrency) {
+        in_flight.push_back(
+            db.load_incremental_config(ns, after_sequences.get(ns).copied().unwrap_or(0)),
+        );
+    }
+    let mut outcome_namespaces = namespaces.iter();
+    while let Some(outcome) = in_flight.next().await {
+        // Outcomes arrive in admission order, so this never runs dry first.
+        let Some(ns) = outcome_namespaces.next() else {
+            break;
+        };
         match outcome {
             Ok(mut delta) => {
                 any_success = true;
@@ -779,6 +785,9 @@ async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
                 // Consumer changes escalate to full reload for the whole CP —
                 // credential rehydration is not safe to partition.
                 if db_backend::is_incremental_full_reload_required(&error) {
+                    // Admit nothing more. Loads already started run to
+                    // completion (never dropped mid-query) and are discarded.
+                    while in_flight.next().await.is_some() {}
                     return Err(error);
                 }
                 error!(
@@ -789,6 +798,12 @@ async fn load_incremental_config_multi<B: CpIncrementalLoadSource + ?Sized>(
                 load_failures.push((ns.clone(), error.to_string()));
                 last_hard_error = Some(error);
             }
+        }
+        if let Some(next_ns) = unadmitted.next() {
+            in_flight.push_back(db.load_incremental_config(
+                next_ns,
+                after_sequences.get(next_ns).copied().unwrap_or(0),
+            ));
         }
     }
     if !any_success {
@@ -4765,10 +4780,23 @@ mod tests {
         );
     }
 
-    /// Scripted incremental source for the escalation case. Inline because
+    /// Scripted incremental source for the escalation cases. Inline because
     /// `IncrementalFullReloadRequired`'s constructors are crate-private.
+    /// `hard-*` fails with a connectivity error, `esc-*` yields once and then
+    /// escalates, and anything else yields a few times before succeeding.
+    #[derive(Default)]
     struct EscalatingIncrementalSource {
-        calls: std::sync::Mutex<Vec<String>>,
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl EscalatingIncrementalSource {
+        fn record(&self, event: String) {
+            self.events.lock().unwrap().push(event);
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -4778,60 +4806,99 @@ mod tests {
             namespace: &str,
             after_sequence: u64,
         ) -> Result<IncrementalResult, anyhow::Error> {
-            self.calls.lock().unwrap().push(namespace.to_string());
-            match namespace {
-                "ns-a" => Err(anyhow::anyhow!("scripted connectivity failure")),
-                "ns-b" => Err(anyhow::Error::new(
+            self.record(format!("start:{namespace}"));
+            if namespace.starts_with("hard-") {
+                return Err(anyhow::anyhow!("scripted connectivity failure"));
+            }
+            if namespace.starts_with("esc-") {
+                tokio::task::yield_now().await;
+                return Err(anyhow::Error::new(
                     crate::config::db_backend::IncrementalFullReloadRequired::for_consumer_changes(
                         namespace,
                     ),
-                )),
-                _ => Ok(IncrementalResult {
-                    added_or_modified_proxies: Vec::new(),
-                    removed_proxy_ids: Vec::new(),
-                    added_or_modified_consumers: Vec::new(),
-                    removed_consumer_ids: Vec::new(),
-                    added_or_modified_plugin_configs: Vec::new(),
-                    removed_plugin_config_ids: Vec::new(),
-                    added_or_modified_upstreams: Vec::new(),
-                    removed_upstream_ids: Vec::new(),
-                    sequence_cursor: after_sequence + 1,
-                    poll_timestamp: Utc::now(),
-                }),
+                ));
             }
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+            self.record(format!("done:{namespace}"));
+            Ok(IncrementalResult {
+                added_or_modified_proxies: Vec::new(),
+                removed_proxy_ids: Vec::new(),
+                added_or_modified_consumers: Vec::new(),
+                removed_consumer_ids: Vec::new(),
+                added_or_modified_plugin_configs: Vec::new(),
+                removed_plugin_config_ids: Vec::new(),
+                added_or_modified_upstreams: Vec::new(),
+                removed_upstream_ids: Vec::new(),
+                sequence_cursor: after_sequence + 1,
+                poll_timestamp: Utc::now(),
+            })
         }
     }
 
-    #[tokio::test]
-    async fn concurrent_multi_ns_incremental_escalation_still_wins_over_hard_errors() {
-        // A hard failure in ns-a, an escalation in ns-b and a success in ns-c:
-        // the escalation must still surface as the poll's error (so the CP
-        // runs its same-tick full reload), exactly as the serial loop did.
-        // Concurrency means ns-c is read and discarded rather than skipped.
-        let source = EscalatingIncrementalSource {
-            calls: std::sync::Mutex::new(Vec::new()),
-        };
-        let namespaces: Vec<String> = ["ns-a", "ns-b", "ns-c"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let result = load_incremental_config_multi(
-            &source,
-            &namespaces,
-            &HashMap::new(),
-            CP_NAMESPACE_LOAD_CONCURRENCY_MAX,
-        )
-        .await;
+    fn namespace_list(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    async fn expect_escalation(
+        source: &EscalatingIncrementalSource,
+        namespaces: &[String],
+        concurrency: usize,
+    ) {
+        let result =
+            load_incremental_config_multi(source, namespaces, &HashMap::new(), concurrency).await;
         let Err(error) = result else {
             panic!("an escalating namespace must fail the multi-namespace incremental poll");
         };
         assert!(
             crate::config::db_backend::is_incremental_full_reload_required(&error),
-            "the escalation, not ns-a's earlier hard error, must win: {error}"
+            "the escalation must be the poll's error: {error}"
         );
-        let mut calls = source.calls.lock().unwrap().clone();
-        calls.sort();
-        assert_eq!(calls, namespaces, "every namespace load runs to completion");
+    }
+
+    #[tokio::test]
+    async fn concurrent_multi_ns_incremental_escalation_still_wins_over_hard_errors() {
+        // A hard failure before the escalation must not mask it: the CP still
+        // runs its same-tick full reload, exactly as the serial loop did. The
+        // later namespace was already admitted in the window, so it is drained
+        // to completion rather than dropped mid-query.
+        let source = EscalatingIncrementalSource::default();
+        let namespaces = namespace_list(&["hard-a", "esc-b", "ok-c"]);
+        expect_escalation(&source, &namespaces, CP_NAMESPACE_LOAD_CONCURRENCY_MAX).await;
+        let events = source.events();
+        assert!(events.contains(&"start:hard-a".to_string()), "{events:?}");
+        assert!(events.contains(&"done:ok-c".to_string()), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn serial_budget_escalation_never_starts_later_namespaces() {
+        let source = EscalatingIncrementalSource::default();
+        let namespaces = namespace_list(&["esc-0", "ok-1"]);
+        expect_escalation(&source, &namespaces, 1).await;
+        assert_eq!(
+            source.events(),
+            vec!["start:esc-0".to_string()],
+            "a budget of one must not admit a namespace after the escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalation_drains_started_loads_and_admits_no_more() {
+        let source = EscalatingIncrementalSource::default();
+        let namespaces = namespace_list(&["esc-0", "ok-1", "ok-2", "ok-3"]);
+        expect_escalation(&source, &namespaces, 2).await;
+        let events = source.events();
+        assert!(
+            events.contains(&"start:ok-1".to_string()) && events.contains(&"done:ok-1".to_string()),
+            "the load already in flight must be awaited to completion: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.ends_with("ok-2") || event.ends_with("ok-3")),
+            "namespaces outside the window must never start: {events:?}"
+        );
     }
 
     #[test]
