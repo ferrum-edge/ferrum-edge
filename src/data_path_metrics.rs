@@ -256,10 +256,7 @@ pub fn render_overload(output: &mut String, overload: &OverloadState, ns_label: 
             "reject_new_connections",
             overload.reject_new_connections.load(Ordering::Relaxed),
         ),
-        (
-            "reject_new_requests",
-            overload.reject_new_requests.load(Ordering::Relaxed),
-        ),
+        ("reject_new_requests", overload.request_admission.rejects()),
     ] {
         output.push_str(&format!(
             "ferrum_overload_shedding_active{{action=\"{action}\"{ns_label}}} {}\n",

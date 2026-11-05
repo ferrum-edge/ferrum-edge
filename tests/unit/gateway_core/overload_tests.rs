@@ -1,6 +1,6 @@
 use ferrum_edge::overload::{
     ConnectionGuard, NodeWaypointDropReason, OverloadConfig, OverloadLevel, OverloadState,
-    RED_PROBABILITY_SCALE, RequestGuard,
+    RED_PROBABILITY_SCALE, RequestAdmissionEvent, RequestGuard,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +15,7 @@ fn new_state_is_normal_with_no_active_connections() {
     assert!(!state.draining.load(Ordering::Relaxed));
     assert!(!state.disable_keepalive.load(Ordering::Relaxed));
     assert!(!state.reject_new_connections.load(Ordering::Relaxed));
-    assert!(!state.reject_new_requests.load(Ordering::Relaxed));
+    assert!(!state.request_admission.rejects());
     assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
     assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
 }
@@ -164,10 +164,14 @@ fn reject_new_requests_sets_critical_level() {
     let state = OverloadState::new();
     assert_eq!(state.level(), OverloadLevel::Normal);
 
-    state.reject_new_requests.store(true, Ordering::Relaxed);
+    state
+        .request_admission
+        .apply(RequestAdmissionEvent::RequestPressure { reject: true });
     assert_eq!(state.level(), OverloadLevel::Critical);
 
-    state.reject_new_requests.store(false, Ordering::Relaxed);
+    state
+        .request_admission
+        .apply(RequestAdmissionEvent::RequestPressure { reject: false });
     assert_eq!(state.level(), OverloadLevel::Normal);
 }
 
@@ -240,7 +244,7 @@ fn snapshot_serializes_to_json() {
 fn begin_drain_sets_draining_and_reject_new_requests() {
     let state = Arc::new(OverloadState::new());
     assert!(!state.draining.load(Ordering::Acquire));
-    assert!(!state.reject_new_requests.load(Ordering::Acquire));
+    assert!(!state.request_admission.rejects());
 
     ferrum_edge::overload::begin_drain(&state);
 
@@ -250,7 +254,7 @@ fn begin_drain_sets_draining_and_reject_new_requests() {
          Connection: close even when shutdown_drain_seconds=0",
     );
     assert!(
-        state.reject_new_requests.load(Ordering::Acquire),
+        state.request_admission.rejects(),
         "begin_drain must set reject_new_requests=true so new requests on \
          existing keepalive H1 / multiplexed H2/H3 connections get 503'd \
          during drain rather than continuing to be admitted",
@@ -274,7 +278,7 @@ fn begin_drain_is_idempotent() {
     ferrum_edge::overload::begin_drain(&state);
     ferrum_edge::overload::begin_drain(&state);
     assert!(state.draining.load(Ordering::Acquire));
-    assert!(state.reject_new_requests.load(Ordering::Acquire));
+    assert!(state.request_admission.rejects());
 }
 
 #[test]
@@ -365,7 +369,114 @@ fn wait_for_drain_does_not_clear_begin_drain_flags() {
     // async wait loop — the modes call `begin_drain` BEFORE the gated
     // `if drain_seconds > 0 { wait_for_drain(...) }` block.
     assert!(state.draining.load(Ordering::Acquire));
-    assert!(state.reject_new_requests.load(Ordering::Acquire));
+    assert!(state.request_admission.rejects());
+}
+
+#[test]
+fn a_monitor_pressure_clear_after_begin_drain_cannot_readmit_requests() {
+    // OV-1: the monitor used to load `draining` (false), then — after a
+    // concurrent `begin_drain` had stored both drain flags — store its stale
+    // `draining || pressure = false` into the single shared
+    // `reject_new_requests` flag, re-admitting requests on a draining gateway
+    // until the next tick. This is that interleaving with the monitor's write
+    // landing last: it owns only the pressure bit now, so drain survives.
+    let state = Arc::new(OverloadState::new());
+    ferrum_edge::overload::begin_drain(&state);
+    let (was, now) = state
+        .request_admission
+        .apply(RequestAdmissionEvent::RequestPressure { reject: false });
+    assert!(was && now, "the drain bit keeps requests rejected");
+    assert!(state.draining.load(Ordering::Acquire));
+    assert!(
+        state.request_admission.rejects(),
+        "a low-pressure monitor sample must never clear the drain admission bit"
+    );
+    assert_eq!(state.level(), OverloadLevel::Critical);
+}
+
+#[test]
+fn request_pressure_and_drain_are_independent_admission_bits() {
+    let gate = ferrum_edge::overload::RequestAdmissionGate::new();
+    assert!(!gate.rejects());
+
+    // Pressure alone comes and goes.
+    assert_eq!(
+        gate.apply(RequestAdmissionEvent::RequestPressure { reject: true }),
+        (false, true)
+    );
+    assert_eq!(
+        gate.apply(RequestAdmissionEvent::RequestPressure { reject: false }),
+        (true, false)
+    );
+    assert!(!gate.rejects());
+
+    // Drain latches across any pressure sample, in either order.
+    assert_eq!(
+        gate.apply(RequestAdmissionEvent::RequestPressure { reject: true }),
+        (false, true)
+    );
+    assert_eq!(gate.apply(RequestAdmissionEvent::DrainBegun), (true, true));
+    assert_eq!(
+        gate.apply(RequestAdmissionEvent::RequestPressure { reject: false }),
+        (true, true)
+    );
+    assert_eq!(gate.apply(RequestAdmissionEvent::DrainBegun), (true, true));
+    assert!(gate.rejects());
+}
+
+#[test]
+fn concurrent_pressure_samples_cannot_undo_a_drain() {
+    // OV-1 under real concurrency: one thread flips the pressure bit as fast
+    // as it can while another begins drain. Whatever the interleaving, the
+    // gate must end rejecting. With the former single shared flag the last
+    // pressure write decided the result.
+    for _ in 0..64 {
+        let state = Arc::new(OverloadState::new());
+        let monitor_state = Arc::clone(&state);
+        let monitor = std::thread::spawn(move || {
+            for i in 0..2_000u32 {
+                monitor_state
+                    .request_admission
+                    .apply(RequestAdmissionEvent::RequestPressure { reject: i % 2 == 0 });
+            }
+            monitor_state
+                .request_admission
+                .apply(RequestAdmissionEvent::RequestPressure { reject: false });
+        });
+        ferrum_edge::overload::begin_drain(&state);
+        monitor.join().expect("pressure thread panicked");
+        assert!(
+            state.request_admission.rejects(),
+            "requests must stay rejected once drain began"
+        );
+    }
+}
+
+#[test]
+fn only_begin_drain_sets_the_drain_admission_bit() {
+    // OV-1 ownership: the monitor writes only `RequestPressure`; the drain bit
+    // has exactly one writer.
+    let source = include_str!("../../../src/overload.rs");
+    assert_eq!(
+        source.matches("RequestAdmissionEvent::DrainBegun)").count(),
+        1,
+        "exactly one production site may begin drain on the admission gate"
+    );
+    let entry = source
+        .find("pub fn begin_drain(")
+        .expect("begin_drain must exist");
+    let body = &source[entry..];
+    let body = &body[..body.find("\n}\n").expect("begin_drain body end")];
+    assert!(body.contains("RequestAdmissionEvent::DrainBegun"));
+    let monitor = source
+        .find("pub fn start_monitor(")
+        .expect("start_monitor must exist");
+    let monitor_body = &source[monitor..];
+    let monitor_body = &monitor_body[..monitor_body.find("\n}\n").expect("start_monitor body end")];
+    assert!(
+        !monitor_body.contains("DrainBegun") && !monitor_body.contains(".draining.store("),
+        "the overload monitor must never write drain state"
+    );
 }
 
 #[tokio::test]
@@ -395,7 +506,7 @@ async fn overload_monitor_preserves_reject_new_requests_during_drain() {
         "monitor tick must not clear draining",
     );
     assert!(
-        state.reject_new_requests.load(Ordering::Acquire),
+        state.request_admission.rejects(),
         "monitor tick must preserve request rejection while draining, even \
          when request pressure is below the critical threshold",
     );
@@ -539,7 +650,9 @@ fn red_max_probability_always_triggers() {
 #[test]
 fn reject_new_requests_flag_sets_critical() {
     let state = OverloadState::new();
-    state.reject_new_requests.store(true, Ordering::Relaxed);
+    state
+        .request_admission
+        .apply(RequestAdmissionEvent::RequestPressure { reject: true });
     assert_eq!(state.level(), OverloadLevel::Critical);
 }
 

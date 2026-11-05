@@ -3076,12 +3076,13 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
     };
     let cb = CircuitBreaker::new(config);
     cb.record_failure(503, true, false);
-    assert!(cb.can_execute().is_ok());
+    let (mut ticket, _) = cb.admit().expect("timeout 0 admits a probe");
+    assert!(ticket.is_probe());
     assert_eq!(cb.state_name(), "half_open");
     assert_eq!(cb.half_open_in_flight(), 1);
 
     for status in [StatusCode::FORBIDDEN, StatusCode::SERVICE_UNAVAILABLE] {
-        settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, status, true, true);
+        settle_hbone_backend_connect_circuit_breaker_outcome_for_test(&cb, status, true, ticket);
         assert_eq!(
             cb.state_name(),
             "half_open",
@@ -3092,10 +3093,11 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
             0,
             "DNS-screen {status} policy refusal must release the HALF_OPEN probe slot"
         );
-        assert!(
-            cb.can_execute().is_ok(),
-            "after a health-neutral refusal the next probe must still be admissible"
-        );
+        let (next, _) = cb
+            .admit()
+            .expect("after a health-neutral refusal the next probe must still be admissible");
+        assert!(next.is_probe());
+        ticket = next;
         assert_eq!(cb.half_open_in_flight(), 1);
     }
 
@@ -3103,7 +3105,7 @@ fn inbound_hbone_dns_screen_denial_releases_half_open_probe_without_tripping() {
         &cb,
         StatusCode::BAD_GATEWAY,
         false,
-        true,
+        ticket,
     );
     assert_eq!(
         cb.state_name(),
@@ -3130,9 +3132,9 @@ fn inbound_hbone_dns_screen_denial_settles_half_open_via_production_helper() {
     );
     assert!(
         collapsed.contains(
-            "if policy_refusal { cb.record_neutral(is_half_open_probe); } else { cb.record_failure(status.as_u16(), true, is_half_open_probe); }"
+            "if policy_refusal { cb.settle(ticket, BreakerOutcome::Neutral); } else { cb.settle( ticket, BreakerOutcome::Failure { status_code: status.as_u16(), connection_error: true, }, ); }"
         ),
-        "policy refusals must record_neutral; other connect failures record_failure"
+        "policy refusals must settle Neutral; other connect failures settle a Failure"
     );
 
     let tcp = collapsed_tokens(rust_fn_body(src, "async fn connect_backend("));
