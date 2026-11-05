@@ -4811,7 +4811,7 @@ BARE_COMMAND_WORD_PREFIX = re.compile(
 )
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
-    r"(?:^|\s)(?:/[^\s'\"]+)+/cross\s+)"
+    r"(?:^|\s)(?:/[^\s'\"/]*)+/cross\s+)"
 )
 SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
