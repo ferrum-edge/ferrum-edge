@@ -1321,6 +1321,7 @@ jobs:
               integration::cp_trust_reload_health_tests
               integration::connection_pool_tests
               integration::http2_pool_tests
+              integration::dns_cold_miss_concurrency_tests
               integration::http3_integration_tests
               integration::http3_dedup_dispatch_provenance_tests
               integration::http3_quic_admission_tests

@@ -207,6 +207,37 @@ fn cold_miss_concurrent_prefix_len(query_types: &[CachedRecordType]) -> usize {
     }
 }
 
+/// One record type's non-empty answer from `DnsCache::lookup_record_type`.
+struct RecordTypeAnswer {
+    addrs: Vec<IpAddr>,
+    record_type: CachedRecordType,
+    /// Absolute validity deadline from the response (for SRV, the earlier of
+    /// the SRV and target-address deadlines). Kept absolute so an answer
+    /// buffered behind a slower lookup is not given its full TTL again.
+    valid_until: Instant,
+    /// When the lookup finished.
+    completed_at: Instant,
+}
+
+impl RecordTypeAnswer {
+    fn new(addrs: Vec<IpAddr>, record_type: CachedRecordType, valid_until: Instant) -> Self {
+        Self {
+            addrs,
+            record_type,
+            valid_until,
+            completed_at: Instant::now(),
+        }
+    }
+
+    /// Valid when it completed but expired by `now`. An answer that arrived
+    /// already expired (a TTL hickory clamped to zero) is not "buffered"
+    /// stale: re-asking would get the same answer, so it keeps the
+    /// `min_ttl` fallback instead.
+    fn expired_while_buffered(&self, now: Instant) -> bool {
+        self.valid_until > self.completed_at && self.valid_until <= now
+    }
+}
+
 /// RFC 2782 root target: a Target of "." means the service is decidedly not
 /// available at this domain. After stripping the trailing root label the DNS
 /// root is the empty name, so `"."`, `""`, and dotted-only names are all
@@ -1795,43 +1826,59 @@ impl DnsCache {
                 .map(|&record_type| self.lookup_record_type(hostname, record_type))
                 .collect();
             while let Some(answer) = lookups.next().await {
-                if let Some((addrs, answered_type, native_ttl)) = answer {
-                    return Ok((addrs, Some(answered_type), native_ttl));
-                }
+                let Some(answer) = answer else {
+                    continue;
+                };
+                // A completed answer can wait here behind a slower, preferred
+                // lookup. Its TTL is measured from its absolute deadline now,
+                // at selection, so the wait is not added on top. If it expired
+                // while waiting, ask again rather than cache a stale address.
+                let answer = if answer.expired_while_buffered(Instant::now()) {
+                    match self.lookup_record_type(hostname, answer.record_type).await {
+                        Some(fresh) => fresh,
+                        None => continue,
+                    }
+                } else {
+                    answer
+                };
+                return Ok(self.publishable_answer(answer));
             }
         }
 
         // Try each remaining record type in order
         for &record_type in serial {
-            if let Some((addrs, answered_type, native_ttl)) =
-                self.lookup_record_type(hostname, record_type).await
-            {
-                return Ok((addrs, Some(answered_type), native_ttl));
+            if let Some(answer) = self.lookup_record_type(hostname, record_type).await {
+                return Ok(self.publishable_answer(answer));
             }
         }
 
         anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
     }
 
-    /// Remaining TTL from a lookup's `valid_until` deadline, or `min_ttl` when
-    /// the deadline is already in the past.
-    fn remaining_ttl(&self, valid_until: Instant) -> Duration {
+    /// `do_resolve`'s result for `answer`: the remaining TTL is taken from
+    /// its absolute deadline at this instant, or `min_ttl` when the deadline
+    /// is already in the past (hickory clamped it).
+    fn publishable_answer(
+        &self,
+        answer: RecordTypeAnswer,
+    ) -> (Vec<IpAddr>, Option<CachedRecordType>, Duration) {
         let now = Instant::now();
-        if valid_until > now {
-            valid_until.duration_since(now)
+        let native_ttl = if answer.valid_until > now {
+            answer.valid_until.duration_since(now)
         } else {
             self.min_ttl
-        }
+        };
+        (answer.addrs, Some(answer.record_type), native_ttl)
     }
 
-    /// Query one record type for `hostname`. Returns the addresses, the type
-    /// that answered, and the native TTL, or `None` when the lookup failed or
-    /// answered with no usable address (the caller then tries the next type).
+    /// Query one record type for `hostname`. Returns the answer, or `None`
+    /// when the lookup failed or answered with no usable address (the caller
+    /// then tries the next type).
     async fn lookup_record_type(
         &self,
         hostname: &str,
         record_type: CachedRecordType,
-    ) -> Option<(Vec<IpAddr>, CachedRecordType, Duration)> {
+    ) -> Option<RecordTypeAnswer> {
         match record_type {
             CachedRecordType::A => {
                 let lookup = self.resolver.ipv4_lookup(hostname).await.ok()?;
@@ -1846,8 +1893,11 @@ impl DnsCache {
                 if addrs.is_empty() {
                     return None;
                 }
-                let native_ttl = self.remaining_ttl(lookup.valid_until());
-                Some((addrs, CachedRecordType::A, native_ttl))
+                Some(RecordTypeAnswer::new(
+                    addrs,
+                    CachedRecordType::A,
+                    lookup.valid_until(),
+                ))
             }
             CachedRecordType::Aaaa => {
                 let lookup = self.resolver.ipv6_lookup(hostname).await.ok()?;
@@ -1862,12 +1912,15 @@ impl DnsCache {
                 if addrs.is_empty() {
                     return None;
                 }
-                let native_ttl = self.remaining_ttl(lookup.valid_until());
-                Some((addrs, CachedRecordType::Aaaa, native_ttl))
+                Some(RecordTypeAnswer::new(
+                    addrs,
+                    CachedRecordType::Aaaa,
+                    lookup.valid_until(),
+                ))
             }
             CachedRecordType::Srv => {
                 let srv_lookup = self.resolver.srv_lookup(hostname).await.ok()?;
-                let srv_ttl = self.remaining_ttl(srv_lookup.valid_until());
+                let srv_valid_until = srv_lookup.valid_until();
                 // ADDRESS-ONLY SRV mode. This resolver path answers "what IPs
                 // back this hostname"; the caller dials the proxy's own
                 // configured backend port, so the RR's `port` is never used.
@@ -1902,8 +1955,12 @@ impl DnsCache {
                         let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
                         if !addrs.is_empty() {
                             // Use the shorter of SRV TTL and A/AAAA TTL
-                            let a_ttl = self.remaining_ttl(ip_lookup.valid_until());
-                            return Some((addrs, CachedRecordType::Srv, srv_ttl.min(a_ttl)));
+                            let valid_until = srv_valid_until.min(ip_lookup.valid_until());
+                            return Some(RecordTypeAnswer::new(
+                                addrs,
+                                CachedRecordType::Srv,
+                                valid_until,
+                            ));
                         }
                     }
                 }
@@ -1916,8 +1973,11 @@ impl DnsCache {
                 if addrs.is_empty() {
                     return None;
                 }
-                let native_ttl = self.remaining_ttl(lookup.valid_until());
-                Some((addrs, CachedRecordType::Cname, native_ttl))
+                Some(RecordTypeAnswer::new(
+                    addrs,
+                    CachedRecordType::Cname,
+                    lookup.valid_until(),
+                ))
             }
         }
     }

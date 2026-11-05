@@ -15,13 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   types up to the first address type together and still takes the first
   non-empty answer in configured order; CNAME stays a serial fallback.
   Hostnames whose answering type is already cached keep the sequential walk,
-  so steady-state refreshes send the same queries as before.
-- **The h2c and HBONE capability probes for one mesh HTTP target run
-  together.** An HBONE-hinted `http` target used to finish its h2c probe
-  before starting its HBONE probe. The two dial different ports through
-  different pools and write different record fields, so they now run
-  concurrently, as the H2 and H3 probes of an `https` target already did.
-  Each probe keeps its own timeout and classification rules.
+  so steady-state refreshes send the same queries as before. An A/AAAA answer
+  that waits behind a slower SRV query is cached only for what remains of its
+  TTL, and is queried again if it expired while waiting.
 
 ### Fixed
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
