@@ -502,13 +502,37 @@ impl SseEventBuffer {
     }
 }
 
-/// Whether a line whose leading bytes are `head` followed by `tail` is an SSE
-/// `data` field. Judged from the field name alone, so an oversized line can be
-/// classified without joining or retaining it.
-fn sse_line_is_data_field(head: &[u8], tail: &[u8]) -> bool {
+/// Whether a line made of `head` followed by `tail` is an SSE `data` field.
+///
+/// The check uses only the field name, read across both slices by logical
+/// index, so an oversized line is classified without being joined, copied, or
+/// retained. When `at_stream_start` is set, every leading U+FEFF is skipped
+/// first. That is the shared policy [`strip_sse_boms`] applies to the first
+/// line, so a BOM-prefixed first `data` field is still recognized when a BOM
+/// or the name is split between the slices.
+fn sse_line_is_data_field(head: &[u8], tail: &[u8], at_stream_start: bool) -> bool {
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
     const DATA_FIELD: &[u8] = b"data:";
-    let (in_head, in_tail) = DATA_FIELD.split_at(head.len().min(DATA_FIELD.len()));
-    head.starts_with(in_head) && tail.starts_with(in_tail)
+    let byte_at = |index: usize| -> Option<u8> {
+        match index.checked_sub(head.len()) {
+            None => head.get(index).copied(),
+            Some(tail_index) => tail.get(tail_index).copied(),
+        }
+    };
+    let starts_with_at = |offset: usize, prefix: &[u8]| {
+        prefix
+            .iter()
+            .enumerate()
+            .all(|(index, &byte)| byte_at(offset.saturating_add(index)) == Some(byte))
+    };
+    let mut offset = 0usize;
+    if at_stream_start {
+        // Each skip consumes three present bytes, so this ends within the line.
+        while starts_with_at(offset, UTF8_BOM) {
+            offset = offset.saturating_add(UTF8_BOM.len());
+        }
+    }
+    starts_with_at(offset, DATA_FIELD)
 }
 
 /// Wire framing an [`UsageStreamExtractor`] should decode.
@@ -641,9 +665,8 @@ impl UsageStreamExtractor {
             // would allocate their combined size, bypassing the bounded-parser
             // guarantee even though neither survives after this iteration.
             if self.carry.len().saturating_add(line.len()) > MAX_SSE_EVENT_BYTES {
-                if sse_line_is_data_field(&self.carry, line) {
-                    self.event.step(SseEventStep::OversizedData);
-                }
+                let is_data_field = sse_line_is_data_field(&self.carry, line, self.at_stream_start);
+                self.discard_oversized_line(is_data_field);
                 self.carry.clear();
                 continue;
             }
@@ -664,14 +687,25 @@ impl UsageStreamExtractor {
             // Drop the oversized line entirely and resynchronize; a usage event
             // is never 64 KiB, so this cannot silently lose a real charge. An
             // oversized `data` line abandons its whole event.
-            if sse_line_is_data_field(&self.carry, rest) {
-                self.event.step(SseEventStep::OversizedData);
-            }
+            let is_data_field = sse_line_is_data_field(&self.carry, rest, self.at_stream_start);
+            self.discard_oversized_line(is_data_field);
             self.carry = Vec::new();
             self.resyncing = true;
             return;
         }
         self.carry.extend_from_slice(rest);
+    }
+
+    /// Discard one line that exceeded the line cap without parsing it.
+    ///
+    /// A `data` field abandons its whole event. The line still consumes the
+    /// stream start, so leading-BOM stripping never moves on to the line after
+    /// it.
+    fn discard_oversized_line(&mut self, is_data_field: bool) {
+        self.at_stream_start = false;
+        if is_data_field {
+            self.event.step(SseEventStep::OversizedData);
+        }
     }
 
     /// Feed one complete SSE line into event assembly.

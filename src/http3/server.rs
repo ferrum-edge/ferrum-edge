@@ -19127,6 +19127,20 @@ fn h3_route_deadline_buffered_result(
     }
 }
 
+/// Drive the production [`h3_route_deadline_buffered_result`] without a socket
+/// and return its `(request_on_wire, connection_error)` pair.
+#[doc(hidden)]
+pub(crate) fn h3_route_deadline_buffered_wire_bits_for_test(
+    ctx: &mut RequestContext,
+    expiry: crate::proxy::RouteDeadlineExpiry,
+) -> (bool, bool) {
+    let result = h3_route_deadline_buffered_result(ctx, expiry);
+    (
+        result.handoff.request_on_wire(),
+        result.handoff.connection_error(),
+    )
+}
+
 /// The buffered result for a matched route rule's total deadline (#5646) that
 /// expired in the native retry loop's backoff: proxy core's route timeout
 /// `504` with the `request_timeout` token, health-neutral because no backend

@@ -15191,8 +15191,8 @@ pub mod _test_support {
     /// `(request_on_wire, connection_error)` that each native HTTP/3 surface
     /// reports for an attempt a matched route rule's deadline ended (#5646), in
     /// order: the pool error the native relays raise, the buffered result the
-    /// native retry loop records, and the `BackendResponse` the cross-protocol
-    /// mesh bridge records. `expiry` is one of `"not_started"`, `"in_flight"`,
+    /// native retry loop records (built by its production constructor), and the
+    /// `BackendResponse` the cross-protocol mesh bridge records. `expiry` is one of `"not_started"`, `"in_flight"`,
     /// or `"attempt_budget"`.
     pub fn h3_route_deadline_wire_bits_for_test(expiry: &str) -> [(bool, bool); 3] {
         let expiry = match expiry {
@@ -15206,11 +15206,12 @@ pub mod _test_support {
             "/".to_string(),
         );
         let error = crate::http3::route_deadline::expiry_pool_error(&mut ctx, expiry);
-        let buffered = crate::http3::route_deadline::expiry_handoff(expiry);
+        let buffered =
+            crate::http3::server::h3_route_deadline_buffered_wire_bits_for_test(&mut ctx, expiry);
         let response = crate::http3::route_deadline::expiry_backend_response(&mut ctx, expiry);
         [
             (error.request_on_wire(), error.connection_error()),
-            (buffered.request_on_wire(), buffered.connection_error()),
+            buffered,
             (response.request_on_wire, response.connection_error),
         ]
     }
