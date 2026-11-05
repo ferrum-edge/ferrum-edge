@@ -55,7 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
 ### Performance
-- **Centralized `ai_rate_limiter` reservations take one Redis round trip.**
+- **Centralized `ai_rate_limiter` reservations take one Redis round trip**
+  (#7035).
   A Redis-backed token reservation charged the current window in one
   transaction and then re-read both window counters in a second pipeline. It
   now reads the previous window and charges the current one in a single
@@ -64,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   weighted estimate, deny rollback and `redis_failure_policy` handling are
   unchanged; an unreadable counter still fails the reservation closed.
 - **`mcp_gateway` request-path session teardown deletes upstream sessions
-  concurrently.** A client `DELETE`, an expired session presented again, and an
+  concurrently** (#7035). A client `DELETE`, an expired session presented again, and an
   `initialize` that reclaims sessions used to `DELETE` each upstream MCP session
   one server at a time before answering. They now run concurrently, at most 8
   in flight across every reclaimed session (the background reaper's bound), so
