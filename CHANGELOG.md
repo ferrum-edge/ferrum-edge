@@ -70,20 +70,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`mcp_gateway` request-path session teardown deletes upstream sessions
   concurrently** (#7035). A client `DELETE` and an expired session presented
   again used to `DELETE` the session's upstream MCP sessions one server at a
-  time before answering; an `initialize` that reclaimed sessions ran those
-  per-session loops concurrently across sessions but still one server at a
-  time within each. Each session's upstream `DELETE`s now run concurrently, at
-  most 8 in flight (the background reaper's bound), and reclaimed sessions
-  still run concurrently with each other, so a session spanning N servers
-  costs about ceil(N/8) upstream round trips instead of N, and a reclaiming
-  `initialize` is never slower than before. Each request-path `DELETE` is now
-  also bounded at 10 seconds, like the reaper's: a hung upstream costs a
-  request at most 10 seconds per wave of 8 instead of the plugin HTTP client's
-  60-second timeout, and a timed-out teardown is logged with its `server_id`
-  and abandoned (best-effort, as before). Failures are still logged and never
-  change the client's answer. The overlapping calls count their wall-clock
-  wait once toward `latency_plugin_external_io_ms` instead of summing each
-  call, including when the client aborts mid-teardown.
+  time before answering; they now run concurrently, at most 8 in flight per
+  request (the background reaper's bound), so a session spanning N servers
+  costs about ceil(N/8) upstream round trips instead of N. An `initialize`
+  that reclaims sessions used to run one serial loop per reclaimed session,
+  all concurrently and with no overall bound; it now gives the whole reclaimed
+  batch one budget of 8: the first 8 upstream `DELETE`s run before it answers
+  and the rest are handed to the reaper's bounded background cleanup queue
+  (anything the queue cannot take still runs inline under the same bound), so
+  a mass-expiry backlog neither bursts unboundedly nor holds the `initialize`.
+  Queued teardowns are background work: they carry no hop count and are not
+  counted in the request's `latency_plugin_external_io_ms`. Each request-path
+  `DELETE` is also bounded at 10 seconds, like the reaper's: a hung upstream
+  costs a request at most 10 seconds per wave of 8 instead of the plugin HTTP
+  client's 60-second timeout, and a timed-out teardown is logged with its
+  `server_id` and abandoned (best-effort, as before). Failures are still
+  logged and never change the client's answer. The overlapping calls count
+  their wall-clock wait once toward `latency_plugin_external_io_ms` instead of
+  summing each call, including when the client aborts mid-teardown.
 - **A reclaiming `initialize` no longer returns an already-expired session**
   (#7035). The session `initialize` admits is inserted before it awaits the
   reclaimed sessions' upstream teardown; when that teardown outlasted

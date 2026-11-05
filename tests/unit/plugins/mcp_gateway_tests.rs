@@ -3936,43 +3936,167 @@ async fn cancelled_session_delete_still_counts_its_teardown_wait() {
     );
 }
 
-/// EDGE-PL-2: one session's upstream `DELETE`s share a fan-out bounded at 8:
-/// with 10 upstreams the bound is reached and never exceeded.
+/// EDGE-PL-2: an `initialize` that reclaims several sessions drives all of
+/// their upstream `DELETE`s through ONE budget of 8 for the whole batch: with
+/// no reaper running to take the overflow, every teardown stays inline and the
+/// aggregate peak is exactly 8, however many sessions and servers there are.
 #[tokio::test]
-async fn one_sessions_teardown_never_exceeds_eight_in_flight() {
+async fn reclaiming_initialize_bounds_its_whole_teardown_batch_at_eight() {
     const SERVERS: usize = 10;
+    const RECLAIMED_SESSIONS: usize = 2;
     const BOUND: usize = 8;
     let gate = DeleteGate::new(BOUND);
     let mut servers = Vec::with_capacity(SERVERS);
     for index in 0..SERVERS {
         servers
-            .push(start_gated_session_delete_server(&format!("bounded-{index}"), 200, &gate).await);
+            .push(start_gated_session_delete_server(&format!("batch-{index}"), 200, &gate).await);
     }
-    let plugin = create_plugin("mcp_gateway", &gated_servers_tools_config(&servers))
-        .unwrap()
-        .unwrap();
-    let session_id = initialize(&plugin).await;
-    let _ = aggregate_tool_names(&plugin, &session_id, 1140).await;
+    let mut config = gated_servers_tools_config(&servers);
+    config["sessions"] = json!({ "session_ttl_seconds": 2 });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    for request_id in 0..RECLAIMED_SESSIONS {
+        let session_id = initialize(&plugin).await;
+        let _ = aggregate_tool_names(&plugin, &session_id, 1140 + request_id as i64).await;
+    }
+    // No reaper runs (background tasks are never committed).
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
-    let mut ctx = create_test_context();
-    ctx.method = "DELETE".to_string();
-    ctx.path = "/mcp".to_string();
-    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
-    let (status, _, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert_eq!(status, 200);
-    assert!(gate.met(), "the per-session fan-out must reach its bound");
+    // Reclaims both expired sessions: 20 upstream DELETEs across 10 servers.
+    let _ = initialize(&plugin).await;
+    assert!(gate.met(), "the batch's fan-out must reach its bound");
     assert_eq!(
         gate.max_in_flight(),
         BOUND,
-        "never more than {BOUND} of one session's upstream DELETEs in flight"
+        "never more than {BOUND} upstream DELETEs in flight for the whole batch"
     );
     for (index, server) in servers.iter().enumerate() {
         assert_eq!(
-            deletes_for(server, &format!("bounded-{index}")).await,
-            1,
-            "server {index}: the upstream session is deleted once"
+            deletes_for(server, &format!("batch-{index}")).await,
+            RECLAIMED_SESSIONS,
+            "server {index}: each reclaimed session's upstream session is deleted"
         );
     }
+}
+
+/// How long the reaper's (hop-less) `DELETE`s are held in the spill test.
+const REAPER_DELETE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A mock upstream that mints `upstream_session` on every POST. Request-path
+/// `DELETE`s carry the gateway hop header and answer at once; the reaper's
+/// background `DELETE`s carry none and answer after [`REAPER_DELETE_HOLD`].
+async fn start_hop_aware_session_delete_server(upstream_session: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", upstream_session)
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "upstream",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": { "name": "hop-aware-delete", "version": "1" },
+                        "tools": [{ "name": "create_pr", "inputSchema": { "type": "object" } }]
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .and(wiremock::matchers::header_exists("x-ferrum-hops"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_delay(REAPER_DELETE_HOLD))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// `DELETE`s a mock received with (`true`) or without the gateway hop header.
+async fn deletes_with_hops(servers: &[MockServer], with_hops: bool) -> usize {
+    let mut count = 0;
+    for server in servers {
+        count += server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "DELETE"
+                    && request.headers.contains_key("x-ferrum-hops") == with_hops
+            })
+            .count();
+    }
+    count
+}
+
+/// EDGE-PL-2: reclamation runs one bounded wave inline and hands the rest of
+/// the batch to the reaper's bounded cleanup queue. The `initialize` returns
+/// once its inline wave is done, without waiting for the queued teardowns,
+/// and the queued ones are still deleted in the background.
+#[tokio::test]
+async fn reclaim_overflow_spills_to_the_reaper_without_holding_initialize() {
+    const SERVERS: usize = 10;
+    const INLINE: usize = 8;
+    let mut servers = Vec::with_capacity(SERVERS);
+    for index in 0..SERVERS {
+        servers.push(start_hop_aware_session_delete_server(&format!("spill-{index}")).await);
+    }
+    let mut config = gated_servers_tools_config(&servers);
+    // The second initialize evicts the first session (cap eviction), so no
+    // TTL has to elapse and the reaper's own sweep (every 60 s at the default
+    // TTL) never runs during the test.
+    config["sessions"] = json!({ "max_sessions_per_principal": 1 });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    plugin.commit_background_tasks();
+    let evicted = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &evicted, 1145).await;
+
+    // Stamp a hop count so request-path DELETEs are distinguishable from the
+    // reaper's, which are not request-scoped and carry none.
+    let (mut ctx, mut headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 1146,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "unit-test", "version": "1" }
+        }
+    }));
+    ctx.outbound_proxy_hops = Some(1);
+    let started = std::time::Instant::now();
+    let (status, _, response_headers) =
+        reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200);
+    assert!(response_headers.contains_key("mcp-session-id"));
+    assert!(
+        elapsed < REAPER_DELETE_HOLD,
+        "initialize must not wait for the queued teardowns, took {elapsed:?}"
+    );
+    assert_eq!(
+        deletes_with_hops(&servers, true).await,
+        INLINE,
+        "exactly one bounded wave runs on the request path"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while deletes_with_hops(&servers, false).await < SERVERS - INLINE {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queued teardowns must still reach their upstreams via the reaper"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(deletes_with_hops(&servers, false).await, SERVERS - INLINE);
 }
 
 /// A mock upstream that mints `upstream_session` only on its
@@ -4042,9 +4166,8 @@ async fn start_session_minting_server(
 }
 
 /// EDGE-PL-2: an `initialize` that reclaims several expired sessions tears
-/// them down concurrently with each other (never slower than the slowest
-/// session), and the session it admits stays usable even when that teardown
-/// outlasts `session_ttl_seconds`.
+/// them down concurrently with each other, and the session it admits stays
+/// usable even when that teardown outlasts `session_ttl_seconds`.
 ///
 /// Each reclaimed session owns exactly one upstream session, on a different
 /// server, so the rendezvous is met only if both sessions' teardowns are in
