@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Cold DNS misses query SRV and A together.** With the default
+  `FERRUM_DNS_ORDER` (`CACHE,SRV,A,CNAME`), a hostname with no cached answer
+  used to wait a full SRV round trip (or an SRV timeout during a resolver
+  outage) before sending its A query. A cold miss now starts the leading record
+  types up to the first address type together and still takes the first
+  non-empty answer in configured order; CNAME stays a serial fallback.
+  Hostnames whose answering type is already cached keep the sequential walk,
+  so steady-state refreshes send the same queries as before.
+- **The h2c and HBONE capability probes for one mesh HTTP target run
+  together.** An HBONE-hinted `http` target used to finish its h2c probe
+  before starting its HBONE probe. The two dial different ports through
+  different pools and write different record fields, so they now run
+  concurrently, as the H2 and H3 probes of an `https` target already did.
+  Each probe keeps its own timeout and classification rules.
+
 ### Fixed
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch

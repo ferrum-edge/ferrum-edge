@@ -12201,6 +12201,36 @@ impl ProxyState {
         let previous_h1 = previous.map(|record| record.plain_http.h1);
         let previous_h3 = previous.map(|record| record.plain_http.h3);
 
+        // `Tcp` and `Udp` join `Http` here for the mesh egress relay targets:
+        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP /
+        // UDP app port (nothing below probes those arms), but HBONE support
+        // must still be proven — a UDP egress target rides a `udp`-marked HBONE
+        // CONNECT, so without this its HBONE record is never probed AND
+        // `retain_keys` evicts it, permanently failing the UDP dispatch gate
+        // closed (the same trap as raw-TCP). The probe only performs the CONNECT
+        // handshake, identical for both transports.
+        let mut hbone_target = if target.hbone_hint
+            && matches!(
+                scheme,
+                BackendScheme::Http | BackendScheme::Tcp | BackendScheme::Udp
+            ) {
+            Some(HboneProbeTarget {
+                host,
+                dial_host: target.hbone_dial_host.as_str(),
+                port,
+                policy_port: target.dispatch_policy_port,
+                hbone_port: target.hbone_port,
+                expected_peer: target.hbone_expected_peer.as_ref(),
+                previous_hbone,
+                // A UDP egress target's destination relay expects the `udp`
+                // marker; probe it with the matching datagram CONNECT so the
+                // handshake reaches the right relay (codex r1 P1).
+                is_udp: matches!(scheme, BackendScheme::Udp),
+            })
+        } else {
+            None
+        };
+
         match scheme {
             BackendScheme::Http => {
                 record.plain_http.h1 = ProtocolSupport::Supported;
@@ -12208,8 +12238,21 @@ impl ProxyState {
                 // flavor, not a scheme), so configuration cannot prove h2c is
                 // inapplicable. Probe with explicit capability-probe context
                 // so only the expected HTTP/1.1 classification miss is quiet.
-                self.probe_h2c(&probe_proxy, probe_timeout, host, port, &mut record)
-                    .await;
+                let h2c_fut = self.probe_h2c(&probe_proxy, probe_timeout, host, port);
+                // An HBONE-hinted target runs its HBONE probe alongside h2c,
+                // like the H2/H3 pair below: h2c dials the app port through
+                // the gRPC pool and writes only `grpc_transport.h2c`, while
+                // HBONE dials the HBONE port through the HBONE pool and writes
+                // only `hbone` and `last_probe_error`. Neither gates the other.
+                let h2c = match hbone_target.take() {
+                    Some(hbone_target) => {
+                        let hbone_fut = self.probe_hbone(&probe_proxy, hbone_target, &mut record);
+                        let (h2c, ()) = tokio::join!(h2c_fut, hbone_fut);
+                        h2c
+                    }
+                    None => h2c_fut.await,
+                };
+                record.grpc_transport.h2c = h2c;
             }
             BackendScheme::Https => {
                 // Run the H2 and H3 probes concurrently against the same
@@ -12250,38 +12293,10 @@ impl ProxyState {
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
         }
-        // `Tcp` and `Udp` join `Http` here for the mesh egress relay targets:
-        // their scheme keeps the plain-HTTP/h2c probes away from a raw-TCP /
-        // UDP app port (nothing above probes those arms), but HBONE support
-        // must still be proven — a UDP egress target rides a `udp`-marked HBONE
-        // CONNECT, so without this its HBONE record is never probed AND
-        // `retain_keys` evicts it, permanently failing the UDP dispatch gate
-        // closed (the same trap as raw-TCP). The probe only performs the CONNECT
-        // handshake, identical for both transports.
-        if target.hbone_hint
-            && matches!(
-                scheme,
-                BackendScheme::Http | BackendScheme::Tcp | BackendScheme::Udp
-            )
-        {
-            self.probe_hbone(
-                &probe_proxy,
-                HboneProbeTarget {
-                    host,
-                    dial_host: target.hbone_dial_host.as_str(),
-                    port,
-                    policy_port: target.dispatch_policy_port,
-                    hbone_port: target.hbone_port,
-                    expected_peer: target.hbone_expected_peer.as_ref(),
-                    previous_hbone,
-                    // A UDP egress target's destination relay expects the `udp`
-                    // marker; probe it with the matching datagram CONNECT so the
-                    // handshake reaches the right relay (codex r1 P1).
-                    is_udp: matches!(scheme, BackendScheme::Udp),
-                },
-                &mut record,
-            )
-            .await;
+        // `Tcp` / `Udp` HBONE targets (the `Http` arm already ran its probe).
+        if let Some(hbone_target) = hbone_target {
+            self.probe_hbone(&probe_proxy, hbone_target, &mut record)
+                .await;
         }
 
         record.last_probe_at_unix_secs = backend_capabilities::now_unix_secs();
@@ -12302,43 +12317,42 @@ impl ProxyState {
         record
     }
 
-    /// h2c prior-knowledge probe for a plaintext HTTP backend. Borrows
-    /// `record` so the outcome is written directly. The pool dial uses
-    /// `get_sender_for_capability_probe` so an expected HTTP/1.1 h2c miss is
-    /// debug-level at the establishment logger; request-time gRPC still WARNs.
-    /// Probe dial timeouts, port exhaustion, and unexpected candidate
+    /// h2c prior-knowledge probe for a plaintext HTTP backend. Returns the
+    /// `grpc_transport.h2c` classification (it writes nothing else), so it can
+    /// run beside the HBONE probe, which holds `&mut record`. The pool dial
+    /// uses `get_sender_for_capability_probe` so an expected HTTP/1.1 h2c miss
+    /// is debug-level at the establishment logger; request-time gRPC still
+    /// WARNs. Probe dial timeouts, port exhaustion, and unexpected candidate
     /// connection/handshake failures keep their WARN/ERROR diagnostics.
     /// Genuine "backend doesn't speak h2c" outcomes classify as
-    /// `Unsupported`.
+    /// `Unsupported`; a timeout leaves `Unknown`.
     async fn probe_h2c(
         &self,
         probe_proxy: &Proxy,
         probe_timeout: Duration,
         host: &str,
         port: u16,
-        record: &mut BackendCapabilityRecord,
-    ) {
+    ) -> ProtocolSupport {
         match tokio::time::timeout(
             probe_timeout,
             self.grpc_pool.get_sender_for_capability_probe(probe_proxy),
         )
         .await
         {
-            Ok(Ok(_)) => {
-                record.grpc_transport.h2c = ProtocolSupport::Supported;
-            }
+            Ok(Ok(_)) => ProtocolSupport::Supported,
             Ok(Err(err)) => {
-                record.grpc_transport.h2c = ProtocolSupport::Unsupported;
                 debug!(
                     "h2c probe for {}:{} classified unsupported: {}",
                     host, port, err
                 );
+                ProtocolSupport::Unsupported
             }
             Err(_) => {
                 debug!(
                     "h2c probe for {}:{} timed out after {}ms; leaving unknown",
                     host, port, probe_proxy.backend_connect_timeout_ms
                 );
+                ProtocolSupport::Unknown
             }
         }
     }
