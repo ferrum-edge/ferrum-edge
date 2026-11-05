@@ -27,6 +27,8 @@ use tower::service_fn;
 struct MockKubeState {
     gets: Vec<String>,
     patches: Vec<String>,
+    /// Kind of every request (GET or PATCH) in the order the mock handled it.
+    requests: Vec<String>,
     fail_kinds: Vec<String>,
 }
 
@@ -196,6 +198,7 @@ fn mock_kube_client_with_gates(
             let response = match method {
                 Method::GET => {
                     state.gets.push(kind.to_string());
+                    state.requests.push(kind.to_string());
                     if state.fail_kinds.iter().any(|failed| failed == kind) {
                         json_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -226,6 +229,7 @@ fn mock_kube_client_with_gates(
                 }
                 Method::PATCH => {
                     state.patches.push(kind.to_string());
+                    state.requests.push(kind.to_string());
                     if state.fail_kinds.iter().any(|failed| failed == kind) {
                         json_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -446,16 +450,21 @@ async fn reconcile_dispatch_runs_gateway_and_istio_batches_concurrently() {
 #[tokio::test]
 async fn reconcile_dispatch_keeps_writer_failures_isolated_when_concurrent() {
     // A failing Gateway API batch must not stop the concurrently running Istio
-    // batch, and it must still record exactly one failed batch on the
-    // status-plan cursor (cursor retry semantics are unchanged, #6370).
-    let gateway_state = Arc::new(Mutex::new(MockKubeState {
+    // batch on the shared client, and it must still record exactly one failed
+    // batch on the status-plan cursor (cursor retry semantics are unchanged,
+    // #6370).
+    let (gateway_gate, istio_gate) = writer_gates();
+    let state = Arc::new(Mutex::new(MockKubeState {
         fail_kinds: vec!["GatewayClass".to_string(), "HTTPRoute".to_string()],
         ..MockKubeState::default()
     }));
-    let istio_state = Arc::new(Mutex::new(MockKubeState::default()));
-    let gateway_writer = GatewayApiStatusWriter::new(mock_kube_client(gateway_state.clone()));
-    let istio_writer = IstioStatusWriter::new(mock_kube_client(istio_state.clone()));
-    let metrics = ControllerMetrics::new();
+    let client = mock_kube_client_with_gates(
+        state.clone(),
+        Some((gateway_gate.clone(), istio_gate.clone())),
+    );
+    let metrics = Arc::new(ControllerMetrics::new());
+    let gateway_writer = GatewayApiStatusWriter::new(client.clone()).with_metrics(metrics.clone());
+    let istio_writer = IstioStatusWriter::new(client).with_metrics(metrics.clone());
 
     run_status_patchers_for_test(
         Some(gateway_writer),
@@ -467,12 +476,8 @@ async fn reconcile_dispatch_keeps_writer_failures_isolated_when_concurrent() {
     .await;
 
     assert!(
-        !gateway_state
-            .lock()
-            .expect("lock gateway mock state")
-            .gets
-            .is_empty(),
-        "the Gateway API batch must have run"
+        gateway_gate.overlapped.load(Ordering::SeqCst),
+        "the failing Gateway API batch must overlap the Istio batch"
     );
     assert_eq!(
         metrics
@@ -481,12 +486,92 @@ async fn reconcile_dispatch_keeps_writer_failures_isolated_when_concurrent() {
         1,
         "the failed Gateway API batch keeps its cursor-retry accounting"
     );
+    let state = state.lock().expect("lock mock Kubernetes state");
     assert!(
-        !istio_state
-            .lock()
-            .expect("lock istio mock state")
+        state
+            .gets
+            .iter()
+            .any(|kind| kind == "GatewayClass" || kind == "HTTPRoute"),
+        "the Gateway API batch must have run: {:?}",
+        state.gets
+    );
+    assert!(
+        state
             .patches
-            .is_empty(),
-        "Istio status patches must land despite the Gateway API failure"
+            .iter()
+            .any(|kind| kind == "VirtualService" || kind == "DestinationRule"),
+        "Istio status patches must land despite the Gateway API failure: {:?}",
+        state.patches
+    );
+}
+
+#[tokio::test]
+async fn reconcile_dispatch_runs_large_istio_batch_after_gateway_batch() {
+    // An Istio plan larger than STATUS_PATCH_PARALLELISM (32) starts every
+    // update at once, so it must not overlap the Gateway API batch on the
+    // shared client: dispatch stays sequential, Gateway API first.
+    let mut objects = mixed_generation();
+    objects.extend((0..40).map(|index| {
+        object(
+            "networking.istio.io/v1beta1",
+            "VirtualService",
+            &format!("vs-{index}"),
+            json!({
+                "hosts": [format!("host-{index}.example.com")],
+                "http": [{"route": [{"destination": {"host": "svc.default.svc.cluster.local"}}]}]
+            }),
+        )
+    }));
+    let istio_plan = plan_istio_status_updates(&objects, options()).len();
+    assert!(
+        istio_plan > 32,
+        "fixture must plan more Istio updates than the overlap threshold, got {istio_plan}"
+    );
+
+    let state = Arc::new(Mutex::new(MockKubeState::default()));
+    let client = mock_kube_client(state.clone());
+    let metrics = Arc::new(ControllerMetrics::new());
+    let gateway_writer = GatewayApiStatusWriter::new(client.clone()).with_metrics(metrics.clone());
+    let istio_writer = IstioStatusWriter::new(client).with_metrics(metrics.clone());
+
+    run_status_patchers_for_test(
+        Some(gateway_writer),
+        Some(istio_writer),
+        objects,
+        options(),
+        &metrics,
+    )
+    .await;
+
+    let state = state.lock().expect("lock mock Kubernetes state");
+    let is_gateway = |kind: &String| kind == "GatewayClass" || kind == "HTTPRoute";
+    let last_gateway = state
+        .requests
+        .iter()
+        .rposition(is_gateway)
+        .expect("the Gateway API batch must reach the API server");
+    let first_istio = state
+        .requests
+        .iter()
+        .position(|kind| !is_gateway(kind))
+        .expect("the Istio batch must reach the API server");
+    assert!(
+        last_gateway < first_istio,
+        "the Gateway API batch must finish before any Istio request starts: {:?}",
+        state.requests
+    );
+    assert!(
+        state.patches.iter().any(is_gateway),
+        "Gateway API status patches must land: {:?}",
+        state.patches
+    );
+    assert_eq!(
+        state
+            .patches
+            .iter()
+            .filter(|kind| *kind == "VirtualService" || *kind == "DestinationRule")
+            .count(),
+        istio_plan,
+        "every planned Istio status patch must land"
     );
 }

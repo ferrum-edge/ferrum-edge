@@ -31,7 +31,7 @@ use crate::k8s_controller::status::{
     StatusTranslationReuse, gateway_api_data_plane_service_ready,
     plan_gateway_api_status_updates_budgeted,
 };
-use crate::k8s_controller::status_budget::STATUS_BATCH_BACKSTOP;
+use crate::k8s_controller::status_budget::{STATUS_BATCH_BACKSTOP, STATUS_PATCH_PARALLELISM};
 use crate::k8s_controller::status_plan::{
     DEFAULT_STATUS_PLAN_WORK_BUDGET, STATUS_WINDOW_MAX_FAILED_BATCHES, StatusPlanBudget,
     StatusWindowBatch, StatusWindowCursorDecision, status_window_cursor_after_batch,
@@ -1346,8 +1346,10 @@ struct StatusPatchersRequest<'a> {
 /// futures (required for `tokio::spawn`'s HRTB Send check — see the
 /// `Send is not general enough` history in `spawn_reconcile_loop`).
 ///
-/// The two batches run concurrently, so the reconcile loop is held for the
-/// slower batch rather than for their sum.
+/// Both writers plan first. The two patch batches then run concurrently when
+/// the Istio batch has at most [`STATUS_PATCH_PARALLELISM`] updates, so the
+/// reconcile loop is held for the slower batch rather than for their sum;
+/// a larger Istio batch runs after the Gateway API batch.
 async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
     let StatusPatchersRequest {
         gateway_writer,
@@ -1392,15 +1394,27 @@ async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
     // result feeds the other. Only the Gateway arm writes the status-plan
     // cursor. Both arms log their own errors, so `join!` (not `try_join!`)
     // keeps each batch's failure handling, and each keeps its own batch
-    // budget and backstop. Both writers bound their request fan-out to
-    // `STATUS_PATCH_PARALLELISM` on the shared kube client.
+    // budget and backstop.
+    //
+    // Threshold: the Istio writer starts every update at once (unbounded, so a
+    // stalled object never holds a slot a later one needs). Overlap only an
+    // Istio batch no larger than the Gateway API writer's own fan-out, so
+    // concurrent status I/O on the shared kube client stays at most 32 + 32
+    // and a large Istio flood never queues the Gateway API batch past its
+    // budgets. Larger Istio batches run after the Gateway API batch, as before.
+    let istio_updates = istio_batch.as_ref().map_or(0, |(_, updates)| updates.len());
     let gateway: OptionFuture<_> = gateway_batch
         .map(|(writer, batch)| patch_gateway_api_statuses(writer, batch, metrics))
         .into();
     let istio: OptionFuture<_> = istio_batch
         .map(|(writer, updates)| patch_istio_statuses(writer, updates, metrics))
         .into();
-    tokio::join!(gateway, istio);
+    if istio_updates <= STATUS_PATCH_PARALLELISM {
+        tokio::join!(gateway, istio);
+    } else {
+        gateway.await;
+        istio.await;
+    }
 }
 
 /// Test-only entry into [`run_status_patchers`] (no route conflicts, no
