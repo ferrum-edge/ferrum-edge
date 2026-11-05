@@ -317,6 +317,14 @@ impl StockHarness {
         script: HashMap<String, Vec<ScriptedResponse>>,
         close_on_nack: bool,
     ) -> Self {
+        Self::start_with_timings(script, close_on_nack, MeshStreamTimings::production()).await
+    }
+
+    async fn start_with_timings(
+        script: HashMap<String, Vec<ScriptedResponse>>,
+        close_on_nack: bool,
+        timings: MeshStreamTimings,
+    ) -> Self {
         let policy_dir = tempfile::tempdir().expect("temp dir");
         let policy_path = policy_dir.path().join("mesh-policy.yaml");
         std::fs::write(&policy_path, POLICY_DOCUMENT).expect("write policy document");
@@ -362,7 +370,7 @@ impl StockHarness {
             primary_retry_secs: 0,
             connect_timeout_seconds: 5,
             limits: StockXdsLimits::default(),
-            timings: MeshStreamTimings::production(),
+            timings,
         };
         let request = MeshSliceRequest {
             node_id: config.node_id.clone(),
@@ -611,6 +619,98 @@ async fn stock_invalid_response_is_nacked_and_the_last_good_slice_keeps_serving(
         .collect();
     names.sort_unstable();
     assert_eq!(names, vec!["ratings", "reviews"]);
+}
+
+/// Debounce window wide enough that the scripted NACK is guaranteed to land
+/// while the slice is still STAGED, independent of runner scheduling.
+const CONTROLLED_DEBOUNCE: Duration = Duration::from_secs(4);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stock_nack_inside_the_debounce_window_keeps_the_staged_slice() {
+    // The ACK for the first EDS response is what completes the gating set and
+    // stages the slice; that same ACK releases this structurally invalid EDS
+    // push (two assignments sharing a name). Nothing is queued after it: a
+    // state-of-the-world control plane does not resend what it already saw
+    // ACKed, so the staged slice is the only way to converge.
+    let mut script = converged_script();
+    script
+        .get_mut(EDS_TYPE_URL)
+        .expect("EDS queue")
+        .push(ScriptedResponse {
+            type_url: EDS_TYPE_URL.to_string(),
+            version: "eds-v2".to_string(),
+            nonce: "eds-n2".to_string(),
+            resources: vec![
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+                any_resource(EDS_TYPE_URL, &cla(REVIEWS_CLUSTER, "10.1.2.9", 9080)),
+            ],
+        });
+    let harness = StockHarness::start_with_timings(
+        script,
+        false,
+        MeshStreamTimings {
+            first_slice: Duration::from_secs(60),
+            apply_debounce: CONTROLLED_DEBOUNCE,
+            apply_max_delay: CONTROLLED_DEBOUNCE,
+            ..MeshStreamTimings::production()
+        },
+    )
+    .await;
+
+    // Phase 1: the server records the NACK. The client staged the slice while
+    // handling the eds-v1 response whose ACK released eds-v2, so the slice was
+    // staged before this NACK was sent...
+    let nack_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let nack = loop {
+        if let Some(request) = harness
+            .recorder
+            .for_type(EDS_TYPE_URL)
+            .into_iter()
+            .find(|request| request.error_detail.is_some())
+        {
+            break request;
+        }
+        assert!(
+            tokio::time::Instant::now() < nack_deadline,
+            "the invalid EDS push was never NACKed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(nack.response_nonce, "eds-n2");
+    assert_eq!(nack.version_info, "eds-v1");
+    // ...and nothing has been committed yet: the NACK landed inside the
+    // debounce window, with the slice still staged.
+    assert!(
+        harness.state.snapshot().is_none(),
+        "the NACK must be observed before the debounce commits, or this test proves nothing"
+    );
+
+    // Phase 2: the staged slice commits when the debounce fires.
+    let install_deadline =
+        tokio::time::Instant::now() + CONTROLLED_DEBOUNCE + Duration::from_secs(10);
+    let slice = loop {
+        if let Some(slice) = harness.state.snapshot().as_ref().clone()
+            && slice.services.len() == 2
+        {
+            break slice;
+        }
+        assert!(
+            tokio::time::Instant::now() < install_deadline,
+            "the staged slice must survive a NACK of a later push"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let mut addresses: Vec<String> = slice
+        .workloads
+        .iter()
+        .flat_map(|workload| workload.addresses.clone())
+        .collect();
+    addresses.sort();
+    assert_eq!(
+        addresses,
+        vec!["10.1.2.3".to_string(), "10.1.2.4".to_string()],
+        "the installed slice is the ACKed eds-v1 view, never the NACKed push"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -237,6 +237,19 @@ impl RemoteEndpointSnapshot {
     }
 }
 
+/// What [`RemoteEndpointStore::remove`] did to the cluster's generation slot.
+///
+/// `Retired` obliges `remove` to publish a NEW snapshot pointer even when no
+/// endpoints were cached, so an in-flight first-sight `install` CAS based on the
+/// old pointer fails and re-checks the (now retired) generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteGenerationRetirement {
+    /// The cluster had no registered generation: nothing can be in flight.
+    Untracked,
+    /// A registered generation was retired by this call.
+    Retired,
+}
+
 /// Outcome of a [`RemoteEndpointStore::install`] call.
 ///
 /// `install` returns more than a simple `bool` so the poll loop can tell a
@@ -458,7 +471,10 @@ impl RemoteEndpointStore {
         // subsequent `inner` clear drops the endpoints, or (b) `remove`'s `inner`
         // clear wins the CAS, this closure retries, re-reads the now-retired
         // generation, and skips — never reintroducing endpoints for a removed
-        // cluster. Without the in-closure recheck, a stale task could insert
+        // cluster. (b) also covers a first-sight install with no entry to clear:
+        // `remove` republishes `inner` whenever it retired a generation, so the
+        // pointer this closure read is always stale after a retire. Without the
+        // in-closure recheck, a stale task could insert
         // after `remove` had already cleared the cluster (the F6 race, widened
         // to the trust-withdrawal case). `outcome` is computed fresh on every
         // closure iteration so a CAS retry never carries a stale verdict.
@@ -510,24 +526,38 @@ impl RemoteEndpointStore {
     /// No-op if untracked.
     pub fn remove(&self, cluster_name: &str) {
         // Retire the cluster's generation so any in-flight task sees mismatch.
+        let mut retirement = RemoteGenerationRetirement::Untracked;
         self.cluster_generation.rcu(|current| {
             if current.contains_key(cluster_name) {
                 let mut next = (**current).clone();
                 next.remove(cluster_name);
+                retirement = RemoteGenerationRetirement::Retired;
                 Arc::new(next)
             } else {
+                retirement = RemoteGenerationRetirement::Untracked;
                 Arc::clone(current)
             }
         });
+        // Mirrors `FederationStore::remove_cluster`. A first-sight `install`
+        // can pass its in-closure generation check, lose the race to the
+        // retire above, and still be waiting to CAS against the snapshot
+        // pointer it read. If there is no entry to drop, returning the SAME
+        // pointer here would let that CAS succeed and commit endpoints for a
+        // retired cluster that nothing would ever reap. Republishing whenever
+        // a generation was retired forces that CAS to fail, so the install
+        // retries, observes the retired generation, and skips.
         let mut changed = false;
         self.inner.rcu(|current| {
-            if current.clusters.contains_key(cluster_name) {
-                let mut next = (**current).clone();
-                next.clusters.remove(cluster_name);
-                changed = true;
-                Arc::new(next)
-            } else {
-                Arc::clone(current)
+            changed = false;
+            match (retirement, current.clusters.contains_key(cluster_name)) {
+                (_, true) => {
+                    let mut next = (**current).clone();
+                    next.clusters.remove(cluster_name);
+                    changed = true;
+                    Arc::new(next)
+                }
+                (RemoteGenerationRetirement::Retired, false) => Arc::new((**current).clone()),
+                (RemoteGenerationRetirement::Untracked, false) => Arc::clone(current),
             }
         });
         if changed {

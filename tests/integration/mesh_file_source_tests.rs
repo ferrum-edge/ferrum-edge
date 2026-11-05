@@ -966,6 +966,74 @@ fn stock_policy_recovery_epoch_fences_stale_slice_binding() {
 }
 
 #[test]
+fn stale_policy_rebuild_failure_cannot_cancel_a_newer_policy_recovery() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // The stock stream is rebuilding baseline N when a newer SIGHUP publishes
+    // baseline N+1 and begins its recovery. N's rebuild then fails.
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+    recovery.mark_rejected();
+    let stale_epoch = recovery.begin_policy_recovery();
+    let current_epoch = recovery.begin_policy_recovery();
+    assert_ne!(stale_epoch, current_epoch);
+
+    assert!(
+        !recovery.mark_rejected_for_epoch(stale_epoch),
+        "a stale rebuild failure must not raise or cancel anything"
+    );
+    assert_eq!(
+        recovery.pending_epoch(),
+        current_epoch,
+        "an older rebuild failure must not cancel the newer policy recovery"
+    );
+
+    // N+1 builds, installs, and is accepted by the proxy: health clears.
+    let current = MeshSlice {
+        labels: [("policy".to_string(), "current".to_string())].into(),
+        ..MeshSlice::default()
+    };
+    recovery.bind_installed_slice_if_policy_recovery(current_epoch, &current);
+    recovery.note_proxy_apply_success(&current);
+    assert!(
+        !recovery.is_rejected(),
+        "config_rejected must clear once the newer valid policy is live"
+    );
+}
+
+#[test]
+fn current_policy_rebuild_failure_cancels_its_own_recovery() {
+    use ferrum_edge::modes::mesh::config_consumer::file_source::MeshLocalSourceRecovery;
+    use ferrum_edge::modes::mesh::slice::MeshSlice;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let recovery = MeshLocalSourceRecovery::new(Arc::new(AtomicBool::new(false)));
+    let epoch = recovery.begin_policy_recovery();
+    assert!(
+        recovery.mark_rejected_for_epoch(epoch),
+        "a rebuild failure of the CURRENT recovery raises config_rejected"
+    );
+    assert!(recovery.is_rejected());
+    assert_eq!(recovery.pending_epoch(), 0, "and cancels that recovery");
+
+    // The canceled epoch can no longer bind or clear.
+    let slice = MeshSlice {
+        labels: [("policy".to_string(), "canceled".to_string())].into(),
+        ..MeshSlice::default()
+    };
+    recovery.bind_installed_slice_if_policy_recovery(epoch, &slice);
+    recovery.note_proxy_apply_success(&slice);
+    assert!(recovery.is_rejected());
+
+    // A repeated stale failure for the already-rejected epoch is a no-op.
+    assert!(!recovery.mark_rejected_for_epoch(epoch));
+    assert!(recovery.is_rejected());
+}
+
+#[test]
 fn stock_policy_reload_without_consumer_fails_closed() {
     use ferrum_edge::modes::mesh::config::MeshConfig;
     use ferrum_edge::modes::mesh::config_consumer::file_source::{
