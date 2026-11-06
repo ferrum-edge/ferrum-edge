@@ -61,7 +61,11 @@ RUNTIME_ENV = {
 }
 
 
-_CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}")
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+_PORT_RE = re.compile(r"[1-9][0-9]{0,4}")
+_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_UTC_TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z")
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _SOCKET_LINK_RE = re.compile(r"socket:\[([0-9]+)\]")
 _PROFILE_METRIC_RE = re.compile(r"ferrum_h1_profile_([a-z0-9_]+) ([0-9]+)")
 
@@ -77,7 +81,7 @@ def gateway_identity(runtime):
     """Select only the identity retained from the runner-owned docker inspect."""
     if (not isinstance(runtime, dict) or runtime.get("identity_error")
             or not isinstance(runtime.get("container_id"), str)
-            or not _CONTAINER_ID_RE.fullmatch(runtime["container_id"])
+            or not _SHA256_HEX_RE.fullmatch(runtime["container_id"])
             or any(type(runtime.get(key)) is not int or runtime[key] <= 0
                    for key in ("host_pid", "start_ticks"))
             or runtime.get("network_mode") != "host"
@@ -455,7 +459,7 @@ def safe_environment(environment):
         return False
     return (environment[CUTOFF_ENV] in ("0", "1")
             and environment["FERRUM_LOG_LEVEL"] in ("error", "warn", "info", "debug", "trace", "off")
-            and all(matches(r"[1-9][0-9]{0,4}", environment[key])
+            and all(matches(_PORT_RE, environment[key])
                     and int(environment[key]) <= 65535
                     for key in ("FERRUM_PROXY_HTTP_PORT", "FERRUM_PROXY_HTTPS_PORT")))
 
@@ -505,7 +509,7 @@ def retain_runtime(destination, container, config_path, pair, gateway, host_id, 
     except errors:
         result["capture_issues"].append("invalid container metadata or safe environment/command")
     try:
-        if not matches(r"sha256:[0-9a-f]{64}", result.get("image_id")):
+        if not matches(_IMAGE_ID_RE, result.get("image_id")):
             raise ValueError("immutable image ID required")
         # Keep the executable and script literal for the trusted CI policy
         # reader. The immutable ID is validated data, never a command operand
@@ -567,21 +571,21 @@ def runtime_issues(runtime, config_path, pair, gateway, manifest, mode):
         issues.append("missing or invalid owned gateway identity")
     started = runtime.get("started_at")
     try:
-        if not matches(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", started):
+        if not matches(_UTC_TIMESTAMP_RE, started):
             raise ValueError("invalid start timestamp")
         datetime.datetime.fromisoformat(started.replace("Z", "+00:00"))
     except ValueError:
         issues.append("invalid container start timestamp")
     if runtime.get("running") is not True:
         issues.append("container not running at capture")
-    if not matches(r"sha256:[0-9a-f]{64}", runtime.get("image_id")):
+    if not matches(_IMAGE_ID_RE, runtime.get("image_id")):
         issues.append("missing or invalid immutable image ID")
     expected_observer = "off" if (mode == "diagnostic" or
                                   (mode == "calibration" and gateway == "ferrum-baseline")) else "on"
     for key in ("container_labels", "image_labels"):
         labels = runtime.get(key)
         if (not isinstance(labels, dict) or labels.keys() != {REVISION_LABEL, OBSERVER_LABEL}
-                or not matches(r"[0-9a-f]{40}", labels.get(REVISION_LABEL))
+                or not matches(_GIT_SHA_RE, labels.get(REVISION_LABEL))
                 or labels[REVISION_LABEL] != manifest.get("h1_revision")
                 or labels.get(OBSERVER_LABEL) != expected_observer):
             issues.append("missing or mismatched revision/observer " + key)
@@ -598,7 +602,7 @@ def runtime_issues(runtime, config_path, pair, gateway, manifest, mode):
             or not isinstance(mount.get("source"), str) or not mount["source"].startswith("/")):
         issues.append("invalid runtime config mount")
     for key in ("config_sha256", "other_environment_sha256", "other_mounts_sha256"):
-        if not matches(r"[0-9a-f]{64}", runtime.get(key)):
+        if not matches(_SHA256_HEX_RE, runtime.get(key)):
             issues.append("missing or invalid runtime " + key)
     try:
         if hashlib.sha256(config_path.read_bytes()).hexdigest() != runtime.get("config_sha256"):
@@ -730,7 +734,7 @@ def report(directory, mode):
         manifest_issues.append("four complete pairs required")
     if not isinstance(manifest.get("host_id"), str) or not manifest["host_id"].strip():
         manifest_issues.append("missing same-host identity")
-    if not matches(r"[0-9a-f]{40}", manifest.get("h1_revision")):
+    if not matches(_GIT_SHA_RE, manifest.get("h1_revision")):
         manifest_issues.append("missing immutable campaign revision")
     if manifest.get("h1_diagnostic_enabled"):
         manifest_issues.append("diagnostic slice cannot enter profile comparisons")
@@ -891,7 +895,7 @@ def report_diagnostic(directory):
             if type(manifest.get(key)) is not type(value) or manifest[key] != value:
                 result["manifest_issues"].append("diagnostic manifest mismatch: " + key)
         if (not isinstance(manifest.get("host_id"), str) or not manifest["host_id"].strip()
-                or not matches(r"[0-9a-f]{40}", manifest.get("h1_revision"))
+                or not matches(_GIT_SHA_RE, manifest.get("h1_revision"))
                 or manifest.get("adaptive_extension", False) is not False):
             result["manifest_issues"].append("missing host/revision or unexpected extension")
     except (OSError, ValueError, TypeError, AttributeError, KeyError):
