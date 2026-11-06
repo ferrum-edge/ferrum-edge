@@ -56,6 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
 ### Performance
+- **SQL mTLS identity uniqueness is a single index lookup.** Admin consumer
+  writes, credential add/replace and `POST /batch` checked each mTLS identity
+  against `consumer_credential_index` and, when the lookup found no other
+  owner (every successful write), also scanned and JSON-decoded every
+  Consumer's `credentials` in the namespace. That scan only covered index rows
+  written before identities were trimmed, which no current-schema database can
+  hold. The check now answers from the index alone, like the MongoDB check, so
+  each identity costs one primary-key lookup instead of O(consumers) row
+  decodes (O(B) instead of O(B×N) for a batch of B mTLS consumers). Rejections
+  and the self-exclusion for a PUT that keeps its identity are unchanged, as is
+  the case-folded `san_dns` check.
 - **Centralized `ai_rate_limiter` reservations take one Redis round trip**
   (#7035). A Redis-backed token reservation charged the current window in one
   `MULTI`/`EXEC` (`INCRBY` + `EXPIRE`) and then read the previous and current

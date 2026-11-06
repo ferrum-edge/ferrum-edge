@@ -1420,44 +1420,55 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
 }
 
 #[tokio::test]
-async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_rows() {
+async fn mtls_uniqueness_is_answered_by_the_credential_index() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir
-        .path()
-        .join("consumer_legacy_mtls_identity_index.db");
+    let db_path = temp_dir.path().join("consumer_mtls_identity_indexed.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
     let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .unwrap();
 
-    let mut consumer = make_consumer("legacy", "alice");
-    consumer.credentials.insert(
+    let mut owner = make_consumer("owner", "alice");
+    owner.credentials.insert(
         "mtls_auth".to_string(),
         json!([{ "identity": " API.Example.COM " }]),
     );
-    store.create_consumer(&consumer).await.unwrap();
+    store.create_consumer(&owner).await.unwrap();
+    store
+        .create_consumer(&make_consumer("other", "bob"))
+        .await
+        .unwrap();
 
-    // Simulate an index row written before surrounding whitespace was
-    // canonicalized. A trimmed exact lookup misses this row, so admission must
-    // inspect the authoritative Consumer record instead of treating it as unique.
-    sqlx::query(
-        "UPDATE consumer_credential_index SET credential_hash = ? \
-         WHERE namespace = ? AND consumer_id = ? AND credential_type = ?",
-    )
-    .bind("legacy-case-sensitive-hash")
-    .bind("ferrum")
-    .bind("legacy")
-    .bind("mtls_auth")
-    .execute(&store.pool())
-    .await
-    .unwrap();
-
-    assert!(
-        !store
-            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
-            .await
-            .unwrap()
-    );
+    // Another consumer's identity is a conflict, with or without surrounding
+    // whitespace on either side; matching stays exact (no case folding).
+    for probe in [
+        "API.Example.COM",
+        "  API.Example.COM\t",
+        " API.Example.COM ",
+    ] {
+        assert!(
+            !store
+                .check_mtls_identity_unique("ferrum", probe, None)
+                .await
+                .unwrap(),
+            "{probe:?} must conflict with the owner's identity"
+        );
+        assert!(
+            !store
+                .check_mtls_identity_unique("ferrum", probe, Some("other"))
+                .await
+                .unwrap(),
+            "{probe:?} must conflict when a different consumer is excluded"
+        );
+        // A PUT that keeps its own identity excludes itself and is admitted.
+        assert!(
+            store
+                .check_mtls_identity_unique("ferrum", probe, Some("owner"))
+                .await
+                .unwrap(),
+            "{probe:?} must be admitted for the excluded owner"
+        );
+    }
     assert!(
         store
             .check_mtls_identity_unique("ferrum", "api.example.com", None)
@@ -1466,36 +1477,37 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
     );
     assert!(
         store
-            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("legacy"))
+            .check_mtls_identity_unique("other-namespace", "API.Example.COM", None)
             .await
             .unwrap()
     );
 
+    // The check reads only the index, never `consumers.credentials`: an
+    // undecodable stored body neither fails the lookup nor hides the owner.
     sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
         .bind("not-json")
         .bind("ferrum")
-        .bind("legacy")
+        .bind("owner")
         .execute(&store.pool())
         .await
         .unwrap();
-    let error = store
-        .check_mtls_identity_unique("ferrum", "other.example.com", None)
-        .await
-        .expect_err("malformed stored credentials must fail uniqueness closed");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to parse credentials JSON")
-    );
-    // Excluding the undecodable row itself must not fail — PUT overwrite
-    // repair with mTLS credentials needs to skip its own corrupt body
-    // (issue #2997).
     assert!(
         store
-            .check_mtls_identity_unique("ferrum", "other.example.com", Some("legacy"))
+            .check_mtls_identity_unique("ferrum", "other.example.com", None)
             .await
-            .expect("excluded undecodable consumer must not block self uniqueness"),
-        "excluded undecodable consumer is not a conflict"
+            .unwrap()
+    );
+    assert!(
+        !store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("owner"))
+            .await
+            .unwrap()
     );
 }
 
