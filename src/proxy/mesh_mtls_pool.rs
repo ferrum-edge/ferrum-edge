@@ -1590,18 +1590,26 @@ impl MeshMtlsConnectionPool {
         pool_config: &PoolConfig,
         max_entries: usize,
     ) -> Option<MeshMtlsTransport> {
-        let now = unix_secs();
         if self
             .growth_backoff_until
             .get(key)
-            .is_some_and(|until| *until.value() > now)
+            .is_some_and(|until| *until.value() > unix_secs())
         {
             return None;
         }
         let creation_slot = self.creation_slot(key);
         let creation_lease = creation_slot.try_claim()?;
-        // Re-check under the lock: another grower may have widened the key
-        // (or a prune may have narrowed it) since the fast-path read.
+        // Re-check under the lock: a grower that failed between the read above
+        // and this claim has published its backoff before releasing the lease,
+        // and another grower may have widened the key (or a prune may have
+        // narrowed it) since the fast-path read.
+        if self
+            .growth_backoff_until
+            .get(key)
+            .is_some_and(|until| *until.value() > unix_secs())
+        {
+            return None;
+        }
         let live_connections = self
             .entries
             .get(key)
@@ -1631,8 +1639,7 @@ impl MeshMtlsConnectionPool {
                 effective_connect_timeout_ms,
             )
             .await;
-        drop(creation_lease);
-        match dialed {
+        let grown = match dialed {
             Ok(transport) => {
                 debug!(
                     target_host,
@@ -1645,8 +1652,15 @@ impl MeshMtlsConnectionPool {
                 Some(transport)
             }
             Err(err) => {
+                // Measured from the failure, not the dial start, so a dial
+                // that used its whole connect timeout still backs off the full
+                // window. Recorded before the lock is released, and re-checked
+                // after every claim, so once a dial has failed no other caller
+                // starts a second one for the key in between. A dial whose
+                // future is dropped (cancellation) records no backoff, as on
+                // main.
                 self.growth_backoff_until
-                    .insert(key.to_string(), now + MESH_MTLS_GROWTH_BACKOFF_SECS);
+                    .insert(key.to_string(), unix_secs() + MESH_MTLS_GROWTH_BACKOFF_SECS);
                 debug!(
                     target_host,
                     mtls_port,
@@ -1656,7 +1670,9 @@ impl MeshMtlsConnectionPool {
                 );
                 None
             }
-        }
+        };
+        drop(creation_lease);
+        grown
     }
 
     /// Dial one physical connection for `key` while holding its creation lock,

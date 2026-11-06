@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
   one "rejected" flag: every CNI ADD for an enrolled pod then failed its GC
