@@ -101,6 +101,20 @@ ignore = [
     # and the two event parsers to a safe-Rust YAML parser (saphyr /
     # serde-saphyr).
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability). Parents: serde_yaml 0.9.34+deprecated and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2026-12-31]" },
+
+    # ── astral-tokio-tar 0.6.2 — RUSTSEC-2026-0440, unmaintained (Astral ended
+    # maintenance on 2026-11-03; `patched = []`, every version deprecated). An
+    # informational advisory, not a known vulnerability. One parent reaches it:
+    #   - testcontainers 0.28.0 (the latest release, checked 2026-11-06), a
+    #     dev-dependency used only by the `secrets_functional` and
+    #     `service_integration` test targets to start local OSS containers.
+    # It is not in the shipped binary or images: it is only in the root
+    # Cargo.lock (not fuzz/, ebpf/, or tests/performance/*), and the tar
+    # streams it handles are Docker build contexts and copy-to-container
+    # payloads built from repository test fixtures. Upstream is replacing it
+    # with `tar` (testcontainers/testcontainers-rs#1006, open); retire this
+    # when a testcontainers release ships that change.
+    { id = "RUSTSEC-2026-0440", reason = "astral-tokio-tar 0.6.2 unmaintained (Astral ended maintenance 2026-11-03, patched = [], informational, no known vulnerability). Only parent is testcontainers 0.28.0 (latest, checked 2026-11-06), a dev-dependency of the secrets_functional and service_integration test targets; not in the shipped binary or images. Retire when a testcontainers release replaces it (testcontainers-rs#1006). [expires:2026-12-31]" },
 ]
 
 [bans]

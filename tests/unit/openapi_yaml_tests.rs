@@ -1678,17 +1678,22 @@ fn openapi_operations(spec: &serde_json::Value) -> BTreeSet<(String, String)> {
     operations
 }
 
+/// An admin router `(Method::X, [segments])` match arm; captures method and segments.
+static ADMIN_MATCH_ARM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\(Method::(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS),\s*\[([^\]]*)\]\)"#)
+        .expect("admin match-arm regex compiles")
+});
+/// A direct `if path == "..." && method == Method::X` admin route guard.
+static ADMIN_DIRECT_GUARD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"if\s+path\s*==\s*"([^"]+)"\s*&&\s*method\s*==\s*Method::([A-Z]+)"#)
+        .expect("direct-route regex compiles")
+});
+
 fn implemented_admin_operations() -> BTreeSet<(String, String)> {
     let source = include_str!("../../src/admin/mod.rs");
-    let match_arm =
-        Regex::new(r#"\(Method::(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS),\s*\[([^\]]*)\]\)"#)
-            .expect("admin match-arm regex compiles");
-    let direct_guard =
-        Regex::new(r#"if\s+path\s*==\s*"([^"]+)"\s*&&\s*method\s*==\s*Method::([A-Z]+)"#)
-            .expect("direct-route regex compiles");
     let mut operations = BTreeSet::new();
 
-    for captures in match_arm.captures_iter(source) {
+    for captures in ADMIN_MATCH_ARM.captures_iter(source) {
         let method = captures[1].to_string();
         let segments = captures[2]
             .split(',')
@@ -1716,7 +1721,7 @@ fn implemented_admin_operations() -> BTreeSet<(String, String)> {
         operations.insert((method, format!("/{}", segments.join("/"))));
     }
 
-    for captures in direct_guard.captures_iter(source) {
+    for captures in ADMIN_DIRECT_GUARD.captures_iter(source) {
         operations.insert((captures[2].to_string(), captures[1].to_string()));
     }
 
@@ -1823,6 +1828,20 @@ fn openapi_request_timeout_operations(spec: &serde_json::Value) -> BTreeSet<(Str
     operations
 }
 
+/// A `body_consuming_route_role` match arm: `[..] | [..]` patterns and an
+/// optional `is_post` / `is_put` guard.
+static BODY_GATE_ARM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?x)
+        (?:^|\n)\s*
+        ((?:\[[^\]]+\])(?:\s*\|\s*\[[^\]]+\])*)
+        (?:\s+if\s+(is_post|is_put))?
+        \s*=>
+        "#,
+    )
+    .expect("body-gate arm regex compiles")
+});
+
 /// Parse `body_consuming_route_role` match arms into normalized `(METHOD, path)`
 /// pairs (`{param}` → `{}`) so the pin cannot drift from the runtime gate.
 fn shared_body_gate_operations_from_source() -> BTreeSet<(String, String)> {
@@ -1836,18 +1855,8 @@ fn shared_body_gate_operations_from_source() -> BTreeSet<(String, String)> {
         .expect("tls_route_required_role must follow body_consuming_route_role");
     let gate = &after[..end];
 
-    let arm = Regex::new(
-        r#"(?x)
-        (?:^|\n)\s*
-        ((?:\[[^\]]+\])(?:\s*\|\s*\[[^\]]+\])*)
-        (?:\s+if\s+(is_post|is_put))?
-        \s*=>
-        "#,
-    )
-    .expect("body-gate arm regex compiles");
-
     let mut operations = BTreeSet::new();
-    for captures in arm.captures_iter(gate) {
+    for captures in BODY_GATE_ARM.captures_iter(gate) {
         let patterns = captures[1].to_string();
         let methods: &[&str] = match captures.get(2).map(|value| value.as_str()) {
             Some("is_post") => &["POST"],

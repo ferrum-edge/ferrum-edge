@@ -1079,6 +1079,10 @@ pub async fn run(
     // operation once the database recovers.
     let mut bootstrap_from_backup = false;
 
+    // SQL admin-read replica to dial in the background once the store is
+    // shared (see below); `None` when unset, suppressed, or MongoDB.
+    let mut startup_replica_url: Option<String> = None;
+
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
         "mongodb" => {
@@ -1194,20 +1198,17 @@ pub async fn run(
             retention_policy.log_if_enabled();
             store.set_audit_retention_policy(retention_policy);
 
-            // Connect read replica for admin-only read offload. Runtime
-            // config polling remains primary-consistent.
+            // Record the read replica for admin-only read offload. Runtime
+            // config polling remains primary-consistent. The replica is dialed
+            // in the background below: it is never authoritative, so it must
+            // not delay migrations or the initial primary load, and admin reads
+            // use primary until its pool is published.
             if let Some(ref replica_url) = effective_replica_url {
-                match store.connect_read_replica(replica_url).await {
-                    Ok(()) if store.read_replica_suppressed() => {
-                        info!("Read replica configured but suppressed until primary failback")
-                    }
-                    Ok(()) => info!("Read replica connected for admin reads"),
-                    Err(_error) => {
-                        warn!(
-                            "Read replica connection failed for {}; admin reads will use primary until reconnect succeeds",
-                            sanitize_startup_scalar(replica_url)
-                        );
-                    }
+                store.set_read_replica_url(replica_url);
+                if store.read_replica_suppressed() {
+                    info!("Read replica configured but suppressed until primary failback");
+                } else {
+                    startup_replica_url = Some(replica_url.clone());
                 }
             }
             Box::new(store)
@@ -1215,6 +1216,18 @@ pub async fn run(
     };
     // Convert to Arc for sharing across tasks
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
+    // Single-flight guard shared with every poll generation, so the first
+    // tick cannot double-dial while the startup replica connect is in flight.
+    let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
+    if let Some(replica_url) = startup_replica_url {
+        crate::modes::spawn_admin_read_replica_reconnect(
+            db.clone(),
+            replica_url,
+            replica_reconnect_in_flight.clone(),
+            "startup",
+            None,
+        );
+    }
     let db_tls_reload_handle = crate::modes::db_tls_reload::start_db_tls_reload_task(
         env_config.clone(),
         db.clone(),
@@ -2475,6 +2488,7 @@ pub async fn run(
             let poll_namespace = poll_namespace.clone();
             let db_hostname = db_hostname.clone();
             let replica_hostname = replica_hostname.clone();
+            let replica_reconnect_in_flight = replica_reconnect_in_flight.clone();
             let poll_generation = poll_generation.clone();
             let poll_shutdown_tx = poll_shutdown_tx.clone();
             let poll_wake_signal = poll_wake_signal.clone();
@@ -2494,6 +2508,7 @@ pub async fn run(
                 let poll_namespace = poll_namespace.clone();
                 let db_hostname = db_hostname.clone();
                 let replica_hostname = replica_hostname.clone();
+                let replica_reconnect_in_flight = replica_reconnect_in_flight.clone();
                 let poll_wake_signal = poll_wake_signal.clone();
                 let runtime_config_apply_poll = runtime_config_apply_poll.clone();
                 let generation = poll_generation.fetch_add(1, Ordering::AcqRel);
@@ -2513,7 +2528,6 @@ pub async fn run(
                     // wake-up must never run before it, or a stream of
                     // committed-but-invalid changes could defeat the backoff.
                     let mut earliest_wake: Option<tokio::time::Instant> = None;
-                    let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
                     let mut rejected_delta_tracker = RejectedDeltaTracker::new(
                         rejected_delta_initial_backoff,
                         rejected_delta_max_backoff,
