@@ -101,6 +101,8 @@ PERSIST_LINE = re.compile(
     r"^ +persist-credentials *: *(?P<q>[\"']?)(?P<value>[A-Za-z]+)(?P=q) *(?:#.*)?$"
 )
 
+_INLINE_COMMENT_RE = re.compile(r"[ \t]#")
+
 
 def _strip_comment(value: str) -> str:
     return value.split("#", 1)[0].strip()
@@ -282,7 +284,7 @@ def _single_line_input(line: str, mapping_keys: frozenset[str] = frozenset()) ->
         return "'" not in value and '"' not in value and _strip_comment(value).endswith(closing)
     if value.startswith(("&", "*", "!")):
         return False  # anchors, aliases, and tags are not read here
-    plain = re.split(r"[ \t]#", value, maxsplit=1)[0].strip()
+    plain = _INLINE_COMMENT_RE.split(value, maxsplit=1)[0].strip()
     if plain.endswith(("'", '"')) and plain.count(plain[-1]) % 2:
         # An unbalanced closing quote ends a value opened on an earlier line.
         return False

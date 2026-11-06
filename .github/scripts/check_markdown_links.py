@@ -55,6 +55,8 @@ CUSTOM_HEADING_ID_RE = re.compile(r"\s*\{#([A-Za-z0-9_-]+)\}\s*$")
 GITHUB_LINE_FRAGMENT_RE = re.compile(r"^L\d+(?:-L\d+)?$")
 FENCE_RE = re.compile(r"^(```|~~~)")
 
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
 
 @dataclass(frozen=True)
 class LinkRef:
@@ -197,7 +199,7 @@ def normalize_link_destination(raw: str) -> str | None:
     if target.startswith("<") and ">" in target:
         target = target[1:].split(">", 1)[0].strip()
     else:
-        target = re.split(r"\s+", target, maxsplit=1)[0]
+        target = _WHITESPACE_RUN_RE.split(target, maxsplit=1)[0]
     if not target:
         return None
     parsed = urlparse(target)

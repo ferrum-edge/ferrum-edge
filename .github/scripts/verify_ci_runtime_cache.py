@@ -49,6 +49,72 @@ from verify_cross_build_policy import (
     normalize_action_pins,
 )
 
+_PULL_REQUEST_PATHS_RE = re.compile(
+    r"(?ms)^  pull_request:\n    paths:\n(?P<paths>(?:      - .+\n)+)",
+)
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:")
+_QUOTED_EVENT_KEY_RE = re.compile(r'^  ["\']')
+_INLINE_EVENT_VALUE_RE = re.compile(r"^  [A-Za-z0-9_-]+:\s*\S")
+_EVENT_LEVEL_LINE_RE = re.compile(r"^  \S")
+_JOB_IF_RE = re.compile(r"(?m)^    if:\s*(.+)\s*$")
+_JOB_IF_ALWAYS_RE = re.compile(r"(?m)^    if: always\(\)$")
+_NODE_WAYPOINT_SKIP_STEP_RE = re.compile(
+    r"(?m)^      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes$",
+)
+_SKIP_STEP_NAME_RE = re.compile(r"(?m)^      - name: Skip")
+_JOB_NEEDS_LIST_RE = re.compile(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)")
+_JOB_NEEDS_SCALAR_RE = re.compile(r"(?m)^    needs: ([A-Za-z0-9_-]+)$")
+_JOB_STEPS_RE = re.compile(r"(?ms)^    steps:\n(.*)\Z")
+_STEP_BOUNDARY_RE = re.compile(r"(?m)^(?=      - )")
+_STEP_IF_RE = re.compile(r"(?m)^      (?:- )?if:\s*(.+)\s*$")
+_STEP_NESTED_IF_RE = re.compile(r"(?m)^        if:\s*(.+)\s*$")
+_STEP_RUN_BLOCK_BODY_RE = re.compile(r"(?ms)^        run:[ \t]+\|[-+]?[ \t]*\n(?P<body>.*)\Z")
+_EXIT_COMMAND_RE = re.compile(r"exit\s+\d+")
+_STEP_USES_RE = re.compile(r"(?m)^      (?:- )?uses:\s*(\S+)")
+_STEP_NESTED_USES_RE = re.compile(r"(?m)^        uses:\s*(\S+)")
+_STEP_WITH_RE = re.compile(r"(?m)^        with:\n")
+_LIST_ITEM_BOUNDARY_RE = re.compile(r"(?m)^(?=[ ]{2,}- )")
+_LIST_ITEM_RE = re.compile(r"(?m)^[ ]{2,}- ")
+_WITH_BLOCK_RE = re.compile(r"(?ms)^[ \t]+with:\n((?:[ \t]+[^\n]*\n)*)")
+_RUST_ENVIRONMENT_HASH_KEY_FALSE_RE = re.compile(
+    r"(?m)^[ \t]*add-rust-environment-hash-key:\s*['\"]?false",
+)
+_JOB_ENV_BLOCK_RE = re.compile(r"(?ms)^    env:\s*\n(?P<body>(?:^      [^\n]*\n)*)")
+_JOB_ENV_RUSTC_WRAPPER_RE = re.compile(r"(?m)^      (?:RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER):")
+_STEP_EMPTY_RUSTC_WRAPPER_ENV_RE = re.compile(
+    r'(?m)^        env:\s*\n'
+    r'          RUSTC_WRAPPER: ["\']{2}\s*\n'
+    r'          CARGO_BUILD_RUSTC_WRAPPER: ["\']{2}\s*$'
+)
+_CI_PERF_SHARED_KEY_RE = re.compile(r'(?m)^          shared-key: ["\']ci-perf["\']\s*$')
+_SAVE_IF_RE = re.compile(r"(?m)^\s*save-if:([^\n]*)$")
+_CACHE_TARGETS_RE = re.compile(r"(?m)^\s*cache-targets:([^\n]*)$")
+_STEP_NAME_RE = re.compile(r"(?m)^      - name: (.+)$")
+_RUST_BUILDER_STAGE_RE = re.compile(
+    r"^FROM rust(?::[^\s@]+)?(?:@sha256:[0-9a-f]{64})? AS builder$",
+    re.M,
+)
+_FERRUM_LOG_LEVEL_ASSIGNMENT_RE = re.compile(r"\bFERRUM_LOG_LEVEL=([^\s\\]+)")
+_IMAGE_REFERENCE_LIKE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*:[^\s]+")
+_STEP_RUN_BLOCK_START_RE = re.compile(r"(?m)^        run:[ \t]+\|[ \t]*\n")
+_RESOLVE_STEP_ID_RE = re.compile(r"(?m)^        id: resolve$")
+_PERMISSION_ENTRY_RE = re.compile(r"  ([a-z][a-z-]*): (read|write|none)")
+_FIPS_FEATURE_POLICY_NAME_RE = re.compile(r"(?m)^    name: FIPS Feature Policy$")
+_FIPS_BUILD_AND_TEST_NAME_RE = re.compile(r"(?m)^    name: FIPS Build & Test$")
+_FIPS_POLICY_TESTS_COMMAND_RE = re.compile(
+    r"cargo test[^\n]*tls::fips_policy_tests[^\n]+tls::fips_key_admission_tests",
+)
+_FIPS_HANDSHAKE_TESTS_COMMAND_RE = re.compile(
+    r"cargo test[^\n]*frontend_and_backend_builders_complete_a_real_tls_handshake"
+    r"[^\n]+legitimate_data_plane_connects_once_a_permit_is_released"
+)
+_PRODUCTION_SMOKE_NAME_RE = re.compile(r"(?m)^    name: Production Dockerfile eBPF image smoke$")
+_CACHE_ON_FAILURE_RE = re.compile(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$")
+_COVERAGE_UNIT_TESTS_COMMAND_RE = re.compile(
+    r"cargo llvm-cov --no-report\s+\\\s*\n\s*--lib\s+\\\s*\n\s*--test unit_tests",
+)
+_ROOT_DESCRIPTION_BLOCK_RE = re.compile(r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*")
+
 
 def read_pinned(path: Path) -> str:
     """Read a contract input with external action pins normalized.
@@ -188,6 +254,10 @@ YAML_DOUBLE_QUOTED_ESCAPES = {
 # `<<` is a YAML merge key, not an identifier. Keep it in the key token so
 # block/flow merge spellings are parsed and rejected rather than skipped.
 YAML_KEY_TOKEN = r"'(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|<<|[A-Za-z0-9_.+-]+"
+
+_FLOW_KEY_VALUE_RE = re.compile(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", re.DOTALL)
+_FLOW_KEY_PREFIX_RE = re.compile(rf"^(?:{YAML_KEY_TOKEN})[ \t]*:", re.DOTALL)
+
 YAML_MAPPING_LINE = re.compile(
     rf"^(?P<lead>[ \t]*)(?P<dash>-[ \t]+)?(?P<key>{YAML_KEY_TOKEN})[ \t]*:(?P<value>.*)$"
 )
@@ -230,10 +300,7 @@ PINNED_REMOTE = re.compile(
 
 
 def extract_pull_request_paths(workflow: str) -> list[str]:
-    match = re.search(
-        r"(?ms)^  pull_request:\n    paths:\n(?P<paths>(?:      - .+\n)+)",
-        workflow,
-    )
+    match = _PULL_REQUEST_PATHS_RE.search(workflow)
     if match is None:
         return []
     paths: list[str] = []
@@ -261,7 +328,7 @@ def extract_on_block(workflow: str) -> str:
         (
             index
             for index in range(start + 1, len(lines))
-            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
+            if _TOP_LEVEL_KEY_RE.match(lines[index])
         ),
         len(lines),
     )
@@ -320,9 +387,9 @@ def parse_canonical_on_events(workflow: str) -> dict[str, tuple[str, ...]] | Non
             continue
         if current is None:
             return None
-        if re.match(r'^  ["\']', raw) or re.match(r"^  [A-Za-z0-9_-]+:\s*\S", raw):
+        if _QUOTED_EVENT_KEY_RE.match(raw) or _INLINE_EVENT_VALUE_RE.match(raw):
             return None
-        if re.match(r"^  \S", raw) and not raw.startswith("    "):
+        if _EVENT_LEVEL_LINE_RE.match(raw) and not raw.startswith("    "):
             return None
         events[current].append(raw)
     return {name: tuple(body) for name, body in events.items()}
@@ -493,7 +560,7 @@ def check_governed_live_trigger_shape(
 
 
 def job_if(job_body: str) -> str:
-    match = re.search(r"(?m)^    if:\s*(.+)\s*$", job_body)
+    match = _JOB_IF_RE.search(job_body)
     if match:
         return match.group(1).strip()
     return ""
@@ -789,6 +856,10 @@ def check_node_waypoint_live_job(
 NODE_WAYPOINT_AGGREGATE_JOB = "node-waypoint-ebpf-live-gate"
 NODE_WAYPOINT_AGGREGATE_NAME = "NodeWaypoint eBPF Live"
 
+_NODE_WAYPOINT_AGGREGATE_NAME_LINE_RE = re.compile(
+    rf"(?m)^    name: {re.escape(NODE_WAYPOINT_AGGREGATE_NAME)}$",
+)
+
 
 def check_node_waypoint_aggregate(
     workflow: str,
@@ -805,16 +876,14 @@ def check_node_waypoint_aggregate(
     if not aggregate:
         return
     require(
-        re.search(
-            rf"(?m)^    name: {re.escape(NODE_WAYPOINT_AGGREGATE_NAME)}$", aggregate
-        )
+        _NODE_WAYPOINT_AGGREGATE_NAME_LINE_RE.search(aggregate)
         is not None,
         f"{source} aggregate must keep the check name "
         f"{NODE_WAYPOINT_AGGREGATE_NAME!r}",
         failures,
     )
     require(
-        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        _JOB_IF_ALWAYS_RE.search(aggregate) is not None,
         f"{source} aggregate must run with if: always() so a skipped or failed "
         "live job still reports",
         failures,
@@ -845,10 +914,7 @@ def check_node_waypoint_aggregate(
     skip_steps = [
         step
         for step in steps
-        if re.search(
-            r"(?m)^      - name: Skip NodeWaypoint eBPF live datapath for unrelated changes$",
-            step,
-        )
+        if _NODE_WAYPOINT_SKIP_STEP_RE.search(step)
     ]
     require(
         len(skip_steps) == 1,
@@ -899,7 +965,7 @@ def check_aggregate_planner_contract(
     skip_steps = [
         step
         for step in job_steps(aggregate_body)
-        if re.search(r"(?m)^      - name: Skip", step)
+        if _SKIP_STEP_NAME_RE.search(step)
     ]
     require(
         len(skip_steps) == 1,
@@ -1031,34 +1097,32 @@ def extract_job(workflow: str, job: str) -> str:
 
 
 def job_needs_list(job_body: str) -> set[str]:
-    list_match = re.search(
-        r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", job_body
-    )
+    list_match = _JOB_NEEDS_LIST_RE.search(job_body)
     if list_match:
         return {
             line.strip().removeprefix("- ").strip()
             for line in list_match.group("needs").splitlines()
             if line.strip().startswith("- ")
         }
-    scalar_match = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
+    scalar_match = _JOB_NEEDS_SCALAR_RE.search(job_body)
     if scalar_match:
         return {scalar_match.group(1)}
     return set()
 
 
 def job_steps(job_body: str) -> list[str]:
-    match = re.search(r"(?ms)^    steps:\n(.*)\Z", job_body)
+    match = _JOB_STEPS_RE.search(job_body)
     if match is None:
         return []
-    chunks = re.split(r"(?m)^(?=      - )", match.group(1))
+    chunks = _STEP_BOUNDARY_RE.split(match.group(1))
     return [chunk for chunk in chunks if chunk.lstrip().startswith("- ")]
 
 
 def step_if(step: str) -> str:
-    match = re.search(r"(?m)^      (?:- )?if:\s*(.+)\s*$", step)
+    match = _STEP_IF_RE.search(step)
     if match:
         return match.group(1).strip()
-    match = re.search(r"(?m)^        if:\s*(.+)\s*$", step)
+    match = _STEP_NESTED_IF_RE.search(step)
     if match:
         return match.group(1).strip()
     return ""
@@ -1081,10 +1145,7 @@ def step_run_ends_with_exit(step: str, code: int) -> bool:
     if re.search(rf"(?m)^        run:[ \t]+{re.escape(expected)}[ \t]*$", step):
         return True
 
-    block = re.search(
-        r"(?ms)^        run:[ \t]+\|[-+]?[ \t]*\n(?P<body>.*)\Z",
-        step,
-    )
+    block = _STEP_RUN_BLOCK_BODY_RE.search(step)
     if block is None:
         return False
     commands = [
@@ -1094,21 +1155,21 @@ def step_run_ends_with_exit(step: str, code: int) -> bool:
     ]
     if not commands:
         return False
-    exits = [line for line in commands if re.fullmatch(r"exit\s+\d+", line)]
+    exits = [line for line in commands if _EXIT_COMMAND_RE.fullmatch(line)]
     return exits == [expected] and commands[-1] == expected
 
 
 def step_uses(step: str) -> str:
-    match = re.search(r"(?m)^      (?:- )?uses:\s*(\S+)", step)
+    match = _STEP_USES_RE.search(step)
     if match is None:
-        match = re.search(r"(?m)^        uses:\s*(\S+)", step)
+        match = _STEP_NESTED_USES_RE.search(step)
     if match is None:
         return ""
     return _yaml_strip_trailing_comment(match.group(1)).strip()
 
 
 def step_with(step: str) -> str:
-    match = re.search(r"(?m)^        with:\n", step)
+    match = _STEP_WITH_RE.search(step)
     if match is None:
         return ""
     lines: list[str] = []
@@ -1130,13 +1191,10 @@ def with_has_key(with_block: str, key: str) -> bool:
 
 def rust_cache_with_blocks(text: str) -> list[str]:
     blocks: list[str] = []
-    for chunk in re.split(r"(?m)^(?=[ ]{2,}- )", text):
-        if RUST_CACHE not in chunk or not re.search(r"(?m)^[ ]{2,}- ", chunk):
+    for chunk in _LIST_ITEM_BOUNDARY_RE.split(text):
+        if RUST_CACHE not in chunk or not _LIST_ITEM_RE.search(chunk):
             continue
-        with_match = re.search(
-            r"(?ms)^[ \t]+with:\n((?:[ \t]+[^\n]*\n)*)",
-            chunk,
-        )
+        with_match = _WITH_BLOCK_RE.search(chunk)
         blocks.append(with_match.group(1) if with_match else "")
     return blocks
 
@@ -1172,10 +1230,7 @@ def check_rust_cache_uses_shared_key_only(
         failures,
     )
     require(
-        re.search(
-            r"(?m)^[ \t]*add-rust-environment-hash-key:\s*['\"]?false",
-            with_block,
-        )
+        _RUST_ENVIRONMENT_HASH_KEY_FALSE_RE.search(with_block)
         is None,
         f"{source} must preserve automatic rust environment/manifest/lock hashing",
         failures,
@@ -1602,7 +1657,7 @@ def _collect_flow_mapping_pairs(flow: str) -> tuple[list[tuple[str, str]], list[
         if item.startswith("?"):
             errors.append("explicit YAML key")
             continue
-        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        match = _FLOW_KEY_VALUE_RE.match(item)
         if match is None:
             errors.append("unreadable flow mapping entry")
             continue
@@ -1649,7 +1704,7 @@ def _collect_flow_sequence(flow: str) -> tuple[list[tuple[str, str]], list[str]]
             pairs.extend(nested)
             errors.extend(nested_errors)
             continue
-        match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+        match = _FLOW_KEY_VALUE_RE.match(item)
         if match is not None:
             pairs.append((match.group(1), match.group(2)))
             _collect_nested_flow_value(match.group(2).strip(), pairs, errors)
@@ -1690,7 +1745,7 @@ def _scan_structural_text(
             pairs, flow_errors = _collect_flow_sequence(flow_text)
         _record_flow_pairs(pairs, flow_errors, uses, using, errors)
         return
-    match = re.match(rf"^({YAML_KEY_TOKEN})[ \t]*:(.*)$", item, re.DOTALL)
+    match = _FLOW_KEY_VALUE_RE.match(item)
     if match is None:
         errors.append("unreadable YAML structure")
         return
@@ -1713,7 +1768,7 @@ def _is_plain_sequence_scalar(item: str) -> bool:
     had_props, remainder = _leading_yaml_node_properties(text)
     if had_props or remainder[:1] in {"{", "[", "?"}:
         return False
-    return re.match(rf"^(?:{YAML_KEY_TOKEN})[ \t]*:", remainder, re.DOTALL) is None
+    return _FLOW_KEY_PREFIX_RE.match(remainder) is None
 
 
 def _yaml_mapping_key_indent(parsed: re.Match[str]) -> int:
@@ -2431,16 +2486,10 @@ def check_performance_cache_wrapper_key(
     )
     if not job:
         return
-    job_env_match = re.search(
-        r"(?ms)^    env:\s*\n(?P<body>(?:^      [^\n]*\n)*)",
-        job,
-    )
+    job_env_match = _JOB_ENV_BLOCK_RE.search(job)
     job_env = job_env_match.group("body") if job_env_match is not None else ""
     require(
-        re.search(
-            r"(?m)^      (?:RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER):",
-            job_env,
-        )
+        _JOB_ENV_RUSTC_WRAPPER_RE.search(job_env)
         is None,
         f"{source} performance-regression must not clear the rustc wrapper at "
         "job scope; benchmark builds need the verified sccache wrapper",
@@ -2461,12 +2510,7 @@ def check_performance_cache_wrapper_key(
         return
     setup_index, setup = setup_steps[0]
     require(
-        re.search(
-            r'(?m)^        env:\s*\n'
-            r'          RUSTC_WRAPPER: ["\']{2}\s*\n'
-            r'          CARGO_BUILD_RUSTC_WRAPPER: ["\']{2}\s*$',
-            setup,
-        )
+        _STEP_EMPTY_RUSTC_WRAPPER_ENV_RE.search(setup)
         is not None,
         f"{source} performance setup-rust-ci step must clear RUSTC_WRAPPER and "
         "CARGO_BUILD_RUSTC_WRAPPER only for the nested rust-cache key calculation",
@@ -2474,7 +2518,7 @@ def check_performance_cache_wrapper_key(
     )
     with_block = step_with(setup)
     require(
-        re.search(r'(?m)^          shared-key: ["\']ci-perf["\']\s*$', with_block)
+        _CI_PERF_SHARED_KEY_RE.search(with_block)
         is not None
         and "tests/performance/mesh -> target" in with_block,
         f"{source} performance setup-rust-ci step must retain the ci-perf shared "
@@ -3434,7 +3478,7 @@ def check_direct_rust_cache_diet(
     blocks = rust_cache_with_blocks(job)
     require(len(blocks) == 1, f"{source} must keep one pinned rust-cache site", failures)
     for block in blocks:
-        saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
+        saves = _SAVE_IF_RE.findall(block)
         require(
             [value.strip() for value in saves]
             in (
@@ -3446,7 +3490,7 @@ def check_direct_rust_cache_diet(
         )
         if compiler_only:
             require(
-                re.findall(r"(?m)^\s*cache-targets:([^\n]*)$", block) == [' "false"'],
+                _CACHE_TARGETS_RE.findall(block) == [' "false"'],
                 f"{source} must not archive the unused root target",
                 failures,
             )
@@ -3666,7 +3710,7 @@ def check_ambient_image_cache_budget(
     )
     steps_by_name: dict[str, str] = {}
     for step in job_steps(job_body):
-        match = re.search(r"(?m)^      - name: (.+)$", step)
+        match = _STEP_NAME_RE.search(step)
         if match:
             steps_by_name[match.group(1).strip()] = step
     build_steps = [
@@ -3981,11 +4025,7 @@ def builder_arg_features_is_after_apt(dockerfile: str) -> bool:
     # The base is digest-pinned (`rust:<tag>@sha256:...`), so match the stage
     # rather than one literal reference; a pin refresh must not silently turn
     # this contract into a no-op by failing to find its marker.
-    match = re.search(
-        r"^FROM rust(?::[^\s@]+)?(?:@sha256:[0-9a-f]{64})? AS builder$",
-        dockerfile,
-        re.M,
-    )
+    match = _RUST_BUILDER_STAGE_RE.search(dockerfile)
     if match is None:
         return False
     rest = dockerfile[match.end() :]
@@ -4006,7 +4046,7 @@ def ferrum_log_level_assignments(dockerfile: str) -> list[str]:
     the assignment token itself rather than a line that starts with `ENV`.
     """
 
-    return re.findall(r"\bFERRUM_LOG_LEVEL=([^\s\\]+)", dockerfile)
+    return _FERRUM_LOG_LEVEL_ASSIGNMENT_RE.findall(dockerfile)
 
 
 def check_dockerfile_log_level(
@@ -4054,7 +4094,7 @@ def _arg_value_looks_like_image(value: str) -> bool:
         return False
     if "/" in value:
         return True
-    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*:[^\s]+", value) is not None
+    return _IMAGE_REFERENCE_LIKE_RE.fullmatch(value) is not None
 
 
 def dockerfile_image_references(dockerfile: str) -> list[tuple[int, str, str]]:
@@ -4220,7 +4260,7 @@ def named_step(steps: list[str], name: str) -> str | None:
 def step_run_block_commands(step: str) -> list[str]:
     """Return a literal `run: |` block's non-empty, non-comment lines, stripped."""
 
-    match = re.search(r"(?m)^        run:[ \t]+\|[ \t]*\n", step)
+    match = _STEP_RUN_BLOCK_START_RE.search(step)
     if match is None:
         return []
     commands: list[str] = []
@@ -4244,7 +4284,7 @@ def base_image_refresh_rotation_errors(workflow: str) -> list[str]:
         errors.append("the refresh must not hold any image back from rotation")
     steps = job_steps(job)
     resolve = named_step(steps, "Resolve current digests")
-    if resolve is None or not re.search(r"(?m)^        id: resolve$", resolve):
+    if resolve is None or not _RESOLVE_STEP_ID_RE.search(resolve):
         return [*errors, "missing one `Resolve current digests` step with `id: resolve`"]
     commands = step_run_block_commands(resolve)
     index = -1
@@ -4285,7 +4325,7 @@ def workflow_permissions_are_read_only(text: str) -> bool:
             break
         if not line:
             continue
-        match = re.fullmatch(r"  ([a-z][a-z-]*): (read|write|none)", line)
+        match = _PERMISSION_ENTRY_RE.fullmatch(line)
         if match is None:
             return False
         name, access = match.groups()
@@ -4325,12 +4365,12 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(r"(?m)^    name: FIPS Feature Policy$", workflow) is not None,
+        _FIPS_FEATURE_POLICY_NAME_RE.search(workflow) is not None,
         "FIPS Feature Policy job name must be preserved",
         failures,
     )
     require(
-        re.search(r"(?m)^    name: FIPS Build & Test$", workflow) is not None,
+        _FIPS_BUILD_AND_TEST_NAME_RE.search(workflow) is not None,
         "FIPS Build & Test required-check name must be preserved",
         failures,
     )
@@ -4488,10 +4528,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(
-            r"cargo test[^\n]*tls::fips_policy_tests[^\n]+tls::fips_key_admission_tests",
-            workflow,
-        )
+        _FIPS_POLICY_TESTS_COMMAND_RE.search(workflow)
         is None,
         "FIPS unit tests must not pass two Cargo TESTNAME filters to one invocation",
         failures,
@@ -4512,11 +4549,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(
-            r"cargo test[^\n]*frontend_and_backend_builders_complete_a_real_tls_handshake"
-            r"[^\n]+legitimate_data_plane_connects_once_a_permit_is_released",
-            workflow,
-        )
+        _FIPS_HANDSHAKE_TESTS_COMMAND_RE.search(workflow)
         is None,
         "FIPS handshake tests must not pass two Cargo TESTNAME filters to one invocation",
         failures,
@@ -4619,7 +4652,7 @@ def check_fips(workflow: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        _JOB_IF_ALWAYS_RE.search(aggregate) is not None,
         "FIPS Build & Test aggregate must run with if: always()",
         failures,
     )
@@ -4771,7 +4804,7 @@ def check_node_default_registry_jobs(workflow: str, failures: list[str]) -> None
 
 def check_production_smoke(workflow: str, failures: list[str]) -> None:
     require(
-        re.search(r"(?m)^    name: Production Dockerfile eBPF image smoke$", workflow)
+        _PRODUCTION_SMOKE_NAME_RE.search(workflow)
         is not None,
         "Production Dockerfile eBPF image smoke check name must be preserved",
         failures,
@@ -4838,7 +4871,7 @@ def check_production_smoke(workflow: str, failures: list[str]) -> None:
             failures,
         )
     require(
-        re.search(r"(?m)^    if: always\(\)$", aggregate) is not None,
+        _JOB_IF_ALWAYS_RE.search(aggregate) is not None,
         "production-image aggregate must run with if: always()",
         failures,
     )
@@ -4888,7 +4921,7 @@ def check_completed_rust_cache_save(action: str, failures: list[str]) -> None:
     blocks = rust_cache_with_blocks(action)
     require(len(blocks) == 1, "setup-rust-ci must have one Rust cache step", failures)
     for block in blocks:
-        values = re.findall(r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", block)
+        values = _CACHE_ON_FAILURE_RE.findall(block)
         require(
             values == [COMPLETED_CACHE_ON_FAILURE],
             "setup-rust-ci must publish Rust caches only from a lane producer, "
@@ -4909,9 +4942,7 @@ def check_completed_cache_producer(job: str, source: str, failures: list[str]) -
         failures,
     )
     for step in steps:
-        values = re.findall(
-            r"(?m)^[ \t]+cache-on-failure:[ \t]*(.*)$", step_with(step)
-        )
+        values = _CACHE_ON_FAILURE_RE.findall(step_with(step))
         require(
             values == ['"false"'],
             f"{source} must save shared Rust caches only after job success",
@@ -5282,10 +5313,7 @@ def check_docs_and_coverage(failures: list[str]) -> None:
     )
     lib_unit = coverage
     require(
-        re.search(
-            r"cargo llvm-cov --no-report\s+\\\s*\n\s*--lib\s+\\\s*\n\s*--test unit_tests",
-            lib_unit,
-        )
+        _COVERAGE_UNIT_TESTS_COMMAND_RE.search(lib_unit)
         is not None,
         "coverage lib-unit must compile lib and unit_tests in one llvm-cov invocation",
         failures,
@@ -6868,10 +6896,7 @@ def self_test() -> int:
     # The root `description:` key at column zero plus every line of its block
     # body (indented, or blank). Nothing else in the file is exempt, so every
     # occurrence of the token has to fall inside this span.
-    root_description_block = re.search(
-        r"(?m)^description:[^\n]*\n(?:(?:[ \t]+[^\n]*)?\n)*",
-        real_sccache,
-    )
+    root_description_block = _ROOT_DESCRIPTION_BLOCK_RE.search(real_sccache)
     root_description_hits = (
         0
         if root_description_block is None

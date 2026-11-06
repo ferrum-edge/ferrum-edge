@@ -95,6 +95,13 @@ PY_BENCH_SWALLOWED = re.compile(
     r"[^\n]*\|\|\s*true"
 )
 
+_PERFORMANCE_REGRESSION_JOB_RE = re.compile(
+    r"(?ms)^  performance-regression:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+)
+_WRITE_PERMISSION_RE = re.compile(r"^\s+[A-Za-z_-]+:\s*write\s*$", re.MULTILINE)
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
+_LOCAL_ACTION_USES_RE = re.compile(r"uses:\s*(\./\.github/actions/[^\s]+)")
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -174,13 +181,14 @@ def mapping_keys(block: str, indent: int) -> list[str]:
     """Return top-level keys in a YAML mapping at `indent` spaces."""
 
     prefix = " " * indent
+    key_re = re.compile(rf"^{re.escape(prefix)}([A-Za-z0-9_-]+):")
     keys: list[str] = []
     for line in block.splitlines():
         if not line.startswith(prefix):
             continue
         if len(line) > indent and line[indent] == " ":
             continue
-        match = re.match(rf"^{re.escape(prefix)}([A-Za-z0-9_-]+):", line)
+        match = key_re.match(line)
         if match:
             keys.append(match.group(1))
     return keys
@@ -294,10 +302,7 @@ def validate_setup_rust_ci_workspaces(text: str, failures: list[str]) -> None:
 def validate_performance_regression_workspaces(text: str, failures: list[str]) -> None:
     """Perf job must cache root plus tests/performance/mesh without extra workspaces."""
 
-    performance_job = re.search(
-        r"(?ms)^  performance-regression:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-        text,
-    )
+    performance_job = _PERFORMANCE_REGRESSION_JOB_RE.search(text)
     require(
         performance_job is not None,
         "performance-regression.yml must contain the performance-regression job",
@@ -391,7 +396,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
     require("actions: read" in text, "workflow must use actions: read", failures)
     require(
         "write-all" not in text
-        and not re.search(r"^\s+[A-Za-z_-]+:\s*write\s*$", text, re.MULTILINE),
+        and not _WRITE_PERMISSION_RE.search(text),
         "benchmark workflow must not request write permissions",
         failures,
     )
@@ -408,12 +413,12 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
     for match in external:
         ref = match.group("ref")
         require(
-            bool(re.fullmatch(r"[0-9a-f]{40}", ref, flags=re.IGNORECASE)),
+            bool(_COMMIT_SHA_RE.fullmatch(ref)),
             f"mutable external action ref forbidden: {match.group('action')}@{ref}",
             failures,
         )
 
-    local_uses = re.findall(r"uses:\s*(\./\.github/actions/[^\s]+)", text)
+    local_uses = _LOCAL_ACTION_USES_RE.findall(text)
     for action in local_uses:
         require(
             action in APPROVED_SETUP,
@@ -577,10 +582,7 @@ def validate_scenarios_contract(text: str, failures: list[str]) -> None:
 
 def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
     """Required PR CI must run lightweight protocol-perf validators without benches."""
-    performance_job = re.search(
-        r"(?ms)^  performance-regression:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-        text,
-    )
+    performance_job = _PERFORMANCE_REGRESSION_JOB_RE.search(text)
     require(
         performance_job is not None,
         "performance-regression.yml must contain the performance-regression job",

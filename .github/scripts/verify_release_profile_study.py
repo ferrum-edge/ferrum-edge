@@ -34,6 +34,8 @@ EXPECTED = [
     ("UDP+DTLS", "127.0.0.1:3006"),
 ]
 
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
 
 def extract(raw):
     decoder = json.JSONDecoder()
@@ -68,7 +70,7 @@ def validate(records):
 
 def digest(path):
     value = path.read_text().split()[0]
-    if not re.fullmatch(r"[0-9a-f]{64}", value):
+    if not _SHA256_HEX_RE.fullmatch(value):
         raise ValueError(f"invalid binary digest: {path}")
     return value
 

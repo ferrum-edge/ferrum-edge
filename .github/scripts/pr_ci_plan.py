@@ -69,6 +69,8 @@ ACTION_DIRECT_K8S_TOOL_DOWNLOAD = re.compile(
 )
 ACTION_DISALLOWED_HELM = re.compile(r"^azure/setup-helm(?:@|$)", re.IGNORECASE)
 
+_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
+
 
 def normalize_action_uses_ref(raw: str) -> str:
     ref = raw.strip()
@@ -268,7 +270,7 @@ def scan_action_policy_text(
     non_comment_text = "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
-    continued = re.sub(r"\\\r?\n[ \t]*", "", non_comment_text)
+    continued = _LINE_CONTINUATION_RE.sub("", non_comment_text)
     if not pipe_found and ACTION_PIPE_TO_SHELL.search(continued):
         failures.append(f"{rel}: continued pipe-to-shell installer is forbidden")
     if not mutable_helm_found and ACTION_MUTABLE_HELM_INSTALL.search(continued):

@@ -53,6 +53,11 @@ REQUIRED_LATEST_RUN_SELF_TESTS = (
 )
 PUBLISHER_QUEUE_MODE = "queue: max"
 
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:")
+_JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+_COMMENT_RE = re.compile(r"#.*")
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -75,9 +80,9 @@ def job_blocks(workflow: str) -> dict[str, str]:
     current: str | None = None
     body: list[str] = []
     for line in lines[start + 1 :]:
-        if re.match(r"^[A-Za-z0-9_-]+:", line):
+        if _TOP_LEVEL_KEY_RE.match(line):
             break
-        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        match = _JOB_KEY_RE.match(line)
         if match:
             if current is not None:
                 blocks[current] = "".join(body)
@@ -136,7 +141,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     for name in REQUIRED_CHECK_NAMES:
-        live = re.sub(r"#.*", "", text)
+        live = _COMMENT_RE.sub("", text)
         require(
             name not in live,
             f"scaling workflow must not mention required check name {name}",
@@ -190,7 +195,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
     for match in EXTERNAL_ACTION.finditer(text):
         ref = match.group("ref")
         require(
-            bool(re.fullmatch(r"[0-9a-f]{40}", ref, flags=re.IGNORECASE)),
+            bool(_COMMIT_SHA_RE.fullmatch(ref)),
             f"mutable external action ref forbidden: {match.group('action')}@{ref}",
             failures,
         )
@@ -238,7 +243,7 @@ def validate_freshness_text(text: str, failures: list[str]) -> None:
         "freshness workflow must not reference the advisory token",
         failures,
     )
-    live = re.sub(r"#.*", "", text)
+    live = _COMMENT_RE.sub("", text)
     for name in REQUIRED_CHECK_NAMES:
         require(
             name not in live,
@@ -248,7 +253,7 @@ def validate_freshness_text(text: str, failures: list[str]) -> None:
     for match in EXTERNAL_ACTION.finditer(text):
         ref = match.group("ref")
         require(
-            bool(re.fullmatch(r"[0-9a-f]{40}", ref, flags=re.IGNORECASE)),
+            bool(_COMMIT_SHA_RE.fullmatch(ref)),
             f"mutable external action ref forbidden: {match.group('action')}@{ref}",
             failures,
         )

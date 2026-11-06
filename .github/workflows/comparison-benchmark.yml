@@ -223,24 +223,28 @@ jobs:
           CONNECTIONS = os.environ["INPUT_CONNECTIONS"]
           SKIP_GATEWAYS = os.environ["INPUT_SKIP_GATEWAYS"]
 
+          RPS_RE = re.compile(r"Requests/sec:\s+([\d.]+)")
+          TRANSFER_RE = re.compile(r"Transfer/sec:\s+([\d.]+[KMGT]?B)")
+          LATENCY_RE = re.compile(r"Latency\s+([\d.]+[munμ]?s)")
+          COMPARISON_BLOCK_RE = re.compile(
+              r"--- Comparison Results ---\n(.*?)--- End Results ---", re.DOTALL
+          )
+
           def parse_wrk_output(file_path):
               """Parse wrk output including the machine-parseable comparison block."""
               with open(file_path, "r") as f:
                   content = f.read()
               metrics = {}
-              rps_match = re.search(r"Requests/sec:\s+([\d.]+)", content)
+              rps_match = RPS_RE.search(content)
               if rps_match:
                   metrics["rps"] = float(rps_match.group(1))
-              transfer_match = re.search(r"Transfer/sec:\s+([\d.]+[KMGT]?B)", content)
+              transfer_match = TRANSFER_RE.search(content)
               if transfer_match:
                   metrics["transfer"] = transfer_match.group(1)
-              latency_match = re.search(r"Latency\s+([\d.]+[munμ]?s)", content)
+              latency_match = LATENCY_RE.search(content)
               if latency_match:
                   metrics["latency_avg_str"] = latency_match.group(1)
-              block = re.search(
-                  r"--- Comparison Results ---\n(.*?)--- End Results ---",
-                  content, re.DOTALL,
-              )
+              block = COMPARISON_BLOCK_RE.search(content)
               if block:
                   for line in block.group(1).strip().splitlines():
                       key, _, value = line.partition(":")

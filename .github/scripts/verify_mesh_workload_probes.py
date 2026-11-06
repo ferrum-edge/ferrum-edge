@@ -23,6 +23,34 @@ DEFAULT_EXPECTATIONS = Path(__file__).with_name(
 
 PROBE_KEYS = ("startupProbe", "livenessProbe", "readinessProbe")
 
+_DOCUMENT_SEPARATOR_RE = re.compile(r"(?m)^---\s*$")
+_LIVE_PROBE_PATH_RE = re.compile(r"(?m)^\s+path:\s*/live\s*$")
+_SCHEMA_OVERRIDE_REJECTION_RE = re.compile(
+    r"override|additional propert|Additional propert",
+    re.IGNORECASE,
+)
+_PORT_19443_ITEM_RE = re.compile(r'(?m)^\s+-\s+"19443"\s*$')
+_ADMIN_HTTP_PORT_ZERO_RE = re.compile(
+    r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "0"\s*$',
+)
+_ADMIN_HTTP_PORT_19090_RE = re.compile(
+    r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "19090"\s*$',
+)
+_PORT_19090_ITEM_RE = re.compile(r'(?m)^\s+-\s+"19090"\s*$')
+_HEALTH_PROBE_COMMAND_RE = re.compile(r"ferrum-edge\"?\s*\n\s*-\s*\"health\"")
+_POD_TEMPLATE_SPEC_RE = re.compile(r"(?ms)^    spec:\n(?P<body>.*?)(?=^  [^ ]|\Z)")
+_AUTOMOUNT_TOKEN_FALSE_RE = re.compile(r"(?m)^automountServiceAccountToken:\s*false\s*$")
+_RBAC_RULES_BLOCK_RE = re.compile(r"(?m)^rules:\n(?P<body>(?:^[ ]+.*\n?|^\n)*)")
+_TOP_LIST_ITEM_RE = re.compile(r"(?m)^  - ")
+_SUBJECTS_BLOCK_RE = re.compile(r"(?m)^subjects:\n(?P<body>(?:^[ ]+.*\n?)*)")
+_SUBJECT_KIND_RE = re.compile(r"(?m)^(?:kind:|    kind:)\s*(\S+)")
+_SUBJECT_NAME_RE = re.compile(r"(?m)^(?:name:|    name:)\s*(\S+)")
+_DOCUMENT_KIND_RE = re.compile(r"(?m)^kind:\s*(\S+)\s*$")
+_ROLE_KIND_RE = re.compile(r"(?m)^kind:\s*Role\s*$")
+_NODE_WAYPOINT_SERVICE_ACCOUNT_CONST_RE = re.compile(
+    r'(?m)^const NODE_WAYPOINT_SERVICE_ACCOUNT: &str = "(?P<name>[^"]+)";$',
+)
+
 
 def fail(title: str, detail: str) -> None:
     print(f"::error title={title}::{detail}")
@@ -50,14 +78,16 @@ def require_capture(results_dir: Path, relative: str) -> Path:
 
 
 def split_documents(rendered: str) -> list[str]:
-    return [doc for doc in re.split(r"(?m)^---\s*$", rendered) if doc.strip()]
+    return [doc for doc in _DOCUMENT_SEPARATOR_RE.split(rendered) if doc.strip()]
 
 
 def resource_document(rendered: str, name: str, kind: str) -> str:
+    kind_re = re.compile(rf"(?m)^kind:\s*{re.escape(kind)}\s*$")
+    name_re = re.compile(rf"(?m)^  name:\s*{re.escape(name)}\s*$")
     for doc in split_documents(rendered):
-        if not re.search(rf"(?m)^kind:\s*{re.escape(kind)}\s*$", doc):
+        if not kind_re.search(doc):
             continue
-        if re.search(rf"(?m)^  name:\s*{re.escape(name)}\s*$", doc):
+        if name_re.search(doc):
             return doc
     fail(
         "Mesh workload missing from render",
@@ -181,22 +211,18 @@ def validate_override(results_dir: Path, expectations: dict) -> None:
     liveness = require_probe(resource, "ferrum-mesh-control-plane", "livenessProbe")
     readiness = require_probe(resource, "ferrum-mesh-control-plane", "readinessProbe")
     startup = require_probe(resource, "ferrum-mesh-control-plane", "startupProbe")
-    if "httpGet:" not in liveness or not re.search(
-        r"(?m)^\s+path:\s*/live\s*$", liveness
-    ):
+    if "httpGet:" not in liveness or not _LIVE_PROBE_PATH_RE.search(liveness):
         fail(
             "Per-probe liveness override missing",
             "controlPlane.probes.liveness.override must replace the liveness handler",
         )
     # Startup shares the liveness handler, so the override reaches startup too.
-    if "httpGet:" not in startup or not re.search(
-        r"(?m)^\s+path:\s*/live\s*$", startup
-    ):
+    if "httpGet:" not in startup or not _LIVE_PROBE_PATH_RE.search(startup):
         fail(
             "Startup did not inherit liveness override",
             "startupProbe must use the overridden liveness handler",
         )
-    if "httpGet:" in readiness or re.search(r"(?m)^\s+path:\s*/live\s*$", readiness):
+    if "httpGet:" in readiness or _LIVE_PROBE_PATH_RE.search(readiness):
         fail(
             "Per-probe override leaked into readiness",
             "liveness.override must not replace the readiness handler",
@@ -219,11 +245,7 @@ def validate_coupled_rejected(results_dir: Path, expectations: dict) -> None:
             "controlPlane.probes.override must fail schema validation",
         )
     # Helm JSON schema wording varies slightly; require a property/additional hint.
-    if not re.search(
-        r"override|additional propert|Additional propert",
-        err_text,
-        re.IGNORECASE,
-    ):
+    if not _SCHEMA_OVERRIDE_REJECTION_RE.search(err_text):
         fail(
             "Coupled override rejection message drift",
             "stderr must mention the rejected shared probes.override shape",
@@ -260,7 +282,7 @@ def validate_node_agent_https_only(results_dir: Path, expectations: dict) -> Non
             "Node-agent HTTPS-only probes missing TLS",
             "HTTPS-only admin must render health --tls --tls-no-verify",
         )
-    if not re.search(r'(?m)^\s+-\s+"19443"\s*$', readiness):
+    if not _PORT_19443_ITEM_RE.search(readiness):
         fail(
             "Node-agent HTTPS-only probe port mismatch",
             "HTTPS-only probes must dial httpsPort 19443, not the disabled HTTP port",
@@ -298,24 +320,18 @@ def validate_node_agent_integer_port0_preserves_https_only(
         results_dir, captures["node_agent_https_only_int_port0"]
     ).read_text(encoding="utf-8")
     resource = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
-    if not re.search(
-        r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "0"\s*$',
-        resource,
-    ):
+    if not _ADMIN_HTTP_PORT_ZERO_RE.search(resource):
         fail(
             "Integer admin.port=0 re-enabled plaintext",
             "Helm --set nodeAgent.admin.port=0 must render FERRUM_ADMIN_HTTP_PORT=0",
         )
-    if re.search(
-        r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "19090"\s*$',
-        resource,
-    ):
+    if _ADMIN_HTTP_PORT_19090_RE.search(resource):
         fail(
             "Integer admin.port=0 fell back to 19090",
             "Sprig default must not treat integer 0 as empty for admin.port",
         )
     readiness = require_probe(resource, "ferrum-mesh-node-agent", "readinessProbe")
-    if "--tls" not in readiness or not re.search(r'(?m)^\s+-\s+"19443"\s*$', readiness):
+    if "--tls" not in readiness or not _PORT_19443_ITEM_RE.search(readiness):
         fail(
             "Integer port=0 HTTPS-only probe regress",
             "integer port=0 HTTPS-only must keep TLS probes on httpsPort",
@@ -349,7 +365,7 @@ def validate_node_agent_dual(results_dir: Path, expectations: dict) -> None:
             "Node-agent dual probes unexpectedly TLS",
             "dual listeners with HTTP enabled should keep plaintext probe scheme",
         )
-    if not re.search(r'(?m)^\s+-\s+"19090"\s*$', readiness):
+    if not _PORT_19090_ITEM_RE.search(readiness):
         fail(
             "Node-agent dual probe port mismatch",
             "dual listeners must probe the HTTP admin port when it is enabled",
@@ -436,7 +452,7 @@ def validate_node_agent_https_mtls_probe_policy(
             "Node-agent HTTPS-only mTLS override missing",
             "safe override must replace every enabled probe (startup/liveness/readiness)",
         )
-    if re.search(r"ferrum-edge\"?\s*\n\s*-\s*\"health\"", overridden) and "--tls" in overridden:
+    if _HEALTH_PROBE_COMMAND_RE.search(overridden) and "--tls" in overridden:
         fail(
             "Node-agent HTTPS-only mTLS override still uses computed TLS health",
             "overrides must replace computed exec probes",
@@ -645,7 +661,7 @@ def validate_service_account_isolation(rendered: str) -> None:
     for component, account in expected_accounts.items():
         kind, workload_name = workloads[component]
         workload = resource_document(rendered, workload_name, kind)
-        pod_spec = re.search(r"(?ms)^    spec:\n(?P<body>.*?)(?=^  [^ ]|\Z)", workload)
+        pod_spec = _POD_TEMPLATE_SPEC_RE.search(workload)
         if pod_spec is None or not re.search(
             rf"(?m)^      serviceAccountName:\s*{re.escape(account)}\s*$",
             pod_spec.group("body"),
@@ -655,8 +671,8 @@ def validate_service_account_isolation(rendered: str) -> None:
                 f"{workload_name} must use {account}",
             )
         service_account = resource_document(rendered, account, "ServiceAccount")
-        if account != "ferrum-mesh-control-plane" and not re.search(
-            r"(?m)^automountServiceAccountToken:\s*false\s*$", service_account
+        if account != "ferrum-mesh-control-plane" and not _AUTOMOUNT_TOKEN_FALSE_RE.search(
+            service_account
         ):
             fail(
                 "Mesh workload token automount enabled",
@@ -671,6 +687,10 @@ CONTROL_PLANE_ACCOUNT = "ferrum-mesh-control-plane"
 AMBIENT_ACCOUNT = "ferrum-mesh-ambient"
 AMBIENT_TLS_SECRET_ROLE = "ferrum-mesh-ambient-tls-secrets-ferrum"
 SECRET_READ_VERBS = {"get", "list", "watch", "*"}
+
+_AMBIENT_SERVICE_ACCOUNT_NAME_RE = re.compile(
+    rf"(?m)^      serviceAccountName: {re.escape(AMBIENT_ACCOUNT)}$",
+)
 
 
 def document_field(doc: str, path: str) -> str | None:
@@ -720,24 +740,24 @@ def yaml_list_field(block: str, key: str) -> list[str] | None:
 
 
 def rbac_rules(doc: str) -> list[str]:
-    match = re.search(r"(?m)^rules:\n(?P<body>(?:^[ ]+.*\n?|^\n)*)", doc)
+    match = _RBAC_RULES_BLOCK_RE.search(doc)
     if match is None:
         return []
     return [
         "  - " + rule
-        for rule in re.split(r"(?m)^  - ", match.group("body"))[1:]
+        for rule in _TOP_LIST_ITEM_RE.split(match.group("body"))[1:]
         if rule.strip()
     ]
 
 
 def binding_subjects(doc: str) -> list[tuple[str, str]]:
-    match = re.search(r"(?m)^subjects:\n(?P<body>(?:^[ ]+.*\n?)*)", doc)
+    match = _SUBJECTS_BLOCK_RE.search(doc)
     if match is None:
         return []
     subjects = []
-    for entry in re.split(r"(?m)^  - ", match.group("body"))[1:]:
-        kind = re.search(r"(?m)^(?:kind:|    kind:)\s*(\S+)", entry)
-        name = re.search(r"(?m)^(?:name:|    name:)\s*(\S+)", entry)
+    for entry in _TOP_LIST_ITEM_RE.split(match.group("body"))[1:]:
+        kind = _SUBJECT_KIND_RE.search(entry)
+        name = _SUBJECT_NAME_RE.search(entry)
         subjects.append(
             (kind.group(1) if kind else "", name.group(1) if name else "")
         )
@@ -779,7 +799,7 @@ def validate_secret_grants(
     documents = split_documents(rendered)
     roles: dict[tuple[str, str, str], list[list[str] | None]] = {}
     for doc in documents:
-        kind = re.search(r"(?m)^kind:\s*(\S+)\s*$", doc)
+        kind = _DOCUMENT_KIND_RE.search(doc)
         if kind is None or kind.group(1) not in {"Role", "ClusterRole"}:
             continue
         name = document_field(doc, "metadata.name") or ""
@@ -792,7 +812,7 @@ def validate_secret_grants(
 
     ambient_grants: dict[str, set[str]] = {}
     for doc in documents:
-        kind = re.search(r"(?m)^kind:\s*(\S+)\s*$", doc)
+        kind = _DOCUMENT_KIND_RE.search(doc)
         if kind is None or kind.group(1) not in {"RoleBinding", "ClusterRoleBinding"}:
             continue
         binding = document_field(doc, "metadata.name") or ""
@@ -852,7 +872,7 @@ def validate_secret_grants(
             f"expected {sorted((ns, sorted(n)) for ns, n in expected.items())}",
         )
     for doc in documents:
-        if not re.search(r"(?m)^kind:\s*Role\s*$", doc):
+        if not _ROLE_KIND_RE.search(doc):
             continue
         if document_field(doc, "metadata.name") != AMBIENT_TLS_SECRET_ROLE:
             continue
@@ -890,9 +910,7 @@ def validate_ambient_tls_secret_refs(results_dir: Path, expectations: dict) -> N
 
 def validate_node_waypoint_service_account_trust() -> None:
     source = (REPO_ROOT / "src/config_sources/k8s/core.rs").read_text(encoding="utf-8")
-    constant = re.search(
-        r'(?m)^const NODE_WAYPOINT_SERVICE_ACCOUNT: &str = "(?P<name>[^"]+)";$', source
-    )
+    constant = _NODE_WAYPOINT_SERVICE_ACCOUNT_CONST_RE.search(source)
     if constant is None or constant.group("name") != AMBIENT_ACCOUNT:
         fail(
             "NodeWaypoint discovery trusts a different identity",
@@ -901,9 +919,7 @@ def validate_node_waypoint_service_account_trust() -> None:
     daemonset = (REPO_ROOT / "charts/ferrum-mesh/templates/ambient-daemonset.yaml").read_text(
         encoding="utf-8"
     )
-    if not re.search(
-        rf"(?m)^      serviceAccountName: {re.escape(AMBIENT_ACCOUNT)}$", daemonset
-    ):
+    if not _AMBIENT_SERVICE_ACCOUNT_NAME_RE.search(daemonset):
         fail(
             "NodeWaypoint discovery trusts a different identity",
             f"the Ambient DaemonSet must run as {AMBIENT_ACCOUNT}",

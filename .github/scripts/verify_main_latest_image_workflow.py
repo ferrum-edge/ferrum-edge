@@ -631,6 +631,18 @@ REGISTRY_RETRY_MESSAGE = (
     "pinned retry_registry_read helper"
 )
 
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:")
+_JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+_PERMISSION_ENTRY_RE = re.compile(r"^      ([a-z-]+):\s*([a-z]+)\s*$")
+_STEP_START_RE = re.compile(r"^      - ")
+_FI_LINE_RE = re.compile(r"^\s*fi\s*$", re.MULTILINE)
+_LINE_CONTINUATION_RE = re.compile(r"\\\n\s*")
+_CONTEXT_INPUT_RE = re.compile(r"^\s+context:", re.MULTILINE)
+_GITHUB_TOKEN_INPUT_RE = re.compile(r"^\s+github-token:", re.MULTILINE)
+_REF_ENV_RE = re.compile(r"^\s+[A-Z0-9_]*_REF:", re.MULTILINE)
+_CONCURRENCY_KEY_RE = re.compile(r"^\s*concurrency:", re.MULTILINE)
+_TAGS_INPUT_RE = re.compile(r"^\s+tags:", re.MULTILINE)
+
 
 def active_text(text: str) -> str:
     """Drop comment-only lines so prose cannot satisfy or trip a check."""
@@ -642,7 +654,8 @@ def active_text(text: str) -> str:
 
 def top_level_block(text: str, key: str) -> tuple[str | None, list[str]]:
     lines = text.splitlines()
-    starts = [index for index, line in enumerate(lines) if re.match(rf"^{re.escape(key)}:", line)]
+    key_re = re.compile(rf"^{re.escape(key)}:")
+    starts = [index for index, line in enumerate(lines) if key_re.match(line)]
     if len(starts) != 1:
         return None, [f"workflow must contain exactly one top-level {key}: block"]
     block = [lines[starts[0]]]
@@ -664,9 +677,9 @@ def job_blocks(text: str) -> dict[str, str]:
     current: str | None = None
     body: list[str] = []
     for line in lines[headers[0] + 1 :]:
-        if re.match(r"^[A-Za-z0-9_-]+:", line):
+        if _TOP_LEVEL_KEY_RE.match(line):
             break
-        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        match = _JOB_KEY_RE.match(line)
         if match:
             if current is not None:
                 blocks[current] = "".join(body)
@@ -694,7 +707,7 @@ def job_permissions(block: str) -> dict[str, str] | None:
         return None
     permissions: dict[str, str] = {}
     for line in lines[starts[0] + 1 :]:
-        match = re.match(r"^      ([a-z-]+):\s*([a-z]+)\s*$", line)
+        match = _PERMISSION_ENTRY_RE.match(line)
         if match is None:
             break
         permissions[match.group(1)] = match.group(2)
@@ -761,7 +774,7 @@ def step_blocks(block: str) -> list[str]:
     steps: list[str] = []
     current: list[str] | None = None
     for line in block.splitlines():
-        if re.match(r"^      - ", line):
+        if _STEP_START_RE.match(line):
             if current is not None:
                 steps.append("\n".join(current))
             current = [line]
@@ -782,7 +795,7 @@ def branch_contains(body: str, compare: str, needle: str) -> bool:
     start = body.find(compare)
     if start < 0:
         return False
-    end = re.search(r"^\s*fi\s*$", body[start:], re.MULTILINE)
+    end = _FI_LINE_RE.search(body[start:])
     if end is None:
         return False
     return needle in body[start : start + end.start()]
@@ -873,7 +886,7 @@ def credential_isolation_errors(job_name: str, block: str) -> list[str]:
 
     failures: list[str] = []
     for body in run_bodies(block):
-        script = re.sub(r"\\\n\s*", " ", active_text(body))
+        script = _LINE_CONTINUATION_RE.sub(" ", active_text(body))
         if REPOSITORY_EXECUTION.search(script):
             failures.append(f"jobs.{job_name} {REPOSITORY_EXECUTION_MESSAGE}")
         for line in script.splitlines():
@@ -966,8 +979,8 @@ def validate_build(block: str) -> list[str]:
     if (
         block.count(BUILD_CONTEXT) != 1
         or block.count(BUILD_GIT_TOKEN) != 1
-        or len(re.findall(r"^\s+context:", block, re.MULTILINE)) != 1
-        or len(re.findall(r"^\s+github-token:", block, re.MULTILINE)) != 1
+        or len(_CONTEXT_INPUT_RE.findall(block)) != 1
+        or len(_GITHUB_TOKEN_INPUT_RE.findall(block)) != 1
     ):
         failures.append(BUILD_CONTEXT_MESSAGE)
     return failures
@@ -1002,7 +1015,7 @@ def validate_syft(steps: list[str]) -> list[str]:
     if len(syft_steps_raw) != 1:
         return [SYFT_MESSAGE]
     step = active_text(syft_steps_raw[0])
-    script = re.sub(r"\\\n\s*", " ", step)
+    script = _LINE_CONTINUATION_RE.sub(" ", step)
     runs = [" ".join(line.split()) for line in script.splitlines() if "docker run" in line]
     if (
         runs != [SYFT_RUN]
@@ -1075,7 +1088,7 @@ def validate_promote(block: str) -> list[str]:
         or block.count("DOCKER_DIGEST:") != 1
         or block.count("GHCR_DIGEST:") != 1
         or block.count("needs.attest.outputs.") != 2
-        or re.search(r"^\s+[A-Z0-9_]*_REF:", block, re.MULTILINE) is not None
+        or _REF_ENV_RE.search(block) is not None
     ):
         failures.append(PROMOTE_INPUT_MESSAGE)
 
@@ -1184,7 +1197,7 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
             failures.append(f"workflow must not contain {needle!r}: {reason}")
     if active.count("cancelled()") != 2:
         failures.append("cancelled() may appear only in the pinned attest and promote conditions")
-    if len(re.findall(r"^\s*concurrency:", active, re.MULTILINE)) != 1:
+    if len(_CONCURRENCY_KEY_RE.findall(active)) != 1:
         failures.append("only the workflow may declare concurrency")
     for python in PYTHON_INVOCATION.finditer(active):
         if python.group("flag") is None:
@@ -1252,7 +1265,7 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
         tags = [
             match.group("tag")
             for body in run_bodies(block)
-            for match in TAG_ARGUMENT.finditer(re.sub(r"\\\n\s*", " ", body))
+            for match in TAG_ARGUMENT.finditer(_LINE_CONTINUATION_RE.sub(" ", body))
         ]
         expected_tags = TAGS_BY_JOB.get(job_name, [])
         if tags != expected_tags:
@@ -1265,7 +1278,7 @@ def validate_workflow(text: str, release_text: str) -> list[str]:
                 f"jobs.{job_name} must run imagetools create exactly "
                 f"{len(expected_tags)} times, found {creates}"
             )
-        if re.search(r"^\s+tags:", job_active, re.MULTILINE):
+        if _TAGS_INPUT_RE.search(job_active):
             failures.append(f"jobs.{job_name} must not tag images through an action input")
         if job_name != "build" and "push-by-digest=true" in job_active:
             failures.append(f"jobs.{job_name} must not push platform images")

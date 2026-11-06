@@ -81,6 +81,15 @@ HBONE_BACKEND_ALLOW_IPS_VALUE = "private"
 HBONE_GATEWAY_EXECUTABLE = "$PROJECT_ROOT/target/release/examples/hbone_perf_fixture"
 HBONE_PRODUCTION_GATEWAY_EXECUTABLE = "./target/release/ferrum-edge"
 
+_ENV_WORD_RE = re.compile(r"\benv\b")
+_HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(?!<)")
+_FORBIDDEN_INTERPRETER_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(awk|bc|gawk|mawk|perl|node|ruby)(?![A-Za-z0-9_.-])",
+)
+_PERFORMANCE_REGRESSION_JOB_RE = re.compile(
+    r"(?ms)^  performance-regression:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -135,7 +144,7 @@ def _logical_shell_lines(text: str) -> list[str]:
 
 def _is_env_gateway_launch(line: str) -> bool:
     """Return whether a logical line launches the HBONE gateway via env."""
-    return HBONE_GATEWAY_EXECUTABLE in line and re.search(r"\benv\b", line) is not None
+    return HBONE_GATEWAY_EXECUTABLE in line and _ENV_WORD_RE.search(line) is not None
 
 
 def _parse_env_assignment(token: str) -> tuple[str, str] | None:
@@ -425,12 +434,12 @@ def check_workflow(text: str, failures: list[str]) -> None:
     # cannot resolve to a literal argument vector. Keep those computations in
     # .github/scripts/ instead of reintroducing them here.
     require(
-        re.search(r"(?<!<)<<(?!<)", text) is None,
+        _HEREDOC_OPERATOR_RE.search(text) is None,
         "no inline heredoc programs in this workflow",
         failures,
     )
     require(
-        not re.search(r"(?<![A-Za-z0-9_-])(awk|bc|gawk|mawk|perl|node|ruby)(?![A-Za-z0-9_.-])", text),
+        not _FORBIDDEN_INTERPRETER_RE.search(text),
         "no inline non-shell interpreters in this workflow",
         failures,
     )
@@ -873,10 +882,7 @@ def check_dns_tcp_stub_and_fail_closed(
 
 def check_pr_ci_wiring(failures: list[str]) -> None:
     ci = CI_YML.read_text(encoding="utf-8")
-    match = re.search(
-        r"(?ms)^  performance-regression:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-        ci,
-    )
+    match = _PERFORMANCE_REGRESSION_JOB_RE.search(ci)
     body = match.group("body") if match else ""
     require(
         bool(body),

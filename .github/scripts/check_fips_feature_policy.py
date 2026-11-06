@@ -228,6 +228,11 @@ FORBIDDEN_PRODUCTION_CRATE_PATTERNS = (
     re.compile(r"\bhmac::Hmac\b"),
 )
 
+_QUOTED_STRING_RE = re.compile(r'"([^"]+)"')
+_DEPENDENCIES_TABLE_RE = re.compile(r"^\[dependencies\]\s*$\n(.*?)(?=^\[)", re.M | re.S)
+_FEATURES_TABLE_RE = re.compile(r"^\[features\]\s*$\n(.*?)(?=^\[)", re.M | re.S)
+_FEATURE_NAME_RE = re.compile(r"^([A-Za-z0-9_-]+) = \[", re.M)
+
 
 def read_manifest() -> str:
     return MANIFEST.read_text(encoding="utf-8")
@@ -243,7 +248,7 @@ def feature_list(manifest: str, name: str) -> list[str]:
         match = re.search(rf"^{re.escape(name)} = \[(.*?)^\]", manifest, re.M | re.S)
     if match is None:
         return []
-    return re.findall(r'"([^"]+)"', match.group(1))
+    return _QUOTED_STRING_RE.findall(match.group(1))
 
 
 def dependency_line(manifest: str, name: str) -> str | None:
@@ -330,7 +335,7 @@ def check_manifest() -> list[str]:
         if line is None:
             failures.append(f"dependency {dep!r} is not declared on its own line in Cargo.toml")
             continue
-        inline = set(re.findall(r'"([^"]+)"', line))
+        inline = set(_QUOTED_STRING_RE.findall(line))
         for feature in forbidden:
             if feature in inline:
                 failures.append(
@@ -343,7 +348,7 @@ def check_manifest() -> list[str]:
         if line is None:
             failures.append(f"dependency {dep!r} is not declared on its own line in Cargo.toml")
             continue
-        inline = set(re.findall(r'"([^"]+)"', line))
+        inline = set(_QUOTED_STRING_RE.findall(line))
         for feature in required:
             if feature not in inline:
                 failures.append(
@@ -368,9 +373,7 @@ def check_manifest() -> list[str]:
                 "default feature set selects a cryptographic backend"
             )
 
-    dependency_table = re.search(
-        r"^\[dependencies\]\s*$\n(.*?)(?=^\[)", manifest, re.M | re.S
-    )
+    dependency_table = _DEPENDENCIES_TABLE_RE.search(manifest)
     if dependency_table is None:
         failures.append("Cargo.toml has no `[dependencies]` table")
     else:
@@ -478,11 +481,11 @@ def check_claimed_profiles_declared() -> list[str]:
     """
 
     manifest = read_manifest()
-    table = re.search(r"^\[features\]\s*$\n(.*?)(?=^\[)", manifest, re.M | re.S)
+    table = _FEATURES_TABLE_RE.search(manifest)
     if table is None:
         return ["Cargo.toml has no `[features]` table"]
 
-    declared = set(re.findall(r"^([A-Za-z0-9_-]+) = \[", table.group(1), re.M))
+    declared = set(_FEATURE_NAME_RE.findall(table.group(1)))
     # `default` is the profile selector; `crypto-ring`/`fips` are the backends
     # themselves; `fuzzing` compiles no cryptography and is never shipped;
     # `cloud-secrets` is the umbrella over the individual `secrets-*` features.

@@ -24,13 +24,20 @@ PHASES = (
 )
 COMPILERS = {"cargo", "rustc", "sccache", "cc", "gcc", "clang", "clang++", "ld", "ld.lld", "rust-lld", "collect2"}
 
+_PROC_STATUS_MEMORY_RE = re.compile(r"^(VmRSS|VmSwap):\s+(\d+) kB$", re.MULTILINE)
+_IDENTIFIER_BYTES_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
+_MEMINFO_AVAILABLE_RE = re.compile(r"^(MemAvailable|SwapFree):\s+(\d+) kB$", re.MULTILINE)
+_PASSED_TEST_LINE_RE = re.compile(r"^test (\S+) \.\.\. ok$", re.MULTILINE)
+_TIME_USAGE_RE = re.compile(
+    r"wall_seconds=([0-9]+(?:\.[0-9]+)?) max_child_rss_kib=([0-9]+) "
+    r"major_faults=([0-9]+) minor_faults=([0-9]+) exit_status=0\n?"
+)
+
 
 def proc_metrics(stat: str, status: str) -> dict[str, int]:
     """Parse procfs without assuming the parenthesized comm has no spaces."""
     fields = stat[stat.rindex(")") + 2:].split()
-    sizes = {name: int(value) for name, value in re.findall(
-        r"^(VmRSS|VmSwap):\s+(\d+) kB$", status, re.MULTILINE,
-    )}
+    sizes = {name: int(value) for name, value in _PROC_STATUS_MEMORY_RE.findall(status)}
     return {
         "start_ticks": int(fields[19]),
         "minor_faults": int(fields[7]), "major_faults": int(fields[9]),
@@ -47,7 +54,7 @@ def compiler_identity(comm: str, command: bytes) -> dict[str, object]:
         args = command.split(b"\0")
         result["test_harness"] = b"--test" in args
         for index, arg in enumerate(args[:-1]):
-            if arg == b"--crate-name" and re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", args[index + 1]):
+            if arg == b"--crate-name" and _IDENTIFIER_BYTES_RE.fullmatch(args[index + 1]):
                 result["crate"] = args[index + 1].decode("ascii")
                 break
     return result
@@ -89,8 +96,7 @@ def sample_compile(phase: str, parent: int) -> None:
                 except (OSError, ValueError, IndexError):
                     vanished += 1
             vm = dict(line.split() for line in Path("/proc/vmstat").read_text().splitlines())
-            memory = dict(re.findall(r"^(MemAvailable|SwapFree):\s+(\d+) kB$",
-                                     Path("/proc/meminfo").read_text(), re.MULTILINE))
+            memory = dict(_MEMINFO_AVAILABLE_RE.findall(Path("/proc/meminfo").read_text()))
             rss = sum(p["rss_kib"] for p in processes)
             swap = sum(p["swap_kib"] for p in processes)
             peak_rss, peak_swap = max(peak_rss, rss), max(peak_swap, swap)
@@ -208,7 +214,7 @@ def validate_output(phase: str, output: str) -> str:
         raise ValueError(f"{phase}: required selection contains ignored tests")
     if phase in {"default-lib", "default-unit", "acme-dns"} and filtered:
         raise ValueError(f"{phase}: complete target must not filter tests")
-    passed_names = set(re.findall(r"^test (\S+) \.\.\. ok$", output, re.MULTILINE))
+    passed_names = set(_PASSED_TEST_LINE_RE.findall(output))
     missing = REQUIRED_TESTS.get(phase, set()) - passed_names
     if missing:
         raise ValueError(f"{phase}: required tests did not pass: {', '.join(sorted(missing))}")
@@ -220,11 +226,7 @@ def validate_output(phase: str, output: str) -> str:
 
 def validate_usage(phase: str, usage: str) -> str:
     """Require complete GNU time telemetry and a successful child exit."""
-    match = re.fullmatch(
-        r"wall_seconds=([0-9]+(?:\.[0-9]+)?) max_child_rss_kib=([0-9]+) "
-        r"major_faults=([0-9]+) minor_faults=([0-9]+) exit_status=0\n?",
-        usage,
-    )
+    match = _TIME_USAGE_RE.fullmatch(usage)
     if match is None:
         raise ValueError(f"{phase}: missing/invalid timing or unsuccessful command")
     return (f"Wall time (including Cargo): {match[1]}s; maximum child RSS: {match[2]} KiB; "

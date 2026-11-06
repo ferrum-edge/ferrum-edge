@@ -36,6 +36,17 @@ BINARY_MODES = (
     "migrate",
 )
 
+_JOB_KIND_RE = re.compile(r"(?m)^kind:\s*Job\s*$")
+_FERRUM_MODE_ENV_RE = re.compile(r"(?m)^\s*- name: FERRUM_MODE\s*$")
+_MIGRATE_VALUE_RE = re.compile(r"(?m)^\s+value:\s*migrate\s*$")
+_MIGRATE_DRY_RUN_ENV_RE = re.compile(r"(?m)^\s*- name: FERRUM_MIGRATE_DRY_RUN\s*$")
+_WORK_EMPTYDIR_VOLUME_RE = re.compile(r"(?m)^\s*- name:\s*work\s*$\n\s+emptyDir:")
+_MESH_CHART_POINTER_RE = re.compile(
+    r"migrate.*pointer to the right chart|migrate.*ferrum-mesh chart",
+    re.IGNORECASE,
+)
+_MESH_CHART_HOME_RE = re.compile(r"live in the ferrum-mesh", re.IGNORECASE)
+
 
 def fail(title: str, detail: str) -> None:
     print(f"::error title={title}::{detail}")
@@ -46,18 +57,16 @@ def validate_migrate_examples(root: Path) -> None:
     examples_dir = root / "charts" / "ferrum-gateway" / "examples"
     for name, expect in MIGRATE_EXAMPLES.items():
         text = (examples_dir / name).read_text(encoding="utf-8")
-        if not re.search(r"(?m)^kind:\s*Job\s*$", text):
+        if not _JOB_KIND_RE.search(text):
             fail("Migrate example not a Job", f"{name} must be kind: Job")
-        if not re.search(r"(?m)^\s*- name: FERRUM_MODE\s*$", text) or not re.search(
-            r"(?m)^\s+value:\s*migrate\s*$", text
-        ):
+        if not _FERRUM_MODE_ENV_RE.search(text) or not _MIGRATE_VALUE_RE.search(text):
             fail("Migrate example missing FERRUM_MODE", name)
         if not re.search(
             rf"(?m)^\s*- name: FERRUM_MIGRATE_ACTION\s*$\n\s+value:\s*{re.escape(expect['action'])}\s*$",
             text,
         ):
             fail("Migrate example wrong action", name)
-        has_dry = bool(re.search(r"(?m)^\s*- name: FERRUM_MIGRATE_DRY_RUN\s*$", text))
+        has_dry = bool(_MIGRATE_DRY_RUN_ENV_RE.search(text))
         if has_dry != expect["dry_run"]:
             fail("Migrate example dry-run mismatch", name)
         if "runAsNonRoot: true" not in text or "runAsUser: 65532" not in text:
@@ -71,7 +80,7 @@ def validate_migrate_examples(root: Path) -> None:
                     "config migration must use the documented writable PVC",
                 )
             if (
-                re.search(r"(?m)^\s*- name:\s*work\s*$\n\s+emptyDir:", text)
+                _WORK_EMPTYDIR_VOLUME_RE.search(text)
                 or "busybox:" in text
             ):
                 fail(
@@ -101,10 +110,7 @@ def validate_mode_contract_docs(root: Path) -> None:
             "docs/kubernetes_deployment.md must point at migrate-job examples",
         )
 
-    stale = re.compile(
-        r"migrate.*pointer to the right chart|migrate.*ferrum-mesh chart",
-        re.IGNORECASE,
-    )
+    stale = _MESH_CHART_POINTER_RE
     for relative in (
         Path("charts/ferrum-gateway/README.md"),
         Path("charts/ferrum-gateway/values.yaml"),
@@ -131,7 +137,7 @@ def validate_chart_mode_messages(results_dir: Path) -> None:
             "migrate mode message drift",
             "mode=migrate must mention external pre-deploy Kubernetes Job",
         )
-    if re.search(r"live in the ferrum-mesh", migrate_text, re.IGNORECASE):
+    if _MESH_CHART_HOME_RE.search(migrate_text):
         fail(
             "migrate pointed at ferrum-mesh",
             "migrate must not redirect to the mesh chart",

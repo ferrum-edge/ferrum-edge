@@ -11,6 +11,11 @@ import unittest
 from validate_release_request import validate
 from verify_publication_gate import job_body, _parse_job, _scalar, _sequence, _mapping
 
+_TRUSTED_EXTRACTION_PATHS_RE = re.compile(
+    r'git ls-tree -rz --name-only "\$commit" -- (.*?) > "\$listing"; then',
+    re.DOTALL,
+)
+
 
 class ReleaseRequestTests(unittest.TestCase):
     def test_trusted_extraction_includes_every_protected_publication_input(self):
@@ -31,10 +36,7 @@ class ReleaseRequestTests(unittest.TestCase):
         extraction = workflow.split("          extract_automation() {\n", 1)[1].split(
             "\n          }\n", 1
         )[0]
-        selection = re.search(
-            r'git ls-tree -rz --name-only "\$commit" -- (.*?) > "\$listing"; then',
-            extraction, re.DOTALL,
-        )
+        selection = _TRUSTED_EXTRACTION_PATHS_RE.search(extraction)
         self.assertIsNotNone(selection)
         pathspecs = shlex.split(selection[1].replace("\\\n", ""))
 
