@@ -22,8 +22,8 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, LazyLock};
 
 use ferrum_edge::circuit_breaker::{BreakerOutcome, CircuitBreaker, ProbeTicket};
 use ferrum_edge::config::types::{CircuitBreakerConfig, Proxy, UpstreamTarget};
@@ -2524,36 +2524,52 @@ fn admission_source_without_line_comments(text: &str) -> String {
         .join("\n")
 }
 
+/// A named `struct` declaration; captures the struct name.
+static STRUCT_DECLARATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap()
+});
+/// A `#[derive(..)]` struct/enum item; captures indent, derives, kind, and name.
+static DERIVED_ITEM: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
+        r"(?:#\[[^\]]*\]\s*)*",
+        r"(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+(\w+)[^{;]*\{",
+    ))
+    .unwrap()
+});
+/// A named struct field; captures the field name and type text.
+static STRUCT_FIELD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?",
+        r"([a-z_]\w*)\s*:\s*([^,]+),",
+    ))
+    .unwrap()
+});
+/// A serde `skip` / `skip_deserializing` option.
+static SERDE_SKIP: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\bskip(?:_deserializing)?\b").unwrap());
+/// The attribute group immediately preceding a field.
+static FIELD_ATTRIBUTES: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap());
+/// A tuple-newtype enum variant; captures name, attributes, and inner type.
+static NEWTYPE_VARIANT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^[ \t]*([A-Z]\w*)\(\s*",
+        r"((?:#\[[^\]]*\]\s*)*)([\w:]+)\s*,?\s*\)",
+    ))
+    .unwrap()
+});
+
 #[test]
 fn every_nested_admin_struct_field_has_an_object_admission_decision() {
     // Named structs are the serde shape that accepts positional sequences.
     // Include definitions across src/, so an imported or fully qualified
     // struct cannot evade the inventory.
-    let declaration =
-        regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap();
-    let items = regex::Regex::new(concat!(
-        r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
-        r"(?:#\[[^\]]*\]\s*)*",
-        r"(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+(\w+)[^{;]*\{",
-    ))
-    .unwrap();
-    let fields = regex::Regex::new(concat!(
-        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?",
-        r"([a-z_]\w*)\s*:\s*([^,]+),",
-    ))
-    .unwrap();
-    let skip = regex::Regex::new(r"\bskip(?:_deserializing)?\b").unwrap();
-    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
-    let newtype_variants = regex::Regex::new(concat!(
-        r"(?m)^[ \t]*([A-Z]\w*)\(\s*",
-        r"((?:#\[[^\]]*\]\s*)*)([\w:]+)\s*,?\s*\)",
-    ))
-    .unwrap();
     let sources = production_sources();
     let struct_names: BTreeSet<String> = sources
         .iter()
         .flat_map(|(_, text)| {
-            declaration
+            STRUCT_DECLARATION
                 .captures_iter(text)
                 .map(|item| item[1].to_string())
         })
@@ -2563,7 +2579,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
 
     for (path, text) in &sources {
         let text = admission_source_without_line_comments(text);
-        for item in items.captures_iter(&text) {
+        for item in DERIVED_ITEM.captures_iter(&text) {
             if !item[2]
                 .split(',')
                 .any(|derive| derive.trim().rsplit("::").next() == Some("Deserialize"))
@@ -2577,9 +2593,9 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 panic!("{path}: {resource} must have a terminated declaration")
             })];
             let mut previous_field_end = 0;
-            for field in fields.captures_iter(body) {
+            for field in STRUCT_FIELD.captures_iter(body) {
                 let span = field.get(0).unwrap();
-                let attributes = field_attributes
+                let attributes = FIELD_ATTRIBUTES
                     .find(&body[previous_field_end..span.start()])
                     .map_or("", |attributes| attributes.as_str());
                 previous_field_end = span.end();
@@ -2602,7 +2618,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 let name = inner.rsplit("::").next().unwrap_or(inner);
                 if inner.contains(['<', '>', '&'])
                     || !struct_names.contains(name)
-                    || skip.is_match(attributes)
+                    || SERDE_SKIP.is_match(attributes)
                 {
                     continue;
                 }
@@ -2677,7 +2693,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 checked.insert(key);
             }
             if &item[3] == "enum" {
-                for variant in newtype_variants.captures_iter(body) {
+                for variant in NEWTYPE_VARIANT.captures_iter(body) {
                     let name = variant[3].rsplit("::").next().unwrap();
                     if struct_names.contains(name) {
                         let key = format!("{path}:{resource}.{}", &variant[1]);
@@ -3127,7 +3143,6 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
     }
     let text = admission_source_without_line_comments(&source("src/modes/mesh/slice.rs"));
     let body = item_body(&text, "pub struct MeshSlice {", "\n}");
-    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
     for field in ["virtual_service_l4_proxies", "virtual_service_l4_upstreams"] {
         let declaration = format!("pub {field}:");
         let start = body
@@ -3135,7 +3150,7 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
             .expect("MeshSlice L4 field must exist");
         // Inspect this field's full attribute group independently of ordering
         // or whether serde options share one attribute or use separate ones.
-        let attributes = field_attributes
+        let attributes = FIELD_ATTRIBUTES
             .find(&body[..start])
             .expect("MeshSlice L4 field must carry attributes");
         assert!(

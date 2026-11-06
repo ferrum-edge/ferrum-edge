@@ -1,6 +1,7 @@
 //! Producer/emitter parity for #5591. This is a source contract, not a substitute
 //! for rendered-output tests: bare document values cannot be inferred by a lexer.
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 const ROOTS: &[&str] = &[
     "src/config",
@@ -158,9 +159,12 @@ fn tokens(source: &str) -> Vec<Token<'_>> {
     result
 }
 
+/// A format-string placeholder that interpolates an error value.
+static ERROR_CAPTURE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\{(?:error|e|err|cause|message)(?::[^}]*)?\}").unwrap());
+
 fn violations(path: &str, source: &str) -> Vec<String> {
     let tokens = tokens(source);
-    let error_capture = regex::Regex::new(r"\{(?:error|e|err|cause|message)(?::[^}]*)?\}").unwrap();
     let mut failures = Vec::new();
     for index in 0..tokens.len().saturating_sub(2) {
         let name = &tokens[index];
@@ -217,7 +221,7 @@ fn violations(path: &str, source: &str) -> Vec<String> {
                 ));
             }
             if matches!(name.text, "warn" | "error")
-                && error_capture.is_match(literal.text)
+                && ERROR_CAPTURE.is_match(literal.text)
                 && !sanitized
             {
                 failures.push(format!(
