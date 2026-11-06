@@ -17,6 +17,9 @@ HARNESS = ROOT / "tests/performance/mesh_runtime/run_mesh_runtime_bench.sh"
 TEXT = HARNESS.read_text()
 
 
+_DOCKER_VOLUME_RE = re.compile(r'-v "([^"]+)"')
+
+
 def functions(*names):
     return "\n".join(re.search(rf"(?ms)^{name}\(\) \{{.*?^\}}", TEXT).group() for name in names)
 
@@ -51,7 +54,7 @@ class HarnessBounds(unittest.TestCase):
                 self.assertIn('--group-add "$CERT_GID"', body)
                 if name != "start_envoy":
                     self.assertNotIn("--user", body)
-                for mount in re.findall(r'-v "([^"]+)"', body):
+                for mount in _DOCKER_VOLUME_RE.findall(body):
                     if "$CERT_DIR" in mount:
                         self.assertTrue(mount.endswith(":ro"), mount)
 

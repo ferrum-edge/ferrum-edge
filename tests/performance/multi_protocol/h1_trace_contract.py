@@ -30,6 +30,25 @@ BOUNDS = dict(observer_rss_and_map_bytes=32 * 1024**2, map_reservation_bytes=8 *
 ELF_PACKAGE_BYTES = 1024 * 1024**2
 
 
+# perf's default sample header after the explicit -F fields. Threads print pid/tid.
+_PERF_SAMPLE_HEADER_RE = re.compile(
+    r'^\s*.+?\s+(\d+)/(\d+)\s+(\d+\.\d+):\s+cpu-clock(?::[ukhS]+)?:'
+)
+# The DSO is the LAST parenthesized group: demangled C++ symbols such as
+# `Slice::drain(unsigned long)` contain their own parentheses.
+_PERF_FRAME_RE = re.compile(r'^\s*([0-9a-fA-F]+)\s+(.+)\s+\(([^()]*)\)\s*$')
+_PERF_LOST_RE = re.compile(r'PERF_RECORD_LOST(?:_SAMPLES)?\b')
+_PERF_THROTTLE_RE = re.compile(r'PERF_RECORD_THROTTLE\b')
+_PERF_UNTHROTTLE_RE = re.compile(r'PERF_RECORD_UNTHROTTLE\b')
+_PERF_SAMPLE_RECORD_RE = re.compile(r'PERF_RECORD_SAMPLE\b')
+_PERF_TASK_RECORD_RE = re.compile(r'PERF_RECORD_(?:FORK|EXIT|COMM)\b')
+_PERF_MMAP_RECORD_RE = re.compile(r'PERF_RECORD_MMAP2?\b')
+_SHA256_HEX_RE = re.compile(r'[0-9a-f]{64}')
+_SESSION_ID_RE = re.compile(r'[0-9a-f]{32}')
+_GIT_SHA_RE = re.compile(r'[0-9a-f]{40}')
+_BUILD_ID_RE = re.compile(r'[a-fA-F0-9]{8,64}')
+
+
 def natural(value):
     return type(value) is int and 0 <= value <= 2**64 - 1
 
@@ -261,23 +280,18 @@ def fd_lifetimes(rows):
 def decode_cpu(text, raw_text, target_pids):
     """Consume real perf script blocks; stack success requires multiple resolved PCs."""
     samples, chains, current = [], [], None
-    # perf's default sample header after the explicit -F fields. Threads print pid/tid.
-    header = re.compile(r'^\s*.+?\s+(\d+)/(\d+)\s+(\d+\.\d+):\s+cpu-clock(?::[ukhS]+)?:')
-    # The DSO is the LAST parenthesized group: demangled C++ symbols such as
-    # `Slice::drain(unsigned long)` contain their own parentheses.
-    frame = re.compile(r'^\s*([0-9a-fA-F]+)\s+(.+)\s+\(([^()]*)\)\s*$')
     for line in text.splitlines() + ['']:
-        match = header.match(line)
+        match = _PERF_SAMPLE_HEADER_RE.match(line)
         if match:
             if current:
                 samples.append(current)
             current = dict(pid=int(match[1]), tid=int(match[2]), time_secs=match[3], frames=[])
             # Some versions print the sampled frame on the header; preserve it separately.
             suffix = line[match.end():].strip()
-            inline = frame.match(suffix)
+            inline = _PERF_FRAME_RE.match(suffix)
             if inline:
                 current['frames'].append(dict(ip=inline[1], symbol=inline[2], dso=inline[3]))
-        elif current and (match := frame.match(line)):
+        elif current and (match := _PERF_FRAME_RE.match(line)):
             current['frames'].append(dict(ip=match[1], symbol=match[2], dso=match[3]))
         elif not line.strip() and current:
             samples.append(current); current = None
@@ -296,16 +310,16 @@ def decode_cpu(text, raw_text, target_pids):
         multi += len(resolved) >= 2
         folded[';'.join(f['symbol'] for f in reversed(frames)) or '[unresolved]'] += 1
         chains.append(sample)
-    lost = len(re.findall(r'PERF_RECORD_LOST(?:_SAMPLES)?\b', raw_text))
-    throttle = len(re.findall(r'PERF_RECORD_THROTTLE\b', raw_text))
-    unthrottle = len(re.findall(r'PERF_RECORD_UNTHROTTLE\b', raw_text))
-    raw_samples = len(re.findall(r'PERF_RECORD_SAMPLE\b', raw_text))
+    lost = len(_PERF_LOST_RE.findall(raw_text))
+    throttle = len(_PERF_THROTTLE_RE.findall(raw_text))
+    unthrottle = len(_PERF_UNTHROTTLE_RE.findall(raw_text))
+    raw_samples = len(_PERF_SAMPLE_RECORD_RE.findall(raw_text))
     return dict(samples=len(chains), per_tid=dict(tids), depth_distribution=dict(depths),
                 multi_frame_samples=multi, unresolved_samples=unresolved, foreign_samples=foreign,
                 raw_sample_records=raw_samples, lost_records=lost, throttle_records=throttle,
                 unthrottle_records=unthrottle,
-                task_records=len(re.findall(r'PERF_RECORD_(?:FORK|EXIT|COMM)\b', raw_text)),
-                mmap_records=len(re.findall(r'PERF_RECORD_MMAP2?\b', raw_text)),
+                task_records=len(_PERF_TASK_RECORD_RE.findall(raw_text)),
+                mmap_records=len(_PERF_MMAP_RECORD_RE.findall(raw_text)),
                 callchains=chains, folded=dict(folded),
                 complete=False, stack_useful=multi > 0,
                 truncated_stack_fraction=None,
@@ -335,13 +349,14 @@ def nested_fixture_proof(chains):
     Retain whole witnesses (including unknown frames) and PID/TID attribution.
     """
     expected = ('fixture_leaf', 'fixture_middle', 'fixture_outer')
+    expected_symbols = tuple(re.compile(re.escape(name) + r'(?:\.[A-Za-z0-9_.]+)?(?:\+0x[0-9a-fA-F]+)?')
+                             for name in expected)
     witnesses = []
     for sample in chains:
         positions = []
         for index, frame in enumerate(sample['frames']):
             if (frame['dso'] != '[unknown]' and
-                    re.fullmatch(re.escape(expected[len(positions)]) +
-                                 r'(?:\.[A-Za-z0-9_.]+)?(?:\+0x[0-9a-fA-F]+)?', frame['symbol'])):
+                    expected_symbols[len(positions)].fullmatch(frame['symbol'])):
                 positions.append(index)
                 if len(positions) == len(expected):
                     witnesses.append(dict(sample, matched_frame_indices=positions))
@@ -361,7 +376,7 @@ def trace_identity_issues(runtime, owner):
             issues.append('runtime PID generation mismatch: ' + recorded)
     container = runtime.get('container_id')
     cgroup = owner.get('cgroup')
-    if (not isinstance(container, str) or re.fullmatch(r'[0-9a-f]{64}', container) is None
+    if (not isinstance(container, str) or _SHA256_HEX_RE.fullmatch(container) is None
             or not isinstance(cgroup, str) or not cgroup.startswith('/')
             or '..' in Path(cgroup).parts
             or not any(part in (container, 'docker-' + container + '.scope') for part in Path(cgroup).parts)):
@@ -377,7 +392,7 @@ def trace_identity_issues(runtime, owner):
 
 
 def sha256_value(value):
-    return isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) is not None
+    return isinstance(value, str) and _SHA256_HEX_RE.fullmatch(value) is not None
 
 
 def retained_file(root, relative, *, limit=BOUNDS['raw_perf_bytes'], keep=False):
@@ -516,7 +531,7 @@ def load_trace(path, *, expected=None):
         require(receipts.get('binding') == binding_hash, 'admission binding hash mismatch')
         ready = document('ready.json')
         require(ready['binding_sha256'] == binding_hash and ready['owner'] == owner
-                and isinstance(ready['session'], str) and re.fullmatch(r'[0-9a-f]{32}', ready['session']) is not None,
+                and isinstance(ready['session'], str) and _SESSION_ID_RE.fullmatch(ready['session']) is not None,
                 'ready identity/session/hash mismatch')
         require(ready['status'] == claim['ready']['status'] == ('off' if mode == 'none' else 'supported'),
                 'collector readiness incomplete')
@@ -577,7 +592,7 @@ def load_trace(path, *, expected=None):
                 and isinstance(provenance.get('meaning'), str), 'dependency provenance mismatch')
         for group in ('initial_bases', 'integration_checkpoints', 'reviewed_checkpoints'):
             require(isinstance(provenance.get(group), dict) and set(provenance[group]) == {'h1', 'h3'}
-                    and all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{40}', value) is not None
+                    and all(isinstance(value, str) and _GIT_SHA_RE.fullmatch(value) is not None
                             for value in provenance[group].values()), 'missing typed dependency checkpoint')
         for field, mandatory in (('source_hashes', ('h1_trace.py', 'h1_trace_contract.py', 'h1_syscalls.bpf.h', 'h1_loader.h')),
                                  ('object_hashes', ('observer', 'observer.bpf.o', 'perf', 'h1_trace_fixture'))):
@@ -679,7 +694,7 @@ def load_trace(path, *, expected=None):
             build_ids = {}
             for line in retained_file(path.parent, 'perf-buildids.txt', keep=True)[1].decode().splitlines():
                 parts = line.split(None, 1)
-                if len(parts) == 2 and re.fullmatch(r'[a-fA-F0-9]{8,64}', parts[0]):
+                if len(parts) == 2 and _BUILD_ID_RE.fullmatch(parts[0]):
                     build_ids[parts[1].strip()] = parts[0].lower()
             retained_ids = {d['path']: [line.rsplit(' ', 1)[-1].lower() for line in d['build_id_lines']]
                             for d in dsos['dsos']}

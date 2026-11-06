@@ -41,6 +41,16 @@ PAGE = os.sysconf('SC_PAGE_SIZE')
 DEPENDENCY_PROVENANCE = json.loads((HERE / 'h1_profile_manifest.json').read_text())['external_trace']['dependency_provenance']
 
 
+_EVLIST_FIELD_RE = re.compile(
+    r'[ \t]*(\{[ \t]*sample_period[ \t]*,[ \t]*sample_freq[ \t]*\}|[a-z][a-z0-9_]*)'
+    r'[ \t]*:[ \t]*([^,{}:\r\n]+)(?:,|$)'
+)
+_EVLIST_EVENT_RE = re.compile(r'([^\s,{}]+):[ \t]+(.+)')
+_EVLIST_BIT_FIELD_RE = re.compile(r'[A-Z][A-Z0-9_]*(?:\|[A-Z][A-Z0-9_]*)*')
+_PERF_VDSO_PATH_RE = re.compile(r'/tmp/perf-vdso\.so-[A-Za-z0-9]{6}')
+_BUILD_ID_RE = re.compile(r'[a-fA-F0-9]{8,64}')
+
+
 def write(path, value):
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
@@ -1012,15 +1022,12 @@ def read_cpu_attributes(path, status):
         issues.append('perf evlist event/line bound exceeded')
         return result
     union = '{ sample_period, sample_freq }'
-    field_pattern = re.compile(
-        r'[ \t]*(\{[ \t]*sample_period[ \t]*,[ \t]*sample_freq[ \t]*\}|[a-z][a-z0-9_]*)'
-        r'[ \t]*:[ \t]*([^,{}:\r\n]+)(?:,|$)')
     selected = []
     for number, line in enumerate(lines, 1):
         line = line.strip(' \t\r')
         if not line:
             continue
-        event = re.fullmatch(r'([^\s,{}]+):[ \t]+(.+)', line)
+        event = _EVLIST_EVENT_RE.fullmatch(line)
         if not event:
             issues.append(f'perf evlist line {number}: malformed event record')
             continue
@@ -1029,7 +1036,7 @@ def read_cpu_attributes(path, status):
         if payload.endswith(','):
             issues.append(f'perf evlist line {number}: trailing field separator')
         while position < len(payload):
-            field = field_pattern.match(payload, position)
+            field = _EVLIST_FIELD_RE.match(payload, position)
             if not field:
                 issues.append(f'perf evlist line {number}: malformed attribute at column {position + 1}')
                 break
@@ -1085,7 +1092,7 @@ def read_cpu_attributes(path, status):
             ('sample_type', {'IP', 'TID', 'TIME', 'READ', 'REGS_USER', 'STACK_USER'}),
             ('read_format', {'TOTAL_TIME_ENABLED', 'TOTAL_TIME_RUNNING'})):
         value = fields.get(key, '')
-        if not re.fullmatch(r'[A-Z][A-Z0-9_]*(?:\|[A-Z][A-Z0-9_]*)*', value):
+        if not _EVLIST_BIT_FIELD_RE.fullmatch(value):
             issues.append('cpu-clock:uS missing/invalid bit field ' + key)
             continue
         missing = required_bits - set(value.split('|'))
@@ -1107,7 +1114,7 @@ def build_id_gaps(build_ids, retained_ids, records):
     for path, build_id in build_ids.items():
         if not path.startswith('/') or build_id in retained_ids.get(path, []):
             continue
-        if virtual_mapping and re.fullmatch(r'/tmp/perf-vdso\.so-[A-Za-z0-9]{6}', path):
+        if virtual_mapping and _PERF_VDSO_PATH_RE.fullmatch(path):
             virtual[path] = build_id
         else:
             missing.append(path)
@@ -1173,7 +1180,7 @@ def cpu_decode(out, owners, dsos, *, symfs=None, script_timeout=30, script_limit
     build_id_by_path = {}
     for line in (out / 'perf-buildids.txt').read_text(errors='replace').splitlines():
         parts = line.split(None, 1)
-        if len(parts) == 2 and re.fullmatch(r'[a-fA-F0-9]{8,64}', parts[0]):
+        if len(parts) == 2 and _BUILD_ID_RE.fullmatch(parts[0]):
             build_id_by_path[parts[1].strip()] = parts[0].lower()
     retained_ids = {d['path']: [line.rsplit(' ', 1)[-1].lower() for line in d['build_id_lines']]
                     for d in dsos.get('dsos', [])}

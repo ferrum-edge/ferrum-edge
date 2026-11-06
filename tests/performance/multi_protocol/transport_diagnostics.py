@@ -14,6 +14,9 @@ import urllib.request
 from pathlib import Path
 
 
+_KERNEL_FEATURE_RE = re.compile(r"\b(bpf|gro|gso|reuseport)\b", re.IGNORECASE)
+
+
 def parse_snmp(text):
     lines = text.splitlines()
     result = {}
@@ -273,7 +276,7 @@ def annotate_experiment(sample, path, usage_path):
         try:
             lines = startup.read_text().splitlines()
             diagnostics["startup_transport_messages"] = [line for line in lines
-                if re.search(r"\b(bpf|gro|gso|reuseport)\b", line, re.IGNORECASE)]
+                if _KERNEL_FEATURE_RE.search(line)]
             diagnostics["optimized_path"] = "unverified; warnings alone cannot prove use"
         except OSError as error:
             diagnostics["startup_capture_error"] = str(error)

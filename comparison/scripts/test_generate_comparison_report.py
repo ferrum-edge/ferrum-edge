@@ -49,6 +49,9 @@ errors_timeout: 0
 STALE_KONG_RPS = "424,242"  # formatted rendering of 424242 in the tables
 
 
+_RESULT_FILE_REDIRECT_RE = re.compile(r'> "\$result_file" 2>&1')
+
+
 def write_result(directory, name, rps):
     (directory / name).write_text(WRK.format(requests=int(rps * 30), rps=rps))
 
@@ -116,7 +119,7 @@ class RunComparisonManifestContractTests(unittest.TestCase):
     def test_each_result_writer_appends_to_the_manifest(self):
         driver = SCRIPT.parents[1] / "run_comparison.sh"
         text = driver.read_text()
-        writers = [m.start() for m in re.finditer(r'> "\$result_file" 2>&1', text)]
+        writers = [m.start() for m in _RESULT_FILE_REDIRECT_RE.finditer(text)]
         self.assertGreaterEqual(len(writers), 3, "expected the POST, key-auth and Tyk writers")
         for start in writers:
             window = text[start : start + 1200]

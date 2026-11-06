@@ -20,6 +20,18 @@ from pathlib import Path
 # wrk output parsing
 # ---------------------------------------------------------------------------
 
+_WRK_RPS_RE = re.compile(r"Requests/sec:\s+([\d.]+)")
+_WRK_TRANSFER_RE = re.compile(r"Transfer/sec:\s+([\d.]+[KMGT]?B)")
+_WRK_LATENCY_RE = re.compile(r"Latency\s+([\d.]+[munμ]?s)")
+_WRK_TOTAL_REQUESTS_RE = re.compile(r"(\d+)\s+requests in")
+_WRK_NON_2XX_RE = re.compile(r"Non-2xx or 3xx responses:\s+(\d+)")
+_COMPARISON_RESULTS_RE = re.compile(
+    r"--- Comparison Results ---\n(.*?)--- End Results ---",
+    re.DOTALL,
+)
+_NON_NUMERIC_RE = re.compile(r"[^\d.]")
+
+
 def parse_wrk_output(file_path):
     """Parse wrk output including the machine-parseable comparison block."""
     with open(file_path, "r") as f:
@@ -28,33 +40,29 @@ def parse_wrk_output(file_path):
     metrics = {}
 
     # --- Standard wrk header parsing (fallback) ---
-    rps_match = re.search(r"Requests/sec:\s+([\d.]+)", content)
+    rps_match = _WRK_RPS_RE.search(content)
     if rps_match:
         metrics["rps"] = float(rps_match.group(1))
 
-    transfer_match = re.search(r"Transfer/sec:\s+([\d.]+[KMGT]?B)", content)
+    transfer_match = _WRK_TRANSFER_RE.search(content)
     if transfer_match:
         metrics["transfer"] = transfer_match.group(1)
 
-    latency_match = re.search(r"Latency\s+([\d.]+[munμ]?s)", content)
+    latency_match = _WRK_LATENCY_RE.search(content)
     if latency_match:
         metrics["latency_avg_str"] = latency_match.group(1)
         metrics["latency_avg_ms"] = _latency_to_ms(latency_match.group(1))
 
-    requests_match = re.search(r"(\d+)\s+requests in", content)
+    requests_match = _WRK_TOTAL_REQUESTS_RE.search(content)
     if requests_match:
         metrics["total_requests"] = int(requests_match.group(1))
 
-    non2xx_match = re.search(r"Non-2xx or 3xx responses:\s+(\d+)", content)
+    non2xx_match = _WRK_NON_2XX_RE.search(content)
     if non2xx_match:
         metrics["non2xx"] = int(non2xx_match.group(1))
 
     # --- Machine-parseable block from comparison_test.lua ---
-    block = re.search(
-        r"--- Comparison Results ---\n(.*?)--- End Results ---",
-        content,
-        re.DOTALL,
-    )
+    block = _COMPARISON_RESULTS_RE.search(content)
     if block:
         for line in block.group(1).strip().splitlines():
             key, _, value = line.partition(":")
@@ -91,7 +99,7 @@ def parse_wrk_output(file_path):
 def _latency_to_ms(s):
     """Convert a human-readable latency string to milliseconds."""
     if s.endswith("us") or s.endswith("μs"):
-        return float(re.sub(r"[^\d.]", "", s)) / 1000.0
+        return float(_NON_NUMERIC_RE.sub("", s)) / 1000.0
     elif s.endswith("ms"):
         return float(s[:-2])
     elif s.endswith("s"):
