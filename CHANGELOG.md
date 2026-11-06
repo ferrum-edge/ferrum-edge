@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
   one "rejected" flag: every CNI ADD for an enrolled pod then failed its GC
@@ -72,6 +73,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primary load. It now connects in the background through the same reconnect
   path the poll loop uses. Admin reads use primary until the replica pool is
   up, as they already did whenever the replica was unavailable.
+- **Centralized `ai_rate_limiter` reservations take one Redis round trip**
+  (#7035). A Redis-backed token reservation charged the current window in one
+  `MULTI`/`EXEC` (`INCRBY` + `EXPIRE`) and then read the previous and current
+  counters in a second `GETRANGE` pipeline, discarding the current one. It now
+  reads the previous window and charges the current one in a single
+  `MULTI`/`EXEC` (`GETRANGE` prev + `INCRBY` + `EXPIRE`, the transaction
+  `ws_rate_limiting` already uses), so the redundant `GETRANGE` of the current
+  counter is gone and each admitted AI request saves one Redis round trip. The
+  ACL command set, key layout, weighted estimate, deny rollback and
+  `redis_failure_policy` handling are unchanged, and an unreadable counter
+  still fails the reservation closed. A zero-token reservation charges nothing,
+  as before.
+- **`mcp_gateway` session `DELETE` and expired-session teardown delete
+  upstream sessions concurrently** (#7035). A client `DELETE` and an expired
+  session presented again used to `DELETE` the session's upstream MCP
+  sessions one server at a time before answering. They now run concurrently,
+  at most 8 in flight per request (the background reaper's bound), so a
+  session spanning N servers costs about ceil(N/8) upstream round trips
+  instead of N. Failures are still logged and never change the client's
+  answer, and the plugin HTTP client's timeout still applies to each call. The
+  overlapping calls count their wall-clock wait once toward
+  `latency_plugin_external_io_ms` instead of summing each call, including when
+  the client aborts mid-teardown. Session reclamation during `initialize` is
+  unchanged. The background reaper's and failed-`initialize` cleanup's timeout
+  warnings now include `server_id`.
 - **Gateway API and Istio status batches run concurrently** (#7034). The
   Kubernetes reconcile loop used to wait for the Gateway API status batch and
   then for the Istio status batch. The two writers patch disjoint objects, so

@@ -5148,7 +5148,9 @@ impl RedisRateLimitClient {
     ///
     /// Used where one admission decision covers several units of work — the
     /// WebSocket frame limiter charges every physical fragment of a reassembled
-    /// message in a single round trip rather than one round trip per fragment.
+    /// message in a single round trip rather than one round trip per fragment,
+    /// and the `ai_rate_limiter` reservation charges its token estimate and
+    /// reads the previous window in the same round trip.
     /// `amount` must be positive; the caller owns the bound on how large it can
     /// grow.
     #[allow(clippy::result_unit_err)]

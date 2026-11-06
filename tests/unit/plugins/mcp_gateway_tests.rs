@@ -3635,6 +3635,339 @@ async fn aggregate_delete_tears_down_upstream_session() {
     );
 }
 
+/// How long a gated upstream `DELETE` keeps holding after the rendezvous, so
+/// every overlapping call lasts measurably long.
+const DELETE_GATE_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
+/// How long a gated `DELETE` waits for its peers. Sequential teardown never
+/// reaches the target, pays this once, and fails the rendezvous assertion.
+const DELETE_GATE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Default)]
+struct DeleteGateState {
+    in_flight: usize,
+    max_in_flight: usize,
+    released: bool,
+    met: bool,
+}
+
+/// Rendezvous for mocked upstream session `DELETE`s.
+///
+/// wiremock runs every `MockServer` on its own thread and current-thread
+/// runtime, so a responder that blocks holds only its own server. Each
+/// `DELETE` blocks until `target` of them are in flight at once, which proves
+/// overlap by arrival rather than by elapsed time. Once met (or after
+/// [`DELETE_GATE_PATIENCE`]) the gate stays open for every later `DELETE`.
+/// A call stays counted until its response is about to be sent, so
+/// `max_in_flight` never under-reports the client's concurrency.
+struct DeleteGate {
+    target: usize,
+    state: std::sync::Mutex<DeleteGateState>,
+    changed: std::sync::Condvar,
+}
+
+impl DeleteGate {
+    fn new(target: usize) -> Arc<Self> {
+        Arc::new(Self {
+            target,
+            state: std::sync::Mutex::new(DeleteGateState::default()),
+            changed: std::sync::Condvar::new(),
+        })
+    }
+
+    fn pass(&self) {
+        let mut state = self.state.lock().expect("delete gate");
+        state.in_flight += 1;
+        state.max_in_flight = state.max_in_flight.max(state.in_flight);
+        if state.in_flight >= self.target && !state.released {
+            state.released = true;
+            state.met = true;
+        }
+        self.changed.notify_all();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, DELETE_GATE_PATIENCE, |state| !state.released)
+            .expect("delete gate");
+        if !state.released {
+            state.released = true;
+            self.changed.notify_all();
+        }
+        drop(state);
+        std::thread::sleep(DELETE_GATE_HOLD);
+        self.state.lock().expect("delete gate").in_flight -= 1;
+    }
+
+    fn met(&self) -> bool {
+        self.state.lock().expect("delete gate").met
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.state.lock().expect("delete gate").max_in_flight
+    }
+}
+
+/// A mock upstream that mints `upstream_session` on every POST and answers its
+/// session `DELETE` with `delete_status` once `gate` lets it through.
+async fn start_gated_session_delete_server(
+    upstream_session: &str,
+    delete_status: u16,
+    gate: &Arc<DeleteGate>,
+) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", upstream_session)
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "upstream",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": { "name": "gated-session-delete", "version": "1" },
+                        "tools": [{ "name": "create_pr", "inputSchema": { "type": "object" } }]
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    let gate = Arc::clone(gate);
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(move |_: &wiremock::Request| {
+            gate.pass();
+            ResponseTemplate::new(delete_status)
+        })
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A tools-only aggregate config with one upstream server per mock.
+fn gated_servers_tools_config(servers: &[MockServer]) -> Value {
+    let mut config = tools_only_aggregate_config(&format!("{}/mcp", servers[0].uri()));
+    for (index, server) in servers.iter().enumerate().skip(1) {
+        let server_id = format!("server{index}");
+        config["servers"][server_id.as_str()] = json!({
+            "upstream_url": format!("{}/mcp", server.uri()),
+            "namespace": server_id.clone(),
+            "enabled": true,
+            "expose_tools": true,
+            "expose_resources": false,
+            "expose_prompts": false
+        });
+    }
+    config
+}
+
+/// EDGE-PL-2: a client `DELETE` tears down the session's upstream sessions on
+/// every server concurrently, so it waits about one upstream round trip rather
+/// than one per server. One upstream's failed `DELETE` neither stops the other
+/// teardown nor changes the client's answer, and the overlapping calls are
+/// counted once in the request's external-I/O time.
+#[tokio::test]
+async fn aggregate_delete_tears_down_every_upstream_session_concurrently() {
+    let gate = DeleteGate::new(2);
+    let sessions = ["upstream-one", "upstream-two"];
+    let servers = [
+        start_gated_session_delete_server(sessions[0], 200, &gate).await,
+        start_gated_session_delete_server(sessions[1], 500, &gate).await,
+    ];
+    let plugin = create_plugin("mcp_gateway", &gated_servers_tools_config(&servers))
+        .unwrap()
+        .unwrap();
+    let session_id = initialize(&plugin).await;
+    // Discovery initializes the session on both upstreams.
+    let _ = aggregate_tool_names(&plugin, &session_id, 1130).await;
+
+    let mut ctx = create_test_context();
+    ctx.method = "DELETE".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
+    let started = std::time::Instant::now();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let elapsed = started.elapsed();
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200);
+    assert_eq!(body, json!({}));
+
+    assert!(
+        gate.met(),
+        "both upstream DELETEs must be in flight at the same time"
+    );
+    assert_eq!(gate.max_in_flight(), 2);
+    for (server, upstream_session) in servers.iter().zip(sessions) {
+        assert_eq!(
+            deletes_for(server, upstream_session).await,
+            1,
+            "{upstream_session}: every initialized upstream session is deleted once"
+        );
+    }
+    let recorded = std::time::Duration::from_nanos(ctx.plugin_http_call_ns.load(Ordering::Relaxed));
+    assert!(
+        recorded >= DELETE_GATE_HOLD,
+        "the teardown wait is external I/O, recorded {recorded:?}"
+    );
+    assert!(
+        recorded <= elapsed + std::time::Duration::from_millis(5),
+        "overlapping DELETEs must be counted once: {recorded:?} of external I/O in {elapsed:?}"
+    );
+}
+
+/// EDGE-PL-2: an expired session presented again is refused, and its upstream
+/// sessions are torn down concurrently on that request path too.
+#[tokio::test]
+async fn expired_session_presented_again_tears_down_upstreams_concurrently() {
+    let gate = DeleteGate::new(2);
+    let sessions = ["expired-one", "expired-two"];
+    let servers = [
+        start_gated_session_delete_server(sessions[0], 200, &gate).await,
+        start_gated_session_delete_server(sessions[1], 200, &gate).await,
+    ];
+    let mut config = gated_servers_tools_config(&servers);
+    config["sessions"] = json!({ "session_ttl_seconds": 1 });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1131).await;
+    // No reaper runs (background tasks are never committed), so the session
+    // is still in the store when it is presented again.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let (result, _, _) = session_request(
+        &plugin,
+        &session_id,
+        json!({ "jsonrpc": "2.0", "id": 1132, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(reject_raw(result).0, 404, "the expired session is refused");
+    assert!(
+        gate.met(),
+        "both upstream DELETEs must be in flight at the same time"
+    );
+    for (server, upstream_session) in servers.iter().zip(sessions) {
+        assert_eq!(deletes_for(server, upstream_session).await, 1);
+    }
+}
+
+/// A mock upstream that mints `upstream_session` on every POST and answers its
+/// session `DELETE` with 200 after `delete_delay`. wiremock delays are async,
+/// so a long one holds only that response, never the mock server.
+async fn start_delayed_session_delete_server(
+    upstream_session: &str,
+    delete_delay: std::time::Duration,
+) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", upstream_session)
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "upstream",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": { "name": "delayed-session-delete", "version": "1" },
+                        "tools": [{ "name": "create_pr", "inputSchema": { "type": "object" } }]
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_delay(delete_delay))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// EDGE-PL-2: a client that aborts mid-teardown still has the teardown's
+/// wall-clock wait counted as external I/O. One upstream `DELETE` finishes at
+/// once while the other is still held when the request future is dropped; the
+/// credit must not depend on the whole batch completing.
+#[tokio::test]
+async fn cancelled_session_delete_still_counts_its_teardown_wait() {
+    let sessions = ["prompt-delete", "held-delete"];
+    let servers = [
+        start_delayed_session_delete_server(sessions[0], std::time::Duration::ZERO).await,
+        start_delayed_session_delete_server(sessions[1], std::time::Duration::from_secs(30)).await,
+    ];
+    let plugin = create_plugin("mcp_gateway", &gated_servers_tools_config(&servers))
+        .unwrap()
+        .unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1135).await;
+
+    let mut ctx = create_test_context();
+    ctx.method = "DELETE".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
+    let started = std::time::Instant::now();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        plugin.before_proxy(&mut ctx, &mut headers),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(cancelled.is_err(), "the request is dropped mid-teardown");
+
+    assert_eq!(
+        deletes_for(&servers[0], sessions[0]).await,
+        1,
+        "the prompt upstream DELETE completed before the abort"
+    );
+    let recorded = std::time::Duration::from_nanos(ctx.plugin_http_call_ns.load(Ordering::Relaxed));
+    assert!(
+        recorded > std::time::Duration::ZERO,
+        "a dropped teardown batch still credits its wait"
+    );
+    assert!(
+        recorded <= elapsed,
+        "the credit is the batch's wall-clock wait: {recorded:?} of external I/O in {elapsed:?}"
+    );
+}
+
+/// EDGE-PL-2: one session's upstream `DELETE`s share a fan-out bounded at 8:
+/// with 10 upstreams the bound is reached and never exceeded.
+#[tokio::test]
+async fn one_sessions_teardown_never_exceeds_eight_in_flight() {
+    const SERVERS: usize = 10;
+    const BOUND: usize = 8;
+    let gate = DeleteGate::new(BOUND);
+    let mut servers = Vec::with_capacity(SERVERS);
+    for index in 0..SERVERS {
+        servers
+            .push(start_gated_session_delete_server(&format!("bounded-{index}"), 200, &gate).await);
+    }
+    let plugin = create_plugin("mcp_gateway", &gated_servers_tools_config(&servers))
+        .unwrap()
+        .unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1140).await;
+
+    let mut ctx = create_test_context();
+    ctx.method = "DELETE".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
+    let (status, _, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert!(gate.met(), "the per-session fan-out must reach its bound");
+    assert_eq!(
+        gate.max_in_flight(),
+        BOUND,
+        "never more than {BOUND} of one session's upstream DELETEs in flight"
+    );
+    for (index, server) in servers.iter().enumerate() {
+        assert_eq!(
+            deletes_for(server, &format!("bounded-{index}")).await,
+            1,
+            "server {index}: the upstream session is deleted once"
+        );
+    }
+}
+
 #[tokio::test]
 async fn aggregate_tool_call_rejects_invalid_arguments_as_json_rpc_error() {
     let server = start_mcp_catalog_server().await;
