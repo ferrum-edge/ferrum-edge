@@ -6,6 +6,18 @@ import re
 from pathlib import Path
 
 
+_EXPERIMENT_NAME_RE = re.compile(r"[a-z0-9-]{1,80}")
+_GATEWAY_NAME_RE = re.compile(r"ferrum(?:-exp-[a-z0-9-]{1,40})?")
+_ENV_VALUE_RE = re.compile(r"[a-zA-Z0-9_.:/-]+")
+_ENV_KEY_RE = re.compile(r"FERRUM_[A-Z0-9_]+")
+_ADAPTIVE_WINDOW_LINE_RE = re.compile(
+    r"(?m)^(    pool_http2_adaptive_window:)\s*(?:true|false)[^\n]*$"
+)
+_MATERIALIZED_ADAPTIVE_WINDOW_RE = re.compile(
+    rb"(?m)^    pool_http2_adaptive_window: (true|false)$"
+)
+
+
 def load_experiment(path, protocol):
     plan = json.loads(Path(path).read_text())
     if set(plan) - {"enabled", "name", "protocol", "arms", "h2_campaign", "h2_guard_observation"} or not {
@@ -13,7 +25,7 @@ def load_experiment(path, protocol):
         raise ValueError("unexpected experiment fields")
     if not isinstance(plan["enabled"], bool):
         raise ValueError("enabled must be boolean")
-    if not isinstance(plan["name"], str) or not re.fullmatch(r"[a-z0-9-]{1,80}", plan["name"]):
+    if not isinstance(plan["name"], str) or not _EXPERIMENT_NAME_RE.fullmatch(plan["name"]):
         raise ValueError("invalid experiment name")
     protocols = plan["protocol"] if isinstance(plan["protocol"], list) else [plan["protocol"]]
     if not protocols or len(set(protocols)) != len(protocols) or any(
@@ -28,7 +40,7 @@ def load_experiment(path, protocol):
         if not isinstance(arm, dict) or set(arm) != {"gateway", "FERRUM_EXTRA_ENV"}:
             raise ValueError("arms may change only FERRUM_EXTRA_ENV")
         name, env = arm["gateway"], arm["FERRUM_EXTRA_ENV"]
-        if not isinstance(name, str) or not re.fullmatch(r"ferrum(?:-exp-[a-z0-9-]{1,40})?", name):
+        if not isinstance(name, str) or not _GATEWAY_NAME_RE.fullmatch(name):
             raise ValueError("invalid Ferrum experiment arm")
         if name in names:
             raise ValueError("duplicate experiment arm")
@@ -61,11 +73,11 @@ def parse_env(env):
     result = {}
     for entry in env.split(" "):
         key, separator, value = entry.partition("=")
-        valid = re.fullmatch(r"[a-zA-Z0-9_.:/-]+", value)
+        valid = _ENV_VALUE_RE.fullmatch(value)
         if key == "FERRUM_LOG_LEVEL" and value in ("warn,ferrum_h2_observe=debug",
                 "warn,ferrum_h2_observe=debug,ferrum_h2_guard=debug"):
             valid = True
-        if not separator or not re.fullmatch(r"FERRUM_[A-Z0-9_]+", key) or not valid:
+        if not separator or not _ENV_KEY_RE.fullmatch(key) or not valid:
             raise ValueError("environment must contain literal space-separated KEY=VALUE entries")
         if key in result:
             raise ValueError("duplicate environment key")
@@ -90,13 +102,12 @@ def materialize_h2(plan, protocol, gateway, source, destination, manifest):
         matches = re.findall(r"(?m)^    " + key + r":\s*(\S+)[^\n]*$", text)
         if matches != [value]:
             raise ValueError(f"unexpected route fixture: {key}={matches}")
-    text = re.sub(r"(?m)^(    pool_http2_adaptive_window:)\s*(?:true|false)[^\n]*$",
-                  r"\g<1> " + str(adaptive).lower(), text)
+    text = _ADAPTIVE_WINDOW_LINE_RE.sub(r"\g<1> " + str(adaptive).lower(), text)
     text = text.replace("CA_PATH", "/etc/ferrum/tls/ca.pem")
     Path(destination).write_text(text)
     # Read back exactly what will be mounted, including the route override.
     materialized = Path(destination).read_bytes()
-    if re.findall(rb"(?m)^    pool_http2_adaptive_window: (true|false)$", materialized) != [
+    if _MATERIALIZED_ADAPTIVE_WINDOW_RE.findall(materialized) != [
             str(adaptive).lower().encode()]:
         raise ValueError("effective route adaptive flag does not match arm")
     settings = dict(adaptive_window=adaptive, configured_stream_window=8388608,

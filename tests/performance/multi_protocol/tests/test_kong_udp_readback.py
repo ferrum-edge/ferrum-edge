@@ -13,6 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import kong_udp_readback as readback
 
 
+_SHELL_INVENTORY_PATH_RE = re.compile(r"^    (/\S+?)(?: \\|; do)$", re.M)
+
+
 class KongUDPReadbackTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -142,7 +145,7 @@ class KongUDPReadbackTests(unittest.TestCase):
 
     def test_fixed_shell_inventory_hosted_guard_and_pre_measurement_registration(self):
         shell = (readback.ROOT / "kong_udp_readback.sh").read_text()
-        paths = re.findall(r"^    (/\S+?)(?: \\|; do)$", shell, re.M)
+        paths = _SHELL_INVENTORY_PATH_RE.findall(shell)
         self.assertEqual(paths, list(readback.CONFIGS + readback.SOURCES))
         self.assertIn("for query in " + " ".join(readback.QUERIES) + "; do", shell)
         for command in ("kong version -a", "/usr/local/openresty/nginx/sbin/nginx -V",

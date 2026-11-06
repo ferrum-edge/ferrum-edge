@@ -12,6 +12,9 @@ import sys
 from pathlib import Path
 
 
+_HUNK_HEADER_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
 def normalize_path(path: str, workspace: Path) -> str:
     raw = path.replace("\\", "/")
     workspace_raw = str(workspace).replace("\\", "/")
@@ -97,7 +100,6 @@ def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
     changed: dict[str, set[int]] = {}
     current_file: str | None = None
     next_line: int | None = None
-    hunk_pattern = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
     for line in diff_text.splitlines():
         if line.startswith("+++ b/"):
@@ -106,7 +108,7 @@ def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
             next_line = None
             continue
         if line.startswith("@@ "):
-            match = hunk_pattern.match(line)
+            match = _HUNK_HEADER_RE.match(line)
             next_line = int(match.group(1)) if match else None
             continue
         if current_file is None or next_line is None:

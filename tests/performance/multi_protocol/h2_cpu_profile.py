@@ -51,6 +51,10 @@ ENVOY_DECODE_SECONDS = 600
 ENVOY_DECODE_BYTES = 64 * 1024**2
 
 
+_IMAGE_ID_RE = re.compile(r'sha256:[0-9a-f]{64}')
+_SYMBOL_OFFSET_RE = re.compile(r'\+0x[0-9a-fA-F]+$')
+
+
 def fixture(protocol, gateway):
     text = (HERE / 'configs' / FIXTURES[protocol, gateway]).read_text()
     prefix = '/etc/ferrum/tls' if gateway == 'ferrum' else '/certs'
@@ -64,7 +68,7 @@ def validate_runtime(binding, runtime, config, protocol):
     if (gateway not in ('ferrum', 'envoy') or runtime.get('gateway') != gateway
             or runtime.get('protocol') != protocol or runtime.get('pair') != binding['pair']
             or runtime.get('network_mode') != 'host' or runtime.get('running') is not True
-            or not re.fullmatch(r'sha256:[0-9a-f]{64}', runtime.get('image_id', ''))):
+            or not _IMAGE_ID_RE.fullmatch(runtime.get('image_id', ''))):
         raise ValueError('H2 profile runtime/workload identity mismatch')
     if config != fixture(protocol, gateway) or hashlib.sha256(config).hexdigest() != runtime['config_sha256']:
         raise ValueError('effective config does not match the fixed H2/gRPC fixture')
@@ -344,7 +348,7 @@ def leaf_summary(chains, window, *, top=0):
                   leaf_dsos=dict(collections.Counter(s['frames'][0]['dso'] if s['frames'] else '[none]'
                                                      for s in inside)))
     if top:
-        leaves = collections.Counter((re.sub(r'\+0x[0-9a-fA-F]+$', '', s['frames'][0]['symbol']),
+        leaves = collections.Counter((_SYMBOL_OFFSET_RE.sub('', s['frames'][0]['symbol']),
                                       s['frames'][0]['dso']) for s in known)
         result['top_leaves'] = [dict(symbol=name, dso=dso, samples=count, fraction=count / len(inside))
                                 for (name, dso), count in leaves.most_common(top)]

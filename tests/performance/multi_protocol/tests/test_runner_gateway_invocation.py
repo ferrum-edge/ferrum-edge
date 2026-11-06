@@ -22,6 +22,9 @@ RUNNERS = [
 LAUNCH = re.compile(r'(?:\./target/release/ferrum-edge|"\$GATEWAY_BIN")(?P<rest>[^\n]*)')
 
 
+_BENCH_PORTS_RE = re.compile(r'BENCH_PORTS="([^"]*)"')
+
+
 class RunnerGatewayInvocationTests(unittest.TestCase):
     def test_gateway_launch_uses_run_subcommand(self):
         for runner in RUNNERS:
@@ -34,7 +37,7 @@ class RunnerGatewayInvocationTests(unittest.TestCase):
 
     def test_protocol_runner_does_not_claim_unused_port_5000(self):
         text = (REPO_ROOT / "tests/performance/multi_protocol/run_protocol_test.sh").read_text()
-        ports = re.search(r'BENCH_PORTS="([^"]*)"', text).group(1)
+        ports = _BENCH_PORTS_RE.search(text).group(1)
         self.assertNotIn("5000", ports.split())
 
 

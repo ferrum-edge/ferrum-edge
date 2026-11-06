@@ -40,6 +40,11 @@ QUERIES = ("container", "image", "kong-version", "nginx-version", "package-versi
 KEYS = QUERIES + CONFIGS + SOURCES
 
 
+_CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}")
+_IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_NGINX_INCLUDE_RE = re.compile(r"\binclude\s+([^;\n{}]+);")
+
+
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
@@ -54,7 +59,7 @@ def save(path, value):
 
 
 def begin(directory, cid, image):
-    if not re.fullmatch(r"[0-9a-f]{64}", cid) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+    if not _CONTAINER_ID_RE.fullmatch(cid) or not _IMAGE_ID_RE.fullmatch(image):
         raise ValueError("full fixture container and pinned image IDs required")
     directory.mkdir(parents=True, exist_ok=False)
     sources = {}
@@ -165,7 +170,7 @@ def include_candidates(contents):
     edges, truncated = [], False
     for source, raw in contents.items():
         text = raw.decode("utf-8", "replace")
-        for match in re.finditer(r"\binclude\s+([^;\n{}]+);", text):
+        for match in _NGINX_INCLUDE_RE.finditer(text):
             if len(edges) == INCLUDE_LIMIT:
                 return edges, True
             operand = match[1].strip().strip("\"'")

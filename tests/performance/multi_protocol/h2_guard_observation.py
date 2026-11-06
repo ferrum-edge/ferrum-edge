@@ -30,6 +30,9 @@ GATEWAYS = ("direct", "ferrum", "ferrum-exp-fixed")
 PROTOCOLS = {"http2": "HTTP/2", "grpcs": "gRPC"}
 
 
+_SIGNED_INT_RE = re.compile(r"-?[0-9]{1,20}")
+
+
 def finite_time(value):
     return type(value) in (int, float) and 0 <= value < 1e12 and math.isfinite(value)
 
@@ -136,7 +139,7 @@ def numeric_fields(pairs, names):
     row = {}
     for name, pair in zip(names, pairs):
         key, eq, value = pair.partition("=")
-        if key != name or eq != "=" or not re.fullmatch(r"-?[0-9]{1,20}", value):
+        if key != name or eq != "=" or not _SIGNED_INT_RE.fullmatch(value):
             raise ValueError("invalid fixed guard field")
         number = int(value)
         if number > 2**64 - 1 or number < -(2**63) or (number < 0 and name != "byte_available"):

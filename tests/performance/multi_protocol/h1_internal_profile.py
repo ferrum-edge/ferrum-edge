@@ -61,6 +61,11 @@ RUNTIME_ENV = {
 }
 
 
+_CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}")
+_SOCKET_LINK_RE = re.compile(r"socket:\[([0-9]+)\]")
+_PROFILE_METRIC_RE = re.compile(r"ferrum_h1_profile_([a-z0-9_]+) ([0-9]+)")
+
+
 def finite_number(value):
     try:
         return type(value) in (int, float) and math.isfinite(value)
@@ -72,7 +77,7 @@ def gateway_identity(runtime):
     """Select only the identity retained from the runner-owned docker inspect."""
     if (not isinstance(runtime, dict) or runtime.get("identity_error")
             or not isinstance(runtime.get("container_id"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", runtime["container_id"])
+            or not _CONTAINER_ID_RE.fullmatch(runtime["container_id"])
             or any(type(runtime.get(key)) is not int or runtime[key] <= 0
                    for key in ("host_pid", "start_ticks"))
             or runtime.get("network_mode") != "host"
@@ -120,7 +125,7 @@ def gateway_binding(runtime, processes, proc_root=Path("/proc")):
             target = str(fd.readlink())
         except FileNotFoundError:
             continue  # an unrelated connection may close during fd enumeration
-        match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
+        match = _SOCKET_LINK_RE.fullmatch(target)
         if match:
             sockets.add(int(match[1]))
     if len(listeners) != 1 or listeners[0] <= 0 or listeners[0] not in sockets:
@@ -136,7 +141,7 @@ def parse_metrics(text):
     for line in text.splitlines():
         if not line.startswith(PREFIX):
             continue
-        match = re.fullmatch(r"ferrum_h1_profile_([a-z0-9_]+) ([0-9]+)", line)
+        match = _PROFILE_METRIC_RE.fullmatch(line)
         if not match or match[1] not in FIELDS or match[1] in counters:
             raise ValueError("unknown, duplicate or malformed H1 profile metric")
         value = int(match[2])

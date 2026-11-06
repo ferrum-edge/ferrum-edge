@@ -103,6 +103,14 @@ USER_AGENT = "ferrum-edge-dependency-audit (github.com/ferrum-edge/ferrum-edge)"
 MAX_MERGED_RELEASE_HOLD_DAYS = 30
 
 
+GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+PATCH_PATH_ENTRY_RE = re.compile(r'^(\w[\w-]*)\s*=\s*\{\s*path\s*=\s*"([^"]+)"\s*\}')
+DEPENDABOT_ECOSYSTEM_RE = re.compile(r'^-\s+package-ecosystem:\s*["\']?([\w-]+)["\']?$')
+DEPENDABOT_DEPENDENCY_NAME_RE = re.compile(r'^-\s+dependency-name:\s*["\']([^"\']+)["\']$')
+BACKTICK_CELL_RE = re.compile(r"`([^`\n]+)`")
+
+
 def merged_release_hold_shape_errors(patch: dict[str, Any]) -> list[str]:
     retirement = patch.get("retirement")
     if not isinstance(retirement, dict):
@@ -122,7 +130,7 @@ def merged_release_hold_shape_errors(patch: dict[str, Any]) -> list[str]:
     _require_nonempty_str_list(hold.get("evidence"), f"{prefix}.evidence", errors)
     if hold.get("owner") != patch.get("owner"):
         errors.append(f"{prefix}.owner: must match the patch owner")
-    if not re.fullmatch(r"[0-9a-f]{40}", str(hold.get("merge_commit", ""))):
+    if not GIT_SHA_RE.fullmatch(str(hold.get("merge_commit", ""))):
         errors.append(f"{prefix}.merge_commit: must be a full commit SHA")
     if not CRATES_IO_VERSION_RE.fullmatch(str(hold.get("latest_release", ""))):
         errors.append(f"{prefix}.latest_release: must be a registry version")
@@ -133,7 +141,7 @@ def merged_release_hold_shape_errors(patch: dict[str, Any]) -> list[str]:
     if not isinstance(compatible, dict) or compatible.get("status") != "blocked":
         errors.append(f"{prefix}: requires compatible_release_test.status=blocked")
     try:
-        if any(not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(hold.get(field)))
+        if any(not ISO_DATE_RE.fullmatch(str(hold.get(field)))
                for field in ("reviewed_on", "expires_on")):
             raise ValueError("non-calendar review date")
         reviewed = date.fromisoformat(hold["reviewed_on"])
@@ -189,9 +197,7 @@ def parse_patch_crates_io_text(text: str) -> dict[str, str]:
         if in_block:
             if stripped.startswith("[") and stripped.endswith("]"):
                 break
-            match = re.match(
-                r'^(\w[\w-]*)\s*=\s*\{\s*path\s*=\s*"([^"]+)"\s*\}', stripped
-            )
+            match = PATCH_PATH_ENTRY_RE.match(stripped)
             if match:
                 patches[match.group(1)] = match.group(2)
     return patches
@@ -214,7 +220,7 @@ def dependabot_cargo_ignore_names(text: str) -> list[str] | None:
             continue
         indent = len(line) - len(line.lstrip())
         stripped = line.strip()
-        ecosystem = re.match(r'^-\s+package-ecosystem:\s*["\']?([\w-]+)["\']?$', stripped)
+        ecosystem = DEPENDABOT_ECOSYSTEM_RE.match(stripped)
         if ecosystem:
             in_cargo = ecosystem.group(1) == "cargo"
             in_ignore = False
@@ -232,9 +238,7 @@ def dependabot_cargo_ignore_names(text: str) -> list[str] | None:
             in_ignore = stripped == "ignore:"
             continue
         if in_ignore:
-            entry = re.match(
-                r'^-\s+dependency-name:\s*["\']([^"\']+)["\']$', stripped
-            )
+            entry = DEPENDABOT_DEPENDENCY_NAME_RE.match(stripped)
             if entry and names is not None:
                 names.append(entry.group(1))
     return names
@@ -632,7 +636,7 @@ def policy_inventory_rows(policy_text: str) -> tuple[list[tuple[str, str]], list
             )
             continue
         cells = [cell.strip() for cell in raw_cells[1:-1]]
-        id_match = re.fullmatch(r"`([^`\n]+)`", cells[0])
+        id_match = BACKTICK_CELL_RE.fullmatch(cells[0])
         if id_match is None:
             errors.append(
                 f"dependency-policy.md lifecycle inventory row {line_number}: "
