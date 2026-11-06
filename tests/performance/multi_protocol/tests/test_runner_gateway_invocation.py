@@ -23,6 +23,7 @@ LAUNCH = re.compile(r'(?:\./target/release/ferrum-edge|"\$GATEWAY_BIN")(?P<rest>
 
 
 _BENCH_PORTS_RE = re.compile(r'BENCH_PORTS="([^"]*)"')
+_RUN_SUBCOMMAND_RE = re.compile(r"^\s+run\b")
 
 
 class RunnerGatewayInvocationTests(unittest.TestCase):
@@ -32,7 +33,7 @@ class RunnerGatewayInvocationTests(unittest.TestCase):
             launches = [m for m in LAUNCH.finditer(text) if ">" in m.group("rest") or "&" in m.group("rest")]
             self.assertTrue(launches, f"{runner}: no gateway launch found")
             for match in launches:
-                self.assertRegex(match.group("rest"), r"^\s+run\b",
+                self.assertRegex(match.group("rest"), _RUN_SUBCOMMAND_RE,
                                  f"{runner}: gateway launched without `run`: {match.group(0)!r}")
 
     def test_protocol_runner_does_not_claim_unused_port_5000(self):

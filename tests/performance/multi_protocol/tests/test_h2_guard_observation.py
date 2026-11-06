@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,9 @@ from h2_guard_observation import (
 from prepare import SHA256, apply_ferrum_patch, extract_source, patch_source
 from verify import verify_campaign
 from lint import compare
+
+
+_CAMPAIGN_INCOMPLETE_RE = re.compile("campaign evidence incomplete")
 
 
 def row(**updates):
@@ -417,7 +421,7 @@ class GuardObservationTests(unittest.TestCase):
                     self.assertFalse(actual["bounded_capture_complete"])
                     for bucket in ("events", "transitions", "fences", "measurement_failures"):
                         self.assertEqual(actual[bucket], expected_observation[bucket])
-                    with self.assertRaisesRegex(ValueError, "campaign evidence incomplete"):
+                    with self.assertRaisesRegex(ValueError, _CAMPAIGN_INCOMPLETE_RE):
                         verify_campaign(root, protocol)
                 self.assertEqual(len(recursions), 2)  # annotation and raw reconciliation
                 report = json.loads((root / "guard-evidence-index.json").read_text())
@@ -459,7 +463,7 @@ class GuardObservationTests(unittest.TestCase):
                     return original_dumps(value, *args, **kwargs)
 
                 with mock.patch("verify.json.dumps", side_effect=dumps):
-                    with self.assertRaisesRegex(ValueError, "campaign evidence incomplete"):
+                    with self.assertRaisesRegex(ValueError, _CAMPAIGN_INCOMPLETE_RE):
                         verify_campaign(root, protocol)
                 self.assertEqual(len(recursions), 1)
                 report = json.loads((root / "guard-evidence-index.json").read_text())

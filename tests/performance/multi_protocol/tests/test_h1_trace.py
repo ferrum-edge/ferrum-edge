@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import tempfile
@@ -22,6 +23,10 @@ from h1_internal_profile import validate_selection
 import h1_trace as trace
 import h1_trace_preflight as preflight
 from live_contract import measurement_window
+
+
+_ADJACENT_ERROR_RE = re.compile('adjacent')
+_STALE_TEARDOWN_ERROR_RE = re.compile('stale/mismatched')
 
 
 def counter(**changes):
@@ -869,7 +874,7 @@ class H1AdmissionTests(unittest.TestCase):
                            ('namespaces', dict(owner['namespaces'], mnt=99))):
             with patch.object(trace, 'identity', return_value=dict(owner, **{key: value})), \
                     patch.object(trace, 'admit'):
-                with self.assertRaisesRegex(ValueError, 'adjacent'):
+                with self.assertRaisesRegex(ValueError, _ADJACENT_ERROR_RE):
                     trace.admit_runtime_target(runtime, owner)
 
 
@@ -1307,7 +1312,7 @@ class H1TeardownTests(unittest.TestCase):
                            ('owner', dict(self.owner, boot_id='prior-boot')), ('at', self.at(1))]:
             with self.subTest(key=key):
                 trace.write(self.out / 'teardown-request.json', dict(request, **{key: value}))
-                with self.assertRaisesRegex(ValueError, 'stale/mismatched'):
+                with self.assertRaisesRegex(ValueError, _STALE_TEARDOWN_ERROR_RE):
                     self.lifecycle.authorize_teardown()
         trace.write(self.out / 'teardown-request.json', request)
         self.raw['rps'] = 999
