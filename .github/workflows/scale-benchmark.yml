@@ -229,6 +229,17 @@ jobs:
           python3 - /tmp/scale_bench_output.txt <<'PYEOF'
           import sys, os, re, json
 
+          PROXIES_RE = re.compile(r'Proxies:\s+([\d,]+)')
+          DURATION_RE = re.compile(r'Duration:\s+([\d.]+)s')
+          TOTAL_REQUESTS_RE = re.compile(r'Total requests:\s+([\d,]+)')
+          SUCCESSFUL_RE = re.compile(r'Successful:\s+([\d,]+)')
+          FAILED_RE = re.compile(r'Failed:\s+([\d,]+)')
+          RPS_RE = re.compile(r'RPS:\s+([\d.]+)')
+          LATENCY_RES = [
+              (key, re.compile(rf'{label} latency:\s+([\d.]+)\s+µs'))
+              for label, key in [('Avg', 'avg_us'), ('P50', 'p50_us'), ('P95', 'p95_us'), ('P99', 'p99_us'), ('Max', 'max_us')]
+          ]
+
           summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
           db_type = os.environ.get("DB_TYPE", "sqlite")
           build_profile = "release"
@@ -260,32 +271,32 @@ jobs:
           blocks = raw.split("┌─────────────────────────────────────────────────────────┐")
           for block in blocks[1:]:  # skip everything before the first block
               r = {}
-              m = re.search(r'Proxies:\s+([\d,]+)', block)
+              m = PROXIES_RE.search(block)
               if m:
                   r['proxies'] = int(m.group(1).replace(',', ''))
 
-              m = re.search(r'Duration:\s+([\d.]+)s', block)
+              m = DURATION_RE.search(block)
               if m:
                   r['duration_secs'] = float(m.group(1))
 
-              m = re.search(r'Total requests:\s+([\d,]+)', block)
+              m = TOTAL_REQUESTS_RE.search(block)
               if m:
                   r['total_requests'] = int(m.group(1).replace(',', ''))
 
-              m = re.search(r'Successful:\s+([\d,]+)', block)
+              m = SUCCESSFUL_RE.search(block)
               if m:
                   r['successful'] = int(m.group(1).replace(',', ''))
 
-              m = re.search(r'Failed:\s+([\d,]+)', block)
+              m = FAILED_RE.search(block)
               if m:
                   r['failed'] = int(m.group(1).replace(',', ''))
 
-              m = re.search(r'RPS:\s+([\d.]+)', block)
+              m = RPS_RE.search(block)
               if m:
                   r['rps'] = float(m.group(1))
 
-              for label, key in [('Avg', 'avg_us'), ('P50', 'p50_us'), ('P95', 'p95_us'), ('P99', 'p99_us'), ('Max', 'max_us')]:
-                  m = re.search(rf'{label} latency:\s+([\d.]+)\s+µs', block)
+              for key, latency_re in LATENCY_RES:
+                  m = latency_re.search(block)
                   if m:
                       r[key] = float(m.group(1))
 
@@ -534,6 +545,8 @@ jobs:
           import statistics
           from pathlib import Path
 
+          TEST_RESULT_RE = re.compile(r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; (\d+) filtered out; finished in ([0-9.]+)s$", re.MULTILINE)
+          USAGE_RE = re.compile(r"wall_seconds=([0-9.]+) max_child_rss_kib=(\d+) exit_status=0\n?")
           root = Path(os.environ["RUNNER_TEMP"]) / "route-status-profile"
           name = "unit::gateway_core::k8s_status_planning_tests::large_route_snapshots_scale_indexing_while_budget_bounds_planning"
           measurements = []
@@ -541,10 +554,10 @@ jobs:
               log = (root / f"round-{round}.log").read_text()
               if f"test {name} ... ok" not in log:
                   raise SystemExit("The exact scale regression did not pass")
-              results = re.findall(r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; (\d+) filtered out; finished in ([0-9.]+)s$", log, re.MULTILINE)
+              results = TEST_RESULT_RE.findall(log)
               if len(results) != 1 or int(results[0][0]) == 0:
                   raise SystemExit("Expected exactly one isolated passing test from the complete unit target")
-              usage = re.fullmatch(r"wall_seconds=([0-9.]+) max_child_rss_kib=(\d+) exit_status=0\n?", (root / f"round-{round}.time").read_text())
+              usage = USAGE_RE.fullmatch((root / f"round-{round}.time").read_text())
               if usage is None:
                   raise SystemExit("Missing successful timing proof")
               measurements.append({"round": round, "wall_seconds": float(usage[1]), "max_child_rss_kib": int(usage[2]), "test_seconds": float(results[0][1]), "filtered_tests": int(results[0][0])})

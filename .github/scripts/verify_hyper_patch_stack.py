@@ -35,6 +35,8 @@ SERIES = (
 )
 ROOT_FILES = {"Cargo.toml", "LICENSE", "README.md"}
 
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -74,7 +76,7 @@ def manifest_hashes(manifest: Path) -> dict[str, str]:
         relative = name.removeprefix(prefix)
         path = PurePosixPath(relative)
         if (
-            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            not _SHA256_HEX_RE.fullmatch(digest)
             or path.is_absolute()
             or ".." in path.parts
             or relative in hashes

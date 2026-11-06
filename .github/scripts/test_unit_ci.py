@@ -59,6 +59,10 @@ STEP_JOBS = {
     "acme-renewal": "test-acme",
 }
 
+_STEP_BOUNDARY_RE = re.compile(r"(?m)^(?=      - )")
+_ACME_UNIT_TESTS_COMMAND_RE = re.compile(r"cargo test[^\n]*--features acme[^\n]*--test unit_tests")
+_ACME_CARGO_TEST_LINE_RE = re.compile(r"(?m)^\s+cargo test[^\n]*--features acme")
+
 
 def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]:
     errors = []
@@ -74,7 +78,7 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
     for phase, name in STEPS.items():
         job_name = STEP_JOBS[phase]
         job_body = jobs[job_name]
-        steps = re.split(r"(?m)^(?=      - )", job_body)
+        steps = _STEP_BOUNDARY_RE.split(job_body)
         candidates = [step for step in steps if step.startswith(f"      - name: {name}\n")]
         expected = [
             f"- name: {name}",
@@ -128,9 +132,9 @@ def contract_errors(workflow: str, manifest: str, tls_modules: str) -> list[str]
     for target in ("unit_tests", "unit_plugins_a_tests", "unit_plugins_b_tests", "unit_gateway_core_tests"):
         if f"target: {target}\n" not in jobs["test-unit"]:
             errors.append(f"test-unit matrix must run the {target} target")
-    if re.search(r"cargo test[^\n]*--features acme[^\n]*--test unit_tests", executable):
+    if _ACME_UNIT_TESTS_COMMAND_RE.search(executable):
         errors.append("ACME must not recompile the monolithic unit_tests target")
-    if re.search(r"(?m)^\s+cargo test[^\n]*--features acme", "\n".join(
+    if _ACME_CARGO_TEST_LINE_RE.search("\n".join(
         line for line in jobs["test-unit"].splitlines() if not line.lstrip().startswith("#")
     )):
         errors.append("ACME phases must not run inside the monolithic Unit Tests job")

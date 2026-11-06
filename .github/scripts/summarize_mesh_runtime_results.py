@@ -34,6 +34,8 @@ MESH_ORDER = ("direct", "ferrumbaseline", "ferrum", "envoy", "consul", "consulht
 CELL_RE = re.compile(r"^(?P<mesh>[a-z]+)_http1_(?P<payload>[0-9]+)\.json$")
 MEM_RE = re.compile(r"^([0-9.]+)\s*([KMGT]?i?B)")
 
+_LOWERCASE_TOKEN_RE = re.compile(r"[a-z]+")
+
 
 def effective_concurrency(base: int, payload: int) -> int:
     """Match run_mesh_runtime_bench.sh's common bulk-payload schedule."""
@@ -58,7 +60,7 @@ def planned_cells(results_root: Path, warnings: list[str]) -> dict[Path, dict] |
         planned: dict[Path, dict] = {}
         for cell in campaign["cells"]:
             arm, payload, repetition = cell["arm"], cell["payload"], cell["repetition"]
-            if not isinstance(arm, str) or not re.fullmatch(r"[a-z]+", arm):
+            if not isinstance(arm, str) or not _LOWERCASE_TOKEN_RE.fullmatch(arm):
                 raise ValueError("each cell must name an arm")
             if type(payload) is not int or payload <= 0 or type(repetition) is not int or repetition <= 0:
                 raise ValueError("each cell must have a positive payload and repetition")

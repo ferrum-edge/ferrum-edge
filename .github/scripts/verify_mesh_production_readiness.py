@@ -41,6 +41,20 @@ PULL_SECRET_WORKLOADS = (
     ("ferrum-mesh-cni-cleanup-wait", "Job"),
 )
 
+_DOCUMENT_SEPARATOR_RE = re.compile(r"(?m)^---\s*$")
+_ADMIN_CONTAINER_PORT_RE = re.compile(r"(?m)^\s+containerPort:\s*19000\s*$")
+_TERMINATION_GRACE_110_RE = re.compile(r"(?m)^\s+terminationGracePeriodSeconds:\s*110\s*$")
+_PRESTOP_BLOCK_RE = re.compile(r"(?ms)^\s+preStop:\s*\n(?:\s+.*\n){0,6}")
+_PRESTOP_SLEEP_30_RE = re.compile(r"seconds:\s*30")
+_CPU_RESOURCE_RE = re.compile(r"(?m)^\s+cpu:\s*\S+")
+_MEMORY_RESOURCE_RE = re.compile(r"(?m)^\s+memory:\s*\S+")
+_FAILURE_THRESHOLD_3_RE = re.compile(r"(?m)^\s+failureThreshold:\s*3\s*$")
+_ALERT_EXPR_RE = re.compile(r"(?m)^\s+expr:\s*(.+)$")
+_SYS_ADMIN_CAPABILITY_RE = re.compile(r'(?m)^\s*- "?SYS_ADMIN"?\s*$')
+_DROP_ALL_CAPABILITIES_RE = re.compile(r'(?m)^\s*drop:\s*(?:\[\s*"?ALL"?\s*\]|\n\s*- "?ALL"?)\s*$')
+_ADD_CAPABILITIES_RE = re.compile(r"(?m)^\s*add:")
+_REGCRED_PULL_SECRET_RE = re.compile(r"(?m)^\s*- name: regcred\s*$")
+
 
 def fail(title: str, detail: str) -> None:
     print(f"::error title={title}::{detail}")
@@ -58,14 +72,16 @@ def require_capture(results_dir: Path, relative: str) -> Path:
 
 
 def split_documents(rendered: str) -> list[str]:
-    return [doc for doc in re.split(r"(?m)^---\s*$", rendered) if doc.strip()]
+    return [doc for doc in _DOCUMENT_SEPARATOR_RE.split(rendered) if doc.strip()]
 
 
 def resource_document(rendered: str, name: str, kind: str) -> str:
+    kind_re = re.compile(rf"(?m)^kind:\s*{re.escape(kind)}\s*$")
+    name_re = re.compile(rf"(?m)^  name:\s*{re.escape(name)}\s*$")
     for doc in split_documents(rendered):
-        if not re.search(rf"(?m)^kind:\s*{re.escape(kind)}\s*$", doc):
+        if not kind_re.search(doc):
             continue
-        if re.search(rf"(?m)^  name:\s*{re.escape(name)}\s*$", doc):
+        if name_re.search(doc):
             return doc
     fail(
         "Mesh workload missing from render",
@@ -150,7 +166,7 @@ def validate_admin_env_override(results_dir: Path) -> None:
                 "Admin env override duplicated",
                 f"{name} must appear exactly once on the control plane, found {count}",
             )
-    if not re.search(r"(?m)^\s+containerPort:\s*19000\s*$", cp):
+    if not _ADMIN_CONTAINER_PORT_RE.search(cp):
         fail(
             "Admin container port not resolved from env",
             "controlPlane.env.FERRUM_ADMIN_HTTP_PORT must drive the admin-http containerPort",
@@ -164,7 +180,7 @@ def validate_serving_podspecs(results_dir: Path) -> None:
     )
     for name, kind in SERVING:
         doc = resource_document(rendered, name, kind)
-        if not re.search(r"(?m)^\s+terminationGracePeriodSeconds:\s*110\s*$", doc):
+        if not _TERMINATION_GRACE_110_RE.search(doc):
             fail(
                 "Serving grace period missing",
                 f"{name} must render terminationGracePeriodSeconds: 110 "
@@ -176,16 +192,13 @@ def validate_serving_podspecs(results_dir: Path) -> None:
             "Serving preStop missing",
             f"{name} must render lifecycle.preStop (SleepAction) by default",
         )
-        prestop = re.search(
-            r"(?ms)^\s+preStop:\s*\n(?:\s+.*\n){0,6}",
-            doc,
-        )
+        prestop = _PRESTOP_BLOCK_RE.search(doc)
         if prestop is None or "sleep:" not in prestop.group(0):
             fail(
                 "preStop is not a SleepAction",
                 f"{name}: distroless has no shell; preStop must use sleep",
             )
-        if not re.search(r"seconds:\s*30", prestop.group(0)):
+        if not _PRESTOP_SLEEP_30_RE.search(prestop.group(0)):
             fail(
                 "preStop seconds missing",
                 f"{name} must render shutdownPreStopSeconds (30)",
@@ -201,9 +214,7 @@ def validate_serving_podspecs(results_dir: Path) -> None:
                 "Pre-drain env missing",
                 f"{name} must render FERRUM_SHUTDOWN_PREDRAIN_SECONDS=0 by default",
             )
-        if not re.search(r"(?m)^\s+cpu:\s*\S+", doc) or not re.search(
-            r"(?m)^\s+memory:\s*\S+", doc
-        ):
+        if not _CPU_RESOURCE_RE.search(doc) or not _MEMORY_RESOURCE_RE.search(doc):
             fail(
                 "Serving resources missing",
                 f"{name} must render non-empty resources.requests.cpu and memory",
@@ -220,7 +231,7 @@ def validate_serving_podspecs(results_dir: Path) -> None:
             "capabilities.drop ALL missing",
             f"{name} must drop ALL capabilities",
         )
-        if not re.search(r"(?m)^\s+failureThreshold:\s*3\s*$", doc):
+        if not _FAILURE_THRESHOLD_3_RE.search(doc):
             fail(
                 "Readiness failureThreshold implicit",
                 f"{name} must render readiness failureThreshold: 3 (endpoint-removal budget)",
@@ -439,13 +450,13 @@ def validate_injector_shutdown(results_dir: Path) -> None:
         "ferrum-mesh-injector must render lifecycle.preStop (SleepAction) so "
         "kube-proxy endpoint removal finishes before the listener closes",
     )
-    prestop = re.search(r"(?ms)^\s+preStop:\s*\n(?:\s+.*\n){0,6}", injector)
+    prestop = _PRESTOP_BLOCK_RE.search(injector)
     if prestop is None or "sleep:" not in prestop.group(0):
         fail(
             "Injector preStop is not a SleepAction",
             "distroless has no shell; the injector preStop must use sleep",
         )
-    if not re.search(r"seconds:\s*30", prestop.group(0)):
+    if not _PRESTOP_SLEEP_30_RE.search(prestop.group(0)):
         fail(
             "Injector preStop seconds missing",
             "ferrum-mesh-injector must render injector.shutdownPreStopSeconds (30)",
@@ -640,7 +651,7 @@ def validate_observability(results_dir: Path) -> None:
             "do not render a default metrics bearer token value",
         )
     rule = resource_document(rendered, "ferrum-mesh-alerts", "PrometheusRule")
-    for match in re.finditer(r"(?m)^\s+expr:\s*(.+)$", rule):
+    for match in _ALERT_EXPR_RE.finditer(rule):
         if "absent(" in match.group(1):
             fail(
                 "Impossible absent() alert",
@@ -999,7 +1010,7 @@ def validate_node_waypoint_ebpf_caps(results_dir: Path) -> None:
     # Issue #6112: the node-agent resolves veths from host routes and host
     # sysfs and never enters a pod netns, so NodeWaypoint must not widen it with
     # SYS_ADMIN or pod-scoped hostPID. Only the ambient proxy keeps them.
-    if re.search(r'(?m)^\s*- "?SYS_ADMIN"?\s*$', node_agent):
+    if _SYS_ADMIN_CAPABILITY_RE.search(node_agent):
         fail(
             "node-agent SYS_ADMIN granted",
             "NodeWaypoint must not add SYS_ADMIN to the node-agent; it is only the "
@@ -1133,14 +1144,12 @@ def validate_cni_lifecycle_capabilities(results_dir: Path) -> None:
         for container in containers:
             block = init_container_block(node_agent, container, f"{capture} node-agent")
             where = f"{container} in {capture}"
-            if not re.search(
-                r'(?m)^\s*drop:\s*(?:\[\s*"?ALL"?\s*\]|\n\s*- "?ALL"?)\s*$', block
-            ):
+            if not _DROP_ALL_CAPABILITIES_RE.search(block):
                 fail(
                     "CNI init container keeps capabilities",
                     f"{where} must render capabilities.drop: [ALL]",
                 )
-            if re.search(r"(?m)^\s*add:", block):
+            if _ADD_CAPABILITIES_RE.search(block):
                 fail(
                     "CNI init container adds capabilities",
                     f"{where} needs no capability: it owns the root-owned host CNI "
@@ -1180,7 +1189,7 @@ def validate_image_pull_secrets(results_dir: Path) -> None:
             "Mesh workload missing imagePullSecrets",
             f"{kind}/{name} must render image.pullSecrets as `- name: regcred`",
         )
-        entries = len(re.findall(r"(?m)^\s*- name: regcred\s*$", doc))
+        entries = len(_REGCRED_PULL_SECRET_RE.findall(doc))
         if entries != 1:
             fail(
                 "Mesh workload imagePullSecrets count wrong",

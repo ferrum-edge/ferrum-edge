@@ -167,6 +167,16 @@ INTEGRATION_STEP_TOKENS = (
     "INTEGRATION_PARTITION: ${{ matrix.partition }}",
 )
 
+_NEXTEST_REMAINDER_FILTER_RE = re.compile(r"not test\(/(?P<regex>[A-Za-z0-9_:|()]+)/\)")
+_SHARD_MATRIX_RE = re.compile(r"(?m)^      matrix:\n        include:\n          - shard:")
+_TIMEOUT_120_RE = re.compile(r"(?m)^    timeout-minutes: 120$")
+_TIMEOUT_75_RE = re.compile(r"(?m)^    timeout-minutes: 75$")
+_JOB_IF_ALWAYS_RE = re.compile(r"(?m)^    if: always\(\)$")
+_DOWNLOAD_COVERAGE_SCRIPT_RE = re.compile(
+    r"(?ms)^      - name: Download and extract coverage data\n"
+    r".*?^        run: \|\n(?P<script>.*?)^        env:"
+)
+
 
 def extract_job_body(workflow_yml: str, job: str) -> str:
     match = re.search(
@@ -192,7 +202,7 @@ def integration_registry_modules(registry: str) -> list[str]:
 
 
 def remainder_regex(filterset: str) -> re.Pattern[str] | None:
-    match = re.fullmatch(r"not test\(/(?P<regex>[A-Za-z0-9_:|()]+)/\)", filterset)
+    match = _NEXTEST_REMAINDER_FILTER_RE.fullmatch(filterset)
     return re.compile(match.group("regex")) if match else None
 
 
@@ -382,13 +392,13 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(r"(?m)^      matrix:\n        include:\n          - shard:", shard_body)
+        _SHARD_MATRIX_RE.search(shard_body)
         is None,
         "coverage-shard must not hardcode a static six-shard include matrix",
         failures,
     )
     require(
-        re.search(r"(?m)^    timeout-minutes: 120$", shard_body) is not None,
+        _TIMEOUT_120_RE.search(shard_body) is not None,
         "coverage-shard must keep the 120-minute lib-unit wall-clock budget",
         failures,
     )
@@ -403,7 +413,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        re.search(r"(?m)^    timeout-minutes: 75$", shard_body) is None,
+        _TIMEOUT_75_RE.search(shard_body) is None,
         "coverage-shard must not restore the 75-minute deadline that canceled a progressing suite",
         failures,
     )
@@ -427,7 +437,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
 
     merge_body = extract_job_body(text, "coverage-merge")
     require(
-        re.search(r"(?m)^    if: always\(\)$", merge_body) is not None,
+        _JOB_IF_ALWAYS_RE.search(merge_body) is not None,
         "Merge Coverage must run with if: always()",
         failures,
     )
@@ -552,11 +562,7 @@ def validate_docs(failures: list[str]) -> None:
 
 def artifact_transport_script(workflow: str) -> str:
     body = extract_job_body(workflow, "coverage-merge")
-    match = re.search(
-        r"(?ms)^      - name: Download and extract coverage data\n"
-        r".*?^        run: \|\n(?P<script>.*?)^        env:",
-        body,
-    )
+    match = _DOWNLOAD_COVERAGE_SCRIPT_RE.search(body)
     if not match:
         raise RuntimeError("missing coverage artifact transport step")
     return textwrap.dedent(match.group("script"))
