@@ -81,6 +81,24 @@ is printed in the CP startup log (`CP mode: serving single namespace ...`,
 Whitespace is trimmed; duplicates are deduplicated; `*` cannot be combined
 with explicit entries (validation error).
 
+For `Set` and `All`, the CP loads several namespaces at once within each
+polling phase: incremental deltas, the pre-load change-sequence boundaries,
+and full reloads. A phase finishes before the next one starts, so every
+boundary is captured before any resource load. Results are merged in
+namespace order, and one namespace's load failure never blocks the others.
+
+The per-phase budget depends on the backend:
+
+- **SQL** (PostgreSQL, MySQL, SQLite): a quarter of
+  `FERRUM_DB_POOL_MAX_CONNECTIONS`, between 1 and 4. The default pool of 32
+  allows 4; pools below 8 load namespaces one at a time. An in-flight full
+  load holds one primary pool connection for its whole snapshot transaction;
+  incremental loads and boundary reads hold a connection only for each query.
+- **MongoDB**: up to 4. `FERRUM_DB_POOL_*` does not apply; size the driver
+  pool with the URI `maxPoolSize` option (driver default 10), leaving room for
+  admin traffic. Driver checkouts wait rather than time out, so a smaller pool
+  only queues the extra loads.
+
 ## Per-namespace broadcast partitioning
 
 A single broadcast channel shared by every DP would leak other namespaces'

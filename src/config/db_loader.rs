@@ -8949,13 +8949,23 @@ impl DatabaseStore {
         }
     }
 
+    /// Record the admin-read replica URL without dialing it.
+    ///
+    /// Startup pairs this with a background
+    /// [`reconnect_read_replica`](Self::reconnect_read_replica) so an unreachable
+    /// replica cannot delay the authoritative primary load; admin reads use the
+    /// primary until the replica pool is published.
+    pub fn set_read_replica_url(&mut self, replica_url: &str) {
+        self.read_replica_url = Some(replica_url.to_string());
+    }
+
     /// Connect a read replica pool for admin read offload.
     ///
     /// The read replica pool uses the same connection settings (max_connections,
     /// max_lifetime) as the primary. Migrations are NOT run on the replica.
     pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
-        self.read_replica_url = Some(replica_url.to_string());
+        self.set_read_replica_url(replica_url);
 
         if !self.failover_topology.primary_active() {
             info!(

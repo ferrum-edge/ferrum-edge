@@ -56,6 +56,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
 
 ### Performance
+- **Multi-namespace control planes load their namespaces concurrently.** With
+  `FERRUM_CP_NAMESPACES` set to a list or `*`, each incremental poll, each
+  set of pre-load change-sequence boundary reads and each full reload used to
+  query one namespace at a time. Each of those phases now runs several
+  namespace loads at once: on SQL, a quarter of
+  `FERRUM_DB_POOL_MAX_CONNECTIONS` between 1 and 4 (pools below 8 stay
+  serial); on MongoDB, up to 4. Every boundary is still captured before any
+  resource load starts, results are merged in namespace order, and a failing
+  namespace is still isolated (#2983). A multi-namespace full snapshot is now
+  stamped with the earliest namespace load time rather than the first one in
+  namespace order. Single-namespace CPs are unchanged.
+- **An admin-read replica no longer delays database and CP startup.**
+  `FERRUM_DB_READ_REPLICA_URL` used to be dialed (connect plus `SELECT 1`, up to
+  `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS`) before migrations and the initial
+  primary load. It now connects in the background through the same reconnect
+  path the poll loop uses. Admin reads use primary until the replica pool is
+  up, as they already did whenever the replica was unavailable.
 - **SQL mTLS identity uniqueness is a single index lookup.** Admin consumer
   writes, credential add/replace and `POST /batch` checked each mTLS identity
   against `consumer_credential_index` and, when the lookup found no other
