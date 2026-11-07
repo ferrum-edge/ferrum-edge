@@ -1,10 +1,11 @@
 use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    oidc_open_session_cookie_for_test, oidc_resolve_discovery_for_test,
-    oidc_resolved_discovery_endpoints_for_test, oidc_sealed_due_refresh_session_cookie_for_test,
-    oidc_sealed_refresh_session_cookie_for_test, oidc_sealed_session_cookie_for_test,
-    oidc_session_state_from_set_cookie_for_test, request_credential_deadline_remaining,
+    oidc_discovery_published_within_for_test, oidc_open_session_cookie_for_test,
+    oidc_resolve_discovery_for_test, oidc_resolved_discovery_endpoints_for_test,
+    oidc_sealed_due_refresh_session_cookie_for_test, oidc_sealed_refresh_session_cookie_for_test,
+    oidc_sealed_session_cookie_for_test, oidc_session_state_from_set_cookie_for_test,
+    request_credential_deadline_remaining,
 };
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{AuthMode, GatewayConfig, PluginConfig, PluginScope};
@@ -2273,6 +2274,104 @@ async fn gateway_dialed_provider_urls_reject_cleartext_localhost_names() {
         .err()
         .expect("client_auth none against a localhost name must reject");
     assert!(error.contains("loopback IP-literal"), "{error}");
+}
+
+/// `client_auth.method: none` admits an unauthenticated token exchange only
+/// against a loopback IP literal. Construction sees only the discovery URL, so
+/// the constructor hands the rule to the discovery task, which must refuse to
+/// publish a document whose token endpoint is a name; a credentialed provider
+/// keeps cross-origin HTTPS discovery.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test(flavor = "multi_thread")]
+async fn none_client_auth_refuses_a_named_discovered_token_endpoint() {
+    use ferrum_edge::plugins::utils::jwks_cache::clear_jwks_cache;
+    async fn plugin_for(
+        token_endpoint: String,
+        client_auth: serde_json::Value,
+    ) -> (MockServer, OidcRelyingParty) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/none-auth/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": TEST_ISSUER,
+                "authorization_endpoint": format!("{}/none-auth/authorize", server.uri()),
+                "token_endpoint": token_endpoint.replace("{origin}", &server.uri()),
+                "jwks_uri": format!("{}/none-auth/jwks.json", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        let mut config = base_config();
+        config["providers"][0] = json!({
+            "issuer": TEST_ISSUER,
+            "discovery_url": format!("{}/none-auth/openid-configuration", server.uri()),
+            "client_id": "ferrum-gateway",
+            "client_auth": client_auth,
+            "scopes": ["openid"],
+            "redirect_uri": "https://app.example.com/oauth/callback",
+            "callback_path": "/oauth/callback"
+        });
+        let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default())
+            .expect("loopback discovery URL is admitted at construction");
+        (server, plugin)
+    }
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+    let wait = std::time::Duration::from_millis(1500);
+
+    let (_server, named_none) = plugin_for(
+        "https://localhost:8443/token".to_string(),
+        json!({"method": "none"}),
+    )
+    .await;
+    assert!(
+        !oidc_discovery_published_within_for_test(&named_none, wait).await,
+        "none must refuse a named discovered token endpoint"
+    );
+
+    let (_server, named_credentialed) = plugin_for(
+        "https://localhost:8443/token".to_string(),
+        json!({"method": "client_secret_basic", "client_secret": "secret"}),
+    )
+    .await;
+    assert!(
+        oidc_discovery_published_within_for_test(&named_credentialed, wait).await,
+        "a credentialed provider keeps cross-origin HTTPS discovery"
+    );
+
+    let (_server, literal_none) = plugin_for(
+        "{origin}/none-auth/token".to_string(),
+        json!({"method": "none"}),
+    )
+    .await;
+    assert!(
+        oidc_discovery_published_within_for_test(&literal_none, wait).await,
+        "a loopback IP-literal discovered token endpoint is admitted under none"
+    );
+}
+
+/// The parsed-host rule keeps URL-normalized loopback spellings (`127.1`,
+/// expanded `::1`): the `url` parser turns them into the address they connect
+/// to, so no name resolution is involved.
+#[tokio::test]
+async fn gateway_dialed_urls_admit_normalized_loopback_ip_spellings() {
+    for host in ["127.1", "[0:0:0:0:0:0:0:1]"] {
+        let mut config = base_config();
+        config["providers"][0] = json!({
+            "issuer": "http://127.0.0.1:8080",
+            "authorization_endpoint": format!("http://{host}:8080/authorize"),
+            "token_endpoint": format!("http://{host}:8080/token"),
+            "jwks_uri": format!("http://{host}:8080/jwks"),
+            "client_id": "local-client",
+            "client_auth": {"method": "none"},
+            "scopes": ["openid"],
+            "redirect_uri": "http://localhost:3000/oauth/callback",
+            "callback_path": "/oauth/callback"
+        });
+        assert!(
+            OidcRelyingParty::new(&config, PluginHttpClient::default()).is_ok(),
+            "{host}"
+        );
+    }
 }
 
 #[tokio::test]

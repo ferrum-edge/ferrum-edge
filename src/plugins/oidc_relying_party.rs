@@ -3014,6 +3014,23 @@ impl OidcRelyingParty {
     // Reached only through the lib target's `_test_support` shim by external
     // unit tests; the bin target recompiles this module without that caller.
     #[allow(dead_code)]
+    /// Whether the discovery task published a document within `wait`, without
+    /// consuming the plugin. A refused document is retried with backoff, so
+    /// the task itself never ends on refusal.
+    #[allow(dead_code)]
+    pub(crate) async fn discovery_published_within_for_tests(&self, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if self.provider.discovery.load().as_ref().is_some() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     pub(crate) async fn resolved_discovery_endpoints_for_tests(
         mut self,
     ) -> Option<(Option<String>, Option<String>)> {
@@ -5408,7 +5425,9 @@ pub(crate) mod discovery_test_seams {
     }
 
     /// Fetch a live discovery document and apply operator-supplied endpoint
-    /// overrides, mirroring the resolution `spawn_oidc_discovery` performs.
+    /// overrides, mirroring the resolution `spawn_oidc_discovery` performs for
+    /// a credentialed client (no `client_auth.method: none` token-endpoint
+    /// rule; that wiring is pinned through `discovery_published_within_for_tests`).
     pub(crate) async fn resolve_discovery_for_test(
         http_client: &PluginHttpClient,
         discovery_url: &str,
@@ -5790,7 +5809,8 @@ mod tests {
         let named = serve("https://localhost:8443/token").await;
         let error = fetch(&named, true)
             .await
-            .expect_err("none must refuse a named discovered token endpoint");
+            .err()
+            .expect("none must refuse a named discovered token endpoint");
         assert!(error.contains("loopback IP literal"), "{error}");
         assert!(
             fetch(&named, false).await.is_ok(),
@@ -5802,7 +5822,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_provider_urls_allow_http_only_for_literal_loopback_or_localhost() {
+    fn gateway_urls_allow_http_only_for_loopback_ip_literals_and_browser_urls_keep_localhost() {
         for allowed in [
             "http://127.0.0.1:8080/token",
             "http://[::1]:8080/token",
