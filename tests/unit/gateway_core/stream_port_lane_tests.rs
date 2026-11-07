@@ -2,7 +2,7 @@
 //! (`backend_dispatch::stream_port_lane`): TCP, UDP/DTLS, mesh raw-TCP egress
 //! and mesh UDP egress. The four paths used to carry their own copies of this
 //! decision (they disagreed from day one on `LEAST_CONN`, and only TCP gained
-//! the subset refinement). These tests pin the shared invariant, the one
+//! the subset refinement). These tests pin the shared invariant and the one
 //! intentional input difference (`selection_subset`). The structural pin that
 //! every stream path routes through the one helper lives in
 //! `shared_invariant_parity_tests.rs`.
@@ -142,7 +142,7 @@ fn non_ip_hash_key_is_refused_only_when_a_lane_engages() {
         "round_robin",
         None,
         "round_robin",
-        json!({ "hash_on": "header:x-user" }),
+        json!({ "algorithm": "consistent_hashing", "hash_on": "header:x-user" }),
     );
     assert_eq!(lane(&proxy, &cache, None), Err("NonIpHashKey".to_string()));
 
