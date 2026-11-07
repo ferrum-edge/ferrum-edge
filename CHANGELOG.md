@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **`tcp_logging` no-verify TLS advertises the crypto provider's signature
+  schemes and warns.** Under `FERRUM_TLS_NO_VERIFY` the plugin used a private
+  verifier with a hard-coded scheme list (including ED448 and ECDSA P-521,
+  outside the ring and FIPS providers) and logged nothing. It now uses the
+  shared `NoVerifier` and warns that verification is disabled, like
+  `ws_logging` and `ldap_auth`.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`
