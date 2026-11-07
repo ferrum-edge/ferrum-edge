@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authorization codes, audit transcripts, or an attacker-chosen key set over
   cleartext to another host. They now follow the #6659 rule: only
   `127.0.0.0/8` and `::1` literals qualify. Under `client_auth.method: none`,
-  an OIDC token endpoint learned from discovery must meet the same rule, and
+  an OIDC token or revocation endpoint learned from discovery must meet the
+  same rule, and
   `ai_transcript_audit` judges the sink scheme on the parsed URL (a leading
   space or embedded tab no longer skips the cleartext guard). **Upgrade:**
   replace `http://localhost` with `http://127.0.0.1` (or `[::1]`) in these
