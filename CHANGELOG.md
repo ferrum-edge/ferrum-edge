@@ -35,9 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every protocol path (HTTP/1.1, HTTP/2, HTTP/3, native gRPC, gRPC-Web),
   whatever any trigger decides, and route-configured trailer names (claim
   destinations and custom credential locations alike) now match `_` spellings
-  as well as ASCII case. A route that relied on a client value under one of
-  those names reaching the backend, in headers on trigger-excluded requests
-  or in trailers, no longer receives it.
+  as well as ASCII case. `opa` `decision_request_headers` and `mesh_authz`
+  ext_authz `headersToUpstreamOnAllow` names join that trailer list (their
+  initial-header behaviour is unchanged). Untranslated gRPC-Web, whose request
+  trailers ride inside the body where only the `grpc_web` translator parses
+  them, is now refused with `415` on a route that owns any of these
+  gateway-asserted headers; add `grpc_web` to such a route to serve gRPC-Web
+  clients. A route that relied on a client value under one of those names
+  reaching the backend, in headers on trigger-excluded requests or in
+  trailers, no longer receives it.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,

@@ -4547,7 +4547,10 @@ async fn handle_h3_request(
         route_response_body_limit,
     );
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
-    ctx.set_request_trailer_strip_headers(plugin_cache_view.request_trailer_strip_headers());
+    ctx.set_request_trailer_strip_headers(
+        plugin_cache_view.request_trailer_strip_headers(),
+        plugin_cache_view.owns_request_assertion_headers(),
+    );
     // Same cache generation as `plugins` above: replay provenance must describe
     // exactly the response-side rules this request will run.
     ctx.set_response_presentation_policy_digest(

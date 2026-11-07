@@ -1149,6 +1149,14 @@ impl Plugin for Opa {
         !self.decision_request_headers.is_empty()
     }
 
+    /// The policy-owned `decision_request_headers`, for the route's
+    /// request-trailer strip list only: a client can never restate one in
+    /// request trailers. Initial-header ownership is unchanged (decided in
+    /// `authorize` for the requests this instance lets through).
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        self.decision_request_headers.clone()
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         vec![self.decision_hostname.clone()]
     }

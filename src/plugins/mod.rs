@@ -2880,6 +2880,9 @@ pub struct RequestContext {
     /// credential locations above plus every owned gateway-assertion header
     /// (`claim_headers` destinations), precomputed by the plugin cache.
     request_trailer_strip_headers: Option<Arc<Vec<String>>>,
+    /// Whether a plugin on the matched route owns any gateway-assertion request
+    /// header, whatever any trigger decides (plugin cache view).
+    route_owns_request_assertion_headers: bool,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -4727,6 +4730,7 @@ impl RequestContext {
             plugin_state: None,
             request_headers_to_redact: None,
             request_trailer_strip_headers: None,
+            route_owns_request_assertion_headers: false,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
@@ -6383,6 +6387,7 @@ impl RequestContext {
             cors_state: cors::CorsRequestState::default(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             request_trailer_strip_headers: self.request_trailer_strip_headers.clone(),
+            route_owns_request_assertion_headers: self.route_owns_request_assertion_headers,
             // Per-plugin working state. The split into `PluginRequestState`
             // did not change any family's lifecycle here: most are CLONED, the
             // claim-header staging and the `response_caching` header delta stay
@@ -6674,11 +6679,23 @@ impl RequestContext {
     }
 
     /// Install the route's request-trailer strip list (credential locations
-    /// plus owned gateway-assertion headers) from the plugin cache view.
-    pub(crate) fn set_request_trailer_strip_headers(&mut self, headers: Arc<Vec<String>>) {
+    /// plus owned gateway-assertion headers) and whether the route owns any
+    /// gateway-assertion header, from the plugin cache view.
+    pub(crate) fn set_request_trailer_strip_headers(
+        &mut self,
+        headers: Arc<Vec<String>>,
+        owns_assertion_headers: bool,
+    ) {
+        self.route_owns_request_assertion_headers = owns_assertion_headers;
         if !headers.is_empty() {
             self.request_trailer_strip_headers = Some(headers);
         }
+    }
+
+    /// Whether a plugin on the matched route owns any gateway-assertion
+    /// request header (`Plugin::owned_request_assertion_header_names`).
+    pub(crate) fn route_owns_request_assertion_headers(&self) -> bool {
+        self.route_owns_request_assertion_headers
     }
 
     /// Shared handle to the route's request-trailer strip list, for the late

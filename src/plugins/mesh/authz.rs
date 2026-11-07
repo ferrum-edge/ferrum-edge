@@ -4468,6 +4468,13 @@ impl Plugin for MeshAuthz {
         self.ext_authz_declared_modified_headers.clone()
     }
 
+    /// The provider-owned `headersToUpstreamOnAllow` names, for the route's
+    /// request-trailer strip list only: a client can never restate one in
+    /// request trailers. Initial-header ownership is unchanged.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        self.ext_authz_upstream_allow_headers.clone()
+    }
+
     /// Apply an allowed CUSTOM check's `headersToUpstreamOnAllow` result.
     ///
     /// Runs at this plugin's own priority in the ordinary `before_proxy`

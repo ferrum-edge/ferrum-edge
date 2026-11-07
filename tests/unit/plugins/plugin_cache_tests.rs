@@ -16283,13 +16283,8 @@ async fn owned_claim_destinations_are_stripped_from_request_trailers() {
     config["providers"][0]["output_claim_headers"] = json!([
         {"claim": "sub", "header": "X-User-Sub"}
     ]);
-    let mut auth = make_plugin_config_with_json(
-        "auth",
-        "jwks_auth",
-        config,
-        PluginScope::Proxy,
-        Some("p1"),
-    );
+    let mut auth =
+        make_plugin_config_with_json("auth", "jwks_auth", config, PluginScope::Proxy, Some("p1"));
     auth.trigger = Some(post_only_trigger());
     let cache = PluginCache::new(&make_config(
         vec![make_proxy("p1", "/", vec!["auth"])],
@@ -16431,4 +16426,147 @@ async fn trigger_skipped_sibling_never_erases_an_admitted_instance_verified_clai
             assert!(!headers.contains_key("X_User_Email"), "{label}");
         }
     }
+}
+
+/// OPA `decision_request_headers` and ext_authz-style policy-owned names join
+/// the route's request-trailer strip list too (trailers only: the initial
+/// header behaviour is unchanged), and mark the route as owning assertions.
+#[tokio::test]
+async fn opa_decision_request_headers_are_stripped_from_request_trailers() {
+    use ferrum_edge::_test_support::{
+        h1_h2_upload_source_forwarded_frames_for_route,
+        sanitized_backend_request_trailers_for_route,
+    };
+
+    let mut config = minimal_plugin_config("opa");
+    config["decision_request_headers"] = json!(["X-Tenant"]);
+    let opa = make_plugin_config_with_json("opa", "opa", config, PluginScope::Proxy, Some("p1"));
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", vec!["opa"])],
+        vec![opa],
+    ))
+    .unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(view.owns_request_assertion_headers());
+    assert!(
+        !view
+            .request_headers_to_redact()
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("x-tenant")),
+        "a decision header is not a credential location"
+    );
+    let names = view.request_trailer_strip_headers();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let trailers = [
+        ("x-tenant", "blue"),
+        ("x_tenant", "blue"),
+        ("x-checksum", "keep"),
+    ];
+    let expected = vec![("x-checksum".to_string(), "keep".to_string())];
+    let (_, forwarded) =
+        h1_h2_upload_source_forwarded_frames_for_route(b"payload", &trailers, &names).await;
+    assert_eq!(forwarded, expected);
+    assert_eq!(
+        sanitized_backend_request_trailers_for_route(&trailers, &names),
+        expected
+    );
+}
+
+/// Untranslated gRPC-Web is forwarded byte-for-byte, body-embedded `0x80`
+/// trailer frame included, and only the `grpc_web` translator parses that
+/// frame. On a route that owns gateway-assertion request headers such a
+/// request is refused with `415` before any `before_proxy` hook runs, in
+/// binary and text framing. A translated request, a route without owned
+/// assertions, and a non-gRPC-Web request are unaffected.
+#[tokio::test]
+async fn untranslated_grpc_web_is_refused_on_a_route_owning_assertion_headers() {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        set_request_wire_protocol_for_test,
+    };
+    use ferrum_edge::config::types::HttpWireTransport;
+
+    // (translator present, claim-owning auth, request content type, refused)
+    let cases = [
+        (false, true, "application/grpc-web+proto", true),
+        (false, true, "application/grpc-web-text+proto", true),
+        (true, true, "application/grpc-web+proto", false),
+        (true, true, "application/grpc-web-text+proto", false),
+        (false, false, "application/grpc-web+proto", false),
+        (false, true, "application/json", false),
+    ];
+    for (translator, claim_owning, content_type, refused) in cases {
+        let label = format!("translator={translator} claims={claim_owning} {content_type}");
+        let mut auth_config = minimal_plugin_config("jwks_auth");
+        if claim_owning {
+            auth_config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+        }
+        let mut plugin_configs = vec![make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            auth_config,
+            PluginScope::Proxy,
+            Some("p1"),
+        )];
+        let mut plugin_ids = vec!["auth"];
+        if translator {
+            plugin_configs.push(make_plugin_config_with_json(
+                "gw",
+                "grpc_web",
+                json!({}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ));
+            plugin_ids.push("gw");
+        }
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", plugin_ids)],
+            plugin_configs,
+        ))
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+        let is_grpc_web = content_type.starts_with("application/grpc-web");
+        let view = if is_grpc_web {
+            cache.grpc_web_request_view("ferrum", "p1")
+        } else {
+            cache.request_view("ferrum", "p1", ProxyProtocol::Http)
+        };
+        let plugins = view.plugins();
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/svc.Echo/Call".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        set_request_wire_protocol_for_test(&mut ctx, HttpWireTransport::Http2, is_grpc_web);
+        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        let mut headers = ctx.headers.clone();
+        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
+        if refused {
+            assert!(
+                matches!(result, PluginResult::Reject { status_code: 415, .. }),
+                "{label}: untranslated gRPC-Web must be refused"
+            );
+        } else {
+            assert!(matches!(result, PluginResult::Continue), "{label}");
+        }
+    }
+}
+
+/// The trigger-skipped translator case cannot arise: `grpc_web` publishes a
+/// contextless response-trailer policy, so publication refuses a trigger on
+/// it, and an untranslated gRPC-Web request always means "no translator".
+#[test]
+fn grpc_web_translator_cannot_carry_an_execution_trigger() {
+    let mut translator =
+        make_plugin_config_with_json("gw", "grpc_web", json!({}), PluginScope::Proxy, Some("p1"));
+    translator.trigger = Some(post_only_trigger());
+    let config = make_config(vec![make_proxy("p1", "/", vec!["gw"])], vec![translator]);
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("a triggered grpc_web translator must be refused");
+    assert!(error.contains("response-trailer"), "{error}");
 }

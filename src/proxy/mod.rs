@@ -33565,6 +33565,11 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     backend_path_is_policy_bound: bool,
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
+    if matches!(pass, BackendPathBeforeProxyPass::Initial)
+        && let Some(refusal) = refuse_untranslated_grpc_web_on_assertion_route(ctx)
+    {
+        return refusal;
+    }
     let last_route_request_finalizer = route_request_header_finalization_index(plugins);
     for (index, plugin) in plugins.iter().enumerate() {
         let deferred =
@@ -33727,6 +33732,39 @@ pub(crate) fn check_routed_path_parameters(
         }
     }
 }
+
+/// Refuse a recognized gRPC-Web request that no `grpc_web` translator claimed
+/// (none is on the route; publication refuses a trigger on the translator)
+/// when a plugin on the route owns gateway-assertion request headers.
+///
+/// Untranslated gRPC-Web is forwarded byte-for-byte, so a body-embedded `0x80`
+/// trailer frame reaches a gRPC-Web backend that may read it as request
+/// metadata. Only the translator parses that frame (and drops the route's
+/// owned names from it, `grpc_web::split_request_trailer_frame` staging); no
+/// gateway boundary sees it otherwise. On a route whose backend may treat
+/// `claim_headers` destinations, OPA `decision_request_headers` or ext_authz
+/// `headersToUpstreamOnAllow` names as gateway assertions, forwarding a
+/// client-controlled trailer block would let the client restate one, so the
+/// request is refused before any `before_proxy` hook runs. The decision is
+/// taken from the frontend's own gRPC-Web classification and the
+/// translator's ownership marker, never from the request body.
+fn refuse_untranslated_grpc_web_on_assertion_route(ctx: &RequestContext) -> Option<PluginResult> {
+    if !ctx.request_is_grpc_web()
+        || !ctx.route_owns_request_assertion_headers()
+        || crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+    {
+        return None;
+    }
+    Some(PluginResult::Reject {
+        status_code: 415,
+        body: UNTRANSLATED_GRPC_WEB_ASSERTION_ROUTE_BODY.to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    })
+}
+
+/// Fixed refusal body for [`refuse_untranslated_grpc_web_on_assertion_route`].
+const UNTRANSLATED_GRPC_WEB_ASSERTION_ROUTE_BODY: &str =
+    r#"{"error":"gRPC-Web must be translated on a route with gateway-asserted headers"}"#;
 
 pub(crate) fn reject_route_override_path(
     rejection: crate::policy_path::PolicyPathRejection,
@@ -36892,7 +36930,10 @@ async fn handle_proxy_request_inner(
     // From here a client abort is logged through this chain (issue #6768).
     client_abort_record.observe_plugins(&plugins);
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
-    ctx.set_request_trailer_strip_headers(plugin_cache_view.request_trailer_strip_headers());
+    ctx.set_request_trailer_strip_headers(
+        plugin_cache_view.request_trailer_strip_headers(),
+        plugin_cache_view.owns_request_assertion_headers(),
+    );
     // Bind this request to the same cache generation's static response-side
     // presentation policy that the plugin list above will execute, so a plugin
     // persisting a finalized representation can prove which rules produced it.

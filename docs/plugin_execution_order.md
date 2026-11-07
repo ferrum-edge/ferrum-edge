@@ -942,10 +942,14 @@ namespace and `x-geo-country`, matched with the same ASCII-case-insensitive,
 configure — a `key_auth` `header:<name>`, a custom `jwt_auth` / `jwks_auth` /
 `oauth2_introspection` token header — removed whether or not
 `hide_credentials` is set, because trailers are never a credential location);
-every `claim_headers` / `output_claim_headers` destination a `jwks_auth`,
-`oauth2_introspection`, or `oidc_relying_party` instance on the route owns,
-whatever that instance's execution trigger decides (route-configured names
-are matched ASCII-case-insensitively with `_` read as `-`);
+every gateway-asserted request header a plugin on the route owns, whatever
+that instance's execution trigger decides (`claim_headers` /
+`output_claim_headers` destinations of `jwks_auth`, `oauth2_introspection`,
+and `oidc_relying_party`, `opa` `decision_request_headers`, and `mesh_authz`
+ext_authz `headersToUpstreamOnAllow`; route-configured names are matched
+ASCII-case-insensitively with `_` read as `-`). Untranslated gRPC-Web carries
+its trailers inside the body, where only the `grpc_web` translator parses
+them, so it is refused with `415` on a route that owns such a header;
 forwarding identity the gateway regenerates (`x-forwarded-*`, `forwarded`);
 initial-only gRPC call parameters (`grpc-*`); the gateway-owned `early-data`
 marker; the initial-section-only `via` intermediary chain; and header-section

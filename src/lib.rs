@@ -131,7 +131,20 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         headers: Vec<String>,
     ) {
-        ctx.set_request_trailer_strip_headers(std::sync::Arc::new(headers));
+        ctx.set_request_trailer_strip_headers(std::sync::Arc::new(headers), true);
+    }
+
+    /// Install the request-trailer policy a plugin cache view carries, exactly
+    /// as the H1/H2 and H3 handlers do at request setup.
+    pub fn apply_request_view_trailer_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        view: &crate::plugin_cache::PluginCacheRequestView,
+    ) {
+        ctx.set_request_headers_to_redact(view.request_headers_to_redact());
+        ctx.set_request_trailer_strip_headers(
+            view.request_trailer_strip_headers(),
+            view.owns_request_assertion_headers(),
+        );
     }
 
     /// The gateway's `499` client-closed-request logging status (issue #6768
