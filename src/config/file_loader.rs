@@ -211,20 +211,9 @@ pub fn load_config_from_file(
         DocumentNamespaceScope::Filter(namespace),
     )?;
 
-    // File mode keeps its stricter field and identity checks above,
-    // then runs the complete shared admission gate used by database/CP loads.
-    // Do not duplicate that validator list here: newly added runtime rejection
-    // rules must also fail `validate` and SIGHUP before publication.
-    let runtime_errors = collect_rejecting_runtime_config_errors(&config);
-    if !runtime_errors.is_empty() {
-        anyhow::bail!(
-            "Configuration validation failed: {}",
-            runtime_errors.join("; ")
-        );
-    }
-
-    // Match SQL/Mongo admission ordering: only an accepted graph may commit
-    // the MMDB validation handoff consumed by the subsequent cache build.
+    // The core ends with the shared runtime admission gate. Match SQL/Mongo
+    // admission ordering: only an accepted graph may commit the MMDB
+    // validation handoff consumed by the subsequent cache build.
     ValidationPipeline::new(&mut config)
         .validate_plugin_file_dependencies(ValidationAction::FatalCount(
             "Configuration validation failed: {} plugin file dependency error(s) found",
@@ -251,7 +240,8 @@ pub fn load_config_from_file(
 /// Decode and validate a config document from in-memory bytes.
 ///
 /// Skips filesystem stability and plugin file-dependency checks, plus namespace
-/// filtering. Intended for the adversarial fuzz lane and deterministic parser
+/// filtering; runs the same shared runtime admission gate as file mode.
+/// Intended for the adversarial fuzz lane and deterministic parser
 /// tests — not production load. Keeping this entry point free of file reads
 /// prevents generated paths from turning a pure parser target into runner I/O.
 #[cfg(feature = "fuzzing")]
@@ -289,8 +279,10 @@ pub fn decode_and_validate_config_document(
 /// in-memory fuzz entry point: parse, `resource_counts` seal, version
 /// coercion and in-memory migration, `GatewayConfig` deserialization, the
 /// field-level pipeline, the file-only operator checks, the namespace scope,
-/// then the cross-resource pipeline. Step order is load-bearing (the namespace
-/// filter must run before the uniqueness validators); keep it in one place.
+/// the cross-resource pipeline, then the shared runtime admission gate
+/// (`collect_rejecting_runtime_config_errors`). Step order is load-bearing
+/// (the namespace filter must run before the uniqueness validators); keep it
+/// in one place.
 ///
 /// Takes the source buffer by value and drops it once the value trees are
 /// parsed, so the bounded buffer is released before migration/validation
@@ -574,6 +566,19 @@ fn decode_and_validate_document(
             "Configuration validation failed: {} stream proxy error(s) found",
         ))
         .run()?;
+
+    // Every entry point keeps its stricter field and identity checks above,
+    // then runs the complete shared admission gate used by database/CP loads.
+    // Do not duplicate that validator list here: newly added runtime rejection
+    // rules must also fail `validate`, SIGHUP, and the fuzz lane before
+    // publication.
+    let runtime_errors = collect_rejecting_runtime_config_errors(&config);
+    if !runtime_errors.is_empty() {
+        anyhow::bail!(
+            "Configuration validation failed: {}",
+            runtime_errors.join("; ")
+        );
+    }
 
     Ok(config)
 }

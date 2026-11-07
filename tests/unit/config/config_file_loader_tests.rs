@@ -72,8 +72,8 @@ fn file_and_database_full_loads_keep_the_shared_rejecting_admission_gate() {
         (
             "file",
             include_str!("../../../src/config/file_loader.rs"),
-            "pub fn load_config_from_file(",
-            "/// Decode and validate a config document from in-memory bytes.",
+            "fn decode_and_validate_document(",
+            "/// Load and validate an owned file-mode candidate",
         ),
         (
             "SQL",
@@ -95,12 +95,24 @@ fn file_and_database_full_loads_keep_the_shared_rejecting_admission_gate() {
             "{name} full load must inherit the shared rejecting-validator set"
         );
         if name == "file" {
-            let rejecting = body
-                .find("collect_rejecting_runtime_config_errors(&config)")
-                .unwrap();
-            let local_files = body.find(".validate_plugin_file_dependencies(").unwrap();
+            // The gate closes the shared decode core, so both the file loader
+            // and the in-memory (fuzz) decode inherit it; the file loader
+            // commits the MMDB handoff only after the core accepted the graph.
             assert!(
-                rejecting < local_files,
+                !body.contains(".validate_plugin_file_dependencies("),
+                "node-local MMDB checks stay out of the shared core"
+            );
+            let loader = source
+                .split_once("pub fn load_config_from_file(")
+                .unwrap()
+                .1
+                .split_once("/// Decode and validate a config document from in-memory bytes.")
+                .unwrap()
+                .0;
+            let decoded = loader.find("decode_and_validate_document(").unwrap();
+            let local_files = loader.find(".validate_plugin_file_dependencies(").unwrap();
+            assert!(
+                decoded < local_files,
                 "a rejected graph must not publish an MMDB validation handoff"
             );
         }

@@ -142,6 +142,97 @@ fn config_decode_minimal_json() {
     fuzz_decode_config_document(doc).expect("minimal config");
 }
 
+/// A `tcp_connection_throttle` attached to an HTTP proxy. The two
+/// `ValidationPipeline` chains accept it; only the shared runtime admission
+/// gate (`collect_rejecting_runtime_config_errors`, `87c97cbd6`) refuses it.
+/// Mirrors `http-proxy-throttle` in `tests/fixtures/file_admission_cases.json`.
+const HTTP_PROXY_THROTTLE_JSON: &str = r#"{
+    "version":"1",
+    "proxies":[{"id":"fixture-proxy","listen_path":"/fixture","backend_scheme":"http",
+        "backend_host":"localhost","backend_port":3000,
+        "plugins":[{"plugin_config_id":"throttle"}]}],
+    "consumers":[],
+    "plugin_configs":[{"id":"throttle","plugin_name":"tcp_connection_throttle","scope":"proxy",
+        "enabled":true,"config":{"max_connections_per_key":1},"proxy_id":"fixture-proxy"}],
+    "upstreams":[]
+}"#;
+
+const HTTP_PROXY_THROTTLE_YAML: &str = "version: '1'
+proxies:
+- id: fixture-proxy
+  listen_path: /fixture
+  backend_scheme: http
+  backend_host: localhost
+  backend_port: 3000
+  plugins:
+  - plugin_config_id: throttle
+consumers: []
+plugin_configs:
+- id: throttle
+  plugin_name: tcp_connection_throttle
+  scope: proxy
+  enabled: true
+  config:
+    max_connections_per_key: 1
+  proxy_id: fixture-proxy
+upstreams: []
+";
+
+/// Two global `correlation_id` configs writing the same effective header.
+/// Mirrors `duplicate-global-correlation` in the same fixture file.
+const DUPLICATE_GLOBAL_CORRELATION_JSON: &str = r#"{
+    "version":"1",
+    "proxies":[{"id":"fixture-proxy","listen_path":"/fixture","backend_scheme":"http",
+        "backend_host":"localhost","backend_port":3000}],
+    "consumers":[],
+    "plugin_configs":[
+        {"id":"correlation-0","plugin_name":"correlation_id","scope":"global","enabled":true,
+         "config":{}},
+        {"id":"correlation-1","plugin_name":"correlation_id","scope":"global","enabled":true,
+         "config":{"header_name":"x-request-id"},"priority_override":75}],
+    "upstreams":[]
+}"#;
+
+/// The same throttle on a TCP proxy is valid. Mirrors `valid-tcp-proxy-throttle`.
+const VALID_TCP_PROXY_THROTTLE_JSON: &str = r#"{
+    "version":"1",
+    "proxies":[{"id":"fixture-proxy","backend_scheme":"tcp","backend_host":"localhost",
+        "backend_port":3000,"listen_port":31001,"plugins":[{"plugin_config_id":"throttle"}]}],
+    "consumers":[],
+    "plugin_configs":[{"id":"throttle","plugin_name":"tcp_connection_throttle","scope":"proxy",
+        "enabled":true,"config":{"max_connections_per_key":1},"proxy_id":"fixture-proxy"}],
+    "upstreams":[]
+}"#;
+
+#[test]
+fn config_decode_applies_the_shared_runtime_admission_gate() {
+    // The in-memory decode shares file mode's decode-and-validate core, so it
+    // must refuse what `validate` and SIGHUP refuse, for JSON and for sniffed
+    // YAML alike.
+    for (name, doc, expected) in [
+        (
+            "http-proxy-throttle json",
+            HTTP_PROXY_THROTTLE_JSON,
+            "tcp_connection_throttle",
+        ),
+        (
+            "http-proxy-throttle yaml",
+            HTTP_PROXY_THROTTLE_YAML,
+            "tcp_connection_throttle",
+        ),
+        (
+            "duplicate-global-correlation",
+            DUPLICATE_GLOBAL_CORRELATION_JSON,
+            "duplicate effective header_name",
+        ),
+    ] {
+        let error = fuzz_decode_config_document(doc).expect_err(name);
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+    fuzz_decode_config_document(VALID_TCP_PROXY_THROTTLE_JSON)
+        .expect("a TCP proxy throttle passes the shared gate");
+}
+
 #[test]
 fn config_decode_sniffs_yaml_without_a_path() {
     // File mode picks YAML vs JSON from the path extension; the in-memory
