@@ -3281,11 +3281,22 @@ mod inner {
                          document is absent on the original topology"
                     );
                 } else {
-                    debug!(
-                        namespace = %crate::startup::sanitize_startup_scalar(namespace),
-                        probe = ?probe,
-                        "MongoDB mTLS DNS admission fence retained after re-verification"
-                    );
+                    // Fixed literal outcome labels only: no probe value (and so
+                    // no provider payload) ever reaches an emission.
+                    match probe {
+                        AdmissionFenceProbe::DurableFencePresent => debug!(
+                            namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                            probe_outcome = "durable_fence_present",
+                            "MongoDB mTLS DNS admission fence retained after re-verification"
+                        ),
+                        AdmissionFenceProbe::Unverifiable => debug!(
+                            namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                            probe_outcome = "unverifiable",
+                            "MongoDB mTLS DNS admission fence retained after re-verification"
+                        ),
+                        // Already cleared by a concurrent admission's probe.
+                        AdmissionFenceProbe::DurableFenceAbsent => {}
+                    }
                 }
             }
         }
