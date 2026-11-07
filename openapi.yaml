@@ -10654,7 +10654,10 @@ components:
             `trigger` and of `mesh_route_dispatch` / `waf` / `mesh_authz`
             match rules, `request_termination` `trigger.header_value`, and
             `transaction_debugger` `capture_request_header_value`;
-            `docs/admin_api.md` lists every covered path. Mesh
+            `docs/admin_api.md` lists every covered path. Inline PEM private
+            keys in plugin key fields (including the VirtualService L4
+            proxies and upstreams a `mesh_authz` `mesh_slice` embeds) are
+            replaced by `[REDACTED]`; key references stay visible. Mesh
             `workload_metrics` tracing-provider collector URLs, and the
             collector, JWKS, control-plane, and federation URLs in a
             `mesh_authz` `mesh_slice`, receive the same structural
@@ -12999,7 +13002,8 @@ components:
             the configuration export withhold every `header`, `query`, and
             `cookie` `value` operand (`exact` / `prefix` entries and `regex`)
             anywhere in the tree; field names, match kinds, flags, and the
-            tree structure stay visible.
+            tree structure stay visible, and a shape the trigger schema does
+            not define is withheld wholesale.
         api_spec_id:
           type: [string, "null"]
           description: |

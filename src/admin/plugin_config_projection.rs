@@ -177,18 +177,22 @@ const NONE: &[SensitivityRule] = &[];
 /// policies alike). `to[].headers` values and `when[].values` /
 /// `when[].not_values` are request-header (or claim, principal, IP) match
 /// operands. A `when` entry's `key` decides which, and a path rule cannot read
-/// a sibling, so every condition value is withheld (the `key` field itself is
-/// already masked by the name heuristic).
+/// a sibling, so every condition value is withheld, entry by entry so the list
+/// shape stays visible (the `key` field itself is already masked by the name
+/// heuristic).
 ///
 /// The slice also carries the `include_additional_headers_in_check[].value`
-/// headers an external authorization provider sends to its check service, two
-/// opaque operator-authored payloads (Istio ProxyConfig `environment` values
-/// and ECDS extension `value` bytes), all withheld, and collector, JWKS,
-/// control-plane, and federation URLs, projected structurally. Every other
-/// slice field is inventory (workloads, services, hosts, addresses, ports,
-/// labels), public material (trust bundles, inline JWKS), header-name lists,
-/// file paths, or static telemetry tags; DestinationRule `private_key` is
-/// already masked by the name heuristic.
+/// headers and the check-URL `path_prefix` of an external authorization
+/// provider, two opaque operator-authored payloads (Istio ProxyConfig
+/// `environment` values and ECDS extension `value` bytes), all withheld; the
+/// backend client keys of the embedded VirtualService L4 `Proxy` / `Upstream`
+/// objects, withheld when inline; and collector, JWKS, control-plane, and
+/// federation URLs, projected structurally. Every other slice field is
+/// inventory (workloads, services, hosts, addresses, ports, labels), public
+/// material (trust bundles, inline JWKS), header-name lists, file paths, or
+/// static telemetry tags; DestinationRule and Upstream subset `private_key`,
+/// Consul tokens, and credential references are already masked by the name
+/// heuristic.
 const MESH_AUTHZ: &[SensitivityRule] = &[
     secret(&[
         "mesh_policies",
@@ -200,7 +204,16 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
         "headers",
         "*",
     ]),
-    secret(&["mesh_policies", "*", "rules", "*", "when", "*", "values"]),
+    secret(&[
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "values",
+        "*",
+    ]),
     secret(&[
         "mesh_policies",
         "*",
@@ -209,6 +222,7 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
         "when",
         "*",
         "not_values",
+        "*",
     ]),
     secret(&[
         "mesh_slice",
@@ -230,6 +244,7 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
         "when",
         "*",
         "values",
+        "*",
     ]),
     secret(&[
         "mesh_slice",
@@ -240,6 +255,7 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
         "when",
         "*",
         "not_values",
+        "*",
     ]),
     secret(&[
         "mesh_slice",
@@ -261,6 +277,7 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
         "when",
         "*",
         "values",
+        "*",
     ]),
     secret(&[
         "mesh_slice",
@@ -271,6 +288,7 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
         "when",
         "*",
         "not_values",
+        "*",
     ]),
     secret(&[
         "mesh_slice",
@@ -280,8 +298,35 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
         "*",
         "value",
     ]),
+    // The check URL's path prefix is a shared secret on some check services.
+    secret(&["mesh_slice", "ext_authz_providers", "*", "path_prefix"]),
     secret(&["mesh_slice", "proxy_configs", "*", "environment", "*"]),
     secret(&["mesh_slice", "extension_configs", "*", "value"]),
+    // The VirtualService L4 proxies and upstreams are full serialized `Proxy` /
+    // `Upstream` objects; their backend client keys accept inline PEM. (Their
+    // Consul token and subset TLS `private_key` are masked by the name
+    // heuristic, URL userinfo by the structural sweep.)
+    private_key_source(&[
+        "mesh_slice",
+        "virtual_service_l4_proxies",
+        "*",
+        "backend_tls_client_key_path",
+    ]),
+    private_key_source(&[
+        "mesh_slice",
+        "virtual_service_l4_upstreams",
+        "*",
+        "backend_tls_client_key_path",
+    ]),
+    private_key_source(&[
+        "mesh_slice",
+        "virtual_service_l4_upstreams",
+        "*",
+        "port_overrides",
+        "*",
+        "tls",
+        "client_key_path",
+    ]),
     // The telemetry tracing-provider envelope is the same `TracingProvider`
     // the `workload_metrics` rules cover; keep the four fields in step with
     // them (a parity test enforces it).
@@ -880,6 +925,24 @@ pub fn strip_url_userinfo_with(
 /// that a client cannot simply assert, and stay visible.
 pub const TRIGGER_CLIENT_FIELD_PREDICATES: &[&str] = &["header", "query", "cookie"];
 
+/// Trigger leaf predicates that stay visible (see
+/// [`TRIGGER_CLIENT_FIELD_PREDICATES`]). A leaf key in neither list is not a
+/// `PluginTriggerMatch` field, so its value is withheld.
+const TRIGGER_VISIBLE_PREDICATES: &[&str] = &[
+    "method",
+    "path",
+    "host",
+    "sni",
+    "protocol",
+    "source_cidr",
+    "namespace",
+    "proxy_id",
+    "listen_port",
+    "consumer",
+    "auth_method",
+    "spiffe_id",
+];
+
 /// Project a resource-level plugin `trigger` (a sibling of `config`).
 ///
 /// Walks the whole `all` / `any` / `not` / `match` tree and withholds every
@@ -889,15 +952,37 @@ pub const TRIGGER_CLIENT_FIELD_PREDICATES: &[&str] = &["header", "query", "cooki
 /// site. Field names, `presence`, `multi_value`, `case_insensitive`, the match
 /// kinds, and the tree structure stay visible. `root_pointer` is the JSON
 /// pointer of the trigger inside the resource body (`/trigger`).
+///
+/// Like [`project_plugin_config_with`], the walk fails closed: a shape a
+/// `PluginTrigger` cannot have (a non-object trigger or one without `when`, a
+/// non-object node or leaf, a non-array `all` / `any`, a key the schema does
+/// not define, a non-object `value`) is withheld wholesale rather than walked.
 pub fn project_plugin_trigger_with(
     trigger: &mut Value,
     root_pointer: &str,
     rendering: &dyn RedactionRendering,
 ) {
+    if trigger.is_null() {
+        return;
+    }
     let mut projector = Projector::new(root_pointer, rendering);
-    if let Some(node) = trigger.get_mut("when") {
-        let mark = projector.enter("when");
-        projector.project_trigger_node(node);
+    if !trigger
+        .as_object()
+        .is_some_and(|map| map.contains_key("when"))
+    {
+        projector.apply_sensitivity(trigger, FieldSensitivity::Secret);
+        return;
+    }
+    let Some(map) = trigger.as_object_mut() else {
+        return;
+    };
+    for (key, child) in map.iter_mut() {
+        let mark = projector.enter(key);
+        if key == "when" {
+            projector.project_trigger_node(child);
+        } else {
+            projector.apply_sensitivity(child, FieldSensitivity::Secret);
+        }
         projector.leave(mark);
     }
 }
@@ -1038,62 +1123,93 @@ impl<'r> Projector<'r> {
     }
 
     /// One trigger tree node: recurse through `all` / `any` / `not` and
-    /// project each `match` leaf.
+    /// project each `match` leaf. Any other shape is withheld.
     fn project_trigger_node(&mut self, node: &mut Value) {
-        let Value::Object(map) = node else {
+        if !node.is_object() {
+            self.apply_sensitivity(node, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = node.as_object_mut() else {
             return;
         };
         for (key, child) in map.iter_mut() {
             let mark = self.enter(key);
-            match key.as_str() {
-                "all" | "any" => {
-                    if let Value::Array(items) = child {
-                        for (index, item) in items.iter_mut().enumerate() {
-                            let item_mark = self.enter(&index.to_string());
-                            self.project_trigger_node(item);
-                            self.leave(item_mark);
-                        }
+            match (key.as_str(), child) {
+                ("all" | "any", Value::Array(items)) => {
+                    for (index, item) in items.iter_mut().enumerate() {
+                        let item_mark = self.enter(&index.to_string());
+                        self.project_trigger_node(item);
+                        self.leave(item_mark);
                     }
                 }
-                "not" => self.project_trigger_node(child),
-                "match" => self.project_trigger_leaf(child),
-                _ => {}
+                ("not", child) => self.project_trigger_node(child),
+                ("match", child) => self.project_trigger_leaf(child),
+                (_, child) => self.apply_sensitivity(child, FieldSensitivity::Secret),
             }
             self.leave(mark);
         }
     }
 
     /// One trigger `match` leaf: withhold the `value` operands of a
-    /// client-presented field predicate.
+    /// client-presented field predicate, keep the other predicates, and
+    /// withhold anything that is not a predicate.
     fn project_trigger_leaf(&mut self, leaf: &mut Value) {
-        let Value::Object(map) = leaf else {
+        if !leaf.is_object() {
+            self.apply_sensitivity(leaf, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = leaf.as_object_mut() else {
             return;
         };
         for (key, predicate) in map.iter_mut() {
-            if !TRIGGER_CLIENT_FIELD_PREDICATES.contains(&key.as_str()) {
+            if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
                 continue;
             }
-            let Some(value) = predicate.get_mut("value") else {
-                continue;
-            };
             let mark = self.enter(key);
-            let value_mark = self.enter("value");
-            self.project_trigger_operands(value);
-            self.leave(value_mark);
+            if TRIGGER_CLIENT_FIELD_PREDICATES.contains(&key.as_str()) {
+                self.project_trigger_field_predicate(predicate);
+            } else {
+                self.apply_sensitivity(predicate, FieldSensitivity::Secret);
+            }
             self.leave(mark);
         }
     }
 
-    /// A trigger string match: every operand except the `case_insensitive`
-    /// flag is withheld, entry by entry for the `exact` / `prefix` lists so
-    /// their length stays visible. A non-object fails closed.
+    /// A `header` / `query` / `cookie` predicate: `name`, `presence`, and
+    /// `multi_value` stay visible, `value` is projected, and anything else is
+    /// withheld.
+    fn project_trigger_field_predicate(&mut self, predicate: &mut Value) {
+        if !predicate.is_object() {
+            self.apply_sensitivity(predicate, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = predicate.as_object_mut() else {
+            return;
+        };
+        for (key, child) in map.iter_mut() {
+            let mark = self.enter(key);
+            match key.as_str() {
+                "name" | "presence" | "multi_value" => {}
+                "value" => self.project_trigger_operands(child),
+                _ => self.apply_sensitivity(child, FieldSensitivity::Secret),
+            }
+            self.leave(mark);
+        }
+    }
+
+    /// A trigger string match: every operand except a boolean
+    /// `case_insensitive` flag is withheld, entry by entry for the `exact` /
+    /// `prefix` lists so their length stays visible. A non-object fails closed.
     fn project_trigger_operands(&mut self, value: &mut Value) {
-        let Value::Object(map) = value else {
+        if !value.is_object() {
             self.apply_sensitivity(value, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = value.as_object_mut() else {
             return;
         };
         for (key, operand) in map.iter_mut() {
-            if key == "case_insensitive" {
+            if key == "case_insensitive" && operand.is_boolean() {
                 continue;
             }
             let mark = self.enter(key);

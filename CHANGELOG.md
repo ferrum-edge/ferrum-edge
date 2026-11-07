@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `mesh_route_dispatch` `rules[].match.headers`, `match.without_headers` and
     `match.query_params` operands
   - `mesh_authz` policy `to[].headers` and `when[].values` / `not_values`, and
-    the `mesh_slice` ext-authz check-header values, ProxyConfig `environment`
-    values and extension payloads
+    the `mesh_slice` ext-authz check-header values and check-URL
+    `path_prefix`, ProxyConfig `environment` values, extension payloads, and
+    the inline backend client keys of its embedded VirtualService L4 proxies
+    and upstreams
   - `request_termination` `trigger.header_value`
   - `transaction_debugger` `capture_request_header_value`
   - `ai_semantic_firewall` `privacy.snippet_hash_salt`

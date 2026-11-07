@@ -531,8 +531,8 @@ fn mesh_policy(canary: &str) -> Value {
 fn assert_mesh_policy_operands_redacted(policy: &Value) {
     let rule = &policy["rules"][0];
     assert_eq!(rule["to"][0]["headers"]["x-tenant"], REDACTED);
-    assert_eq!(rule["when"][0]["values"], REDACTED);
-    assert_eq!(rule["when"][0]["not_values"], REDACTED);
+    assert_eq!(rule["when"][0]["values"], json!([REDACTED]));
+    assert_eq!(rule["when"][0]["not_values"], json!([REDACTED]));
     assert_eq!(rule["action"], "allow");
     assert_eq!(policy["name"], "payments");
     assert_eq!(policy["namespace"], "shop");
@@ -541,10 +541,13 @@ fn assert_mesh_policy_operands_redacted(policy: &Value) {
 /// `mesh_authz` header and condition operands are withheld in the flat
 /// `mesh_policies` shape and in both policy lists of the mesh-mode
 /// `mesh_slice`, as are the ext-authz check headers, ProxyConfig environment
-/// values and extension payloads the slice carries. Its collector, JWKS,
-/// control-plane and federation URLs get the structural endpoint projection.
+/// values and extension payloads the slice carries, and the inline backend
+/// client keys of its embedded VirtualService L4 proxies and upstreams. Its
+/// collector, JWKS, control-plane and federation URLs get the structural
+/// endpoint projection.
 #[test]
 fn mesh_authz_match_operands_and_check_headers_are_projected() {
+    let inline_key = "-----BEGIN PRIVATE KEY-----\nmat-l4-key-canary\n-----END PRIVATE KEY-----\n";
     let raw = json!({
         "mesh_policies": [mesh_policy("mat-flat-canary")],
         "mesh_slice": {
@@ -553,6 +556,9 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
             "node_waypoint_capture_mesh_policies": [mesh_policy("mat-capture-canary")],
             "ext_authz_providers": [{
                 "name": "ext-check",
+                "service": "authz.shop.svc.cluster.local",
+                "port": 9000,
+                "path_prefix": "/check/mat-prefix-canary",
                 "include_additional_headers_in_check": [
                     {"name": "x-check-gate", "value": "mat-ext-header-canary"}
                 ]
@@ -588,6 +594,21 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
                     "jwks_uri": "https://issuer.example.com/keys?tenant=mat-jwks-canary"
                 }]
             }],
+            "virtual_service_l4_proxies": [{
+                "id": "istio-vs-l4_shop_db",
+                "backend_host": "db.shop.svc",
+                "backend_port": 5432,
+                "backend_tls_client_cert_path": "k8s://shop/db-client#tls.crt",
+                "backend_tls_client_key_path": inline_key
+            }],
+            "virtual_service_l4_upstreams": [{
+                "id": "istio-vs-l4-upstream-db",
+                "backend_tls_client_key_path": "k8s://shop/db#tls.key",
+                "port_overrides": {"5432": {"tls": {
+                    "client_cert_path": "k8s://shop/db#tls.crt",
+                    "client_key_path": inline_key
+                }}}
+            }],
             "multi_cluster": {
                 "federation_endpoint": "https://fed.example.com/mat-fed-canary",
                 "remote_clusters": [{
@@ -613,6 +634,20 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
     assert_eq!(check_header["value"], REDACTED);
     assert_eq!(check_header["name"], "x-check-gate");
     assert_eq!(provider["name"], "ext-check");
+    assert_eq!(provider["path_prefix"], REDACTED);
+    assert_eq!(provider["service"], "authz.shop.svc.cluster.local");
+    assert_eq!(provider["port"], 9000);
+    let l4_proxy = &slice["virtual_service_l4_proxies"][0];
+    assert_eq!(l4_proxy["backend_tls_client_key_path"], REDACTED);
+    assert_eq!(l4_proxy["backend_host"], "db.shop.svc");
+    let l4_upstream = &slice["virtual_service_l4_upstreams"][0];
+    assert_eq!(
+        l4_upstream["backend_tls_client_key_path"],
+        "k8s://shop/db#tls.key"
+    );
+    let port_tls = &l4_upstream["port_overrides"]["5432"]["tls"];
+    assert_eq!(port_tls["client_key_path"], REDACTED);
+    assert_eq!(port_tls["client_cert_path"], "k8s://shop/db#tls.crt");
     let proxy_config = &slice["proxy_configs"][0];
     assert_eq!(proxy_config["environment"]["VENDOR_LICENSE"], REDACTED);
     let extension = &slice["extension_configs"][0];
@@ -621,13 +656,15 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
     assert_eq!(slice["node_id"], "node-a");
 
     let providers = &slice["telemetry_resources"][0]["config"]["tracing"]["providers"];
-    for (index, field, url) in [
-        (0_usize, "url", "https://zipkin.example.com/[REDACTED_PATH]"),
-        (1, "agent_url", "https://dd.example.com?[REDACTED_QUERY]"),
-        (2, "collector_url", "https://ls.example.com/[REDACTED_PATH]"),
-        (3, "endpoint", "https://otel.example.com/[REDACTED_PATH]"),
-    ] {
-        assert_eq!(providers[index]["config"][field], url);
+    let fields = ["url", "agent_url", "collector_url", "endpoint"];
+    let expected_urls = [
+        "https://zipkin.example.com/[REDACTED_PATH]",
+        "https://dd.example.com?[REDACTED_QUERY]",
+        "https://ls.example.com/[REDACTED_PATH]",
+        "https://otel.example.com/[REDACTED_PATH]",
+    ];
+    for (index, (field, url)) in fields.iter().zip(expected_urls).enumerate() {
+        assert_eq!(providers[index]["config"][*field], url);
     }
     assert_eq!(providers[1]["kind"], "datadog");
     let jwt_rule = &slice["request_authentications"][0]["jwt_rules"][0];
@@ -668,12 +705,14 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
             "mat-fed-canary",
             "mat-cp-canary",
             "mat-remote-fed-canary",
+            "mat-prefix-canary",
+            "mat-l4-key-canary",
         ],
     );
 
     // Echoing the projection back is detected at every masked site, including
-    // the condition `key` the name heuristic already masks and the
-    // `values` / `not_values` lists that project to a single placeholder.
+    // the condition `key` the name heuristic already masks and each entry of
+    // the `values` / `not_values` lists.
     let mut expected = Vec::new();
     for policy in [
         "/config/mesh_policies/0",
@@ -683,19 +722,21 @@ fn mesh_authz_match_operands_and_check_headers_are_projected() {
         for site in [
             "to/0/headers/x-tenant",
             "when/0/key",
-            "when/0/values",
-            "when/0/not_values",
+            "when/0/values/0",
+            "when/0/not_values/0",
         ] {
             expected.push(format!("{policy}/rules/0/{site}"));
         }
     }
     let telemetry = "/config/mesh_slice/telemetry_resources/0/config/tracing/providers";
-    let fields = ["url", "agent_url", "collector_url", "endpoint"];
     for (index, field) in fields.iter().enumerate() {
         expected.push(format!("{telemetry}/{index}/config/{field}"));
     }
     for site in [
         "ext_authz_providers/0/include_additional_headers_in_check/0/value",
+        "ext_authz_providers/0/path_prefix",
+        "virtual_service_l4_proxies/0/backend_tls_client_key_path",
+        "virtual_service_l4_upstreams/0/port_overrides/5432/tls/client_key_path",
         "proxy_configs/0/environment/VENDOR_LICENSE",
         "extension_configs/0/value",
         "request_authentications/0/jwt_rules/0/jwks_uri",
@@ -825,6 +866,44 @@ fn trigger_operands_are_withheld_at_every_depth() {
             "/trigger/when/not/any/1/all/0/match/cookie/value/regex".to_string(),
         ]
     );
+}
+
+/// A trigger shape `PluginTrigger` cannot have is withheld wholesale instead of
+/// being walked, so hostile or legacy data never discloses an operand.
+#[test]
+fn malformed_trigger_shapes_fail_closed() {
+    for case in [
+        json!({"at": "", "trigger": "tfc-scalar-canary"}),
+        json!({"at": "", "trigger": {"if": {"match": {"header": {"name": "tfc-if-canary"}}}}}),
+        json!({"at": "/when", "trigger": {"when": "tfc-node-canary"}}),
+        json!({"at": "/when/all", "trigger": {"when": {"all": {"match": "tfc-all-canary"}}}}),
+        json!({"at": "/when/x", "trigger": {"when": {"match": {}, "x": "tfc-key-canary"}}}),
+        json!({"at": "/when/match", "trigger": {"when": {"match": "tfc-leaf-canary"}}}),
+        json!({"at": "/when/match/weird", "trigger": {"when": {"match": {"weird": "tfc-a"}}}}),
+        json!({"at": "/when/match/header", "trigger": {"when": {"match": {"header": "tfc-b"}}}}),
+        json!({
+            "at": "/when/match/header/value",
+            "trigger": {"when": {"match": {"header": {"name": "x", "value": "tfc-c"}}}}
+        }),
+        json!({
+            "at": "/when/match/header/extra",
+            "trigger": {"when": {"match": {"header": {"name": "x", "extra": "tfc-d"}}}}
+        }),
+    ] {
+        let at = case["at"].as_str().expect("case pointer");
+        let mut projected = case["trigger"].clone();
+        let recorder = PlaceholderSiteRecorder::default();
+        project_plugin_trigger_with(&mut projected, "/trigger", &recorder);
+        assert_eq!(
+            projected.pointer(at),
+            Some(&json!(REDACTED)),
+            "{case} -> {projected}"
+        );
+        assert!(
+            !projected.to_string().contains("tfc-"),
+            "{case} leaked: {projected}"
+        );
+    }
 }
 
 #[test]
