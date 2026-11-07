@@ -75,6 +75,10 @@ mod inner {
         deployment_not_started, validate_deployment_candidate,
     };
     use crate::config::gateway_trust::{GatewayTrustBundleIdentity, GatewayTrustBundleRecord};
+    use crate::config::store_policy::{
+        access_control_plugin_allows_consumer, mesh_route_dispatch_referenced_upstream,
+        mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
+    };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
@@ -83,7 +87,6 @@ mod inner {
         ConfigValidationRejection, ValidationAction, collect_rejecting_runtime_config_errors,
         validate_plugin_file_dependencies_off_thread,
     };
-    use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
     use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
     use anyhow::Context;
     use arc_swap::ArcSwap;
@@ -317,48 +320,6 @@ mod inner {
             || message.contains("aggregation expression")
             || (message.contains("expr") && message.contains("now"));
         says_unsupported && names_expr
-    }
-
-    fn mesh_route_dispatch_references_upstream_id(
-        plugin: &PluginConfig,
-        upstream_id: &str,
-    ) -> bool {
-        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-            return false;
-        }
-        MeshRouteDispatchConfig::from_value(&plugin.config)
-            .is_ok_and(|config| config.references_upstream_id(upstream_id))
-    }
-
-    fn mesh_route_dispatch_referenced_upstream(
-        plugin: &PluginConfig,
-        upstream_ids: &HashSet<String>,
-    ) -> Option<String> {
-        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
-            return None;
-        }
-        let config = MeshRouteDispatchConfig::from_value(&plugin.config).ok()?;
-        config
-            .rules
-            .iter()
-            .filter_map(|rule| rule.destination.upstream_id.as_deref())
-            .find(|upstream_id| upstream_ids.contains(*upstream_id))
-            .map(ToOwned::to_owned)
-    }
-
-    /// `access_control.allowed_consumers` names gateway Consumer usernames
-    /// (byte-for-byte). A delete must refuse while any plugin config in the
-    /// namespace still authorizes that username; the operator's policy is not
-    /// rewritten.
-    fn access_control_plugin_allows_consumer(config: &serde_json::Value, username: &str) -> bool {
-        config
-            .get("allowed_consumers")
-            .and_then(|value| value.as_array())
-            .is_some_and(|consumers| {
-                consumers
-                    .iter()
-                    .any(|entry| entry.as_str() == Some(username))
-            })
     }
 
     /// Connection settings captured at startup so `reconnect()` and
@@ -8757,26 +8718,6 @@ mod inner {
         }
     }
 
-    fn store_canonical_resource_hash(
-        bundle: &crate::admin::api_specs::ExtractedBundle,
-    ) -> Result<String, anyhow::Error> {
-        let mut proxy = bundle.proxy.clone();
-        proxy.normalize_fields();
-        let upstream = bundle.upstream.clone().map(|mut upstream| {
-            upstream.normalize_fields();
-            upstream
-        });
-        let mut plugins = bundle.plugins.clone();
-        for plugin in &mut plugins {
-            plugin.normalize_fields();
-        }
-        crate::admin::api_specs::hash_resource_bundle(&crate::admin::api_specs::ExtractedBundle {
-            proxy,
-            upstream,
-            plugins,
-        })
-    }
-
     /// Convert a domain `Proxy` into a BSON `Document` for storage.
     fn proxy_to_doc(proxy: &Proxy) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(proxy)?;
@@ -8863,17 +8804,14 @@ mod inner {
         format!("{namespace}:{value}")
     }
 
-    /// The identity values a consumer claims in the merged per-namespace
-    /// identity keyspace: id ∪ username ∪ custom_id. Self-collisions within
-    /// one consumer are allowed, so the set is deduped.
+    /// Owned form of [`crate::config::store_policy::consumer_identity_values`]:
+    /// the session closures below move the values across `await` points, so
+    /// Mongo needs `String`s. Same set and order as the SQL store.
     fn consumer_identity_values(consumer: &Consumer) -> Vec<String> {
-        let mut values = vec![consumer.id.clone(), consumer.username.clone()];
-        if let Some(ref custom_id) = consumer.custom_id {
-            values.push(custom_id.clone());
-        }
-        values.sort();
-        values.dedup();
-        values
+        crate::config::store_policy::consumer_identity_values(consumer)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect()
     }
 
     fn consumer_identity_index_doc(namespace: &str, value: &str, consumer_id: &str) -> Document {
@@ -13760,12 +13698,11 @@ mod inner {
             custom_id: Option<&str>,
             exclude_consumer_id: Option<&str>,
         ) -> Result<Option<String>, anyhow::Error> {
-            let mut values = vec![consumer_id, username];
-            if let Some(custom_id) = custom_id {
-                values.push(custom_id);
-            }
-            values.sort_unstable();
-            values.dedup();
+            let values = crate::config::store_policy::consumer_identity_values_from_fields(
+                consumer_id,
+                username,
+                custom_id,
+            );
 
             let candidates = {
                 let mut fields = vec![("id", consumer_id), ("username", username)];

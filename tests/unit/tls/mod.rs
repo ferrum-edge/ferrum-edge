@@ -10,6 +10,7 @@ pub(crate) use client_trust_tests::isolated_registry;
 mod crl_policy_tests;
 mod fips_key_admission_tests;
 mod fips_policy_tests;
+mod frontend_live_reload_arming_tests;
 mod frontend_trust_binding_tests;
 mod inbound_crl_resumption_tests;
 mod inventory_public_metadata_tests;
