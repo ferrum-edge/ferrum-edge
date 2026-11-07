@@ -11495,7 +11495,9 @@ async fn grpc_bound_backend_path_outranks_plugin_writable_method_metadata() {
     // Metadata naming an unenrolled method cannot hide the enrolled method the
     // backend actually serves from capture.
     let mut ctx = grpc_ctx("/test.Greeter/SayHello");
-    let headers = grpc_headers();
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
     ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
         &mut ctx,
         "/test.Greeter/SayHello",
@@ -11517,6 +11519,8 @@ async fn grpc_bound_backend_path_outranks_plugin_writable_method_metadata() {
 
     // Nor can metadata enroll a backend method that is not enrolled.
     let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
     ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
         &mut ctx,
         "/test.Greeter/Other",
@@ -11540,6 +11544,7 @@ async fn grpc_bound_backend_path_outranks_plugin_writable_method_metadata() {
     // backend-path boundary or in the final hook.
     let mut ctx = grpc_ctx("/audit/SayHello");
     ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
     let resolved = plugin
         .on_backend_path_resolved(&mut ctx, "/base/test.Greeter/SayHello")
         .await;
@@ -11552,6 +11557,8 @@ async fn grpc_bound_backend_path_outranks_plugin_writable_method_metadata() {
         "a base-path prefix must not un-enroll the backend method at the boundary"
     );
     let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
     ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
         &mut ctx,
         "/base/test.Greeter/SayHello",
