@@ -2471,6 +2471,41 @@ plugin_configs: []
     assert!(config.known_namespaces.iter().any(|n| n == "staging"));
 }
 
+/// File mode keeps only its own namespace before the cross-resource
+/// validators, so another namespace's dangling `upstream_id` does not block
+/// the load. The in-memory (fuzz) decode is unfiltered and refuses the same
+/// document (`fuzz/tests/smoke_properties.rs`
+/// `config_decode_validates_every_namespace_together`).
+#[test]
+fn file_mode_skips_cross_resource_checks_for_other_namespaces() {
+    let json = r#"{
+        "version":"1",
+        "proxies":[
+            {"id":"prod-proxy","namespace":"prod","listen_path":"/prod",
+             "backend_scheme":"http","backend_host":"localhost","backend_port":3001},
+            {"id":"staging-proxy","namespace":"staging","listen_path":"/staging",
+             "backend_scheme":"http","backend_host":"localhost","backend_port":3002,
+             "upstream_id":"missing-upstream"}
+        ],
+        "consumers":[],
+        "plugin_configs":[],
+        "upstreams":[]
+    }"#;
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{json}").unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "prod",
+    )
+    .expect("another namespace's dangling upstream reference must not block file mode");
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.proxies[0].id, "prod-proxy");
+    assert!(config.known_namespaces.iter().any(|n| n == "staging"));
+}
+
 /// Same listen_path within a single namespace must still be rejected.
 #[test]
 fn test_load_config_same_namespace_duplicate_listen_path_rejected() {

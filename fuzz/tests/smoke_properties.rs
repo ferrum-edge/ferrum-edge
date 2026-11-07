@@ -241,27 +241,34 @@ fn config_decode_sniffs_yaml_without_a_path() {
     fuzz_decode_config_document(doc).expect("YAML document decodes without a path");
 }
 
+/// One valid `prod` proxy plus a `staging` proxy whose `upstream_id` does not
+/// exist. File mode loading `prod` drops the staging proxy before the
+/// cross-resource validators run, so it accepts this document
+/// (`file_mode_skips_cross_resource_checks_for_other_namespaces` in
+/// `tests/unit/config/config_file_loader_tests.rs`).
+const OTHER_NAMESPACE_DANGLING_UPSTREAM_JSON: &str = r#"{
+    "version":"1",
+    "proxies":[
+        {"id":"prod-proxy","namespace":"prod","listen_path":"/prod",
+         "backend_scheme":"http","backend_host":"localhost","backend_port":3001},
+        {"id":"staging-proxy","namespace":"staging","listen_path":"/staging",
+         "backend_scheme":"http","backend_host":"localhost","backend_port":3002,
+         "upstream_id":"missing-upstream"}
+    ],
+    "consumers":[],
+    "plugin_configs":[],
+    "upstreams":[]
+}"#;
+
 #[test]
 fn config_decode_validates_every_namespace_together() {
-    // File mode keeps only `FERRUM_NAMESPACE` before the cross-resource
-    // validators, so a listen_path shared across namespaces loads there. The
-    // in-memory decode has no gateway namespace: every namespace's resources
-    // meet the uniqueness validators together.
-    let doc = r#"{
-        "version":"1",
-        "proxies":[
-            {"id":"prod-proxy","namespace":"prod","listen_path":"/api",
-             "backend_scheme":"http","backend_host":"localhost","backend_port":3001},
-            {"id":"staging-proxy","namespace":"staging","listen_path":"/api",
-             "backend_scheme":"http","backend_host":"localhost","backend_port":3002}
-        ],
-        "consumers":[],
-        "plugin_configs":[],
-        "upstreams":[]
-    }"#;
-    let error = fuzz_decode_config_document(doc)
-        .expect_err("unfiltered decode must see the cross-namespace listen_path pair");
-    assert!(error.contains("listen_path"), "{error}");
+    // The in-memory decode has no gateway namespace
+    // (`DocumentNamespaceScope::Unfiltered`), so the cross-resource validators
+    // also see every other namespace's resources and refuse the dangling
+    // staging reference.
+    let error = fuzz_decode_config_document(OTHER_NAMESPACE_DANGLING_UPSTREAM_JSON)
+        .expect_err("unfiltered decode must check the staging proxy's upstream reference");
+    assert!(error.contains("upstream reference"), "{error}");
 }
 
 #[test]
