@@ -1115,7 +1115,9 @@ fn peer_authentication(
     object: &K8sObject,
 ) -> Result<PeerAuthentication, K8sTranslateError> {
     let mtls = object.spec.get("mtls").unwrap_or(&Value::Null);
-    let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("PERMISSIVE"))
+    // An omitted `mtls` block or `mtls.mode` decodes to Istio `UNSET`, which
+    // inherits from the next-higher tier; it is NOT a concrete `PERMISSIVE`.
+    let effective_mtls_mode = mtls_mode(string_field(mtls, "mode").unwrap_or("UNSET"))
         .map_err(|message| invalid_resource(object, format!("mtls.mode {message}")))?;
     let mut port_overrides = HashMap::new();
     for (port, value) in object
@@ -1127,7 +1129,7 @@ fn peer_authentication(
     {
         let port = port_from_string(object, port, "portLevelMtls")?;
         let mode =
-            mtls_mode(string_field(value, "mode").unwrap_or("PERMISSIVE")).map_err(|message| {
+            mtls_mode(string_field(value, "mode").unwrap_or("UNSET")).map_err(|message| {
                 invalid_resource(object, format!("portLevelMtls[\"{port}\"].mode {message}"))
             })?;
         port_overrides.insert(port, mode);
@@ -2822,7 +2824,7 @@ fn translate_client_tls_settings(
         MtlsMode::Disable | MtlsMode::Simple => {}
         // PeerAuthentication-side modes can't be set via DR.tls.mode in Istio;
         // translation above only emits the four client-side modes.
-        MtlsMode::Strict | MtlsMode::Permissive => {
+        MtlsMode::Strict | MtlsMode::Permissive | MtlsMode::Unset => {
             return Err(invalid_resource(
                 object,
                 format!("trafficPolicy.tls.mode {mode_raw:?} is not a client-side TLS mode"),
@@ -3106,10 +3108,12 @@ fn translate_subset(
 /// Translate an Istio PeerAuthentication `mtls.mode` string into [`MtlsMode`].
 ///
 /// Istio defines exactly four values: `UNSET`, `DISABLE`, `PERMISSIVE`, and
-/// `STRICT`. `UNSET` means "inherit from the next-higher tier"; Ferrum models
-/// that inheritance through `resolve_effective_mtls_mode` precedence, so an
-/// explicit `UNSET` contributes the same default posture as `PERMISSIVE` here
-/// (unchanged from prior behaviour).
+/// `STRICT`. `UNSET` (also what an omitted mode decodes to) means "inherit from
+/// the next-higher tier", so it maps to [`MtlsMode::Unset`] rather than a
+/// concrete mode: `resolve_effective_mtls_mode` walks workload port override ->
+/// workload mode -> namespace -> mesh-wide -> the `PERMISSIVE` default. Mapping
+/// it to `PERMISSIVE` here would let a lower-tier policy that only sets
+/// `portLevelMtls` (or an empty `mtls` block) override an inherited `STRICT`.
 ///
 /// A genuinely unknown value (e.g. a typo like `STICT`) is **rejected** rather
 /// than silently treated as `PERMISSIVE`. Otherwise a malformed
@@ -3119,7 +3123,8 @@ fn translate_subset(
 fn mtls_mode(value: &str) -> Result<MtlsMode, String> {
     match value {
         "STRICT" => Ok(MtlsMode::Strict),
-        "PERMISSIVE" | "UNSET" => Ok(MtlsMode::Permissive),
+        "PERMISSIVE" => Ok(MtlsMode::Permissive),
+        "UNSET" => Ok(MtlsMode::Unset),
         "DISABLE" => Ok(MtlsMode::Disable),
         other => Err(format!(
             "unsupported value {other:?} (expected one of UNSET, DISABLE, PERMISSIVE, STRICT)"

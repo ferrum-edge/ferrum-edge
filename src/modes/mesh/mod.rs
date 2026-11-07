@@ -12076,7 +12076,7 @@ fn apply_traffic_policy_tls_to_backend_config(
         // PeerAuthentication-side modes are rejected at translate time;
         // an in-memory slice that still carries one is a programming
         // error. Treat as a no-op rather than panic on the cold path.
-        MtlsMode::Strict | MtlsMode::Permissive => {
+        MtlsMode::Strict | MtlsMode::Permissive | MtlsMode::Unset => {
             warn!(
                 identity = %sanitize_startup_scalar(identity.to_string()),
                 mode = %sanitize_startup_scalar(format!("{:?}", tls.mode)),
@@ -19478,7 +19478,11 @@ fn resolve_mesh_inbound_client_auth(
 ) -> MeshClientAuthDecision {
     let is_egress_gateway = topology == MeshTopology::EgressGateway;
     match mtls_mode {
-        config::MtlsMode::Strict => MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Required),
+        // `Unset` never survives the canonical PeerAuthentication resolver; a
+        // leaked inherit marker fails closed to required client auth.
+        config::MtlsMode::Strict | config::MtlsMode::Unset => {
+            MeshClientAuthDecision::Resolved(tls::MeshClientAuth::Required)
+        }
         config::MtlsMode::Permissive if has_client_ca_bundle || has_spiffe_verifier => {
             // EgressGateway is a security boundary onto external networks: a
             // cert-less client must NOT be admitted to the external backend.
@@ -20504,7 +20508,9 @@ pub fn build_node_waypoint_dtls_owner_configs(
             let mode =
                 effective_node_waypoint_dtls_peer_auth_mode(slice, service, service_port.port);
             let route_client_ca = match mode {
-                config::MtlsMode::Strict => match client_ca {
+                // `Unset` never survives the canonical resolver; a leaked
+                // inherit marker is served as STRICT (fail closed).
+                config::MtlsMode::Strict | config::MtlsMode::Unset => match client_ca {
                     Some(path) => Some(path),
                     None => {
                         // STRICT without a client CA cannot be served. Returning
@@ -20636,7 +20642,9 @@ fn effective_node_waypoint_dtls_peer_auth_mode(
 ) -> config::MtlsMode {
     fn rank(mode: config::MtlsMode) -> u8 {
         match mode {
-            config::MtlsMode::Strict => 2,
+            // `Unset` never survives the canonical resolver; rank a leaked
+            // inherit marker as STRICT so it can only tighten the mixed set.
+            config::MtlsMode::Strict | config::MtlsMode::Unset => 2,
             config::MtlsMode::Permissive => 1,
             config::MtlsMode::Disable => 0,
             // Client-side DestinationRule modes are invalid in this server-side
