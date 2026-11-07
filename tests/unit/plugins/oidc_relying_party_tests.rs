@@ -2204,6 +2204,70 @@ async fn loopback_http_provider_endpoints_remain_available_for_development() {
     assert!(OidcRelyingParty::new(&config, PluginHttpClient::default()).is_ok());
 }
 
+/// Gateway-dialed provider URLs admit plain HTTP only for a loopback IP
+/// literal (#6659): DNS overrides and the resolver decide where a name —
+/// `localhost` included — connects, and these URLs carry the client secret,
+/// the authorization code exchange, and the signing keys. Browser-followed
+/// redirect URLs keep the `localhost` development case (see above).
+#[tokio::test]
+async fn gateway_dialed_provider_urls_reject_cleartext_localhost_names() {
+    let loopback_config = || {
+        json!({
+            "providers": [{
+                "issuer": "http://127.0.0.1:8080",
+                "authorization_endpoint": "http://localhost:8080/authorize",
+                "token_endpoint": "http://127.0.0.1:8080/token",
+                "userinfo_endpoint": "http://127.0.0.1:8080/userinfo",
+                "jwks_uri": "http://127.0.0.1:8080/jwks",
+                "end_session_endpoint": "http://localhost:8080/logout",
+                "client_id": "local-client",
+                "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
+                "scopes": ["openid"],
+                "redirect_uri": "http://localhost:3000/oauth/callback",
+                "callback_path": "/oauth/callback"
+            }],
+            "session": {"encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486"}
+        })
+    };
+    assert!(
+        OidcRelyingParty::new(&loopback_config(), PluginHttpClient::default()).is_ok(),
+        "browser-followed URLs may still name localhost"
+    );
+
+    for field in ["token_endpoint", "userinfo_endpoint", "jwks_uri"] {
+        for host in ["localhost", "idp.localhost"] {
+            let mut config = loopback_config();
+            config["providers"][0][field] = json!(format!("http://{host}:8080/{field}"));
+            let error = OidcRelyingParty::new(&config, PluginHttpClient::default())
+                .err()
+                .unwrap_or_else(|| panic!("cleartext {host} {field} must reject"));
+            assert!(error.contains("loopback IP literal"), "{field}: {error}");
+        }
+    }
+
+    let mut discovery = loopback_config();
+    let provider = discovery["providers"][0].as_object_mut().unwrap();
+    for field in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        provider.remove(field);
+    }
+    provider.insert(
+        "discovery_url".to_string(),
+        json!("http://localhost:8080/.well-known/openid-configuration"),
+    );
+    let error = OidcRelyingParty::new(&discovery, PluginHttpClient::default())
+        .err()
+        .expect("cleartext localhost discovery_url must reject");
+    assert!(error.contains("loopback IP literal"), "{error}");
+
+    let mut none = loopback_config();
+    none["providers"][0]["token_endpoint"] = json!("https://localhost:8443/token");
+    none["providers"][0]["client_auth"] = json!({"method": "none"});
+    let error = OidcRelyingParty::new(&none, PluginHttpClient::default())
+        .err()
+        .expect("client_auth none against a localhost name must reject");
+    assert!(error.contains("loopback IP-literal"), "{error}");
+}
+
 #[tokio::test]
 async fn callback_hook_materializes_decoded_query_before_processing() {
     let mut config = base_config();

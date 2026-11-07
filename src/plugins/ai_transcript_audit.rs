@@ -2317,14 +2317,16 @@ impl AiTranscriptAudit {
                         .to_string(),
                 );
             }
-            let loopback = endpoint_hostname.eq_ignore_ascii_case("localhost")
-                || endpoint_hostname
-                    .parse::<IpAddr>()
-                    .is_ok_and(|address| address.is_loopback());
+            // Only a loopback IP literal proves the transcript stays on this
+            // machine: DNS overrides and the resolver decide where a name —
+            // `localhost` included — connects (the #6659 rule).
+            let loopback = endpoint_hostname
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
             if !loopback {
                 return Err(
                     "ai_transcript_audit: `sink.allow_insecure_loopback` permits http:// only \
-                     for localhost or a loopback IP address"
+                     for a loopback IP literal"
                         .to_string(),
                 );
             }

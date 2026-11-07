@@ -2846,7 +2846,7 @@ fn parse_url_field(
         "http" if is_local_auth_endpoint(&parsed) => {}
         "http" => {
             return Err(format!(
-                "jwks_auth: `provider[{provider_idx}].{field}` must use https except for literal loopback or localhost"
+                "jwks_auth: `provider[{provider_idx}].{field}` must use https except for a loopback IP literal"
             ));
         }
         scheme => {
@@ -2869,12 +2869,15 @@ fn parse_url_field(
     }))
 }
 
+/// `true` only for a loopback IP-literal host. A name — `localhost` included —
+/// never qualifies: DNS overrides and the resolver decide where it connects,
+/// and a cleartext key set fetched from an attacker-chosen address would let
+/// that address mint accepted tokens (the #6659 rule for cleartext endpoints).
 fn is_local_auth_endpoint(parsed: &Url) -> bool {
     match parsed.host() {
-        Some(Host::Domain(hostname)) => hostname.eq_ignore_ascii_case("localhost"),
         Some(Host::Ipv4(address)) => address.is_loopback(),
         Some(Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
+        Some(Host::Domain(_)) | None => false,
     }
 }
 

@@ -477,6 +477,22 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
                 "allow_insecure_loopback": true
             }
         }),
+        // A name never proves the collector is on this machine: DNS overrides
+        // and the resolver decide where `localhost` connects (#6659).
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://collector.localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
     ] {
         let err = AiTranscriptAudit::new(&config, loopback_http_client())
             .err()

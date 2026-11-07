@@ -984,6 +984,7 @@ impl OidcRelyingParty {
         let issuer = validate_url_string(
             &required_string(provider_obj, "issuer", "provider[0]")?,
             "provider[0].issuer",
+            UrlAudience::Identifier,
         )?;
         let discovery_url = optional_string(provider_obj, "discovery_url", "provider[0]")?;
         let authorization_endpoint =
@@ -1010,22 +1011,22 @@ impl OidcRelyingParty {
             );
         }
         let discovery_url = discovery_url
-            .map(|url| validate_url_string(&url, "provider[0].discovery_url"))
+            .map(|url| validate_url_string(&url, "provider[0].discovery_url", UrlAudience::Gateway))
             .transpose()?;
         let authorization_endpoint = authorization_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].authorization_endpoint"))
+            .map(|url| validate_url_string(&url, "provider[0].authorization_endpoint", UrlAudience::Browser))
             .transpose()?;
         let token_endpoint = token_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].token_endpoint"))
+            .map(|url| validate_url_string(&url, "provider[0].token_endpoint", UrlAudience::Gateway))
             .transpose()?;
         let userinfo_endpoint = userinfo_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].userinfo_endpoint"))
+            .map(|url| validate_url_string(&url, "provider[0].userinfo_endpoint", UrlAudience::Gateway))
             .transpose()?;
         let jwks_uri = jwks_uri
-            .map(|url| validate_url_string(&url, "provider[0].jwks_uri"))
+            .map(|url| validate_url_string(&url, "provider[0].jwks_uri", UrlAudience::Gateway))
             .transpose()?;
         let end_session_endpoint = end_session_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].end_session_endpoint"))
+            .map(|url| validate_url_string(&url, "provider[0].end_session_endpoint", UrlAudience::Browser))
             .transpose()?;
 
         let client_id = required_string(provider_obj, "client_id", "provider[0]")?;
@@ -1362,7 +1363,7 @@ impl OidcRelyingParty {
         // rejected plugin configs have no background side effects.
         let post_logout_redirect_uri =
             optional_string(provider_obj, "post_logout_redirect_uri", "provider[0]")?
-                .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri"))
+                .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri", UrlAudience::Browser))
                 .transpose()?;
         let initial_jwks_store = if start_background_tasks {
             jwks_uri
@@ -3884,10 +3885,10 @@ fn parse_client_auth(
                 Url::parse(url)
                     .ok()
                     .and_then(|parsed| parsed.host_str().map(ToOwned::to_owned))
-                    .is_none_or(|host| !is_local_auth_host(&host))
+                    .is_none_or(|host| !is_loopback_ip_literal_host(&host))
             }) {
                 return Err(
-                    "oidc_relying_party: `client_auth.method`=`none` is only allowed for localhost or loopback token endpoints"
+                    "oidc_relying_party: `client_auth.method`=`none` is only allowed for loopback IP-literal token endpoints"
                         .to_string(),
                 );
             }
@@ -4362,15 +4363,40 @@ fn correlation_cookie_host_from_request(ctx: &RequestContext) -> Option<Correlat
     Some(CorrelationCookieHost::Domain(host.to_ascii_lowercase()))
 }
 
-fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
+/// Who dereferences a configured provider URL, which decides whether the name
+/// `localhost` may stand in for a loopback address on plain `http://`.
+#[derive(Clone, Copy)]
+enum UrlAudience {
+    /// The gateway itself dials it (discovery, token, UserInfo, JWKS): client
+    /// credentials, tokens, and signing keys cross it, so plain `http://` is
+    /// admitted only for a loopback IP literal. DNS overrides and the resolver
+    /// decide where a name connects (the #6659 rule).
+    Gateway,
+    /// Only the user agent follows it (authorization, end-session, and
+    /// post-logout redirects); the gateway never resolves it.
+    Browser,
+    /// A compared identifier (`issuer`), never dereferenced.
+    Identifier,
+}
+
+fn validate_url_string(raw: &str, field: &str, audience: UrlAudience) -> Result<String, String> {
     let parsed =
         Url::parse(raw).map_err(|e| format!("oidc_relying_party: `{field}` invalid: {e}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("oidc_relying_party: `{field}` must include a hostname"))?;
+    let local_http = match audience {
+        UrlAudience::Gateway => is_loopback_ip_literal_host(host),
+        UrlAudience::Browser | UrlAudience::Identifier => is_local_auth_host(host),
+    };
     match parsed.scheme() {
         "https" => {}
-        "http" if is_local_auth_host(host) => {}
+        "http" if local_http => {}
+        "http" if matches!(audience, UrlAudience::Gateway) => {
+            return Err(format!(
+                "oidc_relying_party: `{field}` must use https except for a loopback IP literal"
+            ));
+        }
         "http" => {
             return Err(format!(
                 "oidc_relying_party: `{field}` must use https except for literal loopback or localhost"
@@ -4413,7 +4439,7 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
     }
     match parsed.scheme() {
         "https" => Ok(raw.trim().to_string()),
-        "http" if is_local_auth_host(endpoint_host) => {
+        "http" if is_loopback_ip_literal_host(endpoint_host) => {
             let discovery_host = discovery.host_str().ok_or_else(|| {
                 "oidc_relying_party: discovery_url must include a hostname".to_string()
             })?;
@@ -4428,7 +4454,7 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
             Ok(raw.trim().to_string())
         }
         "http" => Err(format!(
-            "oidc_relying_party: discovery {field} must use https except for literal loopback or localhost"
+            "oidc_relying_party: discovery {field} must use https except for a loopback IP literal"
         )),
         scheme => Err(format!(
             "oidc_relying_party: discovery {field} must use http or https, got {scheme:?}"
@@ -4506,6 +4532,20 @@ fn parse_authorization_params(
     Ok(params)
 }
 
+/// `true` only for a loopback IP literal (`127.0.0.0/8`, `[::1]`). Gateway-dialed
+/// provider URLs use this: a name — `localhost` included — never qualifies.
+fn is_loopback_ip_literal_host(hostname: &str) -> bool {
+    hostname
+        .strip_prefix('[')
+        .and_then(|hostname| hostname.strip_suffix(']'))
+        .unwrap_or(hostname)
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+/// Browser-facing redirect URLs additionally accept `localhost`: the user
+/// agent, not the gateway, resolves them, and browsers treat `localhost` as a
+/// potentially trustworthy origin.
 fn is_local_auth_host(hostname: &str) -> bool {
     let literal = hostname
         .strip_prefix('[')
@@ -5662,20 +5702,36 @@ mod tests {
     #[test]
     fn direct_provider_urls_allow_http_only_for_literal_loopback_or_localhost() {
         for allowed in [
-            "http://localhost:8080/token",
             "http://127.0.0.1:8080/token",
             "http://[::1]:8080/token",
             "https://idp.example.com/token",
         ] {
-            assert!(validate_url_string(allowed, "token_endpoint").is_ok());
+            assert!(validate_url_string(allowed, "token_endpoint", UrlAudience::Gateway).is_ok());
         }
         for denied in [
+            "http://localhost:8080/token",
+            "http://api.localhost:8080/token",
             "http://idp.example.com/token",
             "http://127.0.0.1.example.com/token",
             "ftp://localhost/token",
         ] {
-            assert!(validate_url_string(denied, "token_endpoint").is_err());
+            assert!(validate_url_string(denied, "token_endpoint", UrlAudience::Gateway).is_err());
         }
+        // Browser-followed redirects keep the `localhost` development case.
+        for allowed in ["http://localhost:8080/authorize", "http://127.0.0.1:8080/authorize"] {
+            assert!(
+                validate_url_string(allowed, "authorization_endpoint", UrlAudience::Browser)
+                    .is_ok()
+            );
+        }
+        assert!(
+            validate_url_string(
+                "http://idp.example.com/authorize",
+                "authorization_endpoint",
+                UrlAudience::Browser
+            )
+            .is_err()
+        );
     }
 
     #[test]

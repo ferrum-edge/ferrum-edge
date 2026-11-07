@@ -266,8 +266,8 @@ fn new_accepts_credentialed_client_auth_for_remote_https_endpoint() {
 #[test]
 fn new_accepts_credentialed_client_auth_for_loopback_http_endpoint() {
     for endpoint in [
-        "http://localhost:9000/introspect",
         "http://127.0.0.1:9000/introspect",
+        "http://127.42.0.9:9000/introspect",
         "http://[::1]:9000/introspect",
     ] {
         assert!(
@@ -312,13 +312,48 @@ fn new_rejects_none_client_auth_for_remote_endpoint() {
     assert!(err.contains("only allowed"));
 }
 
+/// Only a loopback IP literal exempts a credentialed `http://` endpoint (the
+/// #6659 rule): DNS overrides and the resolver decide where a name connects,
+/// so `localhost` and `*.localhost` must not carry a client secret, a signed
+/// client assertion, or an unauthenticated introspection call in cleartext.
 #[test]
-fn new_accepts_none_client_auth_for_localhost_endpoint() {
+fn new_rejects_cleartext_localhost_names_for_credentialed_and_none_client_auth() {
+    for endpoint in [
+        "http://localhost:9000/introspect",
+        "http://LOCALHOST:9000/introspect",
+        "http://api.localhost:9000/introspect",
+    ] {
+        for method in ["client_secret_basic", "client_secret_post"] {
+            let error = Oauth2Introspection::new(
+                &config_with_client_auth(endpoint, method),
+                PluginHttpClient::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{method} over {endpoint} must reject"));
+            assert!(error.contains("requires an https"), "{error}");
+        }
+        let error = Oauth2Introspection::new(
+            &json!({
+                "providers": [{
+                    "introspection_endpoint": endpoint,
+                    "client_auth": {"method": "none"}
+                }]
+            }),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("none over {endpoint} must reject"));
+        assert!(error.contains("only allowed"), "{error}");
+    }
+}
+
+#[test]
+fn new_accepts_none_client_auth_for_loopback_ip_endpoint() {
     assert!(
         Oauth2Introspection::new(
             &json!({
                 "providers": [{
-                    "introspection_endpoint": "http://localhost:8080/introspect",
+                    "introspection_endpoint": "http://127.0.0.1:8080/introspect",
                     "client_auth": {"method": "none"}
                 }]
             }),
@@ -855,27 +890,27 @@ fn new_rejects_unknown_fields_at_every_config_layer() {
     let configs = [
         json!({
             "providers": [{
-                "introspection_endpoint": "http://localhost/introspect",
+                "introspection_endpoint": "http://127.0.0.1/introspect",
                 "client_auth": {"method": "none"}
             }],
             "required_scope": ["read"]
         }),
         json!({
             "providers": [{
-                "introspection_endpoint": "http://localhost/introspect",
+                "introspection_endpoint": "http://127.0.0.1/introspect",
                 "client_auth": {"method": "none"},
                 "audience": "api"
             }]
         }),
         json!({
             "providers": [{
-                "introspection_endpoint": "http://localhost/introspect",
+                "introspection_endpoint": "http://127.0.0.1/introspect",
                 "client_auth": {"method": "none", "client_secert": "typo"}
             }]
         }),
         json!({
             "providers": [{
-                "introspection_endpoint": "http://localhost/introspect",
+                "introspection_endpoint": "http://127.0.0.1/introspect",
                 "client_auth": {"method": "none"},
                 "from_headers": [{"name": "x-token", "prefx": "Token "}]
             }]
@@ -893,7 +928,7 @@ fn new_rejects_unknown_fields_at_every_config_layer() {
 #[test]
 fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
     let provider = json!({
-        "introspection_endpoint": "http://localhost/introspect",
+        "introspection_endpoint": "http://127.0.0.1/introspect",
         "client_auth": {"method": "none"}
     });
     assert!(
@@ -912,7 +947,7 @@ fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
     assert!(error.contains("allow_provider_fanout"));
 
     let duplicate_location = json!({
-        "introspection_endpoint": "http://localhost/introspect",
+        "introspection_endpoint": "http://127.0.0.1/introspect",
         "client_auth": {"method": "none"},
         "from_headers": [{"name": "x-tenant-token"}]
     });
@@ -925,7 +960,7 @@ fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
     );
 
     let implicit_authorization = json!({
-        "introspection_endpoint": "http://localhost/introspect",
+        "introspection_endpoint": "http://127.0.0.1/introspect",
         "client_auth": {"method": "none"}
     });
     for from_headers in [
@@ -933,7 +968,7 @@ fn new_bounds_provider_count_and_requires_explicit_shared_trust_for_fanout() {
         json!([{"name": "Authorization"}]),
     ] {
         let explicit_authorization = json!({
-            "introspection_endpoint": "http://localhost/introspect",
+            "introspection_endpoint": "http://127.0.0.1/introspect",
             "client_auth": {"method": "none"},
             "from_headers": from_headers
         });
@@ -1260,7 +1295,7 @@ async fn missing_credentials_advertise_bearer_in_single_and_multi_auth_modes() {
     for auth_mode in [AuthMode::Single, AuthMode::Multi] {
         let plugin: Arc<dyn Plugin> = Arc::new(
             Oauth2Introspection::new(
-                &config("http://localhost/introspect"),
+                &config("http://127.0.0.1/introspect"),
                 PluginHttpClient::default(),
             )
             .unwrap(),
