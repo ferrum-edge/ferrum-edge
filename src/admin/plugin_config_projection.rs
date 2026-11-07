@@ -154,6 +154,114 @@ const REDIS_BACKED: &[SensitivityRule] = &[redis_url(&["redis_url"])];
 /// beyond what the name heuristic and the structural URL sweep already cover.
 const NONE: &[SensitivityRule] = &[];
 
+/// `mesh_authz` policy match operands and outbound check headers.
+///
+/// Policies arrive either as an operator-authored flat `mesh_policies` list or
+/// inside the mesh-mode `mesh_slice` (ordinary and NodeWaypoint-capture
+/// policies alike). `to[].headers` values and `when[].values` /
+/// `when[].not_values` are request-header (or claim, principal, IP) match
+/// operands. A `when` entry's `key` decides which, and a path rule cannot read
+/// a sibling, so every condition value is withheld (the `key` field itself is
+/// already masked by the name heuristic). Three more slice fields are withheld: the
+/// `include_additional_headers_in_check[].value` headers an external
+/// authorization provider sends to its check service, and two opaque
+/// operator-authored payloads, Istio ProxyConfig `environment` values and ECDS
+/// extension `value` bytes.
+const MESH_AUTHZ: &[SensitivityRule] = &[
+    secret(&[
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "to",
+        "*",
+        "headers",
+        "*",
+    ]),
+    secret(&["mesh_policies", "*", "rules", "*", "when", "*", "values"]),
+    secret(&[
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "not_values",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "to",
+        "*",
+        "headers",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "values",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "not_values",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "node_waypoint_capture_mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "to",
+        "*",
+        "headers",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "node_waypoint_capture_mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "values",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "node_waypoint_capture_mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "not_values",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "ext_authz_providers",
+        "*",
+        "include_additional_headers_in_check",
+        "*",
+        "value",
+    ]),
+    secret(&["mesh_slice", "proxy_configs", "*", "environment", "*"]),
+    secret(&["mesh_slice", "extension_configs", "*", "value"]),
+];
+
 /// Per-plugin sensitivity schema.
 ///
 /// Every name in `BUILTIN_PLUGIN_PARITY_META` must appear here — enforced by
@@ -177,7 +285,13 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("correlation_id", NONE),
     // ---- Request-received phase ------------------------------------------
     ("cors", NONE),
-    ("request_termination", NONE),
+    (
+        "request_termination",
+        // `trigger.header_value` is the value a request must carry to be
+        // terminated: an operator-chosen token, like a `waf` exemption value.
+        // The header name and the termination response stay visible.
+        &[secret(&["trigger", "header_value"])],
+    ),
     ("mesh_outbound_registry", NONE),
     ("ip_restriction", NONE),
     ("geo_restriction", NONE),
@@ -245,7 +359,7 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     // ---- Authorization ----------------------------------------------------
     ("access_control", NONE),
     ("tcp_connection_throttle", NONE),
-    ("mesh_authz", NONE),
+    ("mesh_authz", MESH_AUTHZ),
     (
         "opa",
         &[
@@ -310,7 +424,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ),
     (
         "ai_semantic_firewall",
-        &[endpoint_url(&["provider", "endpoint"])],
+        &[
+            endpoint_url(&["provider", "endpoint"]),
+            // Keys the logged snippet hashes; disclosing it lets a reader
+            // confirm guessed snippets against the hashes.
+            secret(&["privacy", "snippet_hash_salt"]),
+        ],
     ),
     ("ai_request_guard", NONE),
     (
@@ -347,10 +466,22 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("a2a_gateway", NONE),
     (
         "mesh_route_dispatch",
-        // Per-route request-header writes reach the upstream exactly like
-        // `request_transformer` rule values, so they are secret for the same
-        // reason.
-        &[secret(&["rules", "*", "request_transform", "*", "value"])],
+        &[
+            // Per-route request-header writes reach the upstream exactly like
+            // `request_transformer` rule values, so they are secret for the
+            // same reason.
+            secret(&["rules", "*", "request_transform", "*", "value"]),
+            // Match operands select a route by a value the client presents;
+            // operators may route on a shared secret or a credential-bearing
+            // header or query parameter. Each operand is a bare string or a
+            // one-key `{exact|prefix|regex: ...}` object: the trailing `*`
+            // masks the bare string itself (a scalar where a container is
+            // expected fails closed) and the inner value of the object form,
+            // keeping the match kind visible.
+            secret(&["rules", "*", "match", "headers", "*", "*"]),
+            secret(&["rules", "*", "match", "without_headers", "*", "*"]),
+            secret(&["rules", "*", "match", "query_params", "*", "*"]),
+        ],
     ),
     (
         "ai_semantic_cache",
@@ -452,7 +583,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             secret(&["custom_headers", "*"]),
         ],
     ),
-    ("transaction_debugger", NONE),
+    (
+        "transaction_debugger",
+        // The selector value a request must carry to be captured; the plugin
+        // already treats it as an operator-chosen token.
+        &[secret(&["capture_request_header_value"])],
+    ),
     // ---- Notifications ----------------------------------------------------
     (
         "proxy_alerts",

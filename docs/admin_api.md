@@ -1737,6 +1737,12 @@ Fields covered by the schema include:
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
 | `request_transformer` | `rules.*.value` | `[REDACTED]` (header, query and body values are written into the upstream request and may carry a backend credential; `operation`, `target` and `new_key` stay visible, while `key` is already masked by the name heuristic) |
 | `mesh_route_dispatch` | `rules.*.request_transform.*.value` | `[REDACTED]` (same reason as `request_transformer`) |
+| `mesh_route_dispatch` | `rules.*.match.headers.*`, `rules.*.match.without_headers.*`, `rules.*.match.query_params.*` | `[REDACTED]` for a bare-string operand; an `{exact\|prefix\|regex}` operand keeps its match kind and masks the value |
+| `mesh_authz` | `rules.*.to.*.headers.*`, `rules.*.when.*.values`, `rules.*.when.*.not_values` of every policy in `mesh_policies`, `mesh_slice.mesh_policies` and `mesh_slice.node_waypoint_capture_mesh_policies` | `[REDACTED]` (every condition value is withheld, because the condition `key` decides whether it is a header value) |
+| `mesh_authz` | `mesh_slice.ext_authz_providers.*.include_additional_headers_in_check.*.value`, `mesh_slice.proxy_configs.*.environment.*`, `mesh_slice.extension_configs.*.value` | `[REDACTED]` |
+| `request_termination` | `trigger.header_value` | `[REDACTED]` (`trigger.header` stays visible) |
+| `transaction_debugger` | `capture_request_header_value` | `[REDACTED]` (`capture_request_header` stays visible) |
+| `ai_semantic_firewall` | `privacy.snippet_hash_salt` | `[REDACTED]` |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
 | `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
 | `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |

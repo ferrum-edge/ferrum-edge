@@ -366,6 +366,237 @@ fn waf_condition_header_values_are_projected() {
     );
 }
 
+/// `mesh_route_dispatch` match operands select a route by a value the client
+/// presents. Each operand is a bare string or a one-key `{exact|prefix|regex}`
+/// object: the bare string is masked whole, and the object keeps its match kind
+/// while its value is masked.
+#[test]
+fn mesh_route_dispatch_match_operands_are_projected() {
+    let raw = json!({
+        "reject_unmatched": true,
+        "rules": [{
+            "name": "canary",
+            "match": {
+                "methods": ["GET"],
+                "headers": {
+                    "Ocp-Apim-Subscription-Key": "mrd-bare-header-canary",
+                    "x-tenant": {"prefix": "mrd-tagged-header-canary"}
+                },
+                "without_headers": {"x-debug": {"exact": "mrd-without-canary"}},
+                "query_params": {
+                    "access": "mrd-bare-query-canary",
+                    "sig": {"regex": "mrd-tagged-query-canary.*"}
+                }
+            },
+            "destination": {"upstream_id": "canary-pool"}
+        }]
+    });
+    assert!(
+        placeholder_sites("mesh_route_dispatch", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("mesh_route_dispatch", raw);
+    let rule = &projected["rules"][0];
+    let headers = &rule["match"]["headers"];
+    assert_eq!(headers["Ocp-Apim-Subscription-Key"], REDACTED);
+    assert_eq!(headers["x-tenant"], json!({"prefix": REDACTED}));
+    let without = &rule["match"]["without_headers"];
+    assert_eq!(without["x-debug"], json!({"exact": REDACTED}));
+    let query = &rule["match"]["query_params"];
+    assert_eq!(query["access"], REDACTED);
+    assert_eq!(query["sig"], json!({"regex": REDACTED}));
+    // Names, match kinds and routing metadata stay visible.
+    assert_eq!(rule["match"]["methods"], json!(["GET"]));
+    assert_eq!(rule["name"], "canary");
+    assert_eq!(rule["destination"]["upstream_id"], "canary-pool");
+    assert_eq!(projected["reject_unmatched"], true);
+    assert_no_canaries(
+        &projected,
+        &[
+            "mrd-bare-header-canary",
+            "mrd-tagged-header-canary",
+            "mrd-without-canary",
+            "mrd-bare-query-canary",
+            "mrd-tagged-query-canary",
+        ],
+    );
+
+    // Echoing the masked operands back is detected at every site.
+    let mut sites = placeholder_sites("mesh_route_dispatch", &projected);
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "/config/rules/0/match/headers/Ocp-Apim-Subscription-Key".to_string(),
+            "/config/rules/0/match/headers/x-tenant/prefix".to_string(),
+            "/config/rules/0/match/query_params/access".to_string(),
+            "/config/rules/0/match/query_params/sig/regex".to_string(),
+            "/config/rules/0/match/without_headers/x-debug/exact".to_string(),
+        ]
+    );
+}
+
+/// `trigger.header_value` is the value a request must carry to be terminated:
+/// an operator-chosen token. The header name and the response stay visible.
+#[test]
+fn request_termination_trigger_header_value_is_projected() {
+    let raw = json!({
+        "status_code": 503,
+        "message": "maintenance",
+        "trigger": {"header": "x-maintenance-bypass", "header_value": "rt-trigger-canary"}
+    });
+    assert!(
+        placeholder_sites("request_termination", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("request_termination", raw);
+    assert_eq!(projected["trigger"]["header_value"], REDACTED);
+    assert_eq!(projected["trigger"]["header"], "x-maintenance-bypass");
+    assert_eq!(projected["status_code"], 503);
+    assert_eq!(projected["message"], "maintenance");
+    assert_no_canaries(&projected, &["rt-trigger-canary"]);
+    assert_eq!(
+        placeholder_sites("request_termination", &projected),
+        vec!["/config/trigger/header_value".to_string()]
+    );
+}
+
+/// The `transaction_debugger` capture selector value is an operator-chosen
+/// token a request must carry to be captured.
+#[test]
+fn transaction_debugger_capture_selector_value_is_projected() {
+    let raw = json!({
+        "log_request_body": true,
+        "capture_request_header": "x-debug-session",
+        "capture_request_header_value": "td-selector-canary"
+    });
+    assert!(
+        placeholder_sites("transaction_debugger", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("transaction_debugger", raw);
+    assert_eq!(projected["capture_request_header_value"], REDACTED);
+    assert_eq!(projected["capture_request_header"], "x-debug-session");
+    assert_eq!(projected["log_request_body"], true);
+    assert_no_canaries(&projected, &["td-selector-canary"]);
+    assert_eq!(
+        placeholder_sites("transaction_debugger", &projected),
+        vec!["/config/capture_request_header_value".to_string()]
+    );
+}
+
+/// The `ai_semantic_firewall` snippet-hash salt keys the logged snippet
+/// hashes; a reader holding it could confirm guessed snippets.
+#[test]
+fn ai_semantic_firewall_snippet_hash_salt_is_projected() {
+    let raw = json!({
+        "provider": {"endpoint": "https://guard.example.com"},
+        "privacy": {"include_snippet_hash": true, "snippet_hash_salt": "asf-salt-canary"}
+    });
+    assert!(
+        placeholder_sites("ai_semantic_firewall", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("ai_semantic_firewall", raw);
+    assert_eq!(projected["privacy"]["snippet_hash_salt"], REDACTED);
+    assert_eq!(projected["privacy"]["include_snippet_hash"], true);
+    assert_no_canaries(&projected, &["asf-salt-canary"]);
+    assert_eq!(
+        placeholder_sites("ai_semantic_firewall", &projected),
+        vec!["/config/privacy/snippet_hash_salt".to_string()]
+    );
+}
+
+fn mesh_policy(canary: &str) -> Value {
+    json!({
+        "name": "payments",
+        "namespace": "shop",
+        "rules": [{
+            "to": [{"headers": {"x-tenant": format!("{canary}-to")}}],
+            "when": [{
+                "key": "request.headers[x-gate]",
+                "values": [format!("{canary}-when")],
+                "not_values": [format!("{canary}-not")]
+            }],
+            "action": "allow"
+        }]
+    })
+}
+
+fn assert_mesh_policy_operands_redacted(policy: &Value) {
+    let rule = &policy["rules"][0];
+    assert_eq!(rule["to"][0]["headers"]["x-tenant"], REDACTED);
+    assert_eq!(rule["when"][0]["values"], REDACTED);
+    assert_eq!(rule["when"][0]["not_values"], REDACTED);
+    assert_eq!(rule["action"], "allow");
+    assert_eq!(policy["name"], "payments");
+    assert_eq!(policy["namespace"], "shop");
+}
+
+/// `mesh_authz` header and condition operands are withheld in the flat
+/// `mesh_policies` shape and in both policy lists of the mesh-mode
+/// `mesh_slice`, as are the ext-authz check headers, ProxyConfig environment
+/// values and extension payloads the slice carries.
+#[test]
+fn mesh_authz_match_operands_and_check_headers_are_projected() {
+    let projected = project(
+        "mesh_authz",
+        json!({
+            "mesh_policies": [mesh_policy("mat-flat-canary")],
+            "mesh_slice": {
+                "node_id": "node-a",
+                "mesh_policies": [mesh_policy("mat-slice-canary")],
+                "node_waypoint_capture_mesh_policies": [mesh_policy("mat-capture-canary")],
+                "ext_authz_providers": [{
+                    "name": "ext-check",
+                    "include_additional_headers_in_check": [
+                        {"name": "x-check-gate", "value": "mat-ext-header-canary"}
+                    ]
+                }],
+                "proxy_configs": [{
+                    "name": "defaults",
+                    "environment": {"VENDOR_LICENSE": "mat-env-canary"}
+                }],
+                "extension_configs": [{
+                    "name": "wasm-filter",
+                    "type_url": "type.example/filter",
+                    "value": "mat-extension-canary"
+                }]
+            }
+        }),
+    );
+    assert_mesh_policy_operands_redacted(&projected["mesh_policies"][0]);
+    let slice = &projected["mesh_slice"];
+    assert_mesh_policy_operands_redacted(&slice["mesh_policies"][0]);
+    assert_mesh_policy_operands_redacted(&slice["node_waypoint_capture_mesh_policies"][0]);
+    let provider = &slice["ext_authz_providers"][0];
+    let check_header = &provider["include_additional_headers_in_check"][0];
+    assert_eq!(check_header["value"], REDACTED);
+    assert_eq!(check_header["name"], "x-check-gate");
+    assert_eq!(provider["name"], "ext-check");
+    let proxy_config = &slice["proxy_configs"][0];
+    assert_eq!(proxy_config["environment"]["VENDOR_LICENSE"], REDACTED);
+    let extension = &slice["extension_configs"][0];
+    assert_eq!(extension["value"], REDACTED);
+    assert_eq!(extension["type_url"], "type.example/filter");
+    assert_eq!(slice["node_id"], "node-a");
+    assert_no_canaries(
+        &projected,
+        &[
+            "mat-flat-canary",
+            "mat-slice-canary",
+            "mat-capture-canary",
+            "mat-ext-header-canary",
+            "mat-env-canary",
+            "mat-extension-canary",
+        ],
+    );
+}
+
 #[test]
 fn fault_injection_match_header_values_are_projected() {
     let projected = project(
