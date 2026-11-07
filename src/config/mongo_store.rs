@@ -13691,12 +13691,11 @@ mod inner {
             custom_id: Option<&str>,
             exclude_consumer_id: Option<&str>,
         ) -> Result<Option<String>, anyhow::Error> {
-            let mut values = vec![consumer_id, username];
-            if let Some(custom_id) = custom_id {
-                values.push(custom_id);
-            }
-            values.sort_unstable();
-            values.dedup();
+            let values = crate::config::store_policy::consumer_identity_values_from_fields(
+                consumer_id,
+                username,
+                custom_id,
+            );
 
             let candidates = {
                 let mut fields = vec![("id", consumer_id), ("username", username)];

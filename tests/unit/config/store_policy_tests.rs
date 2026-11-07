@@ -9,8 +9,8 @@ use ferrum_edge::ExtractedBundle;
 use ferrum_edge::admin::api_specs::hash_resource_bundle;
 use ferrum_edge::config::store_policy::{
     access_control_plugin_allows_consumer, consumer_identity_values,
-    mesh_route_dispatch_referenced_upstream, mesh_route_dispatch_references_upstream_id,
-    store_canonical_resource_hash,
+    consumer_identity_values_from_fields, mesh_route_dispatch_referenced_upstream,
+    mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
 };
 use ferrum_edge::config::types::{Consumer, PluginConfig, PluginScope, Proxy};
 use serde_json::{Value, json};
@@ -101,6 +101,28 @@ fn consumer_identity_values_dedupe_self_collisions() {
     let c = consumer("c-id", "alice", Some("c-id"));
     let values = consumer_identity_values(&c);
     assert_eq!(values, vec!["alice", "c-id"]);
+}
+
+#[test]
+fn identity_values_from_fields_match_the_consumer_form() {
+    // The uniqueness prechecks probe the index with the field-based form; the
+    // index writes/releases use the `Consumer` form. They must claim the same
+    // set in the same order, or a precheck would admit what the index refuses.
+    let cases: [(&str, &str, Option<&str>, &[&str]); 6] = [
+        ("c-id", "alice", None, &["alice", "c-id"]),
+        ("c-id", "alice", Some("ext-7"), &["alice", "c-id", "ext-7"]),
+        ("same", "same", Some("same"), &["same"]),
+        ("c-id", "alice", Some("c-id"), &["alice", "c-id"]),
+        ("c-id", "alice", Some("alice"), &["alice", "c-id"]),
+        ("zeta", "alpha", Some("mid"), &["alpha", "mid", "zeta"]),
+    ];
+    for (id, username, custom_id, expected) in cases {
+        let from_fields = consumer_identity_values_from_fields(id, username, custom_id);
+        assert_eq!(from_fields, expected, "{id}/{username}/{custom_id:?}");
+        let candidate = consumer(id, username, custom_id);
+        let from_consumer = consumer_identity_values(&candidate);
+        assert_eq!(from_consumer, from_fields, "{id}/{username}/{custom_id:?}");
+    }
 }
 
 // ── access_control consumer-delete refusal ─────────────────────────────────
@@ -241,6 +263,7 @@ fn store_canonical_resource_hash_is_invariant_under_admission_normalization() {
 fn sql_and_mongo_stores_do_not_redefine_shared_store_policy() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let shared = [
+        "consumer_identity_values_from_fields",
         "store_canonical_resource_hash",
         "access_control_plugin_allows_consumer",
         "mesh_route_dispatch_references_upstream_id",
@@ -261,4 +284,39 @@ fn sql_and_mongo_stores_do_not_redefine_shared_store_policy() {
     assert!(!sql.contains("fn consumer_identity_values("));
     let mongo = std::fs::read_to_string(root.join("src/config/mongo_store.rs")).unwrap();
     assert!(mongo.contains("crate::config::store_policy::consumer_identity_values(consumer)"));
+
+    // Both uniqueness prechecks probe with the shared keyspace instead of
+    // rebuilding the id/username/custom_id union. Their labelled candidate
+    // lists (which field a conflict message names first) stay per backend.
+    for (store, source, end) in [
+        (
+            "SQL",
+            sql.as_str(),
+            "async fn format_indexed_consumer_identity_conflict(",
+        ),
+        (
+            "Mongo",
+            mongo.as_str(),
+            "async fn check_keyauth_key_unique(",
+        ),
+    ] {
+        let body = source
+            .split_once("async fn check_consumer_identity_unique(")
+            .unwrap_or_else(|| panic!("{store} identity precheck"))
+            .1;
+        let body = body
+            .split_once(end)
+            .unwrap_or_else(|| panic!("{store} identity precheck end"))
+            .0;
+        assert!(
+            body.contains("consumer_identity_values_from_fields("),
+            "{store} identity precheck must probe with the shared keyspace"
+        );
+        for rebuilt in ["sort_unstable()", ".sort()", ".dedup()"] {
+            assert!(
+                !body.contains(rebuilt),
+                "{store} identity precheck rebuilds the keyspace (`{rebuilt}`)"
+            );
+        }
+    }
 }

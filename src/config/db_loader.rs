@@ -44,8 +44,8 @@ use crate::config::namespace_registry::{
 use crate::config::policy_graph_scope::PolicyGraphScope;
 use crate::config::store_policy::{
     access_control_plugin_allows_consumer, consumer_identity_values,
-    mesh_route_dispatch_referenced_upstream, mesh_route_dispatch_references_upstream_id,
-    store_canonical_resource_hash,
+    consumer_identity_values_from_fields, mesh_route_dispatch_referenced_upstream,
+    mesh_route_dispatch_references_upstream_id, store_canonical_resource_hash,
 };
 use crate::config::types::{
     AuthMode, BackendScheme, CircuitBreakerConfig, Consumer, DispatchKind, GatewayConfig,
@@ -6315,9 +6315,7 @@ impl DatabaseStore {
     ) -> Result<Option<String>, anyhow::Error> {
         let start = Instant::now();
         let candidates = consumer_identity_probe_fields(consumer_id, username, custom_id);
-        let mut values: Vec<&str> = candidates.iter().map(|(_, value)| *value).collect();
-        values.sort_unstable();
-        values.dedup();
+        let values = consumer_identity_values_from_fields(consumer_id, username, custom_id);
 
         let placeholders = std::iter::repeat_n("?", values.len())
             .collect::<Vec<_>>()

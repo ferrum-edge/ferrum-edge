@@ -25,8 +25,24 @@ use std::collections::HashSet;
 /// Returned sorted, so both stores write and release index entries in the
 /// same order.
 pub fn consumer_identity_values(consumer: &Consumer) -> Vec<&str> {
-    let mut values = vec![consumer.id.as_str(), consumer.username.as_str()];
-    if let Some(custom_id) = consumer.custom_id.as_deref() {
+    consumer_identity_values_from_fields(
+        &consumer.id,
+        &consumer.username,
+        consumer.custom_id.as_deref(),
+    )
+}
+
+/// [`consumer_identity_values`] for a candidate that is not (yet) a
+/// `Consumer`: the uniqueness prechecks probe the index with exactly the set
+/// a write of these fields would claim. Which field a conflict message names
+/// first stays with each backend's precheck.
+pub fn consumer_identity_values_from_fields<'a>(
+    id: &'a str,
+    username: &'a str,
+    custom_id: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut values = vec![id, username];
+    if let Some(custom_id) = custom_id {
         values.push(custom_id);
     }
     values.sort_unstable();
