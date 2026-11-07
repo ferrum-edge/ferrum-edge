@@ -51,6 +51,9 @@ REQUIRED_SCENARIOS = (
 DEFAULT_MIN_RESOURCE_SAMPLES = 3
 
 
+_PROTOCOL_LIST_SEPARATOR_RE = re.compile(r"[,;\s]+")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=Path, help="Combined results JSON from the workflow")
@@ -195,7 +198,7 @@ def resolve_expected_protocols(
     if not selection or selection.lower() == "all":
         return sorted(names)
 
-    tokens = [tok for tok in re.split(r"[,;\s]+", selection) if tok]
+    tokens = [tok for tok in _PROTOCOL_LIST_SEPARATOR_RE.split(selection) if tok]
     if not tokens:
         return sorted(names)
 

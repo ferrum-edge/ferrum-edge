@@ -51,6 +51,9 @@ BANNED_PORT_KILL = [
 ]
 
 
+_CHECK_PORT_CALL_RE = re.compile(r'check_port_available\s+"\$')
+
+
 class BenchmarkRunnerCleanupTests(unittest.TestCase):
     def _read(self, rel):
         path = REPO_ROOT / rel
@@ -81,7 +84,7 @@ class BenchmarkRunnerCleanupTests(unittest.TestCase):
             self.assertIn("kill -KILL", text, f"{rel}: missing bounded forced kill")
             self.assertTrue(
                 "check_ports_available || exit 1" in text
-                or re.search(r'check_port_available\s+"\$', text),
+                or _CHECK_PORT_CALL_RE.search(text),
                 f"{rel}: port-conflict check is defined but never invoked",
             )
 

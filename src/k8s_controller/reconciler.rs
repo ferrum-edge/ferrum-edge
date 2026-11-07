@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use futures_util::future::OptionFuture;
 use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
@@ -19,15 +20,18 @@ use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::ControllerTaskRegistry;
-use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates_budgeted};
+use crate::k8s_controller::istio_status::{
+    IstioStatusUpdate, IstioStatusWriter, plan_istio_status_updates_budgeted,
+};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::revision::K8sConfigRevisionTracker;
 use crate::k8s_controller::status::{
-    GatewayApiStatusContext, GatewayApiStatusWriter, StatusTranslationReuse,
-    gateway_api_data_plane_service_ready, plan_gateway_api_status_updates_budgeted,
+    GatewayApiStatusContext, GatewayApiStatusPlanOutcome, GatewayApiStatusWriter,
+    StatusTranslationReuse, gateway_api_data_plane_service_ready,
+    plan_gateway_api_status_updates_budgeted,
 };
-use crate::k8s_controller::status_budget::STATUS_BATCH_BACKSTOP;
+use crate::k8s_controller::status_budget::{STATUS_BATCH_BACKSTOP, STATUS_PATCH_PARALLELISM};
 use crate::k8s_controller::status_plan::{
     DEFAULT_STATUS_PLAN_WORK_BUDGET, STATUS_WINDOW_MAX_FAILED_BATCHES, StatusPlanBudget,
     StatusWindowBatch, StatusWindowCursorDecision, status_window_cursor_after_batch,
@@ -1304,9 +1308,10 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
 /// `Arc<[K8sObject]>` without cloning elements or their `spec`/`status`
 /// payloads; a second writer only bumps the refcount.
 ///
-/// The Arc keeps planner futures `Send + 'static` across the reconciler's
-/// `tokio::spawn` HRTB boundary without aliasing the store's mutable
-/// reflector state — each reconcile owns a distinct generation.
+/// Both planners borrow this one generation synchronously before any status
+/// I/O starts, so no snapshot borrow is held across an await inside the
+/// reconciler's `tokio::spawn`, and the store's mutable reflector state is
+/// never aliased — each reconcile owns a distinct generation.
 pub(crate) fn shared_status_objects_snapshot(
     objects: Vec<K8sObject>,
     gateway_writer_present: bool,
@@ -1340,6 +1345,11 @@ struct StatusPatchersRequest<'a> {
 /// handling. Writers are taken by value so they can be moved into the helper
 /// futures (required for `tokio::spawn`'s HRTB Send check — see the
 /// `Send is not general enough` history in `spawn_reconcile_loop`).
+///
+/// Both writers plan first. The two patch batches then run concurrently when
+/// the Istio batch has at most [`STATUS_PATCH_PARALLELISM`] updates, so the
+/// reconcile loop is held for the slower batch rather than for their sum;
+/// a larger Istio batch runs after the Gateway API batch.
 async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
     let StatusPatchersRequest {
         gateway_writer,
@@ -1357,51 +1367,108 @@ async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
         return;
     };
 
-    if let Some(writer) = gateway_writer {
-        patch_gateway_api_statuses(
-            writer,
-            Arc::clone(&snapshot),
+    // Plan synchronously first, in the old order (Gateway API, then Istio),
+    // so neither writer's request or batch clocks run while the other plans
+    // on this task. Gateway API planning still records the cursor for an
+    // empty plan exactly as before.
+    let gateway_batch = gateway_writer.and_then(|writer| {
+        plan_gateway_api_status_batch(
+            &snapshot,
             options.clone(),
-            route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
+            route_conflicts.unwrap_or_default(),
             gateway_api_status_context,
             translation_reuse,
             metrics,
         )
-        .await;
-    }
-    if let Some(writer) = istio_writer {
-        patch_istio_statuses(
-            writer,
-            snapshot,
-            options.clone(),
-            translation_reuse,
-            metrics,
-        )
-        .await;
+        .map(|batch| (writer, batch))
+    });
+    let istio_batch = istio_writer.and_then(|writer| {
+        let updates = plan_istio_statuses(&snapshot, options.clone(), translation_reuse);
+        (!updates.is_empty()).then_some((writer, updates))
+    });
+    // Planning is done; release the generation before the patch I/O.
+    drop(snapshot);
+
+    // Safe to patch concurrently: the writers patch disjoint object sets
+    // (Gateway API kinds vs Istio kinds) from already-built plans, and neither
+    // result feeds the other. Only the Gateway arm writes the status-plan
+    // cursor. Both arms log their own errors, so `join!` (not `try_join!`)
+    // keeps each batch's failure handling, and each keeps its own batch
+    // budget and backstop.
+    //
+    // Threshold: the Istio writer starts every update at once (unbounded, so a
+    // stalled object never holds a slot a later one needs). Overlap only an
+    // Istio batch no larger than the Gateway API writer's own fan-out, so
+    // concurrent status I/O on the shared kube client stays at most 32 + 32
+    // and a large Istio flood never queues the Gateway API batch past its
+    // budgets. Larger Istio batches run after the Gateway API batch, as before.
+    let istio_updates = istio_batch.as_ref().map_or(0, |(_, updates)| updates.len());
+    let gateway: OptionFuture<_> = gateway_batch
+        .map(|(writer, batch)| patch_gateway_api_statuses(writer, batch, metrics))
+        .into();
+    let istio: OptionFuture<_> = istio_batch
+        .map(|(writer, updates)| patch_istio_statuses(writer, updates, metrics))
+        .into();
+    if istio_updates <= STATUS_PATCH_PARALLELISM {
+        tokio::join!(gateway, istio);
+    } else {
+        gateway.await;
+        istio.await;
     }
 }
 
-async fn patch_gateway_api_statuses(
-    writer: GatewayApiStatusWriter,
-    objects: Arc<[K8sObject]>,
+/// Test-only entry into [`run_status_patchers`] (no route conflicts, no
+/// translation reuse, default Gateway API status context) so integration
+/// tests drive the production dispatch.
+pub(crate) async fn run_status_patchers_for_test(
+    gateway_writer: Option<GatewayApiStatusWriter>,
+    istio_writer: Option<IstioStatusWriter>,
+    objects: Vec<K8sObject>,
     options: K8sTranslationOptions,
-    route_conflicts: Vec<crate::config_sources::k8s::GatewayApiRouteConflict>,
+    metrics: &ControllerMetrics,
+) {
+    run_status_patchers(StatusPatchersRequest {
+        gateway_writer,
+        istio_writer,
+        objects,
+        options: &options,
+        route_conflicts: None,
+        gateway_api_status_context: GatewayApiStatusContext::default(),
+        translation_reuse: None,
+        metrics,
+    })
+    .await;
+}
+
+/// One planned Gateway API status batch and the cursor it was planned from.
+struct PlannedGatewayApiStatusBatch {
+    cursor: usize,
+    outcome: GatewayApiStatusPlanOutcome,
+}
+
+/// Plan this reconcile's Gateway API status window (synchronous, no I/O).
+///
+/// Returns `None` for an empty write set, after recording that round so the
+/// fair-window cursor still advances.
+fn plan_gateway_api_status_batch(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    route_conflicts: &[crate::config_sources::k8s::GatewayApiRouteConflict],
     status_context: GatewayApiStatusContext,
     translation_reuse: Option<&StatusTranslationReuse>,
     metrics: &ControllerMetrics,
-) {
+) -> Option<PlannedGatewayApiStatusBatch> {
     let cursor = metrics
         .gateway_api_status_plan_cursor
         .load(std::sync::atomic::Ordering::Relaxed) as usize;
     let outcome = plan_gateway_api_status_updates_budgeted(
-        &objects,
+        objects,
         options,
-        &route_conflicts,
+        route_conflicts,
         status_context,
         translation_reuse,
         StatusPlanBudget::new(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP, cursor),
     );
-    let updates = outcome.updates;
     // Advance the cursor when planning succeeds with an empty write set (fairness
     // must progress) or after a successful patch batch. Patch errors and batch
     // timeouts leave the prior cursor so the same bounded window retries on the
@@ -1409,26 +1476,38 @@ async fn patch_gateway_api_statuses(
     // STATUS_WINDOW_MAX_FAILED_BATCHES consecutive failures: a persistently
     // failing object must not starve healthy candidates outside the window
     // (#6370).
-    if updates.is_empty() {
+    if outcome.updates.is_empty() {
         record_gateway_api_status_batch(
             metrics,
             cursor,
             outcome.next_cursor,
             StatusWindowBatch::Succeeded,
         );
-        return;
+        return None;
     }
     if outcome.eligible_candidates > GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP {
         warn!(
             eligible = outcome.eligible_candidates,
             planned = outcome.planned_candidates,
-            updates = updates.len(),
+            updates = outcome.updates.len(),
             cap = GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP,
             cursor,
             next_cursor = outcome.next_cursor,
             "Budgeted Gateway API status planning for this reconcile round"
         );
     }
+    Some(PlannedGatewayApiStatusBatch { cursor, outcome })
+}
+
+/// Patch one planned Gateway API status batch and record the round on the
+/// status-plan cursor.
+async fn patch_gateway_api_statuses(
+    writer: GatewayApiStatusWriter,
+    batch: PlannedGatewayApiStatusBatch,
+    metrics: &ControllerMetrics,
+) {
+    let PlannedGatewayApiStatusBatch { cursor, outcome } = batch;
+    let updates = outcome.updates;
     let updates_len = updates.len();
     match await_status_patch_batch(writer.patch_updates(updates), STATUS_PATCH_BATCH_TIMEOUT).await
     {
@@ -1547,29 +1626,33 @@ fn gateway_api_status_context(
     }
 }
 
-/// T2-B: emit `status.conditions[]` patches for the Istio CRDs supported
-/// by [`crate::k8s_controller::istio_status::plan_istio_status_updates`]. No-op when the writer wasn't built
-/// (Istio CRD watching is off, or kube client unavailable) or when the
-/// plan is empty (no supported Istio CRDs in the snapshot). Failures
-/// are logged and never abort reconcile. Shares the same immutable
-/// object generation as the Gateway API writer when both are enabled.
-async fn patch_istio_statuses(
-    writer: IstioStatusWriter,
-    objects: Arc<[K8sObject]>,
+/// T2-B: plan `status.conditions[]` patches for the Istio CRDs supported
+/// by [`crate::k8s_controller::istio_status::plan_istio_status_updates`]
+/// (synchronous, no I/O). Shares the same immutable object generation as the
+/// Gateway API planner when both are enabled.
+fn plan_istio_statuses(
+    objects: &[K8sObject],
     options: K8sTranslationOptions,
     translation_reuse: Option<&StatusTranslationReuse>,
-    metrics: &ControllerMetrics,
-) {
-    let updates = plan_istio_status_updates_budgeted(
-        &objects,
+) -> Vec<IstioStatusUpdate> {
+    plan_istio_status_updates_budgeted(
+        objects,
         options,
         translation_reuse,
         StatusPlanBudget::unlimited(0),
     )
-    .updates;
-    if updates.is_empty() {
-        return;
-    }
+    .updates
+}
+
+/// T2-B: apply a planned, non-empty Istio status batch. Not called when the
+/// writer wasn't built (Istio CRD watching is off, or kube client
+/// unavailable) or when the plan is empty. Failures are logged and never
+/// abort reconcile.
+async fn patch_istio_statuses(
+    writer: IstioStatusWriter,
+    updates: Vec<IstioStatusUpdate>,
+    metrics: &ControllerMetrics,
+) {
     let updates_len = updates.len();
     match await_status_patch_batch(writer.patch_updates(updates), STATUS_PATCH_BATCH_TIMEOUT).await
     {

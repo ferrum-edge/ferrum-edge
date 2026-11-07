@@ -28,7 +28,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -170,10 +170,14 @@ fn proxy_for_test() -> Proxy {
 /// `200` and echoes the tunnel bytes, and tracks the number of open CONNECT
 /// streams on each accepted connection (in accept order — the same order the
 /// pool appends entries under one key).
+///
+/// While `blackhole` is set, new connections are accepted (and counted) but
+/// never get a TLS handshake, so a dial hangs until its own connect timeout.
 struct Peer {
     port: u16,
     accepted: Arc<AtomicUsize>,
     per_connection_active: Arc<Mutex<Vec<Arc<AtomicUsize>>>>,
+    blackhole: Arc<AtomicBool>,
 }
 
 impl Peer {
@@ -187,6 +191,8 @@ impl Peer {
             Arc::new(Mutex::new(Vec::new()));
         let accepted_for_task = accepted.clone();
         let per_connection_for_task = per_connection_active.clone();
+        let blackhole = Arc::new(AtomicBool::new(false));
+        let blackhole_for_task = blackhole.clone();
         tokio::spawn(async move {
             let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
                 .expect("server config");
@@ -196,6 +202,19 @@ impl Peer {
                     return;
                 };
                 accepted_for_task.fetch_add(1, Ordering::SeqCst);
+                if blackhole_for_task.load(Ordering::SeqCst) {
+                    tokio::spawn(async move {
+                        // Swallow the ClientHello and never answer it.
+                        let mut tcp = tcp;
+                        let mut buf = [0u8; 1024];
+                        while let Ok(read) = tcp.read(&mut buf).await {
+                            if read == 0 {
+                                break;
+                            }
+                        }
+                    });
+                    continue;
+                }
                 let active = Arc::new(AtomicUsize::new(0));
                 per_connection_for_task
                     .lock()
@@ -248,11 +267,16 @@ impl Peer {
             port,
             accepted,
             per_connection_active,
+            blackhole,
         }
     }
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn blackhole_new_connections(&self, blackhole: bool) {
+        self.blackhole.store(blackhole, Ordering::SeqCst);
     }
 
     fn active_per_connection(&self) -> Vec<usize> {
@@ -495,4 +519,45 @@ async fn saturated_and_bounded_key_queues_until_a_stream_frees() {
     fixture.peer.wait_for_active(&[2]).await;
     assert_eq!(fixture.peer.accepted(), 1);
     assert_eq!(fixture.pool.pool_size(), 1);
+}
+
+/// A failed growth dial backs the key off for the full 10 s measured from the
+/// FAILURE. The connect timeout here outlasts that window, so a backoff
+/// measured from the dial's start would already have expired when the dial
+/// gave up, and the next pressured tunnel would dial again at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_growth_dial_backs_off_from_the_failure_not_the_dial_start() {
+    let mut fixture = Fixture::new(2, 1024).await;
+    fixture.proxy.backend_connect_timeout_ms = 11_000;
+    let mut held = Vec::new();
+    for _ in 0..HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION {
+        held.push(fixture.open_ok().await);
+    }
+    fixture
+        .peer
+        .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION])
+        .await;
+
+    // The growth dial hangs until its 11 s connect timeout, then the tunnel
+    // falls back to the connection it already has.
+    fixture.peer.blackhole_new_connections(true);
+    held.push(fixture.open_ok().await);
+    assert_eq!(
+        fixture.peer.accepted(),
+        2,
+        "the growth dial reached the peer"
+    );
+    assert_eq!(fixture.pool.pool_size(), 1);
+
+    // With the peer healthy again, a pressured tunnel inside the backoff
+    // window dials nothing (growth is inline, so a dial would be counted
+    // before the open returns).
+    fixture.peer.blackhole_new_connections(false);
+    held.push(fixture.open_ok().await);
+    assert_eq!(fixture.peer.accepted(), 2, "the key is still backed off");
+    assert_eq!(fixture.pool.pool_size(), 1);
+    fixture
+        .peer
+        .wait_for_active(&[HBONE_GROWTH_ACTIVE_STREAMS_PER_CONNECTION + 2])
+        .await;
 }

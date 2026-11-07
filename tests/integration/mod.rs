@@ -46,6 +46,7 @@ mod cp_consumer_quarantine_forget_tests;
 mod cp_dp_grpc_tests;
 mod cp_grpc_handshake_admission_tests;
 mod cp_multi_namespace_tests;
+mod cp_namespace_load_concurrency_tests;
 mod cp_tenant_trust_binding_tests;
 mod cp_trust_reload_health_tests;
 mod datagram_client_address_datapath_tests;

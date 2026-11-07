@@ -2,8 +2,8 @@
 //!
 //! Tests for the Admin API read-only mode functionality
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use ferrum_edge::admin::{
     AdminState,
@@ -1121,6 +1121,12 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
     }
 }
 
+/// A top-level `fn` header (optionally `pub`/`async`); captures the function name.
+static FUNCTION_HEADER: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^(?:pub(?:\([^)]*\))? )?(?:async )?fn ([a-zA-Z_][a-zA-Z0-9_]*)")
+        .unwrap()
+});
+
 /// Config-database mutation handlers must capture the covering sequence under
 /// the write-topology pin, then release pins before the coordinator wait.
 #[test]
@@ -1187,13 +1193,10 @@ fn live_apply_handlers_capture_sequence_before_releasing_pins() {
             (1, topology),
         ),
     ]);
-    let function_header =
-        regex::Regex::new(r"(?m)^(?:pub(?:\([^)]*\))? )?(?:async )?fn ([a-zA-Z_][a-zA-Z0-9_]*)")
-            .unwrap();
     let call = "complete_live_config_mutation_after_commit_boxed(";
     let mut observed = BTreeMap::new();
     for (file, source) in config_db_sources {
-        let functions: Vec<_> = function_header
+        let functions: Vec<_> = FUNCTION_HEADER
             .captures_iter(source)
             .map(|capture| {
                 let start = capture.get(0).unwrap().start();

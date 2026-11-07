@@ -175,6 +175,39 @@ python3 .github/scripts/h1_tls_post_comparison.py self-test
 bash -n .github/scripts/run_h1_tls_post_comparison.sh
 ```
 
+## Daily full-matrix gateways benchmark
+
+`.github/workflows/gateways-protocol-benchmark-daily.yml` dispatches
+`gateways-protocol-benchmark.yml` on `main` once a day (08:29 UTC) with the
+inputs earlier full `main` runs used: every protocol and gateway, 30 s per
+payload size, 100 connections, 3 iterations, and no `ferrum-baseline` arm. A
+baseline arm at three iterations would push the six-arm `http1-tls` job past
+its step timeout. The dispatcher skips a day while an earlier bot-dispatched
+run is still queued or running. It exists because the benchmark's `benchmark`
+job is frozen by the trusted Cross policy and reads its workload from
+`inputs.*`, which a `schedule` trigger would leave empty.
+
+Reading the series:
+
+- Find the daily runs with
+  `gh run list --workflow gateways-protocol-benchmark.yml --user github-actions[bot]`.
+- Do not compare absolute RPS across days. Each protocol job gets its own
+  hosted runner, and the CPU class varies (Intel Xeon 8370C/8573C, AMD EPYC
+  7763/9V74/9V45 were all seen in October and November 2026). Between
+  classes Ferrum ÷ Envoy moved by 10–25% with no code change. Compare
+  within-run ratios (Ferrum ÷ direct, Ferrum ÷ competitor), and only between
+  runs whose job logs show the same `Model name` in the runner health check.
+- A ratio step that persists across several days on the same CPU class is the
+  signal to confirm with a same-runner A/B: dispatch the workflow with
+  `baseline_image=ferrumedge/ferrum-edge:main-<sha>` for a revision before the
+  step and skip the unaffected protocols.
+
+Artifacts request `retention-days: 90`. The repository's Actions artifact and
+log retention setting (Settings → Actions → General) caps artifacts, logs and
+job summaries. It was raised from 30 to 90 days, the public-repository
+maximum, on 2026-11-07, so a run keeps 90 days of history. Runs uploaded
+before that keep their 30-day expiry.
+
 ## gRPC RPC-deadline A/B (#6904)
 
 `.github/workflows/grpc-deadline-ab-benchmark.yml` (manual, plus push to a

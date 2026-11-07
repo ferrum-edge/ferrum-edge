@@ -2273,6 +2273,8 @@ import re
 import sys
 import uuid
 
+_HEX_BYTE_RE = re.compile(r"\b[0-9a-fA-F]{2}\b")
+
 path, uid_text, expected_port_text = sys.argv[1:4]
 uid = uuid.UUID(uid_text).bytes
 expected_port = int(expected_port_text)
@@ -2319,7 +2321,7 @@ with open(path, encoding="utf-8", errors="replace") as fh:
                 in_orig_dst4 = False
             continue
         if pending_value:
-            hex_bytes.extend(int(token, 16) for token in re.findall(r"\b[0-9a-fA-F]{2}\b", line))
+            hex_bytes.extend(int(token, 16) for token in _HEX_BYTE_RE.findall(line))
     if pending_value:
         flush_value()
 

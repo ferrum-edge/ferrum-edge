@@ -139,15 +139,20 @@ REQUIRED_POLICY_GUARD = '''if [ "$PLAN_RESULT" != "success" ] || [ "$POLICY_RESU
   failures=1
 fi'''
 
+_NEEDS_LIST_RE = re.compile(r"(?m)^    needs:\n(?:      - [a-z0-9-]+\n)+")
+_NEEDS_ITEM_RE = re.compile(r"      - ([a-z0-9-]+)")
+_NEEDS_RESULT_EXPR_RE = re.compile(r"\$\{\{ needs\.([a-z0-9-]+)\.result }}")
+_CI_PLAN_OUTPUT_EXPR_RE = re.compile(r"\$\{\{ needs\.ci-plan\.outputs\.[a-z0-9_]+ }}")
+
 
 def parsed_job(workflow, name):
     body = _protected_job_body(workflow, name)
     # The strict publication parser accepts mapping sequences, not scalar
     # needs lists. Validate and remove this one canonical field first.
-    needs = re.search(r"(?m)^    needs:\n(?:      - [a-z0-9-]+\n)+", body)
+    needs = _NEEDS_LIST_RE.search(body)
     dependencies = set()
     if needs:
-        dependencies = set(re.findall(r"      - ([a-z0-9-]+)", needs[0]))
+        dependencies = set(_NEEDS_ITEM_RE.findall(needs[0]))
         body = body[:needs.start()] + body[needs.end():]
     return _parse_job(body), dependencies
 
@@ -291,9 +296,9 @@ class PolicyParallelTests(unittest.TestCase):
         script = summary['run'][1]
         with tempfile.TemporaryDirectory() as directory:
             for mode in ("full", "light"):
-                replaced = re.sub(r"\$\{\{ needs\.([a-z0-9-]+)\.result }}",
-                                  lambda m: "success" if mode == "full" or m[1] in {"ci-plan", "ci-policy"} else "skipped", script)
-                replaced = re.sub(r"\$\{\{ needs\.ci-plan\.outputs\.[a-z0-9_]+ }}", "true" if mode == "full" else "false", replaced)
+                replaced = _NEEDS_RESULT_EXPR_RE.sub(
+                    lambda m: "success" if mode == "full" or m[1] in {"ci-plan", "ci-policy"} else "skipped", script)
+                replaced = _CI_PLAN_OUTPUT_EXPR_RE.sub("true" if mode == "full" else "false", replaced)
                 for result in ("success", "failure", "cancelled", "skipped", "", "timed_out"):
                     for verified in ("true", "false", "", "TRUE"):
                         with self.subTest(mode=mode, result=result, verified=verified):

@@ -18,8 +18,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequential walk resumed at A, through the cached resolver, exactly as
   before. Hostnames whose answering type is already cached keep the
   sequential walk, so steady-state refreshes send the same queries as before.
+### Removed
+- **`ferrum_xds_warming_partial_applies_total` is no longer exported**
+  (#7027). The xDS data plane only builds a mesh slice once every required
+  type (CDS/EDS/LDS/RDS/ECDS) reports the same `version_info`, so a slice is
+  never applied under version skew and the counter could never leave 0.
+  Remove any dashboard panel or alert that queries it. Required-version skew
+  is still visible as a waiting state through `convergence.version_skew` on
+  the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **HTTP/3 WebSocket handshakes strip the same request headers as H1/H2.**
+  The H3 frontend's backend WebSocket handshake kept its own hop-by-hop list
+  and forwarded a client's `Content-Length` and `Expect` and the internal
+  `x-ferrum-original-content-encoding` / `x-grpc-web-mode` markers to the
+  backend, which the H1/H2 handshake already stripped. Both frontends now use
+  one shared predicate; H3 still replaces `Early-Data` itself and drops
+  pseudo-headers.
+- **A failed SQL failback no longer leaves the primary pool live behind
+  failover topology** (#7033). On a store bootstrapped from
+  `FERRUM_DB_CONFIG_BACKUP_PATH`, a primary failback published the primary pool
+  before running the deferred migrations, and a migration failure returned with
+  that pool live while `/status` still named the failover URL. With
+  `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, Admin writes then landed on the
+  primary while being recorded as failover writes, fencing the next failback
+  onto a failover database that did not have them. Deferred migrations now run
+  on the newly connected pool before it is published, so after a failure the
+  previous pool and topology are still in place. `mark_primary` now requires
+  the permit that the failback-fence check returns; the permit is revalidated
+  right before the primary pool or connection is published, so an Admin write
+  admitted on failover in the meantime aborts the failback with nothing
+  published. The fence is never cleared by a failback. Status fields are still
+  read separately, so `/status` can briefly show a mixed view while a
+  transition is in progress, but that view no longer persists after an error.
+- **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
   one "rejected" flag: every CNI ADD for an enrolled pod then failed its GC
@@ -43,6 +75,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphaned handshake markers only when `/health` was ready, so an unproved
   ingress topology or a withheld migration proof left producers for removed
   pods waiting. Both now depend only on the completed pod relist.
+- **Every ACME order write now goes through the order lifecycle table**
+  (#7028). The renewal's final `valid` write was still a blind upsert under the
+  lease, so it recreated an order an operator deleted mid-renewal (and
+  overwrote one rewritten meanwhile); it is now the same compare-and-set admin
+  finalize uses. When the order is no longer current the issued certificate is
+  still published and reloaded and the renewal counts as renewed, but the
+  order is left as it is. `POST /admin/tls/acme/orders` and
+  `POST /admin/tls/acme/renew/{id}` with `allow_overwrite` could replace any
+  order, including reopening a `valid`, `failed` or `cancelled` one; a
+  replacement must now be a legal lifecycle move (only a stored
+  `pending_challenges` order can be replaced by the new `pending_challenges`
+  one) and is otherwise refused with `409` before any CA request. Finalizing an
+  order that is already `valid` and whose stored certificate is the one that
+  CA order produced (same `order_url`) now returns `200` with the usual body
+  instead of `409`, whether it was completed by an earlier finalize or by a
+  renewal while the request was in flight. Scheduled renewal now signs with the
+  certificate's account credentials from the shared account store and falls
+  back to the latest order's only when the store has none, so an older order
+  restamped by a terminal write can no longer make renewal use a stale account
+  key.
 - **ACME order finalization no longer overwrites concurrent work or revives
   terminal orders** (#7020). `POST /admin/tls/acme/orders/{id}/finalize` read
   the order, spent up to its poll timeout on CA I/O, then wrote its result back
@@ -65,6 +117,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `failed` orders drop their key/CSR, and terminal orders that still carry
   one are pruned as ordinary history under
   `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` rather than kept indefinitely.
+
+### Performance
+- **Multi-namespace control planes load their namespaces concurrently.** With
+  `FERRUM_CP_NAMESPACES` set to a list or `*`, each incremental poll, each
+  set of pre-load change-sequence boundary reads and each full reload used to
+  query one namespace at a time. Each of those phases now runs several
+  namespace loads at once: on SQL, a quarter of
+  `FERRUM_DB_POOL_MAX_CONNECTIONS` between 1 and 4 (pools below 8 stay
+  serial); on MongoDB, up to 4. Every boundary is still captured before any
+  resource load starts, results are merged in namespace order, and a failing
+  namespace is still isolated (#2983). A multi-namespace full snapshot is now
+  stamped with the earliest namespace load time rather than the first one in
+  namespace order. Single-namespace CPs are unchanged.
+- **An admin-read replica no longer delays database and CP startup.**
+  `FERRUM_DB_READ_REPLICA_URL` used to be dialed (connect plus `SELECT 1`, up to
+  `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS`) before migrations and the initial
+  primary load. It now connects in the background through the same reconnect
+  path the poll loop uses. Admin reads use primary until the replica pool is
+  up, as they already did whenever the replica was unavailable.
+- **SQL mTLS identity uniqueness is a single index lookup.** Admin consumer
+  writes, credential add/replace and `POST /batch` checked each mTLS identity
+  against `consumer_credential_index` and, when the lookup found no other
+  owner (every successful write), also scanned and JSON-decoded every
+  Consumer's `credentials` in the namespace. That scan only covered index rows
+  written before identities were trimmed, which no current-schema database can
+  hold. The check now answers from the index alone, like the MongoDB check, so
+  each identity costs one primary-key lookup instead of O(consumers) row
+  decodes (O(B) instead of O(B×N) for a batch of B mTLS consumers). Rejections
+  and the self-exclusion for a PUT that keeps its identity are unchanged, as is
+  the case-folded `san_dns` check.
+- **Centralized `ai_rate_limiter` reservations take one Redis round trip**
+  (#7035). A Redis-backed token reservation charged the current window in one
+  `MULTI`/`EXEC` (`INCRBY` + `EXPIRE`) and then read the previous and current
+  counters in a second `GETRANGE` pipeline, discarding the current one. It now
+  reads the previous window and charges the current one in a single
+  `MULTI`/`EXEC` (`GETRANGE` prev + `INCRBY` + `EXPIRE`, the transaction
+  `ws_rate_limiting` already uses), so the redundant `GETRANGE` of the current
+  counter is gone and each admitted AI request saves one Redis round trip. The
+  ACL command set, key layout, weighted estimate, deny rollback and
+  `redis_failure_policy` handling are unchanged, and an unreadable counter
+  still fails the reservation closed. A zero-token reservation charges nothing,
+  as before.
+- **`mcp_gateway` session `DELETE` and expired-session teardown delete
+  upstream sessions concurrently** (#7035). A client `DELETE` and an expired
+  session presented again used to `DELETE` the session's upstream MCP
+  sessions one server at a time before answering. They now run concurrently,
+  at most 8 in flight per request (the background reaper's bound), so a
+  session spanning N servers costs about ceil(N/8) upstream round trips
+  instead of N. Failures are still logged and never change the client's
+  answer, and the plugin HTTP client's timeout still applies to each call. The
+  overlapping calls count their wall-clock wait once toward
+  `latency_plugin_external_io_ms` instead of summing each call, including when
+  the client aborts mid-teardown. Session reclamation during `initialize` is
+  unchanged. The background reaper's and failed-`initialize` cleanup's timeout
+  warnings now include `server_id`.
+- **Gateway API and Istio status batches run concurrently** (#7034). The
+  Kubernetes reconcile loop used to wait for the Gateway API status batch and
+  then for the Istio status batch. The two writers patch disjoint objects, so
+  they now run together and a reconcile is held for the slower batch rather
+  than both (worst case about 20 s instead of 40 s). Both writers plan before
+  either sends a request. The batches overlap only when the Istio batch has at
+  most 32 updates; a larger Istio batch still runs after the Gateway API batch,
+  so it cannot crowd out Gateway API status on the shared Kubernetes client.
+  Each writer's own batch behaves as before, and clusters that watch only one
+  of the two are unchanged.
 
 ## [0.9.20] - 2026-11-02
 

@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import udp_internal_profile as profile
 
 
+_RUST_SCHEMA_ENTRY_RE = re.compile(r'^    "([a-z0-9_]+)",$', re.M)
+
+
 def values():
     result = dict.fromkeys(profile.FIELDS, 0)
     result.update(schema=1, pid=1, sample_every=64, publication_interval=2048, slot_capacity=128, registered_slots=1)
@@ -33,7 +36,7 @@ class UDPInternalProfileTests(unittest.TestCase):
     def test_literal_rust_and_sampler_schema_match(self):
         root = Path(__file__).resolve().parents[4]
         source = (root / "src/udp_profile/schema.rs").read_text()
-        names = re.findall(r'^    "([a-z0-9_]+)",$', source, re.M)
+        names = _RUST_SCHEMA_ENTRY_RE.findall(source)
         self.assertEqual(names, profile.SCHEMA["counters"])
         self.assertEqual(len(set(names)), len(names))
 

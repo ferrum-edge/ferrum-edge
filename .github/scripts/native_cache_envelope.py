@@ -15,6 +15,8 @@ MAX_FILES = 16
 MAX_PAYLOAD = 256 * 1024
 MANIFEST = "manifest.json"
 
+_SAFE_ENTRY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,199}")
+
 
 def unique_object(pairs):
     result = {}
@@ -56,7 +58,7 @@ def validate(data):
             name = member.name
             if (len(files) >= MAX_FILES or not member.isreg() or member.pax_headers
                     or member.sparse is not None or name in files
-                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,199}", name)
+                    or not _SAFE_ENTRY_NAME_RE.fullmatch(name)
                     or any(part in ("", ".", "..") for part in name.split("/"))):
                 raise ValueError("unsupported, duplicate or unsafe archive member")
             total += member.size

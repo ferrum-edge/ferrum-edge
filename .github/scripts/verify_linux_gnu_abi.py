@@ -62,6 +62,16 @@ LINUX_GNU_ASSETS = (
     "ferrum-cni-linux-aarch64",
 )
 
+_LINUX_GNU_BINARY_PATH_RE = re.compile(
+    r"target/x86_64-unknown-linux-gnu/[^\s\\]*ferrum-(?:edge|cni)",
+)
+_JOB_NEEDS_FLOW_RE = re.compile(
+    r"(?m)^    needs: \[(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)\]$",
+)
+_JOB_NEEDS_LIST_RE = re.compile(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)")
+_JOB_NEEDS_SCALAR_RE = re.compile(r"(?m)^    needs: ([A-Za-z0-9_-]+)$")
+_SRC_TARGET_LINE_RE = re.compile(r"(?m)^\s+/src/target\s*$")
+
 
 def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
     with path.open("rb") as handle:
@@ -431,7 +441,7 @@ def _producer_job_errors(
     # Literal-path lint only. Templated operands such as
     # `target/${{ matrix.target }}/release/ferrum-edge` do not match, so this
     # cannot be the tamper control — see the docstring.
-    if re.search(r"target/x86_64-unknown-linux-gnu/[^\s\\]*ferrum-(?:edge|cni)", body):
+    if _LINUX_GNU_BINARY_PATH_RE.search(body):
         errors.append(
             f"{label} {job} must gate the staged published assets, not a path "
             "in a build tree"
@@ -579,20 +589,17 @@ def _job_needs(workflow: str, job: str) -> set[str]:
     body = _job_body(workflow, job)
     if not body:
         return set()
-    inline = re.search(
-        r"(?m)^    needs: \[(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)\]$",
-        body,
-    )
+    inline = _JOB_NEEDS_FLOW_RE.search(body)
     if inline:
         return set(inline.group("needs").split(", "))
-    listed = re.search(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", body)
+    listed = _JOB_NEEDS_LIST_RE.search(body)
     if listed:
         return {
             line.strip().removeprefix("- ").strip()
             for line in listed.group("needs").splitlines()
             if line.strip().startswith("- ")
         }
-    scalar = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", body)
+    scalar = _JOB_NEEDS_SCALAR_RE.search(body)
     if scalar:
         return {scalar.group(1)}
     return set()
@@ -682,7 +689,7 @@ def check_sysroot_builder(source: str) -> list[str]:
         )
     if '--env CARGO_TARGET_DIR="$CARGO_TARGET_DIR"' in source:
         errors.append("sysroot builder must not pass host CARGO_TARGET_DIR into the container")
-    if re.search(r"(?m)^\s+/src/target\s*$", source):
+    if _SRC_TARGET_LINE_RE.search(source):
         errors.append("sysroot builder must not chown or otherwise use the whole /src/target tree")
     for token in (
         'target_root="$work_root/target"',

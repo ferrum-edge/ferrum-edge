@@ -33,6 +33,8 @@ REPOSITORIES = {
 # c27e5e55eda97047a35af0bb0fd87fea760dcb82 accepted DESCRIBES relationships.
 HISTORICAL_PREDICATE = Path(".github/fixtures/release-sbom/require_sbom-af1bfcccc1c9.jq")
 
+_PINNED_SYFT_IMAGE_RE = re.compile(r"anchore/syft@sha256:[0-9a-f]{64}")
+
 
 def exactly_one(pattern: str, source: str) -> str:
     matches = re.findall(pattern, source, re.MULTILINE | re.DOTALL)
@@ -57,7 +59,7 @@ def production_contract(workflow: str) -> tuple[str, str, str]:
         r'^                -o "spdx-json=/out/\$\{family\}_\$\{registry\}-\$\{arch\}\.spdx\.json")$',
         job,
     )
-    if len(re.findall(r"anchore/syft@sha256:[0-9a-f]{64}", scan)) != 1:
+    if len(_PINNED_SYFT_IMAGE_RE.findall(scan)) != 1:
         raise ValueError("production scanner must remain digest-pinned")
     if 'jq -e -f "$work/require_sbom.jq" "$output" >/dev/null' not in job:
         raise ValueError("production SPDX validation invocation changed")

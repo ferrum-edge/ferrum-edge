@@ -1081,19 +1081,34 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     let sql_swap = sql_reconnect
         .find("self.pool.swap(")
         .expect("SQL failover path must swap the pool");
+    let sql_failback_check = sql_reconnect
+        .find("ensure_primary_failback_allowed()")
+        .expect("SQL primary path must check the failback fence under the transition lock");
     let sql_migrations = sql_reconnect
-        .find("maybe_apply_deferred_migrations()")
-        .expect("SQL reconnect must await deferred migrations under the transition lock");
+        .find("maybe_apply_deferred_migrations_on_pool(new_pool.clone())")
+        .expect("SQL reconnect must migrate the staged pool under the transition lock");
     let sql_mark_primary = sql_reconnect
-        .find("mark_primary(")
-        .expect("SQL primary path must call mark_primary after migrations");
+        .find(".mark_primary(permit,")
+        .expect("SQL primary path must call mark_primary with the failback permit");
     assert!(
         sql_lock < sql_mark && sql_mark < sql_swap,
         "write lock -> mark_failover -> pool.swap is the fail-closed failover order:\n{sql_reconnect}"
     );
+    // Issue #7033: deferred migrations run on the staged pool *before* any
+    // publication, so a migration failure can never leave the new pool live
+    // while topology still reports the previous side.
     assert!(
-        sql_swap < sql_migrations && sql_migrations < sql_mark_primary,
-        "pool.swap -> deferred migrations -> mark_primary must stay under the same write lock:\n{sql_reconnect}"
+        sql_lock < sql_failback_check
+            && sql_failback_check < sql_migrations
+            && sql_migrations < sql_mark
+            && sql_migrations < sql_swap
+            && sql_swap < sql_mark_primary,
+        "write lock -> failback fence -> staged-pool migrations -> publish -> mark_primary must stay under the same write lock:\n{sql_reconnect}"
+    );
+    let after_swap = &sql_reconnect[sql_swap..sql_mark_primary];
+    assert!(
+        !after_swap.contains("?;") && !after_swap.contains("return Err"),
+        "nothing fallible may run between pool.swap and mark_primary:\n{after_swap}"
     );
     let connect_at = sql_reconnect
         .find("connect_any_pool_with_timeout(")

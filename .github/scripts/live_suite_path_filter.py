@@ -32,6 +32,10 @@ LIVE_SUITE_DOCUMENTATION_PATHS = (
     | ISTIO_STATUS_CAS_DOCUMENTATION_PATHS
 )
 
+_LIVE_SERIAL_PARENT_CHANNEL_RE = re.compile(r'\blive_serial="\$\{?NATIVE_CP_SERVED_SERIAL\b')
+_LIVE_SERIAL_DOLLAR_CAPTURE_RE = re.compile(r'\blive_serial="?\$\(')
+_LIVE_SERIAL_BACKTICK_CAPTURE_RE = re.compile(r"\blive_serial=`")
+
 
 def exact_path_patterns(paths: frozenset[str]) -> list[str]:
     return [rf"^{re.escape(path)}$" for path in sorted(paths)]
@@ -719,12 +723,13 @@ def _command_substitution_invokes_observe_helper(run_text: str, names: set[str])
 
 
 def _observe_helper_invoked_in_parent_shell(run_text: str, names: set[str]) -> bool:
+    name_res = [re.compile(rf"(?:^|[\s;]){re.escape(name)}(?:\s|;|$)") for name in names]
     for line in run_text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or "$(" in stripped or "`" in stripped:
             continue
-        for name in names:
-            if re.search(rf"(?:^|[\s;]){re.escape(name)}(?:\s|;|$)", stripped):
+        for name_re in name_res:
+            if name_re.search(stripped):
                 return True
     return False
 
@@ -734,7 +739,7 @@ def _live_serial_copied_from_parent_channel(run_text: str) -> bool:
         stripped = line.strip()
         if stripped.startswith("#"):
             continue
-        if re.search(r'\blive_serial="\$\{?NATIVE_CP_SERVED_SERIAL\b', stripped):
+        if _LIVE_SERIAL_PARENT_CHANNEL_RE.search(stripped):
             return True
     return False
 
@@ -744,8 +749,8 @@ def _live_serial_captured_from_command_substitution(run_text: str) -> bool:
         stripped = line.strip()
         if stripped.startswith("#"):
             continue
-        if re.search(r'\blive_serial="?\$\(', stripped) or re.search(
-            r"\blive_serial=`", stripped
+        if _LIVE_SERIAL_DOLLAR_CAPTURE_RE.search(stripped) or (
+            _LIVE_SERIAL_BACKTICK_CAPTURE_RE.search(stripped)
         ):
             return True
     return False

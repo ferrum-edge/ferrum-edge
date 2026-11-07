@@ -888,9 +888,10 @@ pub struct SqlReconnectTransitionTestHooks {
     /// Invoked after a successful connect and immediately before awaiting the
     /// reconnect transition write lock.
     pub before_lock: Option<SqlReconnectTransitionHook>,
-    /// Invoked while the reconnect transition write lock is held, after pool
-    /// publication (and after failover gate-before-publish), before deferred
-    /// migrations and primary `mark_primary` finalize the transition.
+    /// Invoked while the reconnect transition write lock is held, after
+    /// deferred migrations on the staged pool and pool publication (and after
+    /// failover gate-before-publish), before primary `mark_primary` finalizes
+    /// the transition.
     pub while_holding: Option<SqlReconnectTransitionHook>,
 }
 
@@ -2179,9 +2180,15 @@ impl DatabaseStore {
     /// a tracked, versioned migration system. Existing databases are automatically
     /// detected and bootstrapped into the new system.
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
+        self.run_migrations_on_pool(self.pool()).await
+    }
+
+    /// [`Self::run_migrations`] against an explicit pool. Reconnect uses this
+    /// to migrate a staged pool *before* publishing it (issue #7033).
+    async fn run_migrations_on_pool(&self, pool: AnyPool) -> Result<(), anyhow::Error> {
         use crate::config::migrations::MigrationRunner;
 
-        let runner = MigrationRunner::new(self.pool(), self.db_type.clone());
+        let runner = MigrationRunner::new(pool, self.db_type.clone());
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         let applied = runner
             .run_pending_with_plugin_history(&plugin_migrations)
@@ -2213,6 +2220,20 @@ impl DatabaseStore {
     ///   pool happened to connect on the first query and `reconnect()` never
     ///   fired — otherwise the flag would stay `true` indefinitely).
     pub async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        self.maybe_apply_deferred_migrations_on_pool(self.pool())
+            .await
+    }
+
+    /// [`Self::maybe_apply_deferred_migrations`] against an explicit pool.
+    ///
+    /// Reconnect publication runs this on the newly connected pool before it
+    /// is swapped in, so a migration failure leaves the previously published
+    /// pool and topology untouched instead of exposing an unmigrated pool
+    /// whose topology was never finalized (issue #7033).
+    async fn maybe_apply_deferred_migrations_on_pool(
+        &self,
+        pool: AnyPool,
+    ) -> Result<bool, anyhow::Error> {
         // Only one caller wins the CAS and runs migrations; the rest see
         // `Ok(false)` and return early. Acquire on success ensures we see
         // the constructor's write of `true`; Release on the clear ensures
@@ -2226,7 +2247,7 @@ impl DatabaseStore {
         }
 
         info!("Applying deferred migrations after backup-bootstrap recovery");
-        match self.run_migrations().await {
+        match self.run_migrations_on_pool(pool).await {
             Ok(()) => {
                 info!("Deferred migrations applied — database ready for polling");
                 Ok(true)
@@ -6513,6 +6534,13 @@ impl DatabaseStore {
     }
 
     /// Check that an mTLS identity is not already used by another consumer.
+    ///
+    /// `consumer_credential_index` is authoritative: every SQL consumer writer
+    /// (create, update, batch/restore, namespace rename) writes the trimmed
+    /// identity hash in the same transaction as `consumers.credentials`, and
+    /// its primary key lets only one consumer hold a hash. A point lookup is
+    /// therefore equivalent to scanning the stored credentials. Matching is
+    /// exact here; only san_dns plugin candidates apply ASCII case folding.
     pub async fn check_mtls_identity_unique(
         &self,
         namespace: &str,
@@ -6520,8 +6548,7 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let canonical_identity = canonical_mtls_identity(mtls_identity);
-        let credential_hash = credential_value_hash(canonical_identity);
+        let credential_hash = credential_value_hash(canonical_mtls_identity(mtls_identity));
         let row: Option<AnyRow> =
             sqlx::query(&self.q("SELECT consumer_id FROM consumer_credential_index \
                  WHERE namespace = ? AND credential_type = ? AND credential_hash = ?"))
@@ -6530,88 +6557,15 @@ impl DatabaseStore {
             .bind(credential_hash)
             .fetch_optional(&self.pool())
             .await?;
-        if let Some(row) = row {
-            let consumer_id: String = row.try_get("consumer_id")?;
-            if exclude_consumer_id != Some(consumer_id.as_str()) {
-                self.check_slow_query("check_mtls_identity_unique", start);
-                return Ok(false);
+        let is_unique = match row {
+            Some(row) => {
+                let consumer_id: String = row.try_get("consumer_id")?;
+                exclude_consumer_id == Some(consumer_id.as_str())
             }
-        }
-
-        // Rows written before surrounding whitespace was normalized have a hash
-        // that a trimmed probe cannot find. Fall back to the authoritative
-        // Consumer rows before admitting a write. Matching remains exact here:
-        // only san_dns plugin candidates apply ASCII case-folded uniqueness.
-        // The path is admin-only and paginated; malformed stored credentials
-        // fail closed as a database error.
-        let is_unique = self
-            .stored_mtls_identity_is_unique(namespace, canonical_identity, exclude_consumer_id)
-            .await?;
+            None => true,
+        };
         self.check_slow_query("check_mtls_identity_unique", start);
         Ok(is_unique)
-    }
-
-    async fn stored_mtls_identity_is_unique(
-        &self,
-        namespace: &str,
-        canonical_identity: &str,
-        exclude_consumer_id: Option<&str>,
-    ) -> Result<bool, anyhow::Error> {
-        let mut last_id: Option<String> = None;
-        loop {
-            let sql = if last_id.is_some() {
-                "SELECT id, credentials FROM consumers WHERE namespace = ? AND id > ? ORDER BY id LIMIT ?"
-            } else {
-                "SELECT id, credentials FROM consumers WHERE namespace = ? ORDER BY id LIMIT ?"
-            };
-            let query_sql = self.q(sql);
-            let mut query = sqlx::query(&query_sql).bind(namespace);
-            if let Some(last_id) = last_id.as_deref() {
-                query = query.bind(last_id);
-            }
-            let rows: Vec<AnyRow> = query
-                .bind(self.full_load_page_size)
-                .fetch_all(&self.pool())
-                .await?;
-            let fetched = rows.len();
-            for row in rows {
-                let consumer_id: String = row.try_get("id")?;
-                // Skip the excluded consumer before parsing credentials so PUT
-                // overwrite repair of an undecodable row (issue #2997) is not
-                // blocked by its own corrupt body. Other malformed rows still
-                // fail closed below.
-                if exclude_consumer_id == Some(consumer_id.as_str()) {
-                    last_id = Some(consumer_id);
-                    continue;
-                }
-                let credentials_json = required_utf8_text_column(&row, "credentials")?;
-                let credentials: HashMap<String, serde_json::Value> =
-                    config_decode::from_json_str(&credentials_json).map_err(|error| {
-                        anyhow::anyhow!(
-                            "Consumer {:?}: failed to parse credentials JSON while checking \
-                             mTLS uniqueness: {}",
-                            consumer_id,
-                            error
-                        )
-                    })?;
-                if credentials.get("mtls_auth").is_some_and(|credential| {
-                    Consumer::credential_entries_from_value(credential)
-                        .iter()
-                        .any(|entry| {
-                            entry
-                                .get("identity")
-                                .and_then(serde_json::Value::as_str)
-                                .is_some_and(|identity| identity.trim() == canonical_identity)
-                        })
-                }) {
-                    return Ok(false);
-                }
-                last_id = Some(consumer_id);
-            }
-            if (fetched as i64) < self.full_load_page_size {
-                return Ok(true);
-            }
-        }
     }
 
     /// Check if an upstream with the given ID exists in `namespace`.
@@ -8744,6 +8698,12 @@ impl DatabaseStore {
             .store(fail, Ordering::Release);
     }
 
+    /// Re-arm the offline-bootstrap deferred-migration flag so reconnect tests
+    /// can drive a failback whose deferred migrations fail (issue #7033).
+    pub(crate) fn set_migrations_pending_for_test(&self, pending: bool) {
+        self.migrations_pending.store(pending, Ordering::Release);
+    }
+
     async fn invoke_reconnect_transition_hook(
         &self,
         select: impl Fn(&SqlReconnectTransitionTestHooks) -> Option<&SqlReconnectTransitionHook>,
@@ -8849,12 +8809,54 @@ impl DatabaseStore {
         // (shared reads) and serializes concurrent reconnect publishers.
         let _transition_guard = self.reconnect_transition.write().await;
 
-        if topology == DatabaseTopology::Primary {
-            self.failover_topology.ensure_primary_failback_allowed()?;
-        }
+        let primary_failback_permit = match topology {
+            DatabaseTopology::Primary => {
+                Some(self.failover_topology.ensure_primary_failback_allowed()?)
+            }
+            DatabaseTopology::Failover => None,
+        };
         let next_topology_epoch = crate::config::db_backend::checked_next_config_topology_epoch(
             self.topology_epoch.load(Ordering::Acquire),
         )?;
+
+        // If this store was bootstrapped via `connect_offline_with_pool_config`
+        // (backup-file startup with an unreachable DB), migrations never ran.
+        // Run them against the *staged* pool before anything is published
+        // (issue #7033): a failure then returns with the previous pool, replica
+        // and topology all still installed, instead of leaving the new pool
+        // live while topology still reports the old side (on a primary
+        // failback that let opt-in Admin writes land on the primary while
+        // being recorded as failover writes, fencing the next failback). The
+        // helper uses a CAS so concurrent callers don't run migrations twice,
+        // and restores the flag on failure so a transient error doesn't
+        // silently skip migrations forever.
+        //
+        // The failback permit is then revalidated right before publication: a
+        // permit gone stale (an Admin write admitted on failover since the
+        // fence check) aborts here with nothing published.
+        let staged = async {
+            self.maybe_apply_deferred_migrations_on_pool(new_pool.clone())
+                .await?;
+            if let Some(permit) = primary_failback_permit.as_ref() {
+                self.failover_topology.revalidate_primary_failback(permit)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = staged {
+            tokio::spawn(async move {
+                new_pool.close().await;
+            });
+            if let Some(new_replica) = new_replica {
+                tokio::spawn(async move {
+                    new_replica.close().await;
+                });
+            }
+            return Err(error);
+        }
+
+        // Nothing below can fail: once the pool is swapped in, the topology
+        // finalization that matches it always runs under this same lock.
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
@@ -8871,7 +8873,6 @@ impl DatabaseStore {
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
-        let published_replica = new_replica.is_some();
         if let Some(new_replica) = new_replica {
             let old_replica = self.read_replica_pool.swap(Some(Arc::new(new_replica)));
             if let Some(old_replica) = old_replica {
@@ -8893,37 +8894,20 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
-        // Test seam: hold the transition across the deferred-migration window
-        // so a later failover/primary cannot interleave and then be overwritten
-        // by a delayed mark_primary / mismatched topology finalization.
+        // Test seam: hold the transition between publication and topology
+        // finalization so a later failover/primary cannot interleave and then
+        // be overwritten by a delayed mark_primary / mismatched topology
+        // finalization.
         self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology_kind)
             .await;
 
-        // If this store was bootstrapped via `connect_offline_with_pool_config`
-        // (backup-file startup with an unreachable DB), migrations never ran.
-        // Now that the pool is reconnected to a live DB, run them before
-        // returning so the polling loop finds tables at the expected schema.
-        // The helper uses a CAS so concurrent callers don't run migrations
-        // twice, and restores the flag on failure so a transient error
-        // doesn't silently skip migrations forever.
-        if let Err(error) = self.maybe_apply_deferred_migrations().await {
-            // `mark_primary` below never runs on this path, so a replica this
-            // call just published would stay live but inert (admin reads gate
-            // on `primary_active()`), holding connections and its snapshot
-            // files until some later replica reconnect replaced it. Retract it.
-            if published_replica && let Some(raced_replica) = self.read_replica_pool.swap(None) {
-                tokio::spawn(async move {
-                    raced_replica.close().await;
-                });
-            }
-            return Err(error);
-        }
-
-        // Primary failback stays fail-closed for writes until publication and
-        // deferred migrations succeed: mark_primary only after the await.
-        if topology == DatabaseTopology::Primary {
+        // Primary failback stays fail-closed for writes until the primary pool
+        // is published: mark_primary only after the swap, under the same lock
+        // that `ensure_primary_failback_allowed` ran under (the permit proves
+        // the fence was checked).
+        if let Some(permit) = primary_failback_permit {
             self.failover_topology
-                .mark_primary(&Self::redact_url(db_url));
+                .mark_primary(permit, &Self::redact_url(db_url));
         }
 
         Ok(())
@@ -9016,13 +9000,23 @@ impl DatabaseStore {
         }
     }
 
+    /// Record the admin-read replica URL without dialing it.
+    ///
+    /// Startup pairs this with a background
+    /// [`reconnect_read_replica`](Self::reconnect_read_replica) so an unreachable
+    /// replica cannot delay the authoritative primary load; admin reads use the
+    /// primary until the replica pool is published.
+    pub fn set_read_replica_url(&mut self, replica_url: &str) {
+        self.read_replica_url = Some(replica_url.to_string());
+    }
+
     /// Connect a read replica pool for admin read offload.
     ///
     /// The read replica pool uses the same connection settings (max_connections,
     /// max_lifetime) as the primary. Migrations are NOT run on the replica.
     pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
-        self.read_replica_url = Some(replica_url.to_string());
+        self.set_read_replica_url(replica_url);
 
         if !self.failover_topology.primary_active() {
             info!(

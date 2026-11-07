@@ -18,6 +18,11 @@ CHUNK = 1024 * 1024
 BUILD_SPEC = "fuzz-properties-nightly-2026-09-30-locked-v3"
 IDENTITY_KEYS = {"snapshot_sha", "run_id", "run_attempt", "platform", "build_spec"}
 
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_POSITIVE_DECIMAL_RE = re.compile(r"[1-9][0-9]*")
+_SAFE_ENTRY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,199}")
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
 
 def unique_object(pairs):
     result = {}
@@ -43,16 +48,16 @@ def identity():
 def validate_identity(value):
     if (not isinstance(value, dict) or set(value) != IDENTITY_KEYS
             or not all(isinstance(v, str) for v in value.values())
-            or not re.fullmatch(r"[0-9a-f]{40}", value["snapshot_sha"])
-            or not re.fullmatch(r"[1-9][0-9]*", value["run_id"])
-            or not re.fullmatch(r"[1-9][0-9]*", value["run_attempt"])
+            or not _COMMIT_SHA_RE.fullmatch(value["snapshot_sha"])
+            or not _POSITIVE_DECIMAL_RE.fullmatch(value["run_id"])
+            or not _POSITIVE_DECIMAL_RE.fullmatch(value["run_attempt"])
             or value["platform"] != "Linux-X64" or value["build_spec"] != BUILD_SPEC):
         raise ValueError("incompatible snapshot identity")
 
 
 def safe_name(name):
     return (isinstance(name, str)
-            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,199}", name) is not None
+            and _SAFE_ENTRY_NAME_RE.fullmatch(name) is not None
             and len(name.split("/")) <= 8
             and all(part not in ("", ".", "..") for part in name.split("/")))
 
@@ -183,7 +188,7 @@ def read_manifest(stream, expected, aggregate):
                 or not safe_name(entry["name"]) or entry["name"] <= previous
                 or type(entry["bytes"]) is not int or entry["bytes"] < 0
                 or not isinstance(entry["sha256"], str)
-                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])):
+                or not _SHA256_HEX_RE.fullmatch(entry["sha256"])):
             raise ValueError("invalid or unordered compiler-store entry")
         name = entry["name"]
         if any(parent.as_posix() in names for parent in Path(name).parents):
@@ -197,7 +202,7 @@ def read_manifest(stream, expected, aggregate):
 
 
 def restore_store(archive, destination, expected, expected_digest):
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+    if not _SHA256_HEX_RE.fullmatch(expected_digest):
         raise ValueError("invalid expected archive digest")
     validate_identity(expected)
     stream, initial = regular_file(archive)

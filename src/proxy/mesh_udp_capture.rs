@@ -1421,39 +1421,36 @@ async fn run_udp_egress_session(
             &entry.upstream_id,
             override_port,
         );
-        let port_lane = (health_port_scope.is_some()
-            && match mesh_stream_port_lane_supported(proxy, override_port) {
-                Ok(supported) => supported,
-                Err(message) => {
-                    warn!(
-                        service = %entry.service_fqdn,
-                        port = override_port,
-                        orig_dst = %key.orig_dst,
-                        %message,
-                        "Mesh UDP egress per-port LB policy is unsupported; ending session"
-                    );
-                    return;
-                }
-            })
-        .then_some(override_port);
-        if let Some(port) = port_lane {
-            let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-                lb,
-                &proxy.namespace,
-                &entry.upstream_id,
-                Some(port),
-                None,
-            );
-            if !matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
+        // Mesh relay proxies select from the entry upstream, never a subset.
+        let port_lane = match backend_dispatch::stream_port_lane(
+            proxy,
+            lb,
+            &entry.upstream_id,
+            health_port_scope,
+            None,
+        ) {
+            Ok(port_lane) => port_lane,
+            Err(backend_dispatch::StreamPortLaneRefusal::LeastLatency) => {
+                let message = "per-port LEAST_LATENCY requires stream latency accounting";
                 warn!(
                     service = %entry.service_fqdn,
-                    port,
+                    port = override_port,
+                    orig_dst = %key.orig_dst,
+                    %message,
+                    "Mesh UDP egress per-port LB policy is unsupported; ending session"
+                );
+                return;
+            }
+            Err(backend_dispatch::StreamPortLaneRefusal::NonIpHashKey) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    port = override_port,
                     orig_dst = %key.orig_dst,
                     "Mesh UDP egress per-port consistent hashing supports only source-IP hash keys; ending session"
                 );
                 return;
             }
-        }
+        };
         let lb_hash_key = mesh_udp_lb_hash_key_for_client_ip(key.client.ip());
         let health_ctx = backend_dispatch::health_context_for_selection(
             proxy,
@@ -2125,40 +2122,6 @@ fn spawn_capture_session_cleanup(
     });
 }
 
-#[cfg(target_os = "linux")]
-fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, port: u16) -> bool {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return false;
-    };
-    override_config.algorithm.is_some()
-        || override_config.hash_on.is_some()
-        || override_config.locality_lb_setting.is_some()
-}
-
-#[cfg(target_os = "linux")]
-fn mesh_stream_port_lane_supported(
-    proxy: &crate::config::types::Proxy,
-    port: u16,
-) -> Result<bool, &'static str> {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return Ok(false);
-    };
-    match override_config.algorithm {
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => {
-            Err("per-port LEAST_LATENCY requires stream latency accounting")
-        }
-        _ => Ok(stream_port_override_affects_selection(proxy, port)),
-    }
-}
-
 /// Non-Linux stub. `IP_TRANSPARENT` and recvmsg cmsg orig-dst recovery are
 /// Linux-only; mesh UDP capture is unsupported elsewhere, so the listener logs
 /// and returns immediately (the flag is default-off, so this is never reached
@@ -2261,31 +2224,43 @@ listen_port: 15011
         proxy
     }
 
+    /// The lane decision the mesh UDP egress path makes for port 53: entry
+    /// upstream, no selection subset.
+    fn mesh_udp_lane(
+        proxy: &crate::config::types::Proxy,
+    ) -> Result<Option<u16>, crate::proxy::backend_dispatch::StreamPortLaneRefusal> {
+        let cache = crate::load_balancer::LoadBalancerCache::new(
+            &crate::config::types::GatewayConfig::default(),
+        );
+        let snapshot = cache.load();
+        crate::proxy::backend_dispatch::stream_port_lane(proxy, &snapshot, "dns", Some(53), None)
+    }
+
     #[test]
     fn mesh_udp_stream_port_override_affects_selection_only_for_lb_fields() {
         let timeout_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
             connect_timeout_ms: Some(250),
             ..Default::default()
         });
-        assert!(!stream_port_override_affects_selection(&timeout_only, 53));
+        assert_eq!(mesh_udp_lane(&timeout_only), Ok(None));
 
         let passive_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
             passive_health_check: Some(crate::config::types::PassiveHealthCheck::default()),
             ..Default::default()
         });
-        assert!(!stream_port_override_affects_selection(&passive_only, 53));
+        assert_eq!(mesh_udp_lane(&passive_only), Ok(None));
 
         let locality = proxy_with_override(crate::config::types::ResolvedPortOverride {
             locality_lb_setting: Some(crate::config::types::UpstreamLocalityLbSetting::default()),
             ..Default::default()
         });
-        assert!(stream_port_override_affects_selection(&locality, 53));
+        assert_eq!(mesh_udp_lane(&locality), Ok(Some(53)));
 
         let algorithm = proxy_with_override(crate::config::types::ResolvedPortOverride {
             algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
             ..Default::default()
         });
-        assert!(stream_port_override_affects_selection(&algorithm, 53));
+        assert_eq!(mesh_udp_lane(&algorithm), Ok(Some(53)));
     }
 
     #[test]
@@ -2295,8 +2270,10 @@ listen_port: 15011
             ..Default::default()
         });
 
-        assert!(stream_port_override_affects_selection(&least_latency, 53));
-        assert!(mesh_stream_port_lane_supported(&least_latency, 53).is_err());
+        assert_eq!(
+            mesh_udp_lane(&least_latency),
+            Err(crate::proxy::backend_dispatch::StreamPortLaneRefusal::LeastLatency)
+        );
     }
 
     #[test]

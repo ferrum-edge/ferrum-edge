@@ -20,10 +20,10 @@
 //! the request/response wide-charset decoding parity table, which needs the WAF
 //! plugin surface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, LazyLock};
 
 use ferrum_edge::circuit_breaker::{BreakerOutcome, CircuitBreaker, ProbeTicket};
 use ferrum_edge::config::types::{CircuitBreakerConfig, Proxy, UpstreamTarget};
@@ -1044,9 +1044,25 @@ fn after_matching_close(bytes: &[u8], open_at: usize) -> usize {
     bytes.len()
 }
 
-/// Index just past the item that follows an attribute ending at `from`: its
-/// further attributes, then either a `;` (an out-of-line `mod name;`, a `use`)
-/// or the `{ .. }` body that closes it.
+/// Index just past what an attribute ending at `from` annotates, or a point
+/// inside it — not past it. After its further attributes and any `( .. )` /
+/// `[ .. ]` groups, the annotated text ends at the FIRST of:
+///
+/// - a `;` or `,` at its own depth, consumed: an out-of-line `mod name;`, a
+///   `use`, a statement, or a comma-terminated field, struct-literal field,
+///   tuple field, enum variant or match arm;
+/// - the close of its first `{ .. }` group: an item or block body;
+/// - a closing bracket it did not open, not consumed: the end of the field,
+///   variant, argument or arm list holding a last element with no trailing
+///   comma.
+///
+/// The first of these is never beyond the annotated item's real end, so the
+/// stripper can keep test-only text (an `else` after a gated `if`, or a gated
+/// item whose header has a `,` in its generics), which the parity scan then
+/// sees as production — a loud false positive — but it never erases the
+/// production code that follows. The one shape it does not bound is an
+/// attribute on a generic parameter (`fn f<#[cfg(test)] T>`), which the
+/// scanned sources do not use.
 fn end_of_annotated_item(bytes: &[u8], from: usize) -> usize {
     let mut at = from;
     while at < bytes.len() {
@@ -1055,9 +1071,10 @@ fn end_of_annotated_item(bytes: &[u8], from: usize) -> usize {
             continue;
         }
         match bytes[at] {
-            b';' => return at + 1,
+            b';' | b',' => return at + 1,
             b'{' => return after_matching_close(bytes, at),
             b'(' | b'[' => at = after_matching_close(bytes, at),
+            b')' | b']' | b'}' => return at,
             _ => at += 1,
         }
     }
@@ -1102,10 +1119,14 @@ fn cfg_is_test_only(attribute: &str) -> bool {
     top_level.contains(&"test")
 }
 
-/// `text` with every item gated by a test-only `cfg` removed — inline and
-/// out-of-line modules, helper fns, impls — at any indentation, including one
-/// at byte zero. Comments, strings and char literals are lexed, so a brace or
-/// `#[cfg(test)]` inside one changes nothing. Everything else is kept.
+/// `text` with everything gated by a test-only `cfg` removed — inline and
+/// out-of-line modules, helper fns, impls, fields, struct-literal fields,
+/// variants, match arms and statements — at any indentation, including one at
+/// byte zero. Comments, strings and char literals are lexed, so a brace or
+/// `#[cfg(test)]` inside one changes nothing. Everything else is kept: see
+/// `end_of_annotated_item` for why a removal never reaches past the gated
+/// text, and `production_items_missing_after_strip` for the independent check
+/// that holds it to that over every scanned file.
 fn without_cfg_test_items(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut production = String::with_capacity(text.len());
@@ -1137,6 +1158,168 @@ fn without_cfg_test_items(text: &str) -> String {
     production
 }
 
+/// Per byte of `bytes`, whether it lies inside a comment, string or char
+/// literal past that token's first byte: a line starting there is literal
+/// text, not code.
+fn opaque_token_interior(bytes: &[u8]) -> Vec<bool> {
+    let mut interior = vec![false; bytes.len() + 1];
+    let mut at = 0;
+    while at < bytes.len() {
+        match opaque_token_len(bytes, at) {
+            Some(len) => {
+                if len > 1 {
+                    interior[at + 1..at + len].fill(true);
+                }
+                at += len.max(1);
+            }
+            None => at += 1,
+        }
+    }
+    interior
+}
+
+/// Whether a trimmed rustfmt line opens an item: optional visibility, then an
+/// item keyword or qualifier.
+fn is_item_header(trimmed: &str) -> bool {
+    let mut rest = trimmed;
+    if let Some(after) = rest.strip_prefix("pub(") {
+        rest = after
+            .split_once(')')
+            .map_or(after, |(_, tail)| tail)
+            .trim_start();
+    } else if let Some(after) = rest.strip_prefix("pub ") {
+        rest = after;
+    }
+    let word_len = rest
+        .bytes()
+        .take_while(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        .count();
+    matches!(
+        &rest[..word_len],
+        "fn" | "async"
+            | "const"
+            | "static"
+            | "struct"
+            | "enum"
+            | "union"
+            | "impl"
+            | "trait"
+            | "mod"
+            | "use"
+            | "type"
+            | "unsafe"
+            | "extern"
+            | "macro_rules"
+    )
+}
+
+/// Whether the attribute lines directly above `lines[header]` (at `indent`,
+/// with doc comments and the continuation lines of a multi-line attribute)
+/// carry a test-only `cfg`.
+fn header_attributes_are_test_only(
+    lines: &[(usize, &str)],
+    interior: &[bool],
+    header: usize,
+    indent: usize,
+) -> bool {
+    // Walking up: deeper lines and a `)` / `]` closer are a multi-line
+    // attribute's body only once the `#[` line that opens it is reached, so a
+    // previous item's tail (`struct Pair(\n    #[cfg(test)] T,\n);`) never
+    // gates the header below it.
+    let mut run = Vec::new();
+    let mut continuation = Vec::new();
+    for &(start, line) in lines[..header].iter().rev() {
+        let trimmed = line.trim_start();
+        if interior[start] || trimmed.is_empty() {
+            break;
+        }
+        let line_indent = line.len() - trimmed.len();
+        if line_indent > indent || (line_indent == indent && trimmed.starts_with([')', ']'])) {
+            if !trimmed.starts_with("//") {
+                continuation.push(line);
+            }
+        } else if line_indent == indent && trimmed.starts_with("#[") {
+            run.append(&mut continuation);
+            run.push(line);
+        } else if !(line_indent == indent && trimmed.starts_with("//") && continuation.is_empty()) {
+            break;
+        }
+    }
+    run.reverse();
+    let attributes = run.join("\n");
+    let bytes = attributes.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = attributes[from..].find("#[") {
+        let at = from + offset;
+        let end = after_matching_close(bytes, at + 1);
+        if cfg_is_test_only(attributes.get(at + 2..end.saturating_sub(1)).unwrap_or("")) {
+            return true;
+        }
+        from = at + 2;
+    }
+    false
+}
+
+/// The item header lines of rustfmt-formatted `text` that are production
+/// code, found line by line, independently of the stripper's lexing: every
+/// header at column 0, and every header at four spaces inside an ungated
+/// column-0 item (an `impl`'s methods, an inline module's items), whose own
+/// attribute lines carry no test-only `cfg`. Lines inside comments and string
+/// literals are skipped.
+fn production_item_headers(text: &str) -> Vec<&str> {
+    let interior = opaque_token_interior(text.as_bytes());
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        lines.push((start, line));
+        start += line.len() + 1;
+    }
+    let mut headers = Vec::new();
+    let mut enclosing_is_test_only = false;
+    for (index, &(start, line)) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if interior[start] || trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent == 0 {
+            if trimmed.starts_with(['}', ')', ']', '#', '/', '*']) {
+                continue;
+            }
+            enclosing_is_test_only = header_attributes_are_test_only(&lines, &interior, index, 0);
+            if !enclosing_is_test_only && is_item_header(trimmed) {
+                headers.push(line);
+            }
+        } else if indent == 4
+            && !enclosing_is_test_only
+            && is_item_header(trimmed)
+            && !header_attributes_are_test_only(&lines, &interior, index, 4)
+        {
+            headers.push(line);
+        }
+    }
+    headers
+}
+
+/// The production item headers of `text` (see `production_item_headers`) that
+/// `production` — `text` after `without_cfg_test_items` — no longer has as a
+/// whole line, counted with multiplicity so a surviving duplicate cannot hide
+/// a lost one.
+fn production_items_missing_after_strip<'a>(text: &'a str, production: &str) -> Vec<&'a str> {
+    let mut kept: BTreeMap<&str, usize> = BTreeMap::new();
+    for line in production.split('\n') {
+        *kept.entry(line).or_default() += 1;
+    }
+    let mut missing = Vec::new();
+    for header in production_item_headers(text) {
+        match kept.get_mut(header) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => missing.push(header),
+        }
+    }
+    missing
+}
+
 #[test]
 fn cfg_test_item_stripper_keeps_every_production_item() {
     // Every `PROD_n` item must survive and every `TEST_ONLY_n` item must go.
@@ -1146,6 +1329,10 @@ fn cfg_test_item_stripper_keeps_every_production_item() {
     // (attribute at byte zero), TEST_ONLY_3 (`cfg(all(test, ..))`),
     // TEST_ONLY_4 (indented) and TEST_ONLY_5 (a test-only fn). The string,
     // raw-string, char and comment braces inside `linux_only` pin the lexing.
+    // Issue #7026: an item-only stripper read past a gated field, struct-literal
+    // field, tuple field or match arm to the next `;` or `{ .. }`, so it erased
+    // PROD_7 through PROD_13 — the shape that hid production items of
+    // `src/proxy/deferred_log.rs` and `src/grpc/dp_client.rs` from the scan.
     let fixture = r##"#[cfg(test)]
 mod at_byte_zero { fn t() { TEST_ONLY_1(); } }
 #[cfg(test)]
@@ -1177,11 +1364,66 @@ impl Production {
 fn test_helper(a: [u8; 3]) -> u8 { TEST_ONLY_5(); a[0] }
 // #[cfg(test)] in a comment gates nothing
 fn production_tail() { PROD_6(); }
+struct Logger {
+    state: u8,
+    #[cfg(test)]
+    delivery: Option<Delivery>,
+}
+impl Drop for Logger {
+    fn drop(&mut self) { PROD_7(); }
+}
+struct TrailingField {
+    #[cfg(test)]
+    last: u8
+}
+fn production_after_trailing_field() { PROD_8(); }
+fn build() -> Logger {
+    Logger {
+        state: 0,
+        #[cfg(test)]
+        delivery: TEST_ONLY_6(),
+    }
+}
+fn production_after_struct_literal() { PROD_9(); }
+fn dispatch(kind: u8) -> u8 {
+    match kind {
+        #[cfg(test)]
+        0 => TEST_ONLY_7(),
+        _ => PROD_10(),
+    }
+}
+fn statement() {
+    #[cfg(test)]
+    if let Some(delivery) = DELIVERY { TEST_ONLY_8(); return; }
+    PROD_11();
+}
+enum Kind {
+    #[cfg(test)]
+    TestOnly(TEST_ONLY_9),
+    Production(PROD_12),
+}
+struct Pair(
+    #[cfg(test)] TEST_ONLY_10,
+    PROD_13,
+);
+fn production_after_pair() { PROD_14(); }
 "##;
     let production = without_cfg_test_items(fixture);
-    for kept in ["PROD_1", "PROD_2", "PROD_3", "PROD_4", "PROD_5", "PROD_6"] {
+    // A whole marker, so `PROD_1` is not satisfied by `PROD_13`.
+    let has_marker = |marker: &str| {
+        production.match_indices(marker).any(|(at, _)| {
+            !production
+                .as_bytes()
+                .get(at + marker.len())
+                .is_some_and(u8::is_ascii_digit)
+        })
+    };
+    for kept in [
+        "PROD_1", "PROD_2", "PROD_3", "PROD_4", "PROD_5", "PROD_6", "PROD_7", "PROD_8", "PROD_9",
+        "PROD_10", "PROD_11", "PROD_12", "PROD_13", "PROD_14",
+    ] {
         assert!(
-            production.contains(kept),
+            has_marker(kept),
             "{kept} is production code and must survive the stripper:\n{production}"
         );
     }
@@ -1190,14 +1432,36 @@ fn production_tail() { PROD_6(); }
         "TEST_ONLY_3",
         "TEST_ONLY_4",
         "TEST_ONLY_5",
+        "TEST_ONLY_6",
+        "TEST_ONLY_7",
+        "TEST_ONLY_8",
+        "TEST_ONLY_9",
+        "TEST_ONLY_10",
         "mod out_of_line",
         "mod pathed",
+        "delivery: Option",
+        "last: u8",
     ] {
         assert!(
-            !production.contains(dropped),
+            !has_marker(dropped),
             "{dropped} is test-only and must be stripped:\n{production}"
         );
     }
+    // The independent line-based check agrees, and it notices a lost item.
+    let missing = production_items_missing_after_strip(fixture, &production);
+    assert!(
+        missing.is_empty(),
+        "the stripper erased production items {missing:?}:\n{production}"
+    );
+    assert!(production_item_headers(fixture).contains(&"impl Drop for Logger {"));
+    assert!(production_item_headers(fixture).contains(&"    fn drop(&mut self) { PROD_7(); }"));
+    assert!(!production_item_headers(fixture).contains(&"mod pathed;"));
+    let lost_impl = production.replacen("impl Drop for Logger {\n", "", 1);
+    assert_eq!(
+        production_items_missing_after_strip(fixture, &lost_impl),
+        ["impl Drop for Logger {"],
+        "a production item the stripper lost must be reported"
+    );
 }
 
 /// CB-1: every production settlement of a circuit-breaker admission goes
@@ -1219,7 +1483,19 @@ fn no_production_path_settles_a_breaker_without_its_probe_ticket() {
             continue;
         }
         scanned += 1;
-        let production: String = without_cfg_test_items(&text).split_whitespace().collect();
+        let stripped = without_cfg_test_items(&text);
+        // The scan is only as good as the stripper: a removal that ran past
+        // its gated text would hide production calls from it (issue #7026).
+        assert!(
+            !production_item_headers(&text).is_empty(),
+            "{path}: the line-based production-item check found nothing to check"
+        );
+        let missing = production_items_missing_after_strip(&text, &stripped);
+        assert!(
+            missing.is_empty(),
+            "{path}: stripping `cfg(test)` items erased production items {missing:?}"
+        );
+        let production: String = stripped.split_whitespace().collect();
         for blind in [
             ".record_success(",
             ".record_failure(",
@@ -2524,36 +2800,52 @@ fn admission_source_without_line_comments(text: &str) -> String {
         .join("\n")
 }
 
+/// A named `struct` declaration; captures the struct name.
+static STRUCT_DECLARATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap()
+});
+/// A `#[derive(..)]` struct/enum item; captures indent, derives, kind, and name.
+static DERIVED_ITEM: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
+        r"(?:#\[[^\]]*\]\s*)*",
+        r"(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+(\w+)[^{;]*\{",
+    ))
+    .unwrap()
+});
+/// A named struct field; captures the field name and type text.
+static STRUCT_FIELD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?",
+        r"([a-z_]\w*)\s*:\s*([^,]+),",
+    ))
+    .unwrap()
+});
+/// A serde `skip` / `skip_deserializing` option.
+static SERDE_SKIP: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\bskip(?:_deserializing)?\b").unwrap());
+/// The attribute group immediately preceding a field.
+static FIELD_ATTRIBUTES: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap());
+/// A tuple-newtype enum variant; captures name, attributes, and inner type.
+static NEWTYPE_VARIANT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"(?m)^[ \t]*([A-Z]\w*)\(\s*",
+        r"((?:#\[[^\]]*\]\s*)*)([\w:]+)\s*,?\s*\)",
+    ))
+    .unwrap()
+});
+
 #[test]
 fn every_nested_admin_struct_field_has_an_object_admission_decision() {
     // Named structs are the serde shape that accepts positional sequences.
     // Include definitions across src/, so an imported or fully qualified
     // struct cannot evade the inventory.
-    let declaration =
-        regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)[^{;\n]*\{").unwrap();
-    let items = regex::Regex::new(concat!(
-        r"(?m)^([ \t]*)#\[derive\(([^)]*)\)\]\s*",
-        r"(?:#\[[^\]]*\]\s*)*",
-        r"(?:pub(?:\([^)]*\))?\s+)?(struct|enum)\s+(\w+)[^{;]*\{",
-    ))
-    .unwrap();
-    let fields = regex::Regex::new(concat!(
-        r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?",
-        r"([a-z_]\w*)\s*:\s*([^,]+),",
-    ))
-    .unwrap();
-    let skip = regex::Regex::new(r"\bskip(?:_deserializing)?\b").unwrap();
-    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
-    let newtype_variants = regex::Regex::new(concat!(
-        r"(?m)^[ \t]*([A-Z]\w*)\(\s*",
-        r"((?:#\[[^\]]*\]\s*)*)([\w:]+)\s*,?\s*\)",
-    ))
-    .unwrap();
     let sources = production_sources();
     let struct_names: BTreeSet<String> = sources
         .iter()
         .flat_map(|(_, text)| {
-            declaration
+            STRUCT_DECLARATION
                 .captures_iter(text)
                 .map(|item| item[1].to_string())
         })
@@ -2563,7 +2855,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
 
     for (path, text) in &sources {
         let text = admission_source_without_line_comments(text);
-        for item in items.captures_iter(&text) {
+        for item in DERIVED_ITEM.captures_iter(&text) {
             if !item[2]
                 .split(',')
                 .any(|derive| derive.trim().rsplit("::").next() == Some("Deserialize"))
@@ -2577,9 +2869,9 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 panic!("{path}: {resource} must have a terminated declaration")
             })];
             let mut previous_field_end = 0;
-            for field in fields.captures_iter(body) {
+            for field in STRUCT_FIELD.captures_iter(body) {
                 let span = field.get(0).unwrap();
-                let attributes = field_attributes
+                let attributes = FIELD_ATTRIBUTES
                     .find(&body[previous_field_end..span.start()])
                     .map_or("", |attributes| attributes.as_str());
                 previous_field_end = span.end();
@@ -2602,7 +2894,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 let name = inner.rsplit("::").next().unwrap_or(inner);
                 if inner.contains(['<', '>', '&'])
                     || !struct_names.contains(name)
-                    || skip.is_match(attributes)
+                    || SERDE_SKIP.is_match(attributes)
                 {
                     continue;
                 }
@@ -2677,7 +2969,7 @@ fn every_nested_admin_struct_field_has_an_object_admission_decision() {
                 checked.insert(key);
             }
             if &item[3] == "enum" {
-                for variant in newtype_variants.captures_iter(body) {
+                for variant in NEWTYPE_VARIANT.captures_iter(body) {
                     let name = variant[3].rsplit("::").next().unwrap();
                     if struct_names.contains(name) {
                         let key = format!("{path}:{resource}.{}", &variant[1]);
@@ -3127,7 +3419,6 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
     }
     let text = admission_source_without_line_comments(&source("src/modes/mesh/slice.rs"));
     let body = item_body(&text, "pub struct MeshSlice {", "\n}");
-    let field_attributes = regex::Regex::new(r"(?:#\[[^\]]*\]\s*)+$").unwrap();
     for field in ["virtual_service_l4_proxies", "virtual_service_l4_upstreams"] {
         let declaration = format!("pub {field}:");
         let start = body
@@ -3135,7 +3426,7 @@ fn plugin_struct_lists_behind_raw_json_values_retain_element_admission() {
             .expect("MeshSlice L4 field must exist");
         // Inspect this field's full attribute group independently of ordering
         // or whether serde options share one attribute or use separate ones.
-        let attributes = field_attributes
+        let attributes = FIELD_ATTRIBUTES
             .find(&body[..start])
             .expect("MeshSlice L4 field must carry attributes");
         assert!(
@@ -3541,9 +3832,14 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         ".any(|name| headers_mod::is_gateway_assertion_header(name));",
     ),
     (
+        "WebSocket backend handshake strip predicate",
+        "src/proxy/headers.rs",
+        "        || is_websocket_handshake_strip_header(name)\n        || is_consumer_assertion_header(name)\n}",
+    ),
+    (
         "H1/H2 WebSocket handshake",
         "src/proxy/mod.rs",
-        "    headers_mod::is_consumer_assertion_header(name)\n        || matches!(",
+        "headers_mod::is_websocket_backend_request_strip_header(lower_name.as_str())",
     ),
     (
         // Delegates to the same initial-boundary helper whose gate is the
@@ -3555,7 +3851,7 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
     (
         "H3 WebSocket handshake",
         "src/http3/websocket.rs",
-        "crate::proxy::headers::is_consumer_assertion_header(&lower)",
+        "crate::proxy::headers::is_websocket_backend_request_strip_header(&lower)",
     ),
     (
         "H3-to-gRPC bridge trusted overlay",
@@ -4253,4 +4549,185 @@ fn every_tracing_capture_registers_the_interest_floor_first() {
          installing function, before installing a thread-local tracing \
          capture: {offenders:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stream per-port LB lane admission: TCP, UDP/DTLS, mesh raw-TCP egress, mesh
+// UDP egress. The four paths once carried their own copies of this decision
+// and drifted (per-port `LEAST_CONN`, the subset refinement). The behaviour of
+// the shared `backend_dispatch::stream_port_lane` is pinned in
+// `stream_port_lane_tests.rs`; this table pins that every stream path calls
+// it, with the selection subset it actually selects from, and keeps no copy.
+// ---------------------------------------------------------------------------
+
+/// `(path, selection_subset argument)` for every stream path that selects a
+/// load-balanced target. Only TCP selects inside a route subset:
+/// `upstream_subset` is a validation error on udp/dtls, and mesh relay proxies
+/// select from the entry upstream.
+const STREAM_PORT_LANE_SITES: &[(&str, &str)] = &[
+    ("src/proxy/tcp_proxy.rs", "proxy.upstream_subset.as_deref()"),
+    ("src/proxy/udp_proxy.rs", "None"),
+    ("src/proxy/mesh_tcp_egress.rs", "None"),
+    ("src/proxy/mesh_udp_capture.rs", "None"),
+];
+
+/// The top-level arguments of every `stream_port_lane(` call in `text`.
+fn stream_port_lane_call_args(text: &str) -> Vec<Vec<String>> {
+    const CALL: &str = "backend_dispatch::stream_port_lane(";
+    let mut calls = Vec::new();
+    for (at, _) in text.match_indices(CALL) {
+        let bytes = text.as_bytes();
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(bytes, open) - 1;
+        let compact: String = text[open + 1..close].split_whitespace().collect();
+        let mut depth = 0i32;
+        let mut start = 0;
+        let mut args = Vec::new();
+        for (i, c) in compact.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(compact[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if start < compact.len() {
+            args.push(compact[start..].to_string());
+        }
+        calls.push(args);
+    }
+    calls
+}
+
+#[test]
+fn every_stream_path_admits_its_port_lane_through_the_shared_policy() {
+    for &(path, subset) in STREAM_PORT_LANE_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let calls = stream_port_lane_call_args(&production);
+        assert_eq!(
+            calls.len(),
+            1,
+            "{path} must make exactly one production per-port lane decision \
+             through backend_dispatch::stream_port_lane"
+        );
+        assert_eq!(
+            calls[0].last().map(String::as_str),
+            Some(subset),
+            "{path} must pass its own selection subset explicitly"
+        );
+        for copy in [
+            "override_config.locality_lb_setting.is_some()",
+            "HashOnStrategy::Ip",
+            "LoadBalancerAlgorithm::LeastLatency",
+        ] {
+            assert!(
+                !production.contains(copy),
+                "{path} re-implements part of the stream lane policy (`{copy}`); \
+                 call backend_dispatch::stream_port_lane instead"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hyper HTTP/2 client builders configured from `PoolConfig`
+// ---------------------------------------------------------------------------
+//
+// Issue #5464: every hyper-based backend H2 client must pass
+// `pool_config.http2_adaptive_window`. The direct-H2, gRPC, mesh-mTLS and
+// nested-HBONE gRPC builders used to be four hand-written copies; they now
+// call `pool::hyper_h2_client_builder`, whose behaviour is pinned in
+// `h2_client_builder_tests.rs`. This table pins each site's explicit options
+// and that no site builds its own `PoolConfig`-driven hyper H2 client again.
+
+/// `(path, number of shared-builder calls, keepalive option, send-stream option)`.
+const H2_CLIENT_BUILDER_SITES: &[(&str, usize, &str, &str)] = &[
+    (
+        "src/proxy/http2_pool.rs",
+        1,
+        "H2ClientKeepalive::FromPoolConfig",
+        "H2ClientInitialSendStreams::FromStreamCap",
+    ),
+    (
+        "src/proxy/mesh_mtls_pool.rs",
+        1,
+        "H2ClientKeepalive::FromPoolConfig",
+        "H2ClientInitialSendStreams::HyperDefault",
+    ),
+];
+
+#[test]
+fn every_pool_config_h2_client_uses_the_shared_builder_with_explicit_options() {
+    const CALL: &str = "crate::pool::hyper_h2_client_builder(";
+    let options = |text: &str, at: usize| -> String {
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(text.as_bytes(), open);
+        text[open..close].split_whitespace().collect()
+    };
+
+    for &(path, calls, keepalive, send_streams) in H2_CLIENT_BUILDER_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let found: Vec<_> = production.match_indices(CALL).collect();
+        assert_eq!(found.len(), calls, "{path}: shared H2 builder calls");
+        for (at, _) in found {
+            let args = options(&production, at);
+            assert!(
+                args.contains(keepalive) && args.contains(send_streams),
+                "{path}: expected `{keepalive}` + `{send_streams}`, got {args}"
+            );
+        }
+    }
+
+    // gRPC: the pooled direct dial (`build_h2_builder`) and the nested-HBONE
+    // dial deliberately differ, so pin each call by its enclosing item.
+    let grpc = without_cfg_test_items(&source("src/proxy/grpc_proxy.rs"));
+    let pooled = item_body(&grpc, "fn build_h2_builder(", "\n    }\n");
+    let nested = item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n");
+    for (site, body, keepalive, send_streams) in [
+        (
+            "gRPC pool",
+            pooled,
+            "H2ClientKeepalive::FromPoolConfig",
+            "H2ClientInitialSendStreams::FromStreamCap",
+        ),
+        (
+            "nested-HBONE gRPC dial",
+            nested,
+            "H2ClientKeepalive::NotApplied",
+            "H2ClientInitialSendStreams::HyperDefault",
+        ),
+    ] {
+        let at = body
+            .find(CALL)
+            .unwrap_or_else(|| panic!("{site} must use the shared H2 builder"));
+        let args = options(body, at);
+        assert!(
+            args.contains(keepalive) && args.contains(send_streams),
+            "{site}: expected `{keepalive}` + `{send_streams}`, got {args}"
+        );
+    }
+    assert_eq!(
+        grpc.matches(CALL).count(),
+        2,
+        "grpc_proxy shared H2 builder calls"
+    );
+
+    // No PoolConfig-driven hyper H2 client is hand-built anywhere else. The
+    // Unix-socket h2c client uses fixed constants, not `PoolConfig`, and the
+    // frontend H2 *server* builders in `proxy/mod.rs` use their own env
+    // settings; neither reads `pool_config.http2_adaptive_window`.
+    for (path, text) in production_sources() {
+        if path == "src/pool/mod.rs" {
+            continue;
+        }
+        let production = without_cfg_test_items(&text);
+        assert!(
+            !production.contains(".adaptive_window(pool_config.http2_adaptive_window)"),
+            "{path} hand-builds a PoolConfig-driven hyper H2 client; call \
+             crate::pool::hyper_h2_client_builder instead"
+        );
+    }
 }

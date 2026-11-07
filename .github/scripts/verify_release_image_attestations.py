@@ -42,6 +42,20 @@ FINAL_MANIFEST_JOBS = {
 # `-ebpf-tools` builds that share the `docker-ebpf` matrix job.
 EXPECTED_PROVENANCE_DISABLED = 3
 
+_JOB_NEEDS_FLOW_RE = re.compile(
+    r"(?m)^    needs: \[(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)\]$",
+)
+_JOB_NEEDS_SCALAR_RE = re.compile(r"(?m)^    needs: ([A-Za-z0-9_-]+)$")
+_JOB_IF_ALWAYS_RE = re.compile(r"(?m)^    if: always\(\)$")
+_CONTENTS_WRITE_PERMISSIONS_RE = re.compile(r"(?m)^    permissions:\n      contents: write$")
+_ID_TOKEN_WRITE_RE = re.compile(r"(?m)^\s+id-token:\s*write\s*$")
+_ID_TOKEN_PACKAGES_WRITE_PERMISSIONS_RE = re.compile(
+    r"(?m)^    permissions:\n      id-token: write\n      packages: write$",
+)
+_PINNED_COSIGN_INSTALLER_RE = re.compile(
+    r"(?m)^\s*(?:-\s+)?uses:\s+sigstore/cosign-installer@[0-9a-f]{40}(?:\s+#.*)?$",
+)
+
 
 def extract_job(workflow: str, job: str) -> str:
     match = re.search(
@@ -54,13 +68,10 @@ def extract_job(workflow: str, job: str) -> str:
 
 
 def extract_needs(job_body: str) -> set[str]:
-    inline = re.search(
-        r"(?m)^    needs: \[(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)\]$",
-        job_body,
-    )
+    inline = _JOB_NEEDS_FLOW_RE.search(job_body)
     if inline:
         return set(inline.group("needs").split(", "))
-    scalar = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
+    scalar = _JOB_NEEDS_SCALAR_RE.search(job_body)
     if scalar:
         return {scalar.group(1)}
     return set()
@@ -108,15 +119,12 @@ def validate_release_workflow(workflow: str) -> list[str]:
             "jobs.release-attestation-gate must depend exactly on create-release "
             "and attest-release-images"
         )
-    if not re.search(r"(?m)^    if: always\(\)$", gate_job):
+    if not _JOB_IF_ALWAYS_RE.search(gate_job):
         errors.append(
             "jobs.release-attestation-gate must use if: always() so attestation "
             "failure cannot skip the fail-closed publication gate"
         )
-    if not re.search(
-        r"(?m)^    permissions:\n      contents: write$",
-        gate_job,
-    ):
+    if not _CONTENTS_WRITE_PERMISSIONS_RE.search(gate_job):
         errors.append(
             "jobs.release-attestation-gate must retain contents: write so it "
             "can retract a release after attestation failure"
@@ -133,16 +141,13 @@ def validate_release_workflow(workflow: str) -> list[str]:
                 f"jobs.release-attestation-gate is missing fail-closed token {token!r}"
             )
 
-    id_token_grants = re.findall(r"(?m)^\s+id-token:\s*write\s*$", workflow)
+    id_token_grants = _ID_TOKEN_WRITE_RE.findall(workflow)
     if len(id_token_grants) != 1:
         errors.append(
             "release.yml must grant id-token: write exactly once, on the "
             "attestation job"
         )
-    if not re.search(
-        r"(?m)^    permissions:\n      id-token: write\n      packages: write$",
-        attest_job,
-    ):
+    if not _ID_TOKEN_PACKAGES_WRITE_PERMISSIONS_RE.search(attest_job):
         errors.append(
             "jobs.attest-release-images must have the exact id-token/packages "
             "write permission block"
@@ -160,10 +165,7 @@ def validate_release_workflow(workflow: str) -> list[str]:
     # Any full-commit pin: which upstream release it is, is governed by the
     # trusted action pin rotation check (docs/dependency-policy.md →
     # "Automated action pin rotation").
-    if not re.search(
-        r"(?m)^\s*(?:-\s+)?uses:\s+sigstore/cosign-installer@[0-9a-f]{40}(?:\s+#.*)?$",
-        attest_job,
-    ):
+    if not _PINNED_COSIGN_INSTALLER_RE.search(attest_job):
         errors.append(
             "jobs.attest-release-images must install cosign with a "
             "full-commit-pinned sigstore/cosign-installer"

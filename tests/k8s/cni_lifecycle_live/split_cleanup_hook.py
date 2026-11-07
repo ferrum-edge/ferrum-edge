@@ -8,6 +8,11 @@ import sys
 from pathlib import Path
 
 
+_YAML_DOC_SEPARATOR_RE = re.compile(r"(?m)^---\s*$")
+_KIND_DAEMONSET_RE = re.compile(r"(?m)^kind:\s*DaemonSet\s*$")
+_KIND_JOB_RE = re.compile(r"(?m)^kind:\s*Job\s*$")
+
+
 def main() -> int:
     if len(sys.argv) != 4:
         print(
@@ -20,11 +25,11 @@ def main() -> int:
     job_out = Path(sys.argv[3])
     documents = [
         document
-        for document in re.split(r"(?m)^---\s*$", source.read_text(encoding="utf-8"))
+        for document in _YAML_DOC_SEPARATOR_RE.split(source.read_text(encoding="utf-8"))
         if document.strip()
     ]
-    daemonsets = [document for document in documents if re.search(r"(?m)^kind:\s*DaemonSet\s*$", document)]
-    jobs = [document for document in documents if re.search(r"(?m)^kind:\s*Job\s*$", document)]
+    daemonsets = [document for document in documents if _KIND_DAEMONSET_RE.search(document)]
+    jobs = [document for document in documents if _KIND_JOB_RE.search(document)]
     if len(daemonsets) != 1 or len(jobs) != 1:
         print(
             f"expected one DaemonSet and one Job, got {len(daemonsets)}/{len(jobs)}",

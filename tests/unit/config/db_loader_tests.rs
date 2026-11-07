@@ -1420,44 +1420,55 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
 }
 
 #[tokio::test]
-async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_rows() {
+async fn mtls_uniqueness_is_answered_by_the_credential_index() {
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir
-        .path()
-        .join("consumer_legacy_mtls_identity_index.db");
+    let db_path = temp_dir.path().join("consumer_mtls_identity_indexed.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
     let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .unwrap();
 
-    let mut consumer = make_consumer("legacy", "alice");
-    consumer.credentials.insert(
+    let mut owner = make_consumer("owner", "alice");
+    owner.credentials.insert(
         "mtls_auth".to_string(),
         json!([{ "identity": " API.Example.COM " }]),
     );
-    store.create_consumer(&consumer).await.unwrap();
+    store.create_consumer(&owner).await.unwrap();
+    store
+        .create_consumer(&make_consumer("other", "bob"))
+        .await
+        .unwrap();
 
-    // Simulate an index row written before surrounding whitespace was
-    // canonicalized. A trimmed exact lookup misses this row, so admission must
-    // inspect the authoritative Consumer record instead of treating it as unique.
-    sqlx::query(
-        "UPDATE consumer_credential_index SET credential_hash = ? \
-         WHERE namespace = ? AND consumer_id = ? AND credential_type = ?",
-    )
-    .bind("legacy-case-sensitive-hash")
-    .bind("ferrum")
-    .bind("legacy")
-    .bind("mtls_auth")
-    .execute(&store.pool())
-    .await
-    .unwrap();
-
-    assert!(
-        !store
-            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
-            .await
-            .unwrap()
-    );
+    // Another consumer's identity is a conflict, with or without surrounding
+    // whitespace on either side; matching stays exact (no case folding).
+    for probe in [
+        "API.Example.COM",
+        "  API.Example.COM\t",
+        " API.Example.COM ",
+    ] {
+        assert!(
+            !store
+                .check_mtls_identity_unique("ferrum", probe, None)
+                .await
+                .unwrap(),
+            "{probe:?} must conflict with the owner's identity"
+        );
+        assert!(
+            !store
+                .check_mtls_identity_unique("ferrum", probe, Some("other"))
+                .await
+                .unwrap(),
+            "{probe:?} must conflict when a different consumer is excluded"
+        );
+        // A PUT that keeps its own identity excludes itself and is admitted.
+        assert!(
+            store
+                .check_mtls_identity_unique("ferrum", probe, Some("owner"))
+                .await
+                .unwrap(),
+            "{probe:?} must be admitted for the excluded owner"
+        );
+    }
     assert!(
         store
             .check_mtls_identity_unique("ferrum", "api.example.com", None)
@@ -1466,36 +1477,37 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
     );
     assert!(
         store
-            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("legacy"))
+            .check_mtls_identity_unique("other-namespace", "API.Example.COM", None)
             .await
             .unwrap()
     );
 
+    // The check reads only the index, never `consumers.credentials`: an
+    // undecodable stored body neither fails the lookup nor hides the owner.
     sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
         .bind("not-json")
         .bind("ferrum")
-        .bind("legacy")
+        .bind("owner")
         .execute(&store.pool())
         .await
         .unwrap();
-    let error = store
-        .check_mtls_identity_unique("ferrum", "other.example.com", None)
-        .await
-        .expect_err("malformed stored credentials must fail uniqueness closed");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to parse credentials JSON")
-    );
-    // Excluding the undecodable row itself must not fail — PUT overwrite
-    // repair with mTLS credentials needs to skip its own corrupt body
-    // (issue #2997).
     assert!(
         store
-            .check_mtls_identity_unique("ferrum", "other.example.com", Some("legacy"))
+            .check_mtls_identity_unique("ferrum", "other.example.com", None)
             .await
-            .expect("excluded undecodable consumer must not block self uniqueness"),
-        "excluded undecodable consumer is not a conflict"
+            .unwrap()
+    );
+    assert!(
+        !store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "API.Example.COM", Some("owner"))
+            .await
+            .unwrap()
     );
 }
 
@@ -2281,6 +2293,52 @@ async fn read_replica_tracks_primary_topology_across_failover_and_failback() {
         store.list_namespaces().await.unwrap(),
         vec!["ferrum".to_string(), "replica-ns".to_string()],
         "the configured read replica should become eligible again after primary failback"
+    );
+}
+
+#[tokio::test]
+async fn set_read_replica_url_defers_the_dial_to_the_reconnect_path() {
+    // Startup records the replica URL without dialing it, so an unreachable
+    // replica cannot delay the authoritative primary load, and then connects it
+    // in the background through the same `reconnect_read_replica` path the poll
+    // scheduler uses. Until then admin reads stay on primary.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_url = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("primary.db").to_string_lossy()
+    );
+    let replica_url = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("replica.db").to_string_lossy()
+    );
+    seed_sqlite_namespace(&primary_url, "primary-ns").await;
+    seed_sqlite_namespace(&replica_url, "replica-ns").await;
+
+    let mut store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    store.set_read_replica_url(&replica_url);
+    assert!(
+        !store.read_replica_available(),
+        "recording the replica URL must not dial it"
+    );
+    assert!(
+        !store.read_replica_suppressed(),
+        "a recorded replica on the primary topology must stay eligible for reconnect"
+    );
+    let before = store.list_namespaces().await.unwrap();
+    assert!(
+        before.contains(&"primary-ns".to_string()) && !before.contains(&"replica-ns".to_string()),
+        "admin reads must use primary until the replica connects: {before:?}"
+    );
+
+    store.reconnect_read_replica(&replica_url).await.unwrap();
+    assert!(store.read_replica_available());
+    let after = store.list_namespaces().await.unwrap();
+    assert!(
+        after.contains(&"replica-ns".to_string()) && !after.contains(&"primary-ns".to_string()),
+        "admin reads must use the replica once its pool is published: {after:?}"
     );
 }
 
@@ -4160,4 +4218,117 @@ async fn row_decode_diagnostics_withhold_ids_in_outer_and_inner_reasons() {
         assert!(rendered.contains(column), "{table}: {rendered}");
         assert!(!rendered.contains(token), "{table}: {rendered}");
     }
+}
+
+/// Overwrite the stored core V001 checksum in a migrated SQLite file and
+/// return the previous value, so the next migration run on that file fails
+/// closed with `checksum_mismatch` until the original is written back.
+async fn set_sqlite_core_migration_checksum(db_url: &str, checksum: &str) -> String {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(db_url)
+        .await
+        .unwrap();
+    let previous: String =
+        sqlx::query_scalar("SELECT checksum FROM _ferrum_migrations WHERE version = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind(checksum)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    previous
+}
+
+/// Issue #7033: deferred (offline-bootstrap) migrations used to run after the
+/// primary pool was swapped in, so a migration failure returned `Err` with the
+/// primary pool live while topology still reported failover. Migrations now
+/// run against the staged pool first: a failure must leave the failover pool
+/// and topology fully intact, and a later successful failback must apply the
+/// deferred migrations and mark primary.
+#[tokio::test]
+async fn failback_deferred_migration_failure_keeps_failover_pool_and_topology() {
+    use ferrum_edge::_test_support::database_store_set_migrations_pending_for_test;
+    use ferrum_edge::config::db_backend::primary_failback_fenced;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.set_failover_allow_writes(true);
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let original_checksum =
+        set_sqlite_core_migration_checksum(&primary_create_url, "tampered-7033").await;
+    database_store_set_migrations_pending_for_test(&store, true);
+
+    let before = store.failover_topology_status();
+    assert!(!before.primary_active, "startup must land on failover");
+    assert!(before.allow_writes);
+    assert!(!before.primary_failback_fenced);
+
+    let error = store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect_err("failback must fail when the deferred migrations fail");
+    assert!(
+        format!("{error:#}").contains("checksum_mismatch"),
+        "failback must surface the migration failure: {error:#}"
+    );
+    assert!(
+        !primary_failback_fenced(&error),
+        "a migration failure is not the failback fence: {error:#}"
+    );
+
+    let after = store.failover_topology_status();
+    assert!(
+        !after.primary_active,
+        "a failed failback must leave topology on failover"
+    );
+    assert_eq!(after.active_url_redacted, before.active_url_redacted);
+    assert_eq!(after.failover_since_unix_ms, before.failover_since_unix_ms);
+    assert!(!after.primary_failback_fenced);
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(
+        namespaces.contains(&"failover-ns".to_string())
+            && !namespaces.contains(&"primary-ns".to_string()),
+        "the failover pool must stay the active pool after a failed failback: {namespaces:?}"
+    );
+
+    // Once the primary's migration history is repaired, failback succeeds,
+    // applies the still-pending deferred migrations and marks primary.
+    set_sqlite_core_migration_checksum(&primary_create_url, &original_checksum).await;
+    store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect("failback must succeed once the deferred migrations succeed");
+    let status = store.failover_topology_status();
+    assert!(status.primary_active);
+    assert!(status.failover_since_unix_ms.is_none());
+    assert!(!status.primary_failback_fenced);
+    let namespaces = store.list_namespaces().await.unwrap();
+    assert!(
+        namespaces.contains(&"primary-ns".to_string())
+            && !namespaces.contains(&"failover-ns".to_string()),
+        "the primary pool must be active after the successful failback: {namespaces:?}"
+    );
+    assert!(
+        !store.maybe_apply_deferred_migrations().await.unwrap(),
+        "the successful failback must have consumed the deferred migrations"
+    );
 }

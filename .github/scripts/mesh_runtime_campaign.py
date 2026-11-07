@@ -19,6 +19,8 @@ from pathlib import Path
 ARMS = ("direct", "ferrum", "envoy", "consul", "consulhttp", "linkerd")
 SIZES = (1024, 10240, 71680, 512000, 1048576, 5242880)
 
+_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
 
 def workload_limits(duration):
     """Explicit harness limits shared by every arm; no timeout A/B drift."""
@@ -54,7 +56,7 @@ def build(args):
         raise ValueError("unsupported profile")
     if features not in ("cloud-secrets", "cloud-secrets,bench-h1-profile"):
         raise ValueError("unsupported features")
-    if baseline and not re.fullmatch(r"[0-9a-f]{40}", baseline):
+    if baseline and not _COMMIT_SHA_RE.fullmatch(baseline):
         raise ValueError("baseline must be an exact lowercase 40-hex commit SHA")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     provenance = {"candidate_sha": revision, "baseline_sha": baseline or None,

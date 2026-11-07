@@ -440,13 +440,47 @@ MERGE_GROUP_CONCURRENCY_MARKERS = (
     "merge_group.head_sha",
 )
 
+_TEST_JOB_RE = re.compile(r"(?ms)^  test:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)")
+_JOB_NEEDS_LIST_RE = re.compile(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)")
+_JOB_NEEDS_FLOW_RE = re.compile(
+    r"(?m)^    needs: \["
+    r"(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)"
+    r"\]$"
+)
+_JOB_NEEDS_SCALAR_RE = re.compile(r"(?m)^    needs: ([A-Za-z0-9_-]+)$")
+_TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+:")
+_EVENT_KEY_RE = re.compile(r"^  [A-Za-z0-9_-]+:")
+_PATHS_FILTER_RE = re.compile(r"(?m)^    paths(?:-ignore)?:")
+_JOB_IF_ALWAYS_RE = re.compile(r"(?m)^    if: always\(\)$")
+_MERGE_GROUP_FILTER_RE = re.compile(r"(?m)^    (?:branches(?:-ignore)?|paths(?:-ignore)?):")
+_BINARY_MATRIX_SCRIPT_RE = re.compile(
+    r"python3 - <<'PY' >> \"\$GITHUB_OUTPUT\"\n(?P<script>.*?)^          PY\n",
+    re.M | re.S,
+)
+_PUSH_FILTER_RE = re.compile(r"(?m)^    (?:branches-ignore|paths|paths-ignore):")
+_PUSH_BRANCHES_RE = re.compile(r"(?m)^    branches:\n(?P<branches>(?:^      - [^\n]+\n?)+)")
+_WORKFLOW_NAME_RE = re.compile(r"(?m)^name: ([^\n]+)$")
+_REQUIRE_ASSERTION_RE = re.compile(r"--require\s+(\S+)")
+_RUNS_ON_UBUNTU_RE = re.compile(r"(?m)^    runs-on: ubuntu-26.04$")
+_CONTENTS_WRITE_RE = re.compile(r"(?m)^\s+contents:\s+write\s*$")
+_TRUSTED_ACTION_ARCHIVE_RE = re.compile(
+    r'(?m)^\s*git archive --format=tar --output="\$archive" '
+    r'"\$trusted_ref" -- "\$action_dir"\s*$'
+)
+_TRUSTED_ACTION_VERIFIER_RE = re.compile(
+    r'(?m)^\s*python3 -I "\$verifier" --action-path "\$action_dir" '
+    r'--trusted-archive "\$archive"\s*$'
+)
+_PROPOSED_CHART_CHECKER_RUN_RE = re.compile(r'(?m)^\s*python3 -I "\$proposed"\s*$')
+_CHART_CHECKER_RUN_RE = re.compile(r'(?m)^\s*python3 -I "\$checker"\s*$')
+
 def extract_test_needs(ci_yml: str) -> set[str]:
-    match = re.search(r"(?ms)^  test:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", ci_yml)
+    match = _TEST_JOB_RE.search(ci_yml)
     if not match:
         raise RuntimeError("could not find jobs.test in ci.yml")
 
     body = match.group("body")
-    needs_match = re.search(r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", body)
+    needs_match = _JOB_NEEDS_LIST_RE.search(body)
     if not needs_match:
         raise RuntimeError("could not find jobs.test.needs in ci.yml")
 
@@ -468,9 +502,7 @@ def extract_job_body(ci_yml: str, job: str) -> str:
 
 
 def extract_job_needs(job_body: str) -> set[str]:
-    list_match = re.search(
-        r"(?m)^    needs:\n(?P<needs>(?:^      - [^\n]+\n)+)", job_body
-    )
+    list_match = _JOB_NEEDS_LIST_RE.search(job_body)
     if list_match:
         return {
             line.strip().removeprefix("- ").strip()
@@ -478,16 +510,11 @@ def extract_job_needs(job_body: str) -> set[str]:
             if line.strip().startswith("- ")
         }
 
-    inline_match = re.search(
-        r"(?m)^    needs: \["
-        r"(?P<needs>[A-Za-z0-9_-]+(?:, [A-Za-z0-9_-]+)*)"
-        r"\]$",
-        job_body,
-    )
+    inline_match = _JOB_NEEDS_FLOW_RE.search(job_body)
     if inline_match:
         return set(inline_match.group("needs").split(", "))
 
-    scalar_match = re.search(r"(?m)^    needs: ([A-Za-z0-9_-]+)$", job_body)
+    scalar_match = _JOB_NEEDS_SCALAR_RE.search(job_body)
     if scalar_match:
         return {scalar_match.group(1)}
     return set()
@@ -512,7 +539,7 @@ def workflow_event_body(workflow_yml: str, event: str) -> str | None:
         (
             index
             for index in range(on_start + 1, len(lines))
-            if re.match(r"^[A-Za-z0-9_-]+:", lines[index])
+            if _TOP_LEVEL_KEY_RE.match(lines[index])
         ),
         len(lines),
     )
@@ -530,7 +557,7 @@ def workflow_event_body(workflow_yml: str, event: str) -> str | None:
         (
             index
             for index in range(event_start + 1, on_end)
-            if re.match(r"^  [A-Za-z0-9_-]+:", lines[index])
+            if _EVENT_KEY_RE.match(lines[index])
         ),
         on_end,
     )
@@ -544,7 +571,7 @@ def pull_request_trigger_is_unconditional(workflow_yml: str) -> bool:
         body = workflow_event_body(workflow_yml, "pull_request_target")
         if body is None:
             return False
-    return not re.search(r"(?m)^    paths(?:-ignore)?:", body)
+    return not _PATHS_FILTER_RE.search(body)
 
 
 def optional_live_suite_trigger_errors(
@@ -627,7 +654,7 @@ def check_optional_live_suite_aggregate(
             f"{workflow_path} jobs.{job} must keep the always-reporting "
             f"aggregate `{expected_name}`"
         )
-    if not re.search(r"(?m)^    if: always\(\)$", body):
+    if not _JOB_IF_ALWAYS_RE.search(body):
         errors.append(
             f"{workflow_path} jobs.{job} aggregate must run with if: always()"
         )
@@ -698,7 +725,7 @@ def merge_group_trigger_is_present(workflow_yml: str) -> bool:
     body = workflow_event_body(workflow_yml, "merge_group")
     if body is None:
         return False
-    if re.search(r"(?m)^    (?:branches(?:-ignore)?|paths(?:-ignore)?):", body):
+    if _MERGE_GROUP_FILTER_RE.search(body):
         return False
     return True
 
@@ -715,11 +742,7 @@ def extract_binary_matrix_script(ci_yml: str) -> str:
     """Return the ci-plan Python that selects the native binary matrix."""
 
     body = extract_job_body(ci_yml, "ci-plan")
-    match = re.search(
-        r"python3 - <<'PY' >> \"\$GITHUB_OUTPUT\"\n(?P<script>.*?)^          PY\n",
-        body,
-        flags=re.M | re.S,
-    )
+    match = _BINARY_MATRIX_SCRIPT_RE.search(body)
     if not match:
         raise RuntimeError("could not find jobs.ci-plan binary-matrix script")
     return textwrap.dedent(match.group("script"))
@@ -1508,12 +1531,9 @@ def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
     body = workflow_event_body(workflow_yml, "push")
     if body is None:
         return False
-    if re.search(r"(?m)^    (?:branches-ignore|paths|paths-ignore):", body):
+    if _PUSH_FILTER_RE.search(body):
         return False
-    branches = re.search(
-        r"(?m)^    branches:\n(?P<branches>(?:^      - [^\n]+\n?)+)",
-        body,
-    )
+    branches = _PUSH_BRANCHES_RE.search(body)
     if not branches:
         return False
     configured = {
@@ -1525,7 +1545,7 @@ def main_push_trigger_is_unconditional(workflow_yml: str) -> bool:
 
 
 def workflow_has_exact_name(workflow_yml: str, expected: str) -> bool:
-    names = re.findall(r"(?m)^name: ([^\n]+)$", workflow_yml)
+    names = _WORKFLOW_NAME_RE.findall(workflow_yml)
     if len(names) != 1:
         return False
     actual = names[0].strip()
@@ -1537,7 +1557,7 @@ def workflow_has_exact_name(workflow_yml: str, expected: str) -> bool:
 def extract_required_assertion_ids(gate_body: str) -> set[str]:
     """Return the `--require <id>` arguments the artifact gate passes."""
 
-    return set(re.findall(r"--require\s+(\S+)", gate_body))
+    return set(_REQUIRE_ASSERTION_RE.findall(gate_body))
 
 
 def validate_artifact_gate_wiring() -> list[str]:
@@ -1726,9 +1746,9 @@ def main() -> int:
             planner_errors.append(
                 f"{workflow_path} jobs.{job} must keep required check name `{expected_name}`"
             )
-        if not re.search(r"(?m)^    if: always\(\)$", body):
+        if not _JOB_IF_ALWAYS_RE.search(body):
             planner_errors.append(f"{workflow_path} jobs.{job} must run with if: always()")
-        if not re.search(r"(?m)^    runs-on: ubuntu-26.04$", body):
+        if not _RUNS_ON_UBUNTU_RE.search(body):
             planner_errors.append(
                 f"{workflow_path} jobs.{job} must use the dedicated required-check runner"
             )
@@ -1797,7 +1817,7 @@ def main() -> int:
                 planner_errors.append(
                     f"{workflow_path} must keep persist-credentials disabled"
                 )
-            if re.search(r"(?m)^\s+contents:\s+write\s*$", workflow_yml):
+            if _CONTENTS_WRITE_RE.search(workflow_yml):
                 planner_errors.append(
                     f"{workflow_path} must not grant contents: write"
                 )
@@ -2141,20 +2161,12 @@ def main() -> int:
         planner_errors.append(
             "jobs.helm-chart must self-test the trusted local action verifier"
         )
-    if not re.search(
-        r'(?m)^\s*git archive --format=tar --output="\$archive" '
-        r'"\$trusted_ref" -- "\$action_dir"\s*$',
-        chart_runtime_lint_body,
-    ):
+    if not _TRUSTED_ACTION_ARCHIVE_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must materialize the trusted setup-kubernetes-tools "
             "tree with git archive rather than trusting the checkout"
         )
-    if not re.search(
-        r'(?m)^\s*python3 -I "\$verifier" --action-path "\$action_dir" '
-        r'--trusted-archive "\$archive"\s*$',
-        chart_runtime_lint_body,
-    ):
+    if not _TRUSTED_ACTION_VERIFIER_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must compare the local setup-kubernetes-tools tree "
             "against the trusted archive before the action executes"
@@ -2206,7 +2218,7 @@ def main() -> int:
         planner_errors.append(
             "jobs.helm-chart must self-test the proposed chart runtime checker"
         )
-    if not re.search(r'(?m)^\s*python3 -I "\$proposed"\s*$', chart_runtime_lint_body):
+    if not _PROPOSED_CHART_CHECKER_RUN_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must execute the proposed chart runtime checker "
             "against the checkout during non-authoritative validation"
@@ -2216,7 +2228,7 @@ def main() -> int:
             "jobs.helm-chart must run the chart runtime lint self-test "
             "via isolated python3 -I"
         )
-    if not re.search(r'(?m)^\s*python3 -I "\$checker"\s*$', chart_runtime_lint_body):
+    if not _CHART_CHECKER_RUN_RE.search(chart_runtime_lint_body):
         planner_errors.append(
             "jobs.helm-chart must run the chart runtime lint against the "
             "checkout"

@@ -9,14 +9,31 @@ import urllib.request
 from pathlib import Path
 
 
+_LOG_SINK_GAUGE_RE = re.compile(
+    r'ferrum_log_sink_(healthy|queued_records|queued_bytes|reserved_bytes|'
+    r'shutdown_timeouts_total|shutdown_incomplete_records_total)'
+    r'\{sink="(stdout|stderr)"\} ([0-9]+)'
+)
+_LOG_SINK_IO_FAILURE_RE = re.compile(
+    r'ferrum_log_sink_io_failures_total\{sink="(stdout|stderr)",'
+    r'operation="(write|flush)"\} ([0-9]+)'
+)
+_LOG_SINK_DROPPED_RE = re.compile(
+    r'ferrum_log_sink_dropped_records_total\{sink="(stdout|stderr)",'
+    r'reason="(saturation|record_too_large|closed)"\} ([0-9]+)'
+)
+_RUNTIME_GAUGE_RE = re.compile(
+    r'(ferrum_connection_pool_entries|ferrum_overload_active_connections|'
+    r'ferrum_overload_active_requests)(\{[^}]*\})? ([0-9.eE+-]+)'
+)
+_POOL_LABEL_RE = re.compile(r'(?:\{|,)pool="(http2|grpc)"(?:,|\})')
+
+
 def parse_gauges(text):
     values = {}
     for line in text.splitlines():
-        health = re.fullmatch(r'ferrum_log_sink_(healthy|queued_records|queued_bytes|reserved_bytes|'
-                              r'shutdown_timeouts_total|shutdown_incomplete_records_total)'
-                              r'\{sink="(stdout|stderr)"\} ([0-9]+)', line)
-        io = re.fullmatch(r'ferrum_log_sink_io_failures_total\{sink="(stdout|stderr)",'
-                          r'operation="(write|flush)"\} ([0-9]+)', line)
+        health = _LOG_SINK_GAUGE_RE.fullmatch(line)
+        io = _LOG_SINK_IO_FAILURE_RE.fullmatch(line)
         if health or io:
             key = ("log_" + health[2] + "_" + health[1] if health
                    else "log_" + io[1] + "_io_" + io[2])
@@ -24,21 +41,19 @@ def parse_gauges(text):
                 raise ValueError("duplicate log health counter")
             values[key] = int(health[3] if health else io[3])
             continue
-        loss = re.fullmatch(r'ferrum_log_sink_dropped_records_total\{sink="(stdout|stderr)",'
-                            r'reason="(saturation|record_too_large|closed)"\} ([0-9]+)', line)
+        loss = _LOG_SINK_DROPPED_RE.fullmatch(line)
         if loss:
             key = "log_dropped_" + loss[1] + "_" + loss[2]
             if key in values:
                 raise ValueError("duplicate log loss counter")
             values[key] = int(loss[3])
             continue
-        match = re.fullmatch(r'(ferrum_connection_pool_entries|ferrum_overload_active_connections|'
-                             r'ferrum_overload_active_requests)(\{[^}]*\})? ([0-9.eE+-]+)', line)
+        match = _RUNTIME_GAUGE_RE.fullmatch(line)
         if not match:
             continue
         name, labels, value = match.groups()
         if name == "ferrum_connection_pool_entries":
-            pool = re.search(r'(?:\{|,)pool="(http2|grpc)"(?:,|\})', labels or "")
+            pool = _POOL_LABEL_RE.search(labels or "")
             if not pool:
                 continue
             key = "resident_" + pool[1] + "_pool_entries"
