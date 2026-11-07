@@ -499,11 +499,29 @@ spawners that do not go through `TestGateway` should call
 `pin_gateway_command_rust_log`.
 
 The same barrier is mandatory for suites that keep a bespoke spawner
-instead of `TestGatewayBuilder`. `functional_websocket_test.rs` reuses the
-exported `probe_gateway_identity` in `wait_for_owned_gateway`, because a
-bare TCP accept let an unrelated H2 fixture that had claimed the released
-proxy port answer the RFC 8441 Extended CONNECT handshake and reset it
-with `PROTOCOL_ERROR` (issue #3435).
+instead of `TestGatewayBuilder`. `functional_websocket_test.rs` binds its
+`wait_for_owned_gateway` to the child through the shared
+`wait_for_child_gateway_readiness`, because a bare TCP accept let an
+unrelated H2 fixture that had claimed the released proxy port answer the
+RFC 8441 Extended CONNECT handshake and reset it with `PROTOCOL_ERROR`
+(issue #3435).
+
+Bespoke spawners that do not mint a `SpawnedGatewayIdentity` take the
+explicit health-only alternative through two shared helpers in
+`tests/common/gateway_harness.rs`, and keep their timeout and second stage
+visible at the call site:
+
+- `wait_for_child_gateway_readiness(child, admin_port, token, timeout)` is
+  the wait `TestGateway` uses when admin-auth verification is off:
+  authenticated `/health` `ready: true`, with `Child::try_wait` before every
+  probe and after success. It is readiness, not JWT ownership.
+- `wait_for_child_tcp_accept(child, port, deadline)` is an optional second
+  stage: a TCP accept on a listener port, with `Child::try_wait` before every
+  connect, spending what is left of the same deadline.
+
+Suites whose listeners treat any accepted socket as real traffic
+(passthrough, scripted UDP) and `functional_overload_test.rs` use only the
+first stage. `functional_grpc_test.rs` keeps its own h2c probe.
 
 ## Spawned Gateway Teardown
 

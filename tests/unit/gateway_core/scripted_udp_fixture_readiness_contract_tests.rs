@@ -25,8 +25,12 @@ fn scripted_udp_fixture_binds_readiness_to_spawned_child_identity() {
     let compact = squeezed(region);
 
     assert!(
-        region.contains("crate::common::probe_gateway_identity"),
-        "readiness must use the shared probe_gateway_identity contract"
+        compact.contains("crate::common::wait_for_child_gateway_readiness(child,"),
+        "readiness must use the shared child-bound wait_for_child_gateway_readiness barrier"
+    );
+    assert!(
+        compact.contains("wait_for_owned_gateway(&mutchild,admin_port,&observability_token)"),
+        "the barrier must be bound to the child spawned by this attempt"
     );
     assert!(
         compact.contains("env(\"FERRUM_METRICS_BEARER_TOKEN\",observability_token)"),
@@ -53,22 +57,12 @@ fn scripted_udp_fixture_binds_readiness_to_spawned_child_identity() {
         "each spawn attempt must mint a unique observability identity"
     );
     assert!(
-        region.contains("child.try_wait()?"),
-        "the assigned child must be inspected around probes"
-    );
-    assert!(
-        region.contains("exited during startup")
-            && region.contains("exited after proving ownership"),
-        "an exited assigned child must void the attempt before and after a probe"
-    );
-    assert!(
         region.contains("ready: true"),
         "the barrier must require authenticated health detail with ready:true"
     );
-    assert!(
-        region.contains("PROBE_SLICE") && compact.contains("remaining.min(PROBE_SLICE)"),
-        "identity probes must be sliced so try_wait runs between them"
-    );
+    // `Child::try_wait` before and after every probe now lives in the shared
+    // helper; the `child_readiness_*` tests in `tests/common/gateway_harness.rs`
+    // pin it.
     assert!(
         compact.contains("std::process::Stdio::null()")
             && !compact.contains("std::process::Stdio::piped()"),
