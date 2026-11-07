@@ -786,12 +786,26 @@ async fn stock_nack_breaker_trip_flushes_the_staged_slice_before_closing() {
     );
 
     // Exactly the five invalid pushes were NACKed, each re-asserting eds-v1.
-    let nacks: Vec<DiscoveryRequest> = harness
-        .recorder
-        .for_type(EDS_TYPE_URL)
-        .into_iter()
-        .filter(|request| request.error_detail.is_some())
-        .collect();
+    // The client only enqueued the fifth NACK before the flush installed the
+    // slice; the scripted server records it on its own task, so wait for it.
+    let nack_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let nacks = loop {
+        let nacks: Vec<DiscoveryRequest> = harness
+            .recorder
+            .for_type(EDS_TYPE_URL)
+            .into_iter()
+            .filter(|request| request.error_detail.is_some())
+            .collect();
+        if nacks.len() >= 5 {
+            break nacks;
+        }
+        assert!(
+            tokio::time::Instant::now() < nack_deadline,
+            "timed out waiting for five recorded EDS NACKs, saw {}",
+            nacks.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     let nack_nonces: Vec<&str> = nacks
         .iter()
         .map(|request| request.response_nonce.as_str())

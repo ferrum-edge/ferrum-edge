@@ -51,8 +51,9 @@ pub enum PendingGenerationEvent<T> {
     /// retained and the debounce stays armed at its existing deadline.
     ResponseNacked,
     /// Commit what is staged: the debounce fired, the remote ended the stream
-    /// cleanly, or (`xds` only) the stream is failing and flushes what it
-    /// already ACKed.
+    /// cleanly, or the stream is failing and flushes what it already ACKed
+    /// (both clients; `stock_xds` only while its credential fence admits the
+    /// commit).
     Commit,
 }
 
