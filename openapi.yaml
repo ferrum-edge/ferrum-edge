@@ -37413,8 +37413,9 @@ components:
             or not — and the final request-body hook makes the authoritative
             enrollment decision. An enrolled instance joins the backend-path
             boundary itself, so that decision uses the backend-effective path
-            the proxy binds and does not require grpc_method_router (whose
-            grpc_full_method, when present, still takes precedence). A call enrolled only by its backend-effective method is staged at that boundary, so a deferred before_proxy short circuit after it still leaves a record. A client-streaming or bidirectional-streaming
+            the proxy binds (its trailing /Service/Method) and does not
+            require grpc_method_router; the bound path is never outranked by
+            the plugin-writable grpc_full_method metadata. A call enrolled only by its backend-effective method is staged at that boundary, so a deferred before_proxy short circuit after it still leaves a record. A client-streaming or bidirectional-streaming
             method on such a proxy therefore gets fully buffered request
             semantics; max_messages caps how much is captured, not how much is
             buffered.
