@@ -5175,6 +5175,54 @@ async fn custom_credential_request_trailers_are_stripped_before_native_dispatch(
     }
 }
 
+/// A route's owned claim destinations (`claim_headers` on an auth plugin) are
+/// gateway assertions: a client may not restate one in a gRPC-Web request
+/// trailer, in any case or `_` spelling, while unrelated metadata survives.
+#[tokio::test]
+async fn owned_claim_destination_request_trailers_are_stripped_before_native_dispatch() {
+    let message = request_frame(0x00, b"hello");
+    let block =
+        "X-User-Email: ceo@corp.example\r\nx_user_email: ceo@corp.example\r\nx-app-id: keep\r\n";
+    let mut binary = message.clone();
+    binary.extend_from_slice(&request_frame(0x80, block.as_bytes()));
+    for (content_type, wire) in [
+        ("application/grpc-web+proto", binary.clone()),
+        (
+            "application/grpc-web-text+proto",
+            grpc_web_text_body(&binary),
+        ),
+    ] {
+        let plugin = create_plugin_default();
+        let mut ctx = create_grpc_web_context(content_type);
+        ferrum_edge::_test_support::set_request_trailer_strip_headers_for_test(
+            &mut ctx,
+            vec!["x-user-email".to_string()],
+        );
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let transformed = plugin
+            .transform_request_body_with_context(&mut ctx, &wire, None, &headers)
+            .await
+            .expect("trailer frame is removed");
+        assert_eq!(
+            transformed, message,
+            "{content_type}: preserve message bytes"
+        );
+        assert_eq!(
+            ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
+            Some(vec![("x-app-id".to_string(), "keep".to_string())]),
+            "{content_type}: a claim destination must not reach native trailers"
+        );
+    }
+}
+
 /// grpc_web-SOL-2: a request trailer block that admission accepted at the
 /// 8 KiB boundary, written without the optional space after each colon, must
 /// reach dispatch intact rather than be dropped by a stricter re-measure.

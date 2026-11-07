@@ -2876,6 +2876,10 @@ pub struct RequestContext {
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
+    /// Names every late request-trailer boundary strips for this route: the
+    /// credential locations above plus every owned gateway-assertion header
+    /// (`claim_headers` destinations), precomputed by the plugin cache.
+    request_trailer_strip_headers: Option<Arc<Vec<String>>>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -3874,6 +3878,11 @@ pub(crate) struct PluginRequestState {
     /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
     /// configured.
     pub(crate) sanitized_claim_header_destinations: HashSet<String>,
+    /// Set when a `spiffe_identity` `forward_identity` instance's own
+    /// `before_proxy` installed `x-ferrum-peer-spiffe-id` for this request.
+    /// A trigger-skipped sibling keeps that header only on this provenance
+    /// marker, never because a value equals the admitted peer identity.
+    pub(crate) peer_spiffe_identity_forwarded: bool,
     /// Digests of credential-bearing query parameters that were present before
     /// authentication and request transformation. Kept outside public metadata
     /// so neither reusable credentials nor correlatable digests enter logs.
@@ -4717,6 +4726,7 @@ impl RequestContext {
             cors_state: cors::CorsRequestState::default(),
             plugin_state: None,
             request_headers_to_redact: None,
+            request_trailer_strip_headers: None,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
@@ -6372,6 +6382,7 @@ impl RequestContext {
             // back from this compatibility context.
             cors_state: cors::CorsRequestState::default(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
+            request_trailer_strip_headers: self.request_trailer_strip_headers.clone(),
             // Per-plugin working state. The split into `PluginRequestState`
             // did not change any family's lifecycle here: most are CLONED, the
             // claim-header staging and the `response_caching` header delta stay
@@ -6662,13 +6673,45 @@ impl RequestContext {
             .unwrap_or(&[])
     }
 
-    /// Shared handle to the same configured credential header list, for the
-    /// late request-trailer boundaries that outlive this context (streaming
-    /// request-body adapters and HTTP/3 upload pumps). One reference-count
-    /// increment, and `None` when the route configures no credential header,
-    /// so an unauthenticated route carries nothing into its body adapter.
+    /// Install the route's request-trailer strip list (credential locations
+    /// plus owned gateway-assertion headers) from the plugin cache view.
+    pub(crate) fn set_request_trailer_strip_headers(&mut self, headers: Arc<Vec<String>>) {
+        if !headers.is_empty() {
+            self.request_trailer_strip_headers = Some(headers);
+        }
+    }
+
+    /// Shared handle to the route's request-trailer strip list, for the late
+    /// request-trailer boundaries that outlive this context (streaming
+    /// request-body adapters and HTTP/3 upload pumps): every configured
+    /// credential header location plus every header a plugin on the route
+    /// owns as a gateway assertion (`claim_headers` / `output_claim_headers`
+    /// destinations, whatever any trigger decides). One reference-count
+    /// increment, and `None` when the route configures neither, so an
+    /// unauthenticated route carries nothing into its body adapter. A context
+    /// that never received the strip list falls back to the credential list.
     pub(crate) fn request_trailer_credential_header_names(&self) -> Option<Arc<Vec<String>>> {
-        self.request_headers_to_redact.clone()
+        self.request_trailer_strip_headers
+            .clone()
+            .or_else(|| self.request_headers_to_redact.clone())
+    }
+
+    /// Whether a request trailer named `name` must be dropped at a late
+    /// request-trailer boundary on this route (gRPC-Web trailer staging).
+    /// Matched as a CGI-style backend reads names (ASCII case-insensitive,
+    /// `_` read as `-`), like
+    /// [`crate::proxy::headers::strip_configured_credential_request_trailers`].
+    pub(crate) fn request_trailer_must_be_stripped(&self, name: &str) -> bool {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        self.request_trailer_strip_headers
+            .as_ref()
+            .or(self.request_headers_to_redact.as_ref())
+            .is_some_and(|headers| {
+                headers
+                    .iter()
+                    .any(|header| field_names_equivalent_for_backends(name, header))
+            })
     }
 
     /// Retain one credential-query digest outside public metadata.
@@ -12092,6 +12135,17 @@ pub trait Plugin: Any + Send + Sync {
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
     ) {
+    }
+
+    /// Request header names this instance owns as gateway assertions on every
+    /// request, whatever its trigger decides (`claim_headers` and
+    /// `output_claim_headers` destinations). Collected once when the plugin
+    /// cache is built and folded into the route's request-trailer strip list,
+    /// so a client can never restate one of them in request trailers, which
+    /// are read after the initial header block was sanitized. The default owns
+    /// nothing.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Returns `true` when `before_proxy` can dispatch external work or

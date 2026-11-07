@@ -16264,3 +16264,171 @@ async fn trigger_skipped_spiffe_identity_still_strips_forwarded_identity_header(
         );
     }
 }
+
+/// Owned claim destinations join the route's request-trailer strip list,
+/// whatever any trigger decides: a trigger-excluded client cannot restate a
+/// gateway claim assertion (`claim_headers` or `output_claim_headers`) in
+/// request trailers, in any case or `_` spelling, on the H1/H2 upload seam or
+/// the H3 relays. Unrelated trailers survive, and claim destinations do not
+/// become credential names.
+#[tokio::test]
+async fn owned_claim_destinations_are_stripped_from_request_trailers() {
+    use ferrum_edge::_test_support::{
+        h1_h2_upload_source_forwarded_frames_for_route,
+        sanitized_backend_request_trailers_for_route,
+    };
+
+    let mut config = minimal_plugin_config("jwks_auth");
+    config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+    config["providers"][0]["output_claim_headers"] = json!([
+        {"claim": "sub", "header": "X-User-Sub"}
+    ]);
+    let mut auth = make_plugin_config_with_json(
+        "auth",
+        "jwks_auth",
+        config,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    auth.trigger = Some(post_only_trigger());
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", vec!["auth"])],
+        vec![auth],
+    ))
+    .unwrap();
+    let trailers = [
+        ("x-user-email", "ceo@corp.example"),
+        ("x_user_email", "ceo@corp.example"),
+        ("x-user-sub", "root"),
+        ("x-checksum", "keep"),
+    ];
+    let expected = vec![("x-checksum".to_string(), "keep".to_string())];
+    let mut views = vec![cache.grpc_web_request_view("ferrum", "p1")];
+    for protocol in [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+    ] {
+        views.push(cache.request_view("ferrum", "p1", protocol));
+    }
+    for view in views {
+        assert!(
+            !view
+                .request_headers_to_redact()
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("x-user-email")),
+            "a claim destination is not a credential location"
+        );
+        let names = view.request_trailer_strip_headers();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (data, forwarded) =
+            h1_h2_upload_source_forwarded_frames_for_route(b"payload", &trailers, &names).await;
+        assert_eq!(data.as_slice(), b"payload");
+        assert_eq!(forwarded, expected, "{names:?}");
+        assert_eq!(
+            sanitized_backend_request_trailers_for_route(&trailers, &names),
+            expected
+        );
+    }
+}
+
+/// A trigger-admitted instance installs a verified claim. A trigger-skipped
+/// sibling owning the same destination (through `claim_headers` or
+/// `output_claim_headers`) must not erase it, in either priority order, while
+/// a client copy is still removed.
+#[tokio::test]
+async fn trigger_skipped_sibling_never_erases_an_admitted_instance_verified_claim() {
+    use super::jwks_auth_support::{build_rsa_jwks_from_pem, create_rs256_token};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let admitted_config = json!({"providers": [{
+        "jwks": build_rsa_jwks_from_pem(public_key_pem),
+        "claim_headers": {"email": "X-User-Email"}
+    }]});
+    let claim_headers = json!({"claim_headers": {"email": "X-User-Email"}});
+    let output_claim_headers = json!({
+        "output_claim_headers": [{"claim": "email", "header": "X-User-Email"}]
+    });
+    let token = create_rs256_token(
+        &json!({"sub": "alice", "email": "verified@example.test"}),
+        private_key_pem,
+    );
+    let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&[]);
+    for ownership in [claim_headers, output_claim_headers] {
+        for (admitted_priority, skipped_priority) in [(1000, 1010), (1010, 1000)] {
+            let label = format!("{ownership} admitted={admitted_priority}");
+            let mut skipped_config = minimal_plugin_config("jwks_auth");
+            for (key, value) in ownership.as_object().unwrap() {
+                skipped_config["providers"][0][key] = value.clone();
+            }
+            let mut admitted = make_plugin_config_with_json(
+                "admitted",
+                "jwks_auth",
+                admitted_config.clone(),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            admitted.priority_override = Some(admitted_priority);
+            let mut skipped = make_plugin_config_with_json(
+                "skipped",
+                "jwks_auth",
+                skipped_config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            skipped.priority_override = Some(skipped_priority);
+            skipped.trigger = Some(post_only_trigger());
+            let cache = PluginCache::new(&make_config(
+                vec![make_proxy("p1", "/", vec!["admitted", "skipped"])],
+                vec![admitted, skipped],
+            ))
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+            let plugins = cache.get_plugins("ferrum", "p1");
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "GET".to_string(),
+                "/api/orders".to_string(),
+            );
+            ctx.headers
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+            for plugin in plugins.iter() {
+                plugin.on_request_received(&mut ctx).await;
+            }
+            let rejection = ferrum_edge::proxy::run_authentication_phase(
+                AuthMode::Multi,
+                plugins.as_slice(),
+                &mut ctx,
+                &consumer_index,
+            )
+            .await;
+            assert!(
+                rejection.is_none(),
+                "{label}: the admitted instance authenticates"
+            );
+
+            let mut headers = ctx.headers.clone();
+            headers.insert("X_User_Email".to_string(), "ceo@corp.example".to_string());
+            let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+                plugins.as_slice(),
+                &mut ctx,
+                &mut headers,
+            )
+            .await;
+            assert!(matches!(result, PluginResult::Continue), "{label}");
+            assert_eq!(
+                ctx.metadata
+                    .get("plugin_trigger.skipped.skipped")
+                    .map(String::as_str),
+                Some("true"),
+                "{label}: the sibling must be trigger-skipped"
+            );
+            assert_eq!(
+                headers.get("x-user-email").map(String::as_str),
+                Some("verified@example.test"),
+                "{label}: the verified claim must survive"
+            );
+            assert!(!headers.contains_key("X_User_Email"), "{label}");
+        }
+    }
+}

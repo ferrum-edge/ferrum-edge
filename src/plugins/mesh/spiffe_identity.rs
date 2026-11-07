@@ -711,6 +711,9 @@ impl Plugin for SpiffeIdentity {
                 FORWARDED_IDENTITY_HEADER.to_string(),
                 id.as_str().to_string(),
             );
+            // Provenance for a trigger-skipped sibling instance, which must
+            // not undo this installation (`sanitize_owned_request_headers`).
+            ctx.plugin_state_mut().peer_spiffe_identity_forwarded = true;
         }
         PluginResult::Continue
     }
@@ -718,10 +721,11 @@ impl Plugin for SpiffeIdentity {
     /// A trigger-skipped `forward_identity` instance forwards no identity, but
     /// still removes every client-supplied [`FORWARDED_IDENTITY_HEADER`] copy,
     /// so a trigger can never turn a client-chosen value into the gateway's
-    /// assertion. The one copy kept is the canonical name carrying exactly the
-    /// request's admitted peer SPIFFE ID: that is the value an admitted sibling
-    /// instance earlier in the chain installed, and the value this instance
-    /// would itself have installed.
+    /// assertion. The one copy kept is the canonical name, and only when an
+    /// admitted sibling instance's own `before_proxy` installed it for this
+    /// request (a typed provenance marker). A value that merely equals the
+    /// request's peer identity is no proof: the peer identity can be
+    /// pre-stamped by the accept path, and a client can send the same string.
     fn sanitize_owned_request_headers(
         &self,
         ctx: &mut RequestContext,
@@ -732,11 +736,12 @@ impl Plugin for SpiffeIdentity {
         if !self.forward_identity {
             return;
         }
-        let admitted = ctx.peer_spiffe_id.as_ref().map(|id| id.as_str());
-        headers.retain(|name, value| {
+        let installed = ctx
+            .plugin_state()
+            .is_some_and(|state| state.peer_spiffe_identity_forwarded);
+        headers.retain(|name, _| {
             let owned = field_names_equivalent_for_backends(name, FORWARDED_IDENTITY_HEADER);
-            let installed = name == FORWARDED_IDENTITY_HEADER && admitted == Some(value.as_str());
-            !owned || installed
+            !owned || (installed && name == FORWARDED_IDENTITY_HEADER)
         });
     }
 

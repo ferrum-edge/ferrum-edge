@@ -124,6 +124,16 @@ pub mod _test_support {
         ctx.set_request_headers_to_redact(std::sync::Arc::new(headers));
     }
 
+    /// Install a route's request-trailer strip list (credential locations plus
+    /// owned claim destinations) on a request context, as the H1/H2/H3
+    /// handlers do from `PluginCacheRequestView::request_trailer_strip_headers`.
+    pub fn set_request_trailer_strip_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_trailer_strip_headers(std::sync::Arc::new(headers));
+    }
+
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =

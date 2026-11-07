@@ -852,29 +852,45 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
 
 /// Remove request trailers that restate one of the route's configured
 /// credential header locations (a `key_auth` `header:<name>`, a custom
-/// `jwt_auth` / `jwks_auth` / `oauth2_introspection` token header, ...).
+/// `jwt_auth` / `jwks_auth` / `oauth2_introspection` token header, ...) or one
+/// of the route's owned gateway-assertion headers (a `jwks_auth` /
+/// `oauth2_introspection` / `oidc_relying_party` `claim_headers` or
+/// `output_claim_headers` destination).
 ///
 /// [`sanitize_backend_request_trailers`] knows only the fixed credential names
-/// (`authorization`, `cookie`, `x-api-key`). A custom credential location is
-/// per-route configuration, so every late request-trailer boundary applies
-/// this right after the static filter with the route's precomputed list
-/// (`RequestContext::request_headers_requiring_redaction`, built once with the
-/// plugin cache). Removal is unconditional: trailers are never a legitimate
-/// credential location, and `hide_credentials: false` governs only the
-/// initial header block the plugin authenticated.
+/// (`authorization`, `cookie`, `x-api-key`) and fixed gateway assertions. These
+/// names are per-route configuration, so every late request-trailer boundary
+/// applies this right after the static filter with the route's precomputed
+/// list (`RequestContext::request_trailer_credential_header_names`, built once
+/// with the plugin cache). Removal is unconditional, whatever any trigger
+/// decided: trailers are never a legitimate credential location or claim
+/// assertion, and `hide_credentials: false` governs only the initial header
+/// block the plugin authenticated.
 ///
-/// Allocation-free: one case-insensitive `HeaderMap::remove` per configured
-/// name, and nothing at all when the route configures none.
+/// Names match the way a CGI-style backend reads them (ASCII case-insensitive,
+/// `_` read as `-`, [`field_names_equivalent_for_backends`]), so a client
+/// `x_user_email` trailer cannot fold onto a gateway-owned `x-user-email`.
+/// Nothing allocates unless a trailer matches, and nothing runs at all when
+/// the trailer block or the route list is empty.
 #[inline]
 pub(crate) fn strip_configured_credential_request_trailers(
     trailers: &mut http::HeaderMap,
     credential_header_names: &[String],
 ) {
-    if trailers.is_empty() {
+    if trailers.is_empty() || credential_header_names.is_empty() {
         return;
     }
-    for name in credential_header_names {
-        trailers.remove(name.as_str());
+    let strip: Vec<http::HeaderName> = trailers
+        .keys()
+        .filter(|trailer| {
+            credential_header_names
+                .iter()
+                .any(|name| field_names_equivalent_for_backends(trailer.as_str(), name))
+        })
+        .cloned()
+        .collect();
+    for name in strip {
+        trailers.remove(name);
     }
 }
 

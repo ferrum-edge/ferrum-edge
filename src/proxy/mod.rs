@@ -36892,6 +36892,7 @@ async fn handle_proxy_request_inner(
     // From here a client abort is logged through this chain (issue #6768).
     client_abort_record.observe_plugins(&plugins);
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    ctx.set_request_trailer_strip_headers(plugin_cache_view.request_trailer_strip_headers());
     // Bind this request to the same cache generation's static response-side
     // presentation policy that the plugin list above will execute, so a plugin
     // persisting a finalized representation can prove which rules produced it.

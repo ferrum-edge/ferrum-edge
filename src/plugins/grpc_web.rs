@@ -4876,12 +4876,13 @@ impl Plugin for GrpcWebPlugin {
                     mut trailers,
                 } = frame;
                 // A route-configured credential header location (a `key_auth`
-                // `header:<name>`, a custom JWT header) is per-route, so the
-                // static trailer predicate cannot know it. Drop it here, the
-                // same late-boundary rule every native trailer relay applies
+                // `header:<name>`, a custom JWT header) or an owned claim
+                // destination (`claim_headers`) is per-route, so the static
+                // trailer predicate cannot know it. Drop it here, the same
+                // late-boundary rule every native trailer relay applies
                 // (`strip_configured_credential_request_trailers`).
                 let received_entries = trailers.len();
-                trailers.retain(|(name, _)| !ctx.request_header_requires_redaction(name));
+                trailers.retain(|(name, _)| !ctx.request_trailer_must_be_stripped(name));
                 let carried_only_credentials = received_entries > 0 && trailers.is_empty();
                 // The trailer frame is about to leave the body for good, so the
                 // validated block goes into request-private TYPED state that

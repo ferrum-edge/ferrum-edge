@@ -942,6 +942,10 @@ namespace and `x-geo-country`, matched with the same ASCII-case-insensitive,
 configure — a `key_auth` `header:<name>`, a custom `jwt_auth` / `jwks_auth` /
 `oauth2_introspection` token header — removed whether or not
 `hide_credentials` is set, because trailers are never a credential location);
+every `claim_headers` / `output_claim_headers` destination a `jwks_auth`,
+`oauth2_introspection`, or `oidc_relying_party` instance on the route owns,
+whatever that instance's execution trigger decides (route-configured names
+are matched ASCII-case-insensitively with `_` read as `-`);
 forwarding identity the gateway regenerates (`x-forwarded-*`, `forwarded`);
 initial-only gRPC call parameters (`grpc-*`); the gateway-owned `early-data`
 marker; the initial-section-only `via` intermediary chain; and header-section
@@ -1629,7 +1633,13 @@ because gating them could only add disclosure or forgery, never remove work:
   Without it a client that misses the trigger could forward a forged value the
   backend reads as a gateway assertion. Sanitization is claimed per
   destination per request, so a trigger-admitted sibling instance that shares
-  a destination keeps the value it installs, in either order.
+  a destination keeps the value it installs, in either order; a skipped
+  `spiffe_identity` keeps `x-ferrum-peer-spiffe-id` only when an admitted
+  sibling's own `before_proxy` installed it for this request, never because a
+  value equals the peer identity. The same claim destinations are also on the
+  route's request-trailer strip list (see
+  [Backend Request Trailers](#backend-request-trailers)), which no trigger
+  affects.
 
 `response_caching` has one configuration-specific restriction: its default
 `add_cache_status_header: true` publishes named response-trailer ownership, a

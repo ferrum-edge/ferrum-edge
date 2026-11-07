@@ -3347,6 +3347,12 @@ impl super::Plugin for OidcRelyingParty {
     ) {
         sanitize_claim_header_destinations(ctx, headers, &self.provider.claim_header_destinations);
     }
+    /// Every owned claim destination, for the route's request-trailer strip
+    /// list: a trailer can never restate a gateway claim assertion.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        let destinations = &self.provider.claim_header_destinations;
+        destinations.names().map(str::to_string).collect()
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

@@ -28,9 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a gateway assertion. A skipped instance now removes those client copies
   through a new ungated `Plugin::sanitize_owned_request_headers` hook (no-op by
   default) and installs nothing; a trigger-admitted sibling that installs a
-  verified value for the same header is unaffected. A route that relied on a
-  client value under one of those names reaching the backend on
-  trigger-excluded requests no longer receives it.
+  verified value for the same header is unaffected (a skipped
+  `spiffe_identity` keeps the header only when an admitted sibling installed
+  it, not because a client value equals the peer identity). Every claim
+  destination on a route is also removed from client request trailers on
+  every protocol path (HTTP/1.1, HTTP/2, HTTP/3, native gRPC, gRPC-Web),
+  whatever any trigger decides, and route-configured trailer names (claim
+  destinations and custom credential locations alike) now match `_` spellings
+  as well as ASCII case. A route that relied on a client value under one of
+  those names reaching the backend, in headers on trigger-excluded requests
+  or in trailers, no longer receives it.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,

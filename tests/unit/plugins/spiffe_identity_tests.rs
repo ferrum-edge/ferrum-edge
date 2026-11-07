@@ -1157,20 +1157,19 @@ async fn test_default_config_forwards_nothing() {
     assert!(!headers.contains_key(FORWARDED));
 }
 
-/// The trigger-skip sanitizer strips every client spelling and every value
-/// other than the request's admitted identity, keeps the canonical header an
-/// admitted sibling instance installed, and owns nothing without
-/// `forward_identity`.
-#[test]
-fn test_skip_sanitizer_strips_client_copies_but_keeps_the_admitted_identity() {
+/// The trigger-skip sanitizer strips every client spelling. It keeps the
+/// canonical header only when an admitted instance's own `before_proxy`
+/// installed it: a client copy that merely equals the request's peer identity
+/// (pre-stamped, for example) is still client input. Without
+/// `forward_identity` the instance owns nothing.
+#[tokio::test]
+async fn test_skip_sanitizer_keeps_only_an_identity_an_admitted_instance_installed() {
     let plugin = SpiffeIdentity::new(&json!({"forward_identity": true})).unwrap();
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
-    let forged = || {
+    ctx.peer_spiffe_id = Some(SpiffeId::new(LIFETIME_SVID).unwrap());
+    let client_copies = || {
         HashMap::from([
-            (
-                FORWARDED.to_string(),
-                "spiffe://attacker.example/ns/forged/sa/x".to_string(),
-            ),
+            (FORWARDED.to_string(), LIFETIME_SVID.to_string()),
             (
                 "X_Ferrum_Peer_Spiffe_Id".to_string(),
                 LIFETIME_SVID.to_string(),
@@ -1179,29 +1178,27 @@ fn test_skip_sanitizer_strips_client_copies_but_keeps_the_admitted_identity() {
         ])
     };
 
-    let mut headers = forged();
+    let mut headers = client_copies();
     plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
-    assert_eq!(headers.len(), 1, "no admitted identity: {headers:?}");
-    assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
+    let only_accept = HashMap::from([("accept".to_string(), "*/*".to_string())]);
+    assert_eq!(headers, only_accept, "equality is not provenance");
 
-    ctx.peer_spiffe_id = Some(SpiffeId::new(LIFETIME_SVID).unwrap());
-    let mut headers = forged();
-    plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
-    assert!(!headers.contains_key(FORWARDED), "a forged value is stripped");
-    assert!(!headers.contains_key("X_Ferrum_Peer_Spiffe_Id"));
-
-    let mut headers = HashMap::from([(FORWARDED.to_string(), LIFETIME_SVID.to_string())]);
+    let mut headers = client_copies();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
     plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
     assert_eq!(
         headers.get(FORWARDED).map(String::as_str),
-        Some(LIFETIME_SVID),
-        "an admitted sibling's installed identity is not undone"
+        Some(LIFETIME_SVID)
     );
+    assert_eq!(headers.len(), 2, "{headers:?}");
 
     let passive = SpiffeIdentity::new(&json!({})).unwrap();
-    let mut headers = forged();
+    let mut headers = client_copies();
     passive.sanitize_owned_request_headers(&mut ctx, &mut headers);
-    assert_eq!(headers, forged(), "without forward_identity nothing is owned");
+    assert_eq!(headers, client_copies());
 }
 
 #[test]

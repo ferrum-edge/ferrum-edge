@@ -1779,6 +1779,10 @@ impl Plugin for PluginInstanceWrapper {
     ) {
         self.inner.sanitize_owned_request_headers(ctx, headers);
     }
+    /// Static chain shape, never gated: the trailer strip list is per route.
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        self.inner.owned_request_assertion_header_names()
+    }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
         self.inner.defer_before_proxy_until_backend_path_resolved()
     }
@@ -5898,6 +5902,12 @@ pub struct PluginPhaseData {
     pub backend_path_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Credential-bearing request header names used by safe downstream views.
     pub request_headers_to_redact: Arc<Vec<String>>,
+    /// Route-configured names every late request-trailer boundary strips:
+    /// the credential locations above plus every request header a plugin on
+    /// the route owns as a gateway assertion
+    /// (`Plugin::owned_request_assertion_header_names`), whatever any trigger
+    /// decides.
+    pub request_trailer_strip_headers: Arc<Vec<String>>,
     /// Deterministic initial-response header policy plugins, already filtered
     /// and kept in configured priority order for protocol boundary paths.
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -5979,6 +5989,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut backend_admission = Vec::new();
     let mut backend_path = Vec::new();
     let mut request_headers_to_redact = Vec::new();
+    let mut owned_request_assertion_headers: Vec<String> = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
     let mut response_trailer_policy_names: Vec<String> = Vec::new();
@@ -6090,6 +6101,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
                 request_headers_to_redact.push(header.clone());
             }
         }
+        for header in p.owned_request_assertion_header_names() {
+            if !owned_request_assertion_headers
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&header))
+            {
+                owned_request_assertion_headers.push(header);
+            }
+        }
         if p.modifies_request_headers() {
             caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
         }
@@ -6152,6 +6171,15 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     if mesh_label_projection_deferrable {
         caps |= PluginCapabilities::MESH_LABEL_PROJECTION_DEFERRABLE;
     }
+    let mut request_trailer_strip_headers = request_headers_to_redact.clone();
+    for header in owned_request_assertion_headers {
+        if !request_trailer_strip_headers
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&header))
+        {
+            request_trailer_strip_headers.push(header);
+        }
+    }
     PluginPhaseData {
         enforced_request_body_limit,
         enforced_response_body_limit,
@@ -6161,6 +6189,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         backend_admission_plugins: Arc::new(backend_admission),
         backend_path_plugins: Arc::new(backend_path),
         request_headers_to_redact: Arc::new(request_headers_to_redact),
+        request_trailer_strip_headers: Arc::new(request_trailer_strip_headers),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
         response_trailer_policy_names: Arc::new(response_trailer_policy_names),
@@ -7370,6 +7399,7 @@ impl PluginCacheInner {
             backend_admission_plugins: Arc::clone(&entry.phase.backend_admission_plugins),
             backend_path_plugins,
             request_headers_to_redact: Arc::clone(&entry.phase.request_headers_to_redact),
+            request_trailer_strip_headers: Arc::clone(&entry.phase.request_trailer_strip_headers),
             initial_response_header_policy_plugins: Arc::clone(
                 &entry.phase.initial_response_header_policy_plugins,
             ),
@@ -7407,6 +7437,7 @@ impl PluginCacheInner {
             backend_admission_plugins: Arc::new(Vec::new()),
             backend_path_plugins: None,
             request_headers_to_redact: Arc::new(Vec::new()),
+            request_trailer_strip_headers: Arc::new(Vec::new()),
             initial_response_header_policy_plugins: Arc::new(Vec::new()),
             initial_response_header_policy_names: Arc::new(Vec::new()),
             response_trailer_policy_names: Arc::new(Vec::new()),
@@ -7458,6 +7489,7 @@ pub struct PluginCacheRequestView {
     backend_admission_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     backend_path_plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
     request_headers_to_redact: Arc<Vec<String>>,
+    request_trailer_strip_headers: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
     response_trailer_policy_names: Arc<Vec<String>>,
@@ -7556,6 +7588,12 @@ impl PluginCacheRequestView {
     /// Get credential-bearing request headers precomputed for safe downstream views.
     pub fn request_headers_to_redact(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.request_headers_to_redact)
+    }
+
+    /// Get the names every late request-trailer boundary strips on this route:
+    /// the credential locations plus every owned gateway-assertion header.
+    pub fn request_trailer_strip_headers(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.request_trailer_strip_headers)
     }
 
     /// Get the pre-filtered deterministic initial-response header policy chain.
