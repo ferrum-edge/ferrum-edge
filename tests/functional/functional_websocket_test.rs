@@ -1087,12 +1087,14 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// an h2 server without RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so it reset
 /// the Extended CONNECT that a real Ferrum listener accepts.
 ///
-/// The barrier is the same one `TestGateway` uses (issue #3428), applied to this
-/// file's bespoke spawner:
+/// The barrier is `TestGateway`'s health-only path (issue #3428), via the shared
+/// `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept` helpers.
+/// It is not the JWT ownership barrier (`wait_for_owned_gateway_identity`):
 ///
-/// 1. `Child::try_wait` is polled around every probe, so a child that died after
-///    a partial bind consumes its retry attempt immediately instead of polling
-///    whatever claimed the released port.
+/// 1. `Child::try_wait` is polled before every probe and after a successful
+///    one, in both stages, so a child that died after a partial bind consumes
+///    its retry attempt immediately instead of polling whatever claimed the
+///    released port.
 /// 2. The admin port must answer `/health` in the authenticated detail tier for
 ///    this attempt's `FERRUM_METRICS_BEARER_TOKEN` *and* report `ready: true`.
 ///    A foreign listener has a different token (or is not a gateway at all) and
@@ -1114,65 +1116,18 @@ async fn wait_for_owned_gateway(
     admin_port: u16,
     observability_token: &str,
     gateway_port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    const STARTUP_TIMEOUT_SECS: u64 = 60;
-    // Slice the ownership probe so `try_wait` is re-polled while it retries.
-    const PROBE_SLICE: Duration = Duration::from_secs(1);
-    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
-    let addr = format!("127.0.0.1:{}", gateway_port);
-
-    let mut last_observation = String::from("no response yet");
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(format!(
-                "Gateway exited during startup with {status} \
-                 (last observation: {last_observation})"
-            )
-            .into());
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(format!(
-                "Gateway did not prove ownership of admin port {admin_port} within \
-                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
-            )
-            .into());
-        }
-        match crate::common::probe_gateway_identity(
-            admin_port,
-            observability_token,
-            remaining.min(PROBE_SLICE),
-        )
-        .await
-        {
-            Ok(()) => break,
-            Err(err) => last_observation = err.to_string(),
-        }
-    }
-
-    // Identity is proven, so this child bound every listener. The proxy socket
-    // can still need a moment to surface in the kernel's accept queue on a
-    // loaded runner, and a connect that fails now means the child died between
-    // the two stages — which `try_wait` reports distinctly.
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(format!("Gateway exited after reporting ready with {status}").into());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "Gateway port {gateway_port} did not accept TCP connections within \
-                 {STARTUP_TIMEOUT_SECS} seconds"
-            )
-            .into());
-        }
-        match tokio::net::TcpStream::connect(&addr).await {
-            Ok(stream) => {
-                drop(stream);
-                return Ok(());
-            }
-            Err(_) => sleep(Duration::from_millis(25)).await,
-        }
-    }
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 60s, not 30s: the TLS/HTTP3 cold start documented above.
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + STARTUP_TIMEOUT;
+    crate::common::wait_for_child_gateway_readiness(
+        child,
+        admin_port,
+        observability_token,
+        STARTUP_TIMEOUT,
+    )
+    .await?;
+    crate::common::wait_for_child_tcp_accept(child, gateway_port, deadline).await
 }
 
 /// Start the gateway with retry logic to handle ephemeral port races.
@@ -2373,8 +2328,8 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
         .expect_err("readiness must not accept a foreign listener as the spawned gateway")
         .to_string();
     assert!(
-        err.contains("exited during startup") || err.contains("did not prove ownership"),
-        "readiness must fail on child death or on the unproven ownership probe, got: {err}"
+        err.contains("before proving ownership") || err.contains("did not prove readiness"),
+        "readiness must fail on child death or on the unproven identity probe, got: {err}"
     );
     println!("test_foreign_listener_on_proxy_port_is_not_gateway_readiness PASSED");
 }
