@@ -17,21 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
-- **The Vault secret backend reads `FERRUM_TLS_CA_BUNDLE_PATH` without
-  blocking startup.** The bundle was read with a blocking `std::fs::read`
-  (twice, once inside vaultrs) on the startup secret-resolution runtime, so a
-  FIFO or stalled mount hung `run` / `validate` past the fetch timeout. It now
-  uses the same detached, non-blocking, regular-file, 4 MiB-capped reader as
-  Azure Key Vault, client construction is bounded by the fetch timeout, and a
-  non-PEM or certificate-free bundle fails closed with a reference-free error.
-  Direct Vault lookups read a non-UTF-8 `FERRUM_TLS_CA_BUNDLE_PATH` like
-  Azure's instead of silently skipping it (startup still rejects non-UTF-8
-  `FERRUM_*` values), and construction no longer needs system CA roots when
-  the bundle supplies the trust anchor. **Upgrade:** the undocumented vaultrs
-  ambient defaults are no longer consulted: `VAULT_CACERT` / `VAULT_CAPATH`
-  (set `FERRUM_TLS_CA_BUNDLE_PATH` instead), `VAULT_CLIENT_CERT` /
-  `VAULT_CLIENT_KEY` (blocking reads; no Vault client identity is loaded), and
-  `VAULT_SKIP_VERIFY` (Vault TLS verification is always on).
 - **`tcp_logging` no-verify TLS advertises the crypto provider's signature
   schemes and warns.** Under `FERRUM_TLS_NO_VERIFY` the plugin used a private
   verifier with a hard-coded scheme list that did not follow the build's
@@ -113,6 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream closes on any response-handling error. It still discards the slice
   when the bearer credential that produced it has rotated, been invalidated, or
   passed its deadline.
+- **The Vault secret backend reads `FERRUM_TLS_CA_BUNDLE_PATH` without
+  blocking startup.** The bundle was read with a blocking `std::fs::read`
+  (twice, once inside vaultrs) on the startup secret-resolution runtime, so a
+  FIFO or stalled mount hung `run` / `validate` past the fetch timeout. It now
+  uses the same detached, non-blocking, regular-file, 4 MiB-capped reader as
+  Azure Key Vault, client construction is bounded by the fetch timeout, and a
+  non-PEM or certificate-free bundle fails closed with a reference-free error.
+  Direct Vault lookups read a non-UTF-8 `FERRUM_TLS_CA_BUNDLE_PATH` like
+  Azure's instead of silently skipping it (startup still rejects non-UTF-8
+  `FERRUM_*` values), and construction no longer needs system CA roots when
+  the bundle supplies the trust anchor. **Upgrade:** the undocumented vaultrs
+  ambient defaults are no longer consulted: `VAULT_CACERT` / `VAULT_CAPATH`
+  (set `FERRUM_TLS_CA_BUNDLE_PATH` instead), `VAULT_CLIENT_CERT` /
+  `VAULT_CLIENT_KEY` (blocking reads; no Vault client identity is loaded), and
+  `VAULT_SKIP_VERIFY` (Vault TLS verification is always on).
 - **A failed SQL failback no longer leaves the primary pool live behind
   failover topology** (#7033). On a store bootstrapped from
   `FERRUM_DB_CONFIG_BACKUP_PATH`, a primary failback published the primary pool
