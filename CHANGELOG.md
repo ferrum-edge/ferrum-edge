@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FERRUM_*` values), and construction no longer needs system CA roots when
   the bundle supplies the trust anchor. **Upgrade:** the vaultrs `VAULT_CACERT` / `VAULT_CAPATH` fallbacks
   are no longer consulted; set `FERRUM_TLS_CA_BUNDLE_PATH` instead.
+- **`tcp_logging` no-verify TLS advertises the crypto provider's signature
+  schemes and warns.** Under `FERRUM_TLS_NO_VERIFY` the plugin used a private
+  verifier with a hard-coded scheme list that did not follow the build's
+  provider (ED448, which neither ring nor AWS-LC verifies, and ECDSA P-521,
+  which ring does not) and logged nothing. It now uses the
+  shared `NoVerifier` and warns that verification is disabled, like
+  `ws_logging` and `ldap_auth`.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`

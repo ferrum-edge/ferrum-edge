@@ -1168,3 +1168,43 @@ fn approved_primitives_agree_with_their_published_test_vectors() {
         "87aa7cdea5ef619d4ff0b4241a1d6cb0"
     );
 }
+
+/// `tcp_logging` under `FERRUM_TLS_NO_VERIFY` advertises exactly the selected
+/// provider's verification schemes (AWS-LC FIPS on a `fips` build, ring
+/// otherwise), never a hard-coded list. Lives here so the hosted FIPS lane's
+/// `tls::fips_` filter runs it against the FIPS provider.
+#[test]
+fn fips_tcp_logging_no_verify_advertises_only_provider_schemes() {
+    let provider = fips::base_crypto_provider();
+    let _ = rustls::crypto::CryptoProvider::install_default(provider.clone());
+    let config = ferrum_edge::_test_support::crl_enforcing_outbound_client_config_for_test(
+        "tcp_logging",
+        true,
+        None,
+        &[],
+    )
+    .expect("no-verify TCP logging client config");
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut client = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+        .expect("client connection");
+    let mut client_hello = Vec::new();
+    client.write_tls(&mut client_hello).expect("ClientHello");
+    let mut acceptor = rustls::server::Acceptor::default();
+    acceptor
+        .read_tls(&mut client_hello.as_slice())
+        .expect("read ClientHello");
+    let accepted = acceptor
+        .accept()
+        .map_err(|_| "ClientHello must parse")
+        .unwrap()
+        .expect("complete ClientHello");
+
+    let mut advertised = accepted.client_hello().signature_schemes().to_vec();
+    let mut expected = provider
+        .signature_verification_algorithms
+        .supported_schemes();
+    advertised.sort_by_key(|scheme| format!("{scheme:?}"));
+    expected.sort_by_key(|scheme| format!("{scheme:?}"));
+    assert_eq!(advertised, expected);
+}
