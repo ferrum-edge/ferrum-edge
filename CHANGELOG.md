@@ -52,6 +52,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reacquired for recovery gets the incomplete phase inside its acquisition
   task, so cancelling during reacquisition no longer releases it. A nested
   mutation restores the prior uncertain state instead of settling it.
+- **The stock xDS client applies a staged ACKed slice when its NACK breaker
+  trips** (#7029). When five consecutive invalid responses of one type arrived
+  inside the 25 ms debounce window, the `stock_xds` client closed the stream
+  and dropped the already-ACKed slice it had staged, so the data plane kept
+  serving the previous slice while the control plane considered the newer one
+  delivered. Like the Ferrum `xds` client, it now applies that slice before the
+  stream closes on any response-handling error. It still discards the slice
+  when the bearer credential that produced it has rotated, been invalidated, or
+  passed its deadline.
 - **A failed SQL failback no longer leaves the primary pool live behind
   failover topology** (#7033). On a store bootstrapped from
   `FERRUM_DB_CONFIG_BACKUP_PATH`, a primary failback published the primary pool
