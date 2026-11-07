@@ -13685,6 +13685,74 @@ async fn ai_transcript_audit_grpc_frame_budgets_are_bounded_in_openapi() {
     }
 }
 
+/// `ai_response_guard` carries the same immutable `grpc.max_messages` maximum
+/// as `ai_transcript_audit` (zero-length frames consume no decoded-byte budget)
+/// and a `grpc.max_message_bytes` maximum equal to its `max_scan_bytes`
+/// ceiling. Schema `maximum` and the runtime ceilings must agree, and both must
+/// accept exactly the bound and refuse one above it.
+#[test]
+fn ai_response_guard_grpc_frame_budgets_are_bounded_in_openapi() {
+    use ferrum_edge::plugins::ai_response_guard::{
+        AiResponseGuard, HARD_MAX_GRPC_MAX_MESSAGE_BYTES, HARD_MAX_GRPC_MAX_MESSAGES,
+    };
+
+    // The frame-count cap is the same deployment bound the audit plugin
+    // enforces; keep the two in lockstep.
+    assert_eq!(
+        HARD_MAX_GRPC_MAX_MESSAGES,
+        ferrum_edge::plugins::ai_transcript_audit::HARD_MAX_GRPC_MAX_MESSAGES
+    );
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let grpc_properties = spec
+        .pointer("/components/schemas/AiResponseGuardConfig/properties/grpc/properties")
+        .expect("missing AiResponseGuardConfig grpc properties");
+    for (field, hard_max) in [
+        ("max_message_bytes", HARD_MAX_GRPC_MAX_MESSAGE_BYTES),
+        ("max_messages", HARD_MAX_GRPC_MAX_MESSAGES),
+    ] {
+        assert_eq!(
+            grpc_properties[field]["maximum"],
+            json!(hard_max),
+            "grpc.{field} schema maximum must match the runtime deployment ceiling"
+        );
+        assert_eq!(grpc_properties[field]["minimum"], json!(1));
+    }
+
+    let descriptor_path = format!(
+        "{}/tests/fixtures/test_validator.bin",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = |field: &str, value: usize| {
+        let mut config = json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": descriptor_path,
+                "methods": {
+                    "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+                }
+            }
+        });
+        config["grpc"][field] = json!(value);
+        config
+    };
+    for (field, hard_max) in [
+        ("max_message_bytes", HARD_MAX_GRPC_MAX_MESSAGE_BYTES),
+        ("max_messages", HARD_MAX_GRPC_MAX_MESSAGES),
+    ] {
+        for (value, expected_valid) in [(hard_max, true), (hard_max + 1, false)] {
+            let instance = config(field, value);
+            assert_component_validity(&spec, "AiResponseGuardConfig", &instance, expected_valid);
+            assert_eq!(
+                AiResponseGuard::new(&instance).is_ok(),
+                expected_valid,
+                "runtime/schema parity drift for grpc.{field} = {value}"
+            );
+        }
+    }
+}
+
 #[test]
 fn adaptive_concurrency_schema_rejects_unknown_config_keys() {
     let spec: serde_json::Value =

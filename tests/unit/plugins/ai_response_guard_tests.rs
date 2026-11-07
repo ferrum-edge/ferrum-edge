@@ -8196,8 +8196,10 @@ async fn grpc_bound_backend_path_decides_enrollment_without_method_router() {
     let plugin = grpc_guard("reject");
     let body = grpc_frame(&hello_response_bytes("ops@example.com"));
 
-    // `/api` was stripped: the backend serves the enrolled method.
-    let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    // `listen_path: /api` stripped and `backend_path: /test.Greeter`
+    // assembled: the client sends `/api/SayHello`, the backend serves the
+    // enrolled method.
+    let mut ctx = grpc_ctx("/api/SayHello");
     assert!(
         !plugin.should_buffer_response_body(&ctx),
         "precondition: the client path alone is not enrolled"
@@ -8228,9 +8230,66 @@ async fn grpc_bound_backend_path_decides_enrollment_without_method_router() {
             .await,
         PluginResult::Continue
     ));
+}
 
-    // A published `grpc_full_method` still wins over the bound path.
+/// Before the backend path is bound (a pre-dispatch synthetic reply), an empty
+/// `grpc_full_method` names no method and falls through to the request path,
+/// and a prefixed request path selects its trailing `/Service/Method`.
+#[tokio::test]
+async fn grpc_pre_bind_resolution_falls_through_empty_metadata_and_canonicalizes() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ctx.metadata
+        .insert("grpc_full_method".to_string(), String::new());
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
     let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+/// Plugin-writable `grpc_full_method` metadata never outranks the private bound
+/// backend path, in either direction, and the bound path selects on its
+/// canonical trailing `/Service/Method` (the `body_validator` #6845 rule).
+#[tokio::test]
+async fn grpc_bound_backend_path_outranks_plugin_writable_method_metadata() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+
+    // Metadata naming an unenrolled method cannot un-enroll the backend's
+    // enrolled method and stream its response past inspection.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/Other".to_string(),
+    );
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    // Nor can metadata enroll a method the backend is not serving.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
     ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
         &mut ctx,
         "/test.Greeter/Other",
@@ -8239,7 +8298,21 @@ async fn grpc_bound_backend_path_decides_enrollment_without_method_router() {
         "grpc_full_method".to_string(),
         "/test.Greeter/SayHello".to_string(),
     );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+
+    // An upstream base path in front of the method does not hide it.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/base/test.Greeter/SayHello",
+    );
     assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
 }
 
 // ─── ai_response_guard-SOL-3: empty synthetic successes ──────────────

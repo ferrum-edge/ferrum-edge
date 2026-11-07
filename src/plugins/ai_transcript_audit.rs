@@ -101,6 +101,7 @@ use super::request_representation;
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::byte_budget::{ByteBudget, ByteLease};
+use super::utils::grpc_method::{canonical_grpc_method, resolve_grpc_method_path};
 use super::utils::mcp_jsonrpc;
 use super::utils::metadata_redaction::{
     REDACTED_PLACEHOLDER, is_sensitive_header_name, metadata_value_is_redacted,
@@ -3112,15 +3113,16 @@ impl AiTranscriptAudit {
     /// The method view available to the CALLING hook, which is not always the
     /// backend-effective one.
     ///
-    /// Prefers the finalized `grpc_full_method` published by
-    /// `grpc_method_router` (which reflects a method rewrite), then the
-    /// backend-effective path the proxy bound at the backend-path boundary
+    /// The backend-effective path the proxy bound at the backend-path boundary
     /// (`RequestContext::authorized_backend_path`, bound for every request on a
     /// `grpc`-enrolled instance because it opts into
-    /// `requires_backend_path_resolution`), and only then the request path.
-    /// Without the bound path an audit-only proxy with `strip_listen_path` or a
+    /// `requires_backend_path_resolution`) is authoritative and is never
+    /// outranked by plugin-writable `grpc_full_method` metadata; before it is
+    /// bound, the metadata and then the request path stand in. Without the
+    /// bound path an audit-only proxy with `strip_listen_path` or a
     /// `backend_path` would decide enrollment on the client path, which the
-    /// backend never receives.
+    /// backend never receives. The key is the trailing `/Service/Method`, the
+    /// same resolution `body_validator` uses ([`resolve_grpc_method_path`]).
     ///
     /// `grpc_method_router` publishes this key twice: provisionally from the
     /// CLIENT path in `on_request_received`, then authoritatively from the
@@ -3140,9 +3142,21 @@ impl AiTranscriptAudit {
     /// normalization would make the metadata value unable to match any enrolled
     /// key while still suppressing the `ctx.path` fallback — every enrolled gRPC
     /// call would silently escape capture whenever `grpc_method_router` is also
-    /// configured. Empty metadata still falls back to the bound backend path,
-    /// then the request path.
+    /// configured. Empty metadata falls back to the request path.
+    ///
+    /// Intentional difference from `body_validator` / `ai_response_guard`:
+    /// only the BOUND path goes through the shared canonical resolution. The
+    /// pre-bind view stays exact (slash-normalized metadata, then the verbatim
+    /// request path) because a provisional enrollment here reaches REJECTING
+    /// request admission in `before_proxy` (sink health, staging capacity
+    /// under a fail-closed policy). Canonicalizing `/api/pkg.Service/Method`
+    /// before routing could refuse a call whose backend-effective method is
+    /// not enrolled at all; the final hook re-decides on the bound path, but a
+    /// `before_proxy` rejection never reaches it.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
+        if ctx.authorized_backend_path().is_some() {
+            return resolve_grpc_method_path(ctx);
+        }
         match ctx.metadata.get("grpc_full_method") {
             Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
             Some(method) if !method.is_empty() => {
@@ -3151,7 +3165,7 @@ impl AiTranscriptAudit {
                 path.push_str(method);
                 Cow::Owned(path)
             }
-            _ => Cow::Borrowed(ctx.authorized_backend_path().unwrap_or(ctx.path.as_str())),
+            _ => Cow::Borrowed(ctx.path.as_str()),
         }
     }
 
@@ -4993,8 +5007,8 @@ impl Plugin for AiTranscriptAudit {
     /// Enrolled native-gRPC instances subscribe to the backend-path boundary,
     /// so the proxy binds the backend-effective path (after route override,
     /// listen-path stripping, and upstream target path assembly) on the
-    /// request. That bound path is this instance's own enrollment witness when
-    /// no `grpc_full_method` was published, so an audit-only proxy does not
+    /// request. That bound path is this instance's authoritative enrollment
+    /// witness, never outranked by `grpc_full_method`, so an audit-only proxy does not
     /// depend on `grpc_method_router` to decide enrollment on the method the
     /// backend actually receives.
     fn requires_backend_path_resolution(&self) -> bool {
@@ -5041,7 +5055,7 @@ impl Plugin for AiTranscriptAudit {
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
             return PluginResult::Continue;
         }
-        if !grpc.enrolls(backend_path) {
+        if !grpc.enrolls(canonical_grpc_method(backend_path)) {
             return PluginResult::Continue;
         }
         let encoding = ctx

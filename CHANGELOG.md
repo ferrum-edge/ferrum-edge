@@ -61,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mtls_mode: unset` (and `unset` port overrides); an omitted native
   `mtls_mode` still means `permissive`. The `FerrumAccepted` status message for
   an `UNSET` policy now reports the inheritance.
+- **AI gRPC enrollment is decided on the bound backend path, and
+  `ai_response_guard` gRPC frame budgets are bounded.** `ai_response_guard`
+  and `ai_transcript_audit` let the plugin-writable `grpc_full_method`
+  metadata outrank the private bound backend path and compared the untrimmed
+  path, so another plugin's metadata could un-enroll the method the backend
+  serves and an upstream base path hid an enrolled method. Both now resolve
+  the canonical trailing `/Service/Method` exactly as `body_validator` does
+  (bound path, then pre-routing metadata, then the request path).
+  `ai_response_guard` `grpc.max_messages` is capped at 1024 and
+  `grpc.max_message_bytes` at 67108864 (the `max_scan_bytes` ceiling); a
+  larger configured value is rejected at admission.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,
