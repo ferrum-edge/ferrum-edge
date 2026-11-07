@@ -1603,6 +1603,36 @@ async fn cancelled_settled_guard_release_cannot_pin_reconnect() {
     assert_eq!(fence_gauge(), gauge_before);
 }
 
+/// The fence snapshot walks the store's whole fence registry under shard read
+/// locks, so `/health` / `/status` must build it only in the authenticated
+/// detail tier: unauthenticated (minimal) and namespace-bounded (tenant)
+/// probes return before any detail field is read and must never pay for it.
+#[test]
+fn health_builds_admission_fence_snapshot_only_in_the_detailed_tier() {
+    let call = "db.mtls_dns_admission_fence_status()";
+    assert_eq!(
+        ADMIN_SOURCE.matches(call).count(),
+        1,
+        "exactly one admin call site may snapshot mTLS DNS admission fences"
+    );
+    let at = ADMIN_SOURCE.find(call).expect("fence snapshot call site");
+    assert!(
+        ADMIN_SOURCE[..at].ends_with("if detailed {\n                let fence = "),
+        "the fence snapshot must be the first statement of an `if detailed` block"
+    );
+    let health = ADMIN_SOURCE
+        .find("if path == \"/health\" || path == \"/status\" {")
+        .expect("/health handler");
+    let minimal = health
+        + ADMIN_SOURCE[health..]
+            .find("let minimal = json!({")
+            .expect("minimal /health body");
+    assert!(
+        health < at && at < minimal,
+        "the fence snapshot must live in the /health handler, before the tiered returns"
+    );
+}
+
 /// Ordering seams that cannot be exercised without a live MongoDB: the exit
 /// probe runs before the generation pin is taken (never defers reconnect),
 /// the authoritative fence check runs under the pin, the probe reads only the
