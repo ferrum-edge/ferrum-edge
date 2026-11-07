@@ -15,6 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, which the H1/H2 handshake already stripped. Both frontends now use
   one shared predicate; H3 still replaces `Early-Data` itself and drops
   pseudo-headers.
+- **A failed SQL failback no longer leaves the primary pool live behind
+  failover topology** (#7033). On a store bootstrapped from
+  `FERRUM_DB_CONFIG_BACKUP_PATH`, a primary failback published the primary pool
+  before running the deferred migrations, and a migration failure returned with
+  that pool live while `/status` still named the failover URL. With
+  `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, Admin writes then landed on the
+  primary while being recorded as failover writes, fencing the next failback
+  onto a failover database that did not have them. Deferred migrations now run
+  on the newly connected pool before it is published, so after a failure the
+  previous pool and topology are still in place. `mark_primary` now requires
+  the permit that the failback-fence check returns; the permit is revalidated
+  right before the primary pool or connection is published, so an Admin write
+  admitted on failover in the meantime aborts the failback with nothing
+  published. The fence is never cleared by a failback. Status fields are still
+  read separately, so `/status` can briefly show a mixed view while a
+  transition is in progress, but that view no longer persists after an error.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
