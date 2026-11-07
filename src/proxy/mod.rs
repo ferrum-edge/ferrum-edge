@@ -10697,8 +10697,6 @@ impl ProxyState {
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         let reserved_gateway_ports = env_config.reserved_gateway_ports();
-        let local_proxy_frontends =
-            crate::plugins::utils::LocalProxyFrontends::from_env_config(&env_config);
         Self::new_with_bpf_metrics_and_reserved_gateway_ports(
             config,
             dns_cache,
@@ -10707,7 +10705,6 @@ impl ProxyState {
             health_check_shutdown_rx,
             None,
             reserved_gateway_ports,
-            local_proxy_frontends,
         )
     }
 
@@ -10717,9 +10714,6 @@ impl ProxyState {
     /// File mode uses this when adopting pre-bound listeners so initial
     /// validation, SIGHUP reloads, and programmatic `update_config` calls all
     /// use the same actual socket set instead of recalculating from `EnvConfig`.
-    /// `local_proxy_frontends` likewise describes the proxy listeners this
-    /// process actually owns (an adopted listener's real local address), which
-    /// plugins that dial the local gateway over loopback check against.
     pub fn new_with_reserved_gateway_ports(
         config: GatewayConfig,
         dns_cache: DnsCache,
@@ -10727,7 +10721,6 @@ impl ProxyState {
         tls_policy: Option<TlsPolicy>,
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         reserved_gateway_ports: HashSet<u16>,
-        local_proxy_frontends: crate::plugins::utils::LocalProxyFrontends,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         Self::new_with_bpf_metrics_and_reserved_gateway_ports(
             config,
@@ -10737,7 +10730,6 @@ impl ProxyState {
             health_check_shutdown_rx,
             None,
             reserved_gateway_ports,
-            local_proxy_frontends,
         )
     }
 
@@ -10759,8 +10751,6 @@ impl ProxyState {
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         let reserved_gateway_ports = env_config.reserved_gateway_ports();
-        let local_proxy_frontends =
-            crate::plugins::utils::LocalProxyFrontends::from_env_config(&env_config);
         Self::new_with_bpf_metrics_and_reserved_gateway_ports(
             config,
             dns_cache,
@@ -10769,11 +10759,9 @@ impl ProxyState {
             health_check_shutdown_rx,
             bpf_metrics_state,
             reserved_gateway_ports,
-            local_proxy_frontends,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn new_with_bpf_metrics_and_reserved_gateway_ports(
         mut config: GatewayConfig,
         dns_cache: DnsCache,
@@ -10782,7 +10770,6 @@ impl ProxyState {
         health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
         reserved_gateway_ports: HashSet<u16>,
-        local_proxy_frontends: crate::plugins::utils::LocalProxyFrontends,
     ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         // Seed from loader-stripped credentials and quarantine raw initial
         // snapshots too, before any ConsumerIndex or request epoch is built.
@@ -11071,7 +11058,7 @@ impl ProxyState {
         .with_max_response_body_size_bytes(env_config_arc.max_response_body_size_bytes)
         .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone())
         .with_live_crls(shared_crls.clone())
-        .with_local_proxy_frontends(local_proxy_frontends);
+        .for_serving_node();
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
         // route `__mesh_bpf_metrics` to use it via `with_state`.
@@ -77466,8 +77453,6 @@ mod tests {
         reserved_gateway_ports: HashSet<u16>,
     ) -> ProxyState {
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
-        let local_proxy_frontends =
-            crate::plugins::utils::LocalProxyFrontends::from_env_config(&env_config);
         ProxyState::new_with_reserved_gateway_ports(
             initial_config,
             dns_cache,
@@ -77475,7 +77460,6 @@ mod tests {
             None,
             None,
             reserved_gateway_ports,
-            local_proxy_frontends,
         )
         .expect("ProxyState construction should succeed in tests")
         .0

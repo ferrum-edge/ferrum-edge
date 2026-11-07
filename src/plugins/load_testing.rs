@@ -627,30 +627,22 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
         // Synthetic replays go straight from a dedicated client to the
         // `127.0.0.1` literal, which reqwest never hands to the policy-aware
         // DNS resolver and which never reaches the `execute*` literal-IP
-        // screen. Only a dial that provably reaches this node's own proxy
-        // listener for the selected scheme (enabled, and bound where
-        // `127.0.0.1` reaches it) is the plugin's documented self-dial; any
-        // other loopback port is an Operator-chosen destination and must pass
-        // the backend egress policy, exactly like a `gateway_addresses` entry.
-        // The listener topology is node-local, so a validation client that
-        // admits config for other nodes (a control plane) carries none and
-        // checks shape only; every serving node enforces it when it builds
-        // the plugin.
-        if let Some(frontends) = http_client.local_proxy_frontends() {
-            let self_dial_port = if gateway_tls {
-                frontends.https_loopback_port()
-            } else {
-                frontends.http_loopback_port()
-            };
+        // screen, so the backend egress policy is applied to that dial here,
+        // like every other plugin endpoint (`gateway_addresses` included).
+        // There is no self-dial exemption: which process owns
+        // `127.0.0.1:{gateway_port}` cannot be proven at construction (dynamic
+        // Gateway listeners, IPv6 wildcard binds, co-bound `SO_REUSEADDR`
+        // sockets). The policy is node-local, so validation clients admitting
+        // config for other nodes (a control plane) check shape only; every
+        // serving node enforces it when it builds the plugin.
+        if http_client.is_serving_node() {
             let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-            if self_dial_port != Some(gateway_port)
-                && let Some(reason) = http_client.backend_allow_ips().deny_reason(&loopback)
-            {
+            if let Some(reason) = http_client.backend_allow_ips().deny_reason(&loopback) {
                 return Err(format!(
-                    "load_testing: `gateway_port` \"{gateway_port}\" is not an enabled \
-{listener_name} listener this node serves on 127.0.0.1, and 127.0.0.1 is blocked by the \
-backend egress policy ({reason}); target this node's own proxy listener or adjust \
-FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS."
+                    "load_testing: synthetic requests dial `gateway_port` \"{gateway_port}\" on \
+127.0.0.1, which the backend egress policy blocks ({reason}); permit loopback explicitly with \
+FERRUM_BACKEND_ALLOW_CIDRS=127.0.0.1/32 (this re-permits every loopback port) or adjust \
+FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_DENY_CIDRS."
                 ));
             }
         }

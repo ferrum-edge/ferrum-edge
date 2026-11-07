@@ -121,95 +121,6 @@ impl std::fmt::Display for PluginHttpClientUnavailable {
 
 impl std::error::Error for PluginHttpClientUnavailable {}
 
-/// The proxy frontends a serving process binds that a dial to `127.0.0.1`
-/// provably reaches.
-///
-/// Plugins that dial the local gateway over loopback (`load_testing`) use it
-/// to tell a self-dial from an Operator-chosen loopback destination. Only
-/// clients built for a serving node carry it
-/// ([`PluginHttpClient::with_local_proxy_frontends`]); validation clients for
-/// admission on another node (a control plane, config-load sweeps) do not,
-/// because the listener topology is node-local.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LocalProxyFrontends {
-    http_loopback_port: Option<u16>,
-    https_loopback_port: Option<u16>,
-}
-
-impl LocalProxyFrontends {
-    /// From the local addresses of the proxy listeners a node serves (`None`
-    /// for a listener that does not start). A listener counts only when its
-    /// port is non-zero and its address is the IPv4 wildcard or `127.0.0.1`.
-    /// An IPv6 bind, `::` included, never counts: the global proxy listeners
-    /// leave `IPV6_V6ONLY` at the host default, so with
-    /// `net.ipv6.bindv6only=1` another service can own `127.0.0.1` on the
-    /// same port.
-    pub fn from_listener_addrs(
-        http: Option<std::net::SocketAddr>,
-        https: Option<std::net::SocketAddr>,
-    ) -> Self {
-        let loopback_port = |addr: Option<std::net::SocketAddr>| {
-            addr.filter(|addr| addr.port() != 0 && ipv4_loopback_reaches(addr.ip()))
-                .map(|addr| addr.port())
-        };
-        Self {
-            http_loopback_port: loopback_port(http),
-            https_loopback_port: loopback_port(https),
-        }
-    }
-
-    /// The listeners `env_config` starts when nothing is pre-bound, as the
-    /// mode runtimes start them: the plaintext listener whenever its port is
-    /// non-zero; the HTTPS listener in database/file mode only when frontend
-    /// TLS is configured, and in DP mode whenever its port is non-zero
-    /// (CP-delivered TLS material is hot-swapped into it). Mesh and
-    /// non-serving modes start no `FERRUM_PROXY_*` frontend.
-    pub fn from_env_config(env_config: &crate::config::EnvConfig) -> Self {
-        use crate::config::OperatingMode;
-
-        let Ok(bind) = env_config.proxy_bind_address.parse::<std::net::IpAddr>() else {
-            return Self::default();
-        };
-        let addr = |port: u16| Some(std::net::SocketAddr::new(bind, port));
-        let frontend_tls_configured = env_config.frontend_tls_cert_path.is_some()
-            && env_config.frontend_tls_key_path.is_some();
-        match env_config.mode {
-            OperatingMode::Database | OperatingMode::File => {
-                let https = if frontend_tls_configured {
-                    addr(env_config.proxy_https_port)
-                } else {
-                    None
-                };
-                Self::from_listener_addrs(addr(env_config.proxy_http_port), https)
-            }
-            OperatingMode::DataPlane => Self::from_listener_addrs(
-                addr(env_config.proxy_http_port),
-                addr(env_config.proxy_https_port),
-            ),
-            _ => Self::default(),
-        }
-    }
-
-    /// The plaintext HTTP listener port reachable at `127.0.0.1`, if any.
-    pub fn http_loopback_port(&self) -> Option<u16> {
-        self.http_loopback_port
-    }
-
-    /// The HTTPS listener port reachable at `127.0.0.1`, if any.
-    pub fn https_loopback_port(&self) -> Option<u16> {
-        self.https_loopback_port
-    }
-}
-
-/// Whether a listener bound to `ip` provably accepts a connection to
-/// `127.0.0.1`.
-fn ipv4_loopback_reaches(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ip) => ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST,
-        std::net::IpAddr::V6(_) => false,
-    }
-}
-
 fn unavailable_plugin_http_failure() -> PluginHttpFailure {
     PluginHttpFailure {
         error_class: ErrorClass::ConnectionPoolError,
@@ -420,10 +331,13 @@ pub struct PluginHttpClient {
     /// puts it in its length-gated mode. `None` on clients that never resolved
     /// it (validation and library paths), which stay silent.
     max_response_body_size_bytes: Option<usize>,
-    /// The proxy frontends this serving node binds on loopback. `None` on
-    /// validation clients that admit config for other nodes, which therefore
-    /// skip node-local listener checks.
-    local_proxy_frontends: Option<LocalProxyFrontends>,
+    /// `true` on the client a serving node builds its plugins with, so
+    /// plugins apply node-local egress checks (`load_testing`'s loopback
+    /// dial) at construction. `false` on validation clients that admit config
+    /// for other nodes (a control plane, config-load sweeps), which check shape
+    /// only because the backend egress policy that governs the dial is the
+    /// serving node's.
+    serving_node: bool,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -458,7 +372,7 @@ impl std::fmt::Debug for PluginHttpClient {
                 "max_response_body_size_bytes",
                 &self.max_response_body_size_bytes,
             )
-            .field("local_proxy_frontends", &self.local_proxy_frontends)
+            .field("serving_node", &self.serving_node)
             .finish()
     }
 }
@@ -1590,7 +1504,7 @@ impl PluginHttpClient {
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
             max_response_body_size_bytes: None,
-            local_proxy_frontends: None,
+            serving_node: false,
         }
     }
 
@@ -1666,7 +1580,7 @@ impl PluginHttpClient {
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
             max_response_body_size_bytes: None,
-            local_proxy_frontends: None,
+            serving_node: false,
         }
     }
 
@@ -1793,18 +1707,18 @@ impl PluginHttpClient {
         self.max_response_body_size_bytes
     }
 
-    /// Mark this client as a serving node's: `frontends` are the proxy
-    /// listeners this process binds that a dial to `127.0.0.1` reaches.
-    pub fn with_local_proxy_frontends(mut self, frontends: LocalProxyFrontends) -> Self {
-        self.local_proxy_frontends = Some(frontends);
+    /// Mark this client as the one a serving node builds its plugins with,
+    /// so node-local egress checks apply at plugin construction.
+    pub fn for_serving_node(mut self) -> Self {
+        self.serving_node = true;
         self
     }
 
-    /// The loopback-reachable proxy frontends of the serving node this client
-    /// belongs to, or `None` on a validation client admitting config for
-    /// other nodes.
-    pub fn local_proxy_frontends(&self) -> Option<&LocalProxyFrontends> {
-        self.local_proxy_frontends.as_ref()
+    /// Whether this client belongs to a node that serves traffic (see
+    /// [`Self::for_serving_node`]). `false` on validation clients that admit
+    /// config for other nodes.
+    pub fn is_serving_node(&self) -> bool {
+        self.serving_node
     }
 
     /// Follow the gateway's live CRL list on plugin egress (issue #6621).

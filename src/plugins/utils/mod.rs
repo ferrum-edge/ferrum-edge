@@ -73,7 +73,7 @@ pub use batching_logger::{
 pub use byte_budget::{
     ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES, HARD_MAX_BUFFER_MAX_BYTES, admit_byte_limits,
 };
-pub use http_client::{LocalProxyFrontends, PluginHttpClient};
+pub use http_client::PluginHttpClient;
 pub use log_helpers::{
     BatchConfigDefaults, HttpBatchDrainOutcome, build_batch_config, drain_http_batch_response_body,
     handle_http_batch_response_redacted, parse_custom_headers, parse_http_endpoint,

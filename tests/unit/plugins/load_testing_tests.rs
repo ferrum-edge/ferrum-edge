@@ -814,34 +814,9 @@ fn load_testing_egress_policy(
         .expect("valid backend egress policy")
 }
 
-/// A serving node's `EnvConfig`: plaintext listener 18082 and HTTPS listener
-/// 18443 bound on `bind`, with frontend TLS configured when `frontend_tls`.
-fn serving_env(
-    mode: ferrum_edge::config::OperatingMode,
-    bind: &str,
-    frontend_tls: bool,
-) -> ferrum_edge::config::EnvConfig {
-    let tls_path = |path: &str| frontend_tls.then(|| path.to_string());
-    ferrum_edge::config::EnvConfig {
-        mode,
-        proxy_bind_address: bind.to_string(),
-        proxy_http_port: 18082,
-        proxy_https_port: 18443,
-        frontend_tls_cert_path: tls_path("/etc/ferrum/frontend.crt"),
-        frontend_tls_key_path: tls_path("/etc/ferrum/frontend.key"),
-        ..ferrum_edge::config::EnvConfig::default()
-    }
-}
-
-/// The plugin client a serving node built from `env_config` carries.
-fn serving_client(
-    policy: &ferrum_edge::config::BackendEgressPolicy,
-    env_config: &ferrum_edge::config::EnvConfig,
-) -> PluginHttpClient {
-    use ferrum_edge::plugins::utils::LocalProxyFrontends;
-
-    PluginHttpClient::default_with_backend_allow_ips(policy.clone())
-        .with_local_proxy_frontends(LocalProxyFrontends::from_env_config(env_config))
+/// The plugin client a serving node builds its plugins with.
+fn serving_client(policy: &ferrum_edge::config::BackendEgressPolicy) -> PluginHttpClient {
+    PluginHttpClient::default_with_backend_allow_ips(policy.clone()).for_serving_node()
 }
 
 /// A validation client admitting config for other nodes (control plane).
@@ -862,165 +837,74 @@ fn load_test_config(gateway_tls: bool, gateway_port: Option<u16>) -> serde_json:
     config
 }
 
-/// Pins the listener ports `gateway_port` defaults to, matching `serving_env`.
-fn pin_listener_ports() -> crate::unit::env_lock::EnvGuard {
+#[test]
+fn load_testing_loopback_dial_respects_backend_egress_policy() {
+    use ferrum_edge::config::BackendAllowIps;
+
     let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
     env.set("FERRUM_PROXY_HTTP_PORT", "18082");
     env.set("FERRUM_PROXY_HTTPS_PORT", "18443");
-    env
-}
+    // The default (this node's listener), the listener named explicitly, a
+    // co-located loopback service, and the TLS default: every synthetic dial
+    // targets 127.0.0.1, and ownership of that port is not provable.
+    let targets = [
+        load_test_config(false, None),
+        load_test_config(false, Some(18082)),
+        load_test_config(false, Some(18090)),
+        load_test_config(true, None),
+    ];
 
-#[test]
-fn load_testing_gateway_port_respects_backend_egress_policy() {
-    use ferrum_edge::config::{BackendAllowIps, OperatingMode};
-
-    let _env = pin_listener_ports();
-    let node = serving_env(OperatingMode::Database, "0.0.0.0", false);
-    // A co-located loopback service that is not this node's proxy listener.
-    let sidecar = load_test_config(false, Some(18090));
-
-    // `public` denies loopback: a non-listener `gateway_port` is refused when
-    // the serving node builds the plugin, like a loopback `gateway_addresses`.
+    // `public` denies loopback, so a serving node refuses every target.
     let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
-    let err = LoadTesting::new(&sidecar, serving_client(&public, &node))
-        .err()
-        .expect("a non-listener loopback port must be denied under a public policy");
-    assert!(err.contains("`gateway_port`"), "got: {err}");
-    assert!(err.contains("backend egress policy"), "got: {err}");
-    assert!(err.contains("HTTP (FERRUM_PROXY_HTTP_PORT)"), "got: {err}");
+    for config in &targets {
+        let err = LoadTesting::new(config, serving_client(&public))
+            .err()
+            .expect("a loopback dial must be denied under a public policy");
+        assert!(err.contains("`gateway_port`"), "got: {err}");
+        assert!(err.contains("backend egress policy"), "got: {err}");
+        assert!(err.contains("127.0.0.1/32"), "got: {err}");
+    }
 
     // A deny CIDR covering loopback denies it under `both` mode too.
     let deny_loopback = load_testing_egress_policy(BackendAllowIps::Both, "", "127.0.0.0/8");
-    let err = LoadTesting::new(&sidecar, serving_client(&deny_loopback, &node))
-        .err()
-        .expect("a non-listener loopback port must be denied by a loopback deny CIDR");
-    assert!(err.contains("FERRUM_BACKEND_DENY_CIDRS"), "got: {err}");
-
-    // Controls: a policy that permits loopback admits the explicit port.
-    let both = load_testing_egress_policy(BackendAllowIps::Both, "", "");
-    let client = serving_client(&both, &node);
-    assert!(LoadTesting::new(&sidecar, client).is_ok());
-    let allow_loopback = load_testing_egress_policy(BackendAllowIps::Public, "127.0.0.1/32", "");
-    let client = serving_client(&allow_loopback, &node);
-    assert!(LoadTesting::new(&sidecar, client).is_ok());
-
-    // Controls: the self-dial to the enabled listener stays admitted under
-    // `public`, whether `gateway_port` is omitted or names that listener, on
-    // every bind address `127.0.0.1` provably reaches.
-    for bind in ["0.0.0.0", "127.0.0.1"] {
-        let node = serving_env(OperatingMode::Database, bind, false);
-        let client = serving_client(&public, &node);
-        assert!(LoadTesting::new(&load_test_config(false, None), client).is_ok());
-        let client = serving_client(&public, &node);
-        let listener = load_test_config(false, Some(18082));
-        assert!(LoadTesting::new(&listener, client).is_ok(), "bind {bind}");
-    }
-}
-
-#[test]
-fn load_testing_self_dial_requires_a_listener_loopback_reaches() {
-    use ferrum_edge::config::{BackendAllowIps, OperatingMode};
-
-    let _env = pin_listener_ports();
-    let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
-    let listener = load_test_config(false, Some(18082));
-
-    // Port equality alone is not a self-dial: a listener bound where
-    // `127.0.0.1` does not provably reach it leaves that loopback port to
-    // whatever else listens there. That includes the IPv6 wildcard: the
-    // proxy listeners leave `IPV6_V6ONLY` at the host default, and with
-    // `net.ipv6.bindv6only=1` another service can own `127.0.0.1` there.
-    for bind in ["10.0.0.5", "::1", "127.0.0.2", "::", "::ffff:127.0.0.1"] {
-        let node = serving_env(OperatingMode::Database, bind, false);
-        let client = serving_client(&public, &node);
-        let err = LoadTesting::new(&listener, client)
+    for config in &targets {
+        let err = LoadTesting::new(config, serving_client(&deny_loopback))
             .err()
-            .expect("a listener 127.0.0.1 does not reach must not exempt its port");
-        assert!(err.contains("backend egress policy"), "bind {bind}: {err}");
-        let client = serving_client(&public, &node);
-        assert!(LoadTesting::new(&load_test_config(false, None), client).is_err());
+            .expect("a loopback dial must be denied by a loopback deny CIDR");
+        assert!(err.contains("FERRUM_BACKEND_DENY_CIDRS"), "got: {err}");
     }
 
-    // A disabled plaintext listener exposes no self-dial port.
-    let mut disabled = serving_env(OperatingMode::Database, "0.0.0.0", false);
-    disabled.proxy_http_port = 0;
-    let client = serving_client(&public, &disabled);
-    assert!(LoadTesting::new(&listener, client).is_err());
-
-    // Mesh mode serves no `FERRUM_PROXY_*` frontend at all.
-    let mesh = serving_env(OperatingMode::Mesh, "0.0.0.0", false);
-    let client = serving_client(&public, &mesh);
-    assert!(LoadTesting::new(&listener, client).is_err());
-}
-
-#[test]
-fn load_testing_tls_self_dial_requires_an_https_listener() {
-    use ferrum_edge::config::{BackendAllowIps, OperatingMode};
-
-    let _env = pin_listener_ports();
-    let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
-
-    // Database/file mode starts the HTTPS listener only with frontend TLS
-    // configured, so without it even the default port is not a self-dial.
-    let no_tls = serving_env(OperatingMode::File, "0.0.0.0", false);
-    let client = serving_client(&public, &no_tls);
-    let err = LoadTesting::new(&load_test_config(true, None), client)
-        .err()
-        .expect("gateway_tls without an HTTPS listener must be denied under public");
-    assert!(
-        err.contains("HTTPS (FERRUM_PROXY_HTTPS_PORT)"),
-        "got: {err}"
-    );
-    assert!(err.contains("backend egress policy"), "got: {err}");
-
-    let tls = serving_env(OperatingMode::File, "0.0.0.0", true);
-    let client = serving_client(&public, &tls);
-    assert!(LoadTesting::new(&load_test_config(true, None), client).is_ok());
-    let client = serving_client(&public, &tls);
-    assert!(LoadTesting::new(&load_test_config(true, Some(18443)), client).is_ok());
-    // The plaintext listener is not the listener `gateway_tls` selects.
-    let client = serving_client(&public, &tls);
-    assert!(LoadTesting::new(&load_test_config(true, Some(18082)), client).is_err());
-
-    // A data plane starts its HTTPS listener whenever the port is enabled
-    // (CP-delivered certificates are hot-swapped into it).
-    let dp = serving_env(OperatingMode::DataPlane, "0.0.0.0", false);
-    let client = serving_client(&public, &dp);
-    assert!(LoadTesting::new(&load_test_config(true, Some(18443)), client).is_ok());
+    // Controls: the default `both` policy, and `public` with loopback
+    // explicitly re-permitted, admit every target.
+    let both = load_testing_egress_policy(BackendAllowIps::Both, "", "");
+    let allow_loopback = load_testing_egress_policy(BackendAllowIps::Public, "127.0.0.1/32", "");
+    for config in &targets {
+        assert!(LoadTesting::new(config, serving_client(&both)).is_ok());
+        assert!(LoadTesting::new(config, serving_client(&allow_loopback)).is_ok());
+    }
 }
 
 #[test]
 fn load_testing_gateway_port_is_shape_only_on_admission_clients() {
-    use ferrum_edge::config::{BackendAllowIps, OperatingMode};
+    use ferrum_edge::config::BackendAllowIps;
     use ferrum_edge::plugins::validate_plugin_config_with_policy;
 
-    let _env = pin_listener_ports();
     let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
-    // The data plane serves its listener on 19000; the control plane
-    // admitting the row neither serves it nor knows that port.
-    let dp_listener = load_test_config(false, Some(19000));
-
-    let client = admission_client(&public);
-    assert!(LoadTesting::new(&dp_listener, client).is_ok());
+    // A control plane admitting the row does not own the policy that governs
+    // the data plane's loopback dial.
+    let dp_config = load_test_config(false, Some(19000));
+    assert!(LoadTesting::new(&dp_config, admission_client(&public)).is_ok());
     assert!(
-        validate_plugin_config_with_policy("load_testing", &dp_listener, &public).is_ok(),
-        "control-plane admission must not apply the node-local listener screen"
+        validate_plugin_config_with_policy("load_testing", &dp_config, &public).is_ok(),
+        "control-plane admission must not apply the node-local egress screen"
     );
     // Shape checks still apply on the admission path.
-    let client = admission_client(&public);
-    assert!(LoadTesting::new(&load_test_config(false, Some(0)), client).is_err());
-
-    let mut dp = serving_env(OperatingMode::DataPlane, "0.0.0.0", false);
-    dp.proxy_http_port = 19000;
-    let client = serving_client(&public, &dp);
-    assert!(LoadTesting::new(&dp_listener, client).is_ok());
-    // The same row on a data plane whose listener is elsewhere is refused
-    // when that node builds the plugin.
-    let other_dp = serving_env(OperatingMode::DataPlane, "0.0.0.0", false);
-    let client = serving_client(&public, &other_dp);
-    let err = LoadTesting::new(&dp_listener, client)
+    let zero_port = load_test_config(false, Some(0));
+    assert!(LoadTesting::new(&zero_port, admission_client(&public)).is_err());
+    // The same row is refused when a serving node under `public` builds it.
+    let err = LoadTesting::new(&dp_config, serving_client(&public))
         .err()
-        .expect("a data plane must refuse a port that is not its own listener");
+        .expect("a serving node must refuse the loopback dial under public");
     assert!(err.contains("backend egress policy"), "got: {err}");
 }
 

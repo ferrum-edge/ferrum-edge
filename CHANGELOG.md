@@ -17,22 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
-- **`load_testing` no longer sends synthetic requests to a loopback port the
-  backend egress policy forbids.** `gateway_port` was only range-checked, and
-  replays dialled `127.0.0.1:{gateway_port}` from a dedicated client that
-  never consulted `FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_DENY_CIDRS`, so
-  an Operator could aim up to 10,000 concurrent replays at any co-located
-  loopback service even where the policy denied loopback. A serving node now
-  rejects the plugin when the policy denies `127.0.0.1` unless `gateway_port`
-  is an enabled proxy listener of that node that `127.0.0.1` reaches, for the
-  scheme `gateway_tls` selects: the HTTPS listener counts only when frontend
-  TLS is configured (database/file) or its port is enabled (DP), the bind
-  address must be `0.0.0.0` or `127.0.0.1` (an adopted pre-bound listener's
-  real address counts, and an IPv6 bind such as `::` never does, because
-  `IPV6_V6ONLY` is left at the host default), and mesh mode has no such
-  listener. Control-plane admission checks only the range, since listener
-  topology is node-local. Deployments whose policy permits loopback (the
-  default `both` mode) are unaffected.
+- **`load_testing` synthetic requests now obey the backend egress policy.**
+  `gateway_port` was only range-checked, and replays dialled
+  `127.0.0.1:{gateway_port}` from a dedicated client that never consulted
+  `FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_DENY_CIDRS`, so an Operator
+  could aim up to 10,000 concurrent replays at any co-located loopback
+  service even where the policy denied loopback. A serving node now screens
+  the `127.0.0.1` dial target when it builds the plugin, for every
+  `gateway_port` including its own listener port, because which process owns
+  a loopback port cannot be proven. **Behaviour change:** under a policy that
+  denies loopback (`FERRUM_BACKEND_ALLOW_IPS=public`, or a deny CIDR covering
+  `127.0.0.1`), `load_testing` now requires an explicit loopback allow such
+  as `FERRUM_BACKEND_ALLOW_CIDRS=127.0.0.1/32`, which re-permits every
+  loopback port for all egress on that node; `gateway_addresses` fan-out does
+  not avoid it, since the originating node still runs its own cohort over
+  loopback. The default `both` policy is unaffected. Control-plane admission
+  checks only the field's shape, since the egress policy is node-local, and
+  API-spec imports now validate plugins with the same client as admin plugin
+  writes.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,
