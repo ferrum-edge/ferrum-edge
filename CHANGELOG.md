@@ -23,15 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`jwks_uri` / `discovery_url`), `oidc_relying_party` (`discovery_url`,
   `token_endpoint`, `userinfo_endpoint`, `jwks_uri`, discovered endpoints and
   `client_auth.method: none`) and `ai_transcript_audit`
-  (`sink.allow_insecure_loopback`) accepted `localhost` / `*.localhost` as
+  (`sink.allow_insecure_loopback`) accepted the name `localhost` as
   loopback, so a DNS override or resolver mapping could carry client secrets,
   authorization codes, audit transcripts, or an attacker-chosen key set over
   cleartext to another host. They now follow the #6659 rule: only
-  `127.0.0.0/8` and `::1` literals qualify. **Upgrade:** replace
-  `http://localhost` with `http://127.0.0.1` (or `[::1]`) in these fields.
-  Browser-followed OIDC URLs (`authorization_endpoint`,
-  `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) keep
-  `localhost`.
+  `127.0.0.0/8` and `::1` literals qualify. Under `client_auth.method: none`,
+  an OIDC token endpoint learned from discovery must meet the same rule, and
+  `ai_transcript_audit` judges the sink scheme on the parsed URL (a leading
+  space or embedded tab no longer skips the cleartext guard). **Upgrade:**
+  replace `http://localhost` with `http://127.0.0.1` (or `[::1]`) in these
+  fields. Configured browser-followed OIDC URLs (`authorization_endpoint`,
+  `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) and the
+  `issuer` identifier keep `localhost`; a discovered plaintext endpoint must
+  share the loopback IP-literal discovery origin.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`

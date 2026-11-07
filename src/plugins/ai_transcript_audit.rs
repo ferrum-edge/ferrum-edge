@@ -76,7 +76,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -2306,10 +2305,15 @@ impl AiTranscriptAudit {
             http_client.backend_allow_ips(),
         )?;
         let allow_insecure_loopback = cfg_bool(sink_obj, "allow_insecure_loopback", false, "sink")?;
-        if endpoint_url
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-        {
+        // Decide the scheme from the URL the transport will use, not from
+        // the configured spelling: the URL parser ignores leading/trailing
+        // whitespace and embedded tabs/newlines, so a prefix test on the raw
+        // string let ` http://...` skip this guard entirely.
+        let cleartext = match url::Url::parse(&endpoint_url) {
+            Ok(url) => url.scheme() == "http",
+            Err(_) => true,
+        };
+        if cleartext {
             if !allow_insecure_loopback {
                 return Err(
                     "ai_transcript_audit: `sink.endpoint_url` must use https://; \
@@ -2320,9 +2324,8 @@ impl AiTranscriptAudit {
             // Only a loopback IP literal proves the transcript stays on this
             // machine: DNS overrides and the resolver decide where a name —
             // `localhost` included — connects (the #6659 rule).
-            let loopback = endpoint_hostname
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback());
+            let loopback =
+                super::utils::socket_host::is_loopback_ip_literal_host(&endpoint_hostname);
             if !loopback {
                 return Err(
                     "ai_transcript_audit: `sink.allow_insecure_loopback` permits http:// only \

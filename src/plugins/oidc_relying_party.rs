@@ -45,6 +45,7 @@ use super::utils::oauth_client_auth::{self, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::session_cookie::reject_published_session_secret;
+use super::utils::socket_host::is_loopback_ip_literal_host;
 use super::{PluginResult, RequestContext};
 
 const CLAIM_HEADER_METADATA_PREFIX: &str = "oidc_rp.claim_header.";
@@ -1402,6 +1403,7 @@ impl OidcRelyingParty {
         let jwks_publication_gate = Arc::new(Mutex::new(()));
         let explicit_userinfo_endpoint = userinfo_endpoint.clone();
         let explicit_end_session_endpoint = end_session_endpoint.clone();
+        let token_endpoint_requires_loopback = matches!(client_auth, OidcClientAuth::None);
         let discovery_task = if start_background_tasks {
             discovery_url.clone().map(|url| {
                 spawn_oidc_discovery(
@@ -1416,6 +1418,7 @@ impl OidcRelyingParty {
                     issuer.clone(),
                     explicit_userinfo_endpoint,
                     explicit_end_session_endpoint,
+                    token_endpoint_requires_loopback,
                 )
             })
         } else {
@@ -4554,17 +4557,6 @@ fn parse_authorization_params(
     Ok(params)
 }
 
-/// `true` only for a loopback IP literal (`127.0.0.0/8`, `[::1]`). Gateway-dialed
-/// provider URLs use this: a name — `localhost` included — never qualifies.
-fn is_loopback_ip_literal_host(hostname: &str) -> bool {
-    hostname
-        .strip_prefix('[')
-        .and_then(|hostname| hostname.strip_suffix(']'))
-        .unwrap_or(hostname)
-        .parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
-}
-
 /// Browser-facing redirect URLs additionally accept `localhost`: the user
 /// agent, not the gateway, resolves them, and browsers treat `localhost` as a
 /// potentially trustworthy origin.
@@ -5192,6 +5184,7 @@ fn spawn_oidc_discovery(
     expected_issuer: String,
     explicit_userinfo_endpoint: Option<String>,
     explicit_end_session_endpoint: Option<String>,
+    token_endpoint_requires_loopback: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
@@ -5212,6 +5205,7 @@ fn spawn_oidc_discovery(
                 &expected_issuer,
                 explicit_userinfo_endpoint.is_some(),
                 explicit_end_session_endpoint.is_some(),
+                token_endpoint_requires_loopback,
             )
             .await
             {
@@ -5283,12 +5277,17 @@ fn spawn_oidc_discovery(
 /// copy-paste error pairing one tenant's issuer with another tenant's
 /// discovery URL sent users — and the client credential — to the wrong
 /// tenant's endpoints before ID-token validation failed (MUSE-3).
+/// `token_endpoint_requires_loopback` carries `client_auth.method: none`: an
+/// unauthenticated token exchange is admitted only against a loopback
+/// IP-literal token endpoint, and a discovered one must satisfy the same rule
+/// as a configured one (construction can only check the discovery URL).
 async fn fetch_discovery(
     http_client: &PluginHttpClient,
     discovery_url: &str,
     expected_issuer: &str,
     userinfo_overridden: bool,
     end_session_overridden: bool,
+    token_endpoint_requires_loopback: bool,
 ) -> Result<DiscoveryDoc, String> {
     let client = http_client
         .get()
@@ -5324,6 +5323,17 @@ async fn fetch_discovery(
         .and_then(Value::as_str)
         .ok_or_else(|| "missing token_endpoint".to_string())
         .and_then(|url| validate_discovered_url(discovery_url, url, "token_endpoint"))?;
+    if token_endpoint_requires_loopback
+        && !Url::parse(&token_endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(is_loopback_ip_literal_host))
+            .unwrap_or(false)
+    {
+        return Err(
+            "discovered token_endpoint must be a loopback IP literal when client_auth.method is none"
+                .to_string(),
+        );
+    }
     let userinfo_endpoint = if userinfo_overridden {
         None
     } else {
@@ -5412,6 +5422,7 @@ pub(crate) mod discovery_test_seams {
             expected_issuer,
             explicit_userinfo_endpoint.is_some(),
             explicit_end_session_endpoint.is_some(),
+            false,
         )
         .await?;
         let doc = apply_discovery_endpoint_overrides(
@@ -5709,6 +5720,25 @@ mod tests {
         ] {
             assert!(validate_discovered_url(discovery, endpoint, "token_endpoint").is_err());
         }
+        // A discovered plaintext endpoint must share the loopback IP-literal
+        // discovery origin, so even a browser-followed one can never name
+        // `localhost`; HTTPS browser endpoints stay unrestricted.
+        assert!(
+            validate_discovered_url(
+                discovery,
+                "http://localhost:8080/authorize",
+                "authorization_endpoint"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_discovered_url(
+                discovery,
+                "https://localhost:8443/authorize",
+                "authorization_endpoint"
+            )
+            .is_ok()
+        );
         // An HTTPS discovery document cannot downgrade to a loopback HTTP
         // endpoint either.
         assert!(
@@ -5719,6 +5749,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// `client_auth.method: none` admits an unauthenticated token exchange
+    /// only against a loopback IP-literal token endpoint. Construction can
+    /// only check the discovery URL, so a discovered token endpoint must meet
+    /// the same rule before the document is published.
+    #[tokio::test]
+    async fn discovered_token_endpoint_honors_none_client_auth_loopback_rule() {
+        async fn serve(token_endpoint: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "issuer": server.uri(),
+                    "authorization_endpoint": format!("{}/authorize", server.uri()),
+                    "token_endpoint": token_endpoint.replace("{origin}", &server.uri()),
+                    "jwks_uri": format!("{}/jwks", server.uri()),
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+        let fetch = |server: &MockServer, none: bool| {
+            let discovery_url = format!("{}/.well-known/openid-configuration", server.uri());
+            let issuer = server.uri();
+            async move {
+                fetch_discovery(
+                    &PluginHttpClient::default(),
+                    &discovery_url,
+                    &issuer,
+                    false,
+                    false,
+                    none,
+                )
+                .await
+            }
+        };
+
+        let named = serve("https://localhost:8443/token").await;
+        let error = fetch(&named, true)
+            .await
+            .expect_err("none must refuse a named discovered token endpoint");
+        assert!(error.contains("loopback IP literal"), "{error}");
+        assert!(
+            fetch(&named, false).await.is_ok(),
+            "a credentialed provider keeps cross-origin HTTPS discovery"
+        );
+
+        let literal = serve("{origin}/token").await;
+        assert!(fetch(&literal, true).await.is_ok());
     }
 
     #[test]
@@ -6732,6 +6812,7 @@ mod tests {
                 &PluginHttpClient::default(),
                 &format!("{}/.well-known/openid-configuration", server.uri()),
                 "https://idp.example.com",
+                false,
                 false,
                 false,
             )

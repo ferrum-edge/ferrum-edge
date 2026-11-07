@@ -2,7 +2,6 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -2387,9 +2386,7 @@ fn hostname_from_url(url: &str) -> Option<String> {
 /// decide where a name connects, so it does not prove the client credential
 /// stays on this machine (the #6659 rule for credentialed cleartext endpoints).
 fn is_local_introspection_host(hostname: &str) -> bool {
-    hostname
-        .parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
+    super::utils::socket_host::is_loopback_ip_literal_host(hostname)
 }
 
 /// True when the endpoint would transmit client credentials over plaintext to a

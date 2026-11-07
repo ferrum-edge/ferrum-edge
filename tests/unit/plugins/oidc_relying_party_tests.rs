@@ -2233,6 +2233,13 @@ async fn gateway_dialed_provider_urls_reject_cleartext_localhost_names() {
         OidcRelyingParty::new(&loopback_config(), PluginHttpClient::default()).is_ok(),
         "browser-followed URLs may still name localhost"
     );
+    // `issuer` is a compared identifier the gateway never dials.
+    let mut localhost_issuer = loopback_config();
+    localhost_issuer["providers"][0]["issuer"] = json!("http://localhost:8080");
+    assert!(
+        OidcRelyingParty::new(&localhost_issuer, PluginHttpClient::default()).is_ok(),
+        "a localhost issuer identifier stays admitted"
+    );
 
     for field in ["token_endpoint", "userinfo_endpoint", "jwks_uri"] {
         for host in ["localhost", "idp.localhost"] {

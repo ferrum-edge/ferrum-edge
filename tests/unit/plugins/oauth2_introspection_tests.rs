@@ -323,7 +323,11 @@ fn new_rejects_cleartext_localhost_names_for_credentialed_and_none_client_auth()
         "http://LOCALHOST:9000/introspect",
         "http://api.localhost:9000/introspect",
     ] {
-        for method in ["client_secret_basic", "client_secret_post"] {
+        for method in [
+            "client_secret_basic",
+            "client_secret_post",
+            "private_key_jwt",
+        ] {
             let error = Oauth2Introspection::new(
                 &config_with_client_auth(endpoint, method),
                 PluginHttpClient::default(),

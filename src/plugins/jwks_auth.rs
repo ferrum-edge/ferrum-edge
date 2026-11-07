@@ -2874,11 +2874,9 @@ fn parse_url_field(
 /// and a cleartext key set fetched from an attacker-chosen address would let
 /// that address mint accepted tokens (the #6659 rule for cleartext endpoints).
 fn is_local_auth_endpoint(parsed: &Url) -> bool {
-    match parsed.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(_)) | None => false,
-    }
+    parsed
+        .host_str()
+        .is_some_and(super::utils::socket_host::is_loopback_ip_literal_host)
 }
 
 fn hostname_from_parsed_url(parsed: &Url) -> Option<String> {

@@ -493,6 +493,28 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
                 "allow_insecure_loopback": true
             }
         }),
+        // The URL parser ignores surrounding whitespace and embedded
+        // tabs/newlines, so the scheme is judged on the parsed URL, not on the
+        // configured spelling.
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://collector.example.com/audit"
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": " http://localhost:9001/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "ht\ttp://collector.example.com/audit"
+            }
+        }),
     ] {
         let err = AiTranscriptAudit::new(&config, loopback_http_client())
             .err()
