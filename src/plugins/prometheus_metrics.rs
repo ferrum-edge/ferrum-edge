@@ -2198,7 +2198,7 @@ impl MetricsRegistry {
 
     /// One retained mTLS DNS admission fence was cleared (saturating).
     pub fn record_mtls_dns_admission_fence_cleared(&self) {
-        let _ = self.mtls_dns_admission_fences_retained.fetch_update(
+        let _ = self.mtls_dns_admission_fences_retained.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_sub(1)),
