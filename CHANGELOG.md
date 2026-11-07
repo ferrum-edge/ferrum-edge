@@ -15,6 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, which the H1/H2 handshake already stripped. Both frontends now use
   one shared predicate; H3 still replaces `Early-Data` itself and drops
   pseudo-headers.
+- **A withdrawn inbound redirect port no longer stays redirect-eligible after
+  a partial scope write** (#7025). If the node-agent wrote a pod's widened
+  inbound redirect scope and then failed the pod-IP flag (or IPv6) write, a
+  later event reverting to the previously tracked ports returned early and the
+  withdrawn port stayed in the BPF scope. While a redirect write is pending the
+  node-agent now rewrites the full scope on every event and clears the pending
+  failure once it converges. Pod removal now drops every live-pod capture
+  failure record, including the redirect one it used to miss, so a removed pod
+  no longer pins the node in `partially_attached` or makes every retry tick
+  retract and republish the Ambient UDP registry proof. A failed cgroup program
+  detach is also retained, so its retry is no longer reported as successful
+  while the pod's cgroup still exists. Per-pod capture failures are now typed
+  records rather than parsed strings.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
