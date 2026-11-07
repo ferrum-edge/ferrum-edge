@@ -5043,6 +5043,243 @@ async fn test_restore_rolls_back_prior_config_after_mid_import_failure() {
     );
 }
 
+/// Current owner of the namespace's durable mTLS DNS restore fence, if any.
+async fn mtls_dns_restore_owner(pool: &sqlx::AnyPool, namespace: &str) -> Option<String> {
+    let owner: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT restore_owner FROM mtls_dns_admission_locks WHERE namespace = ?",
+    )
+    .bind(namespace)
+    .fetch_optional(pool)
+    .await
+    .expect("Failed to inspect the mTLS DNS admission fence");
+    owner.flatten()
+}
+
+/// Let any guard-drop cleanup task spawned by the finished request run, so a
+/// retained fence is not observed only because its release is still pending.
+async fn settle_guard_drop_cleanup() {
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+async fn restore_fence_test_server(
+    db_name: &str,
+) -> (
+    tempfile::TempDir,
+    sqlx::AnyPool,
+    String,
+    String,
+    tokio::sync::watch::Sender<bool>,
+) {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join(db_name);
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [{
+            "id": "restore-keep",
+            "listen_path": "/keep",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed failed: {:?}", body);
+    (temp_dir, pool, base_url, token, shutdown)
+}
+
+fn restore_fence_failing_import_payload() -> Value {
+    json!({
+        "consumers": [{
+            "id": "restore-partial-consumer",
+            "username": "partial-user",
+            "credentials": {}
+        }],
+        "proxies": [{
+            "id": "restore-fail",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    })
+}
+
+/// Issue #7032: clear, then an import with errors, then a compensating
+/// rollback that fails. The production finalizer must keep the durable fence
+/// (on the guard explicitly and on its Drop) instead of admitting writes over
+/// the half-restored namespace.
+#[tokio::test]
+async fn mtls_dns_restore_failed_rollback_retains_fence() {
+    let (_temp_dir, pool, base_url, token, _shutdown) =
+        restore_fence_test_server("test_restore_failed_rollback_fence.db").await;
+
+    // The import fails on `restore-fail`; the compensating replay then fails
+    // on the snapshot proxy `restore-keep`.
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_import BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install import fault-injection trigger");
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_rollback BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-keep' \
+         BEGIN SELECT RAISE(FAIL, 'injected rollback persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install rollback fault-injection trigger");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &restore_fence_failing_import_payload(),
+    )
+    .await;
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    assert_eq!(
+        body["rollback"].as_str(),
+        Some("incomplete"),
+        "the injected replay failure must make rollback incomplete: {body:?}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("namespace admission guard was retained"),
+        "the response must report the retained fence: {body:?}"
+    );
+
+    settle_guard_drop_cleanup().await;
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_some(),
+        "a failed rollback must leave the half-restored namespace fenced"
+    );
+}
+
+/// The restore phase drives the finalizer's release: a completed rollback and
+/// a successful restore both clear the durable fence.
+#[tokio::test]
+async fn mtls_dns_restore_completed_rollback_and_success_release_fence() {
+    let (_temp_dir, pool, base_url, token, _shutdown) =
+        restore_fence_test_server("test_restore_completed_rollback_fence.db").await;
+
+    sqlx::query(
+        "CREATE TRIGGER fail_restore_import BEFORE INSERT ON proxies \
+         WHEN NEW.id = 'restore-fail' \
+         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to install import fault-injection trigger");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &restore_fence_failing_import_payload(),
+    )
+    .await;
+    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+    assert_eq!(body["rollback"].as_str(), Some("completed"), "{body:?}");
+    settle_guard_drop_cleanup().await;
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_none(),
+        "a completed rollback must release the fence"
+    );
+
+    let restore_payload = json!({
+        "proxies": [{
+            "id": "restore-new",
+            "listen_path": "/new",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true
+        }]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(status, 200, "Restore response: {:?}", body);
+    settle_guard_drop_cleanup().await;
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_none(),
+        "a successful restore must release the fence"
+    );
+}
+
+/// Issue #7032: a recovery reacquisition cancelled while its detached
+/// acquisition task is still pending must not let the undelivered lifecycle
+/// release the new durable owner over a half-restored namespace.
+#[tokio::test]
+async fn mtls_dns_restore_cancelled_recovery_reacquisition_retains_fence() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_reacquire_fence.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let backend: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> = Arc::new(db);
+
+    ferrum_edge::_test_support::admin_cancel_restore_guard_reacquisition_for_test(
+        backend.clone(),
+        "ferrum",
+        true,
+    )
+    .await;
+    settle_guard_drop_cleanup().await;
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_some(),
+        "the undelivered reacquired guard must retain the inherited incomplete phase"
+    );
+
+    // Control: the same cancelled reacquisition without an inherited phase
+    // claims the fence and its Drop releases it through the backend.
+    sqlx::query(
+        "UPDATE mtls_dns_admission_locks SET restore_owner = NULL, updated_at = ? \
+         WHERE namespace = ?",
+    )
+    .bind("2000-01-01T00:00:00+00:00")
+    .bind("ferrum")
+    .execute(&pool)
+    .await
+    .expect("Failed to reset the mTLS DNS admission fence");
+    ferrum_edge::_test_support::admin_cancel_restore_guard_reacquisition_for_test(
+        backend, "ferrum", false,
+    )
+    .await;
+    settle_guard_drop_cleanup().await;
+    let updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM mtls_dns_admission_locks WHERE namespace = ?")
+            .bind("ferrum")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to inspect the mTLS DNS admission fence");
+    assert_ne!(
+        updated_at, "2000-01-01T00:00:00+00:00",
+        "the control reacquisition must have claimed the fence"
+    );
+    assert!(
+        mtls_dns_restore_owner(&pool, "ferrum").await.is_none(),
+        "without an inherited phase the undelivered guard releases its owner"
+    );
+}
+
 /// Rollback must faithfully replay the raw pre-restore snapshot even when it
 /// contains a legacy/out-of-band mTLS DNS ambiguity. Normal admission rejects
 /// this state, but applying that new validation to the compensating replay

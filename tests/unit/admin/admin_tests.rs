@@ -4,11 +4,12 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    admin_batch_persistence_message_for_test, admin_consumer_persistence_response_for_test,
-    admin_database_error_body_for_test, admin_mtls_dns_admission_contention_response,
-    admin_mtls_dns_admission_drop_should_release, admin_proxy_route_conflict_message_for_test,
-    admin_recovery_persistence_message_for_test, admin_throttle_conflict_message_for_test,
-    admin_wrapped_mtls_conflict_message_for_test, admin_wrapped_mtls_conflict_response_for_test,
+    AdminMtlsDnsAdmissionHoldProbe, admin_batch_persistence_message_for_test,
+    admin_consumer_persistence_response_for_test, admin_database_error_body_for_test,
+    admin_mtls_dns_admission_contention_response, admin_mtls_dns_admission_drop_should_release,
+    admin_proxy_route_conflict_message_for_test, admin_recovery_persistence_message_for_test,
+    admin_throttle_conflict_message_for_test, admin_wrapped_mtls_conflict_message_for_test,
+    admin_wrapped_mtls_conflict_response_for_test,
 };
 use ferrum_edge::admin::{
     AdminState,
@@ -58,6 +59,329 @@ fn mtls_dns_admission_lifecycle_only_retains_uncertain_mutations() {
     assert!(admin_mtls_dns_admission_drop_should_release(false, false));
     assert!(admin_mtls_dns_admission_drop_should_release(true, true));
     assert!(!admin_mtls_dns_admission_drop_should_release(true, false));
+}
+
+type RestoreImportResult = (usize, Vec<String>);
+
+fn restore_import_succeeded(result: &RestoreImportResult) -> bool {
+    result.1.is_empty()
+}
+
+#[tokio::test]
+async fn mtls_dns_admission_single_mutation_drop_behaviour_is_unchanged() {
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    assert!(probe.drop_releases(), "not-started mutation releases");
+
+    // A cancelled in-flight mutation retains the fence.
+    tokio::select! {
+        biased;
+        _ = probe.run_mutation(std::future::pending::<()>()) => unreachable!(),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(
+        !probe.drop_releases(),
+        "cancelled in-flight mutation retains"
+    );
+
+    let fresh = AdminMtlsDnsAdmissionHoldProbe::new();
+    fresh.run_mutation(async { 1_u8 }).await;
+    assert!(fresh.drop_releases(), "settled mutation releases");
+    fresh.run_mutation(async { 2_u8 }).await;
+    assert!(
+        fresh.drop_releases(),
+        "sequential settled mutations release"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_admission_nested_mutation_does_not_settle_outer_uncertain_mutation() {
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    let (inner_done_tx, inner_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let outer = probe.run_mutation(async {
+        probe.run_mutation(async {}).await;
+        let _ = inner_done_tx.send(());
+        std::future::pending::<()>().await
+    });
+    tokio::select! {
+        biased;
+        _ = outer => unreachable!(),
+        _ = inner_done_rx => {}
+    }
+    assert!(
+        !probe.drop_releases(),
+        "a nested mutation's exit must restore the outer in-flight state"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_import_errors_then_unpolled_rollback_retains_fence() {
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    probe
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    assert!(!probe.drop_releases(), "cleared namespace retains");
+
+    let result: RestoreImportResult = probe
+        .run_restore_import(
+            async { (3, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    assert_eq!(result.1.len(), 1);
+    assert!(
+        !probe.drop_releases(),
+        "import with errors must not settle the incomplete restore"
+    );
+
+    // The compensating rollback is dispatched through an admission wrapper
+    // that can fail (for example `ensure_held()`) without polling it.
+    let rollback = probe.run_restore_rollback(async { Ok::<(), Vec<String>>(()) });
+    drop(rollback);
+    assert!(
+        !probe.drop_releases(),
+        "an unpolled rollback leaves a half-restored namespace fenced"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_cancellation_after_clear_retains_fence() {
+    // Cancelled between the clear and the import dispatch.
+    let probe = AdminMtlsDnsAdmissionHoldProbe::new();
+    probe
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    assert!(!probe.drop_releases());
+
+    // Cancelled while the import is in flight.
+    let in_flight = AdminMtlsDnsAdmissionHoldProbe::new();
+    in_flight
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    tokio::select! {
+        biased;
+        _ = in_flight.run_restore_import(
+            std::future::pending::<RestoreImportResult>(),
+            restore_import_succeeded,
+        ) => unreachable!(),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(!in_flight.drop_releases());
+
+    // Cancelled while the compensating rollback is in flight.
+    let rolling_back = AdminMtlsDnsAdmissionHoldProbe::new();
+    rolling_back
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    rolling_back
+        .run_restore_import(
+            async { (0, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    tokio::select! {
+        biased;
+        _ = rolling_back.run_restore_rollback(
+            std::future::pending::<Result<(), Vec<String>>>(),
+        ) => unreachable!(),
+        _ = std::future::ready(()) => {}
+    }
+    assert!(!rolling_back.drop_releases());
+}
+
+// The production finalizer path (`finish_failed_restore` through
+// `/restore`) is covered by
+// `tests/integration/admin_cached_config_tests.rs::mtls_dns_restore_failed_rollback_retains_fence`.
+#[tokio::test]
+async fn mtls_dns_restore_failed_rollback_phase_retains_from_any_prior_phase() {
+    let after_import = AdminMtlsDnsAdmissionHoldProbe::new();
+    after_import
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    after_import
+        .run_restore_import(
+            async { (0, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    let rollback = after_import
+        .run_restore_rollback(async { Err::<(), _>(vec!["replay failed".to_string()]) })
+        .await;
+    assert!(rollback.is_err());
+    assert!(!after_import.drop_releases());
+
+    // A non-atomic clear failure reaches the rollback without a recorded
+    // clear; a failed replay must still retain the fence.
+    let after_partial_clear = AdminMtlsDnsAdmissionHoldProbe::new();
+    assert!(
+        after_partial_clear
+            .run_restore_clear(async { Err::<(), _>("partial clear") })
+            .await
+            .is_err()
+    );
+    assert!(after_partial_clear.drop_releases());
+    let rollback = after_partial_clear
+        .run_restore_rollback(async { Err::<(), _>(vec!["replay failed".to_string()]) })
+        .await;
+    assert!(rollback.is_err());
+    assert!(!after_partial_clear.drop_releases());
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_success_and_completed_rollback_release_fence() {
+    let restored = AdminMtlsDnsAdmissionHoldProbe::new();
+    restored
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    restored
+        .run_restore_import(async { (5, Vec::new()) }, restore_import_succeeded)
+        .await;
+    assert!(restored.drop_releases(), "successful restore releases");
+
+    let rolled_back = AdminMtlsDnsAdmissionHoldProbe::new();
+    rolled_back
+        .run_restore_clear(async { Ok::<(), ()>(()) })
+        .await
+        .unwrap();
+    rolled_back
+        .run_restore_import(
+            async { (1, vec!["chunk failed".to_string()]) },
+            restore_import_succeeded,
+        )
+        .await;
+    rolled_back
+        .run_restore_rollback(async { Ok::<(), Vec<String>>(()) })
+        .await
+        .unwrap();
+    assert!(rolled_back.drop_releases(), "completed rollback releases");
+
+    // A definitively failed clear never enters the incomplete-restore phase.
+    let clear_aborted = AdminMtlsDnsAdmissionHoldProbe::new();
+    assert!(
+        clear_aborted
+            .run_restore_clear(async { Err::<(), _>("atomic abort") })
+            .await
+            .is_err()
+    );
+    assert!(clear_aborted.drop_releases());
+}
+
+/// Source slice from `start` up to the next `end` marker.
+fn admin_source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    let to = source[from..]
+        .find(end)
+        .map(|offset| from + offset)
+        .unwrap_or_else(|| panic!("missing {end} after {start}"));
+    &source[from..to]
+}
+
+/// The restore guard reacquisition statement that precedes `label`.
+fn restore_guard_reacquisition_before<'a>(handler: &'a str, label: &str) -> &'a str {
+    let label_at = handler
+        .find(label)
+        .unwrap_or_else(|| panic!("missing {label}"));
+    let start = handler[..label_at]
+        .rfind("restore_guard = match MtlsDnsAdmissionGuardLifecycle::")
+        .unwrap_or_else(|| panic!("missing reacquisition before {label}"));
+    &handler[start..label_at]
+}
+
+/// Issue #7032: the lost-lease recovery sites cannot be driven through the
+/// SQLite `/restore` harness, so pin their wiring structurally. Both
+/// reacquisitions must apply the inherited incomplete phase inside the
+/// acquisition task, and both rollback finalizers must gate their explicit
+/// release on the recorded restore phase.
+#[test]
+fn mtls_dns_restore_recovery_paths_keep_phase_gated_fence() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let handler = admin_source_section(source, "async fn handle_restore(", "\nasync fn ");
+
+    assert!(
+        handler.contains("let carried_restore_phase = restore_guard.restore_phase();"),
+        "the lost-clear path must capture the phase before releasing the old owner"
+    );
+    let after_clear =
+        restore_guard_reacquisition_before(handler, "\"restore_guard_reacquire_after_clear\"");
+    assert!(
+        after_clear.starts_with(
+            "restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase("
+        ),
+        "lost-clear recovery must reacquire with the inherited phase: {after_clear}"
+    );
+    assert!(after_clear.contains("carried_restore_phase"));
+
+    let after_import = restore_guard_reacquisition_before(
+        handler,
+        "\"restore_guard_reacquire_for_import_rollback\"",
+    );
+    assert!(
+        after_import.starts_with(
+            "restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase("
+        ),
+        "lost-import recovery must reacquire with the failed-import phase: {after_import}"
+    );
+    assert!(after_import.contains("MtlsDnsRestorePhase::ImportedWithErrors"));
+
+    assert!(
+        handler.contains("if !restore_guard.restore_phase_allows_release() {"),
+        "the successful-import release must be phase gated"
+    );
+
+    for (start, end) in [
+        (
+            "async fn finish_failed_restore(",
+            "async fn finish_failed_restore_after_intervening_clear(",
+        ),
+        (
+            "async fn finish_failed_restore_after_intervening_clear(",
+            "async fn finish_atomic_delete_failure(",
+        ),
+    ] {
+        let finalizer = admin_source_section(source, start, end);
+        let gate = finalizer
+            .find("let fence_retained = !guard.restore_phase_allows_release();")
+            .unwrap_or_else(|| panic!("{start} must gate its release on the restore phase"));
+        let retained = finalizer.find("if fence_retained {").unwrap_or_else(|| {
+            panic!("{start} must retain the fence when the phase forbids release")
+        });
+        let release = finalizer
+            .find("} else if let Err(_error) = guard.release().await {")
+            .unwrap_or_else(|| panic!("{start} must release only in the gated else branch"));
+        assert!(gate < retained && retained < release, "{start} gate order");
+        assert_eq!(
+            finalizer.matches("guard.release().await").count(),
+            1,
+            "{start} must have no ungated release"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mtls_dns_restore_reacquired_guard_phase_retains_until_rollback_completes() {
+    // Lease lost during clear or import: the reacquired owner inherits the
+    // incomplete phase before its rollback is dispatched.
+    let after_clear = AdminMtlsDnsAdmissionHoldProbe::new();
+    after_clear.mark_restore_cleared();
+    assert!(!after_clear.drop_releases());
+    after_clear
+        .run_restore_rollback(async { Ok::<(), Vec<String>>(()) })
+        .await
+        .unwrap();
+    assert!(after_clear.drop_releases());
+
+    let after_import = AdminMtlsDnsAdmissionHoldProbe::new();
+    after_import.mark_restore_import_failed();
+    assert!(!after_import.drop_releases());
+    drop(after_import.run_restore_rollback(async { Ok::<(), Vec<String>>(()) }));
+    assert!(!after_import.drop_releases());
 }
 
 #[tokio::test]
