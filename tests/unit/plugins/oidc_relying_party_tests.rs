@@ -3773,13 +3773,13 @@ async fn client_secret_basic_form_encodes_credentials_before_basic_encoding() {
     server.verify().await;
 }
 
-/// `private_key_jwt` on the token endpoint: the shared RFC 7523 builder is
-/// called with the PROVIDER-level `client_id` as `iss`/`sub` and the token
-/// endpoint itself as `aud`. Unlike `oauth2_introspection`, this plugin has no
-/// `client_assertion_audience` override — that difference is intentional and
-/// pinned here so folding it into a shared default fails.
-#[tokio::test]
-async fn private_key_jwt_assertion_audience_is_the_token_endpoint() {
+/// Drive one refresh grant through a `private_key_jwt` provider configured
+/// with `client_auth` and return the decoded client-assertion header and
+/// claims, plus the token endpoint the grant was posted to. Also asserts the
+/// request carried no Basic header and no `client_secret`.
+async fn refresh_grant_client_assertion(
+    client_auth: serde_json::Value,
+) -> (serde_json::Value, serde_json::Value, String) {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -3795,14 +3795,7 @@ async fn private_key_jwt_assertion_audience_is_the_token_endpoint() {
 
     let token_endpoint = format!("{}/token", server.uri());
     let mut config = refresh_config(&token_endpoint);
-    config["providers"][0]["client_auth"] = json!({
-        "method": "private_key_jwt",
-        "private_key_jwt_alg": "ES256",
-        "private_key_jwt_kid": "rp-key-1",
-        "private_key_pem": rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-            .expect("P-256 key")
-            .serialize_pem()
-    });
+    config["providers"][0]["client_auth"] = client_auth;
     let plugin =
         OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
     let now = chrono::Utc::now().timestamp();
@@ -3817,43 +3810,149 @@ async fn private_key_jwt_assertion_audience_is_the_token_endpoint() {
     )
     .expect("session seals");
     let mut ctx = session_ctx(&cookie);
-    assert_continue(
-        plugin
-            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
-            .await,
+    let consumers = ConsumerIndex::new(&[]);
+    assert_continue(plugin.authenticate(&mut ctx, &consumers).await);
+    let rolled = rolling_cookie(&plugin, &mut ctx).await;
+    assert!(
+        rolled.is_some(),
+        "the refresh grant authenticates with a client assertion"
     );
-    rolling_cookie(&plugin, &mut ctx)
-        .await
-        .expect("the refresh grant authenticates with a client assertion");
     server.verify().await;
 
     let requests = server.received_requests().await.expect("requests");
-    let form: HashMap<String, String> = url::form_urlencoded::parse(&requests[0].body)
+    let request = requests.first().expect("one token request");
+    let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
         .into_owned()
         .collect();
-    assert!(!requests[0].headers.contains_key("authorization"));
+    assert!(!request.headers.contains_key("authorization"));
     assert!(!form.contains_key("client_secret"));
     assert_eq!(
         form.get("client_assertion_type").map(String::as_str),
         Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
     );
-    let assertion = form.get("client_assertion").expect("client_assertion");
+    let assertion: String = form
+        .get("client_assertion")
+        .cloned()
+        .expect("client_assertion");
     let decode_part = |index: usize| -> serde_json::Value {
         let part = assertion.split('.').nth(index).expect("compact JWT");
-        serde_json::from_slice(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(part)
-                .expect("base64url"),
-        )
-        .expect("JSON")
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .expect("base64url");
+        serde_json::from_slice(&bytes).expect("JSON")
     };
+    let header = decode_part(0);
     let claims = decode_part(1);
+    (header, claims, token_endpoint)
+}
+
+/// `private_key_jwt` on the token endpoint: the shared RFC 7523 builder is
+/// called with the PROVIDER-level `client_id` as `iss`/`sub` and the token
+/// endpoint itself as `aud`. Unlike `oauth2_introspection`, this plugin has no
+/// `client_assertion_audience` override — that difference is intentional and
+/// pinned here so folding it into a shared default fails.
+#[tokio::test]
+async fn private_key_jwt_assertion_audience_is_the_token_endpoint() {
+    let pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("P-256 key")
+        .serialize_pem();
+    let (header, claims, token_endpoint) = refresh_grant_client_assertion(json!({
+        "method": "private_key_jwt",
+        "private_key_jwt_alg": "ES256",
+        "private_key_jwt_kid": "rp-key-1",
+        "private_key_pem": pem
+    }))
+    .await;
     assert_eq!(claims["iss"], json!("ferrum-gateway"));
     assert_eq!(claims["sub"], json!("ferrum-gateway"));
     assert_eq!(claims["aud"], json!(token_endpoint));
-    let header = decode_part(0);
     assert_eq!(header["alg"], json!("ES256"));
     assert_eq!(header["kid"], json!("rp-key-1"));
+}
+
+/// Current OIDC behaviour (suspected bug E, deliberately preserved by the
+/// shared-helper extraction): a non-string `private_key_jwt_alg` falls back to
+/// `RS256` and a non-string `private_key_jwt_kid` to no `kid`, on the wire.
+/// `oauth2_introspection` rejects the same values at admission
+/// (`oauth2_private_key_jwt_rejects_non_string_alg_and_kid`). If bug E is
+/// fixed, this test must change together with a CHANGELOG entry.
+#[tokio::test]
+async fn private_key_jwt_non_string_alg_and_kid_default_to_rs256_without_kid() {
+    const RSA_PEM: &str = include_str!("../../fixtures/test_rsa_private.pem");
+    for (alg, kid) in [
+        (json!(123), json!(456)),
+        (json!(null), json!(null)),
+        (json!(false), json!(["k"])),
+    ] {
+        let label = format!("alg={alg} kid={kid}");
+        let (header, claims, token_endpoint) = refresh_grant_client_assertion(json!({
+            "method": "private_key_jwt",
+            "private_key_jwt_alg": alg,
+            "private_key_jwt_kid": kid,
+            "private_key_pem": RSA_PEM
+        }))
+        .await;
+        assert_eq!(header["alg"], json!("RS256"), "{label}");
+        assert!(header.get("kid").is_none(), "{label}: no kid header");
+        assert_eq!(claims["aud"], json!(token_endpoint), "{label}");
+    }
+}
+
+/// OIDC admission for `private_key_jwt_alg` / `private_key_jwt_kid` typing,
+/// paired with the introspection rejection test: omitted fields and non-string
+/// (numeric, `null`) values are all admitted today (bug E preserved).
+#[test]
+fn private_key_jwt_non_string_alg_and_kid_are_admitted_with_defaults() {
+    const RSA_PEM: &str = include_str!("../../fixtures/test_rsa_private.pem");
+    let cases = [
+        ("omitted alg and kid", json!({})),
+        ("numeric alg", json!({"private_key_jwt_alg": 123})),
+        ("null alg", json!({"private_key_jwt_alg": null})),
+        ("numeric kid", json!({"private_key_jwt_kid": 123})),
+        ("null kid", json!({"private_key_jwt_kid": null})),
+        (
+            "string alg and kid",
+            json!({"private_key_jwt_alg": "RS256", "private_key_jwt_kid": "k1"}),
+        ),
+    ];
+    for (label, extra) in cases {
+        let mut client_auth = json!({
+            "method": "private_key_jwt",
+            "private_key_pem": RSA_PEM
+        });
+        let extra_fields = extra.as_object().expect("object").clone();
+        for (key, value) in extra_fields {
+            client_auth[key.as_str()] = value;
+        }
+        let mut config = base_config();
+        config["providers"][0]["client_auth"] = client_auth;
+        let result = validate_plugin_config("oidc_relying_party", &config);
+        assert!(result.is_ok(), "{label} must be admitted, got: {result:?}");
+    }
+}
+
+/// The key decoder is shared with `oauth2_introspection`, but OIDC keeps its
+/// own diagnostic grammar for every key family (no provider ordinal).
+#[test]
+fn private_key_jwt_decode_errors_keep_the_oidc_diagnostic_grammar() {
+    for (alg, family) in [("RS256", "RSA"), ("ES256", "EC"), ("EdDSA", "EdDSA")] {
+        let mut config = base_config();
+        config["providers"][0]["client_auth"] = json!({
+            "method": "private_key_jwt",
+            "private_key_jwt_alg": alg,
+            "private_key_pem": "-----BEGIN PRIVATE KEY-----\nAAAA\n"
+        });
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("{alg}: an unparseable PEM must be rejected"));
+        let expected =
+            format!("oidc_relying_party: `client_auth.private_key_pem` is invalid {family} PEM");
+        assert!(
+            error.contains(&expected),
+            "{alg}: expected {expected:?}, got: {error}"
+        );
+        assert!(!error.contains("BEGIN"), "{alg}: no key material echoed");
+    }
 }
 
 /// `session.cookie_name`, `session.path`, and `session.domain` are concatenated
@@ -4132,6 +4231,15 @@ fn private_key_jwt_requires_a_key_that_supports_the_selected_algorithm() {
         assert!(
             error.contains("private_key"),
             "unexpected error for {label}: {error}"
+        );
+        // Exact OIDC probe diagnostic (introspection words it differently on
+        // purpose; the shared probe returns a typed error).
+        let expected = format!(
+            "oidc_relying_party: `client_auth.private_key_pem` cannot sign `private_key_jwt_alg` {alg:?}"
+        );
+        assert!(
+            error.contains(&expected),
+            "{label}: expected {expected:?}, got: {error}"
         );
     }
 

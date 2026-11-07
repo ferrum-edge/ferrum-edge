@@ -2043,11 +2043,73 @@ fn oauth2_private_key_jwt_rejects_a_key_the_selected_algorithm_cannot_sign_with(
             error.contains("private_key_pem") && error.contains("private_key_jwt_alg"),
             "{label}: the error must name both fields, got: {error}"
         );
+        // Exact introspection probe diagnostic (the OIDC relying party words
+        // it differently on purpose; the shared probe returns a typed error).
+        let expected = format!(
+            "oauth2_introspection: `provider[0].client_auth.private_key_pem` cannot sign with private_key_jwt_alg=\"{alg}\" (key type, curve, or size mismatch)"
+        );
+        assert!(
+            error.contains(&expected),
+            "{label}: expected {expected:?}, got: {error}"
+        );
         assert!(
             !error.contains("BEGIN"),
             "{label}: the error must not echo key material, got: {error}"
         );
     }
+}
+
+/// Introspection type-checks every `client_auth` field: a non-string (numeric
+/// or `null`) `private_key_jwt_alg` / `private_key_jwt_kid` is refused with a
+/// field-specific error, while omitting either selects the default (`RS256`,
+/// no `kid`). `oidc_relying_party` intentionally differs today (it defaults
+/// non-string values); this pins that only the algorithm TABLE is shared.
+#[test]
+fn oauth2_private_key_jwt_rejects_non_string_alg_and_kid() {
+    const RSA_PEM: &str = include_str!("../../fixtures/test_rsa_private.pem");
+
+    for field in ["private_key_jwt_alg", "private_key_jwt_kid"] {
+        for bad in [json!(123), json!(null)] {
+            let mut config = private_key_jwt_config("RS256", RSA_PEM);
+            config["providers"][0]["client_auth"][field] = bad.clone();
+            let Err(error) = Oauth2Introspection::new(&config, PluginHttpClient::default()) else {
+                panic!("{field}={bad} must be rejected at admission");
+            };
+            let expected =
+                format!("oauth2_introspection: `provider[0].client_auth.{field}` must be a string");
+            assert!(
+                error.contains(&expected),
+                "{field}={bad}: expected {expected:?}, got: {error}"
+            );
+        }
+    }
+
+    // Controls: omitted algorithm defaults to RS256 (the fixture is RSA), and
+    // an omitted or string kid is admitted.
+    let mut omitted_alg = private_key_jwt_config("RS256", RSA_PEM);
+    let removed = omitted_alg["providers"][0]["client_auth"]
+        .as_object_mut()
+        .expect("client_auth object")
+        .remove("private_key_jwt_alg");
+    assert!(removed.is_some());
+    assert!(
+        Oauth2Introspection::new(&omitted_alg, PluginHttpClient::default()).is_ok(),
+        "an omitted private_key_jwt_alg must default to RS256"
+    );
+    let mut string_kid = private_key_jwt_config("RS256", RSA_PEM);
+    string_kid["providers"][0]["client_auth"]["private_key_jwt_kid"] = json!("kid-1");
+    assert!(
+        Oauth2Introspection::new(&string_kid, PluginHttpClient::default()).is_ok(),
+        "a string private_key_jwt_kid must be admitted"
+    );
+    assert!(
+        Oauth2Introspection::new(
+            &private_key_jwt_config("RS256", RSA_PEM),
+            PluginHttpClient::default()
+        )
+        .is_ok(),
+        "an omitted private_key_jwt_kid must be admitted"
+    );
 }
 
 /// The key decoder is shared with `oidc_relying_party`, but each plugin keeps
