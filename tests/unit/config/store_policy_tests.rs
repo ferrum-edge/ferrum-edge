@@ -78,13 +78,15 @@ fn proxy_with_hosts(hosts: &[&str], backend_host: &str) -> Proxy {
 
 #[test]
 fn consumer_identity_values_cover_id_username_and_custom_id_sorted() {
-    let values = consumer_identity_values(&consumer("c-id", "alice", Some("ext-7")));
+    let c = consumer("c-id", "alice", Some("ext-7"));
+    let values = consumer_identity_values(&c);
     assert_eq!(values, vec!["alice", "c-id", "ext-7"]);
 }
 
 #[test]
 fn consumer_identity_values_omit_absent_custom_id() {
-    let values = consumer_identity_values(&consumer("c-id", "alice", None));
+    let c = consumer("c-id", "alice", None);
+    let values = consumer_identity_values(&c);
     assert_eq!(values, vec!["alice", "c-id"]);
 }
 
@@ -93,9 +95,11 @@ fn consumer_identity_values_dedupe_self_collisions() {
     // A consumer whose custom_id equals its own id (or username) is allowed;
     // the index must hold the value once so the consumer does not collide
     // with itself on the primary key / `_id`.
-    let values = consumer_identity_values(&consumer("same", "same", Some("same")));
+    let c = consumer("same", "same", Some("same"));
+    let values = consumer_identity_values(&c);
     assert_eq!(values, vec!["same"]);
-    let values = consumer_identity_values(&consumer("c-id", "alice", Some("c-id")));
+    let c = consumer("c-id", "alice", Some("c-id"));
+    let values = consumer_identity_values(&c);
     assert_eq!(values, vec!["alice", "c-id"]);
 }
 
