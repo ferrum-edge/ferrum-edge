@@ -11476,18 +11476,19 @@ async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
     );
 }
 
-/// Before routing, a prefixed client path selects its trailing
-/// `/Service/Method` provisionally, so a pre-routing short circuit still
-/// stages it; the bound backend path stays authoritative once it exists.
+/// Before routing, the audit's provisional view is EXACT, not canonicalized:
+/// a provisional enrollment reaches rejecting request admission in
+/// `before_proxy`, so a prefixed client path such as
+/// `/api/test.Greeter/SayHello` must not provisionally enroll (and, under a
+/// fail-closed sink policy, refuse) a call whose backend method may be
+/// unenrolled. The bound backend path stays authoritative once it exists.
 #[tokio::test(flavor = "current_thread")]
-async fn grpc_pre_bind_prefixed_client_path_stages_provisionally() {
+async fn grpc_pre_bind_prefixed_client_path_does_not_stage_or_refuse_provisionally() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
-    let plugin = AiTranscriptAudit::new(
-        &config_with_sink(&endpoint, grpc_audit_overrides()),
-        loopback_http_client(),
-    )
-    .expect("valid config");
+    let mut config = config_with_sink(&endpoint, grpc_audit_overrides());
+    config["sink"]["on_sink_error"] = json!("reject");
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).expect("valid config");
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
@@ -11495,29 +11496,33 @@ async fn grpc_pre_bind_prefixed_client_path_stages_provisionally() {
     let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
     let mut headers = grpc_headers();
     ctx.request_body_bytes = Some(Bytes::from(req.clone()));
-    plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(
-        ctx.metadata
-            .get("ai_transcript_audit.candidate")
-            .map(String::as_str),
-        Some("true"),
-        "a prefixed client path names the enrolled method before routing"
+    let early = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(early, PluginResult::Continue),
+        "no provisional admission may refuse an unbound prefixed path"
     );
-
-    // A conflicting bound path refutes the provisional enrollment.
-    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
-        &mut ctx,
-        "/test.Greeter/Other",
-    );
-    plugin
-        .on_final_request_body_with_context(&mut ctx, &headers, &req)
-        .await;
     assert_ne!(
         ctx.metadata
             .get("ai_transcript_audit.candidate")
             .map(String::as_str),
         Some("true"),
-        "the bound backend path refutes the provisional method"
+        "a prefixed client path does not provisionally enroll"
+    );
+
+    // The backend-effective method is a different, unenrolled one.
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/other.Service/SayHello",
+    );
+    let resolved = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
     );
 }
 

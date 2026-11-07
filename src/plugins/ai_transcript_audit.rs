@@ -3138,8 +3138,30 @@ impl AiTranscriptAudit {
     /// key while still suppressing the `ctx.path` fallback — every enrolled gRPC
     /// call would silently escape capture whenever `grpc_method_router` is also
     /// configured. Empty metadata falls back to the request path.
+    ///
+    /// Intentional difference from `body_validator` / `ai_response_guard`:
+    /// only the BOUND path goes through the shared canonical resolution. The
+    /// pre-bind view stays exact (slash-normalized metadata, then the verbatim
+    /// request path) because a provisional enrollment here reaches REJECTING
+    /// request admission in `before_proxy` (sink health, staging capacity
+    /// under a fail-closed policy). Canonicalizing `/api/pkg.Service/Method`
+    /// before routing could refuse a call whose backend-effective method is
+    /// not enrolled at all; the final hook re-decides on the bound path, but a
+    /// `before_proxy` rejection never reaches it.
     fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
-        resolve_grpc_method_path(ctx)
+        if ctx.authorized_backend_path().is_some() {
+            return resolve_grpc_method_path(ctx);
+        }
+        match ctx.metadata.get("grpc_full_method") {
+            Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
+            Some(method) if !method.is_empty() => {
+                let mut path = String::with_capacity(method.len() + 1);
+                path.push('/');
+                path.push_str(method);
+                Cow::Owned(path)
+            }
+            _ => Cow::Borrowed(ctx.path.as_str()),
+        }
     }
 
     fn grpc_capture_applies(&self, ctx: &RequestContext) -> bool {
