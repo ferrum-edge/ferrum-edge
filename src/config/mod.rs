@@ -6,6 +6,8 @@
 //! - `stable_file` — Shared bounded stable-file reader for authoritative config docs
 //! - `batch_atomicity` — Graph-level all-or-nothing vocabulary for `POST /batch`
 //! - `db_loader` — Database config loader with incremental polling
+//! - `store_policy` — Backend-neutral persistence policy shared by the SQL and
+//!   MongoDB stores (identity keyspace, delete-refusal predicates, spec hash)
 //! - `file_loader` — YAML/JSON file loader with version migration
 //! - `gateway_trust` — Namespace-keyed gateway trust-bundle resource
 //! - `config_backup` — On-disk JSON backup for DB-unreachable startup failover
@@ -59,6 +61,7 @@ pub mod public_env_inventory;
 /// In-process database-mode admin write live-apply coordinator (issue #3926).
 #[allow(dead_code)]
 pub mod runtime_config_apply;
+pub mod store_policy;
 /// TEST-ONLY debug-build database outage control for functional fixtures.
 /// See the module docs — not a production configuration surface.
 #[allow(dead_code)] // arm_path / disarm_for_tests are exercised by external unit tests.

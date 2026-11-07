@@ -25,7 +25,7 @@ use percent_encoding::percent_decode_str;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Upper bound, in canonical JSON bytes, on the representation that fences one
 /// namespace snapshot (`GET /backup?conditional=true`, conditional `/restore`,
@@ -509,6 +509,30 @@ impl Default for DbFailoverTopologyStatus {
     }
 }
 
+/// Bounded snapshot of process-local mTLS DNS admission fences (issue #7031).
+///
+/// A fence is retained when a dispatched protected mutation inside an mTLS
+/// DNS admission has an uncertain outcome (cancelled future, network or
+/// write-concern error). While retained, mTLS DNS admissions for the fenced
+/// namespaces fail closed in this process on every topology; reconnect and
+/// failover are NOT blocked. Exposed on authenticated `/health` detail only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MtlsDnsAdmissionFenceStatus {
+    /// Retained fence entries (one per uncertain guard owner).
+    pub retained_fences: usize,
+    /// Sorted, de-duplicated fenced namespaces.
+    pub namespaces: Vec<String>,
+    /// Unix epoch milliseconds of the oldest retained entry.
+    pub oldest_retained_since_unix_ms: Option<u64>,
+}
+
+impl MtlsDnsAdmissionFenceStatus {
+    /// `true` while at least one namespace is fenced.
+    pub fn fenced(&self) -> bool {
+        self.retained_fences > 0
+    }
+}
+
 /// Opaque Admin API mutation pin of the active config-store write topology.
 ///
 /// Holding this value retains a shared read lock on the backend reconnect
@@ -614,6 +638,9 @@ pub struct DbFailoverTopologyState {
     opt_in_during_window: Arc<AtomicBool>,
     /// Conservative process-local fence: an Admin mutation was admitted on failover.
     failover_write_admitted: Arc<AtomicBool>,
+    /// Bumped by every Admin mutation admitted on failover, so a
+    /// [`PrimaryFailbackPermit`] taken before such a write is detectably stale.
+    failover_write_generation: Arc<AtomicU64>,
     /// Ensures the opt-in-enabled signal logs at most once per failover window.
     opt_in_signal_logged: Arc<AtomicBool>,
 }
@@ -633,6 +660,7 @@ impl DbFailoverTopologyState {
             allow_writes: Arc::new(AtomicBool::new(false)),
             opt_in_during_window: Arc::new(AtomicBool::new(false)),
             failover_write_admitted: Arc::new(AtomicBool::new(false)),
+            failover_write_generation: Arc::new(AtomicU64::new(0)),
             opt_in_signal_logged: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -722,13 +750,36 @@ impl DbFailoverTopologyState {
     /// Record a successful return to the configured primary. Emits one failback
     /// summary; when opt-in writes were enabled during the window, that summary
     /// is the bounded divergence-risk marker (issue #3001).
-    pub fn mark_primary(&self, redacted_url: &str) {
-        let was_failover = !self.primary_active.swap(true, Ordering::AcqRel);
+    ///
+    /// Requires the [`PrimaryFailbackPermit`] returned by
+    /// [`Self::ensure_primary_failback_allowed`], so a caller cannot mark the
+    /// primary active without first consulting the failover-write fence
+    /// (issue #7033). Publishers revalidate the permit with
+    /// [`Self::revalidate_primary_failback`] immediately before publishing the
+    /// primary connection, all under one exclusive topology transition.
+    ///
+    /// This never clears the failover-write fence: it holds until the
+    /// operator reconciles and restarts the process. A permit that went stale
+    /// before this call (a broken caller) is logged at error level and the
+    /// fence is left set and visible in status.
+    ///
+    /// `primary_active` is published last, after the window bookkeeping and
+    /// the active URL, so a concurrent [`Self::status`] is less likely to see
+    /// `primary_active = true` next to the failover URL. Status is still not
+    /// one consistent cut across these fields.
+    pub fn mark_primary(&self, permit: PrimaryFailbackPermit, redacted_url: &str) {
+        if self.primary_failback_permit_stale(&permit) {
+            error!(
+                active_url_redacted = %redacted_url,
+                "Primary failback finalized with a stale failback permit: an Admin mutation was admitted on failover after the fence check. The failover-write fence stays set; reconcile the failover changes onto the primary or confirm replication catch-up, then restart this process"
+            );
+        }
         let since = self.failover_since_unix_ms.swap(0, Ordering::AcqRel);
         let opt_in = self.opt_in_during_window.swap(false, Ordering::AcqRel);
         self.opt_in_signal_logged.store(false, Ordering::Release);
         self.active_url_redacted
             .store(Arc::new(Some(redacted_url.to_string())));
+        let was_failover = !self.primary_active.swap(true, Ordering::AcqRel);
         if was_failover || since > 0 {
             let until = Self::now_unix_ms();
             if opt_in {
@@ -751,6 +802,10 @@ impl DbFailoverTopologyState {
 
     /// Record an Admin mutation admitted while the failover topology is pinned.
     pub fn note_admin_write(&self) {
+        if !self.primary_active() {
+            self.failover_write_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
         if !self.primary_active()
             && self
                 .failover_write_admitted
@@ -769,12 +824,54 @@ impl DbFailoverTopologyState {
     }
 
     /// Prevent a stale recovered primary from replacing failover-side writes.
-    pub fn ensure_primary_failback_allowed(&self) -> Result<(), anyhow::Error> {
+    ///
+    /// On success returns the [`PrimaryFailbackPermit`] that
+    /// [`Self::mark_primary`] consumes. The permit records the failover-write
+    /// generation it was issued at; see [`Self::revalidate_primary_failback`].
+    pub fn ensure_primary_failback_allowed(&self) -> Result<PrimaryFailbackPermit, anyhow::Error> {
+        // Read the generation before the fence so a write admitted between
+        // the two loads makes the permit stale rather than slipping past it.
+        let fence_generation = self.failover_write_generation.load(Ordering::Acquire);
         if self.primary_active() || !self.failover_write_admitted.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(PrimaryFailbackPermit { fence_generation });
         }
         Err(PrimaryFailbackFenced.into())
     }
+
+    /// Fallible freshness check for a permit, run immediately before the
+    /// primary connection is published. Refuses with [`PrimaryFailbackFenced`]
+    /// when an Admin mutation was admitted on failover after the permit was
+    /// issued, so a stale permit aborts before anything is published.
+    pub fn revalidate_primary_failback(
+        &self,
+        permit: &PrimaryFailbackPermit,
+    ) -> Result<(), anyhow::Error> {
+        if self.primary_failback_permit_stale(permit) {
+            return Err(PrimaryFailbackFenced.into());
+        }
+        Ok(())
+    }
+
+    fn primary_failback_permit_stale(&self, permit: &PrimaryFailbackPermit) -> bool {
+        if self.failover_write_generation.load(Ordering::Acquire) != permit.fence_generation {
+            return true;
+        }
+        !self.primary_active() && self.failover_write_admitted.load(Ordering::Acquire)
+    }
+}
+
+/// Proof that [`DbFailoverTopologyState::ensure_primary_failback_allowed`]
+/// passed. Only that method constructs it, and
+/// [`DbFailoverTopologyState::mark_primary`] consumes it, so "mark the primary
+/// active only after the failover-write fence was checked" is enforced by the
+/// type system rather than by call-site convention (issue #7033). It carries
+/// the failover-write generation it was issued at, so
+/// [`DbFailoverTopologyState::revalidate_primary_failback`] can refuse it
+/// once a later failover write has been admitted.
+#[derive(Debug)]
+#[must_use = "a primary failback permit is only useful when passed to mark_primary"]
+pub struct PrimaryFailbackPermit {
+    fence_generation: u64,
 }
 
 /// Typed policy refusal so reconnect loops can skip a stale primary without
@@ -2200,6 +2297,23 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
 
     /// Record an Admin mutation admitted while the failover topology is pinned.
     fn note_failover_admin_write(&self) {}
+
+    /// Process-local mTLS DNS admission fences retained after an uncertain
+    /// protected mutation outcome (issue #7031). Default: none, for backends
+    /// whose admission fence is only the durable lock row.
+    fn mtls_dns_admission_fence_status(&self) -> MtlsDnsAdmissionFenceStatus {
+        MtlsDnsAdmissionFenceStatus::default()
+    }
+
+    /// Hand off a multi-step admission guard that its caller is abandoning
+    /// with an uncertain mutation outcome (it will never call
+    /// [`Self::release_mtls_dns_admission_guard`]). The backend must keep the
+    /// durable fence and fail closed for the namespace, but must not keep a
+    /// process-wide reconnect pin for the guard. Synchronous: called from
+    /// `Drop`. Default no-op.
+    fn retain_uncertain_mtls_dns_admission_guard(&self, namespace: &str, guard_owner: &str) {
+        let _ = (namespace, guard_owner);
+    }
 
     /// Acquire a mutation-only pin of the current write topology.
     ///

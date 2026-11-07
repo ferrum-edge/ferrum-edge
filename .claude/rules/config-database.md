@@ -87,7 +87,11 @@ paths:
   a write-topology pin (SQL reconnect `RwLock` read / Mongo distinct
   `admin_write_topology` `RwLock` read) retained for the full persistence
   lifetime so a reconnect cannot redirect an already-admitted write; Mongo
-  admission continues to pin only `connection_generation` (publication
+  admission continues to pin only `connection_generation` (an uncertain
+  mutation never keeps that pin: it becomes an explicit per-namespace
+  `AdmissionFence` checked under the pin, surfaced on authenticated `/health`
+  and `ferrum_database_mtls_dns_admission_fences_retained`, cleared only by a
+  probe of the ORIGINAL bundle proving the owner-qualified lock absent; publication
   `try_write`s Admin topology then generation, both fail-fast; failover marks
   before publish and primary marks after publish, both under those guards).
   Managed TLS/ACME handlers use the non-topology write gate only (read-only +

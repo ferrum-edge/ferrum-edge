@@ -3014,16 +3014,21 @@ fn try_create_plugin(
     country_mmdb_load_session: &CountryMmdbLoadSession,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
     current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     staged_tcp_throttle_states: &mut TcpConnectionThrottleInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
+    debug_assert!(
+        std::ptr::eq(route_override_memo.config(), gateway_config),
+        "a route-override memo must belong to the generation being built"
+    );
     let created = if pc.plugin_name == "adaptive_concurrency" {
         create_adaptive_concurrency_plugin(
             pc,
-            gateway_config,
             http_client,
             current_adaptive_states,
             staged_adaptive_states,
+            route_override_memo,
         )
     } else if pc.plugin_name == "geo_restriction" {
         crate::plugins::geo_restriction::GeoRestriction::new_with_load_session(
@@ -3743,6 +3748,7 @@ fn try_create_plugin_for_cache(
     country_mmdb_instances: &mut CountryMmdbPluginInstanceMap,
     current_adaptive_states: &AdaptiveConcurrencyInstanceMap,
     staged_adaptive_states: &mut AdaptiveConcurrencyInstanceMap,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
     current_tcp_throttle_states: &TcpConnectionThrottleInstanceMap,
     staged_tcp_throttle_states: &mut TcpConnectionThrottleInstanceMap,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
@@ -3761,6 +3767,7 @@ fn try_create_plugin_for_cache(
             country_mmdb_load_session,
             current_adaptive_states,
             staged_adaptive_states,
+            route_override_memo,
             current_tcp_throttle_states,
             staged_tcp_throttle_states,
         )?
@@ -3844,7 +3851,9 @@ struct AdaptiveConcurrencyRouteOverride {
     /// at all, so editing it can move traffic between destinations that are
     /// all already route keys.
     trigger: Option<crate::config::plugin_trigger::PluginTrigger>,
-    destination_fingerprint: serde_json::Value,
+    /// Shared across every protected proxy the config attaches to: it is
+    /// resolved once per pass by [`RouteOverrideFactsMemo`].
+    destination_fingerprint: Arc<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -4194,34 +4203,142 @@ fn route_override_priority(pc: &PluginConfig) -> u16 {
 ///
 /// `ai_federation` does so only on its streaming path (issue #3298); with
 /// `streaming` disabled it makes its own plugin-client call outside proxy
-/// dispatch, so it contributes no route destination.
+/// dispatch, so it contributes no route destination. This is a scan predicate
+/// evaluated for every config against every protected proxy, so it checks
+/// `streaming.enabled` alone and never resolves the provider plan: the plan
+/// is built once per pass, only for configs that also attach to a protected
+/// proxy (issue #7018).
 fn plugin_config_writes_route_overrides(pc: &PluginConfig) -> bool {
     match pc.plugin_name.as_str() {
         "ai_stream_router" | "mcp_gateway" | "mesh_route_dispatch" => true,
-        "ai_federation" => crate::plugins::ai_federation::stream_route_plan(&pc.config).is_some(),
+        "ai_federation" => crate::plugins::ai_federation::streaming_enabled(&pc.config),
         _ => false,
     }
 }
 
+/// The proxy-independent part of one route-override config's contribution to
+/// an `adaptive_concurrency` route definition.
+struct RouteOverrideFacts {
+    destination_fingerprint: Arc<serde_json::Value>,
+    /// `ai_federation` streaming destinations `(dial host, port)` in dispatch
+    /// order. Empty for every other route-override plugin, whose destinations
+    /// depend on the proxy (upstream subsets, backend ports) and are collected
+    /// per proxy.
+    federation_destinations: Vec<(String, u16)>,
+}
+
+/// Memoizes [`RouteOverrideFacts`] for one candidate generation, keyed by the
+/// config's index in `GatewayConfig::plugin_configs`.
+///
+/// A config attached to many protected proxies, or shared by many adaptive
+/// policies, is otherwise resolved once per proxy and per policy, and for
+/// `ai_federation` that means a provider loop, a sort, and one URL parse per
+/// provider for the fingerprint and again for the destinations (issue #7018).
+/// One memo is owned by each cache build (full, incremental, or composition
+/// candidate) and threaded through the retain, rebuild-scope, and plugin
+/// creation passes, so every adaptive policy in that build shares it. Facts
+/// are resolved lazily, only when an adaptive policy's route definition asks
+/// for them.
+///
+/// The memo borrows the one `GatewayConfig` whose indexes it is keyed by, and
+/// route definitions read that config from the memo, so it can never serve
+/// facts for a different generation.
+struct RouteOverrideFactsMemo<'cfg> {
+    config: &'cfg GatewayConfig,
+    by_config_index: HashMap<usize, RouteOverrideFacts>,
+}
+
+impl<'cfg> RouteOverrideFactsMemo<'cfg> {
+    fn new(config: &'cfg GatewayConfig) -> Self {
+        Self {
+            config,
+            by_config_index: HashMap::new(),
+        }
+    }
+
+    fn config(&self) -> &'cfg GatewayConfig {
+        self.config
+    }
+
+    /// Facts for `pc`, which must be `self.config().plugin_configs[config_index]`.
+    fn facts(&mut self, config_index: usize, pc: &PluginConfig) -> &RouteOverrideFacts {
+        debug_assert!(
+            self.config
+                .plugin_configs
+                .get(config_index)
+                .is_some_and(|indexed| std::ptr::eq(indexed, pc)),
+            "route-override facts must be keyed by the memo's own config"
+        );
+        self.by_config_index
+            .entry(config_index)
+            .or_insert_with(|| route_override_facts(pc))
+    }
+}
+
+thread_local! {
+    /// `ai_federation` route plans resolved on this thread, so a test can prove
+    /// a build resolves each config's plan once (issue #7018). Thread-local so
+    /// a parallel cache build on another test thread cannot perturb the count.
+    static AI_FEDERATION_ROUTE_PLAN_RESOLUTIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Number of `ai_federation` streaming route plans resolved on the calling
+/// thread since it started.
+#[doc(hidden)]
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call through its wrapper.
+pub fn ai_federation_route_plan_resolutions_for_test() -> u64 {
+    AI_FEDERATION_ROUTE_PLAN_RESOLUTIONS.with(Cell::get)
+}
+
+fn route_override_facts(pc: &PluginConfig) -> RouteOverrideFacts {
+    if pc.plugin_name != "ai_federation" {
+        return RouteOverrideFacts {
+            destination_fingerprint: Arc::new(route_override_destination_fingerprint(pc)),
+            federation_destinations: Vec::new(),
+        };
+    }
+    AI_FEDERATION_ROUTE_PLAN_RESOLUTIONS.with(|count| count.set(count.get().saturating_add(1)));
+    // One plan serves both the fingerprint and the destinations.
+    let plan = crate::plugins::ai_federation::stream_route_plan(&pc.config);
+    let federation_destinations: Vec<(String, u16)> = plan
+        .iter()
+        .flat_map(|plan| plan.providers.iter())
+        .filter_map(|provider| provider.destination.as_ref())
+        .map(|destination| (destination.host.clone(), destination.port))
+        .collect();
+    let destination_fingerprint = plan
+        .and_then(|plan| serde_json::to_value(plan).ok())
+        .unwrap_or_else(|| serde_json::json!({"streaming": false}));
+    RouteOverrideFacts {
+        destination_fingerprint: Arc::new(destination_fingerprint),
+        federation_destinations,
+    }
+}
+
+/// The route-override configs effective on `proxy`, in execution order, each
+/// paired with its index in `config.plugin_configs` (the
+/// [`RouteOverrideFactsMemo`] key).
 fn effective_route_override_configs_for_proxy<'a>(
     proxy: &crate::config::types::Proxy,
     config: &'a GatewayConfig,
-) -> Vec<&'a PluginConfig> {
+) -> Vec<(usize, &'a PluginConfig)> {
     let mut route_configs = Vec::new();
 
     // Match PluginCache construction order before its stable
     // `(priority, name)` sort: globals, then proxy-scoped configs, then
     // proxy-group configs, each class in ascending plugin-config id. Only the
     // few matching route-override configs are ordered, never the whole set.
-    let by_canonical_id = |left: &&PluginConfig, right: &&PluginConfig| {
+    let by_canonical_id = |(_, left): &(usize, &PluginConfig),
+                           (_, right): &(usize, &PluginConfig)| {
         left.id
             .cmp(&right.id)
             .then_with(|| left.namespace.cmp(&right.namespace))
     };
-    let mut globals: Vec<&PluginConfig> = config
+    let mut globals: Vec<(usize, &PluginConfig)> = config
         .plugin_configs
         .iter()
-        .filter(|pc| {
+        .enumerate()
+        .filter(|(_, pc)| {
             pc.scope == PluginScope::Global
                 && plugin_config_writes_route_overrides(pc)
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
@@ -4229,10 +4346,11 @@ fn effective_route_override_configs_for_proxy<'a>(
         .collect();
     globals.sort_by(by_canonical_id);
     route_configs.extend(globals);
-    let mut scoped: Vec<&PluginConfig> = config
+    let mut scoped: Vec<(usize, &PluginConfig)> = config
         .plugin_configs
         .iter()
-        .filter(|pc| {
+        .enumerate()
+        .filter(|(_, pc)| {
             pc.scope == PluginScope::Proxy
                 && plugin_config_writes_route_overrides(pc)
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
@@ -4241,17 +4359,17 @@ fn effective_route_override_configs_for_proxy<'a>(
     scoped.sort_by(by_canonical_id);
     route_configs.extend(scoped);
     for association in proxy_plugin_associations_in_canonical_order(proxy) {
-        if let Some(pc) = config.plugin_configs.iter().find(|pc| {
+        if let Some(entry) = config.plugin_configs.iter().enumerate().find(|(_, pc)| {
             pc.id == association.plugin_config_id
                 && pc.namespace == proxy.namespace
                 && pc.scope == PluginScope::ProxyGroup
                 && plugin_config_writes_route_overrides(pc)
                 && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
         }) {
-            route_configs.push(pc);
+            route_configs.push(entry);
         }
     }
-    route_configs.sort_by(|left, right| {
+    route_configs.sort_by(|(_, left), (_, right)| {
         route_override_priority(left)
             .cmp(&route_override_priority(right))
             .then_with(|| left.plugin_name.cmp(&right.plugin_name))
@@ -4275,6 +4393,9 @@ fn url_destination_fingerprint(url: &str) -> serde_json::Value {
     serde_json::Value::String(url.to_string())
 }
 
+/// Fingerprint of a non-`ai_federation` route-override config. `ai_federation`
+/// is fingerprinted by [`route_override_facts`], which builds its plan once
+/// for both the fingerprint and the destinations.
 fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Value {
     match pc.plugin_name.as_str() {
         "mesh_route_dispatch" => {
@@ -4354,9 +4475,6 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
                 "rules": rules
             })
         }
-        "ai_federation" => crate::plugins::ai_federation::stream_route_plan(&pc.config)
-            .and_then(|plan| serde_json::to_value(plan).ok())
-            .unwrap_or_else(|| serde_json::json!({"streaming": false})),
         "ai_stream_router" => {
             let enabled = pc
                 .config
@@ -4503,6 +4621,7 @@ fn route_override_destination_fingerprint(pc: &PluginConfig) -> serde_json::Valu
 
 fn collect_route_override_destinations(
     route_pc: &PluginConfig,
+    facts: &RouteOverrideFacts,
     proxy: &crate::config::types::Proxy,
     key_by: AdaptiveConcurrencyKeyBy,
     config: &GatewayConfig,
@@ -4511,16 +4630,8 @@ fn collect_route_override_destinations(
 ) {
     match route_pc.plugin_name.as_str() {
         "ai_federation" => {
-            let Some(plan) = crate::plugins::ai_federation::stream_route_plan(&route_pc.config)
-            else {
-                return;
-            };
-            for destination in plan
-                .providers
-                .iter()
-                .filter_map(|provider| provider.destination.as_ref())
-            {
-                push_direct_route_key(keys, key_by, proxy, &destination.host, destination.port);
+            for (host, port) in &facts.federation_destinations {
+                push_direct_route_key(keys, key_by, proxy, host, *port);
             }
         }
         "mesh_route_dispatch" => {
@@ -4642,11 +4753,14 @@ fn collect_route_override_destinations(
     }
 }
 
+/// The route definition of adaptive policy `pc` in the generation the memo
+/// was created for; the config is read from the memo so the two cannot drift.
 fn adaptive_concurrency_route_definition(
     pc: &PluginConfig,
     key_by: AdaptiveConcurrencyKeyBy,
-    config: &GatewayConfig,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
 ) -> AdaptiveConcurrencyRouteDefinition {
+    let config = route_override_memo.config();
     let mut protected_proxy_keys = Vec::new();
     let mut keys = Vec::new();
     let mut overrides = Vec::new();
@@ -4657,9 +4771,11 @@ fn adaptive_concurrency_route_definition(
         }
         protected_proxy_keys.push(proxy_runtime_key(proxy));
 
-        for route_pc in effective_route_override_configs_for_proxy(proxy, config) {
+        for (config_index, route_pc) in effective_route_override_configs_for_proxy(proxy, config) {
+            let facts = route_override_memo.facts(config_index, route_pc);
             collect_route_override_destinations(
                 route_pc,
+                facts,
                 proxy,
                 key_by,
                 config,
@@ -4671,7 +4787,7 @@ fn adaptive_concurrency_route_definition(
                 plugin_name: route_pc.plugin_name.clone(),
                 effective_priority: route_override_priority(route_pc),
                 trigger: route_pc.trigger.clone(),
-                destination_fingerprint: route_override_destination_fingerprint(route_pc),
+                destination_fingerprint: Arc::clone(&facts.destination_fingerprint),
             });
         }
 
@@ -4842,8 +4958,9 @@ fn adaptive_concurrency_lb_key_space_changed(
 
 fn retained_adaptive_concurrency_states(
     current: &AdaptiveConcurrencyInstanceMap,
-    config: &GatewayConfig,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
 ) -> AdaptiveConcurrencyInstanceMap {
+    let config = route_override_memo.config();
     let mut retained = HashMap::new();
     for pc in &config.plugin_configs {
         if !pc.enabled
@@ -4854,8 +4971,11 @@ fn retained_adaptive_concurrency_states(
         }
         let identity = adaptive_concurrency_policy_id(pc);
         if let Some(existing) = current.get(&identity) {
-            let route_definition =
-                adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+            let route_definition = adaptive_concurrency_route_definition(
+                pc,
+                existing.config.key_by,
+                route_override_memo,
+            );
             if adaptive_definition_matches(existing, pc, &route_definition) {
                 retained.insert(identity, existing.clone());
             }
@@ -4891,10 +5011,11 @@ fn adaptive_concurrency_policy_is_active(pc: &PluginConfig, config: &GatewayConf
 
 fn include_adaptive_concurrency_route_rebuilds(
     current: &AdaptiveConcurrencyInstanceMap,
-    config: &GatewayConfig,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
     proxy_ids_to_rebuild: &mut HashSet<NamespacedResourceId>,
     rebuild_adaptive_globals: &mut bool,
 ) {
+    let config = route_override_memo.config();
     for (identity, existing) in current {
         let Some(pc) = config.plugin_configs.iter().find(|pc| {
             pc.enabled
@@ -4905,7 +5026,7 @@ fn include_adaptive_concurrency_route_rebuilds(
             continue;
         };
         let route_definition =
-            adaptive_concurrency_route_definition(pc, existing.config.key_by, config);
+            adaptive_concurrency_route_definition(pc, existing.config.key_by, route_override_memo);
         if route_definition == existing.route_definition {
             continue;
         }
@@ -4944,16 +5065,17 @@ fn include_adaptive_concurrency_route_rebuilds(
 
 fn create_adaptive_concurrency_plugin(
     pc: &PluginConfig,
-    gateway_config: &GatewayConfig,
     http_client: &PluginHttpClient,
     current: &AdaptiveConcurrencyInstanceMap,
     staged: &mut AdaptiveConcurrencyInstanceMap,
+    route_override_memo: &mut RouteOverrideFactsMemo<'_>,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     let identity = adaptive_concurrency_policy_id(pc);
     let parsed = Arc::new(crate::plugins::adaptive_concurrency::parse_config_value(
         &pc.config,
     )?);
-    let route_definition = adaptive_concurrency_route_definition(pc, parsed.key_by, gateway_config);
+    let route_definition =
+        adaptive_concurrency_route_definition(pc, parsed.key_by, route_override_memo);
     if let Some(existing) = staged.get(&identity) {
         if !adaptive_definition_matches(existing, pc, &route_definition) {
             return Err(format!(
@@ -5270,6 +5392,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
     let mut staged_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
+    let mut route_override_memo = RouteOverrideFactsMemo::new(config);
     let country_mmdb_load_session = CountryMmdbLoadSession::default();
     let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
     let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
@@ -5332,6 +5455,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                 &country_mmdb_load_session,
                 &current_adaptive_states,
                 &mut staged_adaptive_states,
+                &mut route_override_memo,
                 &current_tcp_throttle_states,
                 &mut staged_tcp_throttle_states,
             )
@@ -5383,6 +5507,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
                 &country_mmdb_load_session,
                 &current_adaptive_states,
                 &mut staged_adaptive_states,
+                &mut route_override_memo,
                 &current_tcp_throttle_states,
                 &mut staged_tcp_throttle_states,
             )
@@ -8076,9 +8201,10 @@ impl PluginCache {
         let current = self.inner.load();
         let mut expanded_proxy_ids = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
+        // A preload-scope query, not a build: it owns its own memo.
         include_adaptive_concurrency_route_rebuilds(
             &current.adaptive_concurrency_instances,
-            config,
+            &mut RouteOverrideFactsMemo::new(config),
             &mut expanded_proxy_ids,
             &mut rebuild_adaptive_globals,
         );
@@ -8262,15 +8388,21 @@ impl PluginCache {
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
+        // One route-override memo for this candidate generation, shared by the
+        // rebuild-scope expansion, the retain pass, and every adaptive policy
+        // created below (issue #7018).
+        let mut route_override_memo = RouteOverrideFactsMemo::new(config);
         include_adaptive_concurrency_route_rebuilds(
             &current.adaptive_concurrency_instances,
-            config,
+            &mut route_override_memo,
             &mut proxy_ids_to_rebuild,
             &mut rebuild_adaptive_globals,
         );
         let mut global_plugins_changed = rebuild_globals || rebuild_adaptive_globals;
-        let mut adaptive_concurrency_instances =
-            retained_adaptive_concurrency_states(&current.adaptive_concurrency_instances, config);
+        let mut adaptive_concurrency_instances = retained_adaptive_concurrency_states(
+            &current.adaptive_concurrency_instances,
+            &mut route_override_memo,
+        );
         let mut tcp_connection_throttle_instances = retained_tcp_connection_throttle_states(
             &current.tcp_connection_throttle_instances,
             config,
@@ -8304,6 +8436,7 @@ impl PluginCache {
                     country_mmdb_load_session,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     &current.tcp_connection_throttle_instances,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -8404,6 +8537,7 @@ impl PluginCache {
                     &mut country_mmdb_instances,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     &current.tcp_connection_throttle_instances,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -8438,6 +8572,7 @@ impl PluginCache {
                         &mut country_mmdb_instances,
                         &current.adaptive_concurrency_instances,
                         &mut adaptive_concurrency_instances,
+                        &mut route_override_memo,
                         &current.tcp_connection_throttle_instances,
                         &mut tcp_connection_throttle_instances,
                     ) {
@@ -8480,6 +8615,7 @@ impl PluginCache {
                     &mut country_mmdb_instances,
                     &current.adaptive_concurrency_instances,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     &current.tcp_connection_throttle_instances,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -8667,6 +8803,7 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             &current.tcp_connection_throttle_instances,
                             &mut tcp_connection_throttle_instances,
                         ) {
@@ -8730,6 +8867,7 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             &current.adaptive_concurrency_instances,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             &current.tcp_connection_throttle_instances,
                             &mut tcp_connection_throttle_instances,
                         ) {
@@ -9350,8 +9488,11 @@ impl PluginCache {
             CountryMmdbLoadSession::claim(&config.country_mmdb_file_dependency_paths())?;
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+        // One route-override memo for this candidate generation, shared by the
+        // retain pass and every adaptive policy created below (issue #7018).
+        let mut route_override_memo = RouteOverrideFactsMemo::new(config);
         let mut adaptive_concurrency_instances =
-            retained_adaptive_concurrency_states(current_adaptive_states, config);
+            retained_adaptive_concurrency_states(current_adaptive_states, &mut route_override_memo);
         let mut country_mmdb_instances = CountryMmdbPluginInstanceMap::new();
         let mut tcp_connection_throttle_instances =
             retained_tcp_connection_throttle_states(current_tcp_throttle_states, config);
@@ -9401,6 +9542,7 @@ impl PluginCache {
                 &mut country_mmdb_instances,
                 current_adaptive_states,
                 &mut adaptive_concurrency_instances,
+                &mut route_override_memo,
                 current_tcp_throttle_states,
                 &mut tcp_connection_throttle_instances,
             ) {
@@ -9431,6 +9573,7 @@ impl PluginCache {
                     &mut country_mmdb_instances,
                     current_adaptive_states,
                     &mut adaptive_concurrency_instances,
+                    &mut route_override_memo,
                     current_tcp_throttle_states,
                     &mut tcp_connection_throttle_instances,
                 ) {
@@ -9502,6 +9645,7 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             current_tcp_throttle_states,
                             &mut tcp_connection_throttle_instances,
                         ) {
@@ -9558,6 +9702,7 @@ impl PluginCache {
                             &mut country_mmdb_instances,
                             current_adaptive_states,
                             &mut adaptive_concurrency_instances,
+                            &mut route_override_memo,
                             current_tcp_throttle_states,
                             &mut tcp_connection_throttle_instances,
                         ) {

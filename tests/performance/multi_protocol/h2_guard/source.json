@@ -39,8 +39,8 @@
   },
   "context_files": {
     "src/admin/mod.rs": {
-      "before": "4c59e368cb4eab0f4887ba8953697c00d14bc85a7e4206076506a7e6b7e80857",
-      "after": "e766cb73766691261791bbbe02ac84626db03c0463303b05c176cc7b04fc3c85"
+      "before": "de902b18d70fdc2c8a2802c53425177eea2cf90e2e301ee2040d3759fb58f210",
+      "after": "4641b2878d7c69ae4a727cb58a05c0cc2243c6136e5b668caab109f8e12e813d"
     }
   }
 }

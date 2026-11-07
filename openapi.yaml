@@ -776,6 +776,15 @@ paths:
         response, including certificate chains, is capped at 1 MiB while streaming.
         When Ferrum is built without the feature this endpoint returns
         `501 Not Implemented`.
+
+        A new order id is always admitted. An existing id returns `409` unless
+        `allow_overwrite` is set, and an overwrite must be a legal order
+        lifecycle move: the new order is `pending_challenges`, so only a stored
+        `pending_challenges` order can be replaced. Replacing a `ready` or
+        `processing` order (backwards) or a terminal `valid`, `failed`, or
+        `cancelled` order (reopening it) returns `409`. Both refusals happen
+        before any directory request, so no CA order is created for a write
+        that cannot land.
       tags: [TLS]
       requestBody:
         required: true
@@ -855,7 +864,11 @@ paths:
         order after the selected challenge is reachable. The same HTTPS,
         same-origin, shared 30-second fresh-DNS/TCP deadline, 64-address DNS limit,
         public-egress checks, and 1 MiB streaming response cap used for initial
-        issuance apply to this renewal.
+        issuance apply to this renewal. An explicit `id` that names an existing
+        order follows the same rules as `POST /admin/tls/acme/orders`: `409`
+        without `allow_overwrite`, and `409` when the stored order is not
+        `pending_challenges` (a terminal order is never reopened and an active
+        one never moves backwards), both before any directory request.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -963,7 +976,20 @@ paths:
         completed by a renewal, deleted, or otherwise rewritten meanwhile, the
         order is left unchanged; a successful finalization then returns `409`
         (an already stored certificate stays stored), while a directory-reported
-        `invalid` result still returns `502`. `409` is also returned, before any directory
+        `invalid` result still returns `502`. Finalize is idempotent for an
+        order that is already complete: when the stored order is `valid`, was
+        finalized into the certificate this request names, and that stored
+        certificate carries the same `order_url` (it is the certificate this CA
+        order produced), the endpoint returns `200` with the usual
+        `{order, certificate}` body. A repeat of a finalize that already
+        succeeded is answered before any directory request. When a renewal or
+        a concurrent finalize completes the same CA order while this request is
+        in its directory I/O, the request still performs that I/O, then finds
+        the order and certificate already published and also returns `200`,
+        whether or not `allow_overwrite` is set (without it, the existing
+        certificate record is not replaced). Any other terminal or changed
+        order, and an existing certificate record from another CA order, stays
+        `409`. `409` is also returned, before any directory
         request, when the certificate the order is persisted under (the
         request's `certificate_id`, else the order's) already has another
         active order as its latest order.
@@ -987,7 +1013,9 @@ paths:
               $ref: "#/components/schemas/AcmeOrderFinalizeRequest"
       responses:
         "200":
-          description: ACME order finalized and certificate persisted
+          description: >-
+            ACME order finalized and certificate persisted, or the order was
+            already finalized into this certificate (idempotent repeat)
           content:
             application/json:
               schema:
@@ -5798,6 +5826,14 @@ paths:
         instead of detaching them; send `"plugins": []` to clear them
         explicitly.
 
+        **Masked secrets.** Stored backend TLS private-key material (an inline
+        PEM key in `backend_tls_client_key_path`, or a private-key block in the
+        certificate or CA field) is returned to `operator` and `viewer` reads
+        as `[REDACTED]`. A `PUT` (or `POST /proxies`) by an `operator` whose
+        body carries that placeholder in one of those fields is rejected with
+        `400` and nothing is mutated. Send the real key or a reference with the
+        change. `admin` reads are raw, so an admin round trip is unaffected.
+
         In database mode a `200` means a covering `config_changes` generation
         is live on this process. If reload cannot apply, the API returns `503`
         with `applied: false` even though the row is durable.
@@ -7143,6 +7179,14 @@ paths:
         the token, and `If-Match` would not catch it. Send the real token, or
         omit it to clear it: the full replace does not keep the stored token.
         `admin` reads are raw, so an admin round trip is unaffected.
+
+        Stored TLS private-key material is likewise returned to `operator` and
+        `viewer` reads as `[REDACTED]`: an inline PEM key in
+        `backend_tls_client_key_path`, `port_overrides.<port>.tls.client_key_path`
+        or `subsets[].traffic_policy.tls.private_key`, or a private-key block in
+        any certificate or CA field. An `operator` body that echoes that
+        placeholder in those fields is rejected with `400`. Send the real key or
+        a reference with the change.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -10044,6 +10088,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >-
+            Replace an existing order with the same id. Only a stored
+            `pending_challenges` order can be replaced; any other stored state is
+            an illegal lifecycle transition and returns `409`.
 
     AcmeOrderFinalizeRequest:
       type: object
@@ -10108,7 +10156,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
-          description: Replace an existing order with the same id.
+          description: >-
+            Replace an existing order with the same id. Only a stored
+            `pending_challenges` order can be replaced; any other stored state is
+            an illegal lifecycle transition and returns `409`.
 
     ManagedTlsRecordListResponse:
       type: object
@@ -10998,6 +11049,9 @@ components:
             optional pkcs11 build feature. Module overrides require admission by
             FERRUM_PKCS11_MODULE_ALLOWED_PATHS on each node. Without that policy,
             omit module options to use FERRUM_PKCS11_MODULE_PATH. Max 4096 characters.
+            Inline PEM key material is withheld from every non-admin read
+            (`[REDACTED]`; a fingerprint in `GET /config/export`); references
+            stay visible.
             When admin namespace-claim enforcement is on, or the token carries
             an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
@@ -15093,6 +15147,9 @@ components:
             With the optional pkcs11 build feature, also accepts a pkcs11 signer
             URI. Module overrides require FERRUM_PKCS11_MODULE_ALLOWED_PATHS on
             each node; without it, omit module options to use FERRUM_PKCS11_MODULE_PATH.
+            Inline PEM key material is withheld from every non-admin read
+            (`[REDACTED]`; a fingerprint in `GET /config/export`); references
+            stay visible.
             When admin namespace-claim enforcement is on, or the token carries
             an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
@@ -15384,7 +15441,11 @@ components:
           description: Client-certificate path required by `mutual` mode.
         private_key:
           type: [string, "null"]
-          description: Private-key path required by `mutual` mode.
+          description: >-
+            Private-key source required by `mutual` mode. Inline PEM key
+            material is withheld from every non-admin Upstream read
+            (`[REDACTED]`; a fingerprint in `GET /config/export`); references
+            stay visible.
         subject_alt_names:
           type: array
           items:
@@ -15460,6 +15521,10 @@ components:
         client_key_path:
           type: [string, "null"]
           minLength: 1
+          description: >-
+            Private-key source. Inline PEM key material is withheld from every
+            non-admin Upstream read (`[REDACTED]`; a fingerprint in
+            `GET /config/export`); references stay visible.
         server_ca_cert_path:
           type: [string, "null"]
           minLength: 1
@@ -16828,6 +16893,8 @@ components:
                       type: integer
             failover_topology:
               $ref: "#/components/schemas/DatabaseFailoverTopology"
+            mtls_dns_admission_fence:
+              $ref: "#/components/schemas/DatabaseMtlsDnsAdmissionFence"
         fips:
           type: object
           description: |
@@ -19215,6 +19282,43 @@ components:
             Credential-free redaction of the active DB URL (`redact_url`).
             Never contains userinfo.
 
+    DatabaseMtlsDnsAdmissionFence:
+      type: object
+      description: |
+        Authenticated `/health` detail only. Present while this gateway process
+        retains at least one MongoDB mTLS DNS admission fence: a protected
+        config-store mutation inside an mTLS DNS admission was dispatched and
+        its outcome is uncertain (cancelled, network, write-concern, or
+        unknown-commit-result error), so it may still commit. While fenced,
+        mTLS DNS admissions for the listed namespaces fail closed with 503 in
+        this process on every topology; other namespaces are unaffected and
+        reconnect/failover are NOT blocked. Exit: verify the write outcome,
+        then remove the owner-qualified `mtls_dns_admission_locks` document on
+        the original database; the next admission attempt for the namespace
+        re-verifies against the original connection and clears the fence. The
+        fence is process-local and is not coordinated across gateway replicas.
+        Mirrored by the `ferrum_database_mtls_dns_admission_fences_retained`
+        gauge.
+      required: [fenced, retained_fences, namespaces]
+      properties:
+        fenced:
+          type: boolean
+          description: Always `true` when the object is present.
+        retained_fences:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Retained fence entries (one per uncertain guard owner).
+        namespaces:
+          type: array
+          description: Sorted, de-duplicated namespaces whose mTLS DNS admissions are fenced.
+          items:
+            type: string
+        oldest_retained_since_unix_ms:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the oldest retained fence was recorded.
+
     DatabaseDeltaPollingHealth:
       type: object
       description: |
@@ -20410,6 +20514,9 @@ components:
               type: integer
         proxies:
           type: array
+          description: >-
+            Proxies with stored backend TLS private-key material, and any URL
+            carrying userinfo, rendered as a `CredentialFingerprint`.
           items:
             $ref: "#/components/schemas/Proxy"
         consumers:
@@ -20426,7 +20533,9 @@ components:
         upstreams:
           type: array
           description: >-
-            Upstreams with `service_discovery.consul.token` rendered as a
+            Upstreams with `service_discovery.consul.token`, and stored TLS
+            private-key material in the top-level, `port_overrides.<port>.tls`
+            and `subsets[].traffic_policy.tls` slots, rendered as a
             `CredentialFingerprint` when set.
           items:
             $ref: "#/components/schemas/Upstream"

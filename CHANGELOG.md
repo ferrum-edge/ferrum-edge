@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **`ferrum_xds_warming_partial_applies_total` is no longer exported**
+  (#7027). The xDS data plane only builds a mesh slice once every required
+  type (CDS/EDS/LDS/RDS/ECDS) reports the same `version_info`, so a slice is
+  never applied under version skew and the counter could never leave 0.
+  Remove any dashboard panel or alert that queries it. Required-version skew
+  is still visible as a waiting state through `convergence.version_skew` on
+  the JWT-authenticated `GET /mesh/config-drift`.
+
 ### Fixed
 - **Non-admin plugin-config reads withhold header values, match operands and
   selector tokens.** `viewer` and `operator` reads of plugin configs
@@ -43,6 +52,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused with `400`. `admin` reads and `GET /backup` stay raw. The collector,
   JWKS, control-plane and federation URLs in a `mesh_authz` `mesh_slice` now
   get the same structural endpoint projection as other collector URLs.
+- **Non-admin admin-API reads no longer return inline backend TLS private
+  keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
+  inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,
+  `GET /upstreams[/{id}]`), admin audit diffs and `GET /config/export`
+  returned it verbatim, as they did inline keys that a mesh DestinationRule
+  placed in an upstream's `port_overrides.<port>.tls.client_key_path` or
+  `subsets[].traffic_policy.tls.private_key`. Every non-admin projection now
+  withholds stored private-key material in every TLS slot (and a private-key
+  block anywhere else in the resource, such as a certificate-plus-key bundle
+  in a certificate or CA field) as `[REDACTED]`, or a keyed fingerprint in the
+  export; paths and `k8s://`, `vault://`, `managed://`, `system://` and other
+  references stay visible, and `admin` reads stay raw. An `operator` write that
+  echoes the placeholder back is refused with `400`, so it cannot replace the
+  stored key; send the real key or a reference with the change.
 - **HTTP/3 WebSocket handshakes strip the same request headers as H1/H2.**
   The H3 frontend's backend WebSocket handshake kept its own hop-by-hop list
   and forwarded a client's `Content-Length` and `Expect` and the internal
@@ -50,6 +73,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, which the H1/H2 handshake already stripped. Both frontends now use
   one shared predicate; H3 still replaces `Early-Data` itself and drops
   pseudo-headers.
+- **One ambiguous MongoDB mTLS DNS admission write no longer disables
+  reconnect and failover** (#7031). A cancelled or uncertain protected
+  mutation used to keep a `connection_generation` read pin for the life of the
+  process, so every later MongoDB reconnect or `FERRUM_DB_FAILOVER_URLS`
+  failover failed fast until restart. It now retains an explicit
+  per-namespace admission fence instead: mTLS DNS admissions for that
+  namespace keep failing closed on every topology, while reconnect and
+  failover proceed. After an operator verifies the write outcome and removes
+  the owner-qualified `mtls_dns_admission_locks` document, the next admission
+  attempt re-verifies through the original connection and clears the fence
+  without a restart. Retained fences appear on authenticated `/health`
+  (`database.mtls_dns_admission_fence`) and as the
+  `ferrum_database_mtls_dns_admission_fences_retained` gauge.
+- **Admin restore keeps its mTLS DNS fence on a half-restored namespace**
+  (#7032). The restore's "multi-phase restore is incomplete" hold shared one
+  state with per-mutation tracking, so a completed import that returned
+  errors settled it; if the compensating rollback was then never polled (for
+  example namespace admission failing before it started) or the request was
+  cancelled, guard Drop released the fence over a cleared, partially imported
+  namespace on SQL backends. The restore phase is now tracked separately
+  (cleared, imported, rolled back, rollback incomplete), and both the explicit
+  release and Drop keep the fence until the import succeeds or the rollback
+  completes. A rollback that runs but fails now retains the fence too: the
+  `500` response keeps `rollback: "incomplete"` and says the guard was
+  retained, and recovery follows the `unknown_outcome` procedure. A guard
+  reacquired for recovery gets the incomplete phase inside its acquisition
+  task, so cancelling during reacquisition no longer releases it. A nested
+  mutation restores the prior uncertain state instead of settling it.
+- **The stock xDS client applies a staged ACKed slice when its NACK breaker
+  trips** (#7029). When five consecutive invalid responses of one type arrived
+  inside the 25 ms debounce window, the `stock_xds` client closed the stream
+  and dropped the already-ACKed slice it had staged, so the data plane kept
+  serving the previous slice while the control plane considered the newer one
+  delivered. Like the Ferrum `xds` client, it now applies that slice before the
+  stream closes on any response-handling error. It still discards the slice
+  when the bearer credential that produced it has rotated, been invalidated, or
+  passed its deadline.
+- **A failed SQL failback no longer leaves the primary pool live behind
+  failover topology** (#7033). On a store bootstrapped from
+  `FERRUM_DB_CONFIG_BACKUP_PATH`, a primary failback published the primary pool
+  before running the deferred migrations, and a migration failure returned with
+  that pool live while `/status` still named the failover URL. With
+  `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, Admin writes then landed on the
+  primary while being recorded as failover writes, fencing the next failback
+  onto a failover database that did not have them. Deferred migrations now run
+  on the newly connected pool before it is published, so after a failure the
+  previous pool and topology are still in place. `mark_primary` now requires
+  the permit that the failback-fence check returns; the permit is revalidated
+  right before the primary pool or connection is published, so an Admin write
+  admitted on failover in the meantime aborts the failback with nothing
+  published. The fence is never cleared by a failback. Status fields are still
+  read separately, so `/status` can briefly show a mixed view while a
+  transition is in progress, but that view no longer persists after an error.
+- **Streaming `ai_federation` providers with an empty `aws_region` are
+  adaptive route keys** (#7018). The constructor treats `"aws_region": ""` as
+  absent, so an OpenAI-compatible provider carrying it streams to its
+  `base_url` host, but the route plan read the raw value, failed region
+  validation, and left that provider without a destination. A later move of
+  its host then kept the `adaptive_concurrency` policy's learned limits and
+  admitted the new destination untracked. The plan now resolves the field
+  exactly as the constructor does. Each plugin-cache build also resolves a
+  federation config's plan once, shared by every adaptive policy and reload
+  pass, instead of once per protected proxy, policy, and pass, and only for
+  configs with `streaming.enabled` that are effective on a protected proxy.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
@@ -60,6 +147,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loading is retried before each CNI request and recovers without a restart;
   malformed or invalid content stays rejected until the file is repaired and
   the node-agent restarts.
+- **A withdrawn inbound redirect port no longer stays redirect-eligible after
+  a partial scope write** (#7025). If the node-agent wrote a pod's widened
+  inbound redirect scope and then failed the pod-IP flag (or IPv6) write, a
+  later event reverting to the previously tracked ports returned early and the
+  withdrawn port stayed in the BPF scope. While a redirect write is pending the
+  node-agent now rewrites the full scope on every event and clears the pending
+  failure once it converges. A failed pod-IP move gets the same treatment:
+  the abandoned target address is recorded, a later event (even one that
+  reverts to the tracked address) re-converges the tracked address and removes
+  the abandoned scope, instead of leaving the record pending for the pod's
+  lifetime. Pod removal now drops every live-pod capture
+  failure record, including the redirect one it used to miss, so a removed pod
+  no longer pins the node in `partially_attached` or makes every retry tick
+  retract and republish the Ambient UDP registry proof. A failed cgroup program
+  detach is also retained, so its retry is no longer reported as successful
+  while the pod's cgroup still exists. Per-pod capture failures are now typed
+  records rather than parsed strings.
 - **Node-agent readiness stays withdrawn while an Ambient UDP registry proof
   retraction is pending** (#7024). A failed retraction of a published
   `.udp-registry-synced` marker left the proof counted as published, so the
@@ -74,6 +178,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphaned handshake markers only when `/health` was ready, so an unproved
   ingress topology or a withheld migration proof left producers for removed
   pods waiting. Both now depend only on the completed pod relist.
+- **Every ACME order write now goes through the order lifecycle table**
+  (#7028). The renewal's final `valid` write was still a blind upsert under the
+  lease, so it recreated an order an operator deleted mid-renewal (and
+  overwrote one rewritten meanwhile); it is now the same compare-and-set admin
+  finalize uses. When the order is no longer current the issued certificate is
+  still published and reloaded and the renewal counts as renewed, but the
+  order is left as it is. `POST /admin/tls/acme/orders` and
+  `POST /admin/tls/acme/renew/{id}` with `allow_overwrite` could replace any
+  order, including reopening a `valid`, `failed` or `cancelled` one; a
+  replacement must now be a legal lifecycle move (only a stored
+  `pending_challenges` order can be replaced by the new `pending_challenges`
+  one) and is otherwise refused with `409` before any CA request. Finalizing an
+  order that is already `valid` and whose stored certificate is the one that
+  CA order produced (same `order_url`) now returns `200` with the usual body
+  instead of `409`, whether it was completed by an earlier finalize or by a
+  renewal while the request was in flight. Scheduled renewal now signs with the
+  certificate's account credentials from the shared account store and falls
+  back to the latest order's only when the store has none, so an older order
+  restamped by a terminal write can no longer make renewal use a stale account
+  key.
 - **ACME order finalization no longer overwrites concurrent work or revives
   terminal orders** (#7020). `POST /admin/tls/acme/orders/{id}/finalize` read
   the order, spent up to its poll timeout on CA I/O, then wrote its result back

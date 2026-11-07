@@ -453,6 +453,11 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 # `admin_writes_enabled` is the config-database mutation signal (CRUD/specs/
 # batch/restore); managed TLS/ACME stores are independent and are not gated by
 # sticky DB failover topology.
+# While a MongoDB mTLS DNS admission fence is retained after an uncertain
+# protected mutation, authenticated `database.mtls_dns_admission_fence`
+# ({"fenced":true,"retained_fences":N,"namespaces":[...],
+#   "oldest_retained_since_unix_ms":...}) is present; admissions for those
+# namespaces fail closed while reconnect/failover stay available.
 ```
 
 Service-discovery task lifecycle and bounded staleness drive the same coarse fields: a restarting, crash-looping, stale, or withdrawn upstream sets `status: "degraded"` while staying ready after a configured `withdraw` has published successfully. An expired upstream configured with `fail_readiness`, or a default `withdraw` upstream whose fail-closed withdrawal publication is still retrying, flips `ready: false` with `status: "unavailable"` and HTTP 503. Background task transitions precompute this fixed-cardinality coarse projection, so the unauthenticated probe remains an O(1), lock-free snapshot load rather than walking configured upstreams. The authenticated tier adds a `service_discovery` object with process aggregates plus per-upstream detail (provider, task state, stale/withdrawn flags, effective policy and window, last-success age, restart and consecutive-failure counts, and a closed-set `last_error` token) — never a registry URL, Consul/Kubernetes token, or response payload. `/metrics` carries only the fixed-cardinality `ferrum_service_discovery_*` aggregates; the namespaced upstream id is deliberately never a Prometheus label.
@@ -461,7 +466,7 @@ A terminating process reports `status: "draining"`, `ready: false`, and HTTP 503
 
 Unauthenticated callers receive only `status` and `ready` (enough for a readiness probe) with the correct status code — 503 `"starting"` until the gateway is ready, 200 otherwise. Active remote JWKS trust still drives those coarse fields without leaking detail: grace keeps `ready: true` with `status: "degraded"`; expiry flips `ready: false` with `status: "unavailable"` and HTTP 503; with no active remote JWKS the coarse shape stays neutral. The probe path is an O(1) ArcSwap load plus monotonic deadline comparison — it never walks attacker-sized cache state.
 
-The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require the authenticated tier described under [Authentication](#authentication); a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens).
+The detailed diagnostics (DB type/pool stats, optional `database.failover_topology`, optional `database.mtls_dns_admission_fence` (see [mongodb.md](mongodb.md#retained-mtls-dns-admission-fences)), cached-config proxy/consumer counts, `database_polling` degradation, `config_rejected`, mesh state, sanitized listener failures, fixed-cardinality `jwks_trust` fresh/grace/expired counts with per-state max ages — never URLs, kids, tokens, claims, or key material — and the `service_discovery` block described below) require the authenticated tier described under [Authentication](#authentication); a namespace-bounded JWT gets the [tenant tier](#tenant-tier-for-namespace-bounded-tokens).
 
 - **Data-plane mode**: authenticated detail additionally includes a fixed-cardinality `dp_config` object; `cp_disconnected_seconds` there measures how long the DP has been without usable applied configuration (`0` only after a snapshot is accepted and applied, not on bare transport connect).
 - **Database mode**: the authenticated response includes `database_polling`; repeated rejected incremental deltas set `status: "degraded"` (also visible unauthenticated) while the gateway keeps serving the last known-good config. The poll task is respawned after an unexpected exit while last-known-good config continues to serve.
@@ -704,6 +709,8 @@ Every ACME response body, including an issued certificate chain, is limited to 1
 
 `challenge_type` defaults to `http01`; set it to `tls_alpn01` to prepare TLS-ALPN-01 challenge material or `dns01` to prepare DNS-01 TXT material. HTTP-01 responses include public key-authorization values and challenge paths. TLS-ALPN-01 responses include the SNI identifier, token, `acme-tls/1` ALPN protocol, and base64url SHA-256 digest embedded in the validation certificate's critical `acmeIdentifier` extension. DNS-01 responses include the identifier, token, TXT record name, and TXT value. While an order is `pending_challenges`, `ready`, or `processing`, proxy listeners serve HTTP-01 key authorizations at `/.well-known/acme-challenge/{token}` before normal route matching, and TLS listeners return the TLS-ALPN-01 validation certificate when the ClientHello offers only `acme-tls/1` and SNI matches an active challenge. DNS-01 TXT records must be published in authoritative DNS before finalization. Account credentials are persisted in the order store for follow-up ACME calls but are never returned.
 
+A new order id is always admitted. Re-using an existing id returns `409` unless the request sets `allow_overwrite`, and an overwrite is an order status write like any other, so it must be a legal lifecycle move. The replacement is a freshly prepared `pending_challenges` order, so only a stored `pending_challenges` order can be replaced: overwriting a `ready` or `processing` order would move it backwards, and overwriting a `valid`, `failed`, or `cancelled` order would reopen a terminal one, so both return `409` with an error naming the order and the two states. Both refusals happen before any directory request, so no CA order is created for a write that cannot land; the store re-checks under its lock. `POST /admin/tls/acme/renew/{cert_id}` with an explicit `id` follows the same rules.
+
 `GET /admin/tls/acme/accounts` lists non-secret account identifiers, ACME directory URLs, order/certificate counts, whether resumable credentials exist, and last-seen timestamps. It merges credentials from order records and the dedicated `acme-accounts.json` account store, but never returns credential material.
 
 After DNS points at the gateway and the HTTP-01 challenge path or TLS-ALPN-01 listener is externally reachable, or after DNS-01 TXT records are published, finalize the order:
@@ -717,7 +724,11 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Finalization re-reads the order's current state from the ACME directory and drives it from there: a `pending` order has its prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges marked ready and is polled to readiness before being finalized; a `ready` order is finalized exactly once with the CSR generated when the order was created; a `processing` or `valid` order is *not* finalized again, because that finalize already landed — its certificate is retrieved and paired with the private key persisted at creation time. An `invalid` order fails closed. Ferrum then fetches the PEM certificate chain, persists it as the order's `certificate_id`, and asks active TLS source watchers to re-pull. The stored certificate can then be used through `acme://certificates/edge-cert#cert` and `acme://certificates/edge-cert#key`.
 
-Only an active order (`pending_challenges`, `ready`, or `processing`) can be finalized. `valid`, `failed`, and `cancelled` are terminal: finalizing one returns `409` before any directory request, so create a new order instead. Finalization marks the order `failed` only when the ACME directory reports it `invalid`; a network error, poll timeout, or local certificate validation failure returns the error and leaves the order active, so the same request can be retried. The final order write is a compare-and-set on the order as it was read before the directory I/O: if a renewal completed the order, an operator deleted it, or anything else rewrote it while finalization was in flight, the order is left untouched. For a successful finalization the endpoint then returns `409` (the issued certificate, when one was already stored, stays stored and TLS source watchers are asked to re-pull it); a directory-reported `invalid` result still returns the directory error (`502`), whether or not its best-effort `failed` write applied. The order is persisted under the `certificate_id` the request names (else its own `certificate_id`, else the order id); finalizing returns `409` before any directory request when that certificate's latest order is another active order, because the finalized order would otherwise hide it from renewal.
+Only an active order (`pending_challenges`, `ready`, or `processing`) can be finalized. `valid`, `failed`, and `cancelled` are terminal: finalizing one returns `409` before any directory request, so create a new order instead. Finalization marks the order `failed` only when the ACME directory reports it `invalid`; a network error, poll timeout, or local certificate validation failure returns the error and leaves the order active, so the same request can be retried. The final order write is a compare-and-set on the order as it was read before the directory I/O: if a renewal completed the order, an operator deleted it, or anything else rewrote it while finalization was in flight, the order is left untouched. For a successful finalization the endpoint then returns `409` (the issued certificate, when one was already stored, stays stored and TLS source watchers are asked to re-pull it); a directory-reported `invalid` result still returns the directory error (`502`), whether or not its best-effort `failed` write applied.
+
+Finalize is idempotent for an order that is already complete. When the stored order is `valid`, was finalized into the certificate this request resolves to, and the stored certificate carries the same `order_url` — so it is the certificate this CA order produced — the endpoint returns `200` with the same `{order, certificate}` body as a fresh finalization. A repeated finalize after one that already succeeded is answered before any directory request. When a renewal or a concurrent finalize completes the same CA order while this request is in its directory I/O, the request still performs that I/O, then finds the order and certificate already published and also returns `200` — with or without `allow_overwrite` (without it, the existing certificate record is left as it is instead of returning `409`). Every other terminal or changed order — `failed`, `cancelled`, a `valid` order whose certificate came from another order or is missing, a deleted or rewritten order — and an existing certificate record from another CA order still return `409`.
+
+The order is persisted under the `certificate_id` the request names (else its own `certificate_id`, else the order id); finalizing returns `409` before any directory request when that certificate's latest order is another active order, because the finalized order would otherwise hide it from renewal.
 
 The private key and CSR are generated when the order is created and stored with the order, which is what makes finalization retryable after a crash. They are never returned by any endpoint and never appear in `GET /admin/tls/acme/orders` output. An order whose material is missing or unusable is rejected with `400` before any directory request using a fixed diagnostic that never describes the material.
 
@@ -732,7 +743,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Ferrum reuses persisted account credentials from the latest order for that certificate when available. The request accepts the same `challenge_type` values as order creation. The response is a new order whose selected challenges must become reachable before calling `/admin/tls/acme/orders/{id}/finalize`.
 
-Automatic renewal can be enabled with `FERRUM_ACME_AUTO_RENEW_ENABLED=true`. The scheduler reuses persisted account credentials, renews certificates inside `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS`, and finalizes HTTP-01/TLS-ALPN-01 renewals after Ferrum stores their challenge material. For DNS-01 renewals, set `FERRUM_ACME_DNS01_HOOK_COMMAND` to an executable that creates and cleans up provider TXT records; Ferrum passes the challenge through `FERRUM_ACME_DNS01_*` environment variables, waits `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, then finalizes the order.
+Automatic renewal can be enabled with `FERRUM_ACME_AUTO_RENEW_ENABLED=true`. The scheduler reuses persisted account credentials — the certificate's own account from the shared `acme-accounts.json` store, falling back to the latest order's credentials only when that store has none for the account — renews certificates inside `FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS`, and finalizes HTTP-01/TLS-ALPN-01 renewals after Ferrum stores their challenge material. For DNS-01 renewals, set `FERRUM_ACME_DNS01_HOOK_COMMAND` to an executable that creates and cleans up provider TXT records; Ferrum passes the challenge through `FERRUM_ACME_DNS01_*` environment variables, waits `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, then finalizes the order.
 
 ## Managed TLS Records
 
@@ -1459,6 +1470,9 @@ their place. For the roles that can write:
 
 - **`operator` reads of upstreams** replace `service_discovery.consul.token`
   with `[REDACTED]`.
+- **`operator` reads of proxies and upstreams** replace stored backend TLS
+  private-key material with `[REDACTED]` (see
+  [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads)).
 - **`operator` reads of plugin configs** use the redacted plugin-config
   projection described under [Plugin Configs](#plugin-configs): `[REDACTED]`
   for secrets, structural endpoint URLs retain markers for each stripped
@@ -1468,12 +1482,12 @@ their place. For the roles that can write:
   as `redis://redacted@host:port/db`; one with a query projects as
   `redis://host:port/db?[REDACTED_QUERY]`.
 
-`admin` reads of these resources are raw, and `operator` reads of proxies keep
-URL userinfo verbatim, so neither has anything to write back.
+`admin` reads of these resources are raw, and `operator` reads of proxies and
+upstreams keep URL userinfo verbatim, so neither has anything to write back.
 
-A `POST` or `PUT` of an upstream or plugin config whose body carries one of those
-placeholders at a field the caller's read projection masks is refused with `400`
-and nothing is mutated (issue #5925). Without this check, an operator tool that
+A `POST` or `PUT` of a proxy, upstream, or plugin config whose body carries one
+of those placeholders at a field the caller's read projection masks is refused
+with `400` and nothing is mutated (issue #5925). Without this check, an operator tool that
 reads a resource, edits an unrelated field, and writes the body back would store
 the literal placeholder as the secret. `If-Match` cannot catch it: the `ETag`
 covers the full stored resource, so the masked body's tag still matches. The
@@ -1511,6 +1525,42 @@ are also `admin`-only, and their credential projection has its own round-trip
 rule: a `[REDACTED]` credential entry is restored from the stored entry (see
 [Consumers](#consumers)).
 
+### Backend TLS private keys in reads
+
+Proxies and upstreams name TLS material in several places, and each accepts
+inline PEM as well as a reference:
+
+| Slot | Private-key field | Certificate / CA fields |
+| --- | --- | --- |
+| Proxy and Upstream top level | `backend_tls_client_key_path` | `backend_tls_client_cert_path`, `backend_tls_server_ca_cert_path` |
+| Upstream `port_overrides.<port>.tls` (DestinationRule `portLevelSettings[].tls`) | `client_key_path` | `client_cert_path`, `server_ca_cert_path` |
+| Upstream `subsets[].traffic_policy.tls` (DestinationRule subset `trafficPolicy.tls`) | `private_key` | `client_certificate`, `ca_certificates` |
+
+Non-admin projections never return stored private-key material: `viewer` and
+`operator` reads (single and list, from the database or a cached snapshot),
+write responses to an `operator`, admin audit diffs, and `GET /config/export`
+(as a fingerprint at the field's exact JSON pointer, for example
+`/port_overrides/443/tls/client_key_path`) all withhold it. `admin` reads and
+`/backup` stay raw.
+
+- **Withheld.** In a private-key field, any value that is or may be inline
+  material: PEM armour (`-----BEGIN`, in any case) anywhere in the value, or a
+  line break or other control character, neither of which a path or typed URI
+  contains. In a certificate or CA field, and in any other string of the
+  resource, a value that carries a PEM private-key block (for example a
+  certificate-plus-key bundle pasted into the certificate field). The field
+  names are matched wherever they occur in the body, so a TLS slot nested
+  somewhere new is covered the same way.
+- **Visible.** References name the material without disclosing it and are
+  returned verbatim: a filesystem path, `k8s://`, `vault://`, `aws://`,
+  `azure://`, `gcp://`, `managed://`, `acme://`, `pkcs11://` and `system://`
+  sources. Inline certificates and CA bundles are public and stay visible.
+
+An `operator` write that echoes the `[REDACTED]` placeholder back in any of
+these fields is refused with `400`, exactly as described above, and the stored
+key is untouched. Because the certificate and key must be set together,
+omitting the key does not clear it; send the real key (an inline PEM key or a
+reference) with the change, or have an `admin` make it.
 
 ### Conditional writes (`ETag` / `If-Match`)
 
@@ -2017,12 +2067,15 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
     per entry.
   - In plugin configs, fingerprints replace secrets and credential-bearing
     URLs, including URLs whose path or query would otherwise be masked.
-  - Upstream `service_discovery.consul.token` gets a fingerprint, and any URL
-    carrying userinfo anywhere in a Proxy or Upstream (a Consul `address`,
-    for example) is fingerprinted. `viewer` reads and audit diffs strip that
-    userinfo to `redacted@` as well. `operator` and `admin` reads of proxies
-    and upstreams keep it verbatim: both roles write those resources, and a
-    GET-then-PUT must not replace stored userinfo with `redacted@`.
+  - Upstream `service_discovery.consul.token` gets a fingerprint, as does
+    stored backend TLS private-key material in a Proxy or Upstream (see
+    [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads));
+    key references stay verbatim. Any URL carrying userinfo anywhere in a
+    Proxy or Upstream (a Consul `address`, for example) is fingerprinted.
+    `viewer` reads and audit diffs strip that userinfo to `redacted@` as well.
+    `operator` and `admin` reads of proxies and upstreams keep it verbatim:
+    both roles write those resources, and a GET-then-PUT must not replace
+    stored userinfo with `redacted@`.
 
   A value the viewer projection shows is shown verbatim.
 - **Hidden credential types.** Ordinary Consumer reads omit `basicauth` and

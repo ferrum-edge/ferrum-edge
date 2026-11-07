@@ -315,7 +315,7 @@ impl TestGateway {
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
-        wait_for_tcp_port_inner("proxy", self.proxy_port, remaining).await
+        wait_for_tcp_port_inner("proxy", self.proxy_port, Instant::now() + remaining, None).await
     }
 
     /// Explicit shutdown. Safe to call multiple times; subsequent calls are
@@ -2055,7 +2055,16 @@ async fn wait_for_gateway_identity(
     timeout: Duration,
     mut child: Option<&mut Child>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = Client::builder().timeout(Duration::from_secs(2)).build()?;
+    // No idle pooling: every probe opens a fresh connection, so it observes
+    // whichever listener owns the admin port *now*. A pooled keep-alive
+    // connection stays attached to the responder that accepted it, so a
+    // foreign process that answered an early probe and then released the port
+    // could otherwise keep answering every later probe until the deadline.
+    // (The bespoke spawners this replaced renewed their client every 1 s.)
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .pool_max_idle_per_host(0)
+        .build()?;
     let deadline = Instant::now() + timeout;
     let mut last_observation = String::from("no response yet");
     loop {
@@ -2112,6 +2121,50 @@ pub async fn probe_gateway_identity(
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     wait_for_gateway_identity(admin_port, observability_token, timeout, None).await
+}
+
+/// Health-only readiness barrier bound to a bespoke spawner's `child`.
+///
+/// This is the testing rules' *explicit health-only alternative* to
+/// [`wait_for_owned_gateway_identity`], and the same wait [`TestGateway`]
+/// takes when admin-auth verification is off. It succeeds once the admin port
+/// answers `/health` in the authenticated detail tier for
+/// `observability_token` with `ready: true`, and fails as soon as
+/// `Child::try_wait` reports that `child` exited: before every probe and
+/// again after a successful one.
+///
+/// It is readiness, **not** JWT ownership. `/health` detail is also granted by
+/// `FERRUM_METRICS_ALLOWED_CIDRS`, so a foreign gateway with a matching CIDR
+/// grant can satisfy it. Spawners that can mint a [`SpawnedGatewayIdentity`]
+/// should prefer [`wait_for_owned_gateway_identity`].
+///
+/// Callers that dial a TCP listener afterwards share one deadline with
+/// [`wait_for_child_tcp_accept`] so the second stage cannot extend `timeout`.
+pub async fn wait_for_child_gateway_readiness(
+    child: &mut Child,
+    admin_port: u16,
+    observability_token: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_gateway_identity(admin_port, observability_token, timeout, Some(child)).await
+}
+
+/// Poll `127.0.0.1:port` with a raw TCP connect until it accepts, bound to
+/// `child`: `Child::try_wait` runs before every connect and again after a
+/// successful one, so a child that died after proving readiness fails instead
+/// of handing the caller whatever listener claimed its released port. Fails
+/// without connecting once `deadline` (normally the one shared with
+/// [`wait_for_child_gateway_readiness`]) has passed.
+///
+/// A TCP accept proves nothing about identity on its own; call this only
+/// after [`wait_for_child_gateway_readiness`] or
+/// [`wait_for_owned_gateway_identity`] succeeded for the same `child`.
+pub async fn wait_for_child_tcp_accept(
+    child: &mut Child,
+    port: u16,
+    deadline: Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wait_for_tcp_port_inner("listener", port, deadline, Some(child)).await
 }
 
 /// Fail-fast ownership barrier for a spawned child.
@@ -2201,26 +2254,77 @@ async fn wait_for_admin_auth_inner(
     }
 }
 
+/// Poll a TCP accept until the absolute `deadline`. The caller's `Instant` is
+/// compared directly, never re-derived from a sampled remaining duration, so a
+/// shared deadline cannot be extended by the time between the caller's read
+/// and this loop's first check.
 async fn wait_for_tcp_port_inner(
     label: &str,
     port: u16,
-    timeout: Duration,
+    deadline: Instant,
+    mut child: Option<&mut Child>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deadline = Instant::now() + timeout;
+    // Diagnostic only: the budget left when this stage started.
+    let budget = deadline.saturating_duration_since(Instant::now());
     let mut last_err: Option<std::io::Error> = None;
     loop {
+        if let Some(child) = child.as_deref_mut() {
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "gateway process exited with {status} before its {label} port {port} \
+                         accepted TCP connections"
+                    )
+                    .into());
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "could not confirm gateway process is still alive while waiting for \
+                         its {label} port {port} (try_wait failed: {err})"
+                    )
+                    .into());
+                }
+            }
+        }
         if Instant::now() >= deadline {
             let observation = last_err
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no response yet".to_string());
             return Err(format!(
-                "gateway {label} port {port} did not accept TCP connections within {timeout:?} (last observation: {observation})"
+                "gateway {label} port {port} did not accept TCP connections before the shared \
+                 deadline ({budget:?} remained when this stage started; last observation: \
+                 {observation})"
             )
             .into());
         }
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(stream) => {
                 drop(stream);
+                // A child that died between the pre-connect check and this
+                // accept no longer owns the port: the accept may belong to a
+                // listener that claimed it after the child released it.
+                if let Some(child) = child.as_deref_mut() {
+                    match child.try_wait() {
+                        Ok(None) => {}
+                        Ok(Some(status)) => {
+                            return Err(format!(
+                                "gateway process exited with {status} while its {label} port \
+                                 {port} accepted a TCP connection; that accept may belong to \
+                                 another listener"
+                            )
+                            .into());
+                        }
+                        Err(err) => {
+                            return Err(format!(
+                                "could not confirm gateway process is still alive after its \
+                                 {label} port {port} accepted a TCP connection (try_wait \
+                                 failed: {err})"
+                            )
+                            .into());
+                        }
+                    }
+                }
                 return Ok(());
             }
             Err(err) => {
@@ -2898,6 +3002,464 @@ mod ownership_proof_tests {
 
         let _ = child.wait();
         listener.abort();
+    }
+
+    // ── Health-only child-bound barrier for bespoke spawners ──────────────
+    //
+    // `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept` are the
+    // shared barrier of the bespoke functional spawners (websocket, a2a,
+    // grpc_plugins, otel_ldap, overload, passthrough, scripted UDP).
+
+    fn live_child() -> Child {
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live child")
+    }
+
+    fn exited_child() -> Child {
+        let mut child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn exiting child");
+        let _ = child.wait().expect("reap exited child");
+        child
+    }
+
+    #[tokio::test]
+    async fn child_readiness_rejects_child_that_already_exited() {
+        // The responder answers ready detail to anyone, so only the child
+        // check can reject this attempt.
+        let (port, listener) = spawn_fake_admin(FakeAdminBehavior::CidrHealthJwtRejected).await;
+        let mut child = exited_child();
+
+        let err = wait_for_child_gateway_readiness(
+            &mut child,
+            port,
+            "dead-child-token",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("an exited child must not attach to a ready foreign responder")
+        .to_string();
+        assert!(
+            err.contains("exited") && err.contains("(last observation: no response yet)"),
+            "the child must be checked before the first probe, got: {err}"
+        );
+
+        listener.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_readiness_rejects_child_killed_at_health_success_boundary() {
+        let mut child = live_child();
+        let pid = child.id();
+        let (port, listener) = spawn_fake_admin(FakeAdminBehavior::KillChildThenHealth {
+            pid,
+            killed: Arc::new(AtomicBool::new(false)),
+        })
+        .await;
+
+        let err = wait_for_child_gateway_readiness(
+            &mut child,
+            port,
+            "boundary-token",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("child death at health success must fail readiness")
+        .to_string();
+        assert!(
+            err.contains("exited")
+                && err.contains("(last observation: authenticated /health ready)"),
+            "the child must be re-checked after a successful probe, got: {err}"
+        );
+        assert!(
+            !err.contains("boundary-token"),
+            "diagnostics must not echo the credential: {err}"
+        );
+
+        let _ = child.wait();
+        listener.abort();
+    }
+
+    /// Read one HTTP/1 request head. `false` on EOF or error.
+    async fn read_request_head(stream: &mut TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => {
+                    request.extend_from_slice(&chunk[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first accepted connection is a stale foreign responder: it answers
+    /// every request on it with unauthenticated-tier `/health` and keeps the
+    /// connection alive. Every later connection reaches the current owner of
+    /// the port, which answers ready detail and closes.
+    async fn spawn_stale_keepalive_then_ready_admin() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind fake admin");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            let mut accepted = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted += 1;
+                let stale = accepted == 1;
+                tokio::spawn(async move {
+                    while read_request_head(&mut stream).await {
+                        let (body, connection) = if stale {
+                            (r#"{"status":"ok","ready":true}"#, "keep-alive")
+                        } else {
+                            (
+                                r#"{"status":"ok","ready":true,"cached_config":{"available":true}}"#,
+                                "close",
+                            )
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: {connection}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                        if !stale {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    /// Characterization of the replaced per-site loops, which renewed their
+    /// HTTP client every 1 s: a keep-alive connection held by a foreign
+    /// responder must not pin readiness to it. A fresh connection reaches the
+    /// listener that owns the port now, so the wait recovers within budget.
+    #[tokio::test]
+    async fn child_readiness_is_not_pinned_to_a_stale_keepalive_connection() {
+        let (port, admin) = spawn_stale_keepalive_then_ready_admin().await;
+        let mut child = live_child();
+
+        wait_for_child_gateway_readiness(&mut child, port, "fresh-token", Duration::from_secs(5))
+            .await
+            .expect("a fresh connection must reach the ready responder within the budget");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        admin.abort();
+    }
+
+    /// Runs once, after the first `/health` answer has been written.
+    type AfterFirstAnswer = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// Authenticated-tier `/health` responder that answers `503` with
+    /// `ready: false` to the first `not_ready` requests and ready detail
+    /// afterwards, one request per connection. Connections are served one at a
+    /// time, so `after_first` completes before the next request is answered.
+    async fn spawn_scripted_health(
+        not_ready: usize,
+        after_first: Option<AfterFirstAnswer>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind fake admin");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            let mut after_first = after_first;
+            let mut answered = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                if !read_request_head(&mut stream).await {
+                    continue;
+                }
+                let (status, body) = if answered < not_ready {
+                    (
+                        "503 Service Unavailable",
+                        r#"{"status":"starting","ready":false,"cached_config":{"available":false}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"status":"ok","ready":true,"cached_config":{"available":true}}"#,
+                    )
+                };
+                answered += 1;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+                drop(stream);
+                if let Some(hook) = after_first.take() {
+                    hook.await;
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    /// `Child::try_wait` runs before every probe, not just the first: a child
+    /// that exits after an unsuccessful probe, while the responder keeps
+    /// answering not-ready, fails the wait promptly instead of polling until
+    /// the deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_readiness_fails_fast_when_child_dies_between_unsuccessful_probes() {
+        let mut child = live_child();
+        let pid = child.id();
+        let kill: AfterFirstAnswer = Box::pin(kill_and_await_exit_or_reaped(pid));
+        let (port, admin) = spawn_scripted_health(usize::MAX, Some(kill)).await;
+        let budget = Duration::from_secs(20);
+
+        let started = Instant::now();
+        let err = wait_for_child_gateway_readiness(&mut child, port, "not-ready-token", budget)
+            .await
+            .expect_err("a dead child must fail readiness")
+            .to_string();
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.contains("exited") && err.contains("(last observation: HTTP 503"),
+            "the exit must be reported after an unsuccessful probe, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the exit must fail the wait promptly, not at the {budget:?} deadline \
+             (took {elapsed:?})"
+        );
+
+        let _ = child.wait();
+        admin.abort();
+    }
+
+    /// Control for the test above: while the child lives, unsuccessful probes
+    /// are retried until the responder reports ready.
+    #[tokio::test]
+    async fn child_readiness_retries_unsuccessful_probes_while_child_lives() {
+        let (port, admin) = spawn_scripted_health(2, None).await;
+        let mut child = live_child();
+
+        wait_for_child_gateway_readiness(&mut child, port, "retry-token", Duration::from_secs(10))
+            .await
+            .expect("a live child is retried until the responder is ready");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        admin.abort();
+    }
+
+    /// Intentional difference from `wait_for_owned_gateway_identity`: the
+    /// bespoke-spawner barrier is health-only. A CIDR-granted detail responder
+    /// satisfies it but not the JWT ownership barrier. If this starts failing
+    /// because the helper now demands JWT `/proxies`, every bespoke spawner
+    /// must first set a per-attempt `FERRUM_ADMIN_JWT_SECRET`.
+    #[tokio::test]
+    async fn child_readiness_is_health_only_not_jwt_ownership() {
+        let (port, listener) = spawn_fake_admin(FakeAdminBehavior::CidrHealthJwtRejected).await;
+        let mut child = live_child();
+
+        wait_for_child_gateway_readiness(&mut child, port, "any-token", Duration::from_secs(2))
+            .await
+            .expect("health-only readiness accepts ready /health detail");
+        let identity = SpawnedGatewayIdentity::mint("health-only");
+        wait_for_owned_gateway_identity(&mut child, port, &identity, Duration::from_secs(2))
+            .await
+            .expect_err("the same responder must not satisfy JWT ownership");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        listener.abort();
+    }
+
+    #[tokio::test]
+    async fn child_tcp_accept_rejects_foreign_listener_after_child_exit() {
+        // Held and accepting for the whole test: a bare connect would succeed.
+        let squatter = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind foreign listener");
+        let port = squatter.local_addr().expect("addr").port();
+        let mut child = exited_child();
+
+        let err =
+            wait_for_child_tcp_accept(&mut child, port, Instant::now() + Duration::from_secs(2))
+                .await
+                .expect_err("a dead child must not adopt a foreign listener's accept")
+                .to_string();
+        assert!(err.contains("exited"), "got: {err}");
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+            "the foreign listener must still accept, or this proves nothing"
+        );
+        drop(squatter);
+    }
+
+    #[tokio::test]
+    async fn child_tcp_accept_succeeds_for_live_child() {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("addr").port();
+        let mut child = live_child();
+
+        wait_for_child_tcp_accept(&mut child, port, Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("a live child's accepting port satisfies the TCP stage");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(listener);
+    }
+
+    /// The TCP stage spends what is left of the caller's shared deadline and
+    /// never extends it, even when the port would accept.
+    #[tokio::test]
+    async fn child_tcp_accept_does_not_extend_an_expired_shared_deadline() {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("addr").port();
+        let mut child = live_child();
+
+        let err = wait_for_child_tcp_accept(&mut child, port, Instant::now())
+            .await
+            .expect_err("an expired deadline must fail without connecting")
+            .to_string();
+        assert!(err.contains("did not accept TCP connections"), "got: {err}");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(listener);
+    }
+
+    /// A positive remaining deadline expires at the caller's original instant.
+    /// Time spent between computing the shared deadline and entering the TCP
+    /// stage (stage 1, scheduling) is consumed, never handed back.
+    #[tokio::test]
+    async fn child_tcp_accept_honours_the_original_positive_deadline() {
+        // Nothing is bound on a released handoff port, so each connect is
+        // refused at once on every host (a bound-but-unlistened port would
+        // black-hole on Darwin instead).
+        let port = ephemeral_port().await.expect("refusing handoff port");
+        let mut child = live_child();
+
+        let deadline = Instant::now() + Duration::from_millis(3000);
+        // Stand-in for stage 1 spending most of the shared budget.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        let err = wait_for_child_tcp_accept(&mut child, port, deadline)
+            .await
+            .expect_err("a refusing port must time out")
+            .to_string();
+        let returned = Instant::now();
+
+        assert!(err.contains("did not accept TCP connections"), "got: {err}");
+        assert!(
+            returned >= deadline,
+            "the stage must keep polling until the original deadline"
+        );
+        // A stage that restarted the full 3 s budget on entry would return
+        // about 2 s after the original deadline; 1.25 s covers a loaded runner.
+        assert!(
+            returned < deadline + Duration::from_millis(1250),
+            "the stage overran the caller's deadline by {:?}",
+            returned.duration_since(deadline)
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Like [`kill_and_await_exit`], but tolerates the harness reaping the
+    /// child first: the TCP stage polls `try_wait` concurrently, so `waitid`
+    /// may find no child (`ECHILD`), which also means it has exited.
+    #[cfg(unix)]
+    async fn kill_and_await_exit_or_reaped(pid: u32) {
+        tokio::task::spawn_blocking(move || {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if rc == 0 {
+                    return;
+                }
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(libc::ECHILD) => return,
+                    _ => panic!("waitid on killed child {pid} failed: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("kill-and-wait task");
+    }
+
+    /// `Child::try_wait` runs on every poll iteration, not only before the
+    /// first connect: a child that dies mid-poll, after which a foreign
+    /// listener claims its released port, must fail the stage. Deterministic:
+    /// the listener binds only after the exit is observable, and a successful
+    /// connect is re-checked against the child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_tcp_accept_rechecks_child_on_every_poll() {
+        let port = ephemeral_port().await.expect("refusing handoff port");
+        let mut child = live_child();
+        let pid = child.id();
+        let squatter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // The child has exited before the foreign listener appears, so only
+            // a fresh `try_wait` can tell them apart.
+            kill_and_await_exit_or_reaped(pid).await;
+            TcpListener::bind_test(format!("127.0.0.1:{port}"))
+                .await
+                .expect("foreign listener binds the released port")
+        });
+
+        let err =
+            wait_for_child_tcp_accept(&mut child, port, Instant::now() + Duration::from_secs(10))
+                .await
+                .expect_err("a child that died mid-poll must not adopt a foreign listener")
+                .to_string();
+        let squatter = squatter.await.expect("squatter task");
+
+        assert!(err.contains("exited"), "got: {err}");
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+            "the foreign listener must accept, or this proves nothing"
+        );
+        drop(squatter);
+        let _ = child.wait();
     }
 }
 

@@ -992,6 +992,13 @@ fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
             "DOC-10 required family missing from contract: {required}"
         );
     }
+    // Retired families must not be re-listed. `ferrum_xds_warming_partial_
+    // applies_total` was removed in #7027: the xDS DP only builds coherent
+    // slices, so a skewed apply (the only thing it counted) cannot happen.
+    assert!(
+        !contract.contains_key("ferrum_xds_warming_partial_applies_total"),
+        "retired family must not be in the contract: ferrum_xds_warming_partial_applies_total"
+    );
     for required in API_CHARGEBACK_FAMILIES {
         let fam = contract
             .get(*required)

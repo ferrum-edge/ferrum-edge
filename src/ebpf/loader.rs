@@ -37,6 +37,8 @@ use aya::{Ebpf, EbpfLoader};
 use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
+use super::cgroup::{UnconfirmedCgroupDetaches, cgroup_path_may_exist};
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::maps::BpfMaps;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
@@ -80,8 +82,25 @@ const INGRESS_REDIRECT_PROGRAM: &str = super::BPF_PROGRAM_TC_INGRESS_REDIRECT;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 #[derive(Default)]
 struct PodLinks {
-    cgroup_links: Vec<CgroupSockAddrLink>,
+    cgroup_links: Vec<PodCgroupLink>,
     tc_links: Vec<PodTcLink>,
+    /// Cgroup program detaches that FAILED; see `cgroup::UnconfirmedCgroupDetaches`.
+    ///
+    /// Deliberately NOT cleared by a same-UID re-enrollment (`attach_cgroup`
+    /// reuses this entry via `or_default`): a same-UID pod usually has the same
+    /// cgroup path, where the program whose detach failed may still be
+    /// attached. Keeping the path fails closed — the next `detach_pod` keeps
+    /// reporting it until the kernel releases it with the cgroup — whereas
+    /// clearing it would let that teardown report a clean detach.
+    unconfirmed_cgroup_detaches: UnconfirmedCgroupDetaches,
+}
+
+/// One per-pod cgroup program attachment, with the cgroup path it is bound to
+/// so a failed detach can be tracked until that cgroup is gone.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+struct PodCgroupLink {
+    cgroup_path: String,
+    link: CgroupSockAddrLink,
 }
 
 /// One per-pod tc classifier attachment, with the interface it is attached to
@@ -351,7 +370,10 @@ impl EbpfBackend for AyaEbpfBackend {
             .entry(pod_uid.to_string())
             .or_default()
             .cgroup_links
-            .push(link);
+            .push(PodCgroupLink {
+                cgroup_path: cgroup_path.to_string(),
+                link,
+            });
 
         debug!(program, cgroup_path, "BPF cgroup program attached");
         Ok(())
@@ -416,12 +438,19 @@ impl EbpfBackend for AyaEbpfBackend {
         // Detach every link, collecting failures instead of returning on the
         // first one, so each remaining attachment still gets its attempt.
         let mut errors = Vec::new();
-        for link in links.cgroup_links {
+        // An earlier failed cgroup detach left no handle to retry with. The
+        // attachment cannot outlive the cgroup it is bound to, so it is
+        // confirmed gone only once that cgroup no longer exists; until then
+        // the failure is reported again (and retained) on every retry.
+        let mut unconfirmed_cgroup_detaches = links.unconfirmed_cgroup_detaches;
+        errors.extend(unconfirmed_cgroup_detaches.recheck(cgroup_path_may_exist));
+        for PodCgroupLink { cgroup_path, link } in links.cgroup_links {
             // A failed cgroup detach consumes the link and leaves no handle to
-            // retry with. It is reported; the attachment cannot outlive the pod
-            // cgroup it is bound to.
+            // retry with. It is reported and its cgroup path retained, so the
+            // pending POD_DETACH retry cannot succeed vacuously.
             if let Err(e) = link.detach() {
-                errors.push(format!("cgroup program: {e}"));
+                errors.push(format!("cgroup program on '{cgroup_path}': {e}"));
+                unconfirmed_cgroup_detaches.record(cgroup_path);
             }
         }
         let mut retained = Vec::new();
@@ -455,12 +484,13 @@ impl EbpfBackend for AyaEbpfBackend {
                 retained.push(PodTcLink { iface, link });
             }
         }
-        if !retained.is_empty() {
+        if !retained.is_empty() || !unconfirmed_cgroup_detaches.is_empty() {
             self.pod_links.insert(
                 pod_uid.to_string(),
                 PodLinks {
                     cgroup_links: Vec::new(),
                     tc_links: retained,
+                    unconfirmed_cgroup_detaches,
                 },
             );
         }

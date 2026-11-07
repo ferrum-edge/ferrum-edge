@@ -9,12 +9,11 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use base64::Engine as _;
 use dashmap::DashMap;
 use http::HeaderValue;
 use http::header::{AUTHORIZATION, HeaderName};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use serde_json::{Map, Value, json};
+use jsonwebtoken::{Algorithm, EncodingKey};
+use serde_json::{Map, Value};
 use tokio::sync::{OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 use url::{Host, Url};
@@ -43,6 +42,7 @@ use super::utils::introspection_cache::{
     IntrospectionCache, MIN_MAX_CACHE_ENTRIES, MIN_MAX_CACHE_ENTRY_BYTES,
     MIN_MAX_CACHE_TOTAL_BYTES, TokenKey,
 };
+use super::utils::oauth_client_auth::{self, BasicCredentialsError, PrivateKeyDecodeError};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
@@ -74,10 +74,6 @@ const MAX_PROCESS_CONCURRENT_INTROSPECTIONS: usize = 1_024;
 const DEFAULT_DISCOVERY_REFRESH_INTERVAL_SECS: u64 = 900;
 const MIN_DISCOVERY_REFRESH_INTERVAL_SECS: u64 = 1;
 const MAX_DISCOVERY_REFRESH_INTERVAL_SECS: u64 = 86_400;
-/// Audience used only by the construction-time `private_key_jwt` signing probe.
-/// The assertion is discarded and never sent; the value affects nothing the
-/// signature backend checks.
-const PROBE_ASSERTION_AUDIENCE: &str = "urn:ferrum-edge:client-assertion-probe";
 /// RFC 7800 confirmation member this plugin can verify: the SHA-256 thumbprint
 /// of the frontend client certificate a token is bound to (RFC 8705 §3.1).
 const CERTIFICATE_THUMBPRINT_CONFIRMATION: &str = "x5t#S256";
@@ -908,13 +904,18 @@ impl Oauth2Introspection {
                 // `issuer` pin: many authorization servers require the
                 // endpoint the assertion is presented to (RFC 7523 §3).
                 let assertion_audience = audience.as_deref().unwrap_or(endpoint.as_str());
-                let assertion =
-                    build_client_assertion(client_id, assertion_audience, encoding_key, *alg, kid)
-                        .map_err(|_| IntrospectionDecision::Unavailable)?;
+                let assertion = oauth_client_auth::build_client_assertion(
+                    client_id,
+                    assertion_audience,
+                    encoding_key,
+                    *alg,
+                    kid.as_deref(),
+                )
+                .map_err(|_| IntrospectionDecision::Unavailable)?;
                 params.push(("client_id".to_string(), client_id.clone()));
                 params.push((
                     "client_assertion_type".to_string(),
-                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+                    oauth_client_auth::CLIENT_ASSERTION_TYPE_JWT_BEARER.to_string(),
                 ));
                 params.push(("client_assertion".to_string(), assertion));
                 client
@@ -1927,32 +1928,21 @@ fn parse_client_auth(
             })?;
             let pem = required_auth_string(&auth, "private_key_pem", provider_idx)?;
             let alg = parse_private_key_alg(auth.get("private_key_jwt_alg"), provider_idx)?;
-            let encoding_key = match alg {
-                Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-                    EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| {
-                        format!(
-                            "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` is invalid RSA PEM"
-                        )
-                    })?
-                }
-                Algorithm::ES256 | Algorithm::ES384 => {
-                    EncodingKey::from_ec_pem(pem.as_bytes()).map_err(|_| {
-                        format!(
-                            "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` is invalid EC PEM"
-                        )
-                    })?
-                }
-                Algorithm::EdDSA => EncodingKey::from_ed_pem(pem.as_bytes()).map_err(|_| {
-                    format!(
-                        "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` is invalid EdDSA PEM"
-                    )
-                })?,
-                _ => {
-                    return Err(format!(
-                        "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_jwt_alg` is unsupported"
-                    ));
-                }
-            };
+            let encoding_key = oauth_client_auth::decode_private_key(alg, &pem).map_err(|error| {
+                let family = match error {
+                    PrivateKeyDecodeError::InvalidRsaPem => "RSA",
+                    PrivateKeyDecodeError::InvalidEcPem => "EC",
+                    PrivateKeyDecodeError::InvalidEdDsaPem => "EdDSA",
+                    PrivateKeyDecodeError::UnsupportedAlgorithm => {
+                        return format!(
+                            "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_jwt_alg` is unsupported"
+                        );
+                    }
+                };
+                format!(
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` is invalid {family} PEM"
+                )
+            })?;
             let kid = match auth.get("private_key_jwt_kid") {
                 Some(value) => Some(value.as_str().ok_or_else(|| {
                     format!(
@@ -1974,7 +1964,11 @@ fn parse_client_auth(
             // provider call, and the result is a field-specific configuration
             // error instead of a permanently unusable runtime. The same probe
             // rejects an RSA key below the signing backend's minimum modulus.
-            probe_client_assertion_signing(&client_id, &encoding_key, alg, &kid, provider_idx)?;
+            oauth_client_auth::probe_client_assertion_signing(&encoding_key, alg).map_err(|_| {
+                format!(
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` cannot sign with private_key_jwt_alg=\"{alg:?}\" (key type, curve, or size mismatch)"
+                )
+            })?;
             Ok(ClientAuth::PrivateKeyJwt {
                 client_id,
                 encoding_key,
@@ -1995,27 +1989,6 @@ fn parse_client_auth(
             "oauth2_introspection: `provider[{provider_idx}].client_auth.method` is unsupported"
         )),
     }
-}
-
-/// Prove the decoded private key can actually sign with the selected algorithm.
-///
-/// `jsonwebtoken` binds the curve to the algorithm only when it signs, so a
-/// throwaway assertion is the cheapest complete check. It performs no I/O, is
-/// discarded immediately, and never leaves the process.
-fn probe_client_assertion_signing(
-    client_id: &str,
-    encoding_key: &EncodingKey,
-    alg: Algorithm,
-    kid: &Option<String>,
-    provider_idx: usize,
-) -> Result<(), String> {
-    build_client_assertion(client_id, PROBE_ASSERTION_AUDIENCE, encoding_key, alg, kid)
-        .map(|_| ())
-        .map_err(|_| {
-            format!(
-                "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_pem` cannot sign with private_key_jwt_alg=\"{alg:?}\" (key type, curve, or size mismatch)"
-            )
-        })
 }
 
 fn required_auth_string(
@@ -2043,35 +2016,17 @@ fn oauth_basic_authorization_header(
     client_id: &str,
     client_secret: &str,
 ) -> Result<HeaderValue, String> {
-    let encoded_client_id = oauth_form_encode_component(client_id)?;
-    let encoded_client_secret = oauth_form_encode_component(client_secret)?;
-    let mut credential = String::with_capacity(
-        encoded_client_id
-            .len()
-            .saturating_add(encoded_client_secret.len())
-            .saturating_add(1),
-    );
-    credential.push_str(&encoded_client_id);
-    credential.push(':');
-    credential.push_str(&encoded_client_secret);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(credential.as_bytes());
-    let mut value = String::with_capacity("Basic ".len().saturating_add(encoded.len()));
-    value.push_str("Basic ");
-    value.push_str(&encoded);
-    let mut header = HeaderValue::from_bytes(value.as_bytes())
-        .map_err(|_| "oauth2_introspection: failed to encode client credentials".to_string())?;
-    header.set_sensitive(true);
-    Ok(header)
-}
-
-fn oauth_form_encode_component(value: &str) -> Result<String, String> {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("value", value);
-    serializer
-        .finish()
-        .strip_prefix("value=")
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "oauth2_introspection: failed to form-encode client credentials".to_string())
+    oauth_client_auth::basic_authorization_header(client_id, client_secret).map_err(|error| {
+        match error {
+            BasicCredentialsError::FormEncode => {
+                "oauth2_introspection: failed to form-encode client credentials"
+            }
+            BasicCredentialsError::HeaderValue => {
+                "oauth2_introspection: failed to encode client credentials"
+            }
+        }
+        .to_string()
+    })
 }
 
 fn parse_private_key_alg(value: Option<&Value>, provider_idx: usize) -> Result<Algorithm, String> {
@@ -2083,42 +2038,11 @@ fn parse_private_key_alg(value: Option<&Value>, provider_idx: usize) -> Result<A
         })?,
         None => "RS256",
     };
-    match algorithm {
-        "RS256" => Ok(Algorithm::RS256),
-        "RS384" => Ok(Algorithm::RS384),
-        "RS512" => Ok(Algorithm::RS512),
-        "ES256" => Ok(Algorithm::ES256),
-        "ES384" => Ok(Algorithm::ES384),
-        "EdDSA" => Ok(Algorithm::EdDSA),
-        _ => Err(format!(
+    oauth_client_auth::private_key_jwt_algorithm(algorithm).ok_or_else(|| {
+        format!(
             "oauth2_introspection: `provider[{provider_idx}].client_auth.private_key_jwt_alg` is unsupported"
-        )),
-    }
-}
-
-fn build_client_assertion(
-    client_id: &str,
-    endpoint: &str,
-    encoding_key: &EncodingKey,
-    alg: Algorithm,
-    kid: &Option<String>,
-) -> Result<String, String> {
-    let now = chrono::Utc::now().timestamp();
-    let mut header = Header::new(alg);
-    header.kid = kid.clone();
-    encode(
-        &header,
-        &json!({
-            "iss": client_id,
-            "sub": client_id,
-            "aud": endpoint,
-            "iat": now,
-            "exp": now + 300,
-            "jti": uuid::Uuid::new_v4().to_string()
-        }),
-        encoding_key,
-    )
-    .map_err(|e| format!("client assertion signing failed: {e}"))
+        )
+    })
 }
 
 fn parse_token_locations(
@@ -2796,6 +2720,7 @@ fn validate_discovered_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn introspection_expiry_uses_earliest_authoritative_bound_once() {

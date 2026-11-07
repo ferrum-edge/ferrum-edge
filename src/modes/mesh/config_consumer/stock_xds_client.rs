@@ -1617,7 +1617,7 @@ async fn run_stock_ads_stream(
                     break MeshStreamAttempt::RemoteEof;
                 };
                 awaiting_first_frame = false;
-                match handle_stock_response(
+                let handled = handle_stock_response(
                     response,
                     config,
                     baseline.mesh(),
@@ -1631,7 +1631,30 @@ async fn run_stock_ads_stream(
                     },
                     accumulator,
                     stream_state,
-                ).await.map_err(StockResponseError::into_stream_error)? {
+                ).await;
+                let outcome = match handled {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // Publish the already-ACKed staged slice before the
+                        // stream closes, as the Ferrum `xds` client does —
+                        // including when the NACK circuit breaker tripped on a
+                        // later response (issue #7029). State-of-the-world does
+                        // not resend an ACKed version, so dropping it would
+                        // leave the previous slice serving.
+                        return flush_pending_stock_slice_before_error(
+                            &fence,
+                            config,
+                            state,
+                            &mut pending,
+                            &mut last_logged_refusals,
+                            &recovery,
+                            tracker,
+                            delivered_usable_state,
+                            error.into_stream_error(),
+                        );
+                    }
+                };
+                match outcome {
                     StockResponseOutcome::Pending(next) => {
                         let action = pending.transition(PendingGenerationEvent::Stage {
                             generation: next,
@@ -1767,6 +1790,63 @@ async fn run_stock_ads_stream(
         }
     }
     Ok(ended)
+}
+
+/// Publish an already-complete debounced slice before surfacing a stream
+/// error, then fail the attempt with that error (issue #7029).
+///
+/// Mirrors the Ferrum `xds` client's flush-before-close, with the stock
+/// client's credential fence on top:
+///
+/// * a credential retirement error publishes NOTHING it staged — the slice was
+///   produced under a credential that is no longer current (issue #3852);
+/// * the flush is a COMMIT, so it goes through `commit_pending` and its final
+///   fence admission. A credential that rotated, was invalidated, or hit its
+///   deadline while the slice sat in the debounce window retires the stream
+///   instead (and resets discovery state), exactly like the end-of-stream
+///   flush;
+/// * a successful flush is real progress: the outer loop sees
+///   `delivered_usable_state` and the tracker records the usable install, but
+///   the original error still classifies the attempt — a refused stream is
+///   never turned into success.
+#[allow(clippy::too_many_arguments)]
+fn flush_pending_stock_slice_before_error(
+    fence: &StockCredentialFence,
+    config: &StockXdsClientConfig,
+    state: &MeshRuntimeState,
+    pending: &mut PendingGeneration<Box<PendingStockSlice>>,
+    last_logged_refusals: &mut Option<Vec<StockRefusal>>,
+    recovery: &MeshLocalSourceRecovery,
+    tracker: &mut MeshStreamTracker,
+    delivered_usable_state: &mut bool,
+    error: StockStreamError,
+) -> Result<MeshStreamAttempt, StockStreamError> {
+    if matches!(error, StockStreamError::Retirement(_)) {
+        return Err(error);
+    }
+    if let PendingGenerationAction::Commit(next) =
+        pending.transition(PendingGenerationEvent::Commit)
+    {
+        match commit_pending(fence, config, state, next, last_logged_refusals, recovery) {
+            Ok(()) => {
+                *delivered_usable_state = true;
+                tracker.record_usable_state();
+                state.set_config_stream_status(tracker.status(state.has_first_slice()));
+            }
+            Err(StockCommitFailure::Retirement(retirement)) => {
+                warn!(
+                    outcome = retirement.as_metric_label(),
+                    "Discarding a staged stock xDS slice before closing the stream: the \
+                     credential that produced it is no longer current"
+                );
+                return Ok(MeshStreamAttempt::LocalRetirement(retirement));
+            }
+            Err(StockCommitFailure::Policy(reason)) => {
+                return Err(StockStreamError::Policy(reason));
+            }
+        }
+    }
+    Err(error)
 }
 
 /// Re-arm the stock debounce timer when a transition asks for it.

@@ -3482,6 +3482,13 @@ pub mod _test_support {
         crate::plugin_cache::request_reject_after_jwks_startup_for_test();
     }
 
+    /// `ai_federation` streaming route plans resolved on the calling thread so
+    /// far; a cache build resolves each attached config's plan once
+    /// (issue #7018).
+    pub fn ai_federation_route_plan_resolutions_for_test() -> u64 {
+        crate::plugin_cache::ai_federation_route_plan_resolutions_for_test()
+    }
+
     pub fn clear_jwks_cache_for_test() {
         crate::plugins::utils::jwks_cache::clear_jwks_cache();
     }
@@ -8002,6 +8009,16 @@ pub mod _test_support {
         store.reconnect_as_failover(db_url).await
     }
 
+    /// Re-arm `DatabaseStore`'s offline-bootstrap deferred-migration flag so
+    /// reconnect tests can make a failback's deferred migrations run (and
+    /// fail) against the staged primary pool (issue #7033).
+    pub fn database_store_set_migrations_pending_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        pending: bool,
+    ) {
+        store.set_migrations_pending_for_test(pending);
+    }
+
     /// Fail `DatabaseStore::latest_change_sequence` so live-apply tests can
     /// prove `sequence_unavailable` after a durable commit (issue #3926).
     pub fn database_store_set_latest_change_sequence_fault_for_test(
@@ -8026,7 +8043,9 @@ pub mod _test_support {
 
     // ── config/mongo_store: Admin write-topology / publication test seams ────
     pub use crate::config::mongo_store::{
-        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+        AdmissionFence as MongoAdmissionFence, AdmissionFenceProbe as MongoAdmissionFenceProbe,
+        AdmissionFenceReason as MongoAdmissionFenceReason, MongoReconnectTopology,
+        MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
     };
 
     // External test crates only: mirror production `config_changes` shapes without
@@ -8099,6 +8118,58 @@ pub mod _test_support {
         store: &crate::config::mongo_store::MongoStore,
     ) -> tokio::sync::OwnedRwLockReadGuard<()> {
         store.acquire_connection_generation_pin_for_test().await
+    }
+
+    /// Retain an mTLS DNS admission fence exactly as an uncertain single-call
+    /// guard's Drop does, handing over a real generation read pin (#7031).
+    pub async fn mongo_store_retain_mtls_dns_admission_fence_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        owner: &str,
+    ) {
+        store
+            .retain_mtls_dns_admission_fence_for_test(namespace, owner)
+            .await;
+    }
+
+    /// Register a live multi-step persistent admission pin (holding the
+    /// generation read pin); `uncertain` marks an unknown borrowed outcome
+    /// (#7031).
+    pub async fn mongo_store_insert_persistent_admission_pin_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        guard_owner: &str,
+        uncertain: bool,
+    ) {
+        store
+            .insert_persistent_admission_pin_for_test(namespace, guard_owner, uncertain)
+            .await;
+    }
+
+    /// Explicit per-namespace mTLS DNS admission fence state (no I/O).
+    pub fn mongo_store_mtls_dns_admission_fence(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+    ) -> crate::config::mongo_store::AdmissionFence {
+        store.mtls_dns_admission_fence(namespace)
+    }
+
+    /// The fail-closed fence gate admission runs under its generation pin.
+    pub fn mongo_store_ensure_mtls_dns_admission_unfenced_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        store.ensure_mtls_dns_admission_unfenced_for_test(namespace)
+    }
+
+    /// Apply one exit-probe outcome to every retained fence on `namespace`
+    /// through the production decision; returns how many were cleared.
+    pub fn mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        probe: crate::config::mongo_store::AdmissionFenceProbe,
+    ) -> usize {
+        store.apply_mtls_dns_admission_fence_probe_for_test(namespace, probe)
     }
 
     /// Active published Mongo database name (white-box accessor).
@@ -8336,6 +8407,93 @@ pub mod _test_support {
             mutation_started,
             outcome_settled,
         )
+    }
+
+    /// Drives the shared admin mTLS DNS admission hold state (single-mutation
+    /// state plus the multi-phase restore phase) the way the restore flow
+    /// does, so external tests can assert when guard Drop releases the
+    /// durable fence (issue #7032).
+    pub struct AdminMtlsDnsAdmissionHoldProbe(
+        std::sync::Arc<crate::admin::MtlsDnsAdmissionHoldState>,
+    );
+
+    impl Default for AdminMtlsDnsAdmissionHoldProbe {
+        fn default() -> Self {
+            Self(std::sync::Arc::new(
+                crate::admin::MtlsDnsAdmissionHoldState::new(),
+            ))
+        }
+    }
+
+    impl AdminMtlsDnsAdmissionHoldProbe {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub async fn run_mutation<T, F>(&self, mutation: F) -> T
+        where
+            F: std::future::Future<Output = T>,
+        {
+            self.0.run_mutation(mutation).await
+        }
+
+        pub async fn run_restore_clear<T, E, F>(&self, clear: F) -> Result<T, E>
+        where
+            F: std::future::Future<Output = Result<T, E>>,
+        {
+            self.0.run_restore_clear(clear).await
+        }
+
+        pub async fn run_restore_import<T, F>(
+            &self,
+            import: F,
+            succeeded: impl FnOnce(&T) -> bool,
+        ) -> T
+        where
+            F: std::future::Future<Output = T>,
+        {
+            self.0.run_restore_import(import, succeeded).await
+        }
+
+        pub async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
+        where
+            F: std::future::Future<Output = Result<T, E>>,
+        {
+            self.0.run_restore_rollback(rollback).await
+        }
+
+        /// Mirror the restore flow's explicit `Cleared` transitions (ambiguous
+        /// atomic clear, reacquired guard after a lost lease during clear).
+        pub fn mark_restore_cleared(&self) {
+            self.0.mark_restore_cleared_for_test();
+        }
+
+        /// Mirror the restore flow's explicit failed-import transition (lease
+        /// lost during import, reacquired guard for the rollback).
+        pub fn mark_restore_import_failed(&self) {
+            self.0.mark_restore_import_failed_for_test();
+        }
+
+        /// Whether `MtlsDnsAdmissionGuardLifecycle::drop` would release the
+        /// durable fence in the current state.
+        pub fn drop_releases(&self) -> bool {
+            self.0.release_on_drop()
+        }
+    }
+
+    /// Cancel a restore-guard recovery reacquisition after its first poll
+    /// (issue #7032). See `admin::cancel_restore_guard_reacquisition_for_test`.
+    pub async fn admin_cancel_restore_guard_reacquisition_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+        inherit_incomplete_restore: bool,
+    ) {
+        crate::admin::cancel_restore_guard_reacquisition_for_test(
+            db,
+            namespace,
+            inherit_incomplete_restore,
+        )
+        .await
     }
 
     pub fn admin_mtls_dns_admission_contention_response(

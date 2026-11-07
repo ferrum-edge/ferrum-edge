@@ -656,3 +656,168 @@ fn export_fingerprints_mesh_authz_ext_authz_path_prefix() {
     assert_eq!(provider["port"], 9000);
     assert!(!export.to_string().contains(EXT_AUTHZ_PREFIX));
 }
+
+const INLINE_CLIENT_CERT: &str =
+    "-----BEGIN CERTIFICATE-----\nY2xpZW50LWNlcnQ=\n-----END CERTIFICATE-----\n";
+const INLINE_CLIENT_KEY: &str =
+    "-----BEGIN PRIVATE KEY-----\na2V5LW11c3Qtbm90LWxlYWs=\n-----END PRIVATE KEY-----\n";
+const INLINE_CLIENT_KEY_BODY: &str = "a2V5LW11c3Qtbm90LWxlYWs=";
+
+fn backend_tls_fixture() -> GatewayConfig {
+    let bundle = format!("{INLINE_CLIENT_CERT}{INLINE_CLIENT_KEY}");
+    serde_json::from_value(json!({
+        "version": "1",
+        "proxies": [
+            {
+                "id": "proxy-inline",
+                "listen_path": "/inline",
+                "backend_host": "backend.internal",
+                "backend_port": 8443,
+                "backend_scheme": "https",
+                "backend_tls_client_cert_path": INLINE_CLIENT_CERT,
+                "backend_tls_client_key_path": INLINE_CLIENT_KEY,
+                "created_at": STAMP,
+                "updated_at": STAMP
+            },
+            {
+                "id": "proxy-reference",
+                "listen_path": "/reference",
+                "backend_host": "backend.internal",
+                "backend_port": 8443,
+                "backend_scheme": "https",
+                "backend_tls_client_cert_path": "k8s://ferrum/client-mtls#tls.crt",
+                "backend_tls_client_key_path": "k8s://ferrum/client-mtls#tls.key",
+                "created_at": STAMP,
+                "updated_at": STAMP
+            }
+        ],
+        "plugin_configs": [],
+        "upstreams": [
+            {
+                "id": "upstream-inline",
+                "name": "inline",
+                "targets": [],
+                "backend_tls_client_cert_path": INLINE_CLIENT_CERT,
+                "backend_tls_client_key_path": INLINE_CLIENT_KEY,
+                "created_at": STAMP,
+                "updated_at": STAMP
+            },
+            {
+                "id": "upstream-bundle",
+                "name": "bundle",
+                "targets": [],
+                "backend_tls_client_cert_path": bundle,
+                "backend_tls_client_key_path": "/etc/ferrum/backend/client.key",
+                "created_at": STAMP,
+                "updated_at": STAMP
+            },
+            {
+                "id": "upstream-mesh",
+                "name": "mesh",
+                "targets": [],
+                "subsets": [{
+                    "name": "v1",
+                    "labels": {"version": "v1"},
+                    "traffic_policy": {"tls": {
+                        "mode": "mutual",
+                        "client_certificate": INLINE_CLIENT_CERT,
+                        "private_key": INLINE_CLIENT_KEY,
+                        "ca_certificates": "k8s://ferrum/v1-mtls#ca.crt"
+                    }}
+                }],
+                "port_overrides": {
+                    "443": {"tls": {
+                        "client_cert_path": INLINE_CLIENT_CERT,
+                        "client_key_path": INLINE_CLIENT_KEY
+                    }},
+                    "8443": {"tls": {
+                        "client_cert_path": "k8s://ferrum/p8443#tls.crt",
+                        "client_key_path": "k8s://ferrum/p8443#tls.key"
+                    }}
+                },
+                "created_at": STAMP,
+                "updated_at": STAMP
+            }
+        ]
+    }))
+    .expect("backend TLS fixture deserializes")
+}
+
+fn exported<'a>(export: &'a Value, collection: &str, id: &str) -> &'a Value {
+    export[collection]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == id))
+        .unwrap_or_else(|| panic!("{collection} {id} exported"))
+}
+
+/// Inline backend TLS private keys on proxies and upstreams are withheld by the
+/// viewer projection, so the export fingerprints them; references and public
+/// certificates are shown verbatim.
+#[test]
+fn export_fingerprints_inline_backend_tls_private_keys_and_keeps_references() {
+    let key = key(ADMIN_SECRET);
+    let export = build_config_export(backend_tls_fixture(), "cached", "ferrum", &key);
+    let text = export.to_string();
+    assert!(!text.contains("PRIVATE KEY"), "{text}");
+    assert!(!text.contains(INLINE_CLIENT_KEY_BODY), "{text}");
+
+    let proxy = exported(&export, "proxies", "proxy-inline");
+    let rendering = FingerprintRendering::new(&key, "proxy", "ferrum", "proxy-inline");
+    let pointer = "/backend_tls_client_key_path";
+    let expected = rendering.fingerprint(pointer, &json!(INLINE_CLIENT_KEY));
+    assert_eq!(proxy["backend_tls_client_key_path"], expected);
+    assert_eq!(proxy["backend_tls_client_cert_path"], INLINE_CLIENT_CERT);
+    assert_eq!(proxy["backend_host"], "backend.internal");
+
+    let proxy = exported(&export, "proxies", "proxy-reference");
+    assert_eq!(
+        proxy["backend_tls_client_key_path"],
+        "k8s://ferrum/client-mtls#tls.key"
+    );
+    assert_eq!(
+        proxy["backend_tls_client_cert_path"],
+        "k8s://ferrum/client-mtls#tls.crt"
+    );
+
+    let inline = exported(&export, "upstreams", "upstream-inline");
+    assert!(is_fingerprint(&inline["backend_tls_client_key_path"]));
+    assert_eq!(inline["backend_tls_client_cert_path"], INLINE_CLIENT_CERT);
+    assert_eq!(inline["name"], "inline");
+
+    // A certificate field carrying a private-key block is withheld as well.
+    let upstream = exported(&export, "upstreams", "upstream-bundle");
+    assert!(is_fingerprint(&upstream["backend_tls_client_cert_path"]));
+    assert_eq!(
+        upstream["backend_tls_client_key_path"],
+        "/etc/ferrum/backend/client.key"
+    );
+
+    // Nested subset and per-port TLS slots are fingerprinted at their exact
+    // pointers; references and certificates beside them stay verbatim.
+    let mesh = exported(&export, "upstreams", "upstream-mesh");
+    let rendering = FingerprintRendering::new(&key, "upstream", "ferrum", "upstream-mesh");
+    for pointer in [
+        "/subsets/0/traffic_policy/tls/private_key",
+        "/port_overrides/443/tls/client_key_path",
+    ] {
+        let expected = rendering.fingerprint(pointer, &json!(INLINE_CLIENT_KEY));
+        assert_eq!(mesh.pointer(pointer), Some(&json!(expected)), "{pointer}");
+    }
+    let at = |pointer: &str| mesh.pointer(pointer).cloned().unwrap_or_default();
+    assert_eq!(
+        at("/subsets/0/traffic_policy/tls/client_certificate"),
+        INLINE_CLIENT_CERT
+    );
+    assert_eq!(
+        at("/subsets/0/traffic_policy/tls/ca_certificates"),
+        "k8s://ferrum/v1-mtls#ca.crt"
+    );
+    assert_eq!(
+        at("/port_overrides/443/tls/client_cert_path"),
+        INLINE_CLIENT_CERT
+    );
+    assert_eq!(
+        at("/port_overrides/8443/tls/client_key_path"),
+        "k8s://ferrum/p8443#tls.key"
+    );
+}
