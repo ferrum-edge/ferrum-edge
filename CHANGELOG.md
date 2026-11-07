@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Cold DNS misses query SRV and A together.** With the default
+  `FERRUM_DNS_ORDER` (`CACHE,SRV,A,CNAME`), a hostname with no cached answer
+  used to wait a full SRV round trip before sending its A query. A cold miss
+  now also sends the A (or AAAA) query that follows SRV speculatively, through
+  a resolver with no cache. Speculation may only contribute an early success:
+  SRV still wins when it answers, and a live speculative answer already in
+  hand is used when SRV answers empty. In every other case the lookup is the
+  sequential walk resumed at A, through the cached resolver, exactly as
+  before. Hostnames whose answering type is already cached keep the
+  sequential walk, so steady-state refreshes send the same queries as before.
 ### Removed
 - **`ferrum_xds_warming_partial_applies_total` is no longer exported**
   (#7027). The xDS data plane only builds a mesh slice once every required

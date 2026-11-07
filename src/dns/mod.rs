@@ -192,6 +192,42 @@ fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
     name
 }
 
+/// The address type a cold-miss resolve may query speculatively beside SRV:
+/// the A or AAAA right after a leading SRV. `None` for any other order. CNAME
+/// never qualifies, since its `lookup_ip` re-issues A/AAAA.
+fn cold_miss_speculative_address_type(
+    query_types: &[CachedRecordType],
+) -> Option<CachedRecordType> {
+    match query_types {
+        [
+            CachedRecordType::Srv,
+            address_type @ (CachedRecordType::A | CachedRecordType::Aaaa),
+            ..,
+        ] => Some(*address_type),
+        _ => None,
+    }
+}
+
+/// One record type's non-empty answer from `DnsCache::lookup_record_type`.
+struct RecordTypeAnswer {
+    addrs: Vec<IpAddr>,
+    record_type: CachedRecordType,
+    /// Absolute validity deadline from the response (for SRV, the earlier of
+    /// the SRV and target-address deadlines). Kept absolute so an answer
+    /// buffered behind a slower lookup is not given its full TTL again.
+    valid_until: Instant,
+}
+
+impl RecordTypeAnswer {
+    fn new(addrs: Vec<IpAddr>, record_type: CachedRecordType, valid_until: Instant) -> Self {
+        Self {
+            addrs,
+            record_type,
+            valid_until,
+        }
+    }
+}
+
 /// RFC 2782 root target: a Target of "." means the service is decidedly not
 /// available at this domain. After stripping the trailing root label the DNS
 /// root is the empty name, so `"."`, `""`, and dotted-only names are all
@@ -697,6 +733,8 @@ pub struct DnsCache {
     /// Resolver dedicated to security-sensitive connection establishment.
     /// Its internal cache is disabled and it always queries A and AAAA so a
     /// caller cannot reuse a previously permitted answer after a DNS rebind.
+    /// `do_resolve` also sends its cold-miss speculative A/AAAA query through
+    /// it, so that query leaves nothing in `resolver`'s cache.
     dial_resolver: Arc<Resolver<TokioRuntimeProvider>>,
     dns_order: Vec<DnsRecordOrder>,
     /// When set, ALL records use this fixed TTL regardless of DNS response.
@@ -1712,9 +1750,12 @@ impl DnsCache {
             return Ok((vec![addr], None, Duration::from_secs(86400)));
         }
 
+        // The record type that answered this hostname's last successful
+        // lookup. `None` is a cold miss: no row yet, or an error row.
+        let row_record_type = self.cache.get(hostname).and_then(|e| e.record_type_used);
         // Determine the cached record type (for CACHE ordering)
         let cached_record_type = if self.dns_order.contains(&DnsRecordOrder::Cache) {
-            self.cache.get(hostname).and_then(|e| e.record_type_used)
+            row_record_type
         } else {
             None
         };
@@ -1758,125 +1799,190 @@ impl DnsCache {
             query_types = vec![CachedRecordType::A, CachedRecordType::Aaaa];
         }
 
-        // Helper: extract the remaining TTL from a lookup's valid_until deadline.
-        // Returns min_ttl if the deadline is already in the past.
-        let extract_ttl = |valid_until: Instant| -> Duration {
-            let now = Instant::now();
-            if valid_until > now {
-                valid_until.duration_since(now)
-            } else {
-                self.min_ttl
+        // Cold miss under an `SRV,A` / `SRV,AAAA` leading order: query the
+        // address type speculatively while SRV runs, so a live address answer
+        // need not wait an SRV round trip. Speculation may only contribute an
+        // early success. SRV runs on the cached resolver as on main; the
+        // speculative query runs on the uncached dial resolver, so it leaves
+        // nothing in the shared cache. If SRV answers, it wins. If SRV yields
+        // nothing, a live speculative answer already in hand is used (cached
+        // only for its remaining TTL); otherwise the speculative lookup is
+        // dropped unawaited and the sequential walk below resumes at the
+        // address type, through the cached resolver, exactly as on main.
+        // A row with a known answering type is not a cold miss and walks
+        // sequentially from the start.
+        let mut resume_at = 0;
+        if row_record_type.is_none()
+            && let Some(address_type) = cold_miss_speculative_address_type(&query_types)
+        {
+            let srv = Self::lookup_record_type(&self.resolver, hostname, CachedRecordType::Srv);
+            let speculative = Self::lookup_record_type(&self.dial_resolver, hostname, address_type);
+            tokio::pin!(srv);
+            tokio::pin!(speculative);
+            let mut speculative_done: Option<Option<RecordTypeAnswer>> = None;
+            let srv_answer = loop {
+                tokio::select! {
+                    biased;
+                    answer = &mut srv => break answer,
+                    answer = &mut speculative, if speculative_done.is_none() => {
+                        speculative_done = Some(answer);
+                    }
+                }
+            };
+            if let Some(answer) = srv_answer {
+                return Ok(self.publishable_answer(answer));
             }
-        };
+            // One non-blocking poll catches a speculative answer that became
+            // ready in the same wakeup as SRV; it never waits.
+            let speculative_answer = match speculative_done {
+                Some(answer) => answer,
+                None => futures_util::FutureExt::now_or_never(speculative.as_mut()).flatten(),
+            };
+            if let Some(answer) = speculative_answer
+                && answer.valid_until > Instant::now()
+            {
+                return Ok(self.publishable_answer(answer));
+            }
+            // SRV was tried; resume the sequential walk at the address type.
+            resume_at = 1;
+        }
 
-        // Try each record type in order
-        for record_type in &query_types {
-            match record_type {
-                CachedRecordType::A => match self.resolver.ipv4_lookup(hostname).await {
-                    Ok(lookup) => {
-                        let addrs: Vec<IpAddr> = lookup
-                            .answers()
-                            .iter()
-                            .filter_map(|r| match &r.data {
-                                RData::A(a) => Some(IpAddr::V4(a.0)),
-                                _ => None,
-                            })
-                            .collect();
-                        if !addrs.is_empty() {
-                            let native_ttl = extract_ttl(lookup.valid_until());
-                            return Ok((addrs, Some(CachedRecordType::A), native_ttl));
-                        }
-                    }
-                    Err(_) => continue,
-                },
-                CachedRecordType::Aaaa => match self.resolver.ipv6_lookup(hostname).await {
-                    Ok(lookup) => {
-                        let addrs: Vec<IpAddr> = lookup
-                            .answers()
-                            .iter()
-                            .filter_map(|r| match &r.data {
-                                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
-                                _ => None,
-                            })
-                            .collect();
-                        if !addrs.is_empty() {
-                            let native_ttl = extract_ttl(lookup.valid_until());
-                            return Ok((addrs, Some(CachedRecordType::Aaaa), native_ttl));
-                        }
-                    }
-                    Err(_) => continue,
-                },
-                CachedRecordType::Srv => {
-                    match self.resolver.srv_lookup(hostname).await {
-                        Ok(srv_lookup) => {
-                            let srv_ttl = extract_ttl(srv_lookup.valid_until());
-                            // ADDRESS-ONLY SRV mode. This resolver path answers
-                            // "what IPs back this hostname"; the caller dials
-                            // the proxy's own configured backend port, so the
-                            // RR's `port` is never used. It therefore
-                            // deliberately does NOT apply the DNS-SD
-                            // registry-port admission that `resolve_srv` (the
-                            // service-availability path) applies: a port-0 RR
-                            // still carries a perfectly usable target address
-                            // here, and dropping it would blackhole a resolvable
-                            // host for a field this mode ignores. See
-                            // `docs/dns_resolver.md` → "Address-only SRV mode".
-                            //
-                            // The RFC 2782 signals that ARE about availability
-                            // still apply: the root target `.` means "decidedly
-                            // not available" and is skipped, and answers are
-                            // walked in ascending `priority` so the lowest
-                            // reachable tier wins instead of whatever order the
-                            // resolver happened to return. Sorting also makes
-                            // the chosen address independent of answer order.
-                            let mut ordered: Vec<_> = srv_lookup.answers().iter().collect();
-                            ordered.sort_by_key(|record| match &record.data {
-                                RData::SRV(srv) => srv.priority,
-                                _ => u16::MAX,
-                            });
-                            for record in ordered {
-                                let RData::SRV(ref srv) = record.data else {
-                                    continue;
-                                };
-                                let target = dns_name_without_trailing_root(&srv.target);
-                                if is_rfc2782_root_target(&target) {
-                                    continue;
-                                }
-                                if let Ok(ip_lookup) = self.resolver.lookup_ip(&target).await {
-                                    let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
-                                    if !addrs.is_empty() {
-                                        // Use the shorter of SRV TTL and A/AAAA TTL
-                                        let a_ttl = extract_ttl(ip_lookup.valid_until());
-                                        let native_ttl = srv_ttl.min(a_ttl);
-                                        return Ok((
-                                            addrs,
-                                            Some(CachedRecordType::Srv),
-                                            native_ttl,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Err(_) => continue,
-                    }
-                }
-                CachedRecordType::Cname => {
-                    // For CNAME, use lookup_ip which follows CNAME chains automatically
-                    match self.resolver.lookup_ip(hostname).await {
-                        Ok(lookup) => {
-                            let addrs: Vec<IpAddr> = lookup.iter().collect();
-                            if !addrs.is_empty() {
-                                let native_ttl = extract_ttl(lookup.valid_until());
-                                return Ok((addrs, Some(CachedRecordType::Cname), native_ttl));
-                            }
-                        }
-                        Err(_) => continue,
-                    }
-                }
+        for &record_type in &query_types[resume_at..] {
+            if let Some(answer) =
+                Self::lookup_record_type(&self.resolver, hostname, record_type).await
+            {
+                return Ok(self.publishable_answer(answer));
             }
         }
 
         anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
+    }
+
+    /// `do_resolve`'s result for `answer`: the remaining TTL is taken from
+    /// its absolute deadline at this instant, or `min_ttl` when the deadline
+    /// is already in the past (hickory clamped it).
+    fn publishable_answer(
+        &self,
+        answer: RecordTypeAnswer,
+    ) -> (Vec<IpAddr>, Option<CachedRecordType>, Duration) {
+        let now = Instant::now();
+        let native_ttl = if answer.valid_until > now {
+            answer.valid_until.duration_since(now)
+        } else {
+            self.min_ttl
+        };
+        (answer.addrs, Some(answer.record_type), native_ttl)
+    }
+
+    /// Query one record type for `hostname` through `resolver`. Returns the
+    /// answer, or `None` when the lookup failed or answered with no usable
+    /// address (the caller then tries the next type).
+    async fn lookup_record_type(
+        resolver: &Resolver<TokioRuntimeProvider>,
+        hostname: &str,
+        record_type: CachedRecordType,
+    ) -> Option<RecordTypeAnswer> {
+        match record_type {
+            CachedRecordType::A => {
+                let lookup = resolver.ipv4_lookup(hostname).await.ok()?;
+                let addrs: Vec<IpAddr> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::A(a) => Some(IpAddr::V4(a.0)),
+                        _ => None,
+                    })
+                    .collect();
+                if addrs.is_empty() {
+                    return None;
+                }
+                Some(RecordTypeAnswer::new(
+                    addrs,
+                    CachedRecordType::A,
+                    lookup.valid_until(),
+                ))
+            }
+            CachedRecordType::Aaaa => {
+                let lookup = resolver.ipv6_lookup(hostname).await.ok()?;
+                let addrs: Vec<IpAddr> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+                        _ => None,
+                    })
+                    .collect();
+                if addrs.is_empty() {
+                    return None;
+                }
+                Some(RecordTypeAnswer::new(
+                    addrs,
+                    CachedRecordType::Aaaa,
+                    lookup.valid_until(),
+                ))
+            }
+            CachedRecordType::Srv => {
+                let srv_lookup = resolver.srv_lookup(hostname).await.ok()?;
+                let srv_valid_until = srv_lookup.valid_until();
+                // ADDRESS-ONLY SRV mode. This resolver path answers "what IPs
+                // back this hostname"; the caller dials the proxy's own
+                // configured backend port, so the RR's `port` is never used.
+                // It therefore deliberately does NOT apply the DNS-SD
+                // registry-port admission that `resolve_srv` (the
+                // service-availability path) applies: a port-0 RR still
+                // carries a perfectly usable target address here, and
+                // dropping it would blackhole a resolvable host for a field
+                // this mode ignores. See `docs/dns_resolver.md` →
+                // "Address-only SRV mode".
+                //
+                // The RFC 2782 signals that ARE about availability still
+                // apply: the root target `.` means "decidedly not available"
+                // and is skipped, and answers are walked in ascending
+                // `priority` so the lowest reachable tier wins instead of
+                // whatever order the resolver happened to return. Sorting
+                // also makes the chosen address independent of answer order.
+                let mut ordered: Vec<_> = srv_lookup.answers().iter().collect();
+                ordered.sort_by_key(|record| match &record.data {
+                    RData::SRV(srv) => srv.priority,
+                    _ => u16::MAX,
+                });
+                for record in ordered {
+                    let RData::SRV(ref srv) = record.data else {
+                        continue;
+                    };
+                    let target = dns_name_without_trailing_root(&srv.target);
+                    if is_rfc2782_root_target(&target) {
+                        continue;
+                    }
+                    if let Ok(ip_lookup) = resolver.lookup_ip(&target).await {
+                        let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
+                        if !addrs.is_empty() {
+                            // Use the shorter of SRV TTL and A/AAAA TTL
+                            let valid_until = srv_valid_until.min(ip_lookup.valid_until());
+                            return Some(RecordTypeAnswer::new(
+                                addrs,
+                                CachedRecordType::Srv,
+                                valid_until,
+                            ));
+                        }
+                    }
+                }
+                None
+            }
+            CachedRecordType::Cname => {
+                // For CNAME, use lookup_ip which follows CNAME chains automatically
+                let lookup = resolver.lookup_ip(hostname).await.ok()?;
+                let addrs: Vec<IpAddr> = lookup.iter().collect();
+                if addrs.is_empty() {
+                    return None;
+                }
+                Some(RecordTypeAnswer::new(
+                    addrs,
+                    CachedRecordType::Cname,
+                    lookup.valid_until(),
+                ))
+            }
+        }
     }
 
     /// Returns the number of entries currently in the cache.
@@ -3622,6 +3728,29 @@ mod tests {
             .collect();
         assert_eq!(first, vec![SocketAddr::new(a, 0), SocketAddr::new(b, 0)]);
         assert_eq!(second, vec![SocketAddr::new(b, 0), SocketAddr::new(a, 0)]);
+    }
+
+    #[test]
+    fn cold_miss_speculative_address_type_only_follows_a_leading_srv() {
+        use super::CachedRecordType::{A, Aaaa, Cname, Srv};
+        let cases: [(&[CachedRecordType], Option<CachedRecordType>); 9] = [
+            (&[Srv, A, Cname], Some(A)),
+            (&[Srv, Aaaa, A], Some(Aaaa)),
+            (&[Srv, A], Some(A)),
+            (&[A, Srv, Cname], None),
+            (&[Aaaa, A], None),
+            (&[Srv, Cname, A], None),
+            (&[Cname, A], None),
+            (&[Srv], None),
+            (&[], None),
+        ];
+        for (query_types, expected) in cases {
+            assert_eq!(
+                cold_miss_speculative_address_type(query_types),
+                expected,
+                "{query_types:?}"
+            );
+        }
     }
 
     #[test]

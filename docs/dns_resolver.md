@@ -61,7 +61,7 @@ If a caller past its own stale window attempts a synchronous refresh and DNS fai
 | `FERRUM_DNS_STALE_TTL` | `u64` | `3600` | How long (seconds) stale cached data can be served while a background refresh is in progress. Also caps failed-entry lifetime and error-TTL exponential backoff. See [Stale-While-Revalidate](#stale-while-revalidate) and [Failed DNS Retry Task](#failed-dns-retry-task). |
 | `FERRUM_DNS_ERROR_TTL` | `u64` | `5` | Base TTL (seconds) for caching DNS errors and empty responses. Doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL` (or 1 day when stale TTL is `0`). Prevents hammering DNS for known-bad hostnames. |
 | `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, error entries are preferred for eviction over live success entries, then oldest `expires_at` within each class. |
-| `FERRUM_DNS_WARMUP_CONCURRENCY` | `usize` | `500` | Maximum number of concurrent DNS resolutions during startup/config warmup. Higher values reduce warmup time for large configs but increase burst load on upstream resolvers. |
+| `FERRUM_DNS_WARMUP_CONCURRENCY` | `usize` | `500` | Maximum number of concurrent DNS resolutions during startup/config warmup. Higher values reduce warmup time for large configs but increase burst load on upstream resolvers. A cold resolution under an `SRV,A` or `SRV,AAAA` leading order keeps up to two record-type queries in flight (see [DNS Order](#dns-order)). |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 60s-TTL entry refreshes after 54s. Lower values add safety margin at the cost of more DNS queries. |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `u64` | `10` | Interval (seconds) for the background task that retries failed DNS lookups. Error-cached entries whose current (possibly backed-off) error TTL has expired are re-attempted at this interval, subject to age eviction and per-cycle work bounds. Set to `0` to disable. |
@@ -73,7 +73,17 @@ Ferrum starts from the platform system DNS configuration (on Linux, `/etc/resolv
 
 ## DNS Order
 
-The `FERRUM_DNS_ORDER` setting controls which DNS record types are queried and in what order. The resolver tries each type sequentially and returns the first successful result.
+The `FERRUM_DNS_ORDER` setting controls which DNS record types are queried and in what order. The resolver returns the first non-empty answer in that order.
+
+Once a hostname has a success row that records which type answered, every lookup for it (stale-while-revalidate, proactive refresh, synchronous re-resolution) tries the types one at a time and sends exactly the queries a sequential walk would. With `CACHE` configured, that walk starts with the type that answered last; without it, the walk follows the configured order. A **cold miss** is a lookup with no such row: no row yet, an error row, or a success row with no recorded type (the built-in `localhost` fallback).
+
+When the order leads with `SRV` followed by `A` or `AAAA`, as the default does, a cold miss sends that address query **speculatively** beside SRV. Any other order (for example `A,AAAA`, or `SRV,CNAME,A`) stays sequential on a cold miss too. **Speculation may only contribute an early success; in every other case the lookup is exactly the sequential walk, resumed when SRV yields nothing.**
+
+- If SRV answers, it wins and the speculative query is cancelled.
+- If SRV yields nothing and the speculative query has already returned a live answer, that answer is used, cached only for what remains of its TTL. This is the case that saves an SRV round trip.
+- Otherwise (the speculative query failed, its answer has expired, a TTL-0 answer included, or it has not returned yet), it is dropped unawaited, and the walk resumes at the address type and continues (`CNAME` …) exactly as the sequential walk does.
+
+The speculative query goes through a separate resolver with no cache, so it never adds to or reads the resolver cache that SRV and every sequential lookup use. Resolver cache hits are honoured exactly as before, and a resumed lookup starts when the sequential walk's would, so a cold miss is never slower than the sequential walk. A cold miss under such an order keeps up to two queries in flight per hostname where a sequential walk kept one. A cold miss on an SRV-backed name sends one extra speculative address query, and so does a cold miss whose speculative answer is not used. In both cases the extra query costs no latency. There is no gain during a resolver outage: a timed-out speculative query is dropped and the resumed lookup waits as the sequential walk did.
 
 Valid values (case-insensitive):
 
