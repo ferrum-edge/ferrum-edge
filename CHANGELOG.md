@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `request_termination` `trigger.header_value`
   - `transaction_debugger` `capture_request_header_value`
   - `ai_semantic_firewall` `privacy.snippet_hash_salt`
+  - the `opa` `opa_host` base path (now projected as a structural URL)
+  - every value of a `headers` / `custom_headers` / `request_headers` /
+    `extra_headers` / `header_present` map in a custom plugin's config, at any
+    depth (built-ins declare their header maps in their schema)
   - inline PEM private keys in `mesh_route_dispatch`
     `rules[].destination.backend_tls.client_key_path` and `udp_logging`
     `dtls_key_path`, and certificate-plus-key bundles pasted into a plugin

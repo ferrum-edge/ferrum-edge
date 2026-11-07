@@ -3513,3 +3513,77 @@ async fn unclassified_private_key_echo_is_refused_for_operators() {
     let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
     assert_eq!(stored["config"]["note"]["nested"][0], json!(bundle));
 }
+
+/// An `opa_host` base path is kept in every OPA decision URL, so non-admin
+/// reads and the audit diff project it structurally (origin visible, path
+/// withheld), admin reads stay raw, and an operator write that echoes the
+/// projected URL is refused.
+#[tokio::test]
+async fn opa_host_base_path_is_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/opa-base-path";
+    let write_path = "/plugins/config/opa-base-path?expected_proxy_ids=";
+    let opa_host = "https://opa.example.com/opa-base-path-canary";
+    let projected_host = "https://opa.example.com/[REDACTED_PATH]";
+
+    // Disabled configs are stored without plugin construction.
+    let plugin = json!({
+        "id": "opa-base-path",
+        "plugin_name": "opa",
+        "scope": "global",
+        "enabled": false,
+        "config": {"opa_host": opa_host, "policy_path": "/v1/data/authz/allow"}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "opa create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=opa-base-path",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["config"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+    }
+    for projection in &projections {
+        assert_eq!(projection["opa_host"], projected_host, "{projection}");
+        assert_eq!(projection["policy_path"], "/v1/data/authz/allow");
+    }
+
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(raw["config"]["opa_host"], opa_host);
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked opa_host was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/opa_host"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["opa_host"], opa_host);
+}

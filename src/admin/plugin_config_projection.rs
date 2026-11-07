@@ -16,6 +16,12 @@
 //!
 //! 1. **Schema rules** ([`PLUGIN_SENSITIVITY_SCHEMAS`]) — exact, per-plugin
 //!    paths with `*` wildcards for arbitrary maps/arrays.
+//!    A custom plugin (no built-in schema) also gets a structural header-map
+//!    rule: every value of an object keyed `headers`, `custom_headers`,
+//!    `request_headers`, `extra_headers`, or `header_present` (any spelling,
+//!    any depth) is withheld ([`HEADER_MAP_KEYS`]). Built-ins declare their
+//!    header maps explicitly instead, because several keep a map of that name
+//!    visible on purpose (response headers, OpenAPI and JSON-schema documents).
 //! 2. **Name heuristics** ([`is_sensitive_plugin_config_key`]) — the historical
 //!    substring matcher, retained as a floor. It still covers custom plugins
 //!    (which have no built-in schema) and any built-in field that a future edit
@@ -518,6 +524,9 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     (
         "opa",
         &[
+            // The OPA server URL may carry a base path that is kept in every
+            // decision URL; project it structurally like any endpoint.
+            endpoint_url(&["opa_host"]),
             // Static headers attached to every OPA decision request; a bundle
             // or management-API token lives here under an arbitrary name.
             secret(&["headers", "*"]),
@@ -849,8 +858,30 @@ pub const KAFKA_SAFE_PRODUCER_PROPERTIES: &[&str] = &[
     "topic.metadata.refresh.interval.ms",
 ];
 
+/// Normalized keys ([`normalize_config_key`]) that name an arbitrary header
+/// map in a plugin config: `headers`, `custom_headers`, `request_headers`,
+/// `extra_headers`, and `header_present`, in any spelling.
+pub const HEADER_MAP_KEYS: &[&str] = &[
+    "headers",
+    "customheaders",
+    "requestheaders",
+    "extraheaders",
+    "headerpresent",
+];
+
+/// Whether `plugin_name` is a built-in with a declared sensitivity schema.
+///
+/// A custom plugin has none, so the projection cannot know which of its maps
+/// carry header values; it gets the structural header-map layer instead (see
+/// [`project_plugin_config_with`]).
+pub fn has_builtin_sensitivity_schema(plugin_name: &str) -> bool {
+    PLUGIN_SENSITIVITY_SCHEMAS
+        .iter()
+        .any(|(name, _)| *name == plugin_name)
+}
+
 /// Look up the schema rules for a plugin. Unknown (custom) plugins get no
-/// rules and rely on the heuristic + structural URL layers.
+/// rules and rely on the heuristic, header-map, and structural layers.
 pub fn sensitivity_rules_for(plugin_name: &str) -> &'static [SensitivityRule] {
     PLUGIN_SENSITIVITY_SCHEMAS
         .iter()
@@ -912,6 +943,9 @@ pub fn project_plugin_config_with(
 
     for rule in sensitivity_rules_for(plugin_name) {
         projector.apply_rule(config, rule.path, rule.sensitivity);
+    }
+    if !has_builtin_sensitivity_schema(plugin_name) {
+        projector.redact_header_maps(config);
     }
     projector.redact_by_name(config);
     projector.strip_url_userinfo(config);
@@ -1380,6 +1414,39 @@ impl<'r> Projector<'r> {
         }
     }
 
+    /// Custom-plugin header-map layer: every value of an object whose key
+    /// normalizes to one of [`HEADER_MAP_KEYS`] is withheld, at any depth.
+    /// An array under such a key is a header-name list and stays visible, as
+    /// do the header names themselves.
+    fn redact_header_maps(&mut self, value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    let mark = self.enter(key);
+                    match child {
+                        Value::Object(headers) if is_header_map_key(key) => {
+                            for (name, header_value) in headers.iter_mut() {
+                                let header_mark = self.enter(name);
+                                self.apply_sensitivity(header_value, FieldSensitivity::Secret);
+                                self.leave(header_mark);
+                            }
+                        }
+                        other => self.redact_header_maps(other),
+                    }
+                    self.leave(mark);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    let mark = self.enter(&index.to_string());
+                    self.redact_header_maps(item);
+                    self.leave(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Heuristic name-based layer; see [`redact_sensitive_plugin_config_fields`].
     fn redact_by_name(&mut self, value: &mut Value) {
         match value {
@@ -1438,6 +1505,11 @@ impl<'r> Projector<'r> {
             _ => {}
         }
     }
+}
+
+/// Whether an object key names an arbitrary header map ([`HEADER_MAP_KEYS`]).
+fn is_header_map_key(key: &str) -> bool {
+    HEADER_MAP_KEYS.contains(&normalize_config_key(key).as_str())
 }
 
 /// Whether an object key matches a schema path segment; `None` is `*`.

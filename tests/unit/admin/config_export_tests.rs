@@ -854,3 +854,30 @@ fn export_fingerprints_plugin_certificate_plus_key_bundles() {
     assert_eq!(udp["dtls_key_path"], "k8s://ferrum/udp-client#tls.key");
     assert!(!export.to_string().contains(INLINE_CLIENT_KEY_BODY));
 }
+
+/// An `opa_host` base path is fingerprinted in the export; `policy_path`
+/// stays verbatim.
+#[test]
+fn export_fingerprints_opa_host_base_path() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let opa: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "opa",
+        "plugin_name": "opa",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "opa_host": "https://opa.example.com/opa-base-path-must-not-leak",
+            "policy_path": "/v1/data/authz/allow"
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("opa fixture");
+    config.plugin_configs.push(opa);
+
+    let export = export(config, ADMIN_SECRET);
+    let opa = &plugin(&export, "opa")["config"];
+    assert!(is_fingerprint(&opa["opa_host"]), "{opa}");
+    assert_eq!(opa["policy_path"], "/v1/data/authz/allow");
+    assert!(!export.to_string().contains("opa-base-path-must-not-leak"));
+}

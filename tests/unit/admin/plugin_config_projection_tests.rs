@@ -908,6 +908,110 @@ fn certificate_plus_key_bundles_are_withheld_in_certificate_sources() {
     }
 }
 
+/// `opa_host` may carry a base path that is kept in every decision URL, so it
+/// is projected structurally; the origin and `policy_path` stay visible.
+#[test]
+fn opa_host_base_path_is_projected() {
+    let raw = json!({
+        "opa_host": "https://opa.example.com/opa-base-canary",
+        "policy_path": "/v1/data/authz/allow",
+        "timeout_ms": 500
+    });
+    assert!(
+        placeholder_sites("opa", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("opa", raw);
+    assert_eq!(
+        projected["opa_host"],
+        "https://opa.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(projected["policy_path"], "/v1/data/authz/allow");
+    assert_eq!(projected["timeout_ms"], 500);
+    assert_no_canaries(&projected, &["opa-base-canary"]);
+    assert_eq!(
+        placeholder_sites("opa", &projected),
+        vec!["/config/opa_host".to_string()]
+    );
+
+    // A bare origin has nothing to withhold and stays verbatim.
+    let origin = project("opa", json!({"opa_host": "http://opa:8181"}));
+    assert_eq!(origin["opa_host"], "http://opa:8181");
+}
+
+/// A custom plugin has no schema, so every value of a map keyed `headers`,
+/// `custom_headers`, `request_headers`, `extra_headers`, or `header_present`
+/// (any spelling, any depth) is withheld. Header names, header-name lists, and
+/// `null` values stay visible, and built-ins keep their deliberately visible
+/// response-header maps.
+#[test]
+fn custom_plugin_header_maps_are_withheld_at_any_depth() {
+    let raw = json!({
+        "headers": {"x-honeycomb-team": "chm-top-canary", "x-null": null},
+        "sinks": [{"customHeaders": {"X-Vendor-Token": "chm-nested-canary"}}],
+        "outbound": {"request-headers": {"x-tenant": {"value": "chm-object-canary"}}},
+        "extra_headers": ["x-forwarded-for", "x-request-id"],
+        "header_present": {"x-skip": "chm-present-canary"},
+        "batch_size": 50
+    });
+    assert!(
+        placeholder_sites("some_custom_plugin", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("some_custom_plugin", raw);
+    assert_eq!(projected["headers"]["x-honeycomb-team"], REDACTED);
+    assert_eq!(projected["headers"]["x-null"], Value::Null);
+    assert_eq!(
+        projected["sinks"][0]["customHeaders"]["X-Vendor-Token"],
+        REDACTED
+    );
+    assert_eq!(
+        projected["outbound"]["request-headers"]["x-tenant"],
+        REDACTED
+    );
+    assert_eq!(
+        projected["extra_headers"],
+        json!(["x-forwarded-for", "x-request-id"])
+    );
+    assert_eq!(projected["header_present"]["x-skip"], REDACTED);
+    assert_eq!(projected["batch_size"], 50);
+    assert_no_canaries(
+        &projected,
+        &[
+            "chm-top-canary",
+            "chm-nested-canary",
+            "chm-object-canary",
+            "chm-present-canary",
+        ],
+    );
+    let mut sites = placeholder_sites("some_custom_plugin", &projected);
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            "/config/header_present/x-skip",
+            "/config/headers/x-honeycomb-team",
+            "/config/outbound/request-headers/x-tenant",
+            "/config/sinks/0/customHeaders/X-Vendor-Token",
+        ]
+    );
+
+    // Built-ins declare their header maps in the schema instead; response
+    // headers they keep visible on purpose are not touched.
+    let termination = project(
+        "request_termination",
+        json!({"status_code": 503, "headers": {"Retry-After": "120"}}),
+    );
+    assert_eq!(termination["headers"]["Retry-After"], "120");
+    let mock = project(
+        "response_mock",
+        json!({"rules": [{"path": "/v1", "headers": {"x-mock": "static-value"}}]}),
+    );
+    assert_eq!(mock["rules"][0]["headers"]["x-mock"], "static-value");
+}
+
 /// A resource-level plugin `trigger` withholds every header, query and cookie
 /// operand at any depth of the `all` / `any` / `not` tree; names, match kinds,
 /// flags, structure, and non-client predicates stay visible.

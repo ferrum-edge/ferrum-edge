@@ -1790,6 +1790,7 @@ Fields covered by the schema include:
 | `otel_tracing` | `endpoint` | structural URL |
 | `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |
 | `opa`, `ai_transcript_audit` | `headers.*`, `custom_headers.*` | `[REDACTED]` |
+| `opa` | `opa_host` | structural URL (a base path is kept in every decision URL; `policy_path` stays visible) |
 | `ai_transcript_audit` | `sink.endpoint_url` | structural URL |
 | `ai_transcript_audit` | `sink.custom_headers.*` | `[REDACTED]` |
 | `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |
@@ -1821,6 +1822,8 @@ Fields covered by the schema include:
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
 
 Header **values** are secret by default wherever a plugin accepts an arbitrary header map, because vendor authentication header names (`x-honeycomb-team`, `dd-api-key`, `lightstep-access-token`) match no substring pattern. Header **names** stay visible as routing diagnostics. Configuration keys that hold header *name lists* rather than values (`expose_headers`, `claim_headers`, `vary_by_headers`, `forward_headers`, `redact_headers`, …) are deliberately not redacted — distinguishing them from value maps is exactly what the schema exists to do.
+
+A custom plugin has no schema, so the projection cannot tell which of its maps carry header values. For a plugin whose name has no built-in schema entry, every value of an object keyed `headers`, `custom_headers`, `request_headers`, `extra_headers`, or `header_present` (any spelling, at any depth) is withheld; header names, header-name arrays under those keys, and `null` values stay visible. Built-ins declare their header maps in the schema instead, because several deliberately keep a map of that name visible: response headers such as `request_termination` `headers` and `response_mock` `rules[].headers`, and OpenAPI or JSON-schema documents.
 
 `kafka_logging.producer_config` is an open escape hatch forwarded verbatim to librdkafka, several of whose properties are marked sensitive upstream (`ssl.key.pem`, `ssl.key.password`, `ssl.keystore.password`, `sasl.password`, `sasl.oauthbearer.config`, …). The projection therefore allow-lists the known non-credential tuning properties and redacts everything else, so a newly added upstream sensitive property is redacted by default. Separately, `producer_config` values carrying inline PEM private-key material are **rejected at admission** — use the top-level `ssl_key_location` field or an external secret reference. The rejection message names only the property, never the rejected material.
 
