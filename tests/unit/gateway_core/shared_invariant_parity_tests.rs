@@ -20,7 +20,7 @@
 //! the request/response wide-charset decoding parity table, which needs the WAF
 //! plugin surface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
@@ -1044,9 +1044,25 @@ fn after_matching_close(bytes: &[u8], open_at: usize) -> usize {
     bytes.len()
 }
 
-/// Index just past the item that follows an attribute ending at `from`: its
-/// further attributes, then either a `;` (an out-of-line `mod name;`, a `use`)
-/// or the `{ .. }` body that closes it.
+/// Index just past what an attribute ending at `from` annotates, or a point
+/// inside it — not past it. After its further attributes and any `( .. )` /
+/// `[ .. ]` groups, the annotated text ends at the FIRST of:
+///
+/// - a `;` or `,` at its own depth, consumed: an out-of-line `mod name;`, a
+///   `use`, a statement, or a comma-terminated field, struct-literal field,
+///   tuple field, enum variant or match arm;
+/// - the close of its first `{ .. }` group: an item or block body;
+/// - a closing bracket it did not open, not consumed: the end of the field,
+///   variant, argument or arm list holding a last element with no trailing
+///   comma.
+///
+/// The first of these is never beyond the annotated item's real end, so the
+/// stripper can keep test-only text (an `else` after a gated `if`, or a gated
+/// item whose header has a `,` in its generics), which the parity scan then
+/// sees as production — a loud false positive — but it never erases the
+/// production code that follows. The one shape it does not bound is an
+/// attribute on a generic parameter (`fn f<#[cfg(test)] T>`), which the
+/// scanned sources do not use.
 fn end_of_annotated_item(bytes: &[u8], from: usize) -> usize {
     let mut at = from;
     while at < bytes.len() {
@@ -1055,9 +1071,10 @@ fn end_of_annotated_item(bytes: &[u8], from: usize) -> usize {
             continue;
         }
         match bytes[at] {
-            b';' => return at + 1,
+            b';' | b',' => return at + 1,
             b'{' => return after_matching_close(bytes, at),
             b'(' | b'[' => at = after_matching_close(bytes, at),
+            b')' | b']' | b'}' => return at,
             _ => at += 1,
         }
     }
@@ -1102,10 +1119,14 @@ fn cfg_is_test_only(attribute: &str) -> bool {
     top_level.contains(&"test")
 }
 
-/// `text` with every item gated by a test-only `cfg` removed — inline and
-/// out-of-line modules, helper fns, impls — at any indentation, including one
-/// at byte zero. Comments, strings and char literals are lexed, so a brace or
-/// `#[cfg(test)]` inside one changes nothing. Everything else is kept.
+/// `text` with everything gated by a test-only `cfg` removed — inline and
+/// out-of-line modules, helper fns, impls, fields, struct-literal fields,
+/// variants, match arms and statements — at any indentation, including one at
+/// byte zero. Comments, strings and char literals are lexed, so a brace or
+/// `#[cfg(test)]` inside one changes nothing. Everything else is kept: see
+/// `end_of_annotated_item` for why a removal never reaches past the gated
+/// text, and `production_items_missing_after_strip` for the independent check
+/// that holds it to that over every scanned file.
 fn without_cfg_test_items(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut production = String::with_capacity(text.len());
@@ -1137,6 +1158,168 @@ fn without_cfg_test_items(text: &str) -> String {
     production
 }
 
+/// Per byte of `bytes`, whether it lies inside a comment, string or char
+/// literal past that token's first byte: a line starting there is literal
+/// text, not code.
+fn opaque_token_interior(bytes: &[u8]) -> Vec<bool> {
+    let mut interior = vec![false; bytes.len() + 1];
+    let mut at = 0;
+    while at < bytes.len() {
+        match opaque_token_len(bytes, at) {
+            Some(len) => {
+                if len > 1 {
+                    interior[at + 1..at + len].fill(true);
+                }
+                at += len.max(1);
+            }
+            None => at += 1,
+        }
+    }
+    interior
+}
+
+/// Whether a trimmed rustfmt line opens an item: optional visibility, then an
+/// item keyword or qualifier.
+fn is_item_header(trimmed: &str) -> bool {
+    let mut rest = trimmed;
+    if let Some(after) = rest.strip_prefix("pub(") {
+        rest = after
+            .split_once(')')
+            .map_or(after, |(_, tail)| tail)
+            .trim_start();
+    } else if let Some(after) = rest.strip_prefix("pub ") {
+        rest = after;
+    }
+    let word_len = rest
+        .bytes()
+        .take_while(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        .count();
+    matches!(
+        &rest[..word_len],
+        "fn" | "async"
+            | "const"
+            | "static"
+            | "struct"
+            | "enum"
+            | "union"
+            | "impl"
+            | "trait"
+            | "mod"
+            | "use"
+            | "type"
+            | "unsafe"
+            | "extern"
+            | "macro_rules"
+    )
+}
+
+/// Whether the attribute lines directly above `lines[header]` (at `indent`,
+/// with doc comments and the continuation lines of a multi-line attribute)
+/// carry a test-only `cfg`.
+fn header_attributes_are_test_only(
+    lines: &[(usize, &str)],
+    interior: &[bool],
+    header: usize,
+    indent: usize,
+) -> bool {
+    // Walking up: deeper lines and a `)` / `]` closer are a multi-line
+    // attribute's body only once the `#[` line that opens it is reached, so a
+    // previous item's tail (`struct Pair(\n    #[cfg(test)] T,\n);`) never
+    // gates the header below it.
+    let mut run = Vec::new();
+    let mut continuation = Vec::new();
+    for &(start, line) in lines[..header].iter().rev() {
+        let trimmed = line.trim_start();
+        if interior[start] || trimmed.is_empty() {
+            break;
+        }
+        let line_indent = line.len() - trimmed.len();
+        if line_indent > indent || (line_indent == indent && trimmed.starts_with([')', ']'])) {
+            if !trimmed.starts_with("//") {
+                continuation.push(line);
+            }
+        } else if line_indent == indent && trimmed.starts_with("#[") {
+            run.append(&mut continuation);
+            run.push(line);
+        } else if !(line_indent == indent && trimmed.starts_with("//") && continuation.is_empty()) {
+            break;
+        }
+    }
+    run.reverse();
+    let attributes = run.join("\n");
+    let bytes = attributes.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = attributes[from..].find("#[") {
+        let at = from + offset;
+        let end = after_matching_close(bytes, at + 1);
+        if cfg_is_test_only(attributes.get(at + 2..end.saturating_sub(1)).unwrap_or("")) {
+            return true;
+        }
+        from = at + 2;
+    }
+    false
+}
+
+/// The item header lines of rustfmt-formatted `text` that are production
+/// code, found line by line, independently of the stripper's lexing: every
+/// header at column 0, and every header at four spaces inside an ungated
+/// column-0 item (an `impl`'s methods, an inline module's items), whose own
+/// attribute lines carry no test-only `cfg`. Lines inside comments and string
+/// literals are skipped.
+fn production_item_headers(text: &str) -> Vec<&str> {
+    let interior = opaque_token_interior(text.as_bytes());
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        lines.push((start, line));
+        start += line.len() + 1;
+    }
+    let mut headers = Vec::new();
+    let mut enclosing_is_test_only = false;
+    for (index, &(start, line)) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if interior[start] || trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent == 0 {
+            if trimmed.starts_with(['}', ')', ']', '#', '/', '*']) {
+                continue;
+            }
+            enclosing_is_test_only = header_attributes_are_test_only(&lines, &interior, index, 0);
+            if !enclosing_is_test_only && is_item_header(trimmed) {
+                headers.push(line);
+            }
+        } else if indent == 4
+            && !enclosing_is_test_only
+            && is_item_header(trimmed)
+            && !header_attributes_are_test_only(&lines, &interior, index, 4)
+        {
+            headers.push(line);
+        }
+    }
+    headers
+}
+
+/// The production item headers of `text` (see `production_item_headers`) that
+/// `production` — `text` after `without_cfg_test_items` — no longer has as a
+/// whole line, counted with multiplicity so a surviving duplicate cannot hide
+/// a lost one.
+fn production_items_missing_after_strip<'a>(text: &'a str, production: &str) -> Vec<&'a str> {
+    let mut kept: BTreeMap<&str, usize> = BTreeMap::new();
+    for line in production.split('\n') {
+        *kept.entry(line).or_default() += 1;
+    }
+    let mut missing = Vec::new();
+    for header in production_item_headers(text) {
+        match kept.get_mut(header) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => missing.push(header),
+        }
+    }
+    missing
+}
+
 #[test]
 fn cfg_test_item_stripper_keeps_every_production_item() {
     // Every `PROD_n` item must survive and every `TEST_ONLY_n` item must go.
@@ -1146,6 +1329,10 @@ fn cfg_test_item_stripper_keeps_every_production_item() {
     // (attribute at byte zero), TEST_ONLY_3 (`cfg(all(test, ..))`),
     // TEST_ONLY_4 (indented) and TEST_ONLY_5 (a test-only fn). The string,
     // raw-string, char and comment braces inside `linux_only` pin the lexing.
+    // Issue #7026: an item-only stripper read past a gated field, struct-literal
+    // field, tuple field or match arm to the next `;` or `{ .. }`, so it erased
+    // PROD_7 through PROD_13 — the shape that hid production items of
+    // `src/proxy/deferred_log.rs` and `src/grpc/dp_client.rs` from the scan.
     let fixture = r##"#[cfg(test)]
 mod at_byte_zero { fn t() { TEST_ONLY_1(); } }
 #[cfg(test)]
@@ -1177,11 +1364,66 @@ impl Production {
 fn test_helper(a: [u8; 3]) -> u8 { TEST_ONLY_5(); a[0] }
 // #[cfg(test)] in a comment gates nothing
 fn production_tail() { PROD_6(); }
+struct Logger {
+    state: u8,
+    #[cfg(test)]
+    delivery: Option<Delivery>,
+}
+impl Drop for Logger {
+    fn drop(&mut self) { PROD_7(); }
+}
+struct TrailingField {
+    #[cfg(test)]
+    last: u8
+}
+fn production_after_trailing_field() { PROD_8(); }
+fn build() -> Logger {
+    Logger {
+        state: 0,
+        #[cfg(test)]
+        delivery: TEST_ONLY_6(),
+    }
+}
+fn production_after_struct_literal() { PROD_9(); }
+fn dispatch(kind: u8) -> u8 {
+    match kind {
+        #[cfg(test)]
+        0 => TEST_ONLY_7(),
+        _ => PROD_10(),
+    }
+}
+fn statement() {
+    #[cfg(test)]
+    if let Some(delivery) = DELIVERY { TEST_ONLY_8(); return; }
+    PROD_11();
+}
+enum Kind {
+    #[cfg(test)]
+    TestOnly(TEST_ONLY_9),
+    Production(PROD_12),
+}
+struct Pair(
+    #[cfg(test)] TEST_ONLY_10,
+    PROD_13,
+);
+fn production_after_pair() { PROD_14(); }
 "##;
     let production = without_cfg_test_items(fixture);
-    for kept in ["PROD_1", "PROD_2", "PROD_3", "PROD_4", "PROD_5", "PROD_6"] {
+    // A whole marker, so `PROD_1` is not satisfied by `PROD_13`.
+    let has_marker = |marker: &str| {
+        production.match_indices(marker).any(|(at, _)| {
+            !production
+                .as_bytes()
+                .get(at + marker.len())
+                .is_some_and(u8::is_ascii_digit)
+        })
+    };
+    for kept in [
+        "PROD_1", "PROD_2", "PROD_3", "PROD_4", "PROD_5", "PROD_6", "PROD_7", "PROD_8", "PROD_9",
+        "PROD_10", "PROD_11", "PROD_12", "PROD_13", "PROD_14",
+    ] {
         assert!(
-            production.contains(kept),
+            has_marker(kept),
             "{kept} is production code and must survive the stripper:\n{production}"
         );
     }
@@ -1190,14 +1432,36 @@ fn production_tail() { PROD_6(); }
         "TEST_ONLY_3",
         "TEST_ONLY_4",
         "TEST_ONLY_5",
+        "TEST_ONLY_6",
+        "TEST_ONLY_7",
+        "TEST_ONLY_8",
+        "TEST_ONLY_9",
+        "TEST_ONLY_10",
         "mod out_of_line",
         "mod pathed",
+        "delivery: Option",
+        "last: u8",
     ] {
         assert!(
-            !production.contains(dropped),
+            !has_marker(dropped),
             "{dropped} is test-only and must be stripped:\n{production}"
         );
     }
+    // The independent line-based check agrees, and it notices a lost item.
+    let missing = production_items_missing_after_strip(fixture, &production);
+    assert!(
+        missing.is_empty(),
+        "the stripper erased production items {missing:?}:\n{production}"
+    );
+    assert!(production_item_headers(fixture).contains(&"impl Drop for Logger {"));
+    assert!(production_item_headers(fixture).contains(&"    fn drop(&mut self) { PROD_7(); }"));
+    assert!(!production_item_headers(fixture).contains(&"mod pathed;"));
+    let lost_impl = production.replacen("impl Drop for Logger {\n", "", 1);
+    assert_eq!(
+        production_items_missing_after_strip(fixture, &lost_impl),
+        ["impl Drop for Logger {"],
+        "a production item the stripper lost must be reported"
+    );
 }
 
 /// CB-1: every production settlement of a circuit-breaker admission goes
@@ -1219,7 +1483,19 @@ fn no_production_path_settles_a_breaker_without_its_probe_ticket() {
             continue;
         }
         scanned += 1;
-        let production: String = without_cfg_test_items(&text).split_whitespace().collect();
+        let stripped = without_cfg_test_items(&text);
+        // The scan is only as good as the stripper: a removal that ran past
+        // its gated text would hide production calls from it (issue #7026).
+        assert!(
+            !production_item_headers(&text).is_empty(),
+            "{path}: the line-based production-item check found nothing to check"
+        );
+        let missing = production_items_missing_after_strip(&text, &stripped);
+        assert!(
+            missing.is_empty(),
+            "{path}: stripping `cfg(test)` items erased production items {missing:?}"
+        );
+        let production: String = stripped.split_whitespace().collect();
         for blind in [
             ".record_success(",
             ".record_failure(",
