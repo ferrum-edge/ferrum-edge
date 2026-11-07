@@ -8230,7 +8230,6 @@ async fn grpc_bound_backend_path_decides_enrollment_without_method_router() {
             .await,
         PluginResult::Continue
     ));
-
 }
 
 /// Plugin-writable `grpc_full_method` metadata never outranks the private bound

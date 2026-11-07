@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **AI gRPC enrollment is decided on the bound backend path, and
+  `ai_response_guard` gRPC frame budgets are bounded.** `ai_response_guard`
+  and `ai_transcript_audit` let the plugin-writable `grpc_full_method`
+  metadata outrank the private bound backend path and compared the untrimmed
+  path, so another plugin's metadata could un-enroll the method the backend
+  serves and an upstream base path hid an enrolled method. Both now resolve
+  the canonical trailing `/Service/Method` exactly as `body_validator` does
+  (bound path, then pre-routing metadata, then the request path).
+  `ai_response_guard` `grpc.max_messages` is capped at 1024 and
+  `grpc.max_message_bytes` at 67108864 (the `max_scan_bytes` ceiling); a
+  larger configured value is rejected at admission.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`
