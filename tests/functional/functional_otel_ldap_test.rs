@@ -13,7 +13,6 @@
 
 use crate::scaffolding::port_registry::TestSocket;
 
-use crate::common::probe_gateway_identity;
 use hickory_resolver::proto::{
     op::Message,
     rr::{RData, Record, RecordType},
@@ -208,56 +207,16 @@ async fn wait_for_owned_gateway(
     observability_token: &str,
     proxy_port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    const STARTUP_TIMEOUT_SECS: u64 = 30;
-    const PROBE_SLICE: Duration = Duration::from_secs(1);
-    let deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
-    let proxy_addr = format!("127.0.0.1:{}", proxy_port);
-
-    let mut last_observation = String::from("no response yet");
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(format!(
-                "Gateway exited during startup with {status} \
-                 (last observation: {last_observation})"
-            )
-            .into());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(format!(
-                "Gateway did not prove ownership of admin port {admin_port} within \
-                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
-            )
-            .into());
-        }
-        match probe_gateway_identity(admin_port, observability_token, remaining.min(PROBE_SLICE))
-            .await
-        {
-            Ok(()) => break,
-            Err(err) => last_observation = err.to_string(),
-        }
-    }
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(format!("Gateway exited after reporting ready with {status}").into());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "Gateway port {proxy_port} did not accept TCP connections within \
-                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
-            )
-            .into());
-        }
-        match tokio::net::TcpStream::connect(&proxy_addr).await {
-            Ok(stream) => {
-                drop(stream);
-                return Ok(());
-            }
-            Err(err) => last_observation = err.to_string(),
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    crate::common::wait_for_child_gateway_readiness(
+        child,
+        admin_port,
+        observability_token,
+        STARTUP_TIMEOUT,
+    )
+    .await?;
+    crate::common::wait_for_child_tcp_accept(child, proxy_port, deadline).await
 }
 
 /// Start the gateway with retry logic to handle ephemeral port races.

@@ -8402,6 +8402,93 @@ pub mod _test_support {
         )
     }
 
+    /// Drives the shared admin mTLS DNS admission hold state (single-mutation
+    /// state plus the multi-phase restore phase) the way the restore flow
+    /// does, so external tests can assert when guard Drop releases the
+    /// durable fence (issue #7032).
+    pub struct AdminMtlsDnsAdmissionHoldProbe(
+        std::sync::Arc<crate::admin::MtlsDnsAdmissionHoldState>,
+    );
+
+    impl Default for AdminMtlsDnsAdmissionHoldProbe {
+        fn default() -> Self {
+            Self(std::sync::Arc::new(
+                crate::admin::MtlsDnsAdmissionHoldState::new(),
+            ))
+        }
+    }
+
+    impl AdminMtlsDnsAdmissionHoldProbe {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub async fn run_mutation<T, F>(&self, mutation: F) -> T
+        where
+            F: std::future::Future<Output = T>,
+        {
+            self.0.run_mutation(mutation).await
+        }
+
+        pub async fn run_restore_clear<T, E, F>(&self, clear: F) -> Result<T, E>
+        where
+            F: std::future::Future<Output = Result<T, E>>,
+        {
+            self.0.run_restore_clear(clear).await
+        }
+
+        pub async fn run_restore_import<T, F>(
+            &self,
+            import: F,
+            succeeded: impl FnOnce(&T) -> bool,
+        ) -> T
+        where
+            F: std::future::Future<Output = T>,
+        {
+            self.0.run_restore_import(import, succeeded).await
+        }
+
+        pub async fn run_restore_rollback<T, E, F>(&self, rollback: F) -> Result<T, E>
+        where
+            F: std::future::Future<Output = Result<T, E>>,
+        {
+            self.0.run_restore_rollback(rollback).await
+        }
+
+        /// Mirror the restore flow's explicit `Cleared` transitions (ambiguous
+        /// atomic clear, reacquired guard after a lost lease during clear).
+        pub fn mark_restore_cleared(&self) {
+            self.0.mark_restore_cleared_for_test();
+        }
+
+        /// Mirror the restore flow's explicit failed-import transition (lease
+        /// lost during import, reacquired guard for the rollback).
+        pub fn mark_restore_import_failed(&self) {
+            self.0.mark_restore_import_failed_for_test();
+        }
+
+        /// Whether `MtlsDnsAdmissionGuardLifecycle::drop` would release the
+        /// durable fence in the current state.
+        pub fn drop_releases(&self) -> bool {
+            self.0.release_on_drop()
+        }
+    }
+
+    /// Cancel a restore-guard recovery reacquisition after its first poll
+    /// (issue #7032). See `admin::cancel_restore_guard_reacquisition_for_test`.
+    pub async fn admin_cancel_restore_guard_reacquisition_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+        inherit_incomplete_restore: bool,
+    ) {
+        crate::admin::cancel_restore_guard_reacquisition_for_test(
+            db,
+            namespace,
+            inherit_incomplete_restore,
+        )
+        .await
+    }
+
     pub fn admin_mtls_dns_admission_contention_response(
         raw_backend_detail: &str,
     ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {

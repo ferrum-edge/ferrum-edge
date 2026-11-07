@@ -128,6 +128,28 @@ fn validate_resource_counts(
     );
 }
 
+/// Syntax a config document is decoded as. File mode picks it from the path
+/// extension; the in-memory fuzz entry point sniffs the content because it
+/// has no path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentFormat {
+    Yaml,
+    Json,
+}
+
+/// How [`decode_and_validate_document`] scopes a decoded document before the
+/// cross-resource uniqueness and reference validators run.
+#[derive(Debug, Clone, Copy)]
+enum DocumentNamespaceScope<'a> {
+    /// File mode: record every namespace in `known_namespaces`, then keep only
+    /// this namespace's resources.
+    Filter(&'a str),
+    /// In-memory decode (fuzz lane): validate every namespace's resources
+    /// together and leave `known_namespaces` as decoded.
+    #[cfg_attr(not(feature = "fuzzing"), allow(dead_code))]
+    Unfiltered,
+}
+
 /// Load configuration from a YAML or JSON file.
 ///
 /// If the config file is at an older version than `CURRENT_CONFIG_VERSION`,
@@ -164,30 +186,125 @@ pub fn load_config_from_file(
     let content = read_stable_config_file(file_path)?;
     // Extension only; unknown/extensionless paths use YAML, which also admits
     // ordinary JSON without a separate full-document detection parse.
-    let is_yaml = detect_json_or_yaml_extension(file_path);
+    let format = if detect_json_or_yaml_extension(file_path) {
+        DocumentFormat::Yaml
+    } else {
+        DocumentFormat::Json
+    };
 
-    if is_yaml {
-        info!(
+    match format {
+        DocumentFormat::Yaml => info!(
             "Loading YAML configuration from {}",
             crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[])
-        );
-    } else {
-        info!(
+        ),
+        DocumentFormat::Json => info!(
             "Loading JSON configuration from {}",
             crate::startup::sanitize_startup_cause(format!("{file_path:?}"), &[])
-        );
+        ),
     }
 
+    let mut config = decode_and_validate_document(
+        content,
+        format,
+        cert_expiry_warning_days,
+        backend_allow_ips,
+        DocumentNamespaceScope::Filter(namespace),
+    )?;
+
+    // The core ends with the shared runtime admission gate. Match SQL/Mongo
+    // admission ordering: only an accepted graph may commit the MMDB
+    // validation handoff consumed by the subsequent cache build.
+    ValidationPipeline::new(&mut config)
+        .validate_plugin_file_dependencies(ValidationAction::FatalCount(
+            "Configuration validation failed: {} plugin file dependency error(s) found",
+        ))
+        .run()?;
+
+    info!(
+        "{}",
+        crate::startup::sanitize_startup_cause(
+            format!(
+                "Configuration loaded (version {:?}): {} proxies, {} consumers, {} plugin configs",
+                config.version,
+                config.proxies.len(),
+                config.consumers.len(),
+                config.plugin_configs.len()
+            ),
+            &[]
+        )
+    );
+
+    Ok(config)
+}
+
+/// Decode and validate a config document from in-memory bytes.
+///
+/// Skips filesystem stability and plugin file-dependency checks, plus namespace
+/// filtering; runs the same shared runtime admission gate as file mode.
+/// Intended for the adversarial fuzz lane and deterministic parser
+/// tests — not production load. Keeping this entry point free of file reads
+/// prevents generated paths from turning a pure parser target into runner I/O.
+#[cfg(feature = "fuzzing")]
+pub fn decode_and_validate_config_document(
+    content: &str,
+    cert_expiry_warning_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<GatewayConfig, anyhow::Error> {
+    if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        anyhow::bail!("config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes");
+    }
+
+    // Admit YAML alias expansion before the detection parse. The detector uses
+    // `config_decode::from_yaml_str`, which would otherwise materialize aliases first.
+    admit_yaml_alias_expansion(content)?;
+
+    let format = if config_decode::from_yaml_str::<serde_yaml::Value>(content).is_ok()
+        && !content.trim_start().starts_with('{')
+    {
+        DocumentFormat::Yaml
+    } else {
+        DocumentFormat::Json
+    };
+
+    decode_and_validate_document(
+        content.to_owned(),
+        format,
+        cert_expiry_warning_days,
+        backend_allow_ips,
+        DocumentNamespaceScope::Unfiltered,
+    )
+}
+
+/// The decode-and-validate core shared by [`load_config_from_file`] and the
+/// in-memory fuzz entry point: parse, `resource_counts` seal, version
+/// coercion and in-memory migration, `GatewayConfig` deserialization, the
+/// field-level pipeline, the file-only operator checks, the namespace scope,
+/// the cross-resource pipeline, then the shared runtime admission gate
+/// (`collect_rejecting_runtime_config_errors`). Step order is load-bearing
+/// (the namespace filter must run before the uniqueness validators); keep it
+/// in one place.
+///
+/// Takes the source buffer by value and drops it once the value trees are
+/// parsed, so the bounded buffer is released before migration/validation
+/// allocates any additional structures.
+fn decode_and_validate_document(
+    content: String,
+    format: DocumentFormat,
+    cert_expiry_warning_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+    namespace_scope: DocumentNamespaceScope<'_>,
+) -> Result<GatewayConfig, anyhow::Error> {
     // For version detection and migration, parse to serde_json::Value. Retain
     // the YAML value tree as well so accepting an integer version does not
     // force an otherwise-current YAML document through JSON and discard
     // YAML-specific tags.
-    let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
-        admit_yaml_alias_expansion(&content)?;
-        let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(&content)?;
-        (serde_json::to_value(&yaml_val)?, Some(yaml_val))
-    } else {
-        (config_decode::from_json_str(&content)?, None)
+    let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = match format {
+        DocumentFormat::Yaml => {
+            admit_yaml_alias_expansion(&content)?;
+            let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(&content)?;
+            (serde_json::to_value(&yaml_val)?, Some(yaml_val))
+        }
+        DocumentFormat::Json => (config_decode::from_json_str(&content)?, None),
     };
     // The parsed trees own every retained value; release the bounded source
     // buffer before migration/validation allocates any additional structures.
@@ -255,13 +372,14 @@ pub fn load_config_from_file(
     // mutations are the accepted integer-to-string version rewrite and the
     // optional resource_counts strip above. Migrations still operate on
     // serde_json::Value, which remains authoritative for older versions.
-    let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        config_decode::from_yaml_value(yaml_value.ok_or_else(|| {
-            anyhow::anyhow!("internal error: parsed YAML value was not retained")
-        })?)?
-    } else {
-        config_decode::from_json_value(value)?
-    };
+    let mut config: GatewayConfig =
+        if format == DocumentFormat::Yaml && file_version == CURRENT_CONFIG_VERSION {
+            config_decode::from_yaml_value(yaml_value.ok_or_else(|| {
+                anyhow::anyhow!("internal error: parsed YAML value was not retained")
+            })?)?
+        } else {
+            config_decode::from_json_value(value)?
+        };
 
     if let Some(ref expected) = resource_counts {
         validate_resource_counts(&config, expected)?;
@@ -333,81 +451,85 @@ pub fn load_config_from_file(
         );
     }
 
-    // Capture all distinct namespaces before filtering so `GET /namespaces`
-    // can return the full set even though only one namespace's resources are kept.
-    {
-        let mut ns_set = std::collections::HashSet::new();
-        for p in &config.proxies {
-            ns_set.insert(p.namespace.clone());
+    // File mode only: the in-memory fuzz decode has no gateway namespace and
+    // validates every namespace's resources together.
+    if let DocumentNamespaceScope::Filter(namespace) = namespace_scope {
+        // Capture all distinct namespaces before filtering so `GET /namespaces`
+        // can return the full set even though only one namespace's resources are kept.
+        {
+            let mut ns_set = std::collections::HashSet::new();
+            for p in &config.proxies {
+                ns_set.insert(p.namespace.clone());
+            }
+            for c in &config.consumers {
+                ns_set.insert(c.namespace.clone());
+            }
+            for pc in &config.plugin_configs {
+                ns_set.insert(pc.namespace.clone());
+            }
+            for u in &config.upstreams {
+                ns_set.insert(u.namespace.clone());
+            }
+            let mut known: Vec<String> = ns_set.into_iter().collect();
+            known.sort();
+            config.known_namespaces = known;
         }
-        for c in &config.consumers {
-            ns_set.insert(c.namespace.clone());
-        }
-        for pc in &config.plugin_configs {
-            ns_set.insert(pc.namespace.clone());
-        }
-        for u in &config.upstreams {
-            ns_set.insert(u.namespace.clone());
-        }
-        let mut known: Vec<String> = ns_set.into_iter().collect();
-        known.sort();
-        config.known_namespaces = known;
-    }
 
-    // Filter resources to only those matching the configured namespace.
-    //
-    // The filter runs BEFORE cross-resource uniqueness validators
-    // (listen_path, listen_port, consumer identity, upstream/proxy name,
-    // reference-integrity) so that sibling-namespace resources never
-    // participate in those checks. The admin API and SQL unique indexes
-    // treat those fields as `(namespace, value)`-scoped; running the
-    // in-memory validators on a pre-filter multi-namespace view would
-    // spuriously reject configs that are perfectly valid — e.g., two
-    // proxies in different namespaces sharing `listen_path: /api`.
-    //
-    // Field-level validators (`validate_all_fields_*`, `validate_hosts`,
-    // `validate_regex_listen_paths`, `validate_unique_resource_ids`, etc.)
-    // stay above this filter because they enforce properties that should
-    // hold for every namespace in the file, not just the active one.
-    //
-    // This retain is deliberately NOT
-    // `crate::config::namespace_filter::retain_namespace` (the shared
-    // projection used by the database-mode startup backup and the
-    // namespace-scoped admin export). It runs mid-pipeline on a `&mut`
-    // candidate, it must leave the multi-namespace `known_namespaces` list
-    // populated above intact so file mode's `GET /namespaces` keeps its
-    // documented contract, and it must not narrow the Gateway TLS delivery
-    // fields a file source is entitled to author. Any namespace-owned field
-    // added to `GatewayConfig` still fails to compile in the shared helper,
-    // which is where the exhaustiveness gate lives.
-    let pre_filter_counts = (
-        config.proxies.len(),
-        config.consumers.len(),
-        config.plugin_configs.len(),
-        config.upstreams.len(),
-    );
-    config.proxies.retain(|p| p.namespace == namespace);
-    config.consumers.retain(|c| c.namespace == namespace);
-    config.plugin_configs.retain(|pc| pc.namespace == namespace);
-    config.upstreams.retain(|u| u.namespace == namespace);
-
-    let filtered_out = pre_filter_counts.0 - config.proxies.len() + pre_filter_counts.1
-        - config.consumers.len()
-        + pre_filter_counts.2
-        - config.plugin_configs.len()
-        + pre_filter_counts.3
-        - config.upstreams.len();
-    if filtered_out > 0 {
-        info!(
-            "{}",
-            crate::startup::sanitize_startup_cause(
-                format!(
-                    "Namespace filter {:?}: excluded {} resources from other namespaces",
-                    namespace, filtered_out
-                ),
-                &[]
-            )
+        // Filter resources to only those matching the configured namespace.
+        //
+        // The filter runs BEFORE cross-resource uniqueness validators
+        // (listen_path, listen_port, consumer identity, upstream/proxy name,
+        // reference-integrity) so that sibling-namespace resources never
+        // participate in those checks. The admin API and SQL unique indexes
+        // treat those fields as `(namespace, value)`-scoped; running the
+        // in-memory validators on a pre-filter multi-namespace view would
+        // spuriously reject configs that are perfectly valid — e.g., two
+        // proxies in different namespaces sharing `listen_path: /api`.
+        //
+        // Field-level validators (`validate_all_fields_*`, `validate_hosts`,
+        // `validate_regex_listen_paths`, `validate_unique_resource_ids`, etc.)
+        // stay above this filter because they enforce properties that should
+        // hold for every namespace in the file, not just the active one.
+        //
+        // This retain is deliberately NOT
+        // `crate::config::namespace_filter::retain_namespace` (the shared
+        // projection used by the database-mode startup backup and the
+        // namespace-scoped admin export). It runs mid-pipeline on a `&mut`
+        // candidate, it must leave the multi-namespace `known_namespaces` list
+        // populated above intact so file mode's `GET /namespaces` keeps its
+        // documented contract, and it must not narrow the Gateway TLS delivery
+        // fields a file source is entitled to author. Any namespace-owned field
+        // added to `GatewayConfig` still fails to compile in the shared helper,
+        // which is where the exhaustiveness gate lives.
+        let pre_filter_counts = (
+            config.proxies.len(),
+            config.consumers.len(),
+            config.plugin_configs.len(),
+            config.upstreams.len(),
         );
+        config.proxies.retain(|p| p.namespace == namespace);
+        config.consumers.retain(|c| c.namespace == namespace);
+        config.plugin_configs.retain(|pc| pc.namespace == namespace);
+        config.upstreams.retain(|u| u.namespace == namespace);
+
+        let filtered_out = pre_filter_counts.0 - config.proxies.len() + pre_filter_counts.1
+            - config.consumers.len()
+            + pre_filter_counts.2
+            - config.plugin_configs.len()
+            + pre_filter_counts.3
+            - config.upstreams.len();
+        if filtered_out > 0 {
+            info!(
+                "{}",
+                crate::startup::sanitize_startup_cause(
+                    format!(
+                        "Namespace filter {:?}: excluded {} resources from other namespaces",
+                        namespace, filtered_out
+                    ),
+                    &[]
+                )
+            );
+        }
     }
 
     ValidationPipeline::new(&mut config)
@@ -445,10 +567,11 @@ pub fn load_config_from_file(
         ))
         .run()?;
 
-    // File mode keeps its stricter field and identity checks above,
+    // Every entry point keeps its stricter field and identity checks above,
     // then runs the complete shared admission gate used by database/CP loads.
     // Do not duplicate that validator list here: newly added runtime rejection
-    // rules must also fail `validate` and SIGHUP before publication.
+    // rules must also fail `validate`, SIGHUP, and the fuzz lane before
+    // publication.
     let runtime_errors = collect_rejecting_runtime_config_errors(&config);
     if !runtime_errors.is_empty() {
         anyhow::bail!(
@@ -456,204 +579,6 @@ pub fn load_config_from_file(
             runtime_errors.join("; ")
         );
     }
-
-    // Match SQL/Mongo admission ordering: only an accepted graph may commit
-    // the MMDB validation handoff consumed by the subsequent cache build.
-    ValidationPipeline::new(&mut config)
-        .validate_plugin_file_dependencies(ValidationAction::FatalCount(
-            "Configuration validation failed: {} plugin file dependency error(s) found",
-        ))
-        .run()?;
-
-    info!(
-        "{}",
-        crate::startup::sanitize_startup_cause(
-            format!(
-                "Configuration loaded (version {:?}): {} proxies, {} consumers, {} plugin configs",
-                config.version,
-                config.proxies.len(),
-                config.consumers.len(),
-                config.plugin_configs.len()
-            ),
-            &[]
-        )
-    );
-
-    Ok(config)
-}
-
-/// Decode and validate a config document from in-memory bytes.
-///
-/// Skips filesystem stability and plugin file-dependency checks, plus namespace
-/// filtering. Intended for the adversarial fuzz lane and deterministic parser
-/// tests — not production load. Keeping this entry point free of file reads
-/// prevents generated paths from turning a pure parser target into runner I/O.
-#[cfg(feature = "fuzzing")]
-pub fn decode_and_validate_config_document(
-    content: &str,
-    cert_expiry_warning_days: u64,
-    backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> Result<GatewayConfig, anyhow::Error> {
-    if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
-        anyhow::bail!("config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes");
-    }
-
-    // Admit YAML alias expansion before the detection parse. The detector uses
-    // `config_decode::from_yaml_str`, which would otherwise materialize aliases first.
-    admit_yaml_alias_expansion(content)?;
-
-    let is_yaml = config_decode::from_yaml_str::<serde_yaml::Value>(content).is_ok()
-        && !content.trim_start().starts_with('{');
-
-    let (mut value, mut yaml_value): (serde_json::Value, Option<serde_yaml::Value>) = if is_yaml {
-        let yaml_val: serde_yaml::Value = config_decode::from_yaml_str(content)?;
-        (serde_json::to_value(&yaml_val)?, Some(yaml_val))
-    } else {
-        (config_decode::from_json_str(content)?, None)
-    };
-
-    let resource_counts = take_resource_counts_from_json(&mut value)?;
-    strip_resource_counts_from_yaml(&mut yaml_value);
-
-    let file_version = match value.get_mut("version") {
-        None => anyhow::bail!("Configuration file missing required `version` field"),
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(other) => {
-            if let Some(n) = other.as_u64() {
-                let s = n.to_string();
-                *other = serde_json::Value::String(s.clone());
-                if let Some(serde_yaml::Value::Mapping(mapping)) = yaml_value.as_mut()
-                    && let Some(yaml_version) =
-                        mapping.get_mut(serde_yaml::Value::String("version".to_string()))
-                {
-                    *yaml_version = serde_yaml::Value::String(s.clone());
-                }
-                s
-            } else {
-                let value_type = match other {
-                    serde_json::Value::Null => "null",
-                    serde_json::Value::Bool(_) => "boolean",
-                    serde_json::Value::Number(number) if number.is_i64() => "negative integer",
-                    serde_json::Value::Number(_) => "floating-point number",
-                    serde_json::Value::Array(_) => "array",
-                    serde_json::Value::Object(_) => "object",
-                    serde_json::Value::String(_) => "string",
-                };
-                anyhow::bail!(
-                    "field `version` must be a string or non-negative integer (got {value_type}); use version: \"1\" or version: 1"
-                );
-            }
-        }
-    };
-
-    if file_version != CURRENT_CONFIG_VERSION {
-        ConfigMigrator::migrate_in_memory(&mut value)?;
-    }
-
-    let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        config_decode::from_yaml_value(yaml_value.ok_or_else(|| {
-            anyhow::anyhow!("internal error: parsed YAML value was not retained")
-        })?)?
-    } else {
-        config_decode::from_json_value(value)?
-    };
-
-    if let Some(ref expected) = resource_counts {
-        validate_resource_counts(&config, expected)?;
-    }
-
-    ValidationPipeline::new(&mut config)
-        .validate_resource_ids(ValidationAction::FatalCount(
-            "Configuration validation failed: {} invalid resource ID(s) found",
-        ))
-        .validate_all_fields_with_ip_policy(
-            cert_expiry_warning_days,
-            backend_allow_ips,
-            ValidationAction::FatalCount(
-                "Configuration validation failed: {} invalid field(s) found",
-            ),
-        )
-        .validate_unique_resource_ids(ValidationAction::FatalCount(
-            "Configuration validation failed: {} duplicate resource ID(s) found",
-        ))
-        .normalize_fields()
-        .resolve_upstream_tls()
-        .validate_hosts(ValidationAction::FatalCount(
-            "Configuration validation failed: {} invalid host(s) found",
-        ))
-        .validate_regex_listen_paths(ValidationAction::FatalCount(
-            "Configuration validation failed: {} invalid regex listen_path(s) found",
-        ))
-        .validate_listen_path_encodings(ValidationAction::FatalCount(
-            "Configuration validation failed: {} non-canonical listen_path(s) found",
-        ))
-        .run()?;
-
-    let plaintext_basic_auth_consumers: Vec<String> = config
-        .consumers
-        .iter()
-        .filter(|consumer| {
-            consumer
-                .credentials
-                .get("basicauth")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|entries| entries.iter().any(|entry| entry.get("password").is_some()))
-        })
-        .map(|consumer| format!("{:?}", consumer.id))
-        .collect();
-    if !plaintext_basic_auth_consumers.is_empty() {
-        anyhow::bail!(
-            "Configuration validation failed: file-mode Basic-auth credentials must use \
-             `password_hash`; plaintext `password` is accepted only by Admin API writes \
-             (consumer IDs: {})",
-            plaintext_basic_auth_consumers.join(", ")
-        );
-    }
-
-    if let Err(errors) = config.validate_operator_provided_fields() {
-        anyhow::bail!(
-            "Configuration validation failed: {} mesh-projected upstream field(s) \
-             cannot be set in file config: {}",
-            errors.len(),
-            errors.join("; ")
-        );
-    }
-
-    ValidationPipeline::new(&mut config)
-        .validate_unique_listen_paths(ValidationAction::FatalCount(
-            "Configuration validation failed: {} duplicate listen_path(s) found",
-        ))
-        .validate_unique_consumer_identities(ValidationAction::FatalCount(
-            "Configuration validation failed: {} duplicate consumer identity(ies) found. Each consumer must have a unique username and unique custom_id.",
-        ))
-        .validate_unique_consumer_credentials(ValidationAction::FatalCount(
-            "Configuration validation failed: {} duplicate consumer credential(s) found. Each consumer must have a unique keyauth API key.",
-        ))
-        .validate_unique_upstream_names(ValidationAction::FatalCount(
-            "Configuration validation failed: {} duplicate upstream name(s) found",
-        ))
-        .validate_unique_proxy_names(ValidationAction::FatalCount(
-            "Configuration validation failed: {} duplicate proxy name(s) found",
-        ))
-        .validate_upstream_references(ValidationAction::FatalCount(
-            "Configuration validation failed: {} invalid upstream reference(s) found",
-        ))
-        .validate_mesh_route_dispatch_references(ValidationAction::FatalCount(
-            "Configuration validation failed: {} invalid mesh_route_dispatch upstream reference(s) found",
-        ))
-        .validate_plugin_references(ValidationAction::FatalCount(
-            "Configuration validation failed: {} invalid plugin reference(s) found",
-        ))
-        .validate_plugin_configs(
-            backend_allow_ips,
-            ValidationAction::FatalCount(
-                "Configuration validation failed: {} plugin config error(s) found",
-            ),
-        )
-        .validate_stream_proxies(ValidationAction::FatalCount(
-            "Configuration validation failed: {} stream proxy error(s) found",
-        ))
-        .run()?;
 
     Ok(config)
 }
