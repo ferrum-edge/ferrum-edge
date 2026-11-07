@@ -517,7 +517,8 @@ visible at the call site:
   probe and after success. It is readiness, not JWT ownership.
 - `wait_for_child_tcp_accept(child, port, deadline)` is an optional second
   stage: a TCP accept on a listener port, with `Child::try_wait` before every
-  connect, spending what is left of the same deadline.
+  connect and after a successful one, spending what is left of the same
+  absolute deadline.
 
 Suites whose listeners treat any accepted socket as real traffic
 (passthrough, scripted UDP) and `functional_overload_test.rs` use only the

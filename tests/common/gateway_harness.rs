@@ -2150,10 +2150,10 @@ pub async fn wait_for_child_gateway_readiness(
 }
 
 /// Poll `127.0.0.1:port` with a raw TCP connect until it accepts, bound to
-/// `child`: `Child::try_wait` runs before every connect, so a child that died
-/// after proving readiness fails instead of handing the caller whatever
-/// listener claimed its released port. Fails without connecting once
-/// `deadline` (normally the one shared with
+/// `child`: `Child::try_wait` runs before every connect and again after a
+/// successful one, so a child that died after proving readiness fails instead
+/// of handing the caller whatever listener claimed its released port. Fails
+/// without connecting once `deadline` (normally the one shared with
 /// [`wait_for_child_gateway_readiness`]) has passed.
 ///
 /// A TCP accept proves nothing about identity on its own; call this only
@@ -2299,6 +2299,30 @@ async fn wait_for_tcp_port_inner(
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(stream) => {
                 drop(stream);
+                // A child that died between the pre-connect check and this
+                // accept no longer owns the port: the accept may belong to a
+                // listener that claimed it after the child released it.
+                if let Some(child) = child.as_deref_mut() {
+                    match child.try_wait() {
+                        Ok(None) => {}
+                        Ok(Some(status)) => {
+                            return Err(format!(
+                                "gateway process exited with {status} while its {label} port \
+                                 {port} accepted a TCP connection; that accept may belong to \
+                                 another listener"
+                            )
+                            .into());
+                        }
+                        Err(err) => {
+                            return Err(format!(
+                                "could not confirm gateway process is still alive after its \
+                                 {label} port {port} accepted a TCP connection (try_wait \
+                                 failed: {err})"
+                            )
+                            .into());
+                        }
+                    }
+                }
                 return Ok(());
             }
             Err(err) => {
@@ -3298,7 +3322,9 @@ mod ownership_proof_tests {
 
     /// `Child::try_wait` runs on every poll iteration, not only before the
     /// first connect: a child that dies mid-poll, after which a foreign
-    /// listener claims its released port, must fail the stage.
+    /// listener claims its released port, must fail the stage. Deterministic:
+    /// the listener binds only after the exit is observable, and a successful
+    /// connect is re-checked against the child.
     #[cfg(unix)]
     #[tokio::test]
     async fn child_tcp_accept_rechecks_child_on_every_poll() {

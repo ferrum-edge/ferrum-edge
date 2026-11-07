@@ -253,9 +253,8 @@ async fn send_grpc_request(
 /// Barrier (`TestGateway`'s health-only path, via the shared
 /// `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept`; not JWT
 /// ownership):
-/// 1. `Child::try_wait` before every probe and after the successful identity
-///    probe (the TCP stage checks before each connect only) — a dead child
-///    consumes the attempt.
+/// 1. `Child::try_wait` before every probe and after a successful one, in both
+///    stages — a dead child consumes the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
 ///    `ready: true` (flips only after every listener bind, including proxy).
 /// 3. TCP connect to the proxy port after identity is proven.

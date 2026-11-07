@@ -536,9 +536,9 @@ fn start_gateway(
 /// Barrier (`TestGateway`'s health-only path, via the shared
 /// `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept`; not JWT
 /// ownership):
-/// 1. `Child::try_wait` before every probe and after the successful identity
-///    probe (the TCP stage checks before each connect only) — a dead child
-///    voids the attempt instead of being polled for until the timeout.
+/// 1. `Child::try_wait` before every probe and after a successful one, in both
+///    stages — a dead child voids the attempt instead of being polled for
+///    until the timeout.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
 ///    `ready: true`, which flips only after every listener bind (proxy included).
 /// 3. TCP connect to the proxy port once identity is proven.
