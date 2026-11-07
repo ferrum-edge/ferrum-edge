@@ -613,6 +613,65 @@ pub fn collect_cgroup_tree(_pod_cgroup_path: &Path) -> CgroupTreeWalk {
     CgroupTreeWalk::complete(Vec::new())
 }
 
+/// Cgroup paths whose program detach FAILED. A failed cgroup detach consumes
+/// aya's link, so there is no handle to retry with; the attachment is only
+/// proven gone once the kernel releases it together with the cgroup itself.
+/// Retained so a `detach_pod` retry keeps failing (instead of succeeding
+/// vacuously on a missing entry) until each recorded cgroup no longer exists.
+///
+/// Pure bookkeeping (no aya types), kept outside the Linux-only loader so its
+/// transitions are unit-tested on every host; only the live loader
+/// (`AyaEbpfBackend::detach_pod`) uses it outside tests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct UnconfirmedCgroupDetaches {
+    paths: Vec<String>,
+}
+
+impl UnconfirmedCgroupDetaches {
+    /// Record a cgroup whose program detach failed. Idempotent per path.
+    pub(crate) fn record(&mut self, cgroup_path: String) {
+        if !self.paths.contains(&cgroup_path) {
+            self.paths.push(cgroup_path);
+        }
+    }
+
+    /// Forget every recorded cgroup that `cgroup_may_exist` reports gone, and
+    /// return one error per cgroup that may still carry the attachment.
+    pub(crate) fn recheck(
+        &mut self,
+        mut cgroup_may_exist: impl FnMut(&str) -> bool,
+    ) -> Vec<String> {
+        self.paths.retain(|path| cgroup_may_exist(path));
+        self.paths
+            .iter()
+            .map(|path| {
+                format!(
+                    "cgroup program on '{path}': an earlier detach failed and the cgroup \
+                     still exists"
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+}
+
+/// Whether a cgroup path still exists. Anything other than a definite
+/// `NotFound` (for example a permission error) is treated as present, so an
+/// unconfirmed detach is never reported as complete on doubt.
+pub(crate) fn cgroup_path_may_exist(cgroup_path: &str) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(cgroup_path),
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/gateway_core/ebpf_cgroup_detach_tests.rs"]
+mod cgroup_detach_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

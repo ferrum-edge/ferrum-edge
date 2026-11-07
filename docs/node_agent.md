@@ -1758,9 +1758,21 @@ wholesale replacement, so a removed port stops matching immediately. Disabling
 the redirect (or losing IPv6 support) converges the affected family to empty
 scope and a false flag. A failed map or pod-IP write is a visible, retryable
 capture failure: the node-agent records `record_attach_error`, keeps the pending
-capture-failure marker, and does **not** advance its tracked scope, so the next
-pod event recomputes the same delta and converges once the transient condition
-clears.
+capture-failure marker, and does **not** advance its tracked scope. Because a
+write can fail part-way (the scope lands, then the pod-IP flag or the other
+family fails), the tracked scope is not trusted while that marker is pending:
+the next pod event rewrites the full scope even when its ports equal the
+tracked set, so a port the spec has since withdrawn cannot stay
+redirect-eligible, and the marker clears once a full write succeeds. A pod-IP
+move follows the same rule: a move whose scope landed at the new address before
+the pod-IP write failed records that target address, the next event (even one
+naming the tracked address) re-converges the tracked address, and the abandoned
+target's pod-IP entry and scope are removed (as a durable removal retry if that
+fails). Pod removal also retires such abandoned targets. Pod
+removal prunes every live-pod capture-failure marker (pod-IP, probe-port,
+UDP-readiness and redirect updates); only teardown blockers (pod-IP, probe-port
+and cgroup map removals, program detach) survive until their retry succeeds,
+so a removed pod cannot pin the node in `partially_attached`.
 
 This does **not** remove the node-global iptables fallback: that path exists for
 kernels which cannot run eBPF at all

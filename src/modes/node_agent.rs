@@ -103,7 +103,12 @@ const VERIFIED_UDP_HANDSHAKE_RETENTION_MULTIPLIER: u32 = 20;
 
 static FAILED_POD_ENROLLMENT_ATTEMPTS: LazyLock<DashMap<String, FailedPodEnrollmentAttempt>> =
     LazyLock::new(DashMap::new);
-static PENDING_CAPTURE_FAILURES: LazyLock<DashMap<String, ()>> = LazyLock::new(DashMap::new);
+/// Pending per-pod capture failures, keyed by `pod_state_key` (owning
+/// `pod_states` instance + pod UID). An entry is present only while its set is
+/// non-empty; it is mutated only through the remember/forget API below.
+static PENDING_CAPTURE_FAILURES: LazyLock<
+    DashMap<String, std::collections::BTreeSet<CaptureFailureOp>>,
+> = LazyLock::new(DashMap::new);
 /// Ferrum-CNI-owned attachment identities keyed by generation + CNI network +
 /// `(containerID, ifname)`.
 ///
@@ -134,21 +139,64 @@ struct CniOwnedAttachment {
     cleanup: DurableCniCleanupSnapshot,
 }
 
-const CAPTURE_FAILURE_POD_IP_UPDATE: &str = "pod_ip_update";
-const CAPTURE_FAILURE_POD_IP_REMOVE: &str = "pod_ip_remove";
-const CAPTURE_FAILURE_POD_DETACH: &str = "pod_detach";
-const CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE: &str = "node_probe_port_update";
-const CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE: &str = "node_probe_port_remove";
-const CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE: &str = "include_ports_remove";
-const CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE: &str = "workload_identity_remove";
-const CAPTURE_FAILURE_UDP_READINESS: &str = "udp_readiness";
-const CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE: &str = "inbound_redirect_update";
-const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
-const CAPTURE_FAILURE_DETAIL_POD_IP6: &str = "pod_ip6";
-const CAPTURE_FAILURE_DETAIL_POD_DETACH: &str = "pod_detach";
-const CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS: &str = "node_probe_ports";
-const CAPTURE_FAILURE_DETAIL_UDP_READINESS: &str = "udp_readiness";
-const CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT: &str = "inbound_redirect_ports";
+/// One pending, retryable capture failure recorded against a pod-state
+/// identity (`pod_state_key`: the owning `pod_states` instance plus pod UID).
+///
+/// Every operation carries exactly the typed data its retry or supersession
+/// needs, so no record is ever encoded into, or parsed back out of, a string.
+/// Records are created and dropped only through `remember_capture_failure` /
+/// `forget_capture_failure` / `forget_capture_failures_matching`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CaptureFailureOp {
+    /// A live pod's move to this IPv4 address failed part-way: its redirect
+    /// scope and/or pod-IP entry may already be written there while the tracked
+    /// address was not advanced.
+    PodIpUpdate(std::net::Ipv4Addr),
+    /// IPv6 counterpart of `PodIpUpdate`.
+    PodIp6Update(std::net::Ipv6Addr),
+    /// A live pod's node probe-port maps could not be brought to `desired_ports`.
+    NodeProbePortUpdate { desired_ports: Vec<u16> },
+    /// A live pod's Ambient UDP readiness bit could not be reconciled.
+    UdpReadiness,
+    /// A live pod's inbound redirect scope/flag write failed part-way, so the
+    /// BPF-written scope may differ from the tracked `inbound_redirect_ports`.
+    InboundRedirectUpdate,
+    /// Removal blocker: the pod-IP entry (and its redirect scope) for this
+    /// address may still be present.
+    PodIpRemove(std::net::IpAddr),
+    /// Removal blocker: the pod's cgroup/tc programs may still be attached.
+    PodDetach,
+    /// Removal blocker: a node probe-port map key may still be present.
+    NodeProbePortRemove { ip: std::net::IpAddr, port: u16 },
+    /// Removal blocker: an includeOutboundPorts cgroup entry may still be present.
+    IncludePortsRemove { cgroup_id: u64 },
+    /// Removal blocker: a workload-identity cgroup entry may still be present.
+    WorkloadIdentityRemove { cgroup_id: u64 },
+}
+
+impl CaptureFailureOp {
+    /// Whether this record is BPF state that must still be torn down after the
+    /// pod is gone. Removal blockers are the durable retry queue for teardown
+    /// and survive pod removal; every other record describes a desired state of
+    /// a LIVE pod and is meaningless (and must be pruned) once the pod is gone.
+    ///
+    /// Deliberately exhaustive (no wildcard arm): a new operation must be
+    /// classified here, so pod removal can never silently strand it.
+    fn blocks_removal(&self) -> bool {
+        match self {
+            Self::PodIpRemove(_)
+            | Self::PodDetach
+            | Self::NodeProbePortRemove { .. }
+            | Self::IncludePortsRemove { .. }
+            | Self::WorkloadIdentityRemove { .. } => true,
+            Self::PodIpUpdate(_)
+            | Self::PodIp6Update(_)
+            | Self::NodeProbePortUpdate { .. }
+            | Self::UdpReadiness
+            | Self::InboundRedirectUpdate => false,
+        }
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -3070,7 +3118,7 @@ fn has_pending_capture_failures(pod_states: &DashMap<String, PodAttachmentState>
     let key_prefix = pod_state_key_prefix(pod_states);
     PENDING_CAPTURE_FAILURES
         .iter()
-        .any(|entry| entry.key().starts_with(&key_prefix))
+        .any(|entry| entry.key().starts_with(&key_prefix) && !entry.value().is_empty())
 }
 
 /// Outcome of one bounded node-identity retry/revalidation.
@@ -4433,7 +4481,10 @@ fn remove_node_probe_port_if_unowned(
     removal: NodeProbePortRemoval<'_>,
 ) {
     let state_key = pod_state_key(pod_states, removal.pod_uid);
-    let detail = node_probe_port_failure_detail(removal.ip, removal.port);
+    let failure = CaptureFailureOp::NodeProbePortRemove {
+        ip: removal.ip,
+        port: removal.port,
+    };
     if let Some(owner_pod_uid) =
         other_pod_owning_probe_port_addr(pod_states, removal.pod_uid, removal.ip, removal.port)
     {
@@ -4445,7 +4496,7 @@ fn remove_node_probe_port_if_unowned(
             removal_reason = removal.reason,
             "Skipping node probe-port map removal; key is owned by another tracked pod"
         );
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE, &detail);
+        forget_capture_failure(&state_key, &failure);
         forget_pending_node_probe_port_remove_failures_for_key(
             pod_states,
             removal.ip,
@@ -4471,15 +4522,11 @@ fn remove_node_probe_port_if_unowned(
             "Failed to remove node probe-port entry from BPF map"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            &state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE,
-            &detail,
-        );
+        remember_capture_failure(&state_key, failure);
         return;
     }
 
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE, &detail);
+    forget_capture_failure(&state_key, &failure);
     if removal.clear_recovered_state {
         clear_partial_capture_state_if_recovered(pod_states, metrics);
     }
@@ -5205,97 +5252,88 @@ fn apply_cni_gc(
     }
 }
 
-fn pending_capture_failure_key(state_key: &str, operation: &str, detail: &str) -> String {
-    format!(
-        "{state_key}:{operation}:{}",
-        encode_pending_capture_detail(detail)
-    )
-}
-
-fn encode_pending_capture_detail(detail: &str) -> String {
-    detail.replace('%', "%25").replace(':', "%3A")
-}
-
-fn decode_pending_capture_detail(detail: &str) -> String {
-    detail.replace("%3A", ":").replace("%25", "%")
-}
-
-#[derive(Debug, Clone)]
-struct PendingCaptureFailure {
-    key: String,
-    state_key: String,
-    operation: String,
-    detail: String,
-}
-
-fn parse_pending_capture_failure_key(key: &str) -> Option<PendingCaptureFailure> {
-    let mut parts = key.rsplitn(3, ':');
-    let detail = decode_pending_capture_detail(parts.next()?);
-    let operation = parts.next()?;
-    let state_key = parts.next()?;
-    if state_key.is_empty() || operation.is_empty() || detail.is_empty() {
-        return None;
-    }
-    Some(PendingCaptureFailure {
-        key: key.to_string(),
-        state_key: state_key.to_string(),
-        operation: operation.to_string(),
-        detail,
-    })
-}
-
-#[cfg(test)]
-fn pending_capture_failure_prefix(state_key: &str) -> String {
-    format!("{state_key}:")
-}
-
-fn remember_pending_capture_failure(state_key: &str, operation: &str, detail: &str) {
-    PENDING_CAPTURE_FAILURES.insert(
-        pending_capture_failure_key(state_key, operation, detail),
-        (),
-    );
-}
-
-fn forget_pending_capture_failure(state_key: &str, operation: &str, detail: &str) -> bool {
+/// Record (idempotently) a pending capture failure for one pod-state identity.
+///
+/// Callers must not hold a guard on `PENDING_CAPTURE_FAILURES` while calling
+/// any of these transition helpers.
+fn remember_capture_failure(state_key: &str, op: CaptureFailureOp) {
     PENDING_CAPTURE_FAILURES
-        .remove(&pending_capture_failure_key(state_key, operation, detail))
-        .is_some()
+        .entry(state_key.to_string())
+        .or_default()
+        .insert(op);
 }
 
-fn node_probe_port_failure_detail(ip: std::net::IpAddr, port: u16) -> String {
-    format!("{ip},{port}")
+/// Drop every pending record of `state_key` that `matches` selects, removing
+/// the per-pod entry once it is empty. Returns how many records were dropped.
+fn forget_capture_failures_matching(
+    state_key: &str,
+    mut matches: impl FnMut(&CaptureFailureOp) -> bool,
+) -> usize {
+    let removed = match PENDING_CAPTURE_FAILURES.get_mut(state_key) {
+        Some(mut record) => {
+            let before = record.len();
+            record.retain(|op| !matches(op));
+            before - record.len()
+        }
+        None => return 0,
+    };
+    PENDING_CAPTURE_FAILURES.remove_if(state_key, |_, record| record.is_empty());
+    removed
 }
 
-fn parse_node_probe_port_failure_detail(detail: &str) -> Option<(std::net::IpAddr, u16)> {
-    let (ip, port) = detail.split_once(',')?;
-    Some((ip.parse().ok()?, port.parse().ok()?))
+/// Drop one exact pending record. Returns whether it was present.
+fn forget_capture_failure(state_key: &str, op: &CaptureFailureOp) -> bool {
+    forget_capture_failures_matching(state_key, |pending| pending == op) > 0
 }
 
-fn node_probe_port_update_failure_detail(ports: &[u16]) -> String {
+/// Whether one exact pending record is present for `state_key`.
+fn has_capture_failure(state_key: &str, op: &CaptureFailureOp) -> bool {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .is_some_and(|record| record.contains(op))
+}
+
+/// Drop every LIVE-pod record of a pod that is being removed (#7025): any
+/// operation that is not a removal blocker describes desired state of a pod
+/// that no longer exists, so leaving it would keep `has_pending_capture_failures`
+/// true (and the node `PARTIALLY_ATTACHED`) forever. Removal blockers stay:
+/// they are the durable teardown retry queue and are re-evaluated by teardown
+/// and the periodic retries.
+fn forget_live_pod_capture_failures(state_key: &str) -> usize {
+    forget_capture_failures_matching(state_key, |op| !op.blocks_removal())
+}
+
+/// Collect every pending record in this `pod_states` scope that `select` maps
+/// to `Some`, as `(state_key, pod_uid, selected)`. The map guard is released
+/// before returning, so callers may freely remember/forget while iterating.
+fn pending_capture_failures_in_scope<T>(
+    pod_states: &DashMap<String, PodAttachmentState>,
+    mut select: impl FnMut(&CaptureFailureOp) -> Option<T>,
+) -> Vec<(String, String, T)> {
+    if PENDING_CAPTURE_FAILURES.is_empty() {
+        return Vec::new();
+    }
+
+    let key_prefix = pod_state_key_prefix(pod_states);
+    let mut pending = Vec::new();
+    for entry in PENDING_CAPTURE_FAILURES.iter() {
+        let Some(pod_uid) = entry.key().strip_prefix(key_prefix.as_str()) else {
+            continue;
+        };
+        for op in entry.value() {
+            if let Some(selected) = select(op) {
+                pending.push((entry.key().clone(), pod_uid.to_string(), selected));
+            }
+        }
+    }
+    pending
+}
+
+fn normalized_node_probe_ports(ports: &[u16]) -> Vec<u16> {
     let mut ports = ports.to_vec();
     ports.sort_unstable();
     ports.dedup();
-    let ports = ports
-        .iter()
-        .map(u16::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("{CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS}={ports}")
-}
-
-fn parse_node_probe_port_update_failure_detail(detail: &str) -> Option<Vec<u16>> {
-    let ports = detail.strip_prefix(CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS)?;
-    let ports = ports.strip_prefix('=')?;
-    if ports.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut parsed = Vec::new();
-    for port in ports.split(',') {
-        parsed.push(port.parse().ok()?);
-    }
-    parsed.sort_unstable();
-    parsed.dedup();
-    Some(parsed)
+    ports
 }
 
 fn forget_pending_node_probe_port_remove_failures_for_key(
@@ -5303,80 +5341,49 @@ fn forget_pending_node_probe_port_remove_failures_for_key(
     ip: std::net::IpAddr,
     port: u16,
 ) -> usize {
-    let key_prefix = pod_state_key_prefix(pod_states);
-    let detail = node_probe_port_failure_detail(ip, port);
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            (failure.state_key.starts_with(&key_prefix)
-                && failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
-                && failure.detail == detail)
-                .then_some(failure.key)
-        })
-        .collect();
-    let removed = keys.len();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
+    let target = CaptureFailureOp::NodeProbePortRemove { ip, port };
+    let state_keys: Vec<String> =
+        pending_capture_failures_in_scope(pod_states, |op| (op == &target).then_some(()))
+            .into_iter()
+            .map(|(state_key, _, ())| state_key)
+            .collect();
+    let mut removed = 0;
+    for state_key in state_keys {
+        if forget_capture_failure(&state_key, &target) {
+            removed += 1;
+        }
     }
     removed
 }
 
 fn forget_pending_node_probe_port_update_failures_for_state(state_key: &str) -> usize {
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            (failure.state_key == state_key
-                && failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE)
-                .then_some(failure.key)
-        })
-        .collect();
-    let removed = keys.len();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
-    }
-    removed
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::NodeProbePortUpdate { .. })
+    })
 }
 
 fn forget_pending_pod_ip_remove_failures_for_ip(
     pod_states: &DashMap<String, PodAttachmentState>,
-    ip: impl std::fmt::Display,
+    ip: impl Into<std::net::IpAddr>,
 ) -> usize {
-    let key_prefix = pod_state_key_prefix(pod_states);
-    let detail = ip.to_string();
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            (failure.state_key.starts_with(&key_prefix)
-                && failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
-                && failure.detail == detail)
-                .then_some(failure.key)
-        })
-        .collect();
-    let removed = keys.len();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
+    let target = CaptureFailureOp::PodIpRemove(ip.into());
+    let state_keys: Vec<String> =
+        pending_capture_failures_in_scope(pod_states, |op| (op == &target).then_some(()))
+            .into_iter()
+            .map(|(state_key, _, ())| state_key)
+            .collect();
+    let mut removed = 0;
+    for state_key in state_keys {
+        if forget_capture_failure(&state_key, &target) {
+            removed += 1;
+        }
     }
     removed
 }
 
 #[cfg(test)]
 fn forget_pending_capture_failures_for_pod(state_key: &str) {
-    let prefix = pending_capture_failure_prefix(state_key);
-    let keys: Vec<String> = PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .key()
-                .starts_with(&prefix)
-                .then(|| entry.key().clone())
-        })
-        .collect();
-    for key in keys {
-        PENDING_CAPTURE_FAILURES.remove(&key);
-    }
+    forget_capture_failures_matching(state_key, |_| true);
 }
 
 fn map_fingerprint(map: &HashMap<String, String>) -> u64 {
@@ -5639,121 +5646,77 @@ fn retry_backed_off_pod_enrollments(
 
 fn pending_pod_ip_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, String, String, std::net::IpAddr)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_POD_IP_REMOVE
-            {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            let ip = failure.detail.parse().ok()?;
-            Some((failure.key, failure.state_key, pod_uid, ip))
-        })
-        .collect()
+) -> Vec<(String, String, std::net::IpAddr)> {
+    pending_capture_failures_in_scope(pod_states, |op| match op {
+        CaptureFailureOp::PodIpRemove(ip) => Some(*ip),
+        _ => None,
+    })
 }
 
 fn pending_pod_detach_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, String, String)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_POD_DETACH
-                || failure.detail != CAPTURE_FAILURE_DETAIL_POD_DETACH
-            {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            Some((failure.key, failure.state_key, pod_uid))
-        })
-        .collect()
+) -> Vec<(String, String)> {
+    pending_capture_failures_in_scope(pod_states, |op| {
+        matches!(op, CaptureFailureOp::PodDetach).then_some(())
+    })
+    .into_iter()
+    .map(|(state_key, pod_uid, ())| (state_key, pod_uid))
+    .collect()
 }
 
 fn pending_node_probe_port_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-) -> Vec<(String, String, String, std::net::IpAddr, u16)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
+) -> Vec<(String, String, (std::net::IpAddr, u16))> {
+    pending_capture_failures_in_scope(pod_states, |op| match op {
+        CaptureFailureOp::NodeProbePortRemove { ip, port } => Some((*ip, *port)),
+        _ => None,
+    })
+}
+
+/// Which cgroup-keyed map a pending cgroup removal targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgroupMapRemoval {
+    IncludePorts,
+    WorkloadIdentity,
+}
+
+impl CgroupMapRemoval {
+    fn failure(self, cgroup_id: u64) -> CaptureFailureOp {
+        match self {
+            Self::IncludePorts => CaptureFailureOp::IncludePortsRemove { cgroup_id },
+            Self::WorkloadIdentity => CaptureFailureOp::WorkloadIdentityRemove { cgroup_id },
+        }
     }
 
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
-            {
-                return None;
-            }
-            let (ip, port) = parse_node_probe_port_failure_detail(&failure.detail)?;
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            Some((failure.key, failure.state_key, pod_uid, ip, port))
-        })
-        .collect()
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::IncludePorts => "include_ports_remove",
+            Self::WorkloadIdentity => "workload_identity_remove",
+        }
+    }
 }
 
 fn pending_cgroup_map_removal_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
-    operation: &str,
-) -> Vec<(String, String, String, u64)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix) || failure.operation != operation {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            let cgroup_id = failure.detail.parse().ok()?;
-            Some((failure.key, failure.state_key, pod_uid, cgroup_id))
-        })
-        .collect()
+    removal: CgroupMapRemoval,
+) -> Vec<(String, String, u64)> {
+    pending_capture_failures_in_scope(pod_states, |op| match (removal, op) {
+        (CgroupMapRemoval::IncludePorts, CaptureFailureOp::IncludePortsRemove { cgroup_id })
+        | (
+            CgroupMapRemoval::WorkloadIdentity,
+            CaptureFailureOp::WorkloadIdentityRemove { cgroup_id },
+        ) => Some(*cgroup_id),
+        _ => None,
+    })
 }
 
 fn pending_node_probe_port_update_failures(
     pod_states: &DashMap<String, PodAttachmentState>,
 ) -> Vec<(String, String, Vec<u16>)> {
-    if PENDING_CAPTURE_FAILURES.is_empty() {
-        return Vec::new();
-    }
-
-    let key_prefix = pod_state_key_prefix(pod_states);
-    PENDING_CAPTURE_FAILURES
-        .iter()
-        .filter_map(|entry| {
-            let failure = parse_pending_capture_failure_key(entry.key())?;
-            if !failure.state_key.starts_with(&key_prefix)
-                || failure.operation != CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE
-            {
-                return None;
-            }
-            let pod_uid = failure.state_key.strip_prefix(&key_prefix)?.to_string();
-            let desired_ports = parse_node_probe_port_update_failure_detail(&failure.detail)?;
-            Some((failure.key, pod_uid, desired_ports))
-        })
-        .collect()
+    pending_capture_failures_in_scope(pod_states, |op| match op {
+        CaptureFailureOp::NodeProbePortUpdate { desired_ports } => Some(desired_ports.clone()),
+        _ => None,
+    })
 }
 
 fn retry_pending_node_probe_port_updates(
@@ -5766,12 +5729,15 @@ fn retry_pending_node_probe_port_updates(
         return;
     }
 
-    for (failure_key, pod_uid, desired_ports) in pending {
-        if !PENDING_CAPTURE_FAILURES.contains_key(&failure_key) {
+    for (state_key, pod_uid, desired_ports) in pending {
+        let failure = CaptureFailureOp::NodeProbePortUpdate {
+            desired_ports: desired_ports.clone(),
+        };
+        if !has_capture_failure(&state_key, &failure) {
             continue;
         }
         let Some(mut state) = pod_states.get_mut(&pod_uid) else {
-            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            forget_capture_failure(&state_key, &failure);
             debug!(
                 pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                 "Cleared pending node probe-port update because the pod is no longer tracked"
@@ -5794,7 +5760,7 @@ fn retry_pending_node_probe_port_updates(
                 let pod_ip6 = state.pod_ip6;
                 drop(state);
 
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 if let Some(ip) = pod_ip {
                     remove_node_probe_ports_for_ip(
                         backend,
@@ -5817,9 +5783,7 @@ fn retry_pending_node_probe_port_updates(
                         "probe ports update retry",
                     );
                 }
-                forget_pending_node_probe_port_update_failures_for_state(&pod_state_key(
-                    pod_states, &pod_uid,
-                ));
+                forget_pending_node_probe_port_update_failures_for_state(&state_key);
                 debug!(
                     pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                     desired_ports = %crate::startup::sanitize_startup_scalar(format_args!("{:?}", desired_ports)),
@@ -5853,9 +5817,10 @@ fn retry_pending_node_probe_port_removals(
         return;
     }
 
-    for (failure_key, state_key, pod_uid, ip, port) in pending {
+    for (state_key, pod_uid, (ip, port)) in pending {
+        let failure = CaptureFailureOp::NodeProbePortRemove { ip, port };
         if let Some(owner_pod_uid) = pod_owning_probe_port_addr(pod_states, ip, port) {
-            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            forget_capture_failure(&state_key, &failure);
             debug!(
                 owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
                 ip = %crate::startup::sanitize_startup_scalar(ip),
@@ -5872,7 +5837,7 @@ fn retry_pending_node_probe_port_removals(
         };
         match result {
             Ok(()) => {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 debug!(ip = %crate::startup::sanitize_startup_scalar(ip), port = %crate::startup::sanitize_startup_scalar(port), "Recovered pending node probe-port map removal failure");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
@@ -5896,15 +5861,17 @@ fn retry_pending_cgroup_map_removals(
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
 ) {
-    for operation in [
-        CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-        CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
+    for removal in [
+        CgroupMapRemoval::IncludePorts,
+        CgroupMapRemoval::WorkloadIdentity,
     ] {
-        for (failure_key, state_key, pod_uid, cgroup_id) in
-            pending_cgroup_map_removal_failures(pod_states, operation)
+        let operation = removal.as_str();
+        for (state_key, pod_uid, cgroup_id) in
+            pending_cgroup_map_removal_failures(pod_states, removal)
         {
+            let failure = removal.failure(cgroup_id);
             let live_owner = pod_states.iter().find_map(|entry| {
-                let owns_key = if operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE {
+                let owns_key = if removal == CgroupMapRemoval::IncludePorts {
                     entry.value().include_ports_cgroup_ids.contains(&cgroup_id)
                 } else {
                     entry
@@ -5915,7 +5882,7 @@ fn retry_pending_cgroup_map_removals(
                 owns_key.then(|| entry.key().clone())
             });
             if let Some(owner_pod_uid) = live_owner {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 debug!(
                     pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                     owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
@@ -5926,14 +5893,14 @@ fn retry_pending_cgroup_map_removals(
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
                 continue;
             }
-            let result = if operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE {
+            let result = if removal == CgroupMapRemoval::IncludePorts {
                 backend.remove_pod_include_ports(cgroup_id)
             } else {
                 backend.remove_workload_identity(cgroup_id)
             };
             match result {
                 Ok(()) => {
-                    PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                    forget_capture_failure(&state_key, &failure);
                     debug!(
                         pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid),
                         cgroup_id, operation, "Recovered pending cgroup map removal failure"
@@ -5967,9 +5934,10 @@ fn retry_pending_pod_ip_removals(
         return;
     }
 
-    for (failure_key, state_key, pod_uid, ip) in pending {
+    for (state_key, pod_uid, ip) in pending {
+        let failure = CaptureFailureOp::PodIpRemove(ip);
         if let Some(owner_pod_uid) = pod_owning_ip_addr(pod_states, ip) {
-            PENDING_CAPTURE_FAILURES.remove(&failure_key);
+            forget_capture_failure(&state_key, &failure);
             debug!(
                 owner_pod_uid = %crate::startup::sanitize_startup_scalar(&owner_pod_uid),
                 ip = %crate::startup::sanitize_startup_scalar(ip),
@@ -6001,7 +5969,7 @@ fn retry_pending_pod_ip_removals(
         };
         match clear_result {
             Ok(()) => {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &failure);
                 debug!(ip = %crate::startup::sanitize_startup_scalar(ip), "Recovered pending pod IP map removal and inbound redirect scope clear");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
@@ -6030,7 +5998,7 @@ fn retry_pending_pod_detaches(
         return;
     }
 
-    for (failure_key, state_key, pod_uid) in pending {
+    for (state_key, pod_uid) in pending {
         // A same-UID pod that is live again may own newly-attached links. Do not
         // let a stale removal retry detach the current enrollment.
         if pod_states.contains_key(&pod_uid) {
@@ -6038,7 +6006,7 @@ fn retry_pending_pod_detaches(
         }
         match backend.detach_pod(&pod_uid) {
             Ok(()) => {
-                PENDING_CAPTURE_FAILURES.remove(&failure_key);
+                forget_capture_failure(&state_key, &CaptureFailureOp::PodDetach);
                 debug!(pod_uid = %crate::startup::sanitize_startup_scalar(&pod_uid), "Recovered pending pod BPF detach failure");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
@@ -6310,16 +6278,9 @@ fn remove_udp_gate_cleaned_proof(dir: &std::path::Path, pod_uid: &str) -> bool {
 }
 
 fn has_pending_removal_blocking_failure(state_key: &str) -> bool {
-    PENDING_CAPTURE_FAILURES.iter().any(|entry| {
-        parse_pending_capture_failure_key(entry.key()).is_some_and(|failure| {
-            failure.state_key == state_key
-                && (failure.operation == CAPTURE_FAILURE_POD_IP_REMOVE
-                    || failure.operation == CAPTURE_FAILURE_POD_DETACH
-                    || failure.operation == CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE
-                    || failure.operation == CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE
-                    || failure.operation == CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE)
-        })
-    })
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .is_some_and(|record| record.iter().any(CaptureFailureOp::blocks_removal))
 }
 
 /// Complete a removed pod's durable UDP close handoff after all removal-blocking
@@ -7186,22 +7147,14 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                 .pod_ip6
                 .is_none_or(|ip| backend.update_pod_ip6(ip, &info_v6).is_ok());
             if v4_ok && v6_ok {
-                forget_pending_capture_failure(
-                    &state_key,
-                    CAPTURE_FAILURE_UDP_READINESS,
-                    CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-                );
+                forget_capture_failure(&state_key, &CaptureFailureOp::UdpReadiness);
                 ready_uids.insert(uid.clone());
                 if let Some(dir) = &config.node_waypoint_pod_registry_dir {
                     write_udp_not_ready_ack(dir, uid);
                 }
             } else {
                 metrics.record_attach_error();
-                remember_pending_capture_failure(
-                    &state_key,
-                    CAPTURE_FAILURE_UDP_READINESS,
-                    CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-                );
+                remember_capture_failure(&state_key, CaptureFailureOp::UdpReadiness);
                 warn!(
                     pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                     "Failed to verify disabled Ambient UDP pod-map posture; withholding cleanup acknowledgement and retrying"
@@ -7270,11 +7223,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
             .pod_ip6
             .is_none_or(|ip| backend.update_pod_ip6(ip, &info_v6).is_ok());
         if v4_ok && v6_ok {
-            forget_pending_capture_failure(
-                &state_key,
-                CAPTURE_FAILURE_UDP_READINESS,
-                CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-            );
+            forget_capture_failure(&state_key, &CaptureFailureOp::UdpReadiness);
             if ready {
                 ready_uids.insert(uid.clone());
                 if let Some(dir) = &config.node_waypoint_pod_registry_dir {
@@ -7294,11 +7243,7 @@ fn reconcile_udp_capture_readiness_with_sync_state(
             );
         } else {
             metrics.record_attach_error();
-            remember_pending_capture_failure(
-                &state_key,
-                CAPTURE_FAILURE_UDP_READINESS,
-                CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-            );
+            remember_capture_failure(&state_key, CaptureFailureOp::UdpReadiness);
             warn!(
                 pod_uid = %crate::startup::sanitize_startup_scalar(uid.as_str()),
                 udp_ready = ready,
@@ -7541,6 +7486,17 @@ fn handle_pod_added_inner(
                 "Pod already enrolled, reconciled state"
             );
             drop(state);
+            // Before the recovery check, so a failed removal's durable blocker
+            // is visible to it.
+            remove_abandoned_pod_ip_targets(
+                backend,
+                pod_states,
+                metrics,
+                pod_uid,
+                &pod_ip_reconcile.abandoned_pod_ips,
+                &pod_ip6_reconcile.abandoned_pod_ips,
+                "abandoned pod IP move",
+            );
             if pod_ip_reconcile.recovered_pending_failure
                 || pod_ip6_reconcile.recovered_pending_failure
                 || node_probe_reconcile.recovered_pending_failure
@@ -8049,11 +8005,7 @@ fn handle_pod_added_inner(
 
     if state.attached {
         forget_failed_pod_enrollment(&state_key);
-        if forget_pending_capture_failure(
-            &state_key,
-            CAPTURE_FAILURE_POD_DETACH,
-            CAPTURE_FAILURE_DETAIL_POD_DETACH,
-        ) {
+        if forget_capture_failure(&state_key, &CaptureFailureOp::PodDetach) {
             debug!(
                 pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 "Cleared superseded detach failure after same-UID pod re-enrollment"
@@ -8126,6 +8078,10 @@ fn handle_pod_added_inner(
 #[derive(Debug)]
 struct PodIpReconcileResult<Ip> {
     stale_pod_ip: Option<Ip>,
+    /// Targets of earlier failed moves that the converged address superseded.
+    /// Their scope (and any pod-IP entry) may have been written, so the caller
+    /// removes them once it no longer holds the pod's state guard.
+    abandoned_pod_ips: Vec<Ip>,
     recovered_pending_failure: bool,
     pod_ip_update_failed: bool,
 }
@@ -8134,9 +8090,64 @@ impl<Ip> Default for PodIpReconcileResult<Ip> {
     fn default() -> Self {
         Self {
             stale_pod_ip: None,
+            abandoned_pod_ips: Vec::new(),
             recovered_pending_failure: false,
             pod_ip_update_failed: false,
         }
+    }
+}
+
+/// IPv4 targets of pending failed pod-IP moves for one pod-state identity.
+fn pending_pod_ip_update_targets(state_key: &str) -> Vec<std::net::Ipv4Addr> {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .map(|record| {
+            record
+                .iter()
+                .filter_map(|op| match op {
+                    CaptureFailureOp::PodIpUpdate(ip) => Some(*ip),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// IPv6 targets of pending failed pod-IP moves for one pod-state identity.
+fn pending_pod_ip6_update_targets(state_key: &str) -> Vec<std::net::Ipv6Addr> {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .map(|record| {
+            record
+                .iter()
+                .filter_map(|op| match op {
+                    CaptureFailureOp::PodIp6Update(ip) => Some(*ip),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remove the pod-IP entry and redirect scope a failed pod-IP move may have
+/// written at addresses the pod no longer moves to. Ownership by another
+/// tracked pod is respected, and a failed removal is queued as a durable
+/// `PodIpRemove` blocker by the removal helpers. Must be called without
+/// holding a `pod_states` guard.
+fn remove_abandoned_pod_ip_targets(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    abandoned_v4: &[std::net::Ipv4Addr],
+    abandoned_v6: &[std::net::Ipv6Addr],
+    removal_reason: &'static str,
+) {
+    for ip in abandoned_v4 {
+        remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, *ip, removal_reason);
+    }
+    for ip in abandoned_v6 {
+        remove_pod_ip6_if_unowned(backend, pod_states, metrics, pod_uid, *ip, removal_reason);
     }
 }
 
@@ -8173,10 +8184,11 @@ fn reconcile_existing_node_probe_ports(
         );
         metrics.record_attach_error();
         forget_pending_node_probe_port_update_failures_for_state(state_key);
-        remember_pending_capture_failure(
+        remember_capture_failure(
             state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE,
-            &node_probe_port_update_failure_detail(desired_ports),
+            CaptureFailureOp::NodeProbePortUpdate {
+                desired_ports: normalized_node_probe_ports(desired_ports),
+            },
         );
         return NodeProbePortReconcileResult {
             recovered_pending_failure: false,
@@ -8205,7 +8217,12 @@ fn reconcile_existing_pod_ip(
     let Some(new_ip) = pod_ip else {
         return PodIpReconcileResult::default();
     };
-    if state.pod_ip == Some(new_ip) {
+    // A failed move may have written scope (and the pod-IP entry) at its
+    // target while the tracked address stayed put. While any such record is
+    // pending, an event naming the tracked address must not return early: it
+    // re-converges that address and retires the abandoned target (#7025).
+    let pending_targets = pending_pod_ip_update_targets(state_key);
+    if state.pod_ip == Some(new_ip) && pending_targets.is_empty() {
         return PodIpReconcileResult::default();
     }
 
@@ -8223,11 +8240,7 @@ fn reconcile_existing_pod_ip(
             "Failed to move the inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
@@ -8238,25 +8251,24 @@ fn reconcile_existing_pod_ip(
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IP map for existing pod");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
         };
     }
-    forget_pending_capture_failure(
-        state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP,
-    );
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::PodIpUpdate(_))
+    });
     let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
+    let abandoned_pod_ips = pending_targets
+        .into_iter()
+        .filter(|ip| *ip != new_ip && Some(*ip) != old_ip)
+        .collect();
     PodIpReconcileResult {
-        stale_pod_ip: old_ip,
+        stale_pod_ip: old_ip.filter(|ip| *ip != new_ip),
+        abandoned_pod_ips,
         recovered_pending_failure: true,
         pod_ip_update_failed: false,
     }
@@ -8274,7 +8286,9 @@ fn reconcile_existing_pod_ip6(
     let Some(new_ip) = pod_ip else {
         return PodIpReconcileResult::default();
     };
-    if state.pod_ip6 == Some(new_ip) {
+    // Same pending-move contract as the IPv4 reconcile (#7025).
+    let pending_targets = pending_pod_ip6_update_targets(state_key);
+    if state.pod_ip6 == Some(new_ip) && pending_targets.is_empty() {
         return PodIpReconcileResult::default();
     }
 
@@ -8295,11 +8309,7 @@ fn reconcile_existing_pod_ip6(
             "Failed to move the IPv6 inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP6,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
@@ -8310,25 +8320,24 @@ fn reconcile_existing_pod_ip6(
     if let Err(e) = backend.update_pod_ip6(new_ip, &info) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IPv6 map for existing pod");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP6,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
         };
     }
-    forget_pending_capture_failure(
-        state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP6,
-    );
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::PodIp6Update(_))
+    });
     let old_ip = state.pod_ip6;
     state.pod_ip6 = Some(new_ip);
+    let abandoned_pod_ips = pending_targets
+        .into_iter()
+        .filter(|ip| *ip != new_ip && Some(*ip) != old_ip)
+        .collect();
     PodIpReconcileResult {
-        stale_pod_ip: old_ip,
+        stale_pod_ip: old_ip.filter(|ip| *ip != new_ip),
+        abandoned_pod_ips,
         recovered_pending_failure: true,
         pod_ip_update_failed: false,
     }
@@ -8403,8 +8412,10 @@ fn apply_pod_inbound_redirect_v6(
 /// clears any stale v6 scope and keeps the v6 flag false.
 ///
 /// A failed write is a visible, retryable capture failure: the tracked scope is
-/// NOT advanced (so the next event recomputes the same delta) and a pending
-/// capture failure is recorded rather than silently claiming success.
+/// NOT advanced and a pending capture failure is recorded rather than silently
+/// claiming success. While that record is pending, the next event rewrites the
+/// full scope even if its ports equal the tracked set, because the BPF-written
+/// scope may have diverged from it part-way through the failed write.
 fn reconcile_existing_pod_inbound_redirect(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
@@ -8425,7 +8436,16 @@ fn reconcile_existing_pod_inbound_redirect(
     } else {
         Vec::new()
     };
-    if desired == state.inbound_redirect_ports {
+    // The tracked set is only the last scope known to be FULLY written. While a
+    // redirect write is pending, the BPF-written scope is unknown: a failure
+    // after `update_pod_inbound_ports` succeeded (pod-IP flag write, or the
+    // other family) can leave a port the pod never had tracked — and has
+    // since withdrawn — redirect-eligible. Converge the written scope on every
+    // event until a full write succeeds, even when `desired` equals the
+    // tracked set (#7025).
+    let written_scope_uncertain =
+        has_capture_failure(state_key, &CaptureFailureOp::InboundRedirectUpdate);
+    if desired == state.inbound_redirect_ports && !written_scope_uncertain {
         return InboundRedirectReconcileResult::default();
     }
     let desired_v6: &[u16] = if config.capture_contract.ingress_capture_supports_ipv6 {
@@ -8465,11 +8485,7 @@ fn reconcile_existing_pod_inbound_redirect(
 
     if failed {
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
-            CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
-        );
+        remember_capture_failure(state_key, CaptureFailureOp::InboundRedirectUpdate);
         return InboundRedirectReconcileResult {
             update_failed: true,
             recovered_pending_failure: false,
@@ -8477,11 +8493,8 @@ fn reconcile_existing_pod_inbound_redirect(
     }
 
     state.inbound_redirect_ports = desired;
-    let recovered_pending_failure = forget_pending_capture_failure(
-        state_key,
-        CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
-        CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
-    );
+    let recovered_pending_failure =
+        forget_capture_failure(state_key, &CaptureFailureOp::InboundRedirectUpdate);
     InboundRedirectReconcileResult {
         update_failed: false,
         recovered_pending_failure,
@@ -8505,7 +8518,10 @@ fn remove_pod_ip_if_unowned(
             "Skipping pod IP map removal; IP is owned by another tracked pod"
         );
         let state_key = pod_state_key(pod_states, pod_uid);
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
@@ -8514,10 +8530,9 @@ fn remove_pod_ip_if_unowned(
     if let Err(e) = backend.remove_pod_ip(ip) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), removal_reason, "Failed to remove pod IP from map");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8558,7 +8573,10 @@ fn remove_pod_ip6_if_unowned(
             "Skipping pod IPv6 map removal; IP is owned by another tracked pod"
         );
         let state_key = pod_state_key(pod_states, pod_uid);
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         clear_partial_capture_state_if_recovered(pod_states, metrics);
         return;
@@ -8567,10 +8585,9 @@ fn remove_pod_ip6_if_unowned(
     if let Err(e) = backend.remove_pod_ip6(ip) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), ip = %crate::startup::sanitize_startup_scalar(ip), error = %crate::startup::sanitize_startup_scalar(&e), removal_reason, "Failed to remove pod IPv6 from map");
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8685,7 +8702,10 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
             removal_reason,
             "Skipping pre-enrollment pod IP map removal; IP is owned by another tracked pod"
         );
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         return;
     }
@@ -8698,10 +8718,9 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
             "Failed to remove pre-enrollment pod IP from map"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8738,7 +8757,10 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
             removal_reason,
             "Skipping pre-enrollment pod IPv6 map removal; IP is owned by another tracked pod"
         );
-        forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        forget_capture_failure(
+            &state_key,
+            &CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
+        );
         forget_pending_pod_ip_remove_failures_for_ip(pod_states, ip);
         return;
     }
@@ -8751,10 +8773,9 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
             "Failed to remove pre-enrollment pod IPv6 from map"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         return;
     }
@@ -8808,10 +8829,10 @@ fn finish_pod_ip_removal_scope_clear(
             "{scope_label}"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpRemove(ip));
         return false;
     }
-    forget_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    forget_capture_failure(state_key, &CaptureFailureOp::PodIpRemove(ip));
     if !pre_enrollment {
         clear_partial_capture_state_if_recovered(pod_states, metrics);
     }
@@ -9126,21 +9147,13 @@ fn record_removed_pod_detach_result(
 ) -> bool {
     match result {
         Ok(()) => {
-            forget_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_POD_DETACH,
-                CAPTURE_FAILURE_DETAIL_POD_DETACH,
-            );
+            forget_capture_failure(state_key, &CaptureFailureOp::PodDetach);
             true
         }
         Err(e) => {
             warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to detach BPF programs");
             metrics.record_attach_error();
-            remember_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_POD_DETACH,
-                CAPTURE_FAILURE_DETAIL_POD_DETACH,
-            );
+            remember_capture_failure(state_key, CaptureFailureOp::PodDetach);
             false
         }
     }
@@ -9155,25 +9168,19 @@ fn remove_pod_cgroup_maps_recording_failures(
     state: &PodAttachmentState,
 ) {
     for cgroup_id in &state.include_ports_cgroup_ids {
-        let detail = cgroup_id.to_string();
+        let failure = CaptureFailureOp::IncludePortsRemove {
+            cgroup_id: *cgroup_id,
+        };
         if pod_states.iter().any(|entry| {
             entry.key().as_str() != pod_uid
                 && entry.value().include_ports_cgroup_ids.contains(cgroup_id)
         }) {
-            forget_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-                &detail,
-            );
+            forget_capture_failure(state_key, &failure);
             continue;
         }
         match backend.remove_pod_include_ports(*cgroup_id) {
             Ok(()) => {
-                forget_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-                    &detail,
-                );
+                forget_capture_failure(state_key, &failure);
             }
             Err(e) => {
                 warn!(
@@ -9183,16 +9190,14 @@ fn remove_pod_cgroup_maps_recording_failures(
                     "Failed to remove pod includeOutboundPorts entry"
                 );
                 metrics.record_attach_error();
-                remember_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE,
-                    &detail,
-                );
+                remember_capture_failure(state_key, failure);
             }
         }
     }
     for cgroup_id in &state.workload_identity_cgroup_ids {
-        let detail = cgroup_id.to_string();
+        let failure = CaptureFailureOp::WorkloadIdentityRemove {
+            cgroup_id: *cgroup_id,
+        };
         if pod_states.iter().any(|entry| {
             entry.key().as_str() != pod_uid
                 && entry
@@ -9200,20 +9205,12 @@ fn remove_pod_cgroup_maps_recording_failures(
                     .workload_identity_cgroup_ids
                     .contains(cgroup_id)
         }) {
-            forget_pending_capture_failure(
-                state_key,
-                CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
-                &detail,
-            );
+            forget_capture_failure(state_key, &failure);
             continue;
         }
         match backend.remove_workload_identity(*cgroup_id) {
             Ok(()) => {
-                forget_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
-                    &detail,
-                );
+                forget_capture_failure(state_key, &failure);
             }
             Err(e) => {
                 warn!(
@@ -9223,11 +9220,7 @@ fn remove_pod_cgroup_maps_recording_failures(
                     "Failed to remove pod workload-identity entry"
                 );
                 metrics.record_attach_error();
-                remember_pending_capture_failure(
-                    state_key,
-                    CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE,
-                    &detail,
-                );
+                remember_capture_failure(state_key, failure);
             }
         }
     }
@@ -9298,22 +9291,17 @@ pub fn handle_pod_removed(
     let failed_attempt = FAILED_POD_ENROLLMENT_ATTEMPTS
         .get(&state_key)
         .map(|attempt| attempt.value().clone());
-    forget_pending_capture_failure(
-        &state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP,
-    );
-    forget_pending_capture_failure(
-        &state_key,
-        CAPTURE_FAILURE_POD_IP_UPDATE,
-        CAPTURE_FAILURE_DETAIL_POD_IP6,
-    );
-    forget_pending_capture_failure(
-        &state_key,
-        CAPTURE_FAILURE_UDP_READINESS,
-        CAPTURE_FAILURE_DETAIL_UDP_READINESS,
-    );
-    forget_pending_node_probe_port_update_failures_for_state(&state_key);
+    // Every live-pod record (pod-IP, probe-port, UDP-readiness and inbound
+    // redirect updates, plus any future non-removal operation) describes a
+    // pod that no longer exists. Leaving one would keep the node
+    // PARTIALLY_ATTACHED forever and make every retry tick re-retract the
+    // Ambient UDP registry proof (#7025). Removal blockers survive: teardown
+    // below and the periodic retries own them. A failed pod-IP move may have
+    // written scope at its target, so those targets are snapshotted first and
+    // removed below (as durable removal blockers when that fails).
+    let abandoned_v4 = pending_pod_ip_update_targets(&state_key);
+    let abandoned_v6 = pending_pod_ip6_update_targets(&state_key);
+    forget_live_pod_capture_failures(&state_key);
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
     // Best-effort and independent of whether the pod was actually attached: a
@@ -9327,6 +9315,28 @@ pub fn handle_pod_removed(
     }
 
     let removed = pod_states.remove(pod_uid);
+    // Teardown below owns the tracked addresses (and their removal order);
+    // only addresses the pod never converged to are retired here.
+    let (tracked_v4, tracked_v6) = removed
+        .as_ref()
+        .map_or((None, None), |(_, state)| (state.pod_ip, state.pod_ip6));
+    let abandoned_v4: Vec<std::net::Ipv4Addr> = abandoned_v4
+        .into_iter()
+        .filter(|ip| Some(*ip) != tracked_v4)
+        .collect();
+    let abandoned_v6: Vec<std::net::Ipv6Addr> = abandoned_v6
+        .into_iter()
+        .filter(|ip| Some(*ip) != tracked_v6)
+        .collect();
+    remove_abandoned_pod_ip_targets(
+        backend,
+        pod_states,
+        metrics,
+        pod_uid,
+        &abandoned_v4,
+        &abandoned_v6,
+        "abandoned pod IP move on pod removal",
+    );
     let Some((_, state)) = removed else {
         if let Some(failed_attempt) = failed_attempt {
             // `None` proves the attempt failed before the BPF mutation phase;
@@ -9373,11 +9383,7 @@ pub fn handle_pod_removed(
                 pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid),
                 "Retaining Ferrum CNI ownership because rehydrated attachment lacks a cleanup snapshot"
             );
-            remember_pending_capture_failure(
-                &state_key,
-                CAPTURE_FAILURE_POD_DETACH,
-                CAPTURE_FAILURE_DETAIL_POD_DETACH,
-            );
+            remember_capture_failure(&state_key, CaptureFailureOp::PodDetach);
             forget_pod_enrollment_attempt(&state_key);
             clear_partial_capture_state_if_recovered(pod_states, metrics);
             return;
@@ -11868,11 +11874,10 @@ mod tests {
         // Scope the pending-failure assertions to this pod's redirect operation
         // rather than the whole map: the failure registry is process-global.
         let retry_pending = || {
-            PENDING_CAPTURE_FAILURES.contains_key(&pending_capture_failure_key(
+            has_capture_failure(
                 &pod_state_key(&pod_states, "pod-uid-1"),
-                CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
-                CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
-            ))
+                &CaptureFailureOp::InboundRedirectUpdate,
+            )
         };
 
         drive(&mut backend, vec![8080]);
@@ -12959,10 +12964,9 @@ mod tests {
             },
             &failed_cleanup_state,
         );
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
@@ -13080,10 +13084,9 @@ mod tests {
             },
             &failed_cleanup_state,
         );
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
         assert!(!has_pending_removal_blocking_failure(&state_key));
@@ -13522,10 +13525,9 @@ mod tests {
         backend
             .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
             .unwrap();
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
         assert!(!record_removed_pod_detach_result(
             &state_key,
@@ -14475,11 +14477,7 @@ mod tests {
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         let metrics = NodeAgentMetrics::default();
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        remember_pending_capture_failure(
-            &state_key,
-            CAPTURE_FAILURE_POD_DETACH,
-            CAPTURE_FAILURE_DETAIL_POD_DETACH,
-        );
+        remember_capture_failure(&state_key, CaptureFailureOp::PodDetach);
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED);
         let cgroup_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
@@ -16185,12 +16183,10 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        let failure_key = pending_capture_failure_key(
-            &state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_UPDATE,
-            &node_probe_port_update_failure_detail(&[8080]),
-        );
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::NodeProbePortUpdate {
+            desired_ports: vec![8080],
+        };
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.node_probe_ports.contains(&(ip, 8080)),
             "failed update must leave the probe-port exemption absent until retry"
@@ -16203,7 +16199,7 @@ mod tests {
         backend.fail_update_node_probe_port = false;
         retry_pending_node_probe_port_updates(&mut backend, &pod_states, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             backend.node_probe_ports.contains(&(ip, 8080)),
             "retry must write the missing probe-port exemption without another pod event"
@@ -16327,9 +16323,8 @@ mod tests {
         cleanup_partial_pod_enrollment(&mut backend, &pod_states, &metrics, "pod-uid-1", &state);
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        let failure_key =
-            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip));
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -16349,7 +16344,7 @@ mod tests {
         };
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.pod_ips.contains_key(&ip),
             "retry must remove stale pod IP left by partial enrollment cleanup"
@@ -19339,12 +19334,8 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        let failure_key = pending_capture_failure_key(
-            &state_key,
-            CAPTURE_FAILURE_POD_IP_UPDATE,
-            CAPTURE_FAILURE_DETAIL_POD_IP,
-        );
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpUpdate(std::net::Ipv4Addr::new(10, 0, 0, 8));
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19363,7 +19354,7 @@ mod tests {
             pod_states.get("pod-uid-1").unwrap().pod_ip,
             Some(std::net::Ipv4Addr::new(10, 0, 0, 8))
         );
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_READY
@@ -19422,9 +19413,8 @@ mod tests {
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
         handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
-        let failure_key =
-            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, "10.0.0.8");
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from([10, 0, 0, 8]));
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19439,7 +19429,7 @@ mod tests {
         backend.fail_remove_pod_ip = false;
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.pod_ips.contains_key(&ip),
             "retry must remove the stale pod-IP map entry"
@@ -19519,14 +19509,14 @@ mod tests {
 
             handle_pod_removed(&mut backend, &pod_states, &config, &metrics, &pod_uid);
 
-            let detail = ip_v4
-                .map(|ip| ip.to_string())
-                .or_else(|| ip_v6.map(|ip| ip.to_string()))
-                .unwrap();
-            let failure_key =
-                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            let failure_key = CaptureFailureOp::PodIpRemove(
+                ip_v4
+                    .map(std::net::IpAddr::V4)
+                    .or_else(|| ip_v6.map(std::net::IpAddr::V6))
+                    .unwrap(),
+            );
             assert!(
-                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                has_capture_failure(&state_key, &failure_key),
                 "scope clear failure must keep the durable pod_ip_remove key ({family})"
             );
             assert!(has_pending_removal_blocking_failure(&state_key));
@@ -19551,7 +19541,7 @@ mod tests {
             // path) but scope remains, so the pending key must stay.
             retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
             assert!(
-                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                has_capture_failure(&state_key, &failure_key),
                 "retry must keep the pending key while scope clear fails ({family})"
             );
             assert!(
@@ -19565,7 +19555,7 @@ mod tests {
             backend.fail_clear_pod_inbound_ports = false;
             retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            assert!(!has_capture_failure(&state_key, &failure_key));
             if let Some(ip) = ip_v4 {
                 assert!(!backend.pod_inbound_ports.contains(&(ip, 8080)));
             }
@@ -19638,14 +19628,14 @@ mod tests {
                 );
             }
 
-            let detail = ip_v4
-                .map(|ip| ip.to_string())
-                .or_else(|| ip_v6.map(|ip| ip.to_string()))
-                .unwrap();
-            let failure_key =
-                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            let failure_key = CaptureFailureOp::PodIpRemove(
+                ip_v4
+                    .map(std::net::IpAddr::V4)
+                    .or_else(|| ip_v6.map(std::net::IpAddr::V6))
+                    .unwrap(),
+            );
             assert!(
-                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                has_capture_failure(&state_key, &failure_key),
                 "pre-enrollment scope clear failure must stay pending ({family})"
             );
             if let Some(ip) = ip_v4 {
@@ -19670,7 +19660,7 @@ mod tests {
             };
             backend.fail_clear_pod_inbound_ports = false;
             retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
-            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            assert!(!has_capture_failure(&state_key, &failure_key));
             if let Some(ip) = ip_v4 {
                 assert!(!backend.pod_inbound_ports.contains(&(ip, 9090)));
             }
@@ -19723,13 +19713,11 @@ mod tests {
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
         handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
-        let detail = node_probe_port_failure_detail(std::net::IpAddr::V4(ip), 8080);
-        let failure_key = pending_capture_failure_key(
-            &state_key,
-            CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE,
-            &detail,
-        );
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::NodeProbePortRemove {
+            ip: std::net::IpAddr::V4(ip),
+            port: 8080,
+        };
+        assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19738,7 +19726,7 @@ mod tests {
         backend.fail_remove_node_probe_port = false;
         retry_pending_node_probe_port_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.node_probe_ports.contains(&(ip, 8080)),
             "retry must remove stale probe-port map entry"
@@ -19766,20 +19754,12 @@ mod tests {
             .unwrap();
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        remember_pending_capture_failure(
+        remember_capture_failure(
             &state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
+            CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip)),
         );
-        let failure_key =
-            pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
-        assert_eq!(
-            parse_pending_capture_failure_key(&failure_key)
-                .unwrap()
-                .detail,
-            ip.to_string()
-        );
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from(ip));
+        assert!(has_capture_failure(&state_key, &failure_key));
 
         let config = NodeAgentConfig {
             node_name: "test-node".to_string(),
@@ -19794,7 +19774,7 @@ mod tests {
         };
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
-        assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        assert!(!has_capture_failure(&state_key, &failure_key));
         assert!(
             !backend.pod_ips6.contains_key(&ip),
             "retry must remove stale IPv6 pod map entries"
@@ -19852,9 +19832,8 @@ mod tests {
         let old_state_key = pod_state_key(&pod_states, "pod-uid-1");
         handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
-        let failure_key =
-            pending_capture_failure_key(&old_state_key, CAPTURE_FAILURE_POD_IP_REMOVE, "10.0.0.8");
-        assert!(PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+        let failure_key = CaptureFailureOp::PodIpRemove(std::net::IpAddr::from([10, 0, 0, 8]));
+        assert!(has_capture_failure(&old_state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
@@ -19882,7 +19861,7 @@ mod tests {
         retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
 
         assert!(
-            !PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+            !has_capture_failure(&old_state_key, &failure_key),
             "re-owned pod IP should clear stale removal failure instead of keeping readiness degraded"
         );
         assert_eq!(
