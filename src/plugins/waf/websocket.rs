@@ -22,7 +22,7 @@
 //!   `..._SECONDS`), so this hook never has to hold partial state.
 //! * **Compression** — the gateway never negotiates `permessage-deflate`. The
 //!   client's `Sec-WebSocket-Extensions` offer is stripped before the backend
-//!   handshake (`is_websocket_backend_strip_header`) and no negotiated
+//!   handshake (`headers::is_websocket_backend_request_strip_header`) and no negotiated
 //!   extension is echoed back to the client
 //!   (`WEBSOCKET_TRANSPORT_MANAGED_RESPONSE_HEADERS`), so no `rsv1` payload can
 //!   exist end to end on any frontend.

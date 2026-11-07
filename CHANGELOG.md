@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **HTTP/3 WebSocket handshakes strip the same request headers as H1/H2.**
+  The H3 frontend's backend WebSocket handshake kept its own hop-by-hop list
+  and forwarded a client's `Content-Length` and `Expect` and the internal
+  `x-ferrum-original-content-encoding` / `x-grpc-web-mode` markers to the
+  backend, which the H1/H2 handshake already stripped. Both frontends now use
+  one shared predicate; H3 still replaces `Early-Data` itself and drops
+  pseudo-headers.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch

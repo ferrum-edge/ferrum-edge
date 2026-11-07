@@ -1825,6 +1825,68 @@ pub mod _test_support {
         crate::proxy::udp_proxy::udp_backend_host_matches_destination_family(host, destination)
     }
 
+    /// The per-port LB lane admission policy every stream path shares
+    /// (`backend_dispatch::stream_port_lane`). A refusal renders as its variant
+    /// name (`LeastLatency` / `NonIpHashKey`).
+    pub fn stream_port_lane_for_test(
+        proxy: &crate::config::types::Proxy,
+        snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+        upstream_id: &str,
+        health_port_scope: Option<u16>,
+        selection_subset: Option<&str>,
+    ) -> Result<Option<u16>, String> {
+        crate::proxy::backend_dispatch::stream_port_lane(
+            proxy,
+            snapshot,
+            upstream_id,
+            health_port_scope,
+            selection_subset,
+        )
+        .map_err(|refusal| format!("{refusal:?}"))
+    }
+
+    /// `backend_dispatch::stream_health_port_scope`: the per-port scope a stream
+    /// path hands to [`stream_port_lane_for_test`].
+    pub fn stream_health_port_scope_for_test(
+        proxy: &crate::config::types::Proxy,
+        snapshot: &crate::load_balancer::LoadBalancerCacheInner,
+        upstream_id: &str,
+        dispatch_port: u16,
+    ) -> Option<u16> {
+        crate::proxy::backend_dispatch::stream_health_port_scope(
+            proxy,
+            snapshot,
+            upstream_id,
+            dispatch_port,
+        )
+    }
+
+    /// `Debug` rendering of the shared hyper HTTP/2 client builder
+    /// (`pool::hyper_h2_client_builder`); hyper's builder has no getters.
+    /// `pool_keepalive` selects `H2ClientKeepalive::FromPoolConfig` (else
+    /// `NotApplied`); `seed_initial_send_streams` selects
+    /// `H2ClientInitialSendStreams::FromStreamCap` (else `HyperDefault`).
+    pub fn hyper_h2_client_builder_debug_for_test(
+        pool_config: &crate::config::PoolConfig,
+        pool_keepalive: bool,
+        seed_initial_send_streams: bool,
+    ) -> String {
+        let keepalive = if pool_keepalive {
+            crate::pool::H2ClientKeepalive::FromPoolConfig
+        } else {
+            crate::pool::H2ClientKeepalive::NotApplied
+        };
+        let initial_send_streams = if seed_initial_send_streams {
+            crate::pool::H2ClientInitialSendStreams::FromStreamCap
+        } else {
+            crate::pool::H2ClientInitialSendStreams::HyperDefault
+        };
+        format!(
+            "{:?}",
+            crate::pool::hyper_h2_client_builder(pool_config, keepalive, initial_send_streams)
+        )
+    }
+
     /// UDP backend selection with an optional session destination, so tests can
     /// prove destination-family eligibility stays inside load-balancer health,
     /// algorithm, and port-lane selection (hosted NodeWaypoint same-port demux).
@@ -9200,6 +9262,15 @@ pub mod _test_support {
         proxy_headers: &HashMap<String, String>,
     ) -> Vec<(String, String)> {
         crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
+    }
+
+    /// The H3 frontend's backend WebSocket handshake header collector
+    /// (`http3::websocket::collect_forwardable_h3_headers`).
+    pub fn collect_forwardable_h3_websocket_headers_for_test(
+        headers: &HashMap<String, String>,
+        is_early_data: bool,
+    ) -> Vec<(String, String)> {
+        crate::http3::websocket::collect_forwardable_h3_headers(headers, is_early_data)
     }
 
     /// Forward a `permessage-deflate` offer the way a passthrough proxy does;

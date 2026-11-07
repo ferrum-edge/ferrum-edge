@@ -50,6 +50,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
+use super::backend_dispatch::StreamPortLaneRefusal;
 use super::{
     LoadBalancerConnectionGuard, ProxyState, backend_dispatch, hbone_pool, mesh_mtls_pool,
     tcp_proxy,
@@ -101,39 +102,36 @@ pub(crate) async fn handle_mesh_tcp_egress(
     );
     let health_port_scope =
         backend_dispatch::stream_health_port_scope(proxy, lb, &entry.upstream_id, override_port);
-    let port_lane = (health_port_scope.is_some()
-        && match mesh_stream_port_lane_supported(proxy, override_port) {
-            Ok(supported) => supported,
-            Err(message) => {
-                warn!(
-                    service = %entry.service_fqdn,
-                    port = override_port,
-                    orig_dst = %orig_dst,
-                    %message,
-                    "Raw-TCP mesh egress per-port LB policy is unsupported; closing captured connection"
-                );
-                return;
-            }
-        })
-    .then_some(override_port);
-    if let Some(port) = port_lane {
-        let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-            lb,
-            &proxy.namespace,
-            &entry.upstream_id,
-            Some(port),
-            None,
-        );
-        if !matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
+    // Mesh relay proxies select from the entry upstream, never a subset.
+    let port_lane = match backend_dispatch::stream_port_lane(
+        proxy,
+        lb,
+        &entry.upstream_id,
+        health_port_scope,
+        None,
+    ) {
+        Ok(port_lane) => port_lane,
+        Err(StreamPortLaneRefusal::LeastLatency) => {
+            let message = "per-port LEAST_LATENCY requires stream latency accounting";
             warn!(
                 service = %entry.service_fqdn,
-                port,
+                port = override_port,
+                orig_dst = %orig_dst,
+                %message,
+                "Raw-TCP mesh egress per-port LB policy is unsupported; closing captured connection"
+            );
+            return;
+        }
+        Err(StreamPortLaneRefusal::NonIpHashKey) => {
+            warn!(
+                service = %entry.service_fqdn,
+                port = override_port,
                 orig_dst = %orig_dst,
                 "Raw-TCP mesh egress per-port consistent hashing supports only source-IP hash keys; closing captured connection"
             );
             return;
         }
-    }
+    };
     let lb_hash_key = mesh_stream_lb_hash_key_for_client_ip(client_ip);
     let health_ctx = backend_dispatch::health_context_for_selection(
         proxy,
@@ -473,48 +471,14 @@ pub(crate) fn connection_balancer(
     snapshot.balancer(namespace, upstream_id).cloned()
 }
 
-fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, port: u16) -> bool {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return false;
-    };
-    override_config.algorithm.is_some()
-        || override_config.hash_on.is_some()
-        || override_config.locality_lb_setting.is_some()
-}
-
 fn mesh_stream_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
     crate::util::client_identity::canonical_ip_string(ip)
 }
 
-fn mesh_stream_port_lane_supported(
-    proxy: &crate::config::types::Proxy,
-    port: u16,
-) -> Result<bool, &'static str> {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return Ok(false);
-    };
-    match override_config.algorithm {
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => {
-            Err("per-port LEAST_LATENCY requires stream latency accounting")
-        }
-        _ => Ok(stream_port_override_affects_selection(proxy, port)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        mesh_stream_lb_hash_key_for_client_ip, mesh_stream_port_lane_supported,
-        stream_port_override_affects_selection,
-    };
+    use super::backend_dispatch::{StreamPortLaneRefusal, stream_port_lane};
+    use super::mesh_stream_lb_hash_key_for_client_ip;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -535,40 +499,49 @@ listen_port: 15001
         proxy
     }
 
+    /// The lane decision the mesh raw-TCP egress path makes for port 5432:
+    /// entry upstream, no selection subset.
+    fn mesh_tcp_lane(
+        proxy: &crate::config::types::Proxy,
+    ) -> Result<Option<u16>, StreamPortLaneRefusal> {
+        let cache = crate::load_balancer::LoadBalancerCache::new(
+            &crate::config::types::GatewayConfig::default(),
+        );
+        let snapshot = cache.load();
+        stream_port_lane(proxy, &snapshot, "orders", Some(5432), None)
+    }
+
     #[test]
     fn mesh_tcp_stream_port_override_affects_selection_only_for_lb_fields() {
         let timeout_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
             connect_timeout_ms: Some(250),
             ..Default::default()
         });
-        assert!(!stream_port_override_affects_selection(&timeout_only, 5432));
+        assert_eq!(mesh_tcp_lane(&timeout_only), Ok(None));
 
         let keepalive_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
             tcp_keepalive: Some(crate::config::types::TcpKeepaliveCfg::default()),
             ..Default::default()
         });
-        assert!(!stream_port_override_affects_selection(
-            &keepalive_only,
-            5432
-        ));
+        assert_eq!(mesh_tcp_lane(&keepalive_only), Ok(None));
 
         let idle_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
             tcp_idle_timeout_seconds: Some(0),
             ..Default::default()
         });
-        assert!(!stream_port_override_affects_selection(&idle_only, 5432));
+        assert_eq!(mesh_tcp_lane(&idle_only), Ok(None));
 
         let locality = proxy_with_override(crate::config::types::ResolvedPortOverride {
             locality_lb_setting: Some(crate::config::types::UpstreamLocalityLbSetting::default()),
             ..Default::default()
         });
-        assert!(stream_port_override_affects_selection(&locality, 5432));
+        assert_eq!(mesh_tcp_lane(&locality), Ok(Some(5432)));
 
         let hash = proxy_with_override(crate::config::types::ResolvedPortOverride {
             hash_on: Some("ip".to_string()),
             ..Default::default()
         });
-        assert!(stream_port_override_affects_selection(&hash, 5432));
+        assert_eq!(mesh_tcp_lane(&hash), Ok(Some(5432)));
     }
 
     #[test]
@@ -578,8 +551,10 @@ listen_port: 15001
             ..Default::default()
         });
 
-        assert!(stream_port_override_affects_selection(&least_latency, 5432));
-        assert!(mesh_stream_port_lane_supported(&least_latency, 5432).is_err());
+        assert_eq!(
+            mesh_tcp_lane(&least_latency),
+            Err(StreamPortLaneRefusal::LeastLatency)
+        );
     }
 
     #[test]
@@ -632,9 +607,8 @@ listen_port: 15001
             "orders",
             override_port,
         );
-        let port_lane = (health_port_scope.is_some()
-            && mesh_stream_port_lane_supported(&proxy, override_port).expect("supported policy"))
-        .then_some(override_port);
+        let port_lane = stream_port_lane(&proxy, &snapshot, "orders", health_port_scope, None)
+            .expect("supported policy");
 
         assert_eq!(
             health_port_scope,

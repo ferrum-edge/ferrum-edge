@@ -9,7 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use hyper::client::conn::{http1, http2};
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -537,35 +537,15 @@ impl Http2PoolManager {
         })?
     }
 
+    /// The direct-H2 pool's HTTP/2 client builder: the shared `PoolConfig`
+    /// builder with the pool keepalive applied and the outbound stream bound
+    /// seeded from the cap, exactly like the gRPC pool.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
-        let mut builder = http2::Builder::new(TokioExecutor::new());
-        builder.timer(TokioTimer::new());
-
-        if pool_config.enable_http2 {
-            builder
-                .keep_alive_interval(Duration::from_secs(
-                    pool_config.http2_keep_alive_interval_seconds,
-                ))
-                .keep_alive_timeout(Duration::from_secs(
-                    pool_config.http2_keep_alive_timeout_seconds,
-                ))
-                .max_concurrent_reset_streams(4096);
-        }
-
-        builder
-            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
-            .adaptive_window(pool_config.http2_adaptive_window)
-            .max_frame_size(pool_config.http2_max_frame_size);
-
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push) and preserve the operator's
-            // initial outbound concurrency bound until peer SETTINGS arrive.
-            builder.max_concurrent_streams(max_streams);
-            builder.initial_max_send_streams(max_streams as usize);
-        }
-
-        builder
+        crate::pool::hyper_h2_client_builder(
+            pool_config,
+            crate::pool::H2ClientKeepalive::FromPoolConfig,
+            crate::pool::H2ClientInitialSendStreams::FromStreamCap,
+        )
     }
 
     /// Cached backend rustls config for this proxy's TLS identity. A miss is

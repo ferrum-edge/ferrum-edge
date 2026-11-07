@@ -319,6 +319,84 @@ pub fn remaining_connect_timeout(
     connect_timeout.checked_sub(connect_started.elapsed())
 }
 
+/// Whether a hyper HTTP/2 client builder applies `PoolConfig`'s HTTP/2 PING
+/// keepalive and reset-stream cap. Explicit at every call site because the
+/// builder sites differ (see [`hyper_h2_client_builder`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum H2ClientKeepalive {
+    /// When `enable_http2` is set, apply `http2_keep_alive_interval_seconds` /
+    /// `http2_keep_alive_timeout_seconds` PINGs and
+    /// `max_concurrent_reset_streams(4096)`.
+    FromPoolConfig,
+    /// Apply none of them; hyper's defaults stand (no PINGs, no explicit
+    /// reset-stream cap). The nested-HBONE gRPC connection relies on its outer
+    /// HBONE carrier's own `h2` PING keepalive.
+    NotApplied,
+}
+
+/// Whether a hyper HTTP/2 client builder seeds hyper's initial outbound stream
+/// bound from the effective `http2_max_concurrent_streams` cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum H2ClientInitialSendStreams {
+    /// `initial_max_send_streams(cap)`: the operator's bound holds until the
+    /// peer's SETTINGS frame replaces it.
+    FromStreamCap,
+    /// Keep hyper's default initial bound until the peer's SETTINGS arrive.
+    HyperDefault,
+}
+
+/// The hyper HTTP/2 client builder every `PoolConfig`-driven pool family
+/// constructs: direct H2 (`http2_pool`), gRPC (`grpc_proxy`), mesh mTLS
+/// (`mesh_mtls_pool`) and the nested-HBONE gRPC dial.
+///
+/// Always applied: the Tokio timer, both initial flow-control windows,
+/// `adaptive_window(pool_config.http2_adaptive_window)` (issue #5464: the
+/// fixed-window default must reach every builder), `max_frame_size`, and the
+/// advertised `max_concurrent_streams(cap)` when a cap is set. The windows are
+/// set BEFORE `adaptive_window`: hyper's `initial_*_window_size` clears the
+/// adaptive flag and `adaptive_window(true)` resets both windows, so the order
+/// decides which one wins.
+///
+/// `keepalive` and `initial_send_streams` are the per-site differences and
+/// stay visible at each call site.
+pub(crate) fn hyper_h2_client_builder(
+    pool_config: &PoolConfig,
+    keepalive: H2ClientKeepalive,
+    initial_send_streams: H2ClientInitialSendStreams,
+) -> hyper::client::conn::http2::Builder<hyper_util::rt::TokioExecutor> {
+    let mut builder =
+        hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // The timer drives keepalive PINGs and hyper's internal H2 timeouts.
+    builder.timer(hyper_util::rt::TokioTimer::new());
+
+    if keepalive == H2ClientKeepalive::FromPoolConfig && pool_config.enable_http2 {
+        builder
+            .keep_alive_interval(Duration::from_secs(
+                pool_config.http2_keep_alive_interval_seconds,
+            ))
+            .keep_alive_timeout(Duration::from_secs(
+                pool_config.http2_keep_alive_timeout_seconds,
+            ))
+            .max_concurrent_reset_streams(4096);
+    }
+
+    builder
+        .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+        .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
+        .adaptive_window(pool_config.http2_adaptive_window)
+        .max_frame_size(pool_config.http2_max_frame_size);
+
+    if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+        // Advertised to the peer as our own inbound stream cap.
+        builder.max_concurrent_streams(max_streams);
+        if initial_send_streams == H2ClientInitialSendStreams::FromStreamCap {
+            builder.initial_max_send_streams(max_streams as usize);
+        }
+    }
+
+    builder
+}
+
 #[allow(clippy::double_must_use)] // async-trait adds a bare #[must_use]
 #[async_trait]
 pub trait PoolManager: Send + Sync + 'static {

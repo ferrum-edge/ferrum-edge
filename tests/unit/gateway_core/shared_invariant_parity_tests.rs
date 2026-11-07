@@ -3556,9 +3556,14 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         ".any(|name| headers_mod::is_gateway_assertion_header(name));",
     ),
     (
+        "WebSocket backend handshake strip predicate",
+        "src/proxy/headers.rs",
+        "        || is_websocket_handshake_strip_header(name)\n        || is_consumer_assertion_header(name)\n}",
+    ),
+    (
         "H1/H2 WebSocket handshake",
         "src/proxy/mod.rs",
-        "    headers_mod::is_consumer_assertion_header(name)\n        || matches!(",
+        "headers_mod::is_websocket_backend_request_strip_header(lower_name.as_str())",
     ),
     (
         // Delegates to the same initial-boundary helper whose gate is the
@@ -3570,7 +3575,7 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
     (
         "H3 WebSocket handshake",
         "src/http3/websocket.rs",
-        "crate::proxy::headers::is_consumer_assertion_header(&lower)",
+        "crate::proxy::headers::is_websocket_backend_request_strip_header(&lower)",
     ),
     (
         "H3-to-gRPC bridge trusted overlay",
@@ -4268,4 +4273,185 @@ fn every_tracing_capture_registers_the_interest_floor_first() {
          installing function, before installing a thread-local tracing \
          capture: {offenders:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stream per-port LB lane admission: TCP, UDP/DTLS, mesh raw-TCP egress, mesh
+// UDP egress. The four paths once carried their own copies of this decision
+// and drifted (per-port `LEAST_CONN`, the subset refinement). The behaviour of
+// the shared `backend_dispatch::stream_port_lane` is pinned in
+// `stream_port_lane_tests.rs`; this table pins that every stream path calls
+// it, with the selection subset it actually selects from, and keeps no copy.
+// ---------------------------------------------------------------------------
+
+/// `(path, selection_subset argument)` for every stream path that selects a
+/// load-balanced target. Only TCP selects inside a route subset:
+/// `upstream_subset` is a validation error on udp/dtls, and mesh relay proxies
+/// select from the entry upstream.
+const STREAM_PORT_LANE_SITES: &[(&str, &str)] = &[
+    ("src/proxy/tcp_proxy.rs", "proxy.upstream_subset.as_deref()"),
+    ("src/proxy/udp_proxy.rs", "None"),
+    ("src/proxy/mesh_tcp_egress.rs", "None"),
+    ("src/proxy/mesh_udp_capture.rs", "None"),
+];
+
+/// The top-level arguments of every `stream_port_lane(` call in `text`.
+fn stream_port_lane_call_args(text: &str) -> Vec<Vec<String>> {
+    const CALL: &str = "backend_dispatch::stream_port_lane(";
+    let mut calls = Vec::new();
+    for (at, _) in text.match_indices(CALL) {
+        let bytes = text.as_bytes();
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(bytes, open) - 1;
+        let compact: String = text[open + 1..close].split_whitespace().collect();
+        let mut depth = 0i32;
+        let mut start = 0;
+        let mut args = Vec::new();
+        for (i, c) in compact.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(compact[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if start < compact.len() {
+            args.push(compact[start..].to_string());
+        }
+        calls.push(args);
+    }
+    calls
+}
+
+#[test]
+fn every_stream_path_admits_its_port_lane_through_the_shared_policy() {
+    for &(path, subset) in STREAM_PORT_LANE_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let calls = stream_port_lane_call_args(&production);
+        assert_eq!(
+            calls.len(),
+            1,
+            "{path} must make exactly one production per-port lane decision \
+             through backend_dispatch::stream_port_lane"
+        );
+        assert_eq!(
+            calls[0].last().map(String::as_str),
+            Some(subset),
+            "{path} must pass its own selection subset explicitly"
+        );
+        for copy in [
+            "override_config.locality_lb_setting.is_some()",
+            "HashOnStrategy::Ip",
+            "LoadBalancerAlgorithm::LeastLatency",
+        ] {
+            assert!(
+                !production.contains(copy),
+                "{path} re-implements part of the stream lane policy (`{copy}`); \
+                 call backend_dispatch::stream_port_lane instead"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hyper HTTP/2 client builders configured from `PoolConfig`
+// ---------------------------------------------------------------------------
+//
+// Issue #5464: every hyper-based backend H2 client must pass
+// `pool_config.http2_adaptive_window`. The direct-H2, gRPC, mesh-mTLS and
+// nested-HBONE gRPC builders used to be four hand-written copies; they now
+// call `pool::hyper_h2_client_builder`, whose behaviour is pinned in
+// `h2_client_builder_tests.rs`. This table pins each site's explicit options
+// and that no site builds its own `PoolConfig`-driven hyper H2 client again.
+
+/// `(path, number of shared-builder calls, keepalive option, send-stream option)`.
+const H2_CLIENT_BUILDER_SITES: &[(&str, usize, &str, &str)] = &[
+    (
+        "src/proxy/http2_pool.rs",
+        1,
+        "H2ClientKeepalive::FromPoolConfig",
+        "H2ClientInitialSendStreams::FromStreamCap",
+    ),
+    (
+        "src/proxy/mesh_mtls_pool.rs",
+        1,
+        "H2ClientKeepalive::FromPoolConfig",
+        "H2ClientInitialSendStreams::HyperDefault",
+    ),
+];
+
+#[test]
+fn every_pool_config_h2_client_uses_the_shared_builder_with_explicit_options() {
+    const CALL: &str = "crate::pool::hyper_h2_client_builder(";
+    let options = |text: &str, at: usize| -> String {
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(text.as_bytes(), open);
+        text[open..close].split_whitespace().collect()
+    };
+
+    for &(path, calls, keepalive, send_streams) in H2_CLIENT_BUILDER_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let found: Vec<_> = production.match_indices(CALL).collect();
+        assert_eq!(found.len(), calls, "{path}: shared H2 builder calls");
+        for (at, _) in found {
+            let args = options(&production, at);
+            assert!(
+                args.contains(keepalive) && args.contains(send_streams),
+                "{path}: expected `{keepalive}` + `{send_streams}`, got {args}"
+            );
+        }
+    }
+
+    // gRPC: the pooled direct dial (`build_h2_builder`) and the nested-HBONE
+    // dial deliberately differ, so pin each call by its enclosing item.
+    let grpc = without_cfg_test_items(&source("src/proxy/grpc_proxy.rs"));
+    let pooled = item_body(&grpc, "fn build_h2_builder(", "\n    }\n");
+    let nested = item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n");
+    for (site, body, keepalive, send_streams) in [
+        (
+            "gRPC pool",
+            pooled,
+            "H2ClientKeepalive::FromPoolConfig",
+            "H2ClientInitialSendStreams::FromStreamCap",
+        ),
+        (
+            "nested-HBONE gRPC dial",
+            nested,
+            "H2ClientKeepalive::NotApplied",
+            "H2ClientInitialSendStreams::HyperDefault",
+        ),
+    ] {
+        let at = body
+            .find(CALL)
+            .unwrap_or_else(|| panic!("{site} must use the shared H2 builder"));
+        let args = options(body, at);
+        assert!(
+            args.contains(keepalive) && args.contains(send_streams),
+            "{site}: expected `{keepalive}` + `{send_streams}`, got {args}"
+        );
+    }
+    assert_eq!(
+        grpc.matches(CALL).count(),
+        2,
+        "grpc_proxy shared H2 builder calls"
+    );
+
+    // No PoolConfig-driven hyper H2 client is hand-built anywhere else. The
+    // Unix-socket h2c client uses fixed constants, not `PoolConfig`, and the
+    // frontend H2 *server* builders in `proxy/mod.rs` use their own env
+    // settings; neither reads `pool_config.http2_adaptive_window`.
+    for (path, text) in production_sources() {
+        if path == "src/pool/mod.rs" {
+            continue;
+        }
+        let production = without_cfg_test_items(&text);
+        assert!(
+            !production.contains(".adaptive_window(pool_config.http2_adaptive_window)"),
+            "{path} hand-builds a PoolConfig-driven hyper H2 client; call \
+             crate::pool::hyper_h2_client_builder instead"
+        );
+    }
 }

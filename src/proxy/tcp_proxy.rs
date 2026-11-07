@@ -6100,13 +6100,16 @@ fn resolve_backend_target(
             upstream_id,
             override_port,
         );
-        let port_lane = if health_port_scope.is_some()
-            && tcp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
-        {
-            Some(override_port)
-        } else {
-            None
-        };
+        // TCP selects inside the route's `upstream_subset`, so the shared lane
+        // policy sees that subset; UDP/DTLS and mesh egress pass `None`.
+        let port_lane = crate::proxy::backend_dispatch::stream_port_lane(
+            proxy,
+            lb_snapshot,
+            upstream_id,
+            health_port_scope,
+            proxy.upstream_subset.as_deref(),
+        )
+        .map_err(|refusal| tcp_port_lane_refusal(proxy, override_port, refusal))?;
         let health_ctx = crate::proxy::backend_dispatch::health_context_for_selection(
             proxy,
             health_checker,
@@ -6180,100 +6183,30 @@ fn resolve_backend_target(
     }
 }
 
-fn tcp_port_lane_selection_supported(
+/// Map a refused per-port lane onto the TCP stream-setup error surface.
+fn tcp_port_lane_refusal(
     proxy: &Proxy,
-    lb_snapshot: &LoadBalancerCacheInner,
-    upstream_id: &str,
     port: u16,
-) -> Result<bool, anyhow::Error> {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return Ok(false);
-    };
-    // `LEAST_CONN` is supported here: both stream paths now hold a
-    // `LoadBalancerConnectionGuard` for the connection/session lifetime (issue
-    // #4514), and `select_for_port` reads the balancer-level active-connection
-    // counters those guards feed. `LEAST_LATENCY` stays refused uniformly on
-    // stream proxies: UDP/DTLS has no per-request RTT sample, so a per-port
-    // latency lane would be fed on TCP and silently inert on UDP.
-    if matches!(
-        override_config.algorithm,
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency)
-    ) {
-        return Err(StreamSetupError::new(
-            StreamSetupKind::UnsupportedStreamPolicy,
+    refusal: crate::proxy::backend_dispatch::StreamPortLaneRefusal,
+) -> anyhow::Error {
+    use crate::proxy::backend_dispatch::StreamPortLaneRefusal;
+    let detail = match refusal {
+        StreamPortLaneRefusal::LeastLatency => format!(
+            "for TCP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
+             every dispatch path"
+        ),
+        StreamPortLaneRefusal::NonIpHashKey => {
+            let protocol = proxy.effective_scheme();
             format!(
-                "for TCP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
-                 every dispatch path"
-            ),
-        )
-        .into());
-    }
-    let selection_affecting = stream_port_override_affects_selection(
-        proxy,
-        lb_snapshot,
-        upstream_id,
-        port,
-        override_config,
-    );
-    if selection_affecting {
-        validate_stream_hash_on(proxy, lb_snapshot, upstream_id, port)?;
-    }
-    Ok(selection_affecting)
-}
-
-fn stream_port_override_affects_selection(
-    proxy: &Proxy,
-    lb_snapshot: &LoadBalancerCacheInner,
-    upstream_id: &str,
-    port: u16,
-    override_config: &crate::config::types::ResolvedPortOverride,
-) -> bool {
-    if proxy.upstream_subset.is_some() && override_config.algorithm.is_none() {
-        return override_config.locality_lb_setting.is_some()
-            || (override_config.hash_on.is_some()
-                && LoadBalancerCache::effective_algorithm_from(
-                    lb_snapshot,
-                    &proxy.namespace,
-                    upstream_id,
-                    Some(port),
-                    proxy.upstream_subset.as_deref(),
-                ) == Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing));
-    }
-    override_config.algorithm.is_some()
-        || override_config.hash_on.is_some()
-        || override_config.locality_lb_setting.is_some()
+                "for {protocol} port {port}: stream per-port consistent hashing supports only source-IP hash keys"
+            )
+        }
+    };
+    StreamSetupError::new(StreamSetupKind::UnsupportedStreamPolicy, detail).into()
 }
 
 fn stream_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
     crate::util::client_identity::canonical_ip_string(ip)
-}
-
-fn validate_stream_hash_on(
-    proxy: &Proxy,
-    lb_snapshot: &LoadBalancerCacheInner,
-    upstream_id: &str,
-    port: u16,
-) -> Result<(), anyhow::Error> {
-    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-        lb_snapshot,
-        &proxy.namespace,
-        upstream_id,
-        Some(port),
-        proxy.upstream_subset.as_deref(),
-    );
-    if matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
-        return Ok(());
-    }
-    let protocol = proxy.effective_scheme();
-    Err(StreamSetupError::new(
-        StreamSetupKind::UnsupportedStreamPolicy,
-        format!("for {protocol} port {port}: stream per-port consistent hashing supports only source-IP hash keys"),
-    )
-    .into())
 }
 
 #[cfg(test)]

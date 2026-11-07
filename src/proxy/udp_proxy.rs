@@ -10166,13 +10166,16 @@ pub(crate) fn resolve_backend_target(
             upstream_id,
             override_port,
         );
-        let port_lane = if health_port_scope.is_some()
-            && udp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
-        {
-            Some(override_port)
-        } else {
-            None
-        };
+        // `upstream_subset` is a validation error on udp/dtls, so the shared
+        // lane policy is consulted without a selection subset.
+        let port_lane = crate::proxy::backend_dispatch::stream_port_lane(
+            proxy,
+            lb_snapshot,
+            upstream_id,
+            health_port_scope,
+            None,
+        )
+        .map_err(|refusal| udp_port_lane_refusal(override_port, refusal))?;
         let health_ctx = crate::proxy::backend_dispatch::health_context_for_selection(
             proxy,
             health_checker,
@@ -10273,74 +10276,22 @@ pub(crate) fn udp_backend_host_matches_destination_family(host: &str, destinatio
     crate::load_balancer::backend_host_matches_ip_family(host, destination)
 }
 
-fn udp_port_lane_selection_supported(
-    proxy: &Proxy,
-    lb_snapshot: &LoadBalancerCacheInner,
-    upstream_id: &str,
+/// Map a refused per-port lane onto the UDP/DTLS stream-setup error surface.
+fn udp_port_lane_refusal(
     port: u16,
-) -> Result<bool, anyhow::Error> {
-    let Some(override_config) = proxy
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&port))
-    else {
-        return Ok(false);
+    refusal: crate::proxy::backend_dispatch::StreamPortLaneRefusal,
+) -> anyhow::Error {
+    use crate::proxy::backend_dispatch::StreamPortLaneRefusal;
+    let detail = match refusal {
+        StreamPortLaneRefusal::LeastLatency => format!(
+            "for UDP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
+             every dispatch path"
+        ),
+        StreamPortLaneRefusal::NonIpHashKey => format!(
+            "for UDP port {port}: stream per-port consistent hashing supports only source-IP hash keys"
+        ),
     };
-    // `LEAST_CONN` is supported here: every UDP/DTLS session now holds a
-    // `LoadBalancerConnectionGuard` for its lifetime (issue #4514), and
-    // `select_for_port` reads the balancer-level active-connection counters
-    // those guards feed. `LEAST_LATENCY` stays refused uniformly on stream
-    // proxies: UDP/DTLS has no per-request RTT sample, so a per-port latency
-    // lane would be fed on TCP and silently inert here.
-    if matches!(
-        override_config.algorithm,
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency)
-    ) {
-        return Err(StreamSetupError::new(
-            StreamSetupKind::UnsupportedStreamPolicy,
-            format!(
-                "for UDP port {port}: per-port LEAST_LATENCY requires stream latency sampling on \
-                 every dispatch path"
-            ),
-        )
-        .into());
-    }
-    let selection_affecting = stream_port_override_affects_selection(override_config);
-    if selection_affecting {
-        validate_stream_hash_on(proxy, lb_snapshot, upstream_id, port)?;
-    }
-    Ok(selection_affecting)
-}
-
-fn stream_port_override_affects_selection(
-    override_config: &crate::config::types::ResolvedPortOverride,
-) -> bool {
-    override_config.algorithm.is_some()
-        || override_config.hash_on.is_some()
-        || override_config.locality_lb_setting.is_some()
-}
-
-fn validate_stream_hash_on(
-    proxy: &Proxy,
-    lb_snapshot: &LoadBalancerCacheInner,
-    upstream_id: &str,
-    port: u16,
-) -> Result<(), anyhow::Error> {
-    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
-        lb_snapshot,
-        &proxy.namespace,
-        upstream_id,
-        Some(port),
-        None,
-    );
-    if matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
-        return Ok(());
-    }
-    Err(StreamSetupError::new(
-        StreamSetupKind::UnsupportedStreamPolicy,
-        format!("for UDP port {port}: stream per-port consistent hashing supports only source-IP hash keys"),
-    )
-    .into())
+    StreamSetupError::new(StreamSetupKind::UnsupportedStreamPolicy, detail).into()
 }
 
 fn resolve_or_reuse_backend_target(
@@ -12808,9 +12759,16 @@ listen_port: 5300
             host == "a.local" || host == "b.local",
             "selection must stay inside the port lane: {host}"
         );
-        assert!(
-            super::udp_port_lane_selection_supported(&proxy, &snapshot, "dns", 5353)
-                .expect("per-port LEAST_CONN must no longer be refused"),
+        assert_eq!(
+            crate::proxy::backend_dispatch::stream_port_lane(
+                &proxy,
+                &snapshot,
+                "dns",
+                Some(5353),
+                None
+            )
+            .expect("per-port LEAST_CONN must no longer be refused"),
+            Some(5353),
             "per-port LEAST_CONN must engage the port lane now that UDP sessions feed \
              the balancer's active-connection counters (issue #4514)"
         );

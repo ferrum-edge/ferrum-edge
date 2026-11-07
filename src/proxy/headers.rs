@@ -103,6 +103,62 @@ define_header_name_set! {
     ]
 }
 
+define_header_name_set! {
+    // Public inventory is consumed by library tests, not the binary target.
+    #[allow(dead_code)]
+    /// Closed set of lowercase names stripped from a backend WebSocket
+    /// handshake on top of [`BACKEND_REQUEST_STRIP_HEADER_NAMES`] and the
+    /// consumer-assertion namespace. Both WebSocket frontends (H1/H2 and H3)
+    /// apply it through [`is_websocket_backend_request_strip_header`].
+    pub const WEBSOCKET_HANDSHAKE_STRIP_HEADER_NAMES;
+    /// Returns `true` for the WebSocket-handshake-only names a backend
+    /// WebSocket handshake must not carry:
+    ///
+    /// - **`host`:** the backend WebSocket client sets its own from the backend
+    ///   URL.
+    /// - **`proxy-authenticate`:** hop-by-hop.
+    /// - **`sec-websocket-key` / `-version` / `-accept`:** the client side of
+    ///   the gateway's backend handshake synthesises its own (RFC 6455 §4.1).
+    /// - **`sec-websocket-extensions`:** the gateway's WebSocket bridge
+    ///   (tungstenite) cannot encode or decode permessage-deflate, so the
+    ///   client's extension OFFER must not reach the backend: a deflate-capable
+    ///   backend would accept it, set rsv1 on data frames, and the bridge would
+    ///   tear the session down with a protocol error. A
+    ///   `websocket_permessage_deflate: passthrough` proxy re-adds only the
+    ///   permessage-deflate elements (issue #5769).
+    /// - **`x-geo-country`:** reserved gateway assertion header.
+    ///
+    /// `name` is expected to be lowercase.
+    pub fn is_websocket_handshake_strip_header;
+    [
+        "host",
+        "proxy-authenticate",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-accept",
+        "sec-websocket-extensions",
+        "x-geo-country",
+    ]
+}
+
+/// Returns `true` for headers that must NOT be forwarded on a backend WebSocket
+/// handshake request: the canonical backend request strip set
+/// ([`is_backend_request_strip_header`]), the WebSocket handshake set
+/// ([`is_websocket_handshake_strip_header`]) and the consumer-assertion
+/// namespace ([`is_consumer_assertion_header`]).
+///
+/// Frontend-specific arms stay with each collector: H1/H2 also drops
+/// `Connection`-nominated names; H3 also drops pseudo-headers and replaces a
+/// client `early-data` with its own 0-RTT value.
+///
+/// `name` is expected to be lowercase.
+#[inline]
+pub fn is_websocket_backend_request_strip_header(name: &str) -> bool {
+    is_backend_request_strip_header(name)
+        || is_websocket_handshake_strip_header(name)
+        || is_consumer_assertion_header(name)
+}
+
 /// Returns `true` for the gateway-owned consumer assertion namespace
 /// (`x-consumer-*`, ASCII case-insensitive, `_` equivalent to `-`) and for
 /// `x-authenticated-identity`.

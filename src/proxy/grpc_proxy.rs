@@ -30,7 +30,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -2055,45 +2055,15 @@ impl GrpcPoolManager {
             })
     }
 
-    /// Build an HTTP/2 client builder with keepalive and flow-control settings.
-    ///
+    /// The gRPC pool's HTTP/2 client builder: the shared `PoolConfig` builder
+    /// with the pool keepalive applied and the outbound stream bound seeded
+    /// from the cap, exactly like the direct-H2 pool.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
-        let mut builder = http2::Builder::new(TokioExecutor::new());
-
-        // Timer is required for keep_alive_interval and keep_alive_timeout to work
-        builder.timer(TokioTimer::new());
-
-        if pool_config.enable_http2 {
-            builder
-                .keep_alive_interval(Duration::from_secs(
-                    pool_config.http2_keep_alive_interval_seconds,
-                ))
-                .keep_alive_timeout(Duration::from_secs(
-                    pool_config.http2_keep_alive_timeout_seconds,
-                ))
-                .max_concurrent_reset_streams(4096);
-        }
-
-        // Flow-control tuning — larger windows dramatically improve throughput
-        // by allowing more data in flight before waiting for WINDOW_UPDATEs.
-        builder
-            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
-            .adaptive_window(pool_config.http2_adaptive_window)
-            .max_frame_size(pool_config.http2_max_frame_size);
-
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Advertised to the peer as our own inbound stream cap.
-            builder.max_concurrent_streams(max_streams);
-        }
-
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Preserve the configured initial outbound bound until the peer's
-            // SETTINGS frame replaces it.
-            builder.initial_max_send_streams(max_streams as usize);
-        }
-
-        builder
+        crate::pool::hyper_h2_client_builder(
+            pool_config,
+            crate::pool::H2ClientKeepalive::FromPoolConfig,
+            crate::pool::H2ClientInitialSendStreams::FromStreamCap,
+        )
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.
@@ -4802,17 +4772,16 @@ async fn open_hbone_grpc_sender(
     let peer_advertises_fence = tunnel.peer_advertises_inner_reuse();
     // The same effective pool configuration the inner key was built from, so a
     // pooled carrier's wire settings and its key can never disagree.
-    let pool_config = &inner_pool_config;
-    let mut builder = http2::Builder::new(TokioExecutor::new());
-    builder.timer(TokioTimer::new());
-    builder
-        .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-        .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
-        .adaptive_window(pool_config.http2_adaptive_window)
-        .max_frame_size(pool_config.http2_max_frame_size);
-    if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-        builder.max_concurrent_streams(max_streams);
-    }
+    //
+    // Unlike the direct gRPC pool, this nested connection applies neither the
+    // pool's HTTP/2 PING keepalive (the outer HBONE carrier runs its own) nor
+    // the cap as hyper's initial outbound stream bound; both are kept as they
+    // were when this builder was hand-written.
+    let builder = crate::pool::hyper_h2_client_builder(
+        &inner_pool_config,
+        crate::pool::H2ClientKeepalive::NotApplied,
+        crate::pool::H2ClientInitialSendStreams::HyperDefault,
+    );
 
     // The inner connection is CLEARTEXT HTTP/2 to the destination app, so — as
     // on the direct-dial h2c path — nothing about the outer hop proves the app
