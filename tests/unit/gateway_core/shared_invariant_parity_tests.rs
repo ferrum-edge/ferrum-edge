@@ -4350,3 +4350,103 @@ fn every_stream_path_admits_its_port_lane_through_the_shared_policy() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// hyper HTTP/2 client builders configured from `PoolConfig`
+// ---------------------------------------------------------------------------
+//
+// Issue #5464: every hyper-based backend H2 client must pass
+// `pool_config.http2_adaptive_window`. The direct-H2, gRPC, mesh-mTLS and
+// nested-HBONE gRPC builders used to be four hand-written copies; they now
+// call `pool::hyper_h2_client_builder`, whose behaviour is pinned in
+// `h2_client_builder_tests.rs`. This table pins each site's explicit options
+// and that no site builds its own `PoolConfig`-driven hyper H2 client again.
+
+/// `(path, number of shared-builder calls, keepalive option, send-stream option)`.
+const H2_CLIENT_BUILDER_SITES: &[(&str, usize, &str, &str)] = &[
+    (
+        "src/proxy/http2_pool.rs",
+        1,
+        "H2ClientKeepalive::FromPoolConfig",
+        "H2ClientInitialSendStreams::FromStreamCap",
+    ),
+    (
+        "src/proxy/mesh_mtls_pool.rs",
+        1,
+        "H2ClientKeepalive::FromPoolConfig",
+        "H2ClientInitialSendStreams::HyperDefault",
+    ),
+];
+
+#[test]
+fn every_pool_config_h2_client_uses_the_shared_builder_with_explicit_options() {
+    const CALL: &str = "crate::pool::hyper_h2_client_builder(";
+    let options = |text: &str, at: usize| -> String {
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(text.as_bytes(), open);
+        text[open..close].split_whitespace().collect()
+    };
+
+    for &(path, calls, keepalive, send_streams) in H2_CLIENT_BUILDER_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let found: Vec<_> = production.match_indices(CALL).collect();
+        assert_eq!(found.len(), calls, "{path}: shared H2 builder calls");
+        for (at, _) in found {
+            let args = options(&production, at);
+            assert!(
+                args.contains(keepalive) && args.contains(send_streams),
+                "{path}: expected `{keepalive}` + `{send_streams}`, got {args}"
+            );
+        }
+    }
+
+    // gRPC: the pooled direct dial (`build_h2_builder`) and the nested-HBONE
+    // dial deliberately differ, so pin each call by its enclosing item.
+    let grpc = without_cfg_test_items(&source("src/proxy/grpc_proxy.rs"));
+    let pooled = item_body(&grpc, "fn build_h2_builder(", "\n    }\n");
+    let nested = item_body(&grpc, "async fn open_hbone_grpc_sender(", "\n}\n");
+    for (site, body, keepalive, send_streams) in [
+        (
+            "gRPC pool",
+            pooled,
+            "H2ClientKeepalive::FromPoolConfig",
+            "H2ClientInitialSendStreams::FromStreamCap",
+        ),
+        (
+            "nested-HBONE gRPC dial",
+            nested,
+            "H2ClientKeepalive::NotApplied",
+            "H2ClientInitialSendStreams::HyperDefault",
+        ),
+    ] {
+        let at = body
+            .find(CALL)
+            .unwrap_or_else(|| panic!("{site} must use the shared H2 builder"));
+        let args = options(body, at);
+        assert!(
+            args.contains(keepalive) && args.contains(send_streams),
+            "{site}: expected `{keepalive}` + `{send_streams}`, got {args}"
+        );
+    }
+    assert_eq!(
+        grpc.matches(CALL).count(),
+        2,
+        "grpc_proxy shared H2 builder calls"
+    );
+
+    // No PoolConfig-driven hyper H2 client is hand-built anywhere else. The
+    // Unix-socket h2c client uses fixed constants, not `PoolConfig`, and the
+    // frontend H2 *server* builders in `proxy/mod.rs` use their own env
+    // settings; neither reads `pool_config.http2_adaptive_window`.
+    for (path, text) in production_sources() {
+        if path == "src/pool/mod.rs" {
+            continue;
+        }
+        let production = without_cfg_test_items(&text);
+        assert!(
+            !production.contains(".adaptive_window(pool_config.http2_adaptive_window)"),
+            "{path} hand-builds a PoolConfig-driven hyper H2 client; call \
+             crate::pool::hyper_h2_client_builder instead"
+        );
+    }
+}

@@ -24,7 +24,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use http_body::Frame;
 use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::TokioIo;
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::pin::Pin;
@@ -2067,28 +2067,14 @@ impl MeshMtlsConnectionPool {
                     });
                 }
 
-                let mut builder = http2::Builder::new(TokioExecutor::new());
-                builder.timer(TokioTimer::new());
-                if pool_config.enable_http2 {
-                    builder
-                        .keep_alive_interval(Duration::from_secs(
-                            pool_config.http2_keep_alive_interval_seconds,
-                        ))
-                        .keep_alive_timeout(Duration::from_secs(
-                            pool_config.http2_keep_alive_timeout_seconds,
-                        ))
-                        .max_concurrent_reset_streams(4096);
-                }
-                builder
-                    .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-                    .initial_connection_window_size(
-                        pool_config.http2_initial_connection_window_size,
-                    )
-                    .adaptive_window(pool_config.http2_adaptive_window)
-                    .max_frame_size(pool_config.http2_max_frame_size);
-                if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-                    builder.max_concurrent_streams(max_streams);
-                }
+                // Pool keepalive applies; the cap is advertised but, unlike the
+                // direct-H2/gRPC pools, not seeded as hyper's initial outbound
+                // stream bound (kept as it was when this was hand-written).
+                let builder = crate::pool::hyper_h2_client_builder(
+                    pool_config,
+                    crate::pool::H2ClientKeepalive::FromPoolConfig,
+                    crate::pool::H2ClientInitialSendStreams::HyperDefault,
+                );
 
                 let io = TokioIo::new(tls_stream);
                 let (sender, connection) =
