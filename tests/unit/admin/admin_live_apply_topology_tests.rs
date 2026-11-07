@@ -425,3 +425,115 @@ async fn complete_releases_pin_and_fails_when_reconnect_replaces_topology() {
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["reason"], "sequence_unavailable");
 }
+
+/// Count `proxies` rows with `id` in one SQLite file, bypassing the store.
+async fn sqlite_proxy_count(db_url: &str, id: &str) -> i64 {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(db_url)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE id = ?")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    count
+}
+
+/// Issue #7033: a primary failback whose deferred migrations fail must not
+/// leave the primary pool live behind failover topology. An opt-in Admin write
+/// admitted afterwards must land on the failover database it is recorded
+/// against, so the fence it raises protects writes that really are on the
+/// failover side.
+#[tokio::test]
+async fn failed_failback_migration_keeps_admin_writes_on_failover_pool() {
+    use ferrum_edge::_test_support::database_store_set_migrations_pending_for_test;
+    use ferrum_edge::config::db_backend::primary_failback_fenced;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.set_failover_allow_writes(true);
+    assert!(!store.failover_topology_status().primary_active);
+
+    // Migrate the primary file, then corrupt its core history so the deferred
+    // migrations fail on failback.
+    DatabaseStore::connect_with_pool_config("sqlite", &primary_create_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    {
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .connect(&primary_create_url)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE _ferrum_migrations SET checksum = 'tampered-7033' WHERE version = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+    database_store_set_migrations_pending_for_test(&store, true);
+
+    let error = store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect_err("failback must fail when the deferred migrations fail");
+    assert!(!primary_failback_fenced(&error), "{error:#}");
+    assert!(
+        !store.failover_topology_status().primary_active,
+        "a failed failback must leave topology on failover"
+    );
+
+    let db: Arc<dyn DatabaseBackend> = Arc::new(store.clone());
+    let state = live_apply_state(db, None);
+    let permit = state
+        .admit_write()
+        .await
+        .expect("opt-in failover writes are admitted");
+    store
+        .create_proxy(&make_http_proxy("p-after-failed-failback"))
+        .await
+        .unwrap();
+    drop(permit);
+
+    let status = store.failover_topology_status();
+    assert!(!status.primary_active);
+    assert!(
+        status.primary_failback_fenced,
+        "the admitted failover write must fence failback"
+    );
+    assert_eq!(
+        sqlite_proxy_count(&failover_url, "p-after-failed-failback").await,
+        1,
+        "the admitted write must land on the failover database"
+    );
+    assert_eq!(
+        sqlite_proxy_count(&primary_create_url, "p-after-failed-failback").await,
+        0,
+        "the admitted write must not land on the primary behind failover topology"
+    );
+
+    // The fence now correctly protects a write that is on the failover side.
+    let error = store
+        .reconnect(&primary_rw_url)
+        .await
+        .expect_err("failback must stay fenced after the admitted failover write");
+    assert!(primary_failback_fenced(&error), "{error:#}");
+    assert!(!store.failover_topology_status().primary_active);
+}
