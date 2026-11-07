@@ -3818,7 +3818,8 @@ pub(crate) async fn validate_mesh_route_dispatch_plugin_upstream_references(
 /// The one redacted plugin-configuration projection.
 ///
 /// Every non-admin read, every management audit record, and every diagnostic
-/// rendering of a plugin `config` goes through here. The sensitivity contract
+/// rendering of a plugin `config` and its execution `trigger` goes through
+/// here. The sensitivity contract
 /// itself lives in [`crate::admin::plugin_config_projection`]: a per-plugin
 /// schema of credential-bearing paths, backed by the historical name heuristic
 /// and a structural URL-userinfo sweep.
@@ -3839,6 +3840,14 @@ pub(crate) fn plugin_config_audit_body_with(
             config,
             "/config",
             rendering,
+        );
+    }
+    // The execution trigger is a sibling of `config`: its header, query, and
+    // cookie operands are values a client presents to switch the instance on
+    // or off, so they are withheld like any config secret.
+    if let Some(trigger) = body.get_mut("trigger") {
+        crate::admin::plugin_config_projection::project_plugin_trigger_with(
+            trigger, "/trigger", rendering,
         );
     }
     body

@@ -1708,7 +1708,7 @@ Disabled plugin configs are stored without plugin-specific construction, so oper
 
 Global-scope requirements for `transaction_log_schema` and `prometheus_metrics` still apply while disabled.
 
-Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
+Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. The projection covers the plugin `config` and its resource-level execution `trigger`. An `operator` write that sends one of the projection's placeholders back at a masked field is refused with `400`; see [Masked secrets on write](#masked-secrets-on-write-redaction-placeholders).
 
 That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Three layers run in order, and each can only add redaction:
 
@@ -1737,10 +1737,25 @@ Fields covered by the schema include:
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
 | `request_transformer` | `rules.*.value` | `[REDACTED]` (header, query and body values are written into the upstream request and may carry a backend credential; `operation`, `target` and `new_key` stay visible, while `key` is already masked by the name heuristic) |
 | `mesh_route_dispatch` | `rules.*.request_transform.*.value` | `[REDACTED]` (same reason as `request_transformer`) |
+| `mesh_route_dispatch` | `rules.*.match.headers.*`, `rules.*.match.without_headers.*`, `rules.*.match.query_params.*` | `[REDACTED]` for a bare-string operand; an `{exact\|prefix\|regex}` operand keeps its match kind and masks the value |
+| `mesh_authz` | `rules.*.to.*.headers.*`, `rules.*.when.*.values`, `rules.*.when.*.not_values` of every policy in `mesh_policies`, `mesh_slice.mesh_policies` and `mesh_slice.node_waypoint_capture_mesh_policies` | `[REDACTED]` per entry, so the lists keep their length (every condition value is withheld, because the condition `key` decides whether it is a header value) |
+| `mesh_authz` | `mesh_slice.ext_authz_providers.*.include_additional_headers_in_check.*.value`, `mesh_slice.ext_authz_providers.*.path_prefix`, `mesh_slice.proxy_configs.*.environment.*`, `mesh_slice.extension_configs.*.value` | `[REDACTED]` (the provider's `name`, `service`, and `port` stay visible) |
+| `mesh_authz` | `mesh_slice.virtual_service_l4_proxies.*.backend_tls_client_key_path`, `mesh_slice.virtual_service_l4_upstreams.*.backend_tls_client_key_path`, `mesh_slice.virtual_service_l4_upstreams.*.port_overrides.*.tls.client_key_path` | `[REDACTED]` when the value is inline PEM key material; a reference stays visible |
+| `mesh_authz` | `mesh_slice.telemetry_resources.*.config.tracing.providers.*.config.{url,agent_url,collector_url,endpoint}`, `mesh_slice.request_authentications.*.jwt_rules.*.jwks_uri`, `mesh_slice.multi_cluster.federation_endpoint`, `mesh_slice.multi_cluster.remote_clusters.*.{control_plane_url,federation_endpoint}` | structural URL |
+| every plugin (resource-level `trigger`, a sibling of `config`) | `header` / `query` / `cookie` `value.exact[*]`, `value.prefix[*]`, `value.regex` anywhere in the `all` / `any` / `not` tree | `[REDACTED]` (field names, `presence`, `multi_value`, `case_insensitive`, match kinds, and the other predicates stay visible; a shape the trigger schema does not define is withheld wholesale) |
+| `request_termination` | `trigger.header_value` | `[REDACTED]` (`trigger.header` stays visible) |
+| `mesh_route_dispatch`, `udp_logging` | `rules.*.destination.backend_tls.client_key_path`, `dtls_key_path` | `[REDACTED]` when the value is inline PEM key material; a path or `k8s://` / `vault://` / `managed://` reference stays visible |
+| `transaction_debugger` | `capture_request_header_value` | `[REDACTED]` (`capture_request_header` stays visible) |
+| `ai_semantic_firewall` | `privacy.snippet_hash_salt` | `[REDACTED]` |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
 | `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
 | `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |
 | `mcp_gateway` | `servers.*.upstream_url` | structural URL |
+| `mcp_gateway` | `servers.*.headers.*` | `[REDACTED]` |
+| `ai_tool_governor` | `approval.headers.*` | `[REDACTED]` |
+| `openapi_validator` | `bypass.header_present.*` | `[REDACTED]` (shared secrets that skip validation) |
+| `waf` | `global_exemptions.header_present.*` | `[REDACTED]` (shared secrets that suppress every rule) |
+| `waf` | `custom_rules.*.conditions.headers.*`, `rule_overrides.*.conditions.headers.*` | `[REDACTED]` (a `null` presence-only condition stays `null`) |
 | `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
 

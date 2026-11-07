@@ -110,6 +110,14 @@ pub enum FieldSensitivity {
     /// only formulation that stays correct as librdkafka grows new sensitive
     /// ones.
     KafkaProducerProperties,
+    /// A TLS private-key source, which accepts inline PEM as well as a
+    /// reference (a path, `file://`, `k8s://`, `vault://`, `managed://`, …).
+    ///
+    /// Inline key material (anything containing a PEM `-----BEGIN` boundary)
+    /// is replaced by [`REDACTED_PLACEHOLDER`]; a reference only names where
+    /// the gateway loads the key from and stays visible. A non-string fails
+    /// closed.
+    PrivateKeySource,
 }
 
 /// One schema-declared sensitive path.
@@ -147,12 +155,249 @@ const fn redis_url(path: &'static [&'static str]) -> SensitivityRule {
     }
 }
 
+const fn private_key_source(path: &'static [&'static str]) -> SensitivityRule {
+    SensitivityRule {
+        path,
+        sensitivity: FieldSensitivity::PrivateKeySource,
+    }
+}
+
 /// The `redis_url` rule shared by every Redis-backed plugin.
 const REDIS_BACKED: &[SensitivityRule] = &[redis_url(&["redis_url"])];
 
 /// Empty rule set: this built-in exposes no credential-bearing config path
 /// beyond what the name heuristic and the structural URL sweep already cover.
 const NONE: &[SensitivityRule] = &[];
+
+/// `mesh_authz` policy match operands, outbound check headers, and the
+/// endpoint URLs its mesh slice carries.
+///
+/// Policies arrive either as an operator-authored flat `mesh_policies` list or
+/// inside the mesh-mode `mesh_slice` (ordinary and NodeWaypoint-capture
+/// policies alike). `to[].headers` values and `when[].values` /
+/// `when[].not_values` are request-header (or claim, principal, IP) match
+/// operands. A `when` entry's `key` decides which, and a path rule cannot read
+/// a sibling, so every condition value is withheld, entry by entry so the list
+/// shape stays visible (the `key` field itself is already masked by the name
+/// heuristic).
+///
+/// The slice also carries the `include_additional_headers_in_check[].value`
+/// headers and the check-URL `path_prefix` of an external authorization
+/// provider, two opaque operator-authored payloads (Istio ProxyConfig
+/// `environment` values and ECDS extension `value` bytes), all withheld; the
+/// backend client keys of the embedded VirtualService L4 `Proxy` / `Upstream`
+/// objects, withheld when inline; and collector, JWKS, control-plane, and
+/// federation URLs, projected structurally. Every other slice field is
+/// inventory (workloads, services, hosts, addresses, ports, labels), public
+/// material (trust bundles, inline JWKS), header-name lists, file paths, or
+/// static telemetry tags; DestinationRule and Upstream subset `private_key`,
+/// Consul tokens, and credential references are already masked by the name
+/// heuristic.
+const MESH_AUTHZ: &[SensitivityRule] = &[
+    secret(&[
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "to",
+        "*",
+        "headers",
+        "*",
+    ]),
+    secret(&[
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "values",
+        "*",
+    ]),
+    secret(&[
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "not_values",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "to",
+        "*",
+        "headers",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "values",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "not_values",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "node_waypoint_capture_mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "to",
+        "*",
+        "headers",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "node_waypoint_capture_mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "values",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "node_waypoint_capture_mesh_policies",
+        "*",
+        "rules",
+        "*",
+        "when",
+        "*",
+        "not_values",
+        "*",
+    ]),
+    secret(&[
+        "mesh_slice",
+        "ext_authz_providers",
+        "*",
+        "include_additional_headers_in_check",
+        "*",
+        "value",
+    ]),
+    // The check URL's path prefix is a shared secret on some check services.
+    secret(&["mesh_slice", "ext_authz_providers", "*", "path_prefix"]),
+    secret(&["mesh_slice", "proxy_configs", "*", "environment", "*"]),
+    secret(&["mesh_slice", "extension_configs", "*", "value"]),
+    // The VirtualService L4 proxies and upstreams are full serialized `Proxy` /
+    // `Upstream` objects; their backend client keys accept inline PEM. (Their
+    // Consul token and subset TLS `private_key` are masked by the name
+    // heuristic, URL userinfo by the structural sweep.)
+    private_key_source(&[
+        "mesh_slice",
+        "virtual_service_l4_proxies",
+        "*",
+        "backend_tls_client_key_path",
+    ]),
+    private_key_source(&[
+        "mesh_slice",
+        "virtual_service_l4_upstreams",
+        "*",
+        "backend_tls_client_key_path",
+    ]),
+    private_key_source(&[
+        "mesh_slice",
+        "virtual_service_l4_upstreams",
+        "*",
+        "port_overrides",
+        "*",
+        "tls",
+        "client_key_path",
+    ]),
+    // The telemetry tracing-provider envelope is the same `TracingProvider`
+    // the `workload_metrics` rules cover; keep the four fields in step with
+    // them (a parity test enforces it).
+    endpoint_url(&[
+        "mesh_slice",
+        "telemetry_resources",
+        "*",
+        "config",
+        "tracing",
+        "providers",
+        "*",
+        "config",
+        "url",
+    ]),
+    endpoint_url(&[
+        "mesh_slice",
+        "telemetry_resources",
+        "*",
+        "config",
+        "tracing",
+        "providers",
+        "*",
+        "config",
+        "agent_url",
+    ]),
+    endpoint_url(&[
+        "mesh_slice",
+        "telemetry_resources",
+        "*",
+        "config",
+        "tracing",
+        "providers",
+        "*",
+        "config",
+        "collector_url",
+    ]),
+    endpoint_url(&[
+        "mesh_slice",
+        "telemetry_resources",
+        "*",
+        "config",
+        "tracing",
+        "providers",
+        "*",
+        "config",
+        "endpoint",
+    ]),
+    endpoint_url(&[
+        "mesh_slice",
+        "request_authentications",
+        "*",
+        "jwt_rules",
+        "*",
+        "jwks_uri",
+    ]),
+    endpoint_url(&["mesh_slice", "multi_cluster", "federation_endpoint"]),
+    endpoint_url(&[
+        "mesh_slice",
+        "multi_cluster",
+        "remote_clusters",
+        "*",
+        "control_plane_url",
+    ]),
+    endpoint_url(&[
+        "mesh_slice",
+        "multi_cluster",
+        "remote_clusters",
+        "*",
+        "federation_endpoint",
+    ]),
+];
 
 /// Per-plugin sensitivity schema.
 ///
@@ -177,7 +422,13 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("correlation_id", NONE),
     // ---- Request-received phase ------------------------------------------
     ("cors", NONE),
-    ("request_termination", NONE),
+    (
+        "request_termination",
+        // `trigger.header_value` is the value a request must carry to be
+        // terminated: an operator-chosen token, like a `waf` exemption value.
+        // The header name and the termination response stay visible.
+        &[secret(&["trigger", "header_value"])],
+    ),
     ("mesh_outbound_registry", NONE),
     ("ip_restriction", NONE),
     ("geo_restriction", NONE),
@@ -245,7 +496,7 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     // ---- Authorization ----------------------------------------------------
     ("access_control", NONE),
     ("tcp_connection_throttle", NONE),
-    ("mesh_authz", NONE),
+    ("mesh_authz", MESH_AUTHZ),
     (
         "opa",
         &[
@@ -282,8 +533,18 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("ai_prompt_shield", NONE),
     (
         "waf",
-        // `header_present` values are shared secrets that suppress every rule.
-        &[secret(&["global_exemptions", "header_present", "*"])],
+        &[
+            // `header_present` values are shared secrets that suppress every
+            // rule.
+            secret(&["global_exemptions", "header_present", "*"]),
+            // `conditions.headers` values scope a rule to requests carrying a
+            // header value; operators may target with a shared secret or a
+            // credential-bearing header, as for `fault_injection`. A `null`
+            // (presence-only) condition stays `null`. `custom_rules` is an
+            // array and `rule_overrides` is keyed by rule id; `*` covers both.
+            secret(&["custom_rules", "*", "conditions", "headers", "*"]),
+            secret(&["rule_overrides", "*", "conditions", "headers", "*"]),
+        ],
     ),
     (
         "fault_injection",
@@ -292,10 +553,20 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         &[secret(&["match", "headers", "*"])],
     ),
     ("body_validator", NONE),
-    ("openapi_validator", NONE),
+    (
+        "openapi_validator",
+        // `bypass.header_present` values are shared secrets that skip
+        // validation, exactly like the `waf` exemption above.
+        &[secret(&["bypass", "header_present", "*"])],
+    ),
     (
         "ai_semantic_firewall",
-        &[endpoint_url(&["provider", "endpoint"])],
+        &[
+            endpoint_url(&["provider", "endpoint"]),
+            // Keys the logged snippet hashes; disclosing it lets a reader
+            // confirm guessed snippets against the hashes.
+            secret(&["privacy", "snippet_hash_salt"]),
+        ],
     ),
     ("ai_request_guard", NONE),
     (
@@ -303,6 +574,10 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         &[
             endpoint_url(&["endpoint_url"]),
             endpoint_url(&["approval", "endpoint_url"]),
+            // Static headers attached to every approval webhook call; the
+            // approval service's credential lives here under an arbitrary
+            // name, so every value is secret, as for `otel_tracing`.
+            secret(&["approval", "headers", "*"]),
         ],
     ),
     (
@@ -319,15 +594,39 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             // stored without construction, so nothing has screened it at all.
             endpoint_url(&["servers", "*", "upstream_url"]),
             endpoint_url(&["upstream_url"]),
+            // Per-server upstream request headers usually carry the hosted MCP
+            // server's credential under a vendor name (`Ocp-Apim-Subscription-Key`,
+            // `x-functions-key`), so every value is secret, as for `otel_tracing`.
+            secret(&["servers", "*", "headers", "*"]),
         ],
     ),
     ("a2a_gateway", NONE),
     (
         "mesh_route_dispatch",
-        // Per-route request-header writes reach the upstream exactly like
-        // `request_transformer` rule values, so they are secret for the same
-        // reason.
-        &[secret(&["rules", "*", "request_transform", "*", "value"])],
+        &[
+            // Per-route request-header writes reach the upstream exactly like
+            // `request_transformer` rule values, so they are secret for the
+            // same reason.
+            secret(&["rules", "*", "request_transform", "*", "value"]),
+            // Match operands select a route by a value the client presents;
+            // operators may route on a shared secret or a credential-bearing
+            // header or query parameter. Each operand is a bare string or a
+            // one-key `{exact|prefix|regex: ...}` object: the trailing `*`
+            // masks the bare string itself (a scalar where a container is
+            // expected fails closed) and the inner value of the object form,
+            // keeping the match kind visible.
+            secret(&["rules", "*", "match", "headers", "*", "*"]),
+            secret(&["rules", "*", "match", "without_headers", "*", "*"]),
+            secret(&["rules", "*", "match", "query_params", "*", "*"]),
+            // A route-local backend client key may be inline PEM.
+            private_key_source(&[
+                "rules",
+                "*",
+                "destination",
+                "backend_tls",
+                "client_key_path",
+            ]),
+        ],
     ),
     (
         "ai_semantic_cache",
@@ -419,7 +718,11 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             secret(&["custom_headers", "*"]),
         ],
     ),
-    ("udp_logging", NONE),
+    (
+        "udp_logging",
+        // The DTLS client key may be inline PEM.
+        &[private_key_source(&["dtls_key_path"])],
+    ),
     (
         "ws_logging",
         &[
@@ -429,7 +732,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             secret(&["custom_headers", "*"]),
         ],
     ),
-    ("transaction_debugger", NONE),
+    (
+        "transaction_debugger",
+        // The selector value a request must carry to be captured; the plugin
+        // already treats it as an operator-chosen token.
+        &[secret(&["capture_request_header_value"])],
+    ),
     // ---- Notifications ----------------------------------------------------
     (
         "proxy_alerts",
@@ -605,6 +913,80 @@ pub fn strip_url_userinfo_with(
     Projector::new(root_pointer, rendering).strip_url_userinfo(value);
 }
 
+/// Trigger leaf predicates whose `value` operands are compared against a field
+/// the client sends (`header`, `query`, `cookie`).
+///
+/// A client that knows such an operand can make a trigger fire or not fire at
+/// will, for example skipping a `waf` instance whose trigger is
+/// `not: {match: {header: {name: x-skip-waf, value: {exact: [<shared value>]}}}}`.
+/// The other leaf predicates (`method`, `path`, `host`, `sni`, `protocol`,
+/// `source_cidr`, `namespace`, `proxy_id`, `listen_port`, `consumer`,
+/// `auth_method`, `spiffe_id`) compare routing facts or authenticated identity
+/// that a client cannot simply assert, and stay visible.
+pub const TRIGGER_CLIENT_FIELD_PREDICATES: &[&str] = &["header", "query", "cookie"];
+
+/// Trigger leaf predicates that stay visible (see
+/// [`TRIGGER_CLIENT_FIELD_PREDICATES`]). A leaf key in neither list is not a
+/// `PluginTriggerMatch` field, so its value is withheld.
+const TRIGGER_VISIBLE_PREDICATES: &[&str] = &[
+    "method",
+    "path",
+    "host",
+    "sni",
+    "protocol",
+    "source_cidr",
+    "namespace",
+    "proxy_id",
+    "listen_port",
+    "consumer",
+    "auth_method",
+    "spiffe_id",
+];
+
+/// Project a resource-level plugin `trigger` (a sibling of `config`).
+///
+/// Walks the whole `all` / `any` / `not` / `match` tree and withholds every
+/// comparison operand (`exact[]` entries, `prefix[]` entries, `regex`) of a
+/// [`TRIGGER_CLIENT_FIELD_PREDICATES`] leaf through `rendering`, so reads get
+/// the placeholder, the export a fingerprint, and the write path a placeholder
+/// site. Field names, `presence`, `multi_value`, `case_insensitive`, the match
+/// kinds, and the tree structure stay visible. `root_pointer` is the JSON
+/// pointer of the trigger inside the resource body (`/trigger`).
+///
+/// Like [`project_plugin_config_with`], the walk fails closed: a shape a
+/// `PluginTrigger` cannot have (a non-object trigger or one without `when`, a
+/// non-object node or leaf, a non-array `all` / `any`, a key the schema does
+/// not define, a non-object `value`) is withheld wholesale rather than walked.
+pub fn project_plugin_trigger_with(
+    trigger: &mut Value,
+    root_pointer: &str,
+    rendering: &dyn RedactionRendering,
+) {
+    if trigger.is_null() {
+        return;
+    }
+    let mut projector = Projector::new(root_pointer, rendering);
+    if !trigger
+        .as_object()
+        .is_some_and(|map| map.contains_key("when"))
+    {
+        projector.apply_sensitivity(trigger, FieldSensitivity::Secret);
+        return;
+    }
+    let Some(map) = trigger.as_object_mut() else {
+        return;
+    };
+    for (key, child) in map.iter_mut() {
+        let mark = projector.enter(key);
+        if key == "when" {
+            projector.project_trigger_node(child);
+        } else {
+            projector.apply_sensitivity(child, FieldSensitivity::Secret);
+        }
+        projector.leave(mark);
+    }
+}
+
 /// One projection pass: the renderer, the JSON pointer of the site being
 /// visited, and — for an opaque renderer — the sites already withheld.
 struct Projector<'r> {
@@ -708,6 +1090,14 @@ impl<'r> Projector<'r> {
                 // is replaced wholesale rather than walked.
                 None => json!(REDACTED_PLACEHOLDER),
             },
+            FieldSensitivity::PrivateKeySource => match value.as_str() {
+                // A reference discloses no key material. The exact placeholder
+                // still goes through the renderer so an echoed write is found.
+                Some(raw) if !raw.contains("-----BEGIN") && raw != REDACTED_PLACEHOLDER => {
+                    return;
+                }
+                _ => json!(REDACTED_PLACEHOLDER),
+            },
             FieldSensitivity::RedisUrl => match value.as_str() {
                 Some(raw) => json!(redis_rate_limiter::redact_url_userinfo(raw)),
                 None => json!(REDACTED_PLACEHOLDER),
@@ -730,6 +1120,110 @@ impl<'r> Projector<'r> {
             },
         };
         self.render(value, redacted);
+    }
+
+    /// One trigger tree node: recurse through `all` / `any` / `not` and
+    /// project each `match` leaf. Any other shape is withheld.
+    fn project_trigger_node(&mut self, node: &mut Value) {
+        if !node.is_object() {
+            self.apply_sensitivity(node, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = node.as_object_mut() else {
+            return;
+        };
+        for (key, child) in map.iter_mut() {
+            let mark = self.enter(key);
+            match (key.as_str(), child) {
+                ("all" | "any", Value::Array(items)) => {
+                    for (index, item) in items.iter_mut().enumerate() {
+                        let item_mark = self.enter(&index.to_string());
+                        self.project_trigger_node(item);
+                        self.leave(item_mark);
+                    }
+                }
+                ("not", child) => self.project_trigger_node(child),
+                ("match", child) => self.project_trigger_leaf(child),
+                (_, child) => self.apply_sensitivity(child, FieldSensitivity::Secret),
+            }
+            self.leave(mark);
+        }
+    }
+
+    /// One trigger `match` leaf: withhold the `value` operands of a
+    /// client-presented field predicate, keep the other predicates, and
+    /// withhold anything that is not a predicate.
+    fn project_trigger_leaf(&mut self, leaf: &mut Value) {
+        if !leaf.is_object() {
+            self.apply_sensitivity(leaf, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = leaf.as_object_mut() else {
+            return;
+        };
+        for (key, predicate) in map.iter_mut() {
+            if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
+                continue;
+            }
+            let mark = self.enter(key);
+            if TRIGGER_CLIENT_FIELD_PREDICATES.contains(&key.as_str()) {
+                self.project_trigger_field_predicate(predicate);
+            } else {
+                self.apply_sensitivity(predicate, FieldSensitivity::Secret);
+            }
+            self.leave(mark);
+        }
+    }
+
+    /// A `header` / `query` / `cookie` predicate: `name`, `presence`, and
+    /// `multi_value` stay visible, `value` is projected, and anything else is
+    /// withheld.
+    fn project_trigger_field_predicate(&mut self, predicate: &mut Value) {
+        if !predicate.is_object() {
+            self.apply_sensitivity(predicate, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = predicate.as_object_mut() else {
+            return;
+        };
+        for (key, child) in map.iter_mut() {
+            let mark = self.enter(key);
+            match key.as_str() {
+                "name" | "presence" | "multi_value" => {}
+                "value" => self.project_trigger_operands(child),
+                _ => self.apply_sensitivity(child, FieldSensitivity::Secret),
+            }
+            self.leave(mark);
+        }
+    }
+
+    /// A trigger string match: every operand except a boolean
+    /// `case_insensitive` flag is withheld, entry by entry for the `exact` /
+    /// `prefix` lists so their length stays visible. A non-object fails closed.
+    fn project_trigger_operands(&mut self, value: &mut Value) {
+        if !value.is_object() {
+            self.apply_sensitivity(value, FieldSensitivity::Secret);
+            return;
+        }
+        let Some(map) = value.as_object_mut() else {
+            return;
+        };
+        for (key, operand) in map.iter_mut() {
+            if key == "case_insensitive" && operand.is_boolean() {
+                continue;
+            }
+            let mark = self.enter(key);
+            if let Value::Array(items) = operand {
+                for (index, item) in items.iter_mut().enumerate() {
+                    let item_mark = self.enter(&index.to_string());
+                    self.apply_sensitivity(item, FieldSensitivity::Secret);
+                    self.leave(item_mark);
+                }
+            } else {
+                self.apply_sensitivity(operand, FieldSensitivity::Secret);
+            }
+            self.leave(mark);
+        }
     }
 
     /// Heuristic name-based layer; see [`redact_sensitive_plugin_config_fields`].

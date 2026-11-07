@@ -4911,7 +4911,13 @@ paths:
         `mesh_route_dispatch` `rules[].request_transform[].value`,
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
-        allow-list. Redis envelope signing keys (`redis_integrity_key` and any
+        allow-list. So are client-presented match operands and selector
+        tokens wherever a built-in declares them (header, query, and cookie
+        operands of a plugin `trigger` and of `mesh_route_dispatch` /
+        `waf` / `mesh_authz` match rules, `request_termination`
+        `trigger.header_value`, `transaction_debugger`
+        `capture_request_header_value`); `docs/admin_api.md` lists every
+        covered path. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
         userinfo is replaced by `redacted@` and stripped query/fragment data
         is marked while its scheme/host/port/database are kept. Explicit JSON
@@ -10643,8 +10649,19 @@ components:
             `rules[].request_transform[].value` (written into the upstream
             request, so they may carry a backend credential), and every
             `kafka_logging.producer_config` property outside the safe-tuning
-            allow-list. Mesh `workload_metrics` tracing-provider collector
-            URLs receive the same structural projection. `redis_integrity_key`
+            allow-list. Client-presented match operands and selector tokens
+            are replaced too: header, query, and cookie operands of a plugin
+            `trigger` and of `mesh_route_dispatch` / `waf` / `mesh_authz`
+            match rules, `request_termination` `trigger.header_value`, and
+            `transaction_debugger` `capture_request_header_value`;
+            `docs/admin_api.md` lists every covered path. Inline PEM private
+            keys in plugin key fields (including the VirtualService L4
+            proxies and upstreams a `mesh_authz` `mesh_slice` embeds) are
+            replaced by `[REDACTED]`; key references stay visible. Mesh
+            `workload_metrics` tracing-provider collector URLs, and the
+            collector, JWKS, control-plane, and federation URLs in a
+            `mesh_authz` `mesh_slice`, receive the same structural
+            projection. `redis_integrity_key`
             (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
             `redis_url` userinfo is replaced by `redacted@` and stripped
@@ -12981,7 +12998,12 @@ components:
             publication; invalid shapes, unbounded regexes, malformed CIDRs, and
             unsupported plugin/phase combinations are rejected with HTTP 400.
             See `docs/plugin_execution_order.md` for the phase model and the
-            fail-closed composition rules.
+            fail-closed composition rules. Non-admin reads, audit diffs, and
+            the configuration export withhold every `header`, `query`, and
+            `cookie` `value` operand (`exact` / `prefix` entries and `regex`)
+            anywhere in the tree; field names, match kinds, flags, and the
+            tree structure stay visible, and a shape the trigger schema does
+            not define is withheld wholesale.
         api_spec_id:
           type: [string, "null"]
           description: |

@@ -38,6 +38,9 @@ const REDIS_PASSWORD: &str = "redis-password-must-not-leak";
 const KAFKA_PASSWORD: &str = "kafka-sasl-password-must-not-leak";
 const SLACK_WEBHOOK: &str = "https://hooks.slack.com/services/T000/B000/slack-token-must-not-leak";
 const RAW_CONFIG: &str = "scalar-config-must-not-leak";
+const TRIGGER_HEADER: &str = "trigger-header-operand-must-not-leak";
+const TRIGGER_QUERY: &str = "trigger-query-operand-must-not-leak";
+const EXT_AUTHZ_PREFIX: &str = "/check/ext-authz-prefix-must-not-leak";
 
 fn key(secret: &str) -> HmacSha256Key {
     fingerprint_key(secret).expect("a non-empty secret derives a key")
@@ -578,4 +581,78 @@ fn export_fingerprints_request_transformer_rule_values() {
     assert!(is_fingerprint(&config["rules"][0]["value"]));
     assert!(is_fingerprint(&config["rules"][1]["value"]));
     assert_eq!(config["rules"][1]["target"], "query");
+}
+
+/// A plugin `trigger` (a sibling of `config`) is exported through the same
+/// projection: its header, query and cookie operands are fingerprinted at any
+/// depth of the tree, while field names, match kinds and structure are
+/// exported verbatim.
+#[test]
+fn export_fingerprints_plugin_trigger_operands() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let triggered: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "triggered",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {},
+        "trigger": {"when": {"any": [
+            {"not": {"match": {"header": {
+                "name": "x-skip",
+                "value": {"exact": [TRIGGER_HEADER]}
+            }}}},
+            {"match": {"query": {"name": "debug", "value": {"regex": TRIGGER_QUERY}}}},
+            {"match": {"method": ["POST"]}}
+        ]}},
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("trigger fixture");
+    config.plugin_configs.push(triggered);
+
+    let export = export(config, ADMIN_SECRET);
+    let any = &plugin(&export, "triggered")["trigger"]["when"]["any"];
+    let header = &any[0]["not"]["match"]["header"];
+    assert_eq!(header["name"], "x-skip");
+    assert!(is_fingerprint(&header["value"]["exact"][0]), "{header}");
+    let query = &any[1]["match"]["query"];
+    assert_eq!(query["name"], "debug");
+    assert!(is_fingerprint(&query["value"]["regex"]), "{query}");
+    assert_eq!(any[2]["match"]["method"], json!(["POST"]));
+    let text = export.to_string();
+    for secret in [TRIGGER_HEADER, TRIGGER_QUERY] {
+        assert!(!text.contains(secret), "export leaked {secret}");
+    }
+}
+
+/// A `mesh_authz` external-authorization `path_prefix` is fingerprinted in the
+/// export, while the provider's name, service, and port are exported verbatim.
+#[test]
+fn export_fingerprints_mesh_authz_ext_authz_path_prefix() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let mesh_authz: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "mesh-authz",
+        "plugin_name": "mesh_authz",
+        "scope": "global",
+        "enabled": false,
+        "config": {"mesh_slice": {"ext_authz_providers": [{
+            "name": "ext-check",
+            "service": "authz.shop.svc.cluster.local",
+            "port": 9000,
+            "path_prefix": EXT_AUTHZ_PREFIX
+        }]}},
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("mesh_authz fixture");
+    config.plugin_configs.push(mesh_authz);
+
+    let export = export(config, ADMIN_SECRET);
+    let slice = &plugin(&export, "mesh-authz")["config"]["mesh_slice"];
+    let provider = &slice["ext_authz_providers"][0];
+    assert!(is_fingerprint(&provider["path_prefix"]), "{provider}");
+    assert_eq!(provider["name"], "ext-check");
+    assert_eq!(provider["service"], "authz.shop.svc.cluster.local");
+    assert_eq!(provider["port"], 9000);
+    assert!(!export.to_string().contains(EXT_AUTHZ_PREFIX));
 }

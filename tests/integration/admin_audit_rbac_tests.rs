@@ -2680,3 +2680,255 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     );
     assert_eq!(stored["config"]["batch_size"], 100);
 }
+
+fn assert_trigger_projection_redacted(trigger: &Value, secrets: &[&str]) {
+    let all = &trigger["when"]["all"];
+    assert_eq!(all[0]["match"]["method"], json!(["POST"]));
+    let header = &all[1]["not"]["match"]["header"];
+    assert_eq!(header["name"], "x-skip-transform");
+    assert_eq!(header["value"], json!({"exact": ["[REDACTED]"]}));
+    let query = &all[2]["any"][0]["match"]["query"];
+    assert_eq!(query["name"], "debug");
+    assert_eq!(query["value"], json!({"prefix": ["[REDACTED]"]}));
+    let cookie = &all[2]["any"][1]["match"]["cookie"];
+    assert_eq!(cookie["name"], "tier");
+    assert_eq!(
+        cookie["value"],
+        json!({"regex": "[REDACTED]", "case_insensitive": true})
+    );
+    let serialized = trigger.to_string();
+    for secret in secrets {
+        assert!(
+            !serialized.contains(secret),
+            "trigger projection leaked {secret}: {serialized}"
+        );
+    }
+}
+
+/// A plugin `trigger` is a sibling of `config`. Its header, query, and cookie
+/// operands are values a client presents to switch the instance on or off: a
+/// negated header trigger skips the instance for anyone who knows the value.
+/// Viewer and operator reads (single and list) and the audit diff withhold them
+/// anywhere in the tree while keeping field names, match kinds, flags, and the
+/// tree structure; admin reads stay raw; an operator write that echoes the
+/// placeholder is refused and leaves the stored operands untouched.
+#[tokio::test]
+async fn plugin_trigger_operands_are_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/trigger-redaction";
+    let write_path = "/plugins/config/trigger-redaction?expected_proxy_ids=";
+
+    let header_secret = "trigger-skip-header-canary";
+    let query_secret = "trigger-query-prefix-canary";
+    let cookie_secret = "trigger-cookie-regex-canary";
+    let secrets = [header_secret, query_secret, cookie_secret];
+    let plugin = json!({
+        "id": "trigger-redaction",
+        "plugin_name": "request_transformer",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "rules": [{"operation": "add", "target": "header", "key": "x-env", "value": "edge"}]
+        },
+        "trigger": {"when": {"all": [
+            {"match": {"method": ["POST"]}},
+            {"not": {"match": {"header": {
+                "name": "x-skip-transform",
+                "value": {"exact": [header_secret]}
+            }}}},
+            {"any": [
+                {"match": {"query": {"name": "debug", "value": {"prefix": [query_secret]}}}},
+                {"match": {"cookie": {
+                    "name": "tier",
+                    "value": {"regex": cookie_secret, "case_insensitive": true}
+                }}}
+            ]}
+        ]}}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "triggered plugin create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=trigger-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["trigger"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["trigger"].clone());
+
+        let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+        assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+        let listed = list["data"]
+            .as_array()
+            .expect("plugin list data")
+            .iter()
+            .find(|item| item["id"] == "trigger-redaction")
+            .expect("listed triggered config");
+        projections.push(listed["trigger"].clone());
+    }
+    for projection in &projections {
+        assert_trigger_projection_redacted(projection, &secrets);
+    }
+
+    // Admin reads stay raw for read-modify-write.
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    let all = &raw["trigger"]["when"]["all"];
+    assert_eq!(
+        all[1]["not"]["match"]["header"]["value"]["exact"][0],
+        header_secret
+    );
+    assert_eq!(
+        all[2]["any"][0]["match"]["query"]["value"]["prefix"][0],
+        query_secret
+    );
+    assert_eq!(
+        all[2]["any"][1]["match"]["cookie"]["value"]["regex"],
+        cookie_secret
+    );
+
+    // An operator write that echoes the masked trigger is refused. The config
+    // is restored to its real values so only the trigger carries placeholders.
+    let (status, etag, mut masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    masked["config"] = raw["config"].clone();
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked trigger was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    for pointer in [
+        "/trigger/when/all/1/not/match/header/value/exact/0",
+        "/trigger/when/all/2/any/0/match/query/value/prefix/0",
+        "/trigger/when/all/2/any/1/match/cookie/value/regex",
+    ] {
+        assert!(error.contains(pointer), "missing {pointer}: {error}");
+    }
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    let header = &stored["trigger"]["when"]["all"][1]["not"]["match"]["header"];
+    assert_eq!(header["value"]["exact"][0], header_secret);
+}
+
+/// A `mesh_authz` external-authorization provider's check-URL `path_prefix` is
+/// a shared secret on some check services. Viewer and operator reads (single
+/// and list) and the audit diff withhold it while the provider's name,
+/// service, and port stay visible; admin reads stay raw; an operator write
+/// that echoes the placeholder is refused and leaves the stored value intact.
+#[tokio::test]
+async fn mesh_authz_ext_authz_path_prefix_is_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/mesh-authz-ext";
+    let write_path = "/plugins/config/mesh-authz-ext?expected_proxy_ids=";
+
+    let prefix_secret = "/check/ext-authz-prefix-canary";
+    // Disabled configs are stored without plugin construction, so the slice
+    // needs only the fields under test.
+    let plugin = json!({
+        "id": "mesh-authz-ext",
+        "plugin_name": "mesh_authz",
+        "scope": "global",
+        "enabled": false,
+        "config": {"mesh_slice": {"ext_authz_providers": [{
+            "name": "ext-check",
+            "service": "authz.shop.svc.cluster.local",
+            "port": 9000,
+            "path_prefix": prefix_secret,
+            "timeout_ms": 500,
+            "status_on_error": 403
+        }]}}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "mesh_authz create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=mesh-authz-ext",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_items = audit_body["items"].as_array().expect("audit items");
+    let mut projections = vec![audit_items[0]["diff"]["after"]["config"].clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(&base, path, bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+
+        let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+        assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+        let listed = list["data"]
+            .as_array()
+            .expect("plugin list data")
+            .iter()
+            .find(|item| item["id"] == "mesh-authz-ext")
+            .expect("listed mesh_authz config");
+        projections.push(listed["config"].clone());
+    }
+    for projection in &projections {
+        let provider = &projection["mesh_slice"]["ext_authz_providers"][0];
+        assert_eq!(provider["path_prefix"], "[REDACTED]", "{projection}");
+        assert_eq!(provider["service"], "authz.shop.svc.cluster.local");
+        assert_eq!(provider["port"], 9000);
+        assert_eq!(provider["name"], "ext-check");
+        assert!(
+            !projection.to_string().contains(prefix_secret),
+            "path_prefix leaked: {projection}"
+        );
+    }
+
+    // Admin reads stay raw for read-modify-write.
+    let (status, raw) = get_json(&base, path, &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    let raw_provider = &raw["config"]["mesh_slice"]["ext_authz_providers"][0];
+    assert_eq!(raw_provider["path_prefix"], prefix_secret);
+
+    // An operator write that echoes the masked prefix is refused.
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    let etag = etag.expect("plugin config GET carries an ETag");
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked path_prefix was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/mesh_slice/ext_authz_providers/0/path_prefix"),
+        "unexpected refusal: {error}"
+    );
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(
+        stored["config"]["mesh_slice"]["ext_authz_providers"][0]["path_prefix"],
+        prefix_secret
+    );
+}
