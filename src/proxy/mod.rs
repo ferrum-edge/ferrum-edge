@@ -18037,8 +18037,7 @@ fn collect_forwardable_proxy_headers(headers: &HashMap<String, String>) -> Vec<(
         .iter()
         .filter_map(|(name, value)| {
             let lower_name = name.to_ascii_lowercase();
-            if headers_mod::is_backend_request_strip_header(lower_name.as_str())
-                || is_websocket_backend_strip_header(lower_name.as_str())
+            if headers_mod::is_websocket_backend_request_strip_header(lower_name.as_str())
                 || connection_listed_strip
                     .iter()
                     .any(|listed| listed == lower_name.as_str())
@@ -18071,8 +18070,7 @@ pub(crate) fn collect_forwardable_websocket_headers(
 
     for name in raw_headers.keys() {
         let lower_name = name.as_str().to_ascii_lowercase();
-        if headers_mod::is_backend_request_strip_header(lower_name.as_str())
-            || is_websocket_backend_strip_header(lower_name.as_str())
+        if headers_mod::is_websocket_backend_request_strip_header(lower_name.as_str())
             || raw_connection_listed_strip
                 .iter()
                 .any(|listed| listed.as_str() == lower_name.as_str())
@@ -18109,8 +18107,7 @@ pub(crate) fn collect_forwardable_websocket_headers(
     for (name, value) in proxy_headers {
         let lower_name = name.to_ascii_lowercase();
         if preserved_raw_names.contains(lower_name.as_str())
-            || headers_mod::is_backend_request_strip_header(lower_name.as_str())
-            || is_websocket_backend_strip_header(lower_name.as_str())
+            || headers_mod::is_websocket_backend_request_strip_header(lower_name.as_str())
             || raw_connection_listed_strip
                 .iter()
                 .any(|listed| listed.as_str() == lower_name.as_str())
@@ -18168,28 +18165,6 @@ fn proxy_header_entry_case_insensitive<'a>(
     headers
         .iter()
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-}
-
-fn is_websocket_backend_strip_header(name: &str) -> bool {
-    headers_mod::is_consumer_assertion_header(name)
-        || matches!(
-            name,
-            "host"
-            | "proxy-authenticate"
-            | "sec-websocket-key"
-            | "sec-websocket-version"
-            | "sec-websocket-accept"
-            // The gateway's WebSocket bridge (tungstenite) cannot encode or
-            // decode permessage-deflate, so the client's extension OFFER must
-            // not reach the backend: a deflate-capable backend would accept it,
-            // set rsv1 on data frames, and the bridge would tear the session
-            // down with a protocol error. Strip the offer so no extension is
-            // ever negotiated end to end. A `websocket_permessage_deflate:
-            // passthrough` proxy re-adds only the permessage-deflate elements
-            // through `forward_permessage_deflate_offer` (issue #5769).
-            | "sec-websocket-extensions"
-            | "x-geo-country"
-        )
 }
 
 /// The only WebSocket extension a `websocket_permessage_deflate: passthrough`

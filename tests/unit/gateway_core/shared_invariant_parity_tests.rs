@@ -3556,9 +3556,14 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         ".any(|name| headers_mod::is_gateway_assertion_header(name));",
     ),
     (
+        "WebSocket backend handshake strip predicate",
+        "src/proxy/headers.rs",
+        "        || is_websocket_handshake_strip_header(name)\n        || is_consumer_assertion_header(name)\n}",
+    ),
+    (
         "H1/H2 WebSocket handshake",
         "src/proxy/mod.rs",
-        "    headers_mod::is_consumer_assertion_header(name)\n        || matches!(",
+        "headers_mod::is_websocket_backend_request_strip_header(lower_name.as_str())",
     ),
     (
         // Delegates to the same initial-boundary helper whose gate is the

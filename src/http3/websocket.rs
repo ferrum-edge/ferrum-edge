@@ -314,36 +314,32 @@ fn buf_into_bytes<B: Buf>(mut buf: B) -> Bytes {
 }
 
 /// Strip hop-by-hop headers and HTTP/1.1 WebSocket handshake artefacts
-/// before forwarding the WebSocket request to the backend. Identical
-/// list to `crate::proxy::collect_forwardable_headers` — duplicated
-/// here because the H3 frontend has `proxy_headers: HashMap` while the
-/// H1/H2 path has `hyper::HeaderMap` and the same predicate doesn't
-/// directly reuse.
-fn collect_forwardable_h3_headers(
+/// before forwarding the WebSocket request to the backend.
+///
+/// The WebSocket handshake set and the consumer-assertion namespace are the
+/// shared predicates the H1/H2 collector
+/// (`crate::proxy::collect_forwardable_websocket_headers`) also applies. The
+/// H3-only arms stay here: a client `early-data` is replaced by the gateway's
+/// own value on 0-RTT, and H3 pseudo-headers never become HTTP/1.1 fields. The
+/// H1/H2 `Connection`-nomination strip does not apply: `Connection` is
+/// malformed on H3 (RFC 9114 §4.2) and ingress confinement runs first.
+pub(crate) fn collect_forwardable_h3_headers(
     headers: &HashMap<String, String>,
     is_early_data: bool,
 ) -> Vec<(String, String)> {
-    /// hop-by-hop per RFC 9110 §7.6.1 + WS handshake.
-    const SKIP_HEADERS: &[&str] = &[
+    /// Hop-by-hop request headers (RFC 9110 §7.6.1) this collector strips.
+    const HOP_BY_HOP: &[&str] = &[
         "connection",
         "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-accept",
-        // The WebSocket bridge cannot encode/decode permessage-deflate, so the
-        // client's extension offer must not reach the backend (it would set
-        // rsv1 and the session would be torn down). Mirrors the H1/H2 strip in
-        // proxy::is_websocket_backend_strip_header. A passthrough proxy re-adds
-        // only the permessage-deflate elements (issue #5769).
-        "sec-websocket-extensions",
-        "host",
         "transfer-encoding",
         "te",
         "trailer",
         "keep-alive",
-        "proxy-authenticate",
         "proxy-authorization",
         "proxy-connection",
+    ];
+    /// H3-only names: never forwarded from the client.
+    const H3_ONLY: &[&str] = &[
         // RFC 8470 §5.2: clients do not set this. The gateway strips any
         // inbound value and injects its authoritative value below.
         "early-data",
@@ -355,17 +351,16 @@ fn collect_forwardable_h3_headers(
         ":path",
         ":protocol",
         ":status",
-        // Reserved gateway assertion header. Consumer assertions are matched
-        // by prefix below; GeoIP remains an exact-name assertion.
-        "x-geo-country",
     ];
 
     let mut out: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            if SKIP_HEADERS.contains(&lower.as_str())
+            if HOP_BY_HOP.contains(&lower.as_str())
+                || crate::proxy::headers::is_websocket_handshake_strip_header(&lower)
                 || crate::proxy::headers::is_consumer_assertion_header(&lower)
+                || H3_ONLY.contains(&lower.as_str())
             {
                 return None;
             }
@@ -2320,7 +2315,7 @@ mod tests {
         // compressed frames, so a deflate-capable backend that accepted the
         // offer would set rsv1 and the session would be torn down with a
         // protocol error. Mirrors the H1/H2 strip in
-        // proxy::is_websocket_backend_strip_header.
+        // proxy::headers::is_websocket_handshake_strip_header.
         assert_eq!(value_for(&out, "sec-websocket-protocol"), Some("chat"));
     }
 
