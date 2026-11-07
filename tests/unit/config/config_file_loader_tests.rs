@@ -107,6 +107,83 @@ fn file_and_database_full_loads_keep_the_shared_rejecting_admission_gate() {
     }
 }
 
+/// The production loader and the in-memory (fuzz) decode share ONE
+/// decode-and-validate core. The fuzz copy was once a hand-maintained replica
+/// and silently missed a later admission fix; this pins that neither entry
+/// point grows its own parse/version/validator chain again, and that the core
+/// keeps its load-bearing step order.
+#[test]
+fn file_and_in_memory_decode_share_one_decode_and_validate_core() {
+    let source = include_str!("../../../src/config/file_loader.rs");
+    let section = |start: &str, end: &str| -> &str {
+        let body = source.split_once(start).expect(start).1;
+        body.split_once(end).expect(end).0
+    };
+    let production = section(
+        "pub fn load_config_from_file(",
+        "/// Decode and validate a config document from in-memory bytes.",
+    );
+    let in_memory = section(
+        "pub fn decode_and_validate_config_document(",
+        "/// The decode-and-validate core shared by",
+    );
+    let core = section(
+        "fn decode_and_validate_document(",
+        "/// Load and validate an owned file-mode candidate",
+    );
+
+    for (name, wrapper, scope) in [
+        (
+            "file",
+            production,
+            "DocumentNamespaceScope::Filter(namespace)",
+        ),
+        ("in-memory", in_memory, "DocumentNamespaceScope::Unfiltered"),
+    ] {
+        assert!(
+            wrapper.contains("decode_and_validate_document(") && wrapper.contains(scope),
+            "{name} entry point must decode through the shared core with {scope}"
+        );
+        for owned_by_core in [
+            "take_resource_counts_from_json",
+            "migrate_in_memory",
+            "from_yaml_value",
+            "validate_all_fields_with_ip_policy",
+            "validate_operator_provided_fields",
+            "validate_unique_listen_paths",
+        ] {
+            assert!(
+                !wrapper.contains(owned_by_core),
+                "{name} entry point must not re-implement core step `{owned_by_core}`"
+            );
+        }
+    }
+
+    // Load-bearing order inside the core: the seal is checked against the
+    // pre-filter document, field-level validators run on every namespace, and
+    // the namespace filter runs before the cross-resource validators.
+    let mut last = 0;
+    for step in [
+        "take_resource_counts_from_json",
+        "migrate_in_memory",
+        "validate_resource_counts(",
+        "validate_all_fields_with_ip_policy",
+        "plaintext_basic_auth_consumers",
+        "validate_operator_provided_fields",
+        "DocumentNamespaceScope::Filter(namespace) = namespace_scope",
+        "config.known_namespaces = known",
+        "config.proxies.retain(",
+        "validate_unique_listen_paths",
+        "validate_stream_proxies",
+    ] {
+        let at = core
+            .find(step)
+            .unwrap_or_else(|| panic!("core step `{step}` missing"));
+        assert!(at >= last, "core step `{step}` moved out of order");
+        last = at;
+    }
+}
+
 // ============================================================================
 // Basic Loading Tests
 // ============================================================================

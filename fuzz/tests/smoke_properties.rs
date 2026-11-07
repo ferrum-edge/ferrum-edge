@@ -143,6 +143,37 @@ fn config_decode_minimal_json() {
 }
 
 #[test]
+fn config_decode_sniffs_yaml_without_a_path() {
+    // File mode picks YAML vs JSON from the path extension; the in-memory
+    // decode has no path and sniffs the content instead.
+    let doc = "version: 1\nproxies: []\nconsumers: []\nplugin_configs: []\nupstreams: []\n";
+    fuzz_decode_config_document(doc).expect("YAML document decodes without a path");
+}
+
+#[test]
+fn config_decode_validates_every_namespace_together() {
+    // File mode keeps only `FERRUM_NAMESPACE` before the cross-resource
+    // validators, so a listen_path shared across namespaces loads there. The
+    // in-memory decode has no gateway namespace: every namespace's resources
+    // meet the uniqueness validators together.
+    let doc = r#"{
+        "version":"1",
+        "proxies":[
+            {"id":"prod-proxy","namespace":"prod","listen_path":"/api",
+             "backend_scheme":"http","backend_host":"localhost","backend_port":3001},
+            {"id":"staging-proxy","namespace":"staging","listen_path":"/api",
+             "backend_scheme":"http","backend_host":"localhost","backend_port":3002}
+        ],
+        "consumers":[],
+        "plugin_configs":[],
+        "upstreams":[]
+    }"#;
+    let error = fuzz_decode_config_document(doc)
+        .expect_err("unfiltered decode must see the cross-namespace listen_path pair");
+    assert!(error.contains("listen_path"), "{error}");
+}
+
+#[test]
 fn config_decode_does_not_materialize_runtime_file_dependencies() {
     let doc = r#"{
         "version":"1",
