@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **The Vault secret backend reads `FERRUM_TLS_CA_BUNDLE_PATH` without
+  blocking startup.** The bundle was read with a blocking `std::fs::read`
+  (twice, once inside vaultrs) on the startup secret-resolution runtime, so a
+  FIFO or stalled mount hung `run` / `validate` past the fetch timeout. It now
+  uses the same detached, non-blocking, regular-file, 4 MiB-capped reader as
+  Azure Key Vault, client construction is bounded by the fetch timeout, and a
+  non-PEM or certificate-free bundle fails closed with a reference-free error.
+  **Upgrade:** the vaultrs `VAULT_CACERT` / `VAULT_CAPATH` fallbacks are no
+  longer consulted; set `FERRUM_TLS_CA_BUNDLE_PATH` instead.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`

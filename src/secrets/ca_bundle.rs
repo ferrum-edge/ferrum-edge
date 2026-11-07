@@ -77,8 +77,12 @@ pub(super) async fn read_ca_bundle_detached(
 fn read_ca_bundle(path: &std::path::Path, label: &'static str) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
-    let io_error =
-        |e: std::io::Error| format!("Failed to read {CA_BUNDLE_PATH_ENV} for {label}: {}", e.kind());
+    let io_error = |e: std::io::Error| {
+        format!(
+            "Failed to read {CA_BUNDLE_PATH_ENV} for {label}: {}",
+            e.kind()
+        )
+    };
     let not_regular = || format!("{CA_BUNDLE_PATH_ENV} must name a regular file ({label})");
     let oversized =
         || format!("{CA_BUNDLE_PATH_ENV} exceeds the {CA_BUNDLE_MAX_BYTES}-byte limit ({label})");
