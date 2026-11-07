@@ -10865,7 +10865,7 @@ pub mod _test_support {
         headers: &mut HashMap<String, String>,
         body: &mut Vec<u8>,
     ) -> crate::plugins::PluginResult {
-        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+        apply_buffered_request_body_normalization_with_requirements_for_test(
             plugins, ctx, headers, body, true, true,
         )
         .await
@@ -10879,15 +10879,65 @@ pub mod _test_support {
         needs_body_text: bool,
         needs_body_bytes: bool,
     ) -> crate::plugins::PluginResult {
-        crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+        // With no request-buffer charge there is nothing for the budget to
+        // refuse, so the phase always yields a plugin result.
+        match crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
             plugins,
             ctx,
             headers,
             body,
+            None,
             needs_body_text,
             needs_body_bytes,
         )
         .await
+        {
+            Ok(result) => result,
+            Err(crate::proxy::NormalizedBodyCapacityExceeded) => {
+                unreachable!("an uncharged body is never refused for capacity")
+            }
+        }
+    }
+
+    /// Outcome of the PRODUCTION pre-`before_proxy` normalization phase run
+    /// with a request-buffer charge.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChargedNormalizationOutcomeForTest {
+        Continue,
+        Rejected,
+        BufferCapacityExceeded,
+    }
+
+    /// Run the PRODUCTION pre-`before_proxy` normalization phase with the
+    /// collected body's request-buffer charge, exactly as both protocol
+    /// handlers do, so a test can observe that a normalized (for example
+    /// decompressed) body is charged before any later phase keeps it.
+    pub async fn apply_buffered_request_body_normalization_with_charge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+        body: &mut Vec<u8>,
+        charge: &mut RequestBufferPermitProbe,
+    ) -> ChargedNormalizationOutcomeForTest {
+        match crate::proxy::apply_buffered_request_body_normalization_before_before_proxy(
+            plugins,
+            ctx,
+            headers,
+            body,
+            Some(&mut charge.0),
+            true,
+            true,
+        )
+        .await
+        {
+            Ok(crate::plugins::PluginResult::Continue) => {
+                ChargedNormalizationOutcomeForTest::Continue
+            }
+            Ok(_) => ChargedNormalizationOutcomeForTest::Rejected,
+            Err(crate::proxy::NormalizedBodyCapacityExceeded) => {
+                ChargedNormalizationOutcomeForTest::BufferCapacityExceeded
+            }
+        }
     }
 
     /// Drive the client-request-contract phase exactly as both protocol

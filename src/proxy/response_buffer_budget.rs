@@ -427,11 +427,12 @@ pub(crate) const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
 // On the success path [`RequestBufferPermit::into_charged_bytes`] moves the
 // charge onto the published `Bytes`, so the backend write and retry replay stay
 // charged until the last clone drops (issue #4231) and no path can leak it.
-// A request-body plugin can replace the collected body with a larger one; the
-// charge is grown to cover the replacement right after the transform where the
-// body is kept for later phases ([`charge_covers`]), and publication itself
-// fails closed, so a body the budget cannot cover is refused with the same
-// `503` rather than retained uncharged.
+// A gateway-owned normalizer (request decompression) or a request-body plugin
+// can replace the collected body with a larger one; the charge is grown to
+// cover the replacement as soon as the normalizer or transform returns, before
+// any later phase awaits ([`charge_covers`]), and publication itself fails
+// closed, so a body the budget cannot cover is refused with the same `503`
+// rather than retained uncharged.
 //
 // A third semaphore, not a share of the retained-response or request-decode
 // ones, for exactly the reason those two are already separate: they bound

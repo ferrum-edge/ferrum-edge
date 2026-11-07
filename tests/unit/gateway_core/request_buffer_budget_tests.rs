@@ -877,3 +877,170 @@ async fn h1_h2_collect_terminals_stay_distinct_and_release_their_charge() {
     drop((body, permit, holder));
     assert_eq!(budget.available_bytes(), 2 * UNIT);
 }
+
+// ---------------------------------------------------------------------------
+// 8. A normalized (decompressed) body is charged before later phases keep it.
+// ---------------------------------------------------------------------------
+
+/// A `compression` instance that decodes request bodies before `before_proxy`.
+fn decompressing_plugins() -> Vec<std::sync::Arc<dyn ferrum_edge::plugins::Plugin>> {
+    let config = serde_json::json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 1_048_576,
+    });
+    let plugin = ferrum_edge::plugins::compression::CompressionPlugin::new(&config)
+        .expect("compression config");
+    vec![std::sync::Arc::new(plugin)]
+}
+
+/// About three blocks of plaintext that gzip shrinks several-fold but well
+/// inside the decoder's amplification bound.
+fn compressible_plaintext() -> Vec<u8> {
+    (0..20_000u32)
+        .flat_map(|line| format!("{line:08}\n").into_bytes())
+        .collect()
+}
+
+fn gzip(plaintext: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(plaintext).expect("gzip");
+    encoder.finish().expect("gzip")
+}
+
+/// A buffered gzip upload as the pre-`before_proxy` phase receives it.
+fn gzip_upload(compressed: &[u8]) -> (RequestContext, std::collections::HashMap<String, String>) {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/upload".into());
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(compressed));
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+    (ctx, headers)
+}
+
+#[tokio::test]
+async fn a_decompressed_body_is_charged_before_any_later_phase_keeps_it() {
+    use ferrum_edge::_test_support::{
+        ChargedNormalizationOutcomeForTest,
+        apply_buffered_request_body_normalization_with_charge_for_test,
+    };
+    // A small compressed upload expands to several blocks of plaintext. Every
+    // later phase (a `before_proxy` hook that pauses, final-body hooks, the
+    // backend write) holds that plaintext, so it must be charged as soon as
+    // normalization returns, not only when the body is published.
+    let plaintext = compressible_plaintext();
+    let compressed = gzip(&plaintext);
+    let budget = probe(8);
+    let total = budget.available_bytes();
+    let mut charge = budget
+        .try_reserve(compressed.len())
+        .expect("the collected compressed body is charged");
+    let collected_charge = charge.reserved_bytes();
+    assert!(collected_charge < plaintext.len());
+
+    let plugins = decompressing_plugins();
+    let (mut ctx, mut headers) = gzip_upload(&compressed);
+    let mut body = compressed;
+    let outcome = apply_buffered_request_body_normalization_with_charge_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+        &mut charge,
+    )
+    .await;
+    assert_eq!(outcome, ChargedNormalizationOutcomeForTest::Continue);
+    assert_eq!(body, plaintext);
+    // While any later phase awaits, the enlarged body is fully charged.
+    assert!(
+        charge.reserved_bytes() >= body.capacity(),
+        "the decoded body must be charged before a later phase keeps it"
+    );
+    assert!(charge.reserved_bytes() > collected_charge);
+    assert_eq!(budget.available_bytes(), total - charge.reserved_bytes());
+
+    // The admissible decoded upload is published for dispatch under that charge.
+    let published = charge.into_charged_bytes(body).expect("covered");
+    assert_eq!(published.len(), plaintext.len());
+    drop(published);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[tokio::test]
+async fn a_decompressed_body_the_budget_cannot_cover_is_refused_and_dropped() {
+    use ferrum_edge::_test_support::{
+        ChargedNormalizationOutcomeForTest,
+        apply_buffered_request_body_normalization_with_charge_for_test,
+    };
+    let plaintext = compressible_plaintext();
+    let compressed = gzip(&plaintext);
+    let budget = probe(8);
+    let total = budget.available_bytes();
+    let mut charge = budget
+        .try_reserve(compressed.len())
+        .expect("the collected compressed body is charged");
+    let collected_charge = charge.reserved_bytes();
+    // Every other block is held by other uploads.
+    let other = budget
+        .try_reserve(budget.available_bytes())
+        .expect("other uploads");
+    assert_eq!(budget.available_bytes(), 0);
+
+    let plugins = decompressing_plugins();
+    let (mut ctx, mut headers) = gzip_upload(&compressed);
+    let mut body = compressed;
+    let outcome = apply_buffered_request_body_normalization_with_charge_for_test(
+        &plugins,
+        &mut ctx,
+        &mut headers,
+        &mut body,
+        &mut charge,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ChargedNormalizationOutcomeForTest::BufferCapacityExceeded,
+        "a decoded body the budget cannot cover must be refused, not kept uncharged"
+    );
+    assert!(body.is_empty(), "the uncovered decoded body must be dropped");
+    assert_eq!(body.capacity(), 0);
+    drop(charge);
+    assert_eq!(budget.available_bytes(), collected_charge);
+    drop(other);
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[test]
+fn every_body_replacement_is_charged_before_a_later_phase_keeps_it() {
+    // Normalizers and request-body transforms can replace the collected body
+    // with a larger one. Each replacement point grows the charge before the
+    // next await, on both protocol paths.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let server = include_str!("../../../src/http3/server.rs");
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    let normalization = proxy
+        .split("async fn apply_buffered_request_body_normalization_before_before_proxy(")
+        .nth(1)
+        .expect("normalization phase")
+        .split("\n}\n")
+        .next()
+        .expect("bounded normalization phase");
+    let normalized = normalization
+        .find(".into_plugin_result(ctx);")
+        .expect("normalizer call");
+    let covered = normalization
+        .find("if !charge_covers(charge.as_deref_mut(), body.capacity()) {")
+        .expect("normalized body is charged");
+    assert!(normalized < covered);
+    assert!(proxy.contains("buffered.budget.as_mut(),\n"));
+    assert!(server.contains("retained_request_charge.as_mut(),\n"));
+    assert_eq!(proxy.matches("if !charge_covers(").count(), 6);
+    assert_eq!(proxy.matches("if !request_buffer_permit.cover(").count(), 1);
+    assert_eq!(server.matches("if !charge_covers(").count(), 3);
+    assert_eq!(
+        bridge
+            .matches("crate::proxy::response_buffer_budget::charge_covers(")
+            .count(),
+        1
+    );
+}

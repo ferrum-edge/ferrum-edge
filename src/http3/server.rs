@@ -5603,11 +5603,25 @@ async fn handle_h3_request(
                     &mut ctx,
                     &mut tmp_headers,
                     body_data,
+                    retained_request_charge.as_mut(),
                     before_proxy_body_requirements.needs_text,
                     before_proxy_body_requirements.needs_bytes,
                 )
                 .await;
             ctx.headers = tmp_headers;
+            // A normalized body the budget cannot cover was dropped inside the
+            // phase; refuse before any rejection hook awaits.
+            let Ok(normalize_result) = normalize_result else {
+                boxed_send_h3_request_buffer_capacity_rejection(
+                    &mut stream,
+                    &state,
+                    http_flavor,
+                    grpc_web_response_content_type,
+                    initial_response_header_policy_plugins.as_ref(),
+                )
+                .await?;
+                return Ok(());
+            };
             if !matches!(normalize_result, PluginResult::Continue) {
                 rejected = Some((normalize_result, "normalize_buffered_request_body"));
             }
@@ -10121,6 +10135,23 @@ async fn handle_h3_request(
     } else {
         body_data
     };
+    // Charged before the final hooks await: a replacement the budget cannot
+    // cover is dropped here, never kept uncharged.
+    if !charge_covers(retained_request_charge.as_mut(), body_data.capacity()) {
+        cb_probe.release_neutral();
+        return boxed_finalize_h3_request_buffer_capacity_rejection(
+            &mut stream,
+            &state,
+            &plugins,
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            start_time,
+            &mut plugin_execution_ns,
+            &original_request_path,
+        )
+        .await;
+    }
 
     // Skip the per-plugin context-aware dispatch when no plugin opted in via
     // `needs_final_request_body_context`. The default impl of

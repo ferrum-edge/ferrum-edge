@@ -1125,7 +1125,7 @@ where
         cb_probe,
         flavor,
         prebuffered_body,
-        prebuffered_body_charge,
+        mut prebuffered_body_charge,
         request_body_prepared,
         raw_prebuffered_body_bytes,
         client_ip,
@@ -1175,6 +1175,25 @@ where
                 body,
             )
             .await;
+            // Charged before the validators await: a replacement the budget
+            // cannot cover is dropped here, never kept uncharged.
+            if !crate::proxy::response_buffer_budget::charge_covers(
+                prebuffered_body_charge.as_mut(),
+                transformed.capacity(),
+            ) {
+                cb_probe.release_neutral();
+                return Box::pin(write_bridge_upload_refusal(
+                    stream,
+                    flavor,
+                    plugins,
+                    ctx,
+                    BridgeUploadRefusal::BufferCapacity,
+                    response_committed_plugins,
+                    initial_response_header_policy_plugins.as_ref(),
+                    backend_start,
+                ))
+                .await;
+            }
             // Run validators. Reject = emit a trailers-only native gRPC error,
             // a gRPC-Web trailer frame when that client representation was
             // retained, or a plain JSON error otherwise, then return early

@@ -279,6 +279,7 @@ use self::grpc_proxy::{
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
 use self::http2_pool::Http2ConnectionPool;
+use self::response_buffer_budget::charge_covers;
 
 /// Static empty HashMap used by rejection responses to avoid allocating a new
 /// HashMap on every error path. ~20+ rejection sites in the proxy handler pass
@@ -4746,7 +4747,7 @@ async fn prepare_mesh_request_body(
         buffered => buffered,
     };
 
-    let buffered = match buffered {
+    let mut buffered = match buffered {
         ClientRequestBody::Buffered(buffered) => *buffered,
         ClientRequestBody::Streaming(request) => {
             return Ok((MeshClientRequestBody::Streaming(*request), None));
@@ -4813,6 +4814,14 @@ async fn prepare_mesh_request_body(
             buffered.body,
         )
         .await;
+        // Charged before the final hooks await: a replacement the budget
+        // cannot cover is dropped here, never kept uncharged.
+        if !charge_covers(buffered.budget.as_mut(), transformed.capacity()) {
+            return Err(request_buffer_capacity_backend_response(
+                request_ctx,
+                resolved_ip,
+            ));
+        }
         match run_final_request_body_hooks(
             plugins,
             ctx.as_deref_mut(),
@@ -4839,7 +4848,10 @@ async fn prepare_mesh_request_body(
         None => Some(Bytes::from(body)),
     };
     let Some(body) = body else {
-        return Err(request_buffer_capacity_backend_response(request_ctx, resolved_ip));
+        return Err(request_buffer_capacity_backend_response(
+            request_ctx,
+            resolved_ip,
+        ));
     };
     // Authoritative gRPC request messages are counted from the backend-visible
     // body: `apply_request_body_plugins_with_context` above is where gRPC-Web
@@ -4944,19 +4956,33 @@ pub(crate) fn refresh_request_body_views_after_normalization(
     }
 }
 
+/// A buffered request body a gateway-owned normalizer replaced (for example a
+/// decompressed upload) that the request-buffer budget could not cover. The
+/// replacement has already been dropped; the caller answers the capacity
+/// terminal before any rejection hook awaits.
+pub(crate) struct NormalizedBodyCapacityExceeded;
+
 /// Run opt-in buffered-body normalizers after the pre-`before_proxy` buffer is
 /// stored and before any `before_proxy` hook.
 ///
 /// Configured request decompression lives here so earlier body consumers see
 /// validated plaintext without each plugin reimplementing gzip/Brotli decode.
+///
+/// `charge` is the request-buffer charge of the collected body. A normalizer
+/// can replace that body with a larger one (decoded plaintext), so the charge
+/// is grown to cover the replacement as soon as each normalizer returns, with
+/// no await in between and before any later phase keeps it. When the budget
+/// cannot cover it, the replacement is dropped and this returns
+/// [`NormalizedBodyCapacityExceeded`].
 pub(crate) async fn apply_buffered_request_body_normalization_before_before_proxy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     body: &mut Vec<u8>,
+    mut charge: Option<&mut response_buffer_budget::RequestBufferPermit>,
     needs_body_text: bool,
     needs_body_bytes: bool,
-) -> PluginResult {
+) -> Result<PluginResult, NormalizedBodyCapacityExceeded> {
     let was_decoded = ctx
         .metadata
         .contains_key(crate::plugins::compression::REQUEST_DECODED_METADATA_KEY);
@@ -4965,17 +4991,21 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
             continue;
         }
         let deadline = ctx.grpc_deadline_at();
-        match crate::plugins::await_request_plugin_deadline_with_provenance(
+        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
             deadline,
             plugin.normalize_buffered_request_body_before_before_proxy(ctx, headers, body),
         )
         .await
-        .into_plugin_result(ctx)
-        {
+        .into_plugin_result(ctx);
+        if !charge_covers(charge.as_deref_mut(), body.capacity()) {
+            *body = Vec::new();
+            return Err(NormalizedBodyCapacityExceeded);
+        }
+        match result {
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin.as_ref());
-                return reject;
+                return Ok(reject);
             }
         }
     }
@@ -4991,7 +5021,7 @@ pub(crate) async fn apply_buffered_request_body_normalization_before_before_prox
             needs_body_bytes,
         );
     }
-    PluginResult::Continue
+    Ok(PluginResult::Continue)
 }
 
 /// Reject-log phase label for the client-request-contract phase. Distinct from
@@ -37894,6 +37924,7 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut rejected: Option<(PluginResult, &'static str)> = None;
         if let ClientRequestBody::Buffered(buffered) = &mut client_request_body {
+            let buffered = &mut **buffered;
             if capabilities
                 .has(PluginCapabilities::NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY)
             {
@@ -37904,11 +37935,26 @@ async fn handle_proxy_request_inner(
                         &mut ctx,
                         &mut tmp_headers,
                         &mut buffered.body,
+                        buffered.budget.as_mut(),
                         before_proxy_body_requirements.needs_text,
                         before_proxy_body_requirements.needs_bytes,
                     )
                     .await;
                 ctx.headers = tmp_headers;
+                // A normalized body the budget cannot cover was dropped inside
+                // the phase; refuse before any rejection hook awaits.
+                let Ok(normalize_result) = normalize_result else {
+                    let response = build_request_buffer_capacity_response(
+                        is_grpc_request,
+                        grpc_web_response_content_type,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    );
+                    ctx.terminal_record.mark_counted();
+                    record_request(&state, response.status().as_u16());
+                    return Ok(response);
+                };
                 if !matches!(normalize_result, PluginResult::Continue) {
                     rejected = Some((normalize_result, "normalize_buffered_request_body"));
                 }
@@ -38966,11 +39012,7 @@ async fn handle_proxy_request_inner(
                 // The transformed body replaces the charged one for the rest of
                 // the request, so its charge must cover it before any further
                 // phase (final hooks, egress, dispatch) keeps it.
-                let covered = response_buffer_budget::charge_covers(
-                    buffered.budget.as_mut(),
-                    transformed.capacity(),
-                );
-                if !covered {
+                if !charge_covers(buffered.budget.as_mut(), transformed.capacity()) {
                     return Ok(finalize_terminal_request_body_read_rejection(
                         &state,
                         &plugins,
@@ -39457,11 +39499,7 @@ async fn handle_proxy_request_inner(
                 // The transformed body replaces the charged one for the rest of
                 // the request, so its charge must cover it before any further
                 // phase keeps it.
-                let covered = response_buffer_budget::charge_covers(
-                    buffered.budget.as_mut(),
-                    transformed.capacity(),
-                );
-                if !covered {
+                if !charge_covers(buffered.budget.as_mut(), transformed.capacity()) {
                     cb_probe.release_neutral();
                     drop(preacquired_backend_admission.take_if_acquired());
                     let response = build_request_buffer_capacity_response(
@@ -52337,7 +52375,7 @@ async fn proxy_to_backend(
 
         match client_request_body {
             ClientRequestBody::Buffered(buffered) => {
-                let buffered = *buffered;
+                let mut buffered = *buffered;
                 // Record pre-transform body length (bytes as received from the
                 // client — already buffered by an earlier phase such as
                 // request_mirror prebuffering) BEFORE running plugin transforms
@@ -52370,6 +52408,18 @@ async fn proxy_to_backend(
                         buffered.body,
                     )
                     .await;
+                    // Charged before the final hooks await: a replacement the
+                    // budget cannot cover is dropped here, never kept uncharged.
+                    if !charge_covers(buffered.budget.as_mut(), body_bytes.capacity()) {
+                        return backend_dispatch_response(
+                            request_buffer_capacity_backend_response(
+                                Some(request_ctx),
+                                resolved_ip.clone(),
+                            ),
+                            None,
+                            None,
+                        );
+                    }
                     match run_final_request_body_hooks(
                         plugins,
                         ctx,
@@ -52676,7 +52726,7 @@ async fn proxy_to_backend(
                     }
                 };
                 let body_bytes = collected.body;
-                let request_buffer_permit = collected.permit;
+                let mut request_buffer_permit = collected.permit;
 
                 // Record pre-transform body length (bytes actually received
                 // from the client) for summary. Use fetch_max so retries that
@@ -52695,6 +52745,18 @@ async fn proxy_to_backend(
                     body_bytes,
                 )
                 .await;
+                // Charged before the final hooks await: a replacement the
+                // budget cannot cover is dropped here, never kept uncharged.
+                if !request_buffer_permit.cover(body_bytes.capacity()) {
+                    return backend_dispatch_response(
+                        request_buffer_capacity_backend_response(
+                            Some(request_ctx),
+                            resolved_ip.clone(),
+                        ),
+                        None,
+                        None,
+                    );
+                }
                 // gRPC message accounting uses the transformed, backend-visible
                 // body; `bytes_sent` above stays the raw client-wire length.
                 crate::plugins::grpc_web::record_request_grpc_message_count(
@@ -66175,7 +66237,7 @@ async fn proxy_to_backend_http3(
     // this match so it can be published onto the `Bytes` that stay resident
     // for the H3 send and retry replay. `None` is a plugin-staged or unit-test
     // body that never reserved.
-    let (request_body, request_buffer_permit) = match client_request_body {
+    let (request_body, mut request_buffer_permit) = match client_request_body {
         ClientRequestBody::Buffered(buffered) => (buffered.body, buffered.budget),
         ClientRequestBody::Streaming(original_req) => {
             // An HTTP/2 client's upload EOF must be its own END_STREAM (issue
@@ -66336,6 +66398,14 @@ async fn proxy_to_backend_http3(
             request_body,
         )
         .await;
+        // Charged before the final hooks await: a replacement the budget
+        // cannot cover is dropped here, never kept uncharged.
+        if !charge_covers(request_buffer_permit.as_mut(), request_body.capacity()) {
+            return (
+                request_buffer_capacity_backend_response(Some(request_ctx), resolved_ip),
+                None,
+            );
+        }
         match run_final_request_body_hooks(plugins, ctx, grpc_deadline_at, headers, &request_body)
             .await
         {

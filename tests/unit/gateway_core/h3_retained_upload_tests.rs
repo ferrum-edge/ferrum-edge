@@ -473,14 +473,14 @@ fn every_dispatch_stage_h3_drain_refusal_runs_the_reject_hooks_and_the_log() {
     assert!(refusal.contains("finalize_h3_terminal_body_rejection_with_headers("));
     assert!(refusal.contains("send_h3_plugin_reject_flavor_aware("));
 
-    // Seven committed capacity refusals: four dispatch-stage drains, the two
-    // transforms that replace a charged body before dispatch, and the
-    // fail-closed publication of the dispatched body.
+    // Eight committed capacity refusals: four dispatch-stage drains, the three
+    // request-body transforms that replace a charged body, and the fail-closed
+    // publication of the dispatched body.
     assert_eq!(
         server
             .matches("return boxed_finalize_h3_request_buffer_capacity_rejection(")
             .count(),
-        7
+        8
     );
     let drain_capacity_arm = "Ok(Err(RetainRejection::BudgetExhausted)) => {";
     let oversize_arm = "Ok(Err(RetainRejection::TooLarge)) => {";
