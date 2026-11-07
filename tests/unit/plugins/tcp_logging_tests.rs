@@ -897,8 +897,8 @@ fn tls_no_verify_advertises_provider_schemes_and_warns() {
     let mut expected = provider
         .signature_verification_algorithms
         .supported_schemes();
-    advertised.sort_by_key(|scheme| u16::from(*scheme));
-    expected.sort_by_key(|scheme| u16::from(*scheme));
+    advertised.sort_by_key(|scheme| format!("{scheme:?}"));
+    expected.sort_by_key(|scheme| format!("{scheme:?}"));
     assert_eq!(
         advertised, expected,
         "no-verify must advertise exactly the provider's verification schemes"
