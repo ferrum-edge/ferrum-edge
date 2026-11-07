@@ -315,7 +315,7 @@ impl TestGateway {
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
-        wait_for_tcp_port_inner("proxy", self.proxy_port, remaining, None).await
+        wait_for_tcp_port_inner("proxy", self.proxy_port, Instant::now() + remaining, None).await
     }
 
     /// Explicit shutdown. Safe to call multiple times; subsequent calls are
@@ -2155,8 +2155,7 @@ pub async fn wait_for_child_tcp_accept(
     port: u16,
     deadline: Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let timeout = deadline.saturating_duration_since(Instant::now());
-    wait_for_tcp_port_inner("listener", port, timeout, Some(child)).await
+    wait_for_tcp_port_inner("listener", port, deadline, Some(child)).await
 }
 
 /// Fail-fast ownership barrier for a spawned child.
@@ -2246,13 +2245,18 @@ async fn wait_for_admin_auth_inner(
     }
 }
 
+/// Poll a TCP accept until the absolute `deadline`. The caller's `Instant` is
+/// compared directly, never re-derived from a sampled remaining duration, so a
+/// shared deadline cannot be extended by the time between the caller's read
+/// and this loop's first check.
 async fn wait_for_tcp_port_inner(
     label: &str,
     port: u16,
-    timeout: Duration,
+    deadline: Instant,
     mut child: Option<&mut Child>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deadline = Instant::now() + timeout;
+    // Diagnostic only: the budget left when this stage started.
+    let budget = deadline.saturating_duration_since(Instant::now());
     let mut last_err: Option<std::io::Error> = None;
     loop {
         if let Some(child) = child.as_deref_mut() {
@@ -2279,7 +2283,7 @@ async fn wait_for_tcp_port_inner(
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no response yet".to_string());
             return Err(format!(
-                "gateway {label} port {port} did not accept TCP connections within {timeout:?} (last observation: {observation})"
+                "gateway {label} port {port} did not accept TCP connections within {budget:?} (last observation: {observation})"
             )
             .into());
         }
@@ -3131,6 +3135,43 @@ mod ownership_proof_tests {
         let _ = child.kill();
         let _ = child.wait();
         drop(listener);
+    }
+
+    /// A positive remaining deadline expires at the caller's original instant.
+    /// Time spent between computing the shared deadline and entering the TCP
+    /// stage (stage 1, scheduling) is consumed, never handed back.
+    #[tokio::test]
+    async fn child_tcp_accept_honours_the_original_positive_deadline() {
+        // Nothing is bound on a released handoff port, so each connect is
+        // refused at once on every host (a bound-but-unlistened port would
+        // black-hole on Darwin instead).
+        let port = ephemeral_port().await.expect("refusing handoff port");
+        let mut child = live_child();
+
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        // Stand-in for stage 1 spending most of the shared budget.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let err = wait_for_child_tcp_accept(&mut child, port, deadline)
+            .await
+            .expect_err("a refusing port must time out")
+            .to_string();
+        let returned = Instant::now();
+
+        assert!(err.contains("did not accept TCP connections"), "got: {err}");
+        assert!(
+            returned >= deadline,
+            "the stage must keep polling until the original deadline"
+        );
+        // A stage that restarted the full 1.5 s budget on entry would return
+        // about 1 s after the original deadline.
+        assert!(
+            returned < deadline + Duration::from_millis(750),
+            "the stage overran the caller's deadline by {:?}",
+            returned.duration_since(deadline)
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
