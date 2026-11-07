@@ -271,6 +271,99 @@ async fn mtls_dns_restore_success_and_completed_rollback_release_fence() {
     assert!(clear_aborted.drop_releases());
 }
 
+/// Source slice from `start` up to the next `end` marker.
+fn admin_source_section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("missing {start}"));
+    let to = source[from..]
+        .find(end)
+        .map(|offset| from + offset)
+        .unwrap_or_else(|| panic!("missing {end} after {start}"));
+    &source[from..to]
+}
+
+/// The restore guard reacquisition statement that precedes `label`.
+fn restore_guard_reacquisition_before<'a>(handler: &'a str, label: &str) -> &'a str {
+    let label_at = handler
+        .find(label)
+        .unwrap_or_else(|| panic!("missing {label}"));
+    let start = handler[..label_at]
+        .rfind("restore_guard = match MtlsDnsAdmissionGuardLifecycle::")
+        .unwrap_or_else(|| panic!("missing reacquisition before {label}"));
+    &handler[start..label_at]
+}
+
+/// Issue #7032: the lost-lease recovery sites cannot be driven through the
+/// SQLite `/restore` harness, so pin their wiring structurally. Both
+/// reacquisitions must apply the inherited incomplete phase inside the
+/// acquisition task, and both rollback finalizers must gate their explicit
+/// release on the recorded restore phase.
+#[test]
+fn mtls_dns_restore_recovery_paths_keep_phase_gated_fence() {
+    let source = include_str!("../../../src/admin/mod.rs");
+    let handler = admin_source_section(source, "async fn handle_restore(", "\nasync fn ");
+
+    assert!(
+        handler.contains("let carried_restore_phase = restore_guard.restore_phase();"),
+        "the lost-clear path must capture the phase before releasing the old owner"
+    );
+    let after_clear =
+        restore_guard_reacquisition_before(handler, "\"restore_guard_reacquire_after_clear\"");
+    assert!(
+        after_clear.starts_with(
+            "restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase("
+        ),
+        "lost-clear recovery must reacquire with the inherited phase: {after_clear}"
+    );
+    assert!(after_clear.contains("carried_restore_phase"));
+
+    let after_import = restore_guard_reacquisition_before(
+        handler,
+        "\"restore_guard_reacquire_for_import_rollback\"",
+    );
+    assert!(
+        after_import.starts_with(
+            "restore_guard = match MtlsDnsAdmissionGuardLifecycle::acquire_with_restore_phase("
+        ),
+        "lost-import recovery must reacquire with the failed-import phase: {after_import}"
+    );
+    assert!(after_import.contains("MtlsDnsRestorePhase::ImportedWithErrors"));
+
+    assert!(
+        handler.contains("if !restore_guard.restore_phase_allows_release() {"),
+        "the successful-import release must be phase gated"
+    );
+
+    for (start, end) in [
+        (
+            "async fn finish_failed_restore(",
+            "async fn finish_failed_restore_after_intervening_clear(",
+        ),
+        (
+            "async fn finish_failed_restore_after_intervening_clear(",
+            "async fn finish_atomic_delete_failure(",
+        ),
+    ] {
+        let finalizer = admin_source_section(source, start, end);
+        let gate = finalizer
+            .find("let fence_retained = !guard.restore_phase_allows_release();")
+            .unwrap_or_else(|| panic!("{start} must gate its release on the restore phase"));
+        let retained = finalizer.find("if fence_retained {").unwrap_or_else(|| {
+            panic!("{start} must retain the fence when the phase forbids release")
+        });
+        let release = finalizer
+            .find("} else if let Err(_error) = guard.release().await {")
+            .unwrap_or_else(|| panic!("{start} must release only in the gated else branch"));
+        assert!(gate < retained && retained < release, "{start} gate order");
+        assert_eq!(
+            finalizer.matches("guard.release().await").count(),
+            1,
+            "{start} must have no ungated release"
+        );
+    }
+}
+
 #[tokio::test]
 async fn mtls_dns_restore_reacquired_guard_phase_retains_until_rollback_completes() {
     // Lease lost during clear or import: the reacquired owner inherits the
