@@ -7,6 +7,8 @@
 
 use crate::common::containers::{VaultContainer, fail_in_ci_else_skip, start_vault_dev_container};
 use crate::common::env::{EnvGuard, assert_resolved_var};
+#[cfg(feature = "secrets-azure")]
+use crate::common::fakes::AzureKeyVaultFake;
 use ferrum_edge::secrets::{resolve_all_env_secrets, resolve_external_reference, resolve_secret};
 use serial_test::serial;
 use std::time::Duration;
@@ -953,18 +955,21 @@ async fn vault_redirect_limit_matches_reqwest_default() {
 /// Run one Vault construction-and-reference check on its own thread and
 /// runtime, so a construction that blocks the calling thread (a plain
 /// `std::fs::read` of a FIFO) fails the test instead of hanging it.
-fn vault_reference_outcome_off_thread(timeout: Duration) -> Option<Result<String, String>> {
+fn vault_reference_outcome_off_thread(timeout: Duration) -> Option<Result<(), String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        let outcome = runtime.block_on(resolve_external_reference(
-            "vault",
-            "invalid-reference",
-            "FERRUM_TEST",
-        ));
+        // Only the outcome class matters here; never carry a resolved value.
+        let outcome = runtime
+            .block_on(resolve_external_reference(
+                "vault",
+                "invalid-reference",
+                "FERRUM_TEST",
+            ))
+            .map(|_| ());
         let _ = tx.send(outcome);
     });
     rx.recv_timeout(timeout).ok()
@@ -1066,5 +1071,102 @@ async fn vault_ignores_ambient_vaultrs_ca_fallbacks() {
     assert!(
         err.contains("Invalid Vault KV v2 reference"),
         "construction must succeed without reading VAULT_CACERT, got: {err}"
+    );
+}
+
+/// A plaintext `http` Vault address uses no TLS, so the bundle is never read:
+/// even a FIFO there cannot block or fail construction.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_plaintext_http_never_reads_the_ca_bundle() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fifo = dir.path().join("vault-http-ca-fifo");
+    let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("fifo path");
+    // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed");
+    guard.set("VAULT_ADDR", "http://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", fifo.to_string_lossy());
+
+    let outcome = vault_reference_outcome_off_thread(Duration::from_secs(5));
+    if outcome.is_none() {
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    let err = outcome
+        .expect("plaintext Vault construction must not touch the CA bundle")
+        .err()
+        .expect("the reference is invalid");
+    assert!(
+        err.contains("Invalid Vault KV v2 reference"),
+        "construction must succeed without reading the bundle, got: {err}"
+    );
+}
+
+/// The bundle read through the shared reader actually reaches the Vault
+/// transport: an https Vault whose certificate chains only to the bundle CA is
+/// refused without the bundle and fetched with it. The TLS fake (a terminator
+/// with a per-fake CA in front of a wiremock server) is the Azure one; only its
+/// transport is reused.
+#[cfg(feature = "secrets-azure")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_https_trusts_the_configured_ca_bundle() {
+    let guard = EnvGuard::new();
+    let fake = AzureKeyVaultFake::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("vault-tls-value")))
+        .mount(&fake.server)
+        .await;
+    guard.set("VAULT_ADDR", fake.uri());
+    guard.set("VAULT_TOKEN", "root");
+
+    let untrusted = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .err()
+        .expect("a certificate outside the platform roots must be refused");
+    assert!(!untrusted.contains("vault-tls-value"), "{untrusted}");
+
+    fake.trust_ca(&guard);
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("the bundle CA must be trusted by the Vault transport");
+    assert!(
+        resolved.value == "vault-tls-value",
+        "unexpected resolved value"
+    );
+}
+
+/// Batch client construction is bounded by the fetch timeout: with the shared
+/// CA reader admission held (as a stalled reader thread would hold it),
+/// startup resolution reports a bounded initialization timeout instead of
+/// hanging.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_batch_client_construction_is_bounded_by_the_fetch_timeout() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bundle = dir.path().join("vault-ca.pem");
+    std::fs::write(&bundle, "not read while admission is held").expect("write bundle");
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", bundle.to_string_lossy());
+    guard.set("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS", "1");
+    guard.set("FERRUM_ADMIN_JWT_SECRET_VAULT", "secret/data/app#field");
+
+    let held = ferrum_edge::secrets::hold_ca_bundle_reader_permit_for_test().await;
+    let started = std::time::Instant::now();
+    let err = resolve_all_env_secrets()
+        .await
+        .err()
+        .expect("held CA reader admission must time out");
+    drop(held);
+    assert!(err.contains("Timeout initializing"), "got: {err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "construction should give up at ~1s, not hang"
     );
 }

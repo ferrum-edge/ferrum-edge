@@ -919,7 +919,7 @@ fn vault_plaintext_opt_in_is_inert_because_the_vault_provider_is_refused_first()
         .find("pub async fn fetch_secret(")
         .expect("VaultClientWrapper must keep fetch_secret")];
     assert!(
-        constructor.contains("pub fn new()")
+        constructor.contains("pub async fn new()")
             && constructor.contains("env::var(ALLOW_PLAINTEXT_ENV)"),
         "the plaintext opt-in must be read only in VaultClientWrapper::new"
     );

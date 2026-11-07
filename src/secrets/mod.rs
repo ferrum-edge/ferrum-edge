@@ -1301,6 +1301,11 @@ pub use azure::{
 #[cfg(feature = "secrets-azure")]
 #[doc(hidden)]
 pub use ca_bundle::hold_ca_bundle_reader_permit_for_test as azure_hold_ca_bundle_reader_permit_for_test;
+// The CA bundle reader admission gate is shared by every provider transport
+// that trusts `FERRUM_TLS_CA_BUNDLE_PATH`.
+#[cfg(any(feature = "secrets-azure", feature = "secrets-vault"))]
+#[doc(hidden)]
+pub use ca_bundle::hold_ca_bundle_reader_permit_for_test;
 
 /// Candidate derivation is deliberately private — the whole point of
 /// [`RedactionPlan`] is that no caller can hand it a different candidate set —
