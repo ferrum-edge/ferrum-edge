@@ -38,7 +38,6 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
-use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -48,7 +47,8 @@ use tracing::warn;
 use url::{Host, Url};
 
 use super::utils::byte_budget::{
-    GrowableProcessReservation, ProcessByteReservation, RetainedByteCeiling, process_ceiling,
+    BoundedJsonWriter, GrowableProcessReservation, ProcessByteReservation, RetainedByteCeiling,
+    process_ceiling,
 };
 use super::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
@@ -599,39 +599,6 @@ impl WsByteBudget {
 /// clone only the payload handle.
 fn retained_charge_for_serialized_len(serialized_len: usize) -> usize {
     serialized_len.saturating_add(1).saturating_mul(2)
-}
-
-struct BoundedJsonWriter {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-    limit_exceeded: bool,
-}
-
-impl BoundedJsonWriter {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(max_bytes.min(4096)),
-            max_bytes,
-            limit_exceeded: false,
-        }
-    }
-}
-
-impl Write for BoundedJsonWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
-            self.limit_exceeded = true;
-            return Err(std::io::Error::other(
-                "serialized WebSocket logging entry exceeded its byte limit",
-            ));
-        }
-        self.bytes.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 pub struct WsLogging {

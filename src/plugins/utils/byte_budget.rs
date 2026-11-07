@@ -625,6 +625,13 @@ impl Drop for ByteLease {
 }
 
 /// JSON writer that fails closed once `max_bytes` would be exceeded.
+///
+/// The one bounded serialization sink for retained observability entries
+/// (summary/stream loggers, `loki_logging`, `ws_logging`, `kafka_logging`) and
+/// `ai_federation`'s translated provider bodies. A write that would cross the
+/// limit appends nothing, sets `limit_exceeded`, and fails the serializer;
+/// callers branch on `limit_exceeded` (too large) versus any other serializer
+/// error, never on the `io::Error` text.
 #[derive(Debug)]
 pub struct BoundedJsonWriter {
     pub bytes: Vec<u8>,
@@ -647,7 +654,7 @@ impl Write for BoundedJsonWriter {
         if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
             self.limit_exceeded = true;
             return Err(std::io::Error::other(
-                "serialized observability entry exceeded its byte limit",
+                "serialized JSON exceeded its byte limit",
             ));
         }
         self.bytes.extend_from_slice(buf);
