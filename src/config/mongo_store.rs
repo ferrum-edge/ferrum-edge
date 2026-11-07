@@ -2138,13 +2138,20 @@ mod inner {
                     "MongoDB reconnect deferred while an mTLS DNS admission operation pins the current connection generation"
                 )
             })?;
-            if topology == MongoReconnectTopology::Primary {
-                self.failover_topology.ensure_primary_failback_allowed()?;
-            }
+            let primary_failback_permit = if topology == MongoReconnectTopology::Primary {
+                Some(self.failover_topology.ensure_primary_failback_allowed()?)
+            } else {
+                None
+            };
             let next_topology_epoch =
                 crate::config::db_backend::checked_next_config_topology_epoch(
                     self.topology_epoch.load(Ordering::Acquire),
                 )?;
+            // Revalidate the failback permit right before publication so a
+            // stale permit aborts with nothing published (issue #7033).
+            if let Some(permit) = primary_failback_permit.as_ref() {
+                self.failover_topology.revalidate_primary_failback(permit)?;
+            }
             if topology == MongoReconnectTopology::Failover {
                 self.failover_topology.mark_failover(url_redacted);
             }
@@ -2158,8 +2165,8 @@ mod inner {
             // and then be overwritten only in metadata.
             self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology)
                 .await;
-            if topology == MongoReconnectTopology::Primary {
-                self.failover_topology.mark_primary(url_redacted);
+            if let Some(permit) = primary_failback_permit {
+                self.failover_topology.mark_primary(permit, url_redacted);
             }
             Ok(())
         }

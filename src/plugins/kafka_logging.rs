@@ -36,7 +36,6 @@
 //! GHSA-cm97-4gpw-2v6r, GHSA-7fgr-gqg5-xj6c, GHSA-83h5-52mw-f33p.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -54,7 +53,9 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
-use super::utils::byte_budget::{ProcessByteReservation, RetainedByteCeiling, process_ceiling};
+use super::utils::byte_budget::{
+    BoundedJsonWriter, ProcessByteReservation, RetainedByteCeiling, process_ceiling,
+};
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
@@ -1322,39 +1323,6 @@ struct KafkaRecord {
     payload: Arc<str>,
     key: Option<Arc<str>>,
     lease: Arc<KafkaByteLease>,
-}
-
-struct BoundedJsonWriter {
-    bytes: Vec<u8>,
-    max_bytes: usize,
-    limit_exceeded: bool,
-}
-
-impl BoundedJsonWriter {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            bytes: Vec::with_capacity(max_bytes.min(4096)),
-            max_bytes,
-            limit_exceeded: false,
-        }
-    }
-}
-
-impl Write for BoundedJsonWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
-            self.limit_exceeded = true;
-            return Err(std::io::Error::other(
-                "serialized Kafka entry exceeded its byte limit",
-            ));
-        }
-        self.bytes.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 struct KafkaProducerState {

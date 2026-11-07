@@ -8002,6 +8002,16 @@ pub mod _test_support {
         store.reconnect_as_failover(db_url).await
     }
 
+    /// Re-arm `DatabaseStore`'s offline-bootstrap deferred-migration flag so
+    /// reconnect tests can make a failback's deferred migrations run (and
+    /// fail) against the staged primary pool (issue #7033).
+    pub fn database_store_set_migrations_pending_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        pending: bool,
+    ) {
+        store.set_migrations_pending_for_test(pending);
+    }
+
     /// Fail `DatabaseStore::latest_change_sequence` so live-apply tests can
     /// prove `sequence_unavailable` after a durable commit (issue #3926).
     pub fn database_store_set_latest_change_sequence_fault_for_test(
