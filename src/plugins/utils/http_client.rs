@@ -121,6 +121,80 @@ impl std::fmt::Display for PluginHttpClientUnavailable {
 
 impl std::error::Error for PluginHttpClientUnavailable {}
 
+/// The proxy frontends a serving process binds that a dial to `127.0.0.1`
+/// reaches, derived from the same `EnvConfig` the listener startup uses.
+///
+/// Plugins that dial the local gateway over loopback (`load_testing`) use it
+/// to tell a self-dial from an Operator-chosen loopback destination. Only
+/// clients built for a serving node carry it
+/// ([`PluginHttpClient::with_local_proxy_frontends`]); validation clients for
+/// admission on another node (a control plane, config-load sweeps) do not,
+/// because the listener topology is node-local.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalProxyFrontends {
+    http_loopback_port: Option<u16>,
+    https_loopback_port: Option<u16>,
+}
+
+impl LocalProxyFrontends {
+    /// The listeners `env_config` starts, as the mode runtimes start them:
+    /// the plaintext listener whenever its port is non-zero; the HTTPS
+    /// listener in database/file mode only when frontend TLS is configured,
+    /// and in DP mode whenever its port is non-zero (CP-delivered TLS
+    /// material is hot-swapped into it). Mesh and non-serving modes start no
+    /// `FERRUM_PROXY_*` frontend. A bind address that `127.0.0.1` does not
+    /// reach (anything but an unspecified or `127.0.0.1` bind) exposes none.
+    pub fn from_env_config(env_config: &crate::config::EnvConfig) -> Self {
+        use crate::config::OperatingMode;
+
+        let reaches_loopback = env_config
+            .proxy_bind_address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(bind_accepts_ipv4_loopback);
+        if !reaches_loopback {
+            return Self::default();
+        }
+        let enabled = |port: u16| (port != 0).then_some(port);
+        let frontend_tls_configured = env_config.frontend_tls_cert_path.is_some()
+            && env_config.frontend_tls_key_path.is_some();
+        match env_config.mode {
+            OperatingMode::Database | OperatingMode::File => Self {
+                http_loopback_port: enabled(env_config.proxy_http_port),
+                https_loopback_port: if frontend_tls_configured {
+                    enabled(env_config.proxy_https_port)
+                } else {
+                    None
+                },
+            },
+            OperatingMode::DataPlane => Self {
+                http_loopback_port: enabled(env_config.proxy_http_port),
+                https_loopback_port: enabled(env_config.proxy_https_port),
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// The plaintext HTTP listener port reachable at `127.0.0.1`, if any.
+    pub fn http_loopback_port(&self) -> Option<u16> {
+        self.http_loopback_port
+    }
+
+    /// The HTTPS listener port reachable at `127.0.0.1`, if any.
+    pub fn https_loopback_port(&self) -> Option<u16> {
+        self.https_loopback_port
+    }
+}
+
+/// Whether a listener bound to `bind` accepts a connection to `127.0.0.1`.
+fn bind_accepts_ipv4_loopback(bind: std::net::IpAddr) -> bool {
+    match bind {
+        std::net::IpAddr::V4(ip) => ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST,
+        std::net::IpAddr::V6(ip) => {
+            ip.is_unspecified() || ip.to_ipv4_mapped() == Some(std::net::Ipv4Addr::LOCALHOST)
+        }
+    }
+}
+
 fn unavailable_plugin_http_failure() -> PluginHttpFailure {
     PluginHttpFailure {
         error_class: ErrorClass::ConnectionPoolError,
@@ -331,6 +405,10 @@ pub struct PluginHttpClient {
     /// puts it in its length-gated mode. `None` on clients that never resolved
     /// it (validation and library paths), which stay silent.
     max_response_body_size_bytes: Option<usize>,
+    /// The proxy frontends this serving node binds on loopback. `None` on
+    /// validation clients that admit config for other nodes, which therefore
+    /// skip node-local listener checks.
+    local_proxy_frontends: Option<LocalProxyFrontends>,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -365,6 +443,7 @@ impl std::fmt::Debug for PluginHttpClient {
                 "max_response_body_size_bytes",
                 &self.max_response_body_size_bytes,
             )
+            .field("local_proxy_frontends", &self.local_proxy_frontends)
             .finish()
     }
 }
@@ -1496,6 +1575,7 @@ impl PluginHttpClient {
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
             max_response_body_size_bytes: None,
+            local_proxy_frontends: None,
         }
     }
 
@@ -1571,6 +1651,7 @@ impl PluginHttpClient {
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
             max_response_body_size_bytes: None,
+            local_proxy_frontends: None,
         }
     }
 
@@ -1695,6 +1776,20 @@ impl PluginHttpClient {
 
     pub(crate) fn max_response_body_size_bytes(&self) -> Option<usize> {
         self.max_response_body_size_bytes
+    }
+
+    /// Mark this client as a serving node's: `frontends` are the proxy
+    /// listeners this process binds that a dial to `127.0.0.1` reaches.
+    pub fn with_local_proxy_frontends(mut self, frontends: LocalProxyFrontends) -> Self {
+        self.local_proxy_frontends = Some(frontends);
+        self
+    }
+
+    /// The loopback-reachable proxy frontends of the serving node this client
+    /// belongs to, or `None` on a validation client admitting config for
+    /// other nodes.
+    pub fn local_proxy_frontends(&self) -> Option<&LocalProxyFrontends> {
+        self.local_proxy_frontends.as_ref()
     }
 
     /// Follow the gateway's live CRL list on plugin egress (issue #6621).

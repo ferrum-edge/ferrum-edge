@@ -11035,6 +11035,10 @@ impl ProxyState {
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
+        // The proxy frontends this node binds, so plugins that dial the local
+        // gateway over loopback can tell a self-dial from another service.
+        let local_proxy_frontends =
+            crate::plugins::utils::LocalProxyFrontends::from_env_config(&env_config_arc);
         let mut plugin_http_client = crate::plugins::PluginHttpClient::new(
             &global_pool_config,
             dns_cache.clone(),
@@ -11057,7 +11061,8 @@ impl ProxyState {
         .with_max_request_body_size_bytes(env_config_arc.max_request_body_size_bytes)
         .with_max_response_body_size_bytes(env_config_arc.max_response_body_size_bytes)
         .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone())
-        .with_live_crls(shared_crls.clone());
+        .with_live_crls(shared_crls.clone())
+        .with_local_proxy_frontends(local_proxy_frontends);
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
         // route `__mesh_bpf_metrics` to use it via `with_state`.
