@@ -312,6 +312,25 @@ fn new_rejects_none_client_auth_for_remote_endpoint() {
     assert!(err.contains("only allowed"));
 }
 
+/// URL-normalized loopback spellings (`127.1`, expanded `::1`) are IP literals
+/// the parser turns into the address they connect to, so they stay admitted.
+#[test]
+fn new_accepts_normalized_loopback_ip_spellings_for_credentialed_client_auth() {
+    for endpoint in [
+        "http://127.1:9000/introspect",
+        "http://[0:0:0:0:0:0:0:1]:9000/introspect",
+    ] {
+        assert!(
+            Oauth2Introspection::new(
+                &config_with_client_auth(endpoint, "client_secret_basic"),
+                PluginHttpClient::default(),
+            )
+            .is_ok(),
+            "{endpoint}"
+        );
+    }
+}
+
 /// Only a loopback IP literal exempts a credentialed `http://` endpoint (the
 /// #6659 rule): DNS overrides and the resolver decide where a name connects,
 /// so `localhost` and `*.localhost` must not carry a client secret, a signed

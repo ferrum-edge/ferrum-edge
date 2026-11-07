@@ -563,7 +563,13 @@ fn remote_key_endpoints_require_https_and_reject_userinfo() {
             .expect("remote cleartext endpoint must reject");
         assert!(error.contains("must use https"), "got: {error}");
 
-        for local_endpoint in ["http://127.0.0.1:8080/keys", "http://[::1]:8080/keys"] {
+        for local_endpoint in [
+            "http://127.0.0.1:8080/keys",
+            "http://[::1]:8080/keys",
+            // URL-normalized IP literals connect to the same address.
+            "http://127.1:8080/keys",
+            "http://[0:0:0:0:0:0:0:1]:8080/keys",
+        ] {
             JwksAuth::new(&endpoint_config(field, local_endpoint), default_client())
                 .expect("loopback IP literals remain available for local development");
         }

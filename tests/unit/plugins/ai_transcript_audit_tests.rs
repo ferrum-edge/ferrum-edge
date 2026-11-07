@@ -536,6 +536,22 @@ async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
         AiTranscriptAudit::new(&loopback, loopback_http_client()).is_ok(),
         "explicit IPv6 loopback cleartext should remain available for local development"
     );
+    for endpoint in [
+        "http://127.1:9001/audit",
+        "http://[0:0:0:0:0:0:0:1]:9001/audit",
+    ] {
+        let config = json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "allow_insecure_loopback": true
+            }
+        });
+        assert!(
+            AiTranscriptAudit::new(&config, loopback_http_client()).is_ok(),
+            "URL-normalized loopback IP literal {endpoint} stays admitted"
+        );
+    }
 }
 
 #[tokio::test]
