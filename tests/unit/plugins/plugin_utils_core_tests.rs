@@ -2805,3 +2805,62 @@ fn extended_reassembler_fails_closed_on_unmodelled_cohere_v2_content() {
         );
     }
 }
+
+/// The one gRPC method resolution `body_validator`, `ai_response_guard`, and
+/// `ai_transcript_audit` share: the private bound backend path wins, then
+/// non-empty `grpc_full_method` metadata (slash-prefixed), then the request
+/// path; every source reduces to its trailing `/Service/Method`.
+#[test]
+fn grpc_method_resolution_prefers_the_bound_path_and_canonicalizes_every_source() {
+    use ferrum_edge::plugins::RequestContext;
+    use ferrum_edge::plugins::utils::grpc_method::{
+        canonical_grpc_method, resolve_grpc_method_path,
+    };
+
+    let ctx = |path: &str, metadata: Option<&str>, bound: Option<&str>| {
+        let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), path.into());
+        if let Some(method) = metadata {
+            ctx.metadata
+                .insert("grpc_full_method".to_string(), method.to_string());
+        }
+        if let Some(bound) = bound {
+            ferrum_edge::_test_support::bind_authorized_backend_path_for_test(&mut ctx, bound);
+        }
+        ctx
+    };
+    for (path, metadata, bound, expected) in [
+        // Request path only, verbatim and prefixed.
+        ("/pkg.S/M", None, None, "/pkg.S/M"),
+        ("/api/pkg.S/M", None, None, "/pkg.S/M"),
+        // Metadata stands in before binding, with or without a leading slash.
+        ("/client/Path", Some("pkg.S/M"), None, "/pkg.S/M"),
+        ("/client/Path", Some("/pkg.S/M"), None, "/pkg.S/M"),
+        // Empty metadata names no method and falls through to the path.
+        ("/api/pkg.S/M", Some(""), None, "/pkg.S/M"),
+        // The bound path wins over metadata in both directions.
+        (
+            "/pkg.S/M",
+            Some("pkg.S/Other"),
+            Some("/pkg.S/M"),
+            "/pkg.S/M",
+        ),
+        (
+            "/pkg.S/M",
+            Some("pkg.S/M"),
+            Some("/pkg.S/Other"),
+            "/pkg.S/Other",
+        ),
+        // A backend base path in front of the method does not hide it.
+        ("/client", None, Some("/base/pkg.S/M"), "/pkg.S/M"),
+    ] {
+        let ctx = ctx(path, metadata, bound);
+        assert_eq!(
+            resolve_grpc_method_path(&ctx),
+            expected,
+            "path={path} metadata={metadata:?} bound={bound:?}"
+        );
+    }
+    assert_eq!(canonical_grpc_method("/a/pkg.S/M?x=1#f"), "/pkg.S/M");
+    assert_eq!(canonical_grpc_method("/pkg.S/M"), "/pkg.S/M");
+    assert_eq!(canonical_grpc_method("noslash"), "noslash");
+}

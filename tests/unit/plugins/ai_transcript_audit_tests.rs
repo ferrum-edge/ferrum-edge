@@ -11476,6 +11476,51 @@ async fn grpc_backend_effective_method_enrolls_after_unenrolled_client_path() {
     );
 }
 
+/// Before routing, a prefixed client path selects its trailing
+/// `/Service/Method` provisionally, so a pre-routing short circuit still
+/// stages it; the bound backend path stays authoritative once it exists.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_pre_bind_prefixed_client_path_stages_provisionally() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a prefixed client path names the enrolled method before routing"
+    );
+
+    // A conflicting bound path refutes the provisional enrollment.
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/Other",
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the bound backend path refutes the provisional method"
+    );
+}
+
 /// Plugin-writable `grpc_full_method` metadata never outranks the private bound
 /// backend path, and the bound path selects on its canonical trailing
 /// `/Service/Method` (the `body_validator` #6845 rule).

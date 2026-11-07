@@ -4344,8 +4344,8 @@ impl Plugin for AiResponseGuard {
 
     /// A `grpc`-enrolled instance joins the backend-path boundary so the proxy
     /// binds the backend-effective path for every request on its route. That
-    /// bound path is this instance's own enrollment witness when no
-    /// `grpc_full_method` was published, so enrollment never depends on a
+    /// bound path is this instance's authoritative enrollment witness, never
+    /// outranked by `grpc_full_method`, so enrollment never depends on a
     /// companion `grpc_method_router` (see [`Self::grpc_method_path`]). The
     /// buffering vote is cast after the bind on every dispatcher.
     fn requires_backend_path_resolution(&self) -> bool {

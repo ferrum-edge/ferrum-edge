@@ -4980,8 +4980,8 @@ impl Plugin for AiTranscriptAudit {
     /// Enrolled native-gRPC instances subscribe to the backend-path boundary,
     /// so the proxy binds the backend-effective path (after route override,
     /// listen-path stripping, and upstream target path assembly) on the
-    /// request. That bound path is this instance's own enrollment witness when
-    /// no `grpc_full_method` was published, so an audit-only proxy does not
+    /// request. That bound path is this instance's authoritative enrollment
+    /// witness, never outranked by `grpc_full_method`, so an audit-only proxy does not
     /// depend on `grpc_method_router` to decide enrollment on the method the
     /// backend actually receives.
     fn requires_backend_path_resolution(&self) -> bool {

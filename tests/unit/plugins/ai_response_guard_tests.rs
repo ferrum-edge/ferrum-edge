@@ -8232,6 +8232,35 @@ async fn grpc_bound_backend_path_decides_enrollment_without_method_router() {
     ));
 }
 
+/// Before the backend path is bound (a pre-dispatch synthetic reply), an empty
+/// `grpc_full_method` names no method and falls through to the request path,
+/// and a prefixed request path selects its trailing `/Service/Method`.
+#[tokio::test]
+async fn grpc_pre_bind_resolution_falls_through_empty_metadata_and_canonicalizes() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ctx.metadata
+        .insert("grpc_full_method".to_string(), String::new());
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let mut ctx = grpc_ctx("/api/test.Greeter/SayHello");
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
 /// Plugin-writable `grpc_full_method` metadata never outranks the private bound
 /// backend path, in either direction, and the bound path selects on its
 /// canonical trailing `/Service/Method` (the `body_validator` #6845 rule).
