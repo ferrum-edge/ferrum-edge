@@ -427,6 +427,11 @@ pub(crate) const REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE: &str =
 // On the success path [`RequestBufferPermit::into_charged_bytes`] moves the
 // charge onto the published `Bytes`, so the backend write and retry replay stay
 // charged until the last clone drops (issue #4231) and no path can leak it.
+// A request-body plugin can replace the collected body with a larger one; the
+// charge is grown to cover the replacement right after the transform where the
+// body is kept for later phases ([`charge_covers`]), and publication itself
+// fails closed, so a body the budget cannot cover is refused with the same
+// `503` rather than retained uncharged.
 //
 // A third semaphore, not a share of the retained-response or request-decode
 // ones, for exactly the reason those two are already separate: they bound
@@ -750,6 +755,16 @@ impl RequestBufferPermit {
         self.reservation.reserved_bytes()
     }
 
+    /// Grow the charge to cover an allocation that replaced the collected one,
+    /// such as a request-body plugin's transformed output. `false` is a
+    /// capacity refusal, counted once: the caller must drop the allocation and
+    /// answer [`REQUEST_BUFFER_OVERLOAD_STATUS`] instead of keeping bytes the
+    /// budget does not cover.
+    #[must_use]
+    pub(crate) fn cover(&mut self, retained_capacity: usize) -> bool {
+        self.grow_to(retained_capacity)
+    }
+
     /// Publish `data` as cheaply cloneable [`Bytes`] whose charge is released
     /// when the last clone drops — not when the collector's stack frame ends.
     ///
@@ -761,28 +776,33 @@ impl RequestBufferPermit {
     /// protocol-NACK replay) shares that owner, so the allocation is charged
     /// exactly once for as long as any handle exists.
     ///
-    /// Empty `data` returns [`Bytes::new()`] and drops the charge immediately,
-    /// because nothing is retained. A surviving allocation smaller than the
-    /// charge releases surplus blocks. A plugin transform that grew the body
-    /// past what the collect retained is topped up when the budget has room;
-    /// when it has none the existing charge is kept and the bytes are still
-    /// published — transform growth is outside this budget's collect bound, and
-    /// dropping the bytes here would be a new failure mode on a path that
-    /// already accepted them.
-    pub(crate) fn into_charged_bytes(mut self, data: Vec<u8>) -> Bytes {
+    /// Fail-closed: `data` is published only once the charge covers its whole
+    /// capacity. A request-body plugin can replace the collected body with a
+    /// larger one; the charge is grown to cover it, and when the budget cannot
+    /// cover it this returns `None` (a counted refusal) and drops both the
+    /// bytes and the charge. The caller answers the `503` / gRPC
+    /// `RESOURCE_EXHAUSTED` capacity terminal, so no published body is ever
+    /// retained beyond what the budget admitted. Empty `data` returns
+    /// [`Bytes::new()`] and drops the charge immediately, because nothing is
+    /// retained. A surviving allocation smaller than the charge releases
+    /// surplus blocks.
+    #[must_use]
+    pub(crate) fn into_charged_bytes(mut self, data: Vec<u8>) -> Option<Bytes> {
         if data.is_empty() {
-            return Bytes::new();
+            return Some(Bytes::new());
         }
-        // Best effort, and deliberately not counted as a refusal: nothing is
-        // refused here.
-        let _: bool = self.reservation.reserve_on(&self.permits, data.capacity());
-        // Narrowing only releases. `false` means the top-up above was refused:
-        // keep the existing charge and still publish.
-        let _: bool = self.reservation.narrow_to_covered(data.capacity());
-        Bytes::from_owner(ChargedBuffer {
+        if !self.grow_to(data.capacity()) {
+            return None;
+        }
+        // The charge now covers the capacity, so narrowing only releases the
+        // surplus; `false` would mean it does not, and nothing is published.
+        if !self.reservation.narrow_to_covered(data.capacity()) {
+            return None;
+        }
+        Some(Bytes::from_owner(ChargedBuffer {
             data,
             _permit: self.reservation.into_permit(),
-        })
+        }))
     }
 
     /// Narrow the charge to the allocation that stays resident after a
@@ -793,6 +813,17 @@ impl RequestBufferPermit {
         // charge, which the charged collector excludes; keep the whole charge.
         let _: bool = self.reservation.narrow_to_covered(retained_capacity);
     }
+}
+
+/// Grow a buffered request body's charge to cover the allocation a
+/// request-body plugin replaced it with, right after the transform and before
+/// the replacement is kept across any further phase. `false` is the capacity
+/// refusal: the caller drops the replacement and answers
+/// [`REQUEST_BUFFER_OVERLOAD_STATUS`]. A body no governed collect charged
+/// (`None`) has no charge to grow.
+#[must_use]
+pub(crate) fn charge_covers(charge: Option<&mut RequestBufferPermit>, capacity: usize) -> bool {
+    charge.is_none_or(|charge| charge.cover(capacity))
 }
 
 /// A buffered client REQUEST body collected under the aggregate

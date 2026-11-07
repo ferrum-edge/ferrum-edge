@@ -30,8 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that has sent nothing holds no budget. When the budget cannot cover a
   growth, the upload is refused with the same `503` / gRPC
   `RESOURCE_EXHAUSTED` as before, now after reading part of the body rather
-  than before reading any. A request-body plugin that grows the body is
-  charged for the larger body when the budget has room.
+  than before reading any. A request-body plugin that replaces the body with a
+  larger one is charged for the larger body as soon as the transform returns,
+  and the request is refused with the same `503` / `RESOURCE_EXHAUSTED` when
+  the budget cannot cover it, so no buffered request body is retained beyond
+  what the budget admitted.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,

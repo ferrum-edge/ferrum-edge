@@ -24,10 +24,11 @@ use ferrum_edge::_test_support::{
     DEFAULT_REQUEST_BUFFER_TOTAL_BYTES, REQUEST_BUFFER_OVERLOAD_BODY,
     REQUEST_BUFFER_OVERLOAD_ERROR_CLASS, REQUEST_BUFFER_OVERLOAD_GRPC_STATUS,
     REQUEST_BUFFER_OVERLOAD_STATUS, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
-    RequestBufferBudgetProbe, ResponseBufferRetainRejection, buffered_request_body_ceiling_for_test,
-    collect_charged_request_body_for_test, effective_request_body_limit_for_test,
-    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
-    normalize_reject_response, request_buffer_capacity_backend_response_for_test,
+    RequestBufferBudgetProbe, ResponseBufferRetainRejection,
+    buffered_request_body_ceiling_for_test, collect_charged_request_body_for_test,
+    effective_request_body_limit_for_test, error_class_is_backend_failure_for_test,
+    error_class_is_health_neutral_for_test, normalize_reject_response,
+    request_buffer_capacity_backend_response_for_test,
     request_buffer_capacity_reject_headers_for_test, set_request_grpc_web_upload_for_test,
     set_request_http_flavor_for_test,
 };
@@ -411,7 +412,8 @@ fn sequential_in_dispatch_collections_cannot_exceed_the_aggregate_while_the_firs
     let first_body = budget
         .try_reserve(UNIT)
         .expect("first collection admits")
-        .into_charged_bytes(vec![0u8; UNIT]);
+        .into_charged_bytes(vec![0u8; UNIT])
+        .expect("the charge covers the body");
     assert_eq!(budget.available_bytes(), 0);
     assert!(
         budget.try_reserve(UNIT).is_none(),
@@ -435,7 +437,8 @@ fn a_cloned_dispatch_body_keeps_the_charge_until_the_last_handle_drops() {
     let first = budget
         .try_reserve(UNIT)
         .expect("admits")
-        .into_charged_bytes(vec![0u8; UNIT]);
+        .into_charged_bytes(vec![0u8; UNIT])
+        .expect("the charge covers the body");
     let retry_replay = first.clone();
     assert_eq!(budget.available_bytes(), 0);
 
@@ -470,7 +473,7 @@ fn a_pre_auth_permit_stays_charged_through_dispatch_publication_and_retry_clone(
     );
 
     // Phase 2: dispatch conversion, including a retry clone.
-    let published = permit.into_charged_bytes(body);
+    let published = permit.into_charged_bytes(body).expect("covered");
     let retry_replay = published.clone();
     assert_eq!(budget.available_bytes(), 0);
     assert!(
@@ -498,7 +501,8 @@ fn publishing_an_empty_body_releases_the_charge() {
     let empty = budget
         .try_reserve(UNIT)
         .expect("admits")
-        .into_charged_bytes(Vec::new());
+        .into_charged_bytes(Vec::new())
+        .expect("the charge covers the body");
     assert!(empty.is_empty());
     assert_eq!(
         budget.available_bytes(),
@@ -516,7 +520,8 @@ fn publishing_a_body_smaller_than_the_ceiling_releases_surplus() {
     let body = budget
         .try_reserve(4 * UNIT)
         .expect("admits the ceiling")
-        .into_charged_bytes(vec![0u8; UNIT]);
+        .into_charged_bytes(vec![0u8; UNIT])
+        .expect("the charge covers the body");
     assert_eq!(
         budget.available_bytes(),
         3 * UNIT,
@@ -568,7 +573,7 @@ fn in_dispatch_collectors_publish_the_permit_onto_the_resident_bytes() {
          Bytes that stay resident for send and retry replay"
     );
     assert!(
-        reqwest_buffered.contains("None => Bytes::from(body_bytes)"),
+        reqwest_buffered.contains("None => Some(Bytes::from(body_bytes))"),
         "a plugin-staged Buffered body with no permit must publish plain Bytes"
     );
 
@@ -607,25 +612,67 @@ fn publishing_a_transform_grown_body_tops_the_charge_up_when_the_budget_has_room
     let body = budget
         .try_reserve(UNIT)
         .expect("admits the collected body")
-        .into_charged_bytes(vec![0u8; 3 * UNIT]);
+        .into_charged_bytes(vec![0u8; 3 * UNIT])
+        .expect("the budget has room for the larger body");
+    assert_eq!(body.len(), 3 * UNIT);
     assert_eq!(budget.available_bytes(), UNIT);
     drop(body);
     assert_eq!(budget.available_bytes(), 4 * UNIT);
+}
 
-    // Without room, the bytes are still published under the existing charge:
-    // transform growth is outside the collect bound, and dropping bytes a path
-    // already accepted would be a new failure mode.
+#[test]
+fn publishing_a_transform_grown_body_the_budget_cannot_cover_is_refused() {
+    // Without room, publication fails closed: the larger body is not retained
+    // under a charge that does not cover it, and the collected body's charge
+    // is released with it. The caller answers the 503 capacity terminal.
     let budget = probe(2);
     let other = budget.try_reserve(UNIT).expect("another upload");
-    let body = budget
+    let published = budget
         .try_reserve(UNIT)
         .expect("admits the collected body")
         .into_charged_bytes(vec![0u8; 3 * UNIT]);
-    assert_eq!(body.len(), 3 * UNIT);
-    assert_eq!(budget.available_bytes(), 0);
-    drop(body);
+    assert!(
+        published.is_none(),
+        "a body the budget cannot cover must not be published"
+    );
+    assert_eq!(
+        budget.available_bytes(),
+        UNIT,
+        "the refused publication must release the collected body's charge"
+    );
     drop(other);
     assert_eq!(budget.available_bytes(), 2 * UNIT);
+}
+
+#[test]
+fn every_request_body_publication_fails_closed() {
+    // Each production publication of a charged request body handles the
+    // fail-closed refusal with the capacity terminal instead of retaining a
+    // transform-grown body the budget does not cover.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        proxy.matches("permit.into_charged_bytes(").count(),
+        7,
+        "a new request-body publication must be added to this guard"
+    );
+    for publication in proxy.split("permit.into_charged_bytes(").skip(1) {
+        let handling: String = publication.chars().take(1_200).collect();
+        assert!(
+            handling.contains("request_buffer_capacity_backend_response(")
+                || handling.contains("build_request_buffer_capacity_response("),
+            "a request-body publication must answer the capacity terminal when the budget \
+             cannot cover the body"
+        );
+    }
+    let budget = include_str!("../../../src/proxy/response_buffer_budget.rs");
+    let publish = budget
+        .split("fn into_charged_bytes(mut self, data: Vec<u8>) -> Option<Bytes> {")
+        .nth(1)
+        .expect("fail-closed request publication")
+        .split("\n    }\n")
+        .next()
+        .expect("bounded request publication");
+    assert!(publish.contains("if !self.grow_to(data.capacity()) {"));
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +798,7 @@ async fn stalled_h1_h2_collects_hold_no_budget_and_complete_uploads_still_succee
     };
     assert_eq!(body.len(), 2 * UNIT);
     assert_eq!(permit.reserved_bytes(), 2 * UNIT);
-    let published = permit.into_charged_bytes(body);
+    let published = permit.into_charged_bytes(body).expect("covered");
     assert_eq!(budget.available_bytes(), total - 2 * UNIT);
     drop(published);
 

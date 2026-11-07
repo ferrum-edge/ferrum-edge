@@ -3814,11 +3814,26 @@ where
                 // Publish the body with its request-buffer charge (#6009):
                 // every attempt shares the one allocation, and the charge is
                 // released when this arm drops the last copy, once dispatch
-                // and every retry are done and before the response relay.
-                let buffered_body = publish_h3_retained_body(
+                // and every retry are done and before the response relay. A
+                // body a request-body plugin grew past what the budget can
+                // cover is refused rather than retained uncharged.
+                let Some(buffered_body) = publish_h3_retained_body(
                     buffered_body,
                     prebuffered_body_charge.or(mesh_upload_charge.take()),
-                );
+                ) else {
+                    cb_probe.release_neutral();
+                    return Box::pin(write_bridge_upload_refusal(
+                        stream,
+                        HttpFlavor::Plain,
+                        plugins,
+                        ctx,
+                        BridgeUploadRefusal::BufferCapacity,
+                        response_committed_plugins,
+                        initial_response_header_policy_plugins,
+                        backend_start,
+                    ))
+                    .await;
+                };
                 let bytes_sent = raw_prebuffered_body_bytes;
                 let mut attempt = 0u32;
                 let final_backend_admission_permits: Option<BackendAdmissionPermitSet>;
@@ -8983,7 +8998,22 @@ where
     );
     // Every attempt shares the one charged allocation; the charge is released
     // when the last copy drops, once dispatch and every retry are done (#6009).
-    let body_bytes = publish_h3_retained_body(body, bridge_upload_charge.take());
+    // A body a request-body plugin grew past what the budget can cover is
+    // refused rather than retained uncharged.
+    let Some(body_bytes) = publish_h3_retained_body(body, bridge_upload_charge.take()) else {
+        cb_probe.release_neutral();
+        return Box::pin(write_bridge_upload_refusal(
+            stream,
+            HttpFlavor::Grpc,
+            plugins,
+            ctx,
+            BridgeUploadRefusal::BufferCapacity,
+            response_committed_plugins,
+            initial_response_header_policy_plugins,
+            backend_start,
+        ))
+        .await;
+    };
     let (initial_hmap, initial_body, retry_hmap, retry_body) = if grpc_has_retry {
         (
             hmap.clone(),

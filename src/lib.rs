@@ -17095,8 +17095,10 @@ pub mod _test_support {
         /// Move this claim onto a cheaply cloneable [`bytes::Bytes`] view of
         /// `data`, exactly as dispatch does after a governed collect (in-dispatch
         /// or pre-auth). The charge is released when the last clone drops
-        /// (issue #4231).
-        pub fn into_charged_bytes(self, data: Vec<u8>) -> bytes::Bytes {
+        /// (issue #4231). `None` is the fail-closed capacity refusal: the
+        /// budget could not grow the charge to cover `data`, and both were
+        /// dropped.
+        pub fn into_charged_bytes(self, data: Vec<u8>) -> Option<bytes::Bytes> {
             self.0.into_charged_bytes(data)
         }
     }
@@ -17437,7 +17439,7 @@ pub mod _test_support {
         /// Finish and publish the body for dispatch through the PRODUCTION
         /// native-H3 publication (`publish_h3_retained_body`): the charge
         /// moves onto the shared `Bytes` every attempt and retry replays.
-        pub fn finish_and_publish(self) -> bytes::Bytes {
+        pub fn finish_and_publish(self) -> Option<bytes::Bytes> {
             let (body, permit) = self.0.finish();
             crate::http3::server::publish_h3_retained_body(body, Some(permit))
         }

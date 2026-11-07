@@ -205,7 +205,9 @@ fn a_published_body_is_released_when_its_last_dispatch_copy_drops() {
     assert_eq!(upload.push(b"small soap envelope"), Ok(()));
     // The production publication native-H3 dispatch and both bridges use: the
     // charge moves onto the body, so no handler-held charge outlives it.
-    let body = upload.finish_and_publish();
+    let body = upload
+        .finish_and_publish()
+        .expect("the charge covers the collected body");
     assert_eq!(&body[..], b"small soap envelope");
     assert_eq!(budget.available_bytes(), total - UNIT);
     // The first attempt and a retry replay share the one charged allocation.
@@ -350,7 +352,7 @@ fn every_h3_dispatch_publishes_the_charge_with_the_body() {
     for (source, publication) in [
         (
             server,
-            "publish_h3_retained_body(body_data, retained_request_charge.take());",
+            "publish_h3_retained_body(body_data, retained_request_charge.take())",
         ),
         (
             server,
@@ -362,12 +364,31 @@ fn every_h3_dispatch_publishes_the_charge_with_the_body() {
         ),
         (
             bridge,
-            "publish_h3_retained_body(body, bridge_upload_charge.take());",
+            "publish_h3_retained_body(body, bridge_upload_charge.take())",
         ),
     ] {
         assert!(
             source.contains(publication),
             "the request-buffer charge must ride on the dispatched body: `{publication}`"
+        );
+    }
+    // Publication fails closed: a body a request-body plugin grew past what
+    // the budget can cover is refused, never retained uncharged.
+    assert_eq!(
+        server
+            .matches("charge_covers(retained_request_charge.as_mut(), transformed.capacity())")
+            .count(),
+        2,
+        "both native-H3 transforms that keep the body must cover it before keeping it"
+    );
+    for (source, publication) in [
+        (server, "Some(mut body_data) = publish_h3_retained_body("),
+        (bridge, "Some(buffered_body) = publish_h3_retained_body("),
+        (bridge, "Some(body_bytes) = publish_h3_retained_body("),
+    ] {
+        assert!(
+            source.contains(publication),
+            "the dispatched body's publication must fail closed: `{publication}`"
         );
     }
 }
@@ -452,10 +473,25 @@ fn every_dispatch_stage_h3_drain_refusal_runs_the_reject_hooks_and_the_log() {
     assert!(refusal.contains("finalize_h3_terminal_body_rejection_with_headers("));
     assert!(refusal.contains("send_h3_plugin_reject_flavor_aware("));
 
-    let sites: Vec<&str> = server
-        .split("return boxed_finalize_h3_request_buffer_capacity_rejection(")
-        .skip(1)
-        .collect();
+    // Seven committed capacity refusals: four dispatch-stage drains, the two
+    // transforms that replace a charged body before dispatch, and the
+    // fail-closed publication of the dispatched body.
+    assert_eq!(
+        server
+            .matches("return boxed_finalize_h3_request_buffer_capacity_rejection(")
+            .count(),
+        7
+    );
+    let drain_capacity_arm = "Ok(Err(RetainRejection::BudgetExhausted)) => {";
+    let oversize_arm = "Ok(Err(RetainRejection::TooLarge)) => {";
+    let committed = "return boxed_finalize_h3_request_buffer_capacity_rejection(";
+    let mut sites = Vec::new();
+    for arm in server.split(drain_capacity_arm).skip(1) {
+        let capacity = arm.split(oversize_arm).next().unwrap_or_default();
+        if capacity.contains(committed) {
+            sites.push(arm);
+        }
+    }
     assert_eq!(sites.len(), 4, "four dispatch-stage drains refuse capacity");
     for (index, site) in sites.into_iter().enumerate() {
         let oversize = site

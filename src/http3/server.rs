@@ -67,7 +67,7 @@ use crate::proxy::headers::{
 };
 use crate::proxy::response_buffer_budget::{
     BudgetRef, ChargedRequestCollector, RequestBufferPermit, RetainRejection,
-    buffered_request_body_ceiling,
+    buffered_request_body_ceiling, charge_covers,
 };
 use crate::proxy::udp_port_handoff::UdpPortHold;
 use crate::proxy::{
@@ -340,14 +340,17 @@ impl H3RetainedUpload {
 /// retry replay shares one allocation, and the charge is released when the last
 /// copy drops. That happens once dispatch and every retry are done, before the
 /// response is relayed, not when the handler returns. A body that no drain
-/// charged is published uncharged.
+/// charged is published uncharged. `None` means a request-body plugin grew the
+/// body past what the shared budget can cover: the caller answers the `503` /
+/// `RESOURCE_EXHAUSTED` capacity refusal instead of retaining it uncharged.
+#[must_use]
 pub(crate) fn publish_h3_retained_body(
     body: Vec<u8>,
     charge: Option<RequestBufferPermit>,
-) -> Bytes {
+) -> Option<Bytes> {
     match charge {
         Some(permit) => permit.into_charged_bytes(body),
-        None => Bytes::from(body),
+        None => Some(Bytes::from(body)),
     }
 }
 
@@ -6862,6 +6865,23 @@ async fn handle_h3_request(
             body_data,
         )
         .await;
+        // The transformed body replaces the charged one for the rest of the
+        // request, so its charge must cover it before any further phase keeps
+        // it.
+        if !charge_covers(retained_request_charge.as_mut(), transformed.capacity()) {
+            return boxed_finalize_h3_request_buffer_capacity_rejection(
+                &mut stream,
+                &state,
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                start_time,
+                &mut plugin_execution_ns,
+                &original_request_path,
+            )
+            .await;
+        }
         // `bytes_sent` above is the raw client-wire length; gRPC messages come
         // from the transformed, backend-visible body so translated gRPC-Web
         // requests count native frames instead of base64 / trailer framing,
@@ -7426,6 +7446,25 @@ async fn handle_h3_request(
             body_data,
         )
         .await;
+        // The transformed body replaces the charged one for the rest of the
+        // request, so its charge must cover it before any further phase keeps
+        // it.
+        if !charge_covers(retained_request_charge.as_mut(), transformed.capacity()) {
+            cb_probe.release_neutral();
+            drop(preacquired_backend_admission.take_if_acquired());
+            return boxed_finalize_h3_request_buffer_capacity_rejection(
+                &mut stream,
+                &state,
+                &plugins,
+                &mut ctx,
+                http_flavor,
+                grpc_web_response_content_type,
+                start_time,
+                &mut plugin_execution_ns,
+                &original_request_path,
+            )
+            .await;
+        }
         // Same contract as the terminal-hook ladder above: count the
         // backend-visible representation, not the client wire bytes, and an
         // untranslated pass-through upload on its decoded frames.
@@ -10249,8 +10288,24 @@ async fn handle_h3_request(
     // Publish the body for dispatch (#6009) exactly as H1/H2 do: the
     // request-buffer charge moves onto shared `Bytes`, every attempt and retry
     // replay shares the one allocation, and the charge is released when the
-    // last copy drops, before the response is relayed.
-    let mut body_data = publish_h3_retained_body(body_data, retained_request_charge.take());
+    // last copy drops, before the response is relayed. A body a request-body
+    // plugin grew past what the budget can cover is refused, not retained.
+    let Some(mut body_data) = publish_h3_retained_body(body_data, retained_request_charge.take())
+    else {
+        cb_probe.release_neutral();
+        return boxed_finalize_h3_request_buffer_capacity_rejection(
+            &mut stream,
+            &state,
+            &plugins,
+            &mut ctx,
+            http_flavor,
+            grpc_web_response_content_type,
+            start_time,
+            &mut plugin_execution_ns,
+            &original_request_path,
+        )
+        .await;
+    };
 
     // The matched route rule's deadlines (#5646) for every native attempt
     // below; both `None` when the rule carries no timeouts.

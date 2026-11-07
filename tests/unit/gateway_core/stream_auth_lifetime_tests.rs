@@ -2155,7 +2155,9 @@ fn assert_buffered_upload_region_stays_bounded(dispatcher: &str, open: &str, clo
         "a {dispatcher} buffered upload collect bypassed the charged collector"
     );
     assert_eq!(
-        region.matches("collect_charged_request_body(gated, ").count(),
+        region
+            .matches("collect_charged_request_body(gated, ")
+            .count(),
         authorized,
         "a {dispatcher} buffered upload collect bypassed the charged collector"
     );

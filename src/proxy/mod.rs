@@ -4832,10 +4832,14 @@ async fn prepare_mesh_request_body(
     // (issue #4231). Publish it onto the `Bytes` the mesh transport and its
     // replay clones hold, so the budget is released when the last handle
     // drops rather than when this frame ends. `None` is a body a plugin phase
-    // staged, which never took a charge.
+    // staged, which never took a charge. A body a request-body plugin grew past
+    // what the budget can cover is refused rather than retained uncharged.
     let body = match buffered.budget {
         Some(permit) => permit.into_charged_bytes(body),
-        None => Bytes::from(body),
+        None => Some(Bytes::from(body)),
+    };
+    let Some(body) = body else {
+        return Err(request_buffer_capacity_backend_response(request_ctx, resolved_ip));
     };
     // Authoritative gRPC request messages are counted from the backend-visible
     // body: `apply_request_body_plugins_with_context` above is where gRPC-Web
@@ -38959,6 +38963,28 @@ async fn handle_proxy_request_inner(
                     std::mem::take(&mut buffered.body),
                 )
                 .await;
+                // The transformed body replaces the charged one for the rest of
+                // the request, so its charge must cover it before any further
+                // phase (final hooks, egress, dispatch) keeps it.
+                let covered = response_buffer_budget::charge_covers(
+                    buffered.budget.as_mut(),
+                    transformed.capacity(),
+                );
+                if !covered {
+                    return Ok(finalize_terminal_request_body_read_rejection(
+                        &state,
+                        &plugins,
+                        &mut ctx,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        response_buffer_budget::REQUEST_BUFFER_OVERLOAD_BODY.as_bytes(),
+                        request_buffer_capacity_reject_headers(is_grpc_request),
+                        is_grpc_request,
+                        start_time,
+                        plugin_execution_ns,
+                        &original_request_path,
+                    )
+                    .await);
+                }
                 let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
@@ -39428,6 +39454,27 @@ async fn handle_proxy_request_inner(
                     std::mem::take(&mut buffered.body),
                 )
                 .await;
+                // The transformed body replaces the charged one for the rest of
+                // the request, so its charge must cover it before any further
+                // phase keeps it.
+                let covered = response_buffer_budget::charge_covers(
+                    buffered.budget.as_mut(),
+                    transformed.capacity(),
+                );
+                if !covered {
+                    cb_probe.release_neutral();
+                    drop(preacquired_backend_admission.take_if_acquired());
+                    let response = build_request_buffer_capacity_response(
+                        is_grpc_request,
+                        grpc_web_response_content_type,
+                        plugin_cache_view
+                            .initial_response_header_policy_plugins()
+                            .as_ref(),
+                    );
+                    ctx.terminal_record.mark_counted();
+                    record_request(&state, response.status().as_u16());
+                    return Ok(response);
+                }
                 let mut final_body_result = run_final_request_body_hooks(
                     &plugins,
                     body_hook_ctx.as_mut(),
@@ -40215,14 +40262,25 @@ async fn handle_proxy_request_inner(
                             initial_response_header_policy_plugins.as_ref(),
                         ));
                     }
-                    (
-                        buffered.method,
-                        buffered.headers,
-                        match buffered.budget {
-                            Some(permit) => permit.into_charged_bytes(buffered.body),
-                            None => Bytes::from(buffered.body),
-                        },
-                    )
+                    // A body a request-body plugin grew past what the budget
+                    // can cover is refused rather than retained uncharged.
+                    let grpc_req_body = match buffered.budget {
+                        Some(permit) => permit.into_charged_bytes(buffered.body),
+                        None => Some(Bytes::from(buffered.body)),
+                    };
+                    let Some(grpc_req_body) = grpc_req_body else {
+                        cb_probe.release_neutral();
+                        drop(preacquired_backend_admission.take_if_acquired());
+                        let response = build_request_buffer_capacity_response(
+                            true,
+                            grpc_web_response_content_type,
+                            initial_response_header_policy_plugins.as_ref(),
+                        );
+                        ctx.terminal_record.mark_counted();
+                        record_request(&state, response.status().as_u16());
+                        return Ok(response);
+                    };
+                    (buffered.method, buffered.headers, grpc_req_body)
                 }
             };
 
@@ -40701,14 +40759,25 @@ async fn handle_proxy_request_inner(
                                 ),
                             ))
                         } else {
-                            Ok((
-                                buffered.method,
-                                buffered.headers,
-                                match buffered.budget {
-                                    Some(permit) => permit.into_charged_bytes(buffered.body),
-                                    None => Bytes::from(buffered.body),
-                                },
-                            ))
+                            // Refused rather than retained uncharged when a
+                            // request-body plugin grew it past the budget.
+                            let grpc_req_body = match buffered.budget {
+                                Some(permit) => permit.into_charged_bytes(buffered.body),
+                                None => Some(Bytes::from(buffered.body)),
+                            };
+                            let Some(grpc_req_body) = grpc_req_body else {
+                                cb_probe.release_neutral();
+                                drop(preacquired_backend_admission.take_if_acquired());
+                                let response = build_request_buffer_capacity_response(
+                                    true,
+                                    grpc_web_response_content_type,
+                                    initial_response_header_policy_plugins.as_ref(),
+                                );
+                                ctx.terminal_record.mark_counted();
+                                record_request(&state, response.status().as_u16());
+                                return Ok(response);
+                            };
+                            Ok((buffered.method, buffered.headers, grpc_req_body))
                         }
                     }
                 };
@@ -52336,10 +52405,22 @@ async fn proxy_to_backend(
                 // for the backend write and retry replay (issue #4231). `None`
                 // is a plugin-staged or unit-test body that never reserved.
                 // Empty data returns `Bytes::new()` and drops the charge
-                // immediately, matching the in-dispatch collector below.
+                // immediately, matching the in-dispatch collector below. A body
+                // a request-body plugin grew past what the budget can cover is
+                // refused rather than retained uncharged.
                 let body_bytes = match buffered.budget {
                     Some(permit) => permit.into_charged_bytes(body_bytes),
-                    None => Bytes::from(body_bytes),
+                    None => Some(Bytes::from(body_bytes)),
+                };
+                let Some(body_bytes) = body_bytes else {
+                    return backend_dispatch_response(
+                        request_buffer_capacity_backend_response(
+                            Some(request_ctx),
+                            resolved_ip.clone(),
+                        ),
+                        None,
+                        None,
+                    );
                 };
                 if !body_bytes.is_empty() {
                     if retain_request_body {
@@ -52643,7 +52724,18 @@ async fn proxy_to_backend(
                 // Publish the charge onto the bytes that stay resident for the
                 // backend write and retry replay. An empty body retains nothing,
                 // so this returns `Bytes::new()` and drops the permit immediately.
-                let body_bytes = request_buffer_permit.into_charged_bytes(body_bytes);
+                // A body a request-body plugin grew past what the budget can
+                // cover is refused rather than retained uncharged.
+                let Some(body_bytes) = request_buffer_permit.into_charged_bytes(body_bytes) else {
+                    return backend_dispatch_response(
+                        request_buffer_capacity_backend_response(
+                            Some(request_ctx),
+                            resolved_ip.clone(),
+                        ),
+                        None,
+                        None,
+                    );
+                };
                 if !body_bytes.is_empty() {
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
@@ -54104,9 +54196,18 @@ async fn proxy_to_backend_direct_h1(
                     request_ctx,
                     &buffered.body,
                 );
+                // Refused rather than retained uncharged when a request-body
+                // plugin grew the body past what the budget can cover.
                 let body_bytes = match buffered.budget {
                     Some(permit) => permit.into_charged_bytes(buffered.body),
-                    None => Bytes::from(buffered.body),
+                    None => Some(Bytes::from(buffered.body)),
+                };
+                let Some(body_bytes) = body_bytes else {
+                    return backend_dispatch_response(
+                        request_buffer_capacity_backend_response(Some(request_ctx), resolved_ip),
+                        None,
+                        None,
+                    );
                 };
                 if body_bytes.is_empty() {
                     body::DirectH1RequestBody::Empty
@@ -66276,10 +66377,18 @@ async fn proxy_to_backend_http3(
     // before the optional retain-clone so retain becomes a refcount bump
     // rather than a Vec deep copy on every retry-enabled request. When a
     // permit is present (in-dispatch or pre-auth), it travels with the
-    // `Bytes` so send and retry replay stay charged (issue #4231).
-    let body_bytes: bytes::Bytes = match request_buffer_permit {
+    // `Bytes` so send and retry replay stay charged (issue #4231). A body a
+    // request-body plugin grew past what the budget can cover is refused
+    // rather than retained uncharged.
+    let body_bytes: Option<bytes::Bytes> = match request_buffer_permit {
         Some(permit) => permit.into_charged_bytes(request_body),
-        None => request_body.into(),
+        None => Some(request_body.into()),
+    };
+    let Some(body_bytes) = body_bytes else {
+        return (
+            request_buffer_capacity_backend_response(Some(request_ctx), resolved_ip),
+            None,
+        );
     };
     let retained_body = if retain_request_body && !body_bytes.is_empty() {
         Some(body_bytes.clone())
