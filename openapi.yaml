@@ -5792,6 +5792,14 @@ paths:
         instead of detaching them; send `"plugins": []` to clear them
         explicitly.
 
+        **Masked secrets.** Stored backend TLS private-key material (an inline
+        PEM key in `backend_tls_client_key_path`, or a private-key block in the
+        certificate or CA field) is returned to `operator` and `viewer` reads
+        as `[REDACTED]`. A `PUT` (or `POST /proxies`) by an `operator` whose
+        body carries that placeholder in one of those fields is rejected with
+        `400` and nothing is mutated. Send the real key or a reference with the
+        change. `admin` reads are raw, so an admin round trip is unaffected.
+
         In database mode a `200` means a covering `config_changes` generation
         is live on this process. If reload cannot apply, the API returns `503`
         with `applied: false` even though the row is durable.
@@ -7137,6 +7145,13 @@ paths:
         the token, and `If-Match` would not catch it. Send the real token, or
         omit it to clear it: the full replace does not keep the stored token.
         `admin` reads are raw, so an admin round trip is unaffected.
+
+        Stored backend TLS private-key material (an inline PEM key in
+        `backend_tls_client_key_path`, or a private-key block in the
+        certificate or CA field) is likewise returned to `operator` and
+        `viewer` reads as `[REDACTED]`, and an `operator` body that echoes
+        that placeholder in those fields is rejected with `400`. Send the real
+        key or a reference with the change.
       tags: [Upstreams]
       requestBody:
         required: true
@@ -10981,6 +10996,9 @@ components:
             optional pkcs11 build feature. Module overrides require admission by
             FERRUM_PKCS11_MODULE_ALLOWED_PATHS on each node. Without that policy,
             omit module options to use FERRUM_PKCS11_MODULE_PATH. Max 4096 characters.
+            Inline PEM key material is withheld from every non-admin read
+            (`[REDACTED]`; a fingerprint in `GET /config/export`); references
+            stay visible.
             When admin namespace-claim enforcement is on, or the token carries
             an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
@@ -15071,6 +15089,9 @@ components:
             With the optional pkcs11 build feature, also accepts a pkcs11 signer
             URI. Module overrides require FERRUM_PKCS11_MODULE_ALLOWED_PATHS on
             each node; without it, omit module options to use FERRUM_PKCS11_MODULE_PATH.
+            Inline PEM key material is withheld from every non-admin read
+            (`[REDACTED]`; a fingerprint in `GET /config/export`); references
+            stay visible.
             When admin namespace-claim enforcement is on, or the token carries
             an `ns` claim even with enforcement off, an `operator` may set only
             inline PEM, `system://`, or a `k8s://` Secret in the addressed
@@ -20388,6 +20409,9 @@ components:
               type: integer
         proxies:
           type: array
+          description: >-
+            Proxies with stored backend TLS private-key material, and any URL
+            carrying userinfo, rendered as a `CredentialFingerprint`.
           items:
             $ref: "#/components/schemas/Proxy"
         consumers:
@@ -20404,8 +20428,9 @@ components:
         upstreams:
           type: array
           description: >-
-            Upstreams with `service_discovery.consul.token` rendered as a
-            `CredentialFingerprint` when set.
+            Upstreams with `service_discovery.consul.token`, and stored backend
+            TLS private-key material, rendered as a `CredentialFingerprint`
+            when set.
           items:
             $ref: "#/components/schemas/Upstream"
 

@@ -2680,3 +2680,214 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     );
     assert_eq!(stored["config"]["batch_size"], 100);
 }
+
+/// A self-signed backend mTLS client certificate and its PKCS#8 private key,
+/// both PEM, so admission (which parses inline material) accepts them.
+fn backend_client_cert_and_key_pem() -> (String, String) {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client key");
+    let params =
+        rcgen::CertificateParams::new(vec!["client.test".to_string()]).expect("client params");
+    let cert = params.self_signed(&key).expect("self-signed client cert");
+    (cert.pem(), key.serialize_pem())
+}
+
+fn backend_tls_proxy(id: &str, cert: &str, key: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "listen_path": format!("/{id}"),
+        "backend_scheme": "https",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8443,
+        "backend_tls_client_cert_path": cert,
+        "backend_tls_client_key_path": key
+    })
+}
+
+fn backend_tls_upstream(id: &str, cert: &str, key: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "targets": [{"host": "127.0.0.1", "port": 8443, "weight": 100}],
+        "algorithm": "round_robin",
+        "backend_tls_client_cert_path": cert,
+        "backend_tls_client_key_path": key
+    })
+}
+
+/// The item with `id` in a paginated list response.
+fn list_item<'a>(list: &'a Value, id: &str) -> &'a Value {
+    list["data"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == id))
+        .unwrap_or_else(|| panic!("{id} must be listed: {list}"))
+}
+
+/// An inline PEM private key stored in `backend_tls_client_key_path` is never
+/// returned by `viewer` or `operator` reads (single or list) or in audit
+/// diffs. A key reference and the public certificate stay visible, and
+/// `admin` reads stay raw.
+#[tokio::test]
+async fn non_admin_reads_withhold_inline_backend_tls_private_keys() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let (cert_pem, key_pem) = backend_client_cert_and_key_pem();
+    let key_body = key_pem.lines().nth(1).expect("key body line").to_string();
+    let cert_file = tmp.path().join("client.crt");
+    let key_file = tmp.path().join("client.key");
+    std::fs::write(&cert_file, &cert_pem).expect("write client cert");
+    std::fs::write(&key_file, &key_pem).expect("write client key");
+    let cert_path = cert_file.to_str().expect("utf-8 temp path").to_string();
+    let key_path = key_file.to_str().expect("utf-8 temp path").to_string();
+
+    for (route, inline, by_path) in [
+        (
+            "/proxies",
+            backend_tls_proxy("pem-proxy", &cert_pem, &key_pem),
+            backend_tls_proxy("path-proxy", &cert_path, &key_path),
+        ),
+        (
+            "/upstreams",
+            backend_tls_upstream("pem-upstream", &cert_pem, &key_pem),
+            backend_tls_upstream("path-upstream", &cert_path, &key_path),
+        ),
+    ] {
+        for body in [&inline, &by_path] {
+            let (status, response) = post_json(&base, route, &admin, body).await;
+            assert_eq!(status, 201, "{route} create failed: {response:?}");
+        }
+        let inline_id = inline["id"].as_str().expect("inline id");
+        let path_id = by_path["id"].as_str().expect("path id");
+
+        for (role, bearer) in [("viewer", &viewer), ("operator", &operator)] {
+            let (status, single) = get_json(&base, &format!("{route}/{inline_id}"), bearer).await;
+            assert_eq!(status, 200, "{role} {route} get failed: {single:?}");
+            let (status, list) = get_json(&base, route, bearer).await;
+            assert_eq!(status, 200, "{role} {route} list failed: {list:?}");
+            for body in [&single, list_item(&list, inline_id)] {
+                assert_eq!(
+                    body["backend_tls_client_key_path"], "[REDACTED]",
+                    "{role} {route} read returned the inline key: {body}"
+                );
+                assert_eq!(body["backend_tls_client_cert_path"], cert_pem.as_str());
+                assert_eq!(body["name"], inline_id);
+                let text = body.to_string();
+                assert!(
+                    !text.contains("PRIVATE KEY") && !text.contains(&key_body),
+                    "{role} {route} read leaked private-key material: {body}"
+                );
+            }
+
+            // A reference names the key without disclosing it.
+            let (status, single) = get_json(&base, &format!("{route}/{path_id}"), bearer).await;
+            assert_eq!(status, 200, "{role} {route} get failed: {single:?}");
+            assert_eq!(single["backend_tls_client_key_path"], key_path.as_str());
+            assert_eq!(single["backend_tls_client_cert_path"], cert_path.as_str());
+        }
+
+        let (status, raw) = get_json(&base, &format!("{route}/{inline_id}"), &admin).await;
+        assert_eq!(status, 200, "admin {route} get failed: {raw:?}");
+        assert_eq!(raw["backend_tls_client_key_path"], key_pem.as_str());
+    }
+
+    for (resource_type, id) in [("proxy", "pem-proxy"), ("upstream", "pem-upstream")] {
+        let audit_body = wait_for_audit_total(
+            &base,
+            &format!("/audit?resource_type={resource_type}&resource_id={id}"),
+            &admin,
+            1,
+        )
+        .await;
+        let event = &audit_body["items"].as_array().expect("audit items")[0];
+        assert_eq!(
+            event["diff"]["after"]["backend_tls_client_key_path"], "[REDACTED]",
+            "{resource_type} audit diff kept the inline key: {event:?}"
+        );
+        let serialized = event["diff"].to_string();
+        assert!(
+            !serialized.contains("PRIVATE KEY") && !serialized.contains(&key_body),
+            "{resource_type} audit diff leaked private-key material: {event:?}"
+        );
+    }
+}
+
+/// Issue #5925 semantics for the masked backend TLS key: an operator that
+/// writes back the `[REDACTED]` it was shown is refused with `400` and the
+/// stored key survives; resending the real key is an ordinary write.
+#[tokio::test]
+async fn operator_round_trip_of_masked_backend_tls_private_key_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let operator = token("mesh-operator", Some("operator"));
+    let (cert_pem, key_pem) = backend_client_cert_and_key_pem();
+
+    for (route, body) in [
+        (
+            "/proxies",
+            backend_tls_proxy("roundtrip-pem-proxy", &cert_pem, &key_pem),
+        ),
+        (
+            "/upstreams",
+            backend_tls_upstream("roundtrip-pem-upstream", &cert_pem, &key_pem),
+        ),
+    ] {
+        let (status, response) = post_json(&base, route, &admin, &body).await;
+        assert_eq!(status, 201, "{route} create failed: {response:?}");
+        let path = format!("{route}/{}", body["id"].as_str().expect("id"));
+
+        let (status, etag, mut masked) =
+            send_json(reqwest::Method::GET, &base, &path, &operator, None, None).await;
+        assert_eq!(status, 200, "operator {route} get failed: {masked:?}");
+        assert_eq!(masked["backend_tls_client_key_path"], "[REDACTED]");
+        let etag = etag.expect("GET carries an ETag");
+
+        // An unrelated edit, written back with the masked key and a fresh tag.
+        masked["name"] = json!("renamed-by-operator");
+        let (status, _, refused) = send_json(
+            reqwest::Method::PUT,
+            &base,
+            &path,
+            &operator,
+            Some(&etag),
+            Some(&masked),
+        )
+        .await;
+        assert_eq!(status, 400, "{route} masked write accepted: {refused:?}");
+        let error = refused["error"].as_str().expect("error message");
+        assert!(
+            error.contains("/backend_tls_client_key_path") && error.contains("real value"),
+            "unexpected refusal: {error}"
+        );
+        assert!(!error.contains("PRIVATE KEY"), "{error}");
+
+        let (_, _, stored) =
+            send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+        assert_eq!(stored["backend_tls_client_key_path"], key_pem.as_str());
+        assert_ne!(stored["name"], "renamed-by-operator", "write mutated");
+
+        // Sending the real key is an ordinary operator write.
+        masked["backend_tls_client_key_path"] = json!(key_pem);
+        let (status, _, response) = send_json(
+            reqwest::Method::PUT,
+            &base,
+            &path,
+            &operator,
+            Some(&etag),
+            Some(&masked),
+        )
+        .await;
+        assert_eq!(status, 200, "{route} operator write failed: {response:?}");
+        assert_eq!(response["backend_tls_client_key_path"], "[REDACTED]");
+        let (_, _, stored) =
+            send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+        assert_eq!(stored["backend_tls_client_key_path"], key_pem.as_str());
+        assert_eq!(stored["name"], "renamed-by-operator");
+    }
+}

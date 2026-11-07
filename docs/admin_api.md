@@ -1459,6 +1459,9 @@ their place. For the roles that can write:
 
 - **`operator` reads of upstreams** replace `service_discovery.consul.token`
   with `[REDACTED]`.
+- **`operator` reads of proxies and upstreams** replace stored backend TLS
+  private-key material with `[REDACTED]` (see
+  [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads)).
 - **`operator` reads of plugin configs** use the redacted plugin-config
   projection described under [Plugin Configs](#plugin-configs): `[REDACTED]`
   for secrets, structural endpoint URLs retain markers for each stripped
@@ -1468,12 +1471,12 @@ their place. For the roles that can write:
   as `redis://redacted@host:port/db`; one with a query projects as
   `redis://host:port/db?[REDACTED_QUERY]`.
 
-`admin` reads of these resources are raw, and `operator` reads of proxies keep
-URL userinfo verbatim, so neither has anything to write back.
+`admin` reads of these resources are raw, and `operator` reads of proxies and
+upstreams keep URL userinfo verbatim, so neither has anything to write back.
 
-A `POST` or `PUT` of an upstream or plugin config whose body carries one of those
-placeholders at a field the caller's read projection masks is refused with `400`
-and nothing is mutated (issue #5925). Without this check, an operator tool that
+A `POST` or `PUT` of a proxy, upstream, or plugin config whose body carries one
+of those placeholders at a field the caller's read projection masks is refused
+with `400` and nothing is mutated (issue #5925). Without this check, an operator tool that
 reads a resource, edits an unrelated field, and writes the body back would store
 the literal placeholder as the secret. `If-Match` cannot catch it: the `ETag`
 covers the full stored resource, so the masked body's tag still matches. The
@@ -1511,6 +1514,31 @@ are also `admin`-only, and their credential projection has its own round-trip
 rule: a `[REDACTED]` credential entry is restored from the stored entry (see
 [Consumers](#consumers)).
 
+### Backend TLS private keys in reads
+
+`backend_tls_client_key_path` on proxies and upstreams accepts inline PEM as
+well as a reference. Non-admin projections never return stored private-key
+material: `viewer` and `operator` reads (single and list), write responses to
+an `operator`, admin audit diffs, and `GET /config/export` (as a fingerprint)
+all withhold it. `admin` reads and `/backup` stay raw.
+
+- **Withheld.** In `backend_tls_client_key_path`, any value that is or may be
+  inline material: PEM armour (`-----BEGIN`, in any case) anywhere in the
+  value, or a line break or other control character, neither of which a path
+  or typed URI contains. In `backend_tls_client_cert_path` and
+  `backend_tls_server_ca_cert_path`, a value that carries a PEM private-key
+  block (for example a certificate-plus-key bundle pasted into the
+  certificate field).
+- **Visible.** References name the material without disclosing it and are
+  returned verbatim: a filesystem path, `k8s://`, `vault://`, `aws://`,
+  `azure://`, `gcp://`, `managed://`, `acme://`, `pkcs11://` and `system://`
+  sources. Inline certificates and CA bundles are public and stay visible.
+
+An `operator` write that echoes the `[REDACTED]` placeholder back in any of
+these fields is refused with `400`, exactly as described above, and the stored
+key is untouched. Because the certificate and key must be set together,
+omitting the key does not clear it; send the real key (an inline PEM key or a
+reference) with the change, or have an `admin` make it.
 
 ### Conditional writes (`ETag` / `If-Match`)
 
@@ -2002,12 +2030,15 @@ curl -H "Authorization: Bearer $VIEWER_TOKEN" \
     per entry.
   - In plugin configs, fingerprints replace secrets and credential-bearing
     URLs, including URLs whose path or query would otherwise be masked.
-  - Upstream `service_discovery.consul.token` gets a fingerprint, and any URL
-    carrying userinfo anywhere in a Proxy or Upstream (a Consul `address`,
-    for example) is fingerprinted. `viewer` reads and audit diffs strip that
-    userinfo to `redacted@` as well. `operator` and `admin` reads of proxies
-    and upstreams keep it verbatim: both roles write those resources, and a
-    GET-then-PUT must not replace stored userinfo with `redacted@`.
+  - Upstream `service_discovery.consul.token` gets a fingerprint, as does
+    stored backend TLS private-key material in a Proxy or Upstream (see
+    [Backend TLS private keys in reads](#backend-tls-private-keys-in-reads));
+    key references stay verbatim. Any URL carrying userinfo anywhere in a
+    Proxy or Upstream (a Consul `address`, for example) is fingerprinted.
+    `viewer` reads and audit diffs strip that userinfo to `redacted@` as well.
+    `operator` and `admin` reads of proxies and upstreams keep it verbatim:
+    both roles write those resources, and a GET-then-PUT must not replace
+    stored userinfo with `redacted@`.
 
   A value the viewer projection shows is shown verbatim.
 - **Hidden credential types.** Ordinary Consumer reads omit `basicauth` and
