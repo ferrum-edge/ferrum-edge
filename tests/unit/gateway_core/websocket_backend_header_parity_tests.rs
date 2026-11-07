@@ -1,9 +1,13 @@
 //! Backend WebSocket handshake request-header strip, H1/H2 vs H3.
 //!
 //! Both frontends bridge to the same backend WebSocket transport, so both
-//! collectors strip the shared WebSocket handshake set
-//! (`headers::WEBSOCKET_HANDSHAKE_STRIP_HEADER_NAMES`) and the
-//! consumer-assertion namespace through the shared predicates.
+//! collectors apply ONE predicate for "may this name reach a backend WebSocket
+//! handshake" (`headers::is_websocket_backend_request_strip_header`: the
+//! canonical backend request strip set, the WebSocket handshake set, and the
+//! consumer-assertion namespace). The H3 collector used to keep its own
+//! hop-by-hop list, which missed four later hardenings of the canonical set
+//! (`content-length`, `expect`, `x-ferrum-original-content-encoding`,
+//! `x-grpc-web-mode`).
 //!
 //! Each collector keeps its own frontend-specific arms, pinned below: H3 strips
 //! a client `early-data` and re-injects the gateway's own on 0-RTT, and drops
@@ -136,6 +140,16 @@ fn both_frontends_strip_the_websocket_handshake_set_and_consumer_namespace() {
         .copied()
         .collect();
     assert_both_frontends_strip(&names);
+}
+
+/// Shared invariant: both frontends strip the whole canonical backend request
+/// strip set. Before the H3 collector delegated to the shared predicate it
+/// forwarded `content-length`, `expect`, `x-ferrum-original-content-encoding`
+/// and `x-grpc-web-mode` on the backend handshake.
+#[test]
+fn both_frontends_strip_the_canonical_backend_request_strip_set() {
+    assert_both_frontends_strip(BACKEND_REQUEST_STRIP_HEADER_NAMES);
+    assert_both_frontends_strip(&shared_strip_names());
 }
 
 /// INTENTIONAL (H3 only): H3 is the only frontend that terminates 0-RTT

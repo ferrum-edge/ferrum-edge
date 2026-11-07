@@ -316,10 +316,11 @@ fn buf_into_bytes<B: Buf>(mut buf: B) -> Bytes {
 /// Strip hop-by-hop headers and HTTP/1.1 WebSocket handshake artefacts
 /// before forwarding the WebSocket request to the backend.
 ///
-/// The WebSocket handshake set and the consumer-assertion namespace are the
-/// shared predicates the H1/H2 collector
-/// (`crate::proxy::collect_forwardable_websocket_headers`) also applies. The
-/// H3-only arms stay here: a client `early-data` is replaced by the gateway's
+/// The shared predicate is the one the H1/H2 collector
+/// (`crate::proxy::collect_forwardable_websocket_headers`) also applies:
+/// `headers::is_websocket_backend_request_strip_header` (the canonical backend
+/// request strip set, the WebSocket handshake set, and the consumer-assertion
+/// namespace). The H3-only arms stay here: a client `early-data` is replaced by the gateway's
 /// own value on 0-RTT, and H3 pseudo-headers never become HTTP/1.1 fields. The
 /// H1/H2 `Connection`-nomination strip does not apply: `Connection` is
 /// malformed on H3 (RFC 9114 §4.2) and ingress confinement runs first.
@@ -327,17 +328,6 @@ pub(crate) fn collect_forwardable_h3_headers(
     headers: &HashMap<String, String>,
     is_early_data: bool,
 ) -> Vec<(String, String)> {
-    /// Hop-by-hop request headers (RFC 9110 §7.6.1) this collector strips.
-    const HOP_BY_HOP: &[&str] = &[
-        "connection",
-        "upgrade",
-        "transfer-encoding",
-        "te",
-        "trailer",
-        "keep-alive",
-        "proxy-authorization",
-        "proxy-connection",
-    ];
     /// H3-only names: never forwarded from the client.
     const H3_ONLY: &[&str] = &[
         // RFC 8470 §5.2: clients do not set this. The gateway strips any
@@ -357,9 +347,7 @@ pub(crate) fn collect_forwardable_h3_headers(
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&lower.as_str())
-                || crate::proxy::headers::is_websocket_handshake_strip_header(&lower)
-                || crate::proxy::headers::is_consumer_assertion_header(&lower)
+            if crate::proxy::headers::is_websocket_backend_request_strip_header(&lower)
                 || H3_ONLY.contains(&lower.as_str())
             {
                 return None;

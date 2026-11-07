@@ -3575,7 +3575,7 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
     (
         "H3 WebSocket handshake",
         "src/http3/websocket.rs",
-        "crate::proxy::headers::is_consumer_assertion_header(&lower)",
+        "crate::proxy::headers::is_websocket_backend_request_strip_header(&lower)",
     ),
     (
         "H3-to-gRPC bridge trusted overlay",
