@@ -121,7 +121,7 @@ Supported `client_auth.method` values are:
 | `client_secret_basic` | Sends the client secret with HTTP Basic auth. The client identifier and secret are `application/x-www-form-urlencoded` before the Basic encoding, per [RFC 6749 §2.3.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1), so credentials containing `:`, `+`, spaces, or non-ASCII characters work against a conforming provider |
 | `client_secret_post` | Sends client credentials in the token request body |
 | `private_key_jwt` | Signs a client assertion with RSA, EC, or EdDSA keys (`RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `EdDSA`). Admission signs a throwaway assertion, so a key that cannot support the selected algorithm — an `ES256` client holding a P-384 key, for example — is refused at config load instead of failing the first token exchange after the authorization code has been spent |
-| `none` | Public client mode, allowed only when the token endpoint (configured or discovered) and any discovered `revocation_endpoint` are loopback IP literals; the name `localhost` does not qualify |
+| `none` | Public client mode, allowed only when the token endpoint (configured or discovered) is a loopback IP literal; the name `localhost` does not qualify. A discovered `revocation_endpoint` that is not a loopback IP literal is ignored, so logout skips revocation |
 
 ## Logout
 

@@ -1403,7 +1403,7 @@ impl OidcRelyingParty {
         let jwks_publication_gate = Arc::new(Mutex::new(()));
         let explicit_userinfo_endpoint = userinfo_endpoint.clone();
         let explicit_end_session_endpoint = end_session_endpoint.clone();
-        let token_endpoint_requires_loopback = matches!(client_auth, OidcClientAuth::None);
+        let none_auth_requires_loopback_endpoints = matches!(client_auth, OidcClientAuth::None);
         let discovery_task = if start_background_tasks {
             discovery_url.clone().map(|url| {
                 spawn_oidc_discovery(
@@ -1418,7 +1418,7 @@ impl OidcRelyingParty {
                     issuer.clone(),
                     explicit_userinfo_endpoint,
                     explicit_end_session_endpoint,
-                    token_endpoint_requires_loopback,
+                    none_auth_requires_loopback_endpoints,
                 )
             })
         } else {
@@ -5203,7 +5203,7 @@ fn spawn_oidc_discovery(
     expected_issuer: String,
     explicit_userinfo_endpoint: Option<String>,
     explicit_end_session_endpoint: Option<String>,
-    token_endpoint_requires_loopback: bool,
+    none_auth_requires_loopback_endpoints: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
@@ -5224,7 +5224,7 @@ fn spawn_oidc_discovery(
                 &expected_issuer,
                 explicit_userinfo_endpoint.is_some(),
                 explicit_end_session_endpoint.is_some(),
-                token_endpoint_requires_loopback,
+                none_auth_requires_loopback_endpoints,
             )
             .await
             {
@@ -5296,7 +5296,7 @@ fn spawn_oidc_discovery(
 /// copy-paste error pairing one tenant's issuer with another tenant's
 /// discovery URL sent users — and the client credential — to the wrong
 /// tenant's endpoints before ID-token validation failed (MUSE-3).
-/// `token_endpoint_requires_loopback` carries `client_auth.method: none`: an
+/// `none_auth_requires_loopback_endpoints` carries `client_auth.method: none`: an
 /// unauthenticated token exchange is admitted only against a loopback
 /// IP-literal token endpoint, and a discovered one must satisfy the same rule
 /// as a configured one (construction can only check the discovery URL).
@@ -5306,7 +5306,7 @@ async fn fetch_discovery(
     expected_issuer: &str,
     userinfo_overridden: bool,
     end_session_overridden: bool,
-    token_endpoint_requires_loopback: bool,
+    none_auth_requires_loopback_endpoints: bool,
 ) -> Result<DiscoveryDoc, String> {
     let client = http_client
         .get()
@@ -5342,7 +5342,7 @@ async fn fetch_discovery(
         .and_then(Value::as_str)
         .ok_or_else(|| "missing token_endpoint".to_string())
         .and_then(|url| validate_discovered_url(discovery_url, url, "token_endpoint"))?;
-    if token_endpoint_requires_loopback
+    if none_auth_requires_loopback_endpoints
         && !Url::parse(&token_endpoint)
             .ok()
             .and_then(|url| url.host_str().map(is_loopback_ip_literal_host))
@@ -5374,14 +5374,17 @@ async fn fetch_discovery(
             .map(|url| validate_discovered_url(discovery_url, url, "end_session_endpoint"))
             .transpose()?
     };
-    let revocation_endpoint = body
+    let mut revocation_endpoint = body
         .get("revocation_endpoint")
         .and_then(Value::as_str)
         .map(|url| validate_discovered_url(discovery_url, url, "revocation_endpoint"))
         .transpose()?;
     // Logout revocation POSTs the session refresh token through the same
     // unauthenticated `none` exchange, so it obeys the token endpoint's rule.
-    if token_endpoint_requires_loopback
+    // Revocation is optional and best-effort, so a named endpoint is dropped
+    // (logout then skips revocation) rather than refusing the whole document,
+    // which would take login offline too.
+    if none_auth_requires_loopback_endpoints
         && revocation_endpoint.as_deref().is_some_and(|endpoint| {
             !Url::parse(endpoint)
                 .ok()
@@ -5389,10 +5392,11 @@ async fn fetch_discovery(
                 .unwrap_or(false)
         })
     {
-        return Err(
-            "discovered revocation_endpoint must be a loopback IP literal when client_auth.method is none"
-                .to_string(),
+        warn!(
+            plugin = "oidc_relying_party",
+            "Ignoring a discovered revocation_endpoint that is not a loopback IP literal under client_auth.method none; logout will not revoke refresh tokens"
         );
+        revocation_endpoint = None;
     }
     Ok(DiscoveryDoc {
         authorization_endpoint,
@@ -5838,8 +5842,9 @@ mod tests {
         assert!(fetch(&literal, true).await.is_ok());
 
         // Logout revocation carries the refresh token through the same
-        // unauthenticated exchange, so a named revocation endpoint is refused
-        // under `none` too.
+        // unauthenticated exchange. Under `none` a named revocation endpoint is
+        // dropped (revocation is best-effort) while the document still
+        // publishes; a credentialed provider keeps it.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -5852,12 +5857,17 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let error = fetch(&server, true)
-            .await
-            .err()
-            .expect("none must refuse a named discovered revocation endpoint");
-        assert!(error.contains("revocation_endpoint"), "{error}");
-        assert!(fetch(&server, false).await.is_ok());
+        let Ok(doc) = fetch(&server, true).await else {
+            panic!("a named revocation endpoint must not refuse the document");
+        };
+        assert!(doc.revocation_endpoint.is_none());
+        let Ok(doc) = fetch(&server, false).await else {
+            panic!("a credentialed provider keeps cross-origin HTTPS revocation");
+        };
+        assert_eq!(
+            doc.revocation_endpoint.as_deref(),
+            Some("https://revoke.example.com/revoke")
+        );
 
         // A loopback IP-literal revocation endpoint on the discovery origin
         // stays admitted under `none`.
@@ -5873,10 +5883,9 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let doc = fetch(&server, true)
-            .await
-            .ok()
-            .expect("a loopback IP-literal revocation endpoint is admitted under none");
+        let Ok(doc) = fetch(&server, true).await else {
+            panic!("a loopback IP-literal revocation endpoint is admitted under none");
+        };
         assert_eq!(
             doc.revocation_endpoint.as_deref(),
             Some(format!("{}/revoke", server.uri()).as_str())
