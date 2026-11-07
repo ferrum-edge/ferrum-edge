@@ -5858,6 +5858,29 @@ mod tests {
             .expect("none must refuse a named discovered revocation endpoint");
         assert!(error.contains("revocation_endpoint"), "{error}");
         assert!(fetch(&server, false).await.is_ok());
+
+        // A loopback IP-literal revocation endpoint on the discovery origin
+        // stays admitted under `none`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": server.uri(),
+                "authorization_endpoint": format!("{}/authorize", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "revocation_endpoint": format!("{}/revoke", server.uri()),
+                "jwks_uri": format!("{}/jwks", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        let doc = fetch(&server, true)
+            .await
+            .ok()
+            .expect("a loopback IP-literal revocation endpoint is admitted under none");
+        assert_eq!(
+            doc.revocation_endpoint.as_deref(),
+            Some(format!("{}/revoke", server.uri()).as_str())
+        );
     }
 
     #[test]
