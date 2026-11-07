@@ -805,6 +805,113 @@ fn test_env_derived_enabled_http_port_is_accepted() {
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 }
 
+fn load_testing_egress_policy(
+    allow_ips: ferrum_edge::config::BackendAllowIps,
+    allow_cidrs: &str,
+    deny_cidrs: &str,
+) -> ferrum_edge::config::BackendEgressPolicy {
+    ferrum_edge::config::BackendEgressPolicy::from_env(allow_ips, allow_cidrs, deny_cidrs, true)
+        .expect("valid backend egress policy")
+}
+
+fn client_with_policy(policy: &ferrum_edge::config::BackendEgressPolicy) -> PluginHttpClient {
+    PluginHttpClient::default_with_backend_allow_ips(policy.clone())
+}
+
+#[test]
+fn load_testing_gateway_port_respects_backend_egress_policy() {
+    use ferrum_edge::config::BackendAllowIps;
+    use ferrum_edge::plugins::validate_plugin_config_with_policy;
+
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTP_PORT"]);
+    env.set("FERRUM_PROXY_HTTP_PORT", "18082");
+    // A co-located loopback service that is not this gateway's proxy listener.
+    let sidecar_config = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 18090
+    });
+
+    // `public` denies loopback: a non-listener `gateway_port` is refused at
+    // admission, exactly like a loopback `gateway_addresses` entry.
+    let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
+    let err = LoadTesting::new(&sidecar_config, client_with_policy(&public))
+        .err()
+        .expect("non-listener loopback port must be denied under a public policy");
+    assert!(err.contains("`gateway_port`"), "got: {err}");
+    assert!(err.contains("backend egress policy"), "got: {err}");
+    assert!(err.contains("HTTP (FERRUM_PROXY_HTTP_PORT)"), "got: {err}");
+    assert!(
+        validate_plugin_config_with_policy("load_testing", &sidecar_config, &public).is_err(),
+        "admin admission must refuse the same config"
+    );
+
+    // A deny CIDR covering loopback denies it under `both` mode too.
+    let deny_loopback = load_testing_egress_policy(BackendAllowIps::Both, "", "127.0.0.0/8");
+    let err = LoadTesting::new(&sidecar_config, client_with_policy(&deny_loopback))
+        .err()
+        .expect("non-listener loopback port must be denied by a loopback deny CIDR");
+    assert!(err.contains("FERRUM_BACKEND_DENY_CIDRS"), "got: {err}");
+
+    // Controls: a policy that permits loopback admits the explicit port.
+    let both = load_testing_egress_policy(BackendAllowIps::Both, "", "");
+    assert!(LoadTesting::new(&sidecar_config, client_with_policy(&both)).is_ok());
+    let allow_loopback = load_testing_egress_policy(BackendAllowIps::Public, "127.0.0.1/32", "");
+    assert!(LoadTesting::new(&sidecar_config, client_with_policy(&allow_loopback)).is_ok());
+
+    // Controls: the self-dial to the effective listener stays admitted under
+    // `public`, whether `gateway_port` is omitted or names that listener.
+    let default_port = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1
+    });
+    assert!(LoadTesting::new(&default_port, client_with_policy(&public)).is_ok());
+    let explicit_listener = json!({
+        "key": VALID_KEY,
+        "concurrent_clients": 1,
+        "duration_seconds": 1,
+        "gateway_port": 18082
+    });
+    assert!(LoadTesting::new(&explicit_listener, client_with_policy(&public)).is_ok());
+    assert!(
+        validate_plugin_config_with_policy("load_testing", &explicit_listener, &public).is_ok(),
+        "admin admission must admit the effective listener"
+    );
+}
+
+#[test]
+fn load_testing_tls_gateway_port_is_screened_against_the_https_listener() {
+    use ferrum_edge::config::BackendAllowIps;
+
+    let env = crate::unit::env_lock::EnvGuard::new(&["FERRUM_PROXY_HTTPS_PORT"]);
+    env.set("FERRUM_PROXY_HTTP_PORT", "18082");
+    env.set("FERRUM_PROXY_HTTPS_PORT", "18443");
+    let public = load_testing_egress_policy(BackendAllowIps::Public, "", "");
+    let config = |gateway_port: Option<u16>| {
+        let mut body = json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_tls": true
+        });
+        if let Some(port) = gateway_port {
+            body["gateway_port"] = json!(port);
+        }
+        body
+    };
+
+    assert!(LoadTesting::new(&config(None), client_with_policy(&public)).is_ok());
+    assert!(LoadTesting::new(&config(Some(18443)), client_with_policy(&public)).is_ok());
+    // The HTTP listener is not the listener `gateway_tls` selects.
+    let err = LoadTesting::new(&config(Some(18082)), client_with_policy(&public))
+        .err()
+        .expect("a port other than the HTTPS listener must be denied under a public policy");
+    assert!(err.contains("HTTPS (FERRUM_PROXY_HTTPS_PORT)"), "got: {err}");
+    assert!(err.contains("backend egress policy"), "got: {err}");
+}
+
 #[test]
 fn test_should_buffer_only_when_trigger_key_matches() {
     let plugin = make_plugin();

@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **`load_testing` no longer sends synthetic requests to a loopback port the
+  backend egress policy forbids.** `gateway_port` was only range-checked, and
+  replays dialled `127.0.0.1:{gateway_port}` from a dedicated client that
+  never consulted `FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_DENY_CIDRS`, so
+  an Operator could aim up to 10,000 concurrent replays at any co-located
+  loopback service even where the policy denied loopback. A `gateway_port`
+  other than this node's effective proxy listener port (for the scheme
+  `gateway_tls` selects) is now rejected at admission when the policy denies
+  `127.0.0.1`, matching the screen `gateway_addresses` entries already pass.
+  Omitting `gateway_port`, or setting it to the effective listener, is
+  unchanged, as is every deployment whose policy permits loopback (the default
+  `both` mode).
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,

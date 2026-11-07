@@ -590,6 +590,18 @@ impl LoadTesting {
             "HTTP (FERRUM_PROXY_HTTP_PORT)"
         };
 
+        // Startup resolves the listener ports through the conf-aware
+        // `resolve_default` macro, so a bare `std::env::var` lookup here would
+        // ignore `ferrum.conf` / `--settings`: identical listener settings
+        // would admit differently depending only on where the operator wrote
+        // them, and a non-default settings file listener would leave synthetic
+        // traffic aimed at the hardcoded default port. Use the same env >
+        // conf-file precedence the effective listener uses (issue #5156).
+        let listener_port_setting = crate::config::conf_file::resolve_ferrum_var(default_env_var);
+        let effective_listener_port = listener_port_setting
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(default_port);
+
         let gateway_port = optional_u64(config, "gateway_port")?
             .map(|p| {
                 if p == 0 || p > 65535 {
@@ -602,19 +614,7 @@ impl LoadTesting {
                 }
             })
             .transpose()?
-            .unwrap_or_else(|| {
-                // Startup resolves the listener ports through the conf-aware
-                // `resolve_default` macro, so a bare `std::env::var` lookup
-                // here would ignore `ferrum.conf` / `--settings`: identical
-                // listener settings would admit differently depending only on
-                // where the operator wrote them, and a non-default settings
-                // file listener would leave synthetic traffic aimed at the
-                // hardcoded default port. Use the same env > conf-file
-                // precedence the effective listener uses (issue #5156).
-                crate::config::conf_file::resolve_ferrum_var(default_env_var)
-                    .and_then(|v| v.trim().parse::<u16>().ok())
-                    .unwrap_or(default_port)
-            });
+            .unwrap_or(effective_listener_port);
 
         if gateway_port == 0 {
             return Err(format!(
@@ -622,6 +622,25 @@ impl LoadTesting {
 listener is disabled; set `gateway_tls` to select an enabled listener and/or set an explicit \
 `gateway_port` in 1–65535"
             ));
+        }
+
+        // Synthetic replays go straight from a dedicated client to the
+        // `127.0.0.1` literal, which reqwest never hands to the policy-aware
+        // DNS resolver and which never reaches the `execute*` literal-IP
+        // screen. The self-dial to this node's own effective proxy listener is
+        // the plugin's purpose and stays exempt; any other loopback port is an
+        // Operator-chosen destination and must pass the backend egress policy
+        // at admission, exactly like a `gateway_addresses` entry.
+        if gateway_port != effective_listener_port {
+            let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            if let Some(reason) = http_client.backend_allow_ips().deny_reason(&loopback) {
+                return Err(format!(
+                    "load_testing: `gateway_port` \"{gateway_port}\" is not this gateway's \
+{listener_name} listener port (\"{effective_listener_port}\") and 127.0.0.1 is blocked by the \
+backend egress policy ({reason}); omit `gateway_port` to target the local listener or adjust \
+FERRUM_BACKEND_ALLOW_IPS / FERRUM_BACKEND_ALLOW_CIDRS."
+                ));
+            }
         }
 
         let scheme = if gateway_tls { "https" } else { "http" };
