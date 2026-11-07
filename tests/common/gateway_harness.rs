@@ -2292,7 +2292,9 @@ async fn wait_for_tcp_port_inner(
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "no response yet".to_string());
             return Err(format!(
-                "gateway {label} port {port} did not accept TCP connections within {budget:?} (last observation: {observation})"
+                "gateway {label} port {port} did not accept TCP connections before the shared \
+                 deadline ({budget:?} remained when this stage started; last observation: \
+                 {observation})"
             )
             .into());
         }
@@ -3168,6 +3170,109 @@ mod ownership_proof_tests {
         admin.abort();
     }
 
+    /// Runs once, after the first `/health` answer has been written.
+    type AfterFirstAnswer = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// Authenticated-tier `/health` responder that answers `503` with
+    /// `ready: false` to the first `not_ready` requests and ready detail
+    /// afterwards, one request per connection. Connections are served one at a
+    /// time, so `after_first` completes before the next request is answered.
+    async fn spawn_scripted_health(
+        not_ready: usize,
+        after_first: Option<AfterFirstAnswer>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind fake admin");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            let mut after_first = after_first;
+            let mut answered = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                if !read_request_head(&mut stream).await {
+                    continue;
+                }
+                let (status, body) = if answered < not_ready {
+                    (
+                        "503 Service Unavailable",
+                        r#"{"status":"starting","ready":false,"cached_config":{"available":false}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"status":"ok","ready":true,"cached_config":{"available":true}}"#,
+                    )
+                };
+                answered += 1;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+                drop(stream);
+                if let Some(hook) = after_first.take() {
+                    hook.await;
+                }
+            }
+        });
+        (port, handle)
+    }
+
+    /// `Child::try_wait` runs before every probe, not just the first: a child
+    /// that exits after an unsuccessful probe, while the responder keeps
+    /// answering not-ready, fails the wait promptly instead of polling until
+    /// the deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_readiness_fails_fast_when_child_dies_between_unsuccessful_probes() {
+        let mut child = live_child();
+        let pid = child.id();
+        let kill: AfterFirstAnswer = Box::pin(kill_and_await_exit_or_reaped(pid));
+        let (port, admin) = spawn_scripted_health(usize::MAX, Some(kill)).await;
+        let budget = Duration::from_secs(20);
+
+        let started = Instant::now();
+        let err = wait_for_child_gateway_readiness(&mut child, port, "not-ready-token", budget)
+            .await
+            .expect_err("a dead child must fail readiness")
+            .to_string();
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.contains("exited") && err.contains("(last observation: HTTP 503"),
+            "the exit must be reported after an unsuccessful probe, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the exit must fail the wait promptly, not at the {budget:?} deadline \
+             (took {elapsed:?})"
+        );
+
+        let _ = child.wait();
+        admin.abort();
+    }
+
+    /// Control for the test above: while the child lives, unsuccessful probes
+    /// are retried until the responder reports ready.
+    #[tokio::test]
+    async fn child_readiness_retries_unsuccessful_probes_while_child_lives() {
+        let (port, admin) = spawn_scripted_health(2, None).await;
+        let mut child = live_child();
+
+        wait_for_child_gateway_readiness(&mut child, port, "retry-token", Duration::from_secs(10))
+            .await
+            .expect("a live child is retried until the responder is ready");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        admin.abort();
+    }
+
     /// Intentional difference from `wait_for_owned_gateway_identity`: the
     /// bespoke-spawner barrier is health-only. A CIDR-granted detail responder
     /// satisfies it but not the JWT ownership barrier. If this starts failing
@@ -3262,9 +3367,9 @@ mod ownership_proof_tests {
         let port = ephemeral_port().await.expect("refusing handoff port");
         let mut child = live_child();
 
-        let deadline = Instant::now() + Duration::from_millis(1500);
+        let deadline = Instant::now() + Duration::from_millis(3000);
         // Stand-in for stage 1 spending most of the shared budget.
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         let err = wait_for_child_tcp_accept(&mut child, port, deadline)
             .await
             .expect_err("a refusing port must time out")
@@ -3276,10 +3381,10 @@ mod ownership_proof_tests {
             returned >= deadline,
             "the stage must keep polling until the original deadline"
         );
-        // A stage that restarted the full 1.5 s budget on entry would return
-        // about 1 s after the original deadline.
+        // A stage that restarted the full 3 s budget on entry would return
+        // about 2 s after the original deadline; 1.25 s covers a loaded runner.
         assert!(
-            returned < deadline + Duration::from_millis(750),
+            returned < deadline + Duration::from_millis(1250),
             "the stage overran the caller's deadline by {:?}",
             returned.duration_since(deadline)
         );

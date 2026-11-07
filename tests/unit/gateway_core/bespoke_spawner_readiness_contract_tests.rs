@@ -209,34 +209,60 @@ fn bespoke_spawner_callers_forward_the_attempt_child_and_token() {
     }
 }
 
-/// A new spawner adopting the shared helper must be classified here.
-#[test]
-fn every_shared_readiness_adopter_is_in_the_site_table() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/functional");
-    let mut adopters = Vec::new();
-    for entry in std::fs::read_dir(&dir).expect("read tests/functional") {
+/// Suites that compile `tests/common` and could spawn a gateway. The harness
+/// itself (`tests/common`) defines the helpers and is not an adopter.
+const ADOPTER_SCAN_ROOTS: &[&str] = &[
+    "functional",
+    "integration",
+    "secrets_functional",
+    "service_integration",
+];
+
+fn collect_adopters(root: &std::path::Path, dir: &std::path::Path, adopters: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read {dir:?}: {err}")) {
         let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_adopters(root, &path, adopters);
+            continue;
+        }
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
             continue;
         }
-        let src = std::fs::read_to_string(&path).expect("read functional test source");
+        let src = std::fs::read_to_string(&path).expect("read test source");
         if src.contains("wait_for_child_gateway_readiness(")
             || src.contains("wait_for_child_tcp_accept(")
         {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("utf-8 file name")
-                .to_string();
-            adopters.push(name);
+            let relative = path
+                .strip_prefix(root)
+                .expect("scanned path is under tests/")
+                .to_str()
+                .expect("utf-8 path")
+                .replace('\\', "/");
+            adopters.push(relative);
+        }
+    }
+}
+
+/// A new spawner adopting the shared helper must be classified here.
+#[test]
+fn every_shared_readiness_adopter_is_in_the_site_table() {
+    let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut adopters = Vec::new();
+    for root in ADOPTER_SCAN_ROOTS {
+        let dir = tests_dir.join(root);
+        if dir.is_dir() {
+            collect_adopters(&tests_dir, &dir, &mut adopters);
         }
     }
     adopters.sort();
-    let mut table: Vec<String> = SITES.iter().map(|site| site.file.to_string()).collect();
+    let mut table: Vec<String> = SITES
+        .iter()
+        .map(|site| format!("functional/{}", site.file))
+        .collect();
     table.sort();
     assert_eq!(
         adopters, table,
-        "every functional spawner using the shared child-bound readiness helpers must have \
-         a row in SITES with its timeout and second-stage policy"
+        "every spawner using the shared child-bound readiness helpers must have a row in \
+         SITES with its timeout and second-stage policy"
     );
 }
