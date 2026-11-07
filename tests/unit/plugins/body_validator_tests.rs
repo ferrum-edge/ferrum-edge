@@ -2930,6 +2930,33 @@ async fn test_protobuf_response_per_method_invalid_body_rejected() {
     );
 }
 
+/// An empty `grpc_full_method` names no method, so the shared resolver falls
+/// through to the request path instead of looking up the key `"/"`. For
+/// body_validator an unmatched key means "the default type, if any": with only
+/// a per-method entry configured, the old `"/"` key skipped validation of the
+/// enrolled method entirely.
+#[tokio::test]
+async fn test_protobuf_response_empty_grpc_full_method_falls_through_to_the_request_path() {
+    let plugin = protobuf_plugin_with_method_messages();
+    let invalid = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA];
+    let frame = grpc_frame(&invalid);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    ctx.metadata
+        .insert("grpc_full_method".to_string(), String::new());
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    assert_reject(
+        plugin
+            .finalize_client_visible_response_body(&mut ctx, 200, &response_headers, &frame)
+            .await,
+        Some(502),
+    );
+}
+
 #[tokio::test]
 async fn test_protobuf_response_uses_grpc_full_method_metadata_when_present() {
     // When `grpc_method_router` ran upstream, it stores `grpc_full_method`

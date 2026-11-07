@@ -13696,6 +13696,13 @@ fn ai_response_guard_grpc_frame_budgets_are_bounded_in_openapi() {
         AiResponseGuard, HARD_MAX_GRPC_MAX_MESSAGE_BYTES, HARD_MAX_GRPC_MAX_MESSAGES,
     };
 
+    // The frame-count cap is the same deployment bound the audit plugin
+    // enforces; keep the two in lockstep.
+    assert_eq!(
+        HARD_MAX_GRPC_MAX_MESSAGES,
+        ferrum_edge::plugins::ai_transcript_audit::HARD_MAX_GRPC_MAX_MESSAGES
+    );
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let grpc_properties = spec
