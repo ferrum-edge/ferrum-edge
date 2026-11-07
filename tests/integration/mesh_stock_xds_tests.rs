@@ -785,41 +785,6 @@ async fn stock_nack_breaker_trip_flushes_the_staged_slice_before_closing() {
         "the flushed slice is the ACKed eds-v1 view, never a NACKed push"
     );
 
-    // Exactly the five invalid pushes were NACKed, each re-asserting eds-v1.
-    // The client only enqueued the fifth NACK before the flush installed the
-    // slice; the scripted server records it on its own task, so wait for it.
-    let nack_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let nacks = loop {
-        let nacks: Vec<DiscoveryRequest> = harness
-            .recorder
-            .for_type(EDS_TYPE_URL)
-            .into_iter()
-            .filter(|request| request.error_detail.is_some())
-            .collect();
-        if nacks.len() >= 5 {
-            break nacks;
-        }
-        assert!(
-            tokio::time::Instant::now() < nack_deadline,
-            "timed out waiting for five recorded EDS NACKs, saw {}",
-            nacks.len()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    let nack_nonces: Vec<&str> = nacks
-        .iter()
-        .map(|request| request.response_nonce.as_str())
-        .collect();
-    assert_eq!(
-        nack_nonces,
-        vec!["eds-n2", "eds-n3", "eds-n4", "eds-n5", "eds-n6"],
-        "the breaker trips on the fifth consecutive NACK of one type"
-    );
-    assert!(
-        nacks.iter().all(|request| request.version_info == "eds-v1"),
-        "every NACK re-asserts the last accepted EDS version"
-    );
-
     // The breaker closed the stream: the client opens a fresh one, whose first
     // CDS request is the second node-bearing one and carries no nonce.
     let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -841,6 +806,36 @@ async fn stock_nack_breaker_trip_flushes_the_staged_slice_before_closing() {
     };
     assert!(resubscribe.response_nonce.is_empty());
     assert_eq!(resubscribe.version_info, "cds-v1");
+
+    // NACK delivery. The server sends each invalid push only after recording
+    // the NACK of the previous one, so the first four NACKs were recorded
+    // before the fifth push existed, and the fifth push had to be handled
+    // before the flush could install. The fifth NACK is best-effort, as on the
+    // Ferrum `xds` client: the breaker returns right after enqueueing it, and
+    // tearing the RPC down can drop it before it is written. The closed stream
+    // and the re-subscription that asserts the accepted versions are what
+    // report the refusal. The new stream receives no EDS responses, so every
+    // recorded NACK belongs to the breaker's stream.
+    let nacks: Vec<DiscoveryRequest> = harness
+        .recorder
+        .for_type(EDS_TYPE_URL)
+        .into_iter()
+        .filter(|request| request.error_detail.is_some())
+        .collect();
+    let nack_nonces: Vec<&str> = nacks
+        .iter()
+        .map(|request| request.response_nonce.as_str())
+        .collect();
+    assert!(
+        nack_nonces == ["eds-n2", "eds-n3", "eds-n4", "eds-n5"]
+            || nack_nonces == ["eds-n2", "eds-n3", "eds-n4", "eds-n5", "eds-n6"],
+        "the first four invalid pushes are NACKed in order, the fifth (breaker) NACK at \
+         most once, got {nack_nonces:?}"
+    );
+    assert!(
+        nacks.iter().all(|request| request.version_info == "eds-v1"),
+        "every NACK re-asserts the last accepted EDS version"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
