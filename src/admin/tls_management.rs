@@ -594,6 +594,11 @@ pub(super) async fn handle_create_acme_order(
             Ok(store) => store,
             Err(response) => return Ok(*response),
         };
+        if let Some(response) =
+            acme_order_replacement_precheck(&store, request.id.as_deref(), request.allow_overwrite)
+        {
+            return Ok(response);
+        }
         let (record, overwrite) = match acme_order_record_from_request(state, request).await {
             Ok(value) => value,
             Err(error) => {
@@ -688,8 +693,23 @@ pub(super) async fn handle_finalize_acme_order(
         // Only an active order can be finalized. `valid`, `failed` and
         // `cancelled` are terminal (`AcmeOrderStatus::transition_to`), so this
         // is refused before any CA I/O rather than turning a terminal order
-        // back into `valid`.
+        // back into `valid`. The one exception is a repeat of a finalize that
+        // already happened: a `valid` order whose certificate is the one it
+        // produced is answered as the success it already was.
         if !order.status.is_active() {
+            if let Ok(certificate_id) = acme_finalize_certificate_id(&order, &request) {
+                match acme_completed_finalize_certificate(
+                    &certificate_store,
+                    &order,
+                    &certificate_id,
+                ) {
+                    Ok(Some(certificate)) => {
+                        return Ok(acme_finalize_success_response(&order, &certificate));
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Ok(acme_error_response(error)),
+                }
+            }
             return Ok(super::json_response(
                 StatusCode::CONFLICT,
                 &json!({"error": format!(
@@ -866,6 +886,7 @@ pub(super) async fn handle_finalize_acme_order(
             }
         };
         let allow_overwrite = request.allow_overwrite;
+        let completed_certificate_store = Arc::clone(&certificate_store);
         let stored_certificate = match offload_store_write("acme_certificate_upsert", move || {
             certificate_store.upsert_certificate(certificate, allow_overwrite)
         })
@@ -885,7 +906,9 @@ pub(super) async fn handle_finalize_acme_order(
         // clears the finalization material in the same `valid` write, the same
         // retention rule as the renewal path.
         let order_id = order.id.clone();
+        let finalized_order_url = order.order_url.clone();
         let published_certificate_id = certificate_id.clone();
+        let completed_order_store = Arc::clone(&order_store);
         let stored_order = match offload_store_write("acme_order_upsert", move || {
             order_store.complete_order_if_current(&order, certificate_id)
         })
@@ -900,6 +923,29 @@ pub(super) async fn handle_finalize_acme_order(
                 // The certificate above is published, so watchers must still
                 // re-pull it; only the order record was left untouched.
                 request_managed_source_reloads();
+                // A renewal that completed this same CA order while this
+                // request was in flight is the outcome this request asked for:
+                // the order is `valid` with the `order_url` finalized here, and
+                // the stored certificate is the one it produced. Anything else
+                // (a delete, a rewrite, a different order) stays a conflict.
+                match completed_order_store.get_order(&order_id) {
+                    Ok(current) if current.order_url == finalized_order_url => {
+                        match acme_completed_finalize_certificate(
+                            &completed_certificate_store,
+                            &current,
+                            &published_certificate_id,
+                        ) {
+                            Ok(Some(certificate)) => {
+                                persist_acme_account_credentials(&current).await;
+                                return Ok(acme_finalize_success_response(&current, &certificate));
+                            }
+                            Ok(None) => {}
+                            Err(error) => return Ok(acme_error_response(error)),
+                        }
+                    }
+                    Ok(_) | Err(AcmeError::OrderNotFound(_)) => {}
+                    Err(error) => return Ok(acme_error_response(error)),
+                }
                 return Ok(super::json_response(
                     StatusCode::CONFLICT,
                     &json!({"error": format!(
@@ -914,13 +960,7 @@ pub(super) async fn handle_finalize_acme_order(
         };
         persist_acme_account_credentials(&updated_order).await;
         request_managed_source_reloads();
-        Ok(super::json_response(
-            StatusCode::OK,
-            &json!({
-                "order": updated_order.summary(),
-                "certificate": certificate.summary(),
-            }),
-        ))
+        Ok(acme_finalize_success_response(&updated_order, &certificate))
     }
 }
 
@@ -1070,6 +1110,13 @@ pub(super) async fn handle_renew_acme_certificate(
                 ));
             }
         };
+        if let Some(response) = acme_order_replacement_precheck(
+            &order_store,
+            Some(renewal_order_id.as_str()),
+            request.allow_overwrite,
+        ) {
+            return Ok(response);
+        }
         let (record, overwrite) = match acme_order_record_from_request(
             state,
             AcmeOrderRequest {
@@ -1957,6 +2004,9 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         AcmeError::OrderNotFound(_) => StatusCode::NOT_FOUND,
         AcmeError::AlreadyExists(_) => StatusCode::CONFLICT,
         AcmeError::OrderAlreadyExists(_) => StatusCode::CONFLICT,
+        // The request is well-formed but the stored order's lifecycle state
+        // forbids it (a terminal order cannot be reopened).
+        AcmeError::IllegalOrderTransition { .. } => StatusCode::CONFLICT,
         AcmeError::InvalidId(_)
         | AcmeError::InvalidDomain(_)
         | AcmeError::InvalidPath(_)
@@ -2264,6 +2314,87 @@ async fn acme_order_record_from_request(
         .map_err(|error| error.to_string())?,
         allow_overwrite,
     ))
+}
+
+/// The `200` body of a successful finalize, shared by the idempotent replies so
+/// a repeated finalize is indistinguishable from the first one.
+#[cfg(feature = "acme")]
+fn acme_finalize_success_response(
+    order: &AcmeOrderRecord,
+    certificate: &AcmeCertificateRecord,
+) -> Response<Full<Bytes>> {
+    super::json_response(
+        StatusCode::OK,
+        &json!({
+            "order": order.summary(),
+            "certificate": certificate.summary(),
+        }),
+    )
+}
+
+/// The stored certificate `order` was already completed into, when `order` is
+/// a finished finalize of the certificate this request names
+/// (`crate::tls::acme::order_produced_certificate`). `Ok(None)` for anything
+/// else, including no stored certificate; a store that cannot be read is an
+/// error rather than "not completed".
+#[cfg(feature = "acme")]
+fn acme_completed_finalize_certificate(
+    certificate_store: &crate::tls::acme::AcmeCertificateStore,
+    order: &AcmeOrderRecord,
+    certificate_id: &str,
+) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
+    if order.status != AcmeOrderStatus::Valid
+        || order.certificate_id.as_deref() != Some(certificate_id)
+    {
+        return Ok(None);
+    }
+    let certificate = match certificate_store.get_certificate(certificate_id) {
+        Ok(certificate) => certificate,
+        Err(AcmeError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(crate::tls::acme::order_produced_certificate(order, &certificate).then_some(certificate))
+}
+
+/// Refuse an order create/replace that the store would refuse, before the
+/// directory request that prepares the new order.
+///
+/// Preparing an order creates it with the CA, which cannot be undone, so a
+/// write that is going to be refused must be refused first: an existing id
+/// without `allow_overwrite`, or a replacement the stored order's lifecycle
+/// forbids (`AcmeOrderStatus::admits_overwrite_with` — every order this API
+/// writes is a freshly prepared `pending_challenges` one, so a `valid`,
+/// `failed`, or `cancelled` order, or one that already moved past
+/// `pending_challenges`, cannot be replaced). The store re-checks both under
+/// its lock, so a change between this read and the write is still refused
+/// there. A brand-new id, or one the request supplied in an invalid form (the
+/// normal path reports that), passes through.
+#[cfg(feature = "acme")]
+fn acme_order_replacement_precheck(
+    store: &crate::tls::acme::AcmeOrderStore,
+    id: Option<&str>,
+    allow_overwrite: bool,
+) -> Option<Response<Full<Bytes>>> {
+    let id = id?;
+    let existing = match store.get_order(id) {
+        Ok(existing) => existing,
+        Err(AcmeError::OrderNotFound(_) | AcmeError::InvalidId(_)) => return None,
+        Err(error) => return Some(acme_error_response(error)),
+    };
+    if !allow_overwrite {
+        return Some(acme_error_response(AcmeError::OrderAlreadyExists(
+            existing.id,
+        )));
+    }
+    let next = AcmeOrderStatus::PendingChallenges;
+    if existing.status.admits_overwrite_with(next) {
+        return None;
+    }
+    Some(acme_error_response(AcmeError::IllegalOrderTransition {
+        id: existing.id,
+        from: existing.status,
+        to: next,
+    }))
 }
 
 #[cfg(feature = "acme")]
@@ -2664,6 +2795,22 @@ mod tests {
         );
         assert_eq!(
             acme_error_response(AcmeError::RecordLimitReached).status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    /// Issue #7028: an order write the lifecycle forbids (reopening a terminal
+    /// order through `allow_overwrite`) is a conflict with the stored state,
+    /// not a malformed request or an outage.
+    #[test]
+    fn illegal_order_transitions_are_conflicts() {
+        assert_eq!(
+            acme_error_response(AcmeError::IllegalOrderTransition {
+                id: "edge-order".to_string(),
+                from: crate::tls::acme::AcmeOrderStatus::Valid,
+                to: crate::tls::acme::AcmeOrderStatus::PendingChallenges,
+            })
+            .status(),
             StatusCode::CONFLICT
         );
     }

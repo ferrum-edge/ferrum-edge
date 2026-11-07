@@ -776,6 +776,15 @@ paths:
         response, including certificate chains, is capped at 1 MiB while streaming.
         When Ferrum is built without the feature this endpoint returns
         `501 Not Implemented`.
+
+        A new order id is always admitted. An existing id returns `409` unless
+        `allow_overwrite` is set, and an overwrite must be a legal order
+        lifecycle move: the new order is `pending_challenges`, so only a stored
+        `pending_challenges` order can be replaced. Replacing a `ready` or
+        `processing` order (backwards) or a terminal `valid`, `failed`, or
+        `cancelled` order (reopening it) returns `409`. Both refusals happen
+        before any directory request, so no CA order is created for a write
+        that cannot land.
       tags: [TLS]
       requestBody:
         required: true
@@ -855,7 +864,11 @@ paths:
         order after the selected challenge is reachable. The same HTTPS,
         same-origin, shared 30-second fresh-DNS/TCP deadline, 64-address DNS limit,
         public-egress checks, and 1 MiB streaming response cap used for initial
-        issuance apply to this renewal.
+        issuance apply to this renewal. An explicit `id` that names an existing
+        order follows the same rules as `POST /admin/tls/acme/orders`: `409`
+        without `allow_overwrite`, and `409` when the stored order is not
+        `pending_challenges` (a terminal order is never reopened and an active
+        one never moves backwards), both before any directory request.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -963,7 +976,15 @@ paths:
         completed by a renewal, deleted, or otherwise rewritten meanwhile, the
         order is left unchanged; a successful finalization then returns `409`
         (an already stored certificate stays stored), while a directory-reported
-        `invalid` result still returns `502`. `409` is also returned, before any directory
+        `invalid` result still returns `502`. Finalize is idempotent for an
+        order that is already complete: when the stored order is `valid`, was
+        finalized into the certificate this request names, and that stored
+        certificate carries the same `order_url` (it is the certificate this CA
+        order produced), the endpoint returns `200` with the usual
+        `{order, certificate}` body and no directory request — both for a repeat
+        of a finalize that already succeeded and for a renewal that completed
+        the same CA order while this request was in flight. Any other terminal
+        or changed order stays `409`. `409` is also returned, before any directory
         request, when the certificate the order is persisted under (the
         request's `certificate_id`, else the order's) already has another
         active order as its latest order.
@@ -987,7 +1008,9 @@ paths:
               $ref: "#/components/schemas/AcmeOrderFinalizeRequest"
       responses:
         "200":
-          description: ACME order finalized and certificate persisted
+          description: >-
+            ACME order finalized and certificate persisted, or the order was
+            already finalized into this certificate (idempotent repeat)
           content:
             application/json:
               schema:
@@ -10038,6 +10061,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >-
+            Replace an existing order with the same id. Only a stored
+            `pending_challenges` order can be replaced; any other stored state is
+            an illegal lifecycle transition and returns `409`.
 
     AcmeOrderFinalizeRequest:
       type: object
@@ -10102,7 +10129,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
-          description: Replace an existing order with the same id.
+          description: >-
+            Replace an existing order with the same id. Only a stored
+            `pending_challenges` order can be replaced; any other stored state is
+            an illegal lifecycle transition and returns `409`.
 
     ManagedTlsRecordListResponse:
       type: object

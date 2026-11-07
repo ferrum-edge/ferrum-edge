@@ -32,6 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphaned handshake markers only when `/health` was ready, so an unproved
   ingress topology or a withheld migration proof left producers for removed
   pods waiting. Both now depend only on the completed pod relist.
+- **Every ACME order write now goes through the order lifecycle table**
+  (#7028). The renewal's final `valid` write was still a blind upsert under the
+  lease, so it recreated an order an operator deleted mid-renewal (and
+  overwrote one rewritten meanwhile); it is now the same compare-and-set admin
+  finalize uses. When the order is no longer current the issued certificate is
+  still published and reloaded and the renewal counts as renewed, but the
+  order is left as it is. `POST /admin/tls/acme/orders` and
+  `POST /admin/tls/acme/renew/{id}` with `allow_overwrite` could replace any
+  order, including reopening a `valid`, `failed` or `cancelled` one; a
+  replacement must now be a legal lifecycle move (only a stored
+  `pending_challenges` order can be replaced by the new `pending_challenges`
+  one) and is otherwise refused with `409` before any CA request. Finalizing an
+  order that is already `valid` and whose stored certificate is the one that
+  CA order produced (same `order_url`) now returns `200` with the usual body
+  instead of `409`, whether it was completed by an earlier finalize or by a
+  renewal while the request was in flight. Scheduled renewal now signs with the
+  certificate's account credentials from the shared account store and falls
+  back to the latest order's only when the store has none, so an older order
+  restamped by a terminal write can no longer make renewal use a stale account
+  key.
 - **ACME order finalization no longer overwrites concurrent work or revives
   terminal orders** (#7020). `POST /admin/tls/acme/orders/{id}/finalize` read
   the order, spent up to its poll timeout on CA I/O, then wrote its result back

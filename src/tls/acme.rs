@@ -118,6 +118,38 @@ impl AcmeOrderStatus {
         };
         legal.then_some(next)
     }
+
+    /// Whether a stored order in `self` may be replaced by a record in `next`
+    /// (an `allow_overwrite` write).
+    ///
+    /// A replacement is a lifecycle write like any other, so it must be a legal
+    /// [`transition_to`](Self::transition_to) move. The one addition is
+    /// re-submitting the *same active* state: that is not a transition (the
+    /// order stays where it is in the lifecycle), and it is what an operator
+    /// replacing a still in-flight order with a freshly prepared one does.
+    /// A terminal order is never replaced, and an active order never moves
+    /// backwards through a replacement.
+    pub fn admits_overwrite_with(self, next: Self) -> bool {
+        self.transition_to(next).is_some() || (self == next && self.is_active())
+    }
+
+    /// The wire spelling (`serde` `snake_case`), for diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingChallenges => "pending_challenges",
+            Self::Ready => "ready",
+            Self::Processing => "processing",
+            Self::Valid => "valid",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for AcmeOrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +606,19 @@ pub enum AcmeError {
     OrderNotFound(String),
     #[error("ACME order '{0}' already exists")]
     OrderAlreadyExists(String),
+    /// An overwrite would move a stored order through a transition the
+    /// lifecycle forbids (`AcmeOrderStatus::admits_overwrite_with`), such as
+    /// reopening a terminal order. Carries only the id and the two statuses.
+    #[error(
+        "ACME order '{id}' is `{from}` and cannot be replaced by a `{to}` order; \
+         terminal orders cannot be reopened and active orders only move forward, \
+         so create the order under a new id"
+    )]
+    IllegalOrderTransition {
+        id: String,
+        from: AcmeOrderStatus,
+        to: AcmeOrderStatus,
+    },
     #[error("invalid ACME HTTP-01 challenge token: {0}")]
     InvalidChallengeToken(String),
     #[error("ACME certificate '{id}' does not contain {kind} material")]
@@ -969,6 +1014,14 @@ impl AcmeOrderStore {
         Ok(latest.cloned())
     }
 
+    /// Create an order, or (with `allow_overwrite`) replace a stored one.
+    ///
+    /// Creating a brand-new id is always admitted. Replacing an existing order
+    /// is admitted only when [`AcmeOrderStatus::admits_overwrite_with`] allows
+    /// the stored status to become the record's status; otherwise nothing is
+    /// written and [`AcmeError::IllegalOrderTransition`] is returned. Writers
+    /// that act on an earlier read of an order (finalize, renewal publication,
+    /// CA-invalid evidence) use the compare-and-set methods instead.
     pub fn upsert_order(
         &self,
         record: AcmeOrderRecord,
@@ -992,6 +1045,16 @@ impl AcmeOrderStore {
             if let Some(existing) = document.orders.get(&record.id) {
                 if !allow_overwrite {
                     return Err(AcmeError::OrderAlreadyExists(record.id));
+                }
+                // An overwrite is a status write on the stored order, so it goes
+                // through the lifecycle table under this same lock: a terminal
+                // order is never reopened and an active one never moves back.
+                if !existing.status.admits_overwrite_with(record.status) {
+                    return Err(AcmeError::IllegalOrderTransition {
+                        id: record.id,
+                        from: existing.status,
+                        to: record.status,
+                    });
                 }
                 record.created_at = existing.created_at;
                 record.updated_at = now;
@@ -1724,6 +1787,32 @@ fn validate_acme_account_limit(max_accounts: usize) -> Result<usize, AcmeError> 
 
 fn validate_acme_terminal_history(terminal_history: usize) -> Result<usize, AcmeError> {
     Ok(terminal_history.min(crate::config::env_config::HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY))
+}
+
+/// Whether `certificate` is the certificate `order` was completed into.
+///
+/// True only when the order is `valid`, was finalized into this certificate
+/// id, and both records carry the same non-empty CA `order_url` — the CA's own
+/// identity for the order, which the certificate record keeps as its
+/// completion evidence. The order's key/CSR is cleared when it becomes
+/// `valid`, so the `order_url` is the evidence there is to compare. Admin
+/// finalize uses this to answer a repeated finalize of an already completed
+/// order (by an earlier finalize or by a renewal of the same CA order) as an
+/// idempotent success instead of a conflict.
+pub fn order_produced_certificate(
+    order: &AcmeOrderRecord,
+    certificate: &AcmeCertificateRecord,
+) -> bool {
+    let Some(order_url) = order
+        .order_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return false;
+    };
+    order.status == AcmeOrderStatus::Valid
+        && order.certificate_id.as_deref() == Some(certificate.id.as_str())
+        && certificate.order_url.as_deref() == Some(order_url)
 }
 
 /// Whether `current` is still exactly the order a caller read as `expected`.
@@ -2944,10 +3033,15 @@ pub(crate) async fn claim_and_plan_renewal(
 /// Outcome of the lease-fenced final publication of renewed ACME material.
 ///
 /// Both final store writes are always attempted under the same lease fence
-/// (when the fence is entered). This enum distinguishes the four write-result
-/// combinations so neither a single-target failure nor a storage outage can be
-/// mistaken for a successful renewal, and so published material can clear a
-/// matching stale active order via exact `order_url` correlation.
+/// (when the fence is entered). The order write is a compare-and-set on the
+/// order snapshot the renewal drove (`AcmeOrderStore::complete_order_if_current`),
+/// so it has three results — committed, refused because the order is no longer
+/// that snapshot, or a store failure — and the certificate write two. This enum
+/// distinguishes the combinations so neither a single-target failure nor a
+/// storage outage can be mistaken for a successful renewal, so an order an
+/// operator deleted or rewrote mid-renewal is never recreated or overwritten,
+/// and so published material can clear a matching stale active order via exact
+/// `order_url` correlation.
 #[derive(Debug)]
 pub(crate) enum FinalRenewalPublication {
     /// Order `Valid` status and certificate material both committed.
@@ -2962,6 +3056,20 @@ pub(crate) enum FinalRenewalPublication {
     /// published certificate's `order_url` is durable completion evidence for
     /// [`has_active_renewal_order`].
     MaterialPublishedOrderNotCommitted(AcmeError),
+    /// Certificate material published; the order was left untouched because it
+    /// was no longer the snapshot this renewal drove — an operator deleted or
+    /// rewrote it, admin finalize already completed it, it is already terminal,
+    /// or the certificate gained a newer active order — while the renewal was
+    /// in flight. The CA has issued and nothing failed, so new material is
+    /// authoritative, reload is requested, and the renewal counts as renewed;
+    /// the order is never recreated or overwritten. A still-active order with
+    /// the same `order_url` is cleared by the published certificate exactly as
+    /// for [`Self::MaterialPublishedOrderNotCommitted`].
+    MaterialPublishedOrderNotCurrent,
+    /// The order was no longer current (left untouched, as above) and the
+    /// certificate write failed. No reload; explicit renewal failure, and the
+    /// prior material remains due.
+    OrderNotCurrentMaterialNotPublished(AcmeError),
     /// Neither final write landed. No reload. Diagnostics for both failures are
     /// preserved without disclosing PEM or private-key material.
     NeitherCommitted {
@@ -2970,8 +3078,16 @@ pub(crate) enum FinalRenewalPublication {
     },
 }
 
-/// Persist the already-CA-valid order as `Valid`, then always attempt certificate
-/// publication under the same lease fence — even when the order write fails.
+/// Commit the already-CA-valid order as `Valid` through the order lifecycle's
+/// compare-and-set, then always attempt certificate publication under the same
+/// lease fence — even when the order write fails or is refused.
+///
+/// `order` must be the order exactly as this renewal read or created it. The
+/// `Valid` write lands only while the stored order is still that snapshot
+/// (`AcmeOrderStore::complete_order_if_current`): the lease fences other
+/// renewers, but not an operator, so an order deleted, overwritten, or
+/// finalized through the Admin API mid-renewal is left as it is rather than
+/// recreated from this stale copy.
 ///
 /// # Lock order
 ///
@@ -2987,37 +3103,48 @@ pub(crate) fn commit_final_renewal_publication(
     certificate_store: &AcmeCertificateStore,
     order_store: &AcmeOrderStore,
     issued: AcmeCertificateRecord,
-    mut order: AcmeOrderRecord,
+    order: AcmeOrderRecord,
 ) -> FinalRenewalPublication {
-    order.status = AcmeOrderStatus::Valid;
-    order.error = None;
     // Retention is tied to resumability, not to success. The material exists so
     // a successor can finish an order that is still resumable, and an order is
     // resumable exactly while it is in an active status: `plan_renewal_order`
     // treats `Valid` as terminal and plans a fresh order (with fresh material)
-    // instead. So it is dropped in the *same* write that makes the order
-    // terminal, which keeps all four partial-publication outcomes recoverable:
-    // both-committed and order-only-committed reach `Valid` and no longer need
-    // it; the two outcomes where the order write fails never apply this record
-    // at all, so the stored material survives untouched and the still-active
-    // order stays resumable.
-    order.finalization = None;
+    // instead. So `complete_order_if_current` drops it in the *same* write that
+    // makes the order terminal, which keeps every partial-publication outcome
+    // recoverable: the outcomes where the order commits reach `Valid` and no
+    // longer need it; the outcomes where the order write fails or is refused
+    // never touch the stored record, so whatever is stored keeps its material.
+    //
     // Attempt the order Valid write first, then always attempt certificate
     // publication. Test-only injection hooks scope each fault to its own write
     // so either side (or both) can fail independently through this helper.
     let order_result = {
         #[cfg(test)]
         let _order_write_fault = take_final_publication_order_write_fault();
-        order_store.upsert_order(order, true)
+        order_store.complete_order_if_current(&order, issued.id.clone())
     };
+    if matches!(order_result, Ok(None)) {
+        tracing::warn!(
+            order_id = %order.id,
+            certificate_id = %issued.id,
+            "ACME renewal order was deleted, changed, or superseded while the renewal was in \
+             flight; leaving it unchanged and publishing the issued certificate"
+        );
+    }
     let certificate_result = {
         #[cfg(test)]
         let _certificate_write_fault = take_final_publication_certificate_write_fault();
         certificate_store.upsert_certificate(issued, true)
     };
     match (order_result, certificate_result) {
-        (Ok(_), Ok(_)) => FinalRenewalPublication::Complete,
-        (Ok(_), Err(error)) => FinalRenewalPublication::OrderCommittedMaterialNotPublished(error),
+        (Ok(Some(_)), Ok(_)) => FinalRenewalPublication::Complete,
+        (Ok(Some(_)), Err(error)) => {
+            FinalRenewalPublication::OrderCommittedMaterialNotPublished(error)
+        }
+        (Ok(None), Ok(_)) => FinalRenewalPublication::MaterialPublishedOrderNotCurrent,
+        (Ok(None), Err(error)) => {
+            FinalRenewalPublication::OrderNotCurrentMaterialNotPublished(error)
+        }
         (Err(error), Ok(_)) => FinalRenewalPublication::MaterialPublishedOrderNotCommitted(error),
         (Err(order), Err(certificate)) => {
             FinalRenewalPublication::NeitherCommitted { order, certificate }
@@ -3029,10 +3156,13 @@ pub(crate) fn commit_final_renewal_publication(
 ///
 /// A partial or total persistence failure is always an explicit renewal error
 /// and never a successful renewal. Reload is requested when new certificate
-/// material landed ([`FinalRenewalPublication::Complete`] or
+/// material landed ([`FinalRenewalPublication::Complete`],
+/// [`FinalRenewalPublication::MaterialPublishedOrderNotCurrent`], or
 /// [`FinalRenewalPublication::MaterialPublishedOrderNotCommitted`]). An
-/// order-only commit and a both-failed outage must not reload. On full success,
-/// returns the surfaces that accepted the force-reload request.
+/// outcome without published material must not reload. A refused order write
+/// is not a failure: material published next to an order that was no longer
+/// current is a successful renewal. On success, returns the surfaces that
+/// accepted the force-reload request.
 pub(crate) fn apply_final_renewal_publication(
     outcome: FinalRenewalPublication,
 ) -> Result<Vec<&'static str>, AcmeError> {
@@ -3051,7 +3181,16 @@ pub(crate) fn map_final_renewal_publication_outcome(
     request_reloads: impl FnOnce() -> Vec<&'static str>,
 ) -> Result<Vec<&'static str>, AcmeError> {
     match outcome {
-        FinalRenewalPublication::Complete => Ok(request_reloads()),
+        // Material landed and nothing failed: the order was deliberately left
+        // to whoever changed it, so this is a successful renewal.
+        FinalRenewalPublication::Complete
+        | FinalRenewalPublication::MaterialPublishedOrderNotCurrent => Ok(request_reloads()),
+        FinalRenewalPublication::OrderNotCurrentMaterialNotPublished(error) => {
+            Err(AcmeError::Write(format!(
+                "ACME order changed while the renewal was in flight and was left unchanged, \
+                 and renewed certificate material failed to publish: {error}"
+            )))
+        }
         FinalRenewalPublication::OrderCommittedMaterialNotPublished(error) => {
             Err(AcmeError::Write(format!(
                 "ACME order was marked valid but renewed certificate material failed to publish: {error}"
@@ -3248,6 +3387,33 @@ fn take_final_publication_certificate_write_fault()
     }
 }
 
+/// Account credentials a scheduled renewal of `certificate_id` signs with.
+///
+/// The shared account store, keyed by the certificate's own
+/// `(directory_url, account_id)`, is authoritative: every renewal and every
+/// Admin order/finalize writes the credentials it used there. The latest order
+/// for the certificate is only a fallback for an account the store has never
+/// seen. It is not a safe first choice — "latest" is by `updated_at`, and a
+/// terminal commit on an older order (a CA-invalid `failed`, an Admin finalize)
+/// restamps it, so an order carrying an earlier account key, or another
+/// account's key, can become the latest one.
+///
+/// A store that cannot be read is an error, not "no credentials".
+pub fn renewal_account_credentials(
+    account_store: &AcmeAccountStore,
+    order_store: &AcmeOrderStore,
+    certificate_id: &str,
+    directory_url: &str,
+    account_id: &str,
+) -> Result<Option<String>, AcmeError> {
+    if let Some(credentials) = account_store.get_credentials(directory_url, account_id)? {
+        return Ok(Some(credentials));
+    }
+    Ok(order_store
+        .latest_order_for_certificate(certificate_id)?
+        .and_then(|order| order.account_credentials_json))
+}
+
 /// Renew one certificate under a continuously maintained shared claim.
 ///
 /// Every stretch of external work — account registration, order creation, the
@@ -3280,6 +3446,10 @@ fn take_final_publication_certificate_write_fault()
 /// a later retry. When both writes fail, there is no reload and the outcome is
 /// an explicit combined failure (that storage-outage case may remain
 /// fail-closed). Lease loss before entering the fence performs neither write.
+/// The `Valid` write is a compare-and-set on the order this renewal drove: if
+/// an operator deleted or rewrote that order meanwhile (the lease fences other
+/// renewers, not the Admin API), it is left as it is — never recreated — while
+/// the issued certificate is still published and reloaded.
 ///
 /// One residual is inherent to ACME: an order already created with the CA
 /// cannot be un-created if the claim is lost immediately afterwards. The check
@@ -3297,10 +3467,13 @@ async fn renew_certificate_once(
     let Some(account_id) = certificate.account_id.as_deref() else {
         return Ok(false);
     };
-    let Some(account_credentials_json) = order_store
-        .latest_order_for_certificate(&certificate.id)?
-        .and_then(|order| order.account_credentials_json)
-        .or(account_store.get_credentials(&certificate.directory_url, account_id)?)
+    let Some(account_credentials_json) = renewal_account_credentials(
+        account_store,
+        order_store,
+        &certificate.id,
+        &certificate.directory_url,
+        account_id,
+    )?
     else {
         return Ok(false);
     };
@@ -3592,6 +3765,9 @@ async fn finish_renewal_order(
     // material-without-Valid still reloads and uses the published order_url as
     // durable completion evidence; Valid-without-material does not reload;
     // both-failed does neither and remains an explicit storage-outage failure.
+    // The Valid write is a compare-and-set on `order`, so an order deleted or
+    // rewritten through the Admin API meanwhile is left untouched (material
+    // still publishes and reloads).
     let certs = Arc::clone(certificate_store);
     let orders = Arc::clone(order_store);
     let publication = match keeper
