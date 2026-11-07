@@ -1091,9 +1091,10 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// `wait_for_child_gateway_readiness` + `wait_for_child_tcp_accept` helpers.
 /// It is not the JWT ownership barrier (`wait_for_owned_gateway_identity`):
 ///
-/// 1. `Child::try_wait` is polled around every probe, so a child that died after
-///    a partial bind consumes its retry attempt immediately instead of polling
-///    whatever claimed the released port.
+/// 1. `Child::try_wait` is polled before every probe and after the successful
+///    identity probe (the TCP stage checks before each connect only), so a
+///    child that died after a partial bind consumes its retry attempt
+///    immediately instead of polling whatever claimed the released port.
 /// 2. The admin port must answer `/health` in the authenticated detail tier for
 ///    this attempt's `FERRUM_METRICS_BEARER_TOKEN` *and* report `ready: true`.
 ///    A foreign listener has a different token (or is not a gateway at all) and

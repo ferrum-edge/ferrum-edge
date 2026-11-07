@@ -133,8 +133,8 @@ async fn start_slow_backend_on(listener: TcpListener, delay_ms: u64, stop: Arc<A
 // port while this child exits — `test_overload_endpoint_shape_normal` then
 // reads that sibling's `level=pressure` snapshot instead of its own `normal`.
 // Each spawn wires a unique `FERRUM_METRICS_BEARER_TOKEN` and waits for
-// authenticated `/health` detail + `ready: true` via
-// [`crate::common::probe_gateway_identity`].
+// authenticated `/health` detail + `ready: true` via the child-bound
+// [`crate::common::wait_for_child_gateway_readiness`].
 
 async fn ephemeral_port() -> u16 {
     crate::scaffolding::ports::unbound_port()
@@ -279,7 +279,8 @@ fn start_gateway(
 ///
 /// Barrier (`TestGateway`'s health-only path, via the shared
 /// `wait_for_child_gateway_readiness`; not JWT ownership):
-/// 1. `Child::try_wait` around every probe — a dead child consumes the attempt.
+/// 1. `Child::try_wait` before every probe and after the successful one — a
+///    dead child consumes the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's
 ///    `FERRUM_METRICS_BEARER_TOKEN` with `ready: true`.
 /// 3. One more `try_wait` after a successful probe so a child that dies between
@@ -289,11 +290,12 @@ async fn wait_for_owned_gateway(
     admin_port: u16,
     observability_token: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
     crate::common::wait_for_child_gateway_readiness(
         child,
         admin_port,
         observability_token,
-        Duration::from_secs(30),
+        STARTUP_TIMEOUT,
     )
     .await
 }

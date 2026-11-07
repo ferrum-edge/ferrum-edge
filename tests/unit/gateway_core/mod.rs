@@ -16,6 +16,7 @@ mod backend_pending_limit_scope_tests;
 mod backend_reqwest_no_proxy_tests;
 mod backend_send_queue_tests;
 mod backend_tls_cold_build_tests;
+mod bespoke_spawner_readiness_contract_tests;
 mod buffered_upload_end_stream_tests;
 mod build_profile_panic_strategy_tests;
 mod builtin_plugin_trust_tests;

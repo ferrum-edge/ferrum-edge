@@ -60,9 +60,9 @@ fn scripted_udp_fixture_binds_readiness_to_spawned_child_identity() {
         region.contains("ready: true"),
         "the barrier must require authenticated health detail with ready:true"
     );
-    // `Child::try_wait` before and after every probe now lives in the shared
-    // helper; the `child_readiness_*` tests in `tests/common/gateway_harness.rs`
-    // pin it.
+    // `Child::try_wait` before every probe and after the successful one now
+    // lives in the shared helper; the `child_readiness_*` tests in
+    // `tests/common/gateway_harness.rs` pin it.
     assert!(
         compact.contains("std::process::Stdio::null()")
             && !compact.contains("std::process::Stdio::piped()"),

@@ -3173,6 +3173,73 @@ mod ownership_proof_tests {
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    /// Like [`kill_and_await_exit`], but tolerates the harness reaping the
+    /// child first: the TCP stage polls `try_wait` concurrently, so `waitid`
+    /// may find no child (`ECHILD`), which also means it has exited.
+    #[cfg(unix)]
+    async fn kill_and_await_exit_or_reaped(pid: u32) {
+        tokio::task::spawn_blocking(move || {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if rc == 0 {
+                    return;
+                }
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(libc::ECHILD) => return,
+                    _ => panic!("waitid on killed child {pid} failed: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("kill-and-wait task");
+    }
+
+    /// `Child::try_wait` runs on every poll iteration, not only before the
+    /// first connect: a child that dies mid-poll, after which a foreign
+    /// listener claims its released port, must fail the stage.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_tcp_accept_rechecks_child_on_every_poll() {
+        let port = ephemeral_port().await.expect("refusing handoff port");
+        let mut child = live_child();
+        let pid = child.id();
+        let squatter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // The child has exited before the foreign listener appears, so only
+            // a fresh `try_wait` can tell them apart.
+            kill_and_await_exit_or_reaped(pid).await;
+            TcpListener::bind_test(format!("127.0.0.1:{port}"))
+                .await
+                .expect("foreign listener binds the released port")
+        });
+
+        let err =
+            wait_for_child_tcp_accept(&mut child, port, Instant::now() + Duration::from_secs(10))
+                .await
+                .expect_err("a child that died mid-poll must not adopt a foreign listener")
+                .to_string();
+        let squatter = squatter.await.expect("squatter task");
+
+        assert!(err.contains("exited"), "got: {err}");
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+            "the foreign listener must accept, or this proves nothing"
+        );
+        drop(squatter);
+        let _ = child.wait();
+    }
 }
 
 #[cfg(test)]

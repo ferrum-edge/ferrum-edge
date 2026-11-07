@@ -118,8 +118,8 @@ fn spawn_gateway(
 ///
 /// Barrier (`TestGateway`'s health-only path, via the shared
 /// `wait_for_child_gateway_readiness`; not JWT ownership):
-/// 1. `Child::try_wait` before and after every probe — a dead child voids
-///    the attempt.
+/// 1. `Child::try_wait` before every probe and after the successful one — a
+///    dead child voids the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token
 ///    with `ready: true`.
 ///
@@ -130,11 +130,12 @@ async fn wait_for_owned_gateway(
     admin_port: u16,
     observability_token: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
     crate::common::wait_for_child_gateway_readiness(
         child,
         admin_port,
         observability_token,
-        Duration::from_secs(30),
+        STARTUP_TIMEOUT,
     )
     .await
 }
