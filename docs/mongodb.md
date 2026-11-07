@@ -577,17 +577,30 @@ document may be absent. Ferrum therefore keeps a per-namespace fence:
   failover until restart.)
 - A multi-step guard (restore / clear + replay) whose borrowed mutation became
   uncertain is converted into the same fence when its owner releases or
-  abandons it.
+  abandons it. A *settled* multi-step guard hands its generation pin to a
+  cancellation-safe cleanup state before awaiting the owner-qualified lock
+  delete: if that delete errors, or the release is cancelled (for example by
+  the Admin 5-second cleanup timeout, which is shorter than the driver's
+  default server selection), the generation pin is still released and the
+  namespace is fenced (`uncertain_cleanup`) because the lock may still exist.
 - **Exit:** verify the write outcome, then remove the exact owner-qualified
   document from `mtls_dns_admission_locks` on the original database. The next
   admission attempt for the namespace re-verifies each retained fence with a
-  majority, primary read through the **original** connection bundle (bounded to
-  5 seconds, before the generation pin is taken) and clears it only when the
+  majority, primary read through the **original** connection bundle (one
+  shared 5-second deadline for the whole pass over that namespace's retained
+  fences, before the generation pin is taken) and clears it only when the
   owner-qualified document is proven absent. A probe error, timeout, or a
   still-present document keeps the fence; absence on a different failover
   topology never clears it. No restart is required. If the original topology is
   permanently gone, the fence stays until the process is restarted after
   operator reconciliation.
+- **Known limitation:** the exit probe always requests `readConcern:
+  "majority"` so a delete that could still roll back never clears a fence. A
+  deployment that rejects majority read concern (some MongoDB-compatible
+  services, or a primary-secondary-arbiter replica set with
+  `enableMajorityReadConcern: false`) makes every probe unverifiable, so its
+  fences clear only when the process restarts after operator reconciliation.
+  Reconnect and failover are unaffected.
 - **Visibility:** authenticated `/health` reports
   `database.mtls_dns_admission_fence` (`fenced`, `retained_fences`,
   `namespaces`, `oldest_retained_since_unix_ms`) while any fence is retained,

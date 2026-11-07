@@ -8116,14 +8116,16 @@ pub mod _test_support {
     }
 
     /// Register a live multi-step persistent admission pin (holding the
-    /// generation read pin) whose borrowed mutation became uncertain (#7031).
-    pub async fn mongo_store_insert_uncertain_persistent_admission_pin_for_test(
+    /// generation read pin); `uncertain` marks an unknown borrowed outcome
+    /// (#7031).
+    pub async fn mongo_store_insert_persistent_admission_pin_for_test(
         store: &crate::config::mongo_store::MongoStore,
         namespace: &str,
         guard_owner: &str,
+        uncertain: bool,
     ) {
         store
-            .insert_uncertain_persistent_admission_pin_for_test(namespace, guard_owner)
+            .insert_persistent_admission_pin_for_test(namespace, guard_owner, uncertain)
             .await;
     }
 

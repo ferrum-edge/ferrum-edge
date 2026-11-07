@@ -541,10 +541,11 @@ mod inner {
         uncertain_outcome: Arc<AtomicBool>,
     }
 
-    /// Bound on one exit re-verification probe of a retained admission fence.
-    /// The probe runs before an admission takes the connection-generation
-    /// read pin, so a slow or unreachable original topology delays only the
-    /// refused admission, never a reconnect.
+    /// Shared bound on one admission attempt's exit re-verification pass over
+    /// every retained fence of its namespace. The pass runs before the
+    /// admission takes the connection-generation read pin, so a slow or
+    /// unreachable original topology delays only the refused admission,
+    /// never a reconnect.
     const MONGO_ADMISSION_FENCE_REVERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Why a namespace's mTLS DNS admission fence was retained.
@@ -556,6 +557,10 @@ mod inner {
         /// A multi-step admission guard (restore / namespace clear + replay)
         /// ended while one of its borrowed mutations had an uncertain outcome.
         UncertainGuardedOperation,
+        /// A settled multi-step guard's owner-qualified lock cleanup errored or
+        /// was cancelled (for example by the Admin cleanup timeout) before its
+        /// outcome was known, so the durable lock may still exist.
+        UncertainCleanup,
     }
 
     impl AdmissionFenceReason {
@@ -564,6 +569,7 @@ mod inner {
             match self {
                 Self::UncertainMutation => "uncertain_mutation",
                 Self::UncertainGuardedOperation => "uncertain_guarded_operation",
+                Self::UncertainCleanup => "uncertain_cleanup",
             }
         }
     }
@@ -657,22 +663,22 @@ mod inner {
             generation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
         ) {
             let key = Self::key(namespace, owner);
-            let newly_retained = match self.retained.entry(key) {
-                dashmap::mapref::entry::Entry::Occupied(_) => false,
-                dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                    vacant.insert(RetainedAdmissionFence {
-                        namespace: namespace.to_string(),
-                        owner: owner.to_string(),
-                        since_unix_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
-                        reason,
-                        connection,
-                    });
-                    true
-                }
-            };
-            if newly_retained {
+            if let dashmap::mapref::entry::Entry::Vacant(vacant) = self.retained.entry(key) {
+                let inserted = vacant.insert(RetainedAdmissionFence {
+                    namespace: namespace.to_string(),
+                    owner: owner.to_string(),
+                    since_unix_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                    reason,
+                    connection,
+                });
+                // Count while the shard write guard is still held: a
+                // concurrent `apply_probe` can only remove (and decrement)
+                // this entry after the guard drops, so the increment always
+                // happens-before the matching decrement and the saturating
+                // gauge can never be left stuck at a phantom `1`.
                 crate::plugins::prometheus_metrics::global_registry()
                     .record_mtls_dns_admission_fence_retained();
+                drop(inserted);
             }
             drop(generation_guard);
         }
@@ -781,6 +787,87 @@ mod inner {
                 for _ in 0..remaining {
                     registry.record_mtls_dns_admission_fence_cleared();
                 }
+            }
+        }
+    }
+
+    /// Convert an owned multi-step persistent pin into an explicit namespace
+    /// fence: the fence is recorded first, then the pin (and with it the
+    /// `connection_generation` read pin) is dropped. The durable
+    /// owner-qualified lock document is never touched here.
+    fn fence_persistent_admission_pin(
+        fences: &MongoAdmissionFences,
+        guard_owner: &str,
+        persistent_pin: MongoPersistentAdmissionPin,
+        reason: AdmissionFenceReason,
+    ) {
+        persistent_pin
+            .uncertain_outcome
+            .store(true, Ordering::Release);
+        let MongoPersistentAdmissionPin { namespace, pin, .. } = persistent_pin;
+        let MongoAdmissionConnectionPin {
+            connection,
+            _generation_guard: generation_guard,
+        } = pin;
+        fences.retain(
+            &namespace,
+            guard_owner,
+            reason,
+            connection,
+            Some(generation_guard),
+        );
+        error!(
+            namespace = %crate::startup::sanitize_startup_scalar(&namespace),
+            reason = reason.as_str(),
+            "MongoDB mTLS DNS admission guard retained as a namespace fence; reconnect and \
+             failover stay available, admissions for the namespace fail closed until the \
+             owner-qualified lock document is proven absent on the original topology"
+        );
+    }
+
+    /// Owns a settled multi-step guard's persistent pin while its durable
+    /// owner-qualified lock cleanup is awaited. The pin is removed from
+    /// `MongoStore::persistent_admission_pins` BEFORE the await, so a dropped
+    /// cleanup future (the Admin lifecycle wraps release in a 5 s timeout,
+    /// shorter than the driver's default server selection) can never strand
+    /// the generation read pin with no owner left. If the future is dropped
+    /// before [`Self::finish`], `Drop` converts the pin into a namespace fence
+    /// (the delete may or may not have landed) and releases the generation
+    /// pin; the exit probe clears the fence once the lock is proven absent.
+    struct SettledAdmissionPinCleanup {
+        fences: Arc<MongoAdmissionFences>,
+        owner: String,
+        pin: Option<MongoPersistentAdmissionPin>,
+    }
+
+    impl SettledAdmissionPinCleanup {
+        /// Settle with a known cleanup outcome. `delete_outcome_unknown`
+        /// keeps the namespace fenced; otherwise the pin is simply released.
+        fn finish(mut self, delete_outcome_unknown: bool) {
+            if let Some(pin) = self.pin.take() {
+                if delete_outcome_unknown {
+                    fence_persistent_admission_pin(
+                        &self.fences,
+                        &self.owner,
+                        pin,
+                        AdmissionFenceReason::UncertainCleanup,
+                    );
+                } else {
+                    drop(pin);
+                }
+            }
+        }
+    }
+
+    impl Drop for SettledAdmissionPinCleanup {
+        fn drop(&mut self) {
+            if let Some(pin) = self.pin.take() {
+                fence_persistent_admission_pin(
+                    &self.fences,
+                    &self.owner,
+                    pin,
+                    AdmissionFenceReason::UncertainCleanup,
+                );
             }
         }
     }
@@ -3153,27 +3240,11 @@ mod inner {
             else {
                 return;
             };
-            persistent_pin
-                .uncertain_outcome
-                .store(true, Ordering::Release);
-            let MongoPersistentAdmissionPin { namespace, pin, .. } = persistent_pin;
-            let MongoAdmissionConnectionPin {
-                connection,
-                _generation_guard: generation_guard,
-            } = pin;
-            self.admission_fences.retain(
-                &namespace,
+            fence_persistent_admission_pin(
+                &self.admission_fences,
                 guard_owner,
+                persistent_pin,
                 AdmissionFenceReason::UncertainGuardedOperation,
-                connection,
-                Some(generation_guard),
-            );
-            error!(
-                namespace = %crate::startup::sanitize_startup_scalar(&namespace),
-                "MongoDB mTLS DNS admission guard retained as a namespace fence because a \
-                 protected mutation outcome is uncertain; reconnect and failover stay available, \
-                 admissions for the namespace fail closed until the owner-qualified lock document \
-                 is removed after verifying the write outcome"
             );
         }
 
@@ -3185,9 +3256,17 @@ mod inner {
         /// says nothing about the original write, so the current connection
         /// is never consulted. Failure or timeout keeps the fence.
         async fn reverify_admission_fences(&self, namespace: &str) {
-            for (key, owner, connection) in self.admission_fences.probe_targets(namespace) {
+            let targets = self.admission_fences.probe_targets(namespace);
+            if targets.is_empty() {
+                return;
+            }
+            // One shared deadline bounds the whole pass, however many
+            // retained owners fence this namespace.
+            let deadline = tokio::time::Instant::now() + MONGO_ADMISSION_FENCE_REVERIFY_TIMEOUT;
+            for (key, owner, connection) in targets {
                 let probe =
-                    Self::probe_retained_admission_fence(&connection, namespace, &owner).await;
+                    Self::probe_retained_admission_fence(&connection, namespace, &owner, deadline)
+                        .await;
                 if self.admission_fences.apply_probe(&key, probe) {
                     info!(
                         namespace = %crate::startup::sanitize_startup_scalar(namespace),
@@ -3208,7 +3287,11 @@ mod inner {
             connection: &MongoConnectionBundle,
             namespace: &str,
             owner: &str,
+            deadline: tokio::time::Instant,
         ) -> AdmissionFenceProbe {
+            if tokio::time::Instant::now() >= deadline {
+                return AdmissionFenceProbe::Unverifiable;
+            }
             let collection = connection
                 .lease_client
                 .database(connection.db.name())
@@ -3220,7 +3303,7 @@ mod inner {
                     .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
                     .await
             };
-            match tokio::time::timeout(MONGO_ADMISSION_FENCE_REVERIFY_TIMEOUT, lookup).await {
+            match tokio::time::timeout_at(deadline, lookup).await {
                 Ok(Ok(Some(_))) => AdmissionFenceProbe::DurableFencePresent,
                 Ok(Ok(None)) => AdmissionFenceProbe::DurableFenceAbsent,
                 Ok(Err(_)) | Err(_) => AdmissionFenceProbe::Unverifiable,
@@ -3248,12 +3331,14 @@ mod inner {
         }
 
         /// Test seam: register a live multi-step persistent pin (holding the
-        /// generation read pin) whose borrowed mutation became uncertain.
+        /// generation read pin). `uncertain` marks a borrowed mutation whose
+        /// outcome is unknown; `false` models a settled owner about to release.
         #[allow(dead_code)] // exercised via external unit tests through the lib target
-        pub async fn insert_uncertain_persistent_admission_pin_for_test(
+        pub async fn insert_persistent_admission_pin_for_test(
             &self,
             namespace: &str,
             guard_owner: &str,
+            uncertain: bool,
         ) {
             let generation_guard = self.connection_generation.clone().read_owned().await;
             let _ = self.persistent_admission_pins.insert(
@@ -3264,7 +3349,7 @@ mod inner {
                         connection: self.connection(),
                         _generation_guard: generation_guard,
                     },
-                    uncertain_outcome: Arc::new(AtomicBool::new(true)),
+                    uncertain_outcome: Arc::new(AtomicBool::new(uncertain)),
                 },
             );
         }
@@ -15359,36 +15444,49 @@ mod inner {
             namespace: &str,
             guard_owner: &str,
         ) -> Result<(), anyhow::Error> {
-            let (connection, outcome_uncertain) = {
-                let persistent_pin = self.persistent_admission_pins.get(guard_owner).ok_or_else(
-                    || {
-                        anyhow::anyhow!(
-                            "MongoDB mTLS DNS admission guard is not active in this admin process \
-                             for namespace {namespace:?}"
-                        )
-                    },
-                )?;
-                if persistent_pin.namespace != namespace {
+            // Take ownership of the pin synchronously, before any await, so
+            // cancellation can never leave it (and its generation read pin)
+            // in the map with no owner able to release it (issue #7031).
+            let persistent_pin = match self
+                .persistent_admission_pins
+                .remove_if(guard_owner, |_, pin| pin.namespace == namespace)
+            {
+                Some((_, persistent_pin)) => persistent_pin,
+                None if self.persistent_admission_pins.contains_key(guard_owner) => {
                     anyhow::bail!(
                         "MongoDB mTLS DNS admission guard belongs to a different namespace than \
                          {namespace:?}"
                     );
                 }
-                (
-                    persistent_pin.pin.connection.clone(),
-                    persistent_pin.uncertain_outcome.load(Ordering::Acquire),
-                )
+                None => anyhow::bail!(
+                    "MongoDB mTLS DNS admission guard is not active in this admin process for \
+                     namespace {namespace:?}"
+                ),
             };
-            if outcome_uncertain {
+            if persistent_pin.uncertain_outcome.load(Ordering::Acquire) {
                 // The durable lock stays (no delete), but the generation pin
                 // is handed to the explicit namespace fence instead of being
-                // held for the life of the process (issue #7031).
-                self.retain_uncertain_persistent_admission_pin(guard_owner);
+                // held for the life of the process.
+                fence_persistent_admission_pin(
+                    &self.admission_fences,
+                    guard_owner,
+                    persistent_pin,
+                    AdmissionFenceReason::UncertainGuardedOperation,
+                );
                 anyhow::bail!(
                     "MongoDB mTLS DNS admission guard for namespace {namespace:?} retained \
                      because a protected mutation outcome is uncertain"
                 );
             }
+            let connection = persistent_pin.pin.connection.clone();
+            // From here the pin is owned by a cancellation-safe cleanup state:
+            // dropping this future fences the namespace and releases the
+            // generation pin instead of pinning reconnect/failover forever.
+            let cleanup = SettledAdmissionPinCleanup {
+                fences: self.admission_fences.clone(),
+                owner: guard_owner.to_string(),
+                pin: Some(persistent_pin),
+            };
             let result = connection
                 .lease_client
                 .database(connection.db.name())
@@ -15396,14 +15494,18 @@ mod inner {
                 .delete_one(doc! { "_id": namespace, "owner": guard_owner })
                 .write_concern(WriteConcern::majority())
                 .await;
-            // The mutation outcome was checked as settled above. Drop the
-            // process-local generation pin regardless of cleanup status; the
-            // owner-qualified durable document remains the fail-closed fence
-            // when the delete failed or its acknowledgement was lost.
-            let _ = self.persistent_admission_pins.remove(guard_owner);
+            // The mutation outcome was checked as settled above. Release the
+            // process-local generation pin regardless of cleanup status. When
+            // the delete's outcome is unknown the owner-qualified durable
+            // document may remain, so the namespace stays explicitly fenced in
+            // this process until the exit probe proves the lock absent.
             let result = match result {
-                Ok(result) => result,
+                Ok(result) => {
+                    cleanup.finish(false);
+                    result
+                }
                 Err(_error) => {
+                    cleanup.finish(true);
                     // Every borrowed mutation explicitly settled before this
                     // cleanup. Preserve its known response, surface cleanup
                     // status in the error log, and leave any durable fence for

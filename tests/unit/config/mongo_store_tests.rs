@@ -18,9 +18,8 @@ use ferrum_edge::_test_support::{
     mongo_store_acquire_connection_generation_pin_for_test,
     mongo_store_apply_mtls_dns_admission_fence_probe_for_test,
     mongo_store_ensure_mtls_dns_admission_unfenced_for_test,
-    mongo_store_insert_uncertain_persistent_admission_pin_for_test,
-    mongo_store_mtls_dns_admission_fence, mongo_store_new_unconnected_for_test,
-    mongo_store_published_database_name_for_test,
+    mongo_store_insert_persistent_admission_pin_for_test, mongo_store_mtls_dns_admission_fence,
+    mongo_store_new_unconnected_for_test, mongo_store_published_database_name_for_test,
     mongo_store_retain_mtls_dns_admission_fence_for_test,
     mongo_store_set_reconnect_transition_hooks_for_test,
     mongo_store_try_publish_reconnected_bundle_for_test, mtls_dns_policy_requires_consumer_load,
@@ -1290,6 +1289,18 @@ async fn admission_pin_defers_publish_without_topology_change() {
     );
 }
 
+/// Serializes every test that creates or clears an mTLS DNS admission fence.
+/// The `ferrum_database_mtls_dns_admission_fences_retained` gauge is process
+/// global, and only these tests in this binary move it, so ordering them
+/// against each other makes before/after deltas exact. Bind the guard as the
+/// FIRST local so it drops last, after the store (whose fence registry
+/// decrements the gauge on drop).
+static FENCE_GAUGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn fence_gauge() -> u64 {
+    ferrum_edge::plugins::prometheus_metrics::global_registry().mtls_dns_admission_fences_retained()
+}
+
 fn assert_namespace_fenced(store: &ferrum_edge::config::mongo_store::MongoStore, namespace: &str) {
     let refused = mongo_store_ensure_mtls_dns_admission_unfenced_for_test(store, namespace)
         .expect_err("a fenced namespace must refuse mTLS DNS admission");
@@ -1308,7 +1319,11 @@ fn assert_namespace_fenced(store: &ferrum_edge::config::mongo_store::MongoStore,
 /// fenced namespace keep failing closed across every published topology.
 #[tokio::test(flavor = "current_thread")]
 async fn retained_admission_fence_does_not_block_reconnect_or_failover() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
     let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let gauge_before = fence_gauge();
+    mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
+    // Retaining the same owner again is idempotent for state and gauge.
     mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
 
     match mongo_store_mtls_dns_admission_fence(&store, "ferrum") {
@@ -1358,11 +1373,10 @@ async fn retained_admission_fence_does_not_block_reconnect_or_failover() {
     assert_eq!(status.retained_fences, 1);
     assert_eq!(status.namespaces, vec!["ferrum".to_string()]);
     assert!(status.oldest_retained_since_unix_ms.is_some());
-    assert!(
-        ferrum_edge::plugins::prometheus_metrics::global_registry()
-            .mtls_dns_admission_fences_retained()
-            >= 1,
-        "the retained-fence gauge must count this fence"
+    assert_eq!(
+        fence_gauge(),
+        gauge_before + 1,
+        "the retained-fence gauge must count this fence exactly once"
     );
 }
 
@@ -1371,8 +1385,11 @@ async fn retained_admission_fence_does_not_block_reconnect_or_failover() {
 /// unverifiable probe keeps admissions failing closed.
 #[tokio::test(flavor = "current_thread")]
 async fn admission_fence_exit_requires_proven_absence_of_durable_lock() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
     let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let gauge_before = fence_gauge();
     mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
+    assert_eq!(fence_gauge(), gauge_before + 1);
 
     for probe in [
         MongoAdmissionFenceProbe::DurableFencePresent,
@@ -1402,6 +1419,21 @@ async fn admission_fence_exit_requires_proven_absence_of_durable_lock() {
     mongo_store_ensure_mtls_dns_admission_unfenced_for_test(&store, "ferrum")
         .expect("a cleared fence admits again");
     assert!(!store.mtls_dns_admission_fence_status().fenced());
+    assert_eq!(
+        fence_gauge(),
+        gauge_before,
+        "clearing the fence must return the gauge to its baseline"
+    );
+    assert_eq!(
+        mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+            &store,
+            "ferrum",
+            MongoAdmissionFenceProbe::DurableFenceAbsent,
+        ),
+        0,
+        "a second clear is a no-op"
+    );
+    assert_eq!(fence_gauge(), gauge_before);
 }
 
 /// A multi-step (restore) guard legitimately pins the generation while it is
@@ -1410,15 +1442,12 @@ async fn admission_fence_exit_requires_proven_absence_of_durable_lock() {
 /// it for the life of the process.
 #[tokio::test(flavor = "current_thread")]
 async fn uncertain_multi_step_guard_converts_generation_pin_into_namespace_fence() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
     let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
 
     // Release path.
-    mongo_store_insert_uncertain_persistent_admission_pin_for_test(
-        &store,
-        "tenant-a",
-        "restore-owner",
-    )
-    .await;
+    mongo_store_insert_persistent_admission_pin_for_test(&store, "tenant-a", "restore-owner", true)
+        .await;
     let blocked = mongo_store_try_publish_reconnected_bundle_for_test(
         &store,
         "blocked",
@@ -1456,10 +1485,11 @@ async fn uncertain_multi_step_guard_converts_generation_pin_into_namespace_fence
     assert_namespace_fenced(&store, "tenant-a");
 
     // Abandon path (Admin lifecycle Drop with an uncertain outcome).
-    mongo_store_insert_uncertain_persistent_admission_pin_for_test(
+    mongo_store_insert_persistent_admission_pin_for_test(
         &store,
         "tenant-b",
         "abandoned-owner",
+        true,
     )
     .await;
     mongo_store_try_publish_reconnected_bundle_for_test(
@@ -1491,6 +1521,86 @@ async fn uncertain_multi_step_guard_converts_generation_pin_into_namespace_fence
         status.namespaces,
         vec!["tenant-a".to_string(), "tenant-b".to_string()]
     );
+}
+
+/// Fix round for #7031: a SETTLED multi-step guard's release awaits a
+/// majority delete of its durable lock. The Admin lifecycle wraps that in a
+/// 5 s timeout, shorter than default driver server selection, so the release
+/// future can be dropped mid-delete. The persistent pin must already be out of
+/// the map and owned by a cancellation-safe cleanup state: dropping the future
+/// releases the generation pin (reconnect succeeds) and, because the delete
+/// outcome is unknown, leaves an explicit namespace fence the exit probe can
+/// clear, never an ownerless pin.
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_settled_guard_release_cannot_pin_reconnect() {
+    let _gauge_lock = FENCE_GAUGE_LOCK.lock().await;
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let gauge_before = fence_gauge();
+    mongo_store_insert_persistent_admission_pin_for_test(
+        &store,
+        "tenant-c",
+        "settled-owner",
+        false,
+    )
+    .await;
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "blocked",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect_err("an active multi-step guard still pins the generation");
+
+    // The lazy store has no reachable server, so the delete cannot complete
+    // inside this bound: the release future is dropped mid-await exactly as
+    // the Admin cleanup timeout drops it. (Should the driver instead fail
+    // fast, the cleanup-error path must reach the same end state.)
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        store.release_mtls_dns_admission_guard("tenant-c", "settled-owner"),
+    )
+    .await;
+
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_cancelled_release",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("a dropped settled release must not leave the generation pinned");
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "after_cancelled_release"
+    );
+    match mongo_store_mtls_dns_admission_fence(&store, "tenant-c") {
+        MongoAdmissionFence::Retained { reason, .. } => {
+            assert_eq!(reason, MongoAdmissionFenceReason::UncertainCleanup);
+        }
+        MongoAdmissionFence::Clear => {
+            panic!("an unknown lock-delete outcome must leave the namespace fenced")
+        }
+    }
+    assert_namespace_fenced(&store, "tenant-c");
+    assert_eq!(fence_gauge(), gauge_before + 1);
+    store
+        .release_mtls_dns_admission_guard("tenant-c", "settled-owner")
+        .await
+        .expect_err("the released owner is gone; a second release fails closed");
+
+    assert_eq!(
+        mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+            &store,
+            "tenant-c",
+            MongoAdmissionFenceProbe::DurableFenceAbsent,
+        ),
+        1,
+        "the exit probe clears the cleanup fence once the lock is proven absent"
+    );
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test(&store, "tenant-c")
+        .expect("a cleared cleanup fence admits again");
+    assert_eq!(fence_gauge(), gauge_before);
 }
 
 /// Ordering seams that cannot be exercised without a live MongoDB: the exit
