@@ -36,11 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whatever any trigger decides, and route-configured trailer names (claim
   destinations and custom credential locations alike) now match `_` spellings
   as well as ASCII case. `opa` `decision_request_headers` and `mesh_authz`
-  ext_authz `headersToUpstreamOnAllow` names join that trailer list (their
-  initial-header behaviour is unchanged). Untranslated gRPC-Web, whose request
+  ext_authz `headersToUpstreamOnAllow` names join that trailer list, and a
+  trigger-skipped `opa` or `mesh_authz` instance now also strips client
+  copies of those names from the initial header block (keeping only a value
+  an admitted sibling installed for the request). `mesh_authz` additionally
+  strips them on a request no CUSTOM rule matched, as its docs already
+  promised: a request that relied on a client `headersToUpstreamOnAllow`
+  header (for example `authorization`) reaching the backend without a CUSTOM
+  check no longer does. Untranslated gRPC-Web, whose request
   trailers ride inside the body where only the `grpc_web` translator parses
   them, is now refused with `415` on a route that owns any of these
-  gateway-asserted headers; add `grpc_web` to such a route to serve gRPC-Web
+  gateway-asserted headers (including `x-ferrum-peer-spiffe-id` from
+  `spiffe_identity` with `forward_identity`); add `grpc_web` to such a route to serve gRPC-Web
   clients. A route that relied on a client value under one of those names
   reaching the backend, in headers on trigger-excluded requests or in
   trailers, no longer receives it.

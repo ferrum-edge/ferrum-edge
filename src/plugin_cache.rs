@@ -1762,7 +1762,8 @@ impl Plugin for PluginInstanceWrapper {
         if !self.runs(ctx, TriggerPhase::PostAuth) {
             // A skipped instance installs nothing, but it still owns the
             // headers it documents as always sanitized (`claim_headers`
-            // destinations, `x-ferrum-peer-spiffe-id`). Leaving their client
+            // destinations, `x-ferrum-peer-spiffe-id`, OPA decision headers,
+            // ext_authz upstream headers). Leaving their client
             // copies would let a trigger forward a client-chosen value the
             // backend reads as a gateway assertion; like credential-redaction
             // discovery, this fail-safe work is never gated.

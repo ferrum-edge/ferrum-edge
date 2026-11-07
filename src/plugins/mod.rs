@@ -3886,6 +3886,13 @@ pub(crate) struct PluginRequestState {
     /// A trigger-skipped sibling keeps that header only on this provenance
     /// marker, never because a value equals the admitted peer identity.
     pub(crate) peer_spiffe_identity_forwarded: bool,
+    /// Exact names an admitted policy instance installed on the backend
+    /// request for this request (`opa` `decision_request_headers`,
+    /// `mesh_authz` ext_authz `headersToUpstreamOnAllow`). A sibling instance
+    /// that owns the same name but did not install it (trigger-skipped, or no
+    /// allowed check of its own) keeps only these entries and strips every
+    /// other spelling ([`strip_uninstalled_policy_request_headers`]).
+    pub(crate) policy_installed_request_headers: HashSet<String>,
     /// Digests of credential-bearing query parameters that were present before
     /// authentication and request transformation. Kept outside public metadata
     /// so neither reusable credentials nor correlatable digests enter logs.
@@ -6696,6 +6703,16 @@ impl RequestContext {
     /// request header (`Plugin::owned_request_assertion_header_names`).
     pub(crate) fn route_owns_request_assertion_headers(&self) -> bool {
         self.route_owns_request_assertion_headers
+    }
+
+    /// Record that an admitted policy instance installed `name` on the
+    /// backend request for this request, so a sibling instance owning the same
+    /// name keeps that value ([`strip_uninstalled_policy_request_headers`]).
+    pub(crate) fn mark_policy_request_header_installed(&mut self, name: &str) {
+        let installed = &mut self.plugin_state_mut().policy_installed_request_headers;
+        if !installed.contains(name) {
+            installed.insert(name.to_string());
+        }
     }
 
     /// Shared handle to the route's request-trailer strip list, for the late
@@ -11417,6 +11434,35 @@ impl std::ops::BitOr for PluginHooks {
     fn bitor(self, rhs: Self) -> Self {
         self.union(rhs)
     }
+}
+
+/// Remove every client spelling (ASCII case-insensitive, `_` read as `-`) of
+/// the policy-owned request header `names` from `headers`, keeping only an
+/// exact entry an admitted policy instance installed for this request
+/// ([`RequestContext::mark_policy_request_header_installed`]).
+///
+/// Shared by `opa` and `mesh_authz`: their trigger-skip sanitizer
+/// (`Plugin::sanitize_owned_request_headers`) and `mesh_authz`'s own
+/// `before_proxy` when no allowed check of its own staged a result.
+pub(crate) fn strip_uninstalled_policy_request_headers(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+    names: &[String],
+) {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+
+    if names.is_empty() {
+        return;
+    }
+    let installed = ctx
+        .plugin_state()
+        .map(|state| &state.policy_installed_request_headers);
+    headers.retain(|header, _| {
+        let owned = names
+            .iter()
+            .any(|name| field_names_equivalent_for_backends(header, name));
+        !owned || installed.is_some_and(|installed| installed.contains(header))
+    });
 }
 
 /// Plugin lifecycle hooks.

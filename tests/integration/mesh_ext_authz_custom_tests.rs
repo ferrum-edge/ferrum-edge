@@ -1975,9 +1975,10 @@ mod allowed_request_mutations {
     }
 
     #[tokio::test]
-    async fn a_request_no_custom_rule_matches_keeps_its_headers() {
-        // No delegation ran, so there is no provider-owned contract for this
-        // request: the backend sees exactly what the client sent.
+    async fn a_request_no_custom_rule_matches_still_loses_provider_owned_client_copies() {
+        // No delegation ran, so nothing vouched for the provider-owned names:
+        // the client's copies are removed in every spelling, and every other
+        // header reaches the backend unchanged.
         let stub = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
         let plugin = plugin(stub.port, false);
         let mut ctx = ctx();
@@ -1988,8 +1989,61 @@ mod allowed_request_mutations {
         ));
         let mut upstream = forged_upstream_headers();
         let _ = plugin.before_proxy(&mut ctx, &mut upstream).await;
-        assert_eq!(upstream, forged_upstream_headers());
+        assert_eq!(
+            upstream,
+            HashMap::from([("x-request-id".to_string(), "abc-123".to_string())])
+        );
         assert_eq!(stub.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A trigger-skipped instance (modelled by calling its skip sanitizer,
+    /// exactly what the trigger wrapper does in place of `before_proxy`) runs
+    /// no check but still owns its `headersToUpstreamOnAllow` names: client
+    /// copies go in every spelling, and a value an admitted sibling installed
+    /// survives in either order.
+    #[tokio::test]
+    async fn a_trigger_skipped_instance_strips_client_copies_but_keeps_an_admitted_value() {
+        let stub = start_stub(StubBehavior::Raw(ALLOW_WITH_MUTATIONS)).await;
+        let admitted = plugin(stub.port, false);
+        let skipped = plugin_with(
+            "skipped-ext-authz",
+            stub.port,
+            false,
+            &["x-auth-request-user"],
+            &[],
+        );
+        for skipped_first in [false, true] {
+            let mut ctx = ctx();
+            assert!(matches!(
+                admitted.authorize(&mut ctx).await,
+                PluginResult::Continue
+            ));
+            let mut upstream = forged_upstream_headers();
+            if skipped_first {
+                skipped.sanitize_owned_request_headers(&mut ctx, &mut upstream);
+                let _ = admitted.before_proxy(&mut ctx, &mut upstream).await;
+            } else {
+                let _ = admitted.before_proxy(&mut ctx, &mut upstream).await;
+                skipped.sanitize_owned_request_headers(&mut ctx, &mut upstream);
+            }
+            assert_eq!(
+                upstream.get("x-auth-request-user").map(String::as_str),
+                Some("alice"),
+                "skipped_first={skipped_first}: the admitted value survives"
+            );
+            assert!(!upstream.contains_key("X_Auth_Request_User"));
+        }
+
+        let mut ctx = ctx();
+        let mut upstream = forged_upstream_headers();
+        skipped.sanitize_owned_request_headers(&mut ctx, &mut upstream);
+        assert!(!upstream.contains_key("x-auth-request-user"));
+        assert!(!upstream.contains_key("X_Auth_Request_User"));
+        assert_eq!(
+            upstream.get("authorization").map(String::as_str),
+            Some("Bearer client-token"),
+            "a name the skipped instance does not own is untouched"
+        );
     }
 
     /// A second allowing provider: a tenant header upstream and its own cookie.

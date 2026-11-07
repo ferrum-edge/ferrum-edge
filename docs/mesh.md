@@ -1823,8 +1823,13 @@ honoured, each at one fixed point of the plugin chain:
   `-`), so a forged `x-auth-request-user` can never reach the backend beside or
   instead of the provider's value; the provider's value is then installed when
   it returned one. A `failOpen` allow (the provider could not decide) installs
-  nothing and still strips the client's copies — nothing vouched for them. A
-  request no CUSTOM rule matched is untouched. The names the instance can
+  nothing and still strips the client's copies — nothing vouched for them.
+  The same holds for a request no CUSTOM rule matched (or that a non-CUSTOM
+  rule allowed), and for a request the instance's execution trigger skips:
+  the client's copies of the instance's provider-owned names are removed, and
+  only a value another `mesh_authz` instance's allowed check installed for
+  this request survives. The names are also removed from client request
+  trailers on every request. The names the instance can
   change are declared as `modified_request_header_names` — in every `_` / `-`
   spelling the removal folds — so replay/cache ordering and the early
   route-total preview account for them. Each `mesh_authz` instance stages and

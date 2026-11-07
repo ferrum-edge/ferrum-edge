@@ -616,6 +616,19 @@ impl Plugin for SpiffeIdentity {
         self.forward_identity
     }
 
+    /// With `forward_identity`, the fixed [`FORWARDED_IDENTITY_HEADER`] is a
+    /// gateway assertion on every request: it joins the route's
+    /// request-trailer strip list and marks the route as owning an asserted
+    /// header (so untranslated gRPC-Web, whose trailers ride in the body, is
+    /// refused there).
+    fn owned_request_assertion_header_names(&self) -> Vec<String> {
+        if self.forward_identity {
+            vec![FORWARDED_IDENTITY_HEADER.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Audited (issue #6793): this plugin reads only the peer certificate and
     /// writes only the peer identity; it never reads, iterates or forwards the
     /// `mesh.*` workload labels in either metadata map.

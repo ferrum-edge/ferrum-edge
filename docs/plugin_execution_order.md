@@ -945,8 +945,9 @@ configure — a `key_auth` `header:<name>`, a custom `jwt_auth` / `jwks_auth` /
 every gateway-asserted request header a plugin on the route owns, whatever
 that instance's execution trigger decides (`claim_headers` /
 `output_claim_headers` destinations of `jwks_auth`, `oauth2_introspection`,
-and `oidc_relying_party`, `opa` `decision_request_headers`, and `mesh_authz`
-ext_authz `headersToUpstreamOnAllow`; route-configured names are matched
+and `oidc_relying_party`, `opa` `decision_request_headers`, `mesh_authz`
+ext_authz `headersToUpstreamOnAllow`, and `spiffe_identity`
+`x-ferrum-peer-spiffe-id`; route-configured names are matched
 ASCII-case-insensitively with `_` read as `-`). Untranslated gRPC-Web carries
 its trailers inside the body, where only the `grpc_web` translator parses
 them, so it is refused with `415` on a route that owns such a header;
@@ -1633,7 +1634,11 @@ because gating them could only add disclosure or forgery, never remove work:
   client copies of the request headers it owns as gateway assertions and
   installs nothing. Today that is every `claim_headers` / `output_claim_headers`
   destination of `jwks_auth`, `oauth2_introspection`, and `oidc_relying_party`,
-  and `spiffe_identity`'s `x-ferrum-peer-spiffe-id` with `forward_identity`.
+  `opa` `decision_request_headers`, `mesh_authz` ext_authz
+  `headersToUpstreamOnAllow`, and `spiffe_identity`'s `x-ferrum-peer-spiffe-id`
+  with `forward_identity`. A skipped `opa` / `mesh_authz` / `spiffe_identity`
+  keeps one of its names only when an admitted sibling installed it for this
+  request (a typed provenance marker), never because of the value.
   Without it a client that misses the trigger could forward a forged value the
   backend reads as a gateway assertion. Sanitization is claimed per
   destination per request, so a trigger-admitted sibling instance that shares

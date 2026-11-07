@@ -16472,6 +16472,61 @@ async fn opa_decision_request_headers_are_stripped_from_request_trailers() {
     );
 }
 
+/// Run one request through `plugin_configs` on proxy `p1` the way the
+/// dispatchers do (`on_request_received` on the request view the frontend
+/// selects, then the shared `before_proxy` funnel) and return the funnel's
+/// status: `None` for `Continue`, `Some(status)` for a rejection.
+async fn before_proxy_funnel_status(
+    plugin_configs: Vec<PluginConfig>,
+    content_type: &str,
+) -> Option<u16> {
+    use ferrum_edge::_test_support::{
+        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
+        set_request_wire_protocol_for_test,
+    };
+    use ferrum_edge::config::types::HttpWireTransport;
+
+    let ids: Vec<String> = plugin_configs.iter().map(|pc| pc.id.clone()).collect();
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/", ids)],
+        plugin_configs,
+    ))
+    .unwrap();
+    let is_grpc_web = content_type.starts_with("application/grpc-web");
+    let view = if is_grpc_web {
+        cache.grpc_web_request_view("ferrum", "p1")
+    } else {
+        cache.request_view("ferrum", "p1", ProxyProtocol::Http)
+    };
+    let plugins = view.plugins();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/svc.Echo/Call".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    set_request_wire_protocol_for_test(&mut ctx, HttpWireTransport::Http2, is_grpc_web);
+    apply_request_view_trailer_policy_for_test(&mut ctx, &view);
+    for plugin in plugins.iter() {
+        plugin.on_request_received(&mut ctx).await;
+    }
+    let mut headers = ctx.headers.clone();
+    match run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await {
+        PluginResult::Continue => None,
+        PluginResult::Reject { status_code, .. } => Some(status_code),
+        PluginResult::RejectBinary { status_code, .. } => Some(status_code),
+    }
+}
+
+const GRPC_WEB_BINARY: &str = "application/grpc-web+proto";
+const GRPC_WEB_TEXT: &str = "application/grpc-web-text+proto";
+
+fn grpc_web_translator() -> PluginConfig {
+    make_plugin_config_with_json("gw", "grpc_web", json!({}), PluginScope::Proxy, Some("p1"))
+}
+
 /// Untranslated gRPC-Web is forwarded byte-for-byte, body-embedded `0x80`
 /// trailer frame included, and only the `grpc_web` translator parses that
 /// frame. On a route that owns gateway-assertion request headers such a
@@ -16480,19 +16535,13 @@ async fn opa_decision_request_headers_are_stripped_from_request_trailers() {
 /// assertions, and a non-gRPC-Web request are unaffected.
 #[tokio::test]
 async fn untranslated_grpc_web_is_refused_on_a_route_owning_assertion_headers() {
-    use ferrum_edge::_test_support::{
-        apply_request_view_trailer_policy_for_test, run_before_proxy_hooks_for_test,
-        set_request_wire_protocol_for_test,
-    };
-    use ferrum_edge::config::types::HttpWireTransport;
-
     // (translator present, claim-owning auth, request content type, refused)
     let cases = [
-        (false, true, "application/grpc-web+proto", true),
-        (false, true, "application/grpc-web-text+proto", true),
-        (true, true, "application/grpc-web+proto", false),
-        (true, true, "application/grpc-web-text+proto", false),
-        (false, false, "application/grpc-web+proto", false),
+        (false, true, GRPC_WEB_BINARY, true),
+        (false, true, GRPC_WEB_TEXT, true),
+        (true, true, GRPC_WEB_BINARY, false),
+        (true, true, GRPC_WEB_TEXT, false),
+        (false, false, GRPC_WEB_BINARY, false),
         (false, true, "application/json", false),
     ];
     for (translator, claim_owning, content_type, refused) in cases {
@@ -16508,51 +16557,54 @@ async fn untranslated_grpc_web_is_refused_on_a_route_owning_assertion_headers() 
             PluginScope::Proxy,
             Some("p1"),
         )];
-        let mut plugin_ids = vec!["auth"];
         if translator {
-            plugin_configs.push(make_plugin_config_with_json(
-                "gw",
-                "grpc_web",
-                json!({}),
-                PluginScope::Proxy,
-                Some("p1"),
-            ));
-            plugin_ids.push("gw");
+            plugin_configs.push(grpc_web_translator());
         }
-        let cache = PluginCache::new(&make_config(
-            vec![make_proxy("p1", "/", plugin_ids)],
-            plugin_configs,
-        ))
-        .unwrap_or_else(|error| panic!("{label}: {error}"));
-        let is_grpc_web = content_type.starts_with("application/grpc-web");
-        let view = if is_grpc_web {
-            cache.grpc_web_request_view("ferrum", "p1")
-        } else {
-            cache.request_view("ferrum", "p1", ProxyProtocol::Http)
-        };
-        let plugins = view.plugins();
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "POST".to_string(),
-            "/svc.Echo/Call".to_string(),
+        let status = before_proxy_funnel_status(plugin_configs, content_type).await;
+        assert_eq!(status, refused.then_some(415), "{label}");
+    }
+}
+
+/// `spiffe_identity` with `forward_identity` owns `x-ferrum-peer-spiffe-id`
+/// on every request, so a SPIFFE-only route counts as owning an asserted
+/// header: untranslated gRPC-Web is refused there in binary and text framing,
+/// even when the instance's own trigger skips the request. `forward_identity:
+/// false` owns nothing, and a translator admits the request.
+#[tokio::test]
+async fn untranslated_grpc_web_is_refused_on_a_spiffe_forwarding_route() {
+    let path_trigger: PluginTrigger =
+        serde_json::from_value(json!({"when": {"match": {"path": {"prefix": ["/other"]}}}}))
+            .unwrap();
+    // (forward_identity, trigger skips the instance, translator, content type, refused)
+    let cases = [
+        (true, false, false, GRPC_WEB_BINARY, true),
+        (true, false, false, GRPC_WEB_TEXT, true),
+        (true, true, false, GRPC_WEB_BINARY, true),
+        (true, true, false, GRPC_WEB_TEXT, true),
+        (false, false, false, GRPC_WEB_BINARY, false),
+        (true, false, true, GRPC_WEB_BINARY, false),
+        (true, false, true, GRPC_WEB_TEXT, false),
+    ];
+    for (forward_identity, skipped, translator, content_type, refused) in cases {
+        let label = format!(
+            "forward={forward_identity} skipped={skipped} translator={translator} {content_type}"
         );
-        ctx.headers
-            .insert("content-type".to_string(), content_type.to_string());
-        set_request_wire_protocol_for_test(&mut ctx, HttpWireTransport::Http2, is_grpc_web);
-        apply_request_view_trailer_policy_for_test(&mut ctx, &view);
-        for plugin in plugins.iter() {
-            plugin.on_request_received(&mut ctx).await;
+        let mut spiffe = make_plugin_config_with_json(
+            "sid",
+            "spiffe_identity",
+            json!({"forward_identity": forward_identity}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        if skipped {
+            spiffe.trigger = Some(path_trigger.clone());
         }
-        let mut headers = ctx.headers.clone();
-        let result = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut headers).await;
-        if refused {
-            assert!(
-                matches!(result, PluginResult::Reject { status_code: 415, .. }),
-                "{label}: untranslated gRPC-Web must be refused"
-            );
-        } else {
-            assert!(matches!(result, PluginResult::Continue), "{label}");
+        let mut plugin_configs = vec![spiffe];
+        if translator {
+            plugin_configs.push(grpc_web_translator());
         }
+        let status = before_proxy_funnel_status(plugin_configs, content_type).await;
+        assert_eq!(status, refused.then_some(415), "{label}");
     }
 }
 
@@ -16561,8 +16613,7 @@ async fn untranslated_grpc_web_is_refused_on_a_route_owning_assertion_headers() 
 /// it, and an untranslated gRPC-Web request always means "no translator".
 #[test]
 fn grpc_web_translator_cannot_carry_an_execution_trigger() {
-    let mut translator =
-        make_plugin_config_with_json("gw", "grpc_web", json!({}), PluginScope::Proxy, Some("p1"));
+    let mut translator = grpc_web_translator();
     translator.trigger = Some(post_only_trigger());
     let config = make_config(vec![make_proxy("p1", "/", vec!["gw"])], vec![translator]);
     let error = PluginCache::new(&config)

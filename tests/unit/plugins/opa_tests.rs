@@ -2250,6 +2250,112 @@ async fn opa_allow_obligation_installs_listed_upstream_headers() {
     );
 }
 
+/// A trigger-skipped OPA instance decides nothing and installs nothing, but
+/// its `decision_request_headers` stay policy-owned: every client spelling is
+/// removed. A value an admitted sibling installed for this request survives,
+/// in either priority order.
+#[tokio::test]
+async fn trigger_skipped_opa_strips_client_copies_but_keeps_an_admitted_value() {
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::plugin_trigger::PluginTrigger;
+    use ferrum_edge::config::types::{GatewayConfig, PluginScope};
+
+    use super::plugin_utils::{make_plugin_config_with_json, make_proxy};
+
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-tenant": "blue"}}}),
+    )
+    .await;
+    let opa_config = |headers: Value| {
+        let mut config = base_config(&server.uri());
+        config["decision_request_headers"] = headers;
+        config
+    };
+    let post_only: PluginTrigger =
+        serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap();
+    // (admitted priority, skipped priority); `None` runs the skipped instance alone.
+    for priorities in [Some((2050, 2060)), Some((2060, 2050)), None] {
+        let label = format!("{priorities:?}");
+        let mut skipped = make_plugin_config_with_json(
+            "skipped",
+            "opa",
+            opa_config(json!(["x-tenant", "x-user"])),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        skipped.trigger = Some(post_only.clone());
+        let mut plugin_configs = vec![skipped];
+        if let Some((admitted_priority, skipped_priority)) = priorities {
+            plugin_configs[0].priority_override = Some(skipped_priority);
+            let mut admitted = make_plugin_config_with_json(
+                "admitted",
+                "opa",
+                opa_config(json!(["x-tenant"])),
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            admitted.priority_override = Some(admitted_priority);
+            plugin_configs.push(admitted);
+        }
+        let ids = if priorities.is_some() {
+            vec!["skipped", "admitted"]
+        } else {
+            vec!["skipped"]
+        };
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![make_proxy("p1", "/", ids)],
+            plugin_configs,
+            ..Default::default()
+        };
+        let cache = PluginCache::new(&config).unwrap_or_else(|error| panic!("{label}: {error}"));
+        let plugins = cache.get_plugins("ferrum", "p1");
+
+        let mut ctx = make_ctx();
+        ctx.headers.insert("X_Tenant".into(), "forged".into());
+        ctx.headers.insert("x-user".into(), "forged".into());
+        for plugin in plugins.iter() {
+            plugin.on_request_received(&mut ctx).await;
+        }
+        for plugin in plugins.iter() {
+            assert_continue(plugin.authorize(&mut ctx).await);
+        }
+        let mut headers = ctx.headers.clone();
+        headers.insert("X_User".into(), "forged".into());
+        let result = ferrum_edge::_test_support::run_before_proxy_hooks_for_test(
+            plugins.as_slice(),
+            &mut ctx,
+            &mut headers,
+        )
+        .await;
+        assert_continue(result);
+
+        assert_eq!(
+            ctx.metadata
+                .get("plugin_trigger.skipped.skipped")
+                .map(String::as_str),
+            Some("true"),
+            "{label}"
+        );
+        assert_eq!(
+            headers.get("x-tenant").map(String::as_str),
+            priorities.map(|_| "blue"),
+            "{label}: only an admitted instance's installed value survives"
+        );
+        for forged in ["X_Tenant", "x-user", "X_User"] {
+            assert!(!headers.contains_key(forged), "{label}: {forged}");
+        }
+        assert_eq!(
+            headers.get("x-request-id").map(String::as_str),
+            Some("req-123"),
+            "{label}"
+        );
+    }
+}
+
 /// A bare `true` decision carries no obligation, but a listed destination is
 /// still gateway-owned and the client copy is removed.
 #[tokio::test]

@@ -811,6 +811,10 @@ impl Opa {
                 .any(|destination| field_names_equivalent_for_backends(destination, name))
         });
         for (name, value) in staged {
+            // Provenance for a trigger-skipped sibling instance that owns the
+            // same name (`sanitize_owned_request_headers`): it keeps this
+            // value and strips every other spelling.
+            ctx.mark_policy_request_header_installed(&name);
             ctx.headers.insert(name, value);
         }
     }
@@ -1149,12 +1153,27 @@ impl Plugin for Opa {
         !self.decision_request_headers.is_empty()
     }
 
-    /// The policy-owned `decision_request_headers`, for the route's
-    /// request-trailer strip list only: a client can never restate one in
-    /// request trailers. Initial-header ownership is unchanged (decided in
-    /// `authorize` for the requests this instance lets through).
+    /// The policy-owned `decision_request_headers`: folded into the route's
+    /// request-trailer strip list, so a client can never restate one in
+    /// request trailers.
     fn owned_request_assertion_header_names(&self) -> Vec<String> {
         self.decision_request_headers.clone()
+    }
+
+    /// A trigger-skipped instance decides nothing and installs nothing, but
+    /// its `decision_request_headers` stay policy-owned: every client spelling
+    /// is removed, and only a value an admitted OPA instance installed for
+    /// this request survives.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::plugins::strip_uninstalled_policy_request_headers(
+            ctx,
+            headers,
+            &self.decision_request_headers,
+        );
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
