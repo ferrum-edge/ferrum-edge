@@ -202,10 +202,11 @@ Reading the series:
   `baseline_image=ferrumedge/ferrum-edge:main-<sha>` for a revision before the
   step and skip the unaffected protocols.
 
-Artifacts request `retention-days: 90`, but the repository's Actions
-artifact and log retention setting caps them (and the logs and job summaries)
-at its own value. Raise it under Settings → Actions → General when longer
-history is needed. Public repositories allow up to 90 days.
+Artifacts request `retention-days: 90`. The repository's Actions artifact and
+log retention setting (Settings → Actions → General) caps artifacts, logs and
+job summaries. It was raised from 30 to 90 days, the public-repository
+maximum, on 2026-11-07, so a run keeps 90 days of history. Runs uploaded
+before that keep their 30-day expiry.
 
 ## gRPC RPC-deadline A/B (#6904)
 
