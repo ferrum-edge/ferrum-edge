@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) and the
   `issuer` identifier keep `localhost`; a discovered plaintext endpoint must
   share the loopback IP-literal discovery origin.
+- **`tcp_logging` no-verify TLS advertises the crypto provider's signature
+  schemes and warns.** Under `FERRUM_TLS_NO_VERIFY` the plugin used a private
+  verifier with a hard-coded scheme list that did not follow the build's
+  provider (ED448, which neither ring nor AWS-LC verifies, and ECDSA P-521,
+  which ring does not) and logged nothing. It now uses the
+  shared `NoVerifier` and warns that verification is disabled, like
+  `ws_logging` and `ldap_auth`.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`
