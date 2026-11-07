@@ -109,7 +109,7 @@ pub fn prepare_proxy_frontend_tls(
             );
             return unarmed();
         }
-        FrontendLiveReloadSources::Refreshable(sources) => sources,
+        FrontendLiveReloadSources::Refreshable(sources) => *sources,
     };
 
     // Arm this listener family's client-trust generation from the material the
@@ -365,8 +365,9 @@ enum FrontendLiveReloadSources {
     NoCertificate,
     /// Every watched source is static inline PEM, so nothing can ever change.
     StaticInline,
-    /// At least one watched source is refreshable.
-    Refreshable(FrontendTlsSources),
+    /// At least one watched source is refreshable. Boxed so the dataless
+    /// verdicts stay small (`clippy::large_enum_variant`).
+    Refreshable(Box<FrontendTlsSources>),
 }
 
 fn frontend_live_reload_sources(
@@ -413,13 +414,13 @@ fn frontend_live_reload_sources(
     {
         return FrontendLiveReloadSources::StaticInline;
     }
-    FrontendLiveReloadSources::Refreshable(FrontendTlsSources {
+    FrontendLiveReloadSources::Refreshable(Box::new(FrontendTlsSources {
         cert,
         key,
         client_ca,
         ocsp,
         watched,
-    })
+    }))
 }
 
 fn frontend_watched_sources(
@@ -505,7 +506,7 @@ pub fn prepare_admin_frontend_tls(
             );
             return unarmed();
         }
-        FrontendLiveReloadSources::Refreshable(sources) => sources,
+        FrontendLiveReloadSources::Refreshable(sources) => *sources,
     };
 
     // Same arming contract as the proxy surface, on the admin trust domain
