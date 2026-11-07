@@ -906,8 +906,8 @@ fn load_testing_gateway_port_respects_backend_egress_policy() {
 
     // Controls: the self-dial to the enabled listener stays admitted under
     // `public`, whether `gateway_port` is omitted or names that listener, on
-    // every bind address `127.0.0.1` reaches.
-    for bind in ["0.0.0.0", "::", "127.0.0.1"] {
+    // every bind address `127.0.0.1` provably reaches.
+    for bind in ["0.0.0.0", "127.0.0.1"] {
         let node = serving_env(OperatingMode::Database, bind, false);
         let client = serving_client(&public, &node);
         assert!(LoadTesting::new(&load_test_config(false, None), client).is_ok());
@@ -926,9 +926,11 @@ fn load_testing_self_dial_requires_a_listener_loopback_reaches() {
     let listener = load_test_config(false, Some(18082));
 
     // Port equality alone is not a self-dial: a listener bound where
-    // `127.0.0.1` does not reach it leaves that loopback port to whatever
-    // else listens there.
-    for bind in ["10.0.0.5", "::1", "127.0.0.2"] {
+    // `127.0.0.1` does not provably reach it leaves that loopback port to
+    // whatever else listens there. That includes the IPv6 wildcard: the
+    // proxy listeners leave `IPV6_V6ONLY` at the host default, and with
+    // `net.ipv6.bindv6only=1` another service can own `127.0.0.1` there.
+    for bind in ["10.0.0.5", "::1", "127.0.0.2", "::", "::ffff:127.0.0.1"] {
         let node = serving_env(OperatingMode::Database, bind, false);
         let client = serving_client(&public, &node);
         let err = LoadTesting::new(&listener, client)

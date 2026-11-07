@@ -1816,6 +1816,84 @@ async fn post_with_failing_plugin_config_returns_422_via_real_validator() {
     );
 }
 
+fn public_egress_policy() -> ferrum_edge::config::BackendEgressPolicy {
+    ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    )
+}
+
+fn load_testing_spec(proxy_id: &str, gateway_port: u16) -> Value {
+    json_spec_with_plugin(
+        proxy_id,
+        "backend.internal",
+        &uid("load-testing"),
+        "load_testing",
+        json!({
+            "key": "spec-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": gateway_port
+        }),
+    )
+}
+
+// API-spec admission uses the same plugin validation client as direct admin
+// plugin writes: a serving database-mode node applies its node-local
+// `load_testing` listener screen, while a control plane (no `ProxyState`)
+// checks shape only because the listener topology belongs to its DPs.
+#[tokio::test]
+async fn api_spec_load_testing_gateway_port_follows_the_admin_serving_posture() {
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+
+    let dir = TempDir::new().unwrap();
+    let env_config = EnvConfig {
+        mode: OperatingMode::Database,
+        proxy_http_port: 18082,
+        backend_allow_ips: public_egress_policy(),
+        ..Default::default()
+    };
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (proxy_state, _health_checks) = ferrum_edge::proxy::ProxyState::new(
+        ferrum_edge::config::types::GatewayConfig::default(),
+        dns_cache,
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+    let mut serving = make_admin_state(make_store(&dir).await, 25);
+    serving.proxy_state = Some(proxy_state);
+    serving.backend_allow_ips = public_egress_policy();
+    let (base, _shutdown) = start_admin(serving).await;
+    let client = AdminClient::new(base);
+
+    // The node's own loopback listener is the documented self-dial.
+    let listener_spec = load_testing_spec(&uid("proxy"), 18082);
+    let (status, body) = client.post_json("/api-specs", &listener_spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+    // Any other loopback port is refused under a policy that denies it.
+    let sidecar_spec = load_testing_spec(&uid("proxy"), 18090);
+    let (status, body) = client.post_json("/api-specs", &sidecar_spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {body}"
+    );
+    assert!(
+        body.to_string().contains("backend egress policy"),
+        "body: {body}"
+    );
+
+    // A control-plane-style admin has no local `ProxyState`.
+    let mut control_plane = make_admin_state(make_store(&dir).await, 25);
+    control_plane.backend_allow_ips = public_egress_policy();
+    let (base, _shutdown) = start_admin(control_plane).await;
+    let client = AdminClient::new(base);
+    let dp_listener_spec = load_testing_spec(&uid("proxy"), 18090);
+    let (status, body) = client.post_json("/api-specs", &dp_listener_spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+}
+
 #[tokio::test]
 async fn api_spec_post_and_exact_put_validate_against_prospective_schema_graph() {
     let dir = TempDir::new().unwrap();

@@ -568,6 +568,39 @@ fn effective_process_global_frontends(
     )
 }
 
+/// The loopback-reachable proxy frontends this process will own, by the same
+/// pre-bound-first resolution as [`effective_process_global_frontends`]: an
+/// adopted listener's actual local address (port AND bind address) wins over
+/// `EnvConfig`. The HTTPS listener starts only when both frontend TLS paths are
+/// configured. Plugins that dial the local gateway over loopback
+/// (`load_testing`) check their target against this set.
+fn effective_local_proxy_frontends(
+    env_config: &EnvConfig,
+    prebound: &ServeOptions,
+) -> crate::plugins::utils::LocalProxyFrontends {
+    let resolve = |listener: &Option<TcpListener>, env_port: u16| -> Option<SocketAddr> {
+        match listener {
+            Some(listener) => listener.local_addr().ok(),
+            None => env_config
+                .proxy_bind_address
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| SocketAddr::new(ip, env_port)),
+        }
+    };
+    let https = if env_config.frontend_tls_cert_path.is_some()
+        && env_config.frontend_tls_key_path.is_some()
+    {
+        resolve(&prebound.proxy_https, env_config.proxy_https_port)
+    } else {
+        None
+    };
+    crate::plugins::utils::LocalProxyFrontends::from_listener_addrs(
+        resolve(&prebound.proxy_http, env_config.proxy_http_port),
+        https,
+    )
+}
+
 /// Build the reserved-port set [`serve`] uses for stream-proxy conflict
 /// validation and for `AdminState::reserved_ports`.
 ///
@@ -944,6 +977,7 @@ pub async fn serve(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
         reserved_ports.clone(),
+        effective_local_proxy_frontends(&env_config, &prebound),
     )?;
     proxy_state.overload.attach_shutdown(&shutdown_tx);
     crate::runtime_metrics::global().configure(
@@ -2069,6 +2103,58 @@ mod tests {
             "env-config admin_http_port 9000 must NOT be reserved when a prebound \
              listener is on a different port; got {reserved:?}",
         );
+    }
+
+    // Regression: `load_testing` exempts only the proxy listener this
+    // process actually owns. An adopted listener's local address (port and
+    // bind address) wins over `EnvConfig`, so the configured 8000 is not a
+    // self-dial while the adopted loopback port is.
+    #[tokio::test]
+    async fn effective_local_proxy_frontends_follow_the_adopted_listener() {
+        use crate::config::{BackendAllowIps, BackendEgressPolicy};
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::load_testing::LoadTesting;
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let adopted_port = proxy_listener.local_addr().unwrap().port();
+        assert_ne!(adopted_port, 8000);
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_bind_address: "10.0.0.5".to_string(),
+            proxy_http_port: 8000,
+            ..EnvConfig::default()
+        };
+        let prebound = ServeOptions {
+            proxy_http: Some(proxy_listener),
+            ..ServeOptions::default()
+        };
+
+        let frontends = effective_local_proxy_frontends(&env_config, &prebound);
+        assert_eq!(frontends.http_loopback_port(), Some(adopted_port));
+        assert_eq!(frontends.https_loopback_port(), None);
+
+        let public = BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public);
+        let client = PluginHttpClient::default_with_backend_allow_ips(public)
+            .with_local_proxy_frontends(frontends);
+        let adopted = serde_json::json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": adopted_port
+        });
+        let configured = serde_json::json!({
+            "key": "test-load-key-0123456789abcdef!!",
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 8000
+        });
+        assert!(LoadTesting::new(&adopted, client.clone()).is_ok());
+        let err = LoadTesting::new(&configured, client)
+            .err()
+            .expect("the configured but unowned port must be denied under public");
+        assert!(err.contains("backend egress policy"), "got: {err}");
     }
 
     // Regression P1: H3's UDP socket must bind to the same port the

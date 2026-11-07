@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is an enabled proxy listener of that node that `127.0.0.1` reaches, for the
   scheme `gateway_tls` selects: the HTTPS listener counts only when frontend
   TLS is configured (database/file) or its port is enabled (DP), the bind
-  address must be `0.0.0.0`, `::` or `127.0.0.1`, and mesh mode has no such
+  address must be `0.0.0.0` or `127.0.0.1` (an adopted pre-bound listener's
+  real address counts, and an IPv6 bind such as `::` never does, because
+  `IPV6_V6ONLY` is left at the host default), and mesh mode has no such
   listener. Control-plane admission checks only the range, since listener
   topology is node-local. Deployments whose policy permits loopback (the
   default `both` mode) are unaffected.

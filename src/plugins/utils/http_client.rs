@@ -122,7 +122,7 @@ impl std::fmt::Display for PluginHttpClientUnavailable {
 impl std::error::Error for PluginHttpClientUnavailable {}
 
 /// The proxy frontends a serving process binds that a dial to `127.0.0.1`
-/// reaches, derived from the same `EnvConfig` the listener startup uses.
+/// provably reaches.
 ///
 /// Plugins that dial the local gateway over loopback (`load_testing`) use it
 /// to tell a self-dial from an Operator-chosen loopback destination. Only
@@ -137,39 +137,55 @@ pub struct LocalProxyFrontends {
 }
 
 impl LocalProxyFrontends {
-    /// The listeners `env_config` starts, as the mode runtimes start them:
-    /// the plaintext listener whenever its port is non-zero; the HTTPS
-    /// listener in database/file mode only when frontend TLS is configured,
-    /// and in DP mode whenever its port is non-zero (CP-delivered TLS
-    /// material is hot-swapped into it). Mesh and non-serving modes start no
-    /// `FERRUM_PROXY_*` frontend. A bind address that `127.0.0.1` does not
-    /// reach (anything but an unspecified or `127.0.0.1` bind) exposes none.
+    /// From the local addresses of the proxy listeners a node serves (`None`
+    /// for a listener that does not start). A listener counts only when its
+    /// port is non-zero and its address is the IPv4 wildcard or `127.0.0.1`.
+    /// An IPv6 bind, `::` included, never counts: the global proxy listeners
+    /// leave `IPV6_V6ONLY` at the host default, so with
+    /// `net.ipv6.bindv6only=1` another service can own `127.0.0.1` on the
+    /// same port.
+    pub fn from_listener_addrs(
+        http: Option<std::net::SocketAddr>,
+        https: Option<std::net::SocketAddr>,
+    ) -> Self {
+        let loopback_port = |addr: Option<std::net::SocketAddr>| {
+            addr.filter(|addr| addr.port() != 0 && ipv4_loopback_reaches(addr.ip()))
+                .map(|addr| addr.port())
+        };
+        Self {
+            http_loopback_port: loopback_port(http),
+            https_loopback_port: loopback_port(https),
+        }
+    }
+
+    /// The listeners `env_config` starts when nothing is pre-bound, as the
+    /// mode runtimes start them: the plaintext listener whenever its port is
+    /// non-zero; the HTTPS listener in database/file mode only when frontend
+    /// TLS is configured, and in DP mode whenever its port is non-zero
+    /// (CP-delivered TLS material is hot-swapped into it). Mesh and
+    /// non-serving modes start no `FERRUM_PROXY_*` frontend.
     pub fn from_env_config(env_config: &crate::config::EnvConfig) -> Self {
         use crate::config::OperatingMode;
 
-        let reaches_loopback = env_config
-            .proxy_bind_address
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(bind_accepts_ipv4_loopback);
-        if !reaches_loopback {
+        let Ok(bind) = env_config.proxy_bind_address.parse::<std::net::IpAddr>() else {
             return Self::default();
-        }
-        let enabled = |port: u16| (port != 0).then_some(port);
+        };
+        let addr = |port: u16| Some(std::net::SocketAddr::new(bind, port));
         let frontend_tls_configured = env_config.frontend_tls_cert_path.is_some()
             && env_config.frontend_tls_key_path.is_some();
         match env_config.mode {
-            OperatingMode::Database | OperatingMode::File => Self {
-                http_loopback_port: enabled(env_config.proxy_http_port),
-                https_loopback_port: if frontend_tls_configured {
-                    enabled(env_config.proxy_https_port)
+            OperatingMode::Database | OperatingMode::File => {
+                let https = if frontend_tls_configured {
+                    addr(env_config.proxy_https_port)
                 } else {
                     None
-                },
-            },
-            OperatingMode::DataPlane => Self {
-                http_loopback_port: enabled(env_config.proxy_http_port),
-                https_loopback_port: enabled(env_config.proxy_https_port),
-            },
+                };
+                Self::from_listener_addrs(addr(env_config.proxy_http_port), https)
+            }
+            OperatingMode::DataPlane => Self::from_listener_addrs(
+                addr(env_config.proxy_http_port),
+                addr(env_config.proxy_https_port),
+            ),
             _ => Self::default(),
         }
     }
@@ -185,13 +201,12 @@ impl LocalProxyFrontends {
     }
 }
 
-/// Whether a listener bound to `bind` accepts a connection to `127.0.0.1`.
-fn bind_accepts_ipv4_loopback(bind: std::net::IpAddr) -> bool {
-    match bind {
+/// Whether a listener bound to `ip` provably accepts a connection to
+/// `127.0.0.1`.
+fn ipv4_loopback_reaches(ip: std::net::IpAddr) -> bool {
+    match ip {
         std::net::IpAddr::V4(ip) => ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST,
-        std::net::IpAddr::V6(ip) => {
-            ip.is_unspecified() || ip.to_ipv4_mapped() == Some(std::net::Ipv4Addr::LOCALHOST)
-        }
+        std::net::IpAddr::V6(_) => false,
     }
 }
 
