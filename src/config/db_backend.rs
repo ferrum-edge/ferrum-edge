@@ -722,11 +722,28 @@ impl DbFailoverTopologyState {
     /// Record a successful return to the configured primary. Emits one failback
     /// summary; when opt-in writes were enabled during the window, that summary
     /// is the bounded divergence-risk marker (issue #3001).
-    pub fn mark_primary(&self, redacted_url: &str) {
+    ///
+    /// Requires the [`PrimaryFailbackPermit`] returned by
+    /// [`Self::ensure_primary_failback_allowed`], so a caller cannot mark the
+    /// primary active without first consulting the failover-write fence
+    /// (issue #7033). Callers obtain the permit and call this under the same
+    /// exclusive topology transition, which keeps Admin admission (and so
+    /// [`Self::note_admin_write`]) out of the window between the two.
+    pub fn mark_primary(&self, _permit: PrimaryFailbackPermit, redacted_url: &str) {
         let was_failover = !self.primary_active.swap(true, Ordering::AcqRel);
         let since = self.failover_since_unix_ms.swap(0, Ordering::AcqRel);
         let opt_in = self.opt_in_during_window.swap(false, Ordering::AcqRel);
         self.opt_in_signal_logged.store(false, Ordering::Release);
+        // The fence only has meaning while failover is active; clear it so the
+        // status never reports a fenced failback while the primary is live.
+        // The permit means it was clear when checked and the transition kept
+        // Admin admission out since, so a set fence here is a broken caller.
+        if self.failover_write_admitted.swap(false, Ordering::AcqRel) {
+            warn!(
+                active_url_redacted = %redacted_url,
+                "Primary failback finalized while the failover-write fence was set; the permit must be obtained under the same topology transition as mark_primary"
+            );
+        }
         self.active_url_redacted
             .store(Arc::new(Some(redacted_url.to_string())));
         if was_failover || since > 0 {
@@ -769,12 +786,26 @@ impl DbFailoverTopologyState {
     }
 
     /// Prevent a stale recovered primary from replacing failover-side writes.
-    pub fn ensure_primary_failback_allowed(&self) -> Result<(), anyhow::Error> {
+    ///
+    /// On success returns the [`PrimaryFailbackPermit`] that
+    /// [`Self::mark_primary`] consumes.
+    pub fn ensure_primary_failback_allowed(&self) -> Result<PrimaryFailbackPermit, anyhow::Error> {
         if self.primary_active() || !self.failover_write_admitted.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(PrimaryFailbackPermit { _private: () });
         }
         Err(PrimaryFailbackFenced.into())
     }
+}
+
+/// Proof that [`DbFailoverTopologyState::ensure_primary_failback_allowed`]
+/// passed. Only that method constructs it, and
+/// [`DbFailoverTopologyState::mark_primary`] consumes it, so "mark the primary
+/// active only after the failover-write fence was checked" is enforced by the
+/// type system rather than by call-site convention (issue #7033).
+#[derive(Debug)]
+#[must_use = "a primary failback permit is only useful when passed to mark_primary"]
+pub struct PrimaryFailbackPermit {
+    _private: (),
 }
 
 /// Typed policy refusal so reconnect loops can skip a stale primary without

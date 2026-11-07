@@ -705,7 +705,10 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     assert!(!status.allow_writes);
 
     // Failback remains allowed when no Admin mutation was admitted.
-    state.mark_primary("sqlite:///tmp/primary.db");
+    let permit = state
+        .ensure_primary_failback_allowed()
+        .expect("failback is not fenced without an admitted write");
+    state.mark_primary(permit, "sqlite:///tmp/primary.db");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
 
@@ -746,10 +749,42 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
 fn failover_topology_mark_primary_emits_clear_window() {
     let state = DbFailoverTopologyState::new();
     state.mark_failover("postgres://***/***/ferrum");
-    state.mark_primary("postgres://***/***/ferrum");
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+    state.mark_primary(permit, "postgres://***/***/ferrum");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
     assert!(state.status().failover_since_unix_ms.is_none());
+}
+
+/// Issue #7033: `mark_primary` consumes the permit only a passing
+/// `ensure_primary_failback_allowed` returns, and finalizing the primary
+/// clears the failover-write fence so status never reports a fenced failback
+/// while the primary is live.
+#[test]
+fn failover_topology_mark_primary_requires_permit_and_clears_fence() {
+    let state = DbFailoverTopologyState::new();
+    // A permit taken while failover writes are still unfenced.
+    state.mark_failover("sqlite:///tmp/failover.db");
+    let permit = state.ensure_primary_failback_allowed().unwrap();
+
+    // Once a failover write is admitted, no new permit can be obtained.
+    state.note_admin_write();
+    assert!(state.status().primary_failback_fenced);
+    let fenced = state
+        .ensure_primary_failback_allowed()
+        .expect_err("an admitted failover write must fence failback");
+    assert!(ferrum_edge::config::db_backend::primary_failback_fenced(
+        &fenced
+    ));
+
+    // Production callers hold the transition lock across both calls, so this
+    // interleaving is unreachable there; even so, finalizing must not leave a
+    // fenced status on a live primary.
+    state.mark_primary(permit, "sqlite:///tmp/primary.db");
+    let status = state.status();
+    assert!(status.primary_active);
+    assert!(!status.primary_failback_fenced);
+    assert!(state.ensure_primary_failback_allowed().is_ok());
 }
 
 #[test]

@@ -888,9 +888,10 @@ pub struct SqlReconnectTransitionTestHooks {
     /// Invoked after a successful connect and immediately before awaiting the
     /// reconnect transition write lock.
     pub before_lock: Option<SqlReconnectTransitionHook>,
-    /// Invoked while the reconnect transition write lock is held, after pool
-    /// publication (and after failover gate-before-publish), before deferred
-    /// migrations and primary `mark_primary` finalize the transition.
+    /// Invoked while the reconnect transition write lock is held, after
+    /// deferred migrations on the staged pool and pool publication (and after
+    /// failover gate-before-publish), before primary `mark_primary` finalizes
+    /// the transition.
     pub while_holding: Option<SqlReconnectTransitionHook>,
 }
 
@@ -2179,9 +2180,15 @@ impl DatabaseStore {
     /// a tracked, versioned migration system. Existing databases are automatically
     /// detected and bootstrapped into the new system.
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
+        self.run_migrations_on_pool(self.pool()).await
+    }
+
+    /// [`Self::run_migrations`] against an explicit pool. Reconnect uses this
+    /// to migrate a staged pool *before* publishing it (issue #7033).
+    async fn run_migrations_on_pool(&self, pool: AnyPool) -> Result<(), anyhow::Error> {
         use crate::config::migrations::MigrationRunner;
 
-        let runner = MigrationRunner::new(self.pool(), self.db_type.clone());
+        let runner = MigrationRunner::new(pool, self.db_type.clone());
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         let applied = runner
             .run_pending_with_plugin_history(&plugin_migrations)
@@ -2213,6 +2220,20 @@ impl DatabaseStore {
     ///   pool happened to connect on the first query and `reconnect()` never
     ///   fired — otherwise the flag would stay `true` indefinitely).
     pub async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        self.maybe_apply_deferred_migrations_on_pool(self.pool())
+            .await
+    }
+
+    /// [`Self::maybe_apply_deferred_migrations`] against an explicit pool.
+    ///
+    /// Reconnect publication runs this on the newly connected pool before it
+    /// is swapped in, so a migration failure leaves the previously published
+    /// pool and topology untouched instead of exposing an unmigrated pool
+    /// whose topology was never finalized (issue #7033).
+    async fn maybe_apply_deferred_migrations_on_pool(
+        &self,
+        pool: AnyPool,
+    ) -> Result<bool, anyhow::Error> {
         // Only one caller wins the CAS and runs migrations; the rest see
         // `Ok(false)` and return early. Acquire on success ensures we see
         // the constructor's write of `true`; Release on the clear ensures
@@ -2226,7 +2247,7 @@ impl DatabaseStore {
         }
 
         info!("Applying deferred migrations after backup-bootstrap recovery");
-        match self.run_migrations().await {
+        match self.run_migrations_on_pool(pool).await {
             Ok(()) => {
                 info!("Deferred migrations applied — database ready for polling");
                 Ok(true)
@@ -8677,6 +8698,12 @@ impl DatabaseStore {
             .store(fail, Ordering::Release);
     }
 
+    /// Re-arm the offline-bootstrap deferred-migration flag so reconnect tests
+    /// can drive a failback whose deferred migrations fail (issue #7033).
+    pub(crate) fn set_migrations_pending_for_test(&self, pending: bool) {
+        self.migrations_pending.store(pending, Ordering::Release);
+    }
+
     async fn invoke_reconnect_transition_hook(
         &self,
         select: impl Fn(&SqlReconnectTransitionTestHooks) -> Option<&SqlReconnectTransitionHook>,
@@ -8782,12 +8809,44 @@ impl DatabaseStore {
         // (shared reads) and serializes concurrent reconnect publishers.
         let _transition_guard = self.reconnect_transition.write().await;
 
-        if topology == DatabaseTopology::Primary {
-            self.failover_topology.ensure_primary_failback_allowed()?;
-        }
+        let primary_failback_permit = match topology {
+            DatabaseTopology::Primary => {
+                Some(self.failover_topology.ensure_primary_failback_allowed()?)
+            }
+            DatabaseTopology::Failover => None,
+        };
         let next_topology_epoch = crate::config::db_backend::checked_next_config_topology_epoch(
             self.topology_epoch.load(Ordering::Acquire),
         )?;
+
+        // If this store was bootstrapped via `connect_offline_with_pool_config`
+        // (backup-file startup with an unreachable DB), migrations never ran.
+        // Run them against the *staged* pool before anything is published
+        // (issue #7033): a failure then returns with the previous pool, replica
+        // and topology all still installed, instead of leaving the new pool
+        // live while topology still reports the old side (on a primary
+        // failback that let opt-in Admin writes land on the primary while
+        // being recorded as failover writes, fencing the next failback). The
+        // helper uses a CAS so concurrent callers don't run migrations twice,
+        // and restores the flag on failure so a transient error doesn't
+        // silently skip migrations forever.
+        if let Err(error) = self
+            .maybe_apply_deferred_migrations_on_pool(new_pool.clone())
+            .await
+        {
+            tokio::spawn(async move {
+                new_pool.close().await;
+            });
+            if let Some(new_replica) = new_replica {
+                tokio::spawn(async move {
+                    new_replica.close().await;
+                });
+            }
+            return Err(error);
+        }
+
+        // Nothing below can fail: once the pool is swapped in, the topology
+        // finalization that matches it always runs under this same lock.
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
@@ -8804,7 +8863,6 @@ impl DatabaseStore {
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
-        let published_replica = new_replica.is_some();
         if let Some(new_replica) = new_replica {
             let old_replica = self.read_replica_pool.swap(Some(Arc::new(new_replica)));
             if let Some(old_replica) = old_replica {
@@ -8826,37 +8884,20 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
-        // Test seam: hold the transition across the deferred-migration window
-        // so a later failover/primary cannot interleave and then be overwritten
-        // by a delayed mark_primary / mismatched topology finalization.
+        // Test seam: hold the transition between publication and topology
+        // finalization so a later failover/primary cannot interleave and then
+        // be overwritten by a delayed mark_primary / mismatched topology
+        // finalization.
         self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology_kind)
             .await;
 
-        // If this store was bootstrapped via `connect_offline_with_pool_config`
-        // (backup-file startup with an unreachable DB), migrations never ran.
-        // Now that the pool is reconnected to a live DB, run them before
-        // returning so the polling loop finds tables at the expected schema.
-        // The helper uses a CAS so concurrent callers don't run migrations
-        // twice, and restores the flag on failure so a transient error
-        // doesn't silently skip migrations forever.
-        if let Err(error) = self.maybe_apply_deferred_migrations().await {
-            // `mark_primary` below never runs on this path, so a replica this
-            // call just published would stay live but inert (admin reads gate
-            // on `primary_active()`), holding connections and its snapshot
-            // files until some later replica reconnect replaced it. Retract it.
-            if published_replica && let Some(raced_replica) = self.read_replica_pool.swap(None) {
-                tokio::spawn(async move {
-                    raced_replica.close().await;
-                });
-            }
-            return Err(error);
-        }
-
-        // Primary failback stays fail-closed for writes until publication and
-        // deferred migrations succeed: mark_primary only after the await.
-        if topology == DatabaseTopology::Primary {
+        // Primary failback stays fail-closed for writes until the primary pool
+        // is published: mark_primary only after the swap, under the same lock
+        // that `ensure_primary_failback_allowed` ran under (the permit proves
+        // the fence was checked).
+        if let Some(permit) = primary_failback_permit {
             self.failover_topology
-                .mark_primary(&Self::redact_url(db_url));
+                .mark_primary(permit, &Self::redact_url(db_url));
         }
 
         Ok(())
