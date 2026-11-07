@@ -2050,6 +2050,24 @@ fn oauth2_private_key_jwt_rejects_a_key_the_selected_algorithm_cannot_sign_with(
     }
 }
 
+/// The key decoder is shared with `oidc_relying_party`, but each plugin keeps
+/// its own diagnostic grammar: introspection names the provider ordinal and
+/// the full `client_auth` path for every key family.
+#[test]
+fn oauth2_private_key_jwt_decode_errors_keep_the_plugin_diagnostic_grammar() {
+    for (alg, family) in [("RS256", "RSA"), ("ES256", "EC"), ("EdDSA", "EdDSA")] {
+        let config = private_key_jwt_config(alg, "-----BEGIN PRIVATE KEY-----\nAAAA\n");
+        let Err(error) = Oauth2Introspection::new(&config, PluginHttpClient::default()) else {
+            panic!("{alg}: an unparseable PEM must be rejected");
+        };
+        let expected = format!(
+            "oauth2_introspection: `provider[0].client_auth.private_key_pem` is invalid {family} PEM"
+        );
+        assert!(error.contains(&expected), "{alg}: got {error}");
+        assert!(!error.contains("BEGIN"), "{alg}: no key material echoed");
+    }
+}
+
 #[test]
 fn oauth2_private_key_jwt_admits_every_matching_key_and_algorithm_pair() {
     let rsa = generated_private_key_pem(&rcgen::PKCS_RSA_SHA256);

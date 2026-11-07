@@ -3773,6 +3773,89 @@ async fn client_secret_basic_form_encodes_credentials_before_basic_encoding() {
     server.verify().await;
 }
 
+/// `private_key_jwt` on the token endpoint: the shared RFC 7523 builder is
+/// called with the PROVIDER-level `client_id` as `iss`/`sub` and the token
+/// endpoint itself as `aud`. Unlike `oauth2_introspection`, this plugin has no
+/// `client_assertion_audience` override — that difference is intentional and
+/// pinned here so folding it into a shared default fails.
+#[tokio::test]
+async fn private_key_jwt_assertion_audience_is_the_token_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "rotated-access-token",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh-token",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let token_endpoint = format!("{}/token", server.uri());
+    let mut config = refresh_config(&token_endpoint);
+    config["providers"][0]["client_auth"] = json!({
+        "method": "private_key_jwt",
+        "private_key_jwt_alg": "ES256",
+        "private_key_jwt_kid": "rp-key-1",
+        "private_key_pem": rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("P-256 key")
+            .serialize_pem()
+    });
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_due_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "alice@example.test",
+            "exp": now + 3600
+        }),
+        "original-refresh-token",
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    rolling_cookie(&plugin, &mut ctx)
+        .await
+        .expect("the refresh grant authenticates with a client assertion");
+    server.verify().await;
+
+    let requests = server.received_requests().await.expect("requests");
+    let form: HashMap<String, String> = url::form_urlencoded::parse(&requests[0].body)
+        .into_owned()
+        .collect();
+    assert!(!requests[0].headers.contains_key("authorization"));
+    assert!(!form.contains_key("client_secret"));
+    assert_eq!(
+        form.get("client_assertion_type").map(String::as_str),
+        Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+    );
+    let assertion = form.get("client_assertion").expect("client_assertion");
+    let decode_part = |index: usize| -> serde_json::Value {
+        let part = assertion.split('.').nth(index).expect("compact JWT");
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part)
+                .expect("base64url"),
+        )
+        .expect("JSON")
+    };
+    let claims = decode_part(1);
+    assert_eq!(claims["iss"], json!("ferrum-gateway"));
+    assert_eq!(claims["sub"], json!("ferrum-gateway"));
+    assert_eq!(claims["aud"], json!(token_endpoint));
+    let header = decode_part(0);
+    assert_eq!(header["alg"], json!("ES256"));
+    assert_eq!(header["kid"], json!("rp-key-1"));
+}
+
 /// `session.cookie_name`, `session.path`, and `session.domain` are concatenated
 /// into `Set-Cookie` verbatim, so a delimiter or control character injects an
 /// attribute instead of producing a cookie the browser merely ignores. The
