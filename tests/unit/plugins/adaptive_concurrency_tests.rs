@@ -6,6 +6,7 @@ use std::time::Duration;
 use ferrum_edge::_test_support::{
     AdaptiveConcurrencyBaselineHarness, AdaptiveConcurrencyDecreaseHarness,
     AdaptiveConcurrencyTransitionHarness, UploadPumpOutcomeForTest,
+    ai_federation_route_plan_resolutions_for_test,
     body_validator_descriptor_preload_required_for_test,
     direct_h2_upload_refusal_error_class_for_test,
 };
@@ -3069,6 +3070,110 @@ fn adaptive_concurrency_ai_stream_router_trigger_edit_is_refused() {
         error.contains("cannot carry an execution trigger"),
         "{error}"
     );
+}
+
+#[test]
+fn adaptive_concurrency_build_resolves_each_federation_plan_once() {
+    // Several proxy-scoped adaptive policies, each on its own proxy, share one
+    // global streaming federation config. Every policy's route definition
+    // needs that config's plan, and a build must resolve it once for the whole
+    // candidate generation, not once per policy, proxy, or pass (issue #7018).
+    const POLICIES: usize = 3;
+    let proxies: Vec<serde_json::Value> = (1..=POLICIES)
+        .map(|index| {
+            json!({
+                "id": format!("proxy-{index}"),
+                "namespace": "default",
+                "listen_path": format!("/p{index}"),
+                "backend_host": "backend.local",
+                "backend_port": 8080,
+                "plugins": [{"plugin_config_id": format!("adaptive-{index}")}]
+            })
+        })
+        .collect();
+    let mut plugin_configs: Vec<serde_json::Value> = (1..=POLICIES)
+        .map(|index| {
+            json!({
+                "id": format!("adaptive-{index}"),
+                "namespace": "default",
+                "plugin_name": "adaptive_concurrency",
+                "scope": "proxy",
+                "proxy_id": format!("proxy-{index}"),
+                "enabled": true,
+                "config": {"min_limit": 1, "initial_limit": 1, "max_limit": 1}
+            })
+        })
+        .collect();
+    let federation = |host: &str| {
+        json!({
+            "providers": [{
+                "name": "primary",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": format!("https://{host}/v1/chat/completions")
+            }],
+            "streaming": {"enabled": true}
+        })
+    };
+    plugin_configs.push(json!({
+        "id": "federation-1",
+        "namespace": "default",
+        "plugin_name": "ai_federation",
+        "scope": "global",
+        "enabled": true,
+        "config": federation("first-ai.example")
+    }));
+    let config: GatewayConfig = serde_json::from_value(json!({
+        "version": "1",
+        "proxies": proxies,
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": plugin_configs
+    }))
+    .expect("multi-policy config should deserialize");
+
+    let before = ai_federation_route_plan_resolutions_for_test();
+    let cache = PluginCache::new(&config).expect("initial cache should build");
+    assert_eq!(
+        ai_federation_route_plan_resolutions_for_test() - before,
+        1,
+        "a full build must resolve the shared federation plan once"
+    );
+
+    // An incremental reload that moves the destination runs the rebuild-scope
+    // expansion, the retain pass, and every policy's creation over one memo.
+    let mut reloaded = config.clone();
+    let federation_index = reloaded
+        .plugin_configs
+        .iter()
+        .position(|pc| pc.id == "federation-1")
+        .expect("federation config should exist");
+    reloaded.plugin_configs[federation_index].config = federation("replacement-ai.example");
+    let all_proxies: HashSet<NamespacedResourceId> = (1..=POLICIES)
+        .map(|index| NamespacedResourceId::new("default", &format!("proxy-{index}")))
+        .collect();
+    let before = ai_federation_route_plan_resolutions_for_test();
+    cache
+        .apply_delta(&reloaded, &all_proxies, &[], true)
+        .expect("destination move should publish");
+    assert_eq!(
+        ai_federation_route_plan_resolutions_for_test() - before,
+        1,
+        "an incremental build must resolve the shared federation plan once"
+    );
+
+    // Every policy still limits the moved destination it learned from the
+    // shared plan.
+    for index in 1..=POLICIES {
+        let proxy_id = format!("proxy-{index}");
+        let mut destination = reloaded.proxies[index - 1].clone();
+        destination.backend_host = "replacement-ai.example".to_string();
+        destination.backend_port = 443;
+        let plugin = adaptive_plugin_for_proxy(&cache, &proxy_id);
+        let held = expect_admitted(acquire_from_plugin(&plugin, &destination, None));
+        assert_rejected(acquire_from_plugin(&plugin, &destination, None));
+        drop(held);
+    }
 }
 
 #[test]

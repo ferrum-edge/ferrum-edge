@@ -3482,6 +3482,13 @@ pub mod _test_support {
         crate::plugin_cache::request_reject_after_jwks_startup_for_test();
     }
 
+    /// `ai_federation` streaming route plans resolved on the calling thread so
+    /// far; a cache build resolves each attached config's plan once
+    /// (issue #7018).
+    pub fn ai_federation_route_plan_resolutions_for_test() -> u64 {
+        crate::plugin_cache::ai_federation_route_plan_resolutions_for_test()
+    }
+
     pub fn clear_jwks_cache_for_test() {
         crate::plugins::utils::jwks_cache::clear_jwks_cache();
     }
