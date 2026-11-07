@@ -18170,7 +18170,11 @@ fn proxy_header_entry_case_insensitive<'a>(
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
 }
 
-fn is_websocket_backend_strip_header(name: &str) -> bool {
+/// WebSocket-handshake and gateway-assertion names stripped from the backend
+/// handshake on EVERY WebSocket frontend (H1/H2 here, H3 in
+/// `http3::websocket::collect_forwardable_h3_headers`), on top of
+/// [`headers_mod::is_backend_request_strip_header`]. `name` is lowercase.
+pub(crate) fn is_websocket_backend_strip_header(name: &str) -> bool {
     headers_mod::is_consumer_assertion_header(name)
         || matches!(
             name,

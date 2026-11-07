@@ -313,59 +313,56 @@ fn buf_into_bytes<B: Buf>(mut buf: B) -> Bytes {
     buf.copy_to_bytes(len)
 }
 
+/// Names only the H3 frontend has to drop before the backend HTTP/1.1
+/// Upgrade handshake. Everything else is decided by the SAME predicates the
+/// H1/H2 WebSocket collector (`proxy::collect_forwardable_websocket_headers`)
+/// uses, so the two frontends cannot drift.
+const H3_ONLY_WEBSOCKET_BACKEND_SKIP_HEADERS: &[&str] = &[
+    // RFC 8470 §5.2: clients do not set this. The gateway strips any
+    // inbound value and injects its authoritative value below.
+    "early-data",
+    // H3 pseudo-headers that may still be present in the
+    // header map produced upstream — never forward.
+    ":method",
+    ":scheme",
+    ":authority",
+    ":path",
+    ":protocol",
+    ":status",
+];
+
 /// Strip hop-by-hop headers and HTTP/1.1 WebSocket handshake artefacts
-/// before forwarding the WebSocket request to the backend. Identical
-/// list to `crate::proxy::collect_forwardable_headers` — duplicated
-/// here because the H3 frontend has `proxy_headers: HashMap` while the
-/// H1/H2 path has `hyper::HeaderMap` and the same predicate doesn't
-/// directly reuse.
-fn collect_forwardable_h3_headers(
+/// before forwarding the WebSocket request to the backend.
+///
+/// The strip policy is the H1/H2 one, by delegation rather than by a copied
+/// list: the canonical backend request strip set
+/// ([`crate::proxy::headers::is_backend_request_strip_header`]), the
+/// WebSocket handshake / gateway-assertion set
+/// ([`crate::proxy::is_websocket_backend_strip_header`]), and any field a
+/// `Connection` value in the map nominates. Only
+/// [`H3_ONLY_WEBSOCKET_BACKEND_SKIP_HEADERS`] is H3-specific. This used to be
+/// a hand-maintained list that every WebSocket strip fix had to repeat, and it
+/// had stopped matching H1/H2 (`content-length`, `expect`, and the internal
+/// `x-ferrum-original-content-encoding` / `x-grpc-web-mode` markers reached the
+/// backend on H3 only) — the same drift issue #5110 fixed on the H3
+/// cross-protocol bridge.
+pub(crate) fn collect_forwardable_h3_headers(
     headers: &HashMap<String, String>,
     is_early_data: bool,
 ) -> Vec<(String, String)> {
-    /// hop-by-hop per RFC 9110 §7.6.1 + WS handshake.
-    const SKIP_HEADERS: &[&str] = &[
-        "connection",
-        "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-accept",
-        // The WebSocket bridge cannot encode/decode permessage-deflate, so the
-        // client's extension offer must not reach the backend (it would set
-        // rsv1 and the session would be torn down). Mirrors the H1/H2 strip in
-        // proxy::is_websocket_backend_strip_header. A passthrough proxy re-adds
-        // only the permessage-deflate elements (issue #5769).
-        "sec-websocket-extensions",
-        "host",
-        "transfer-encoding",
-        "te",
-        "trailer",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        // RFC 8470 §5.2: clients do not set this. The gateway strips any
-        // inbound value and injects its authoritative value below.
-        "early-data",
-        // H3 pseudo-headers that may still be present in the
-        // header map produced upstream — never forward.
-        ":method",
-        ":scheme",
-        ":authority",
-        ":path",
-        ":protocol",
-        ":status",
-        // Reserved gateway assertion header. Consumer assertions are matched
-        // by prefix below; GeoIP remains an exact-name assertion.
-        "x-geo-country",
-    ];
+    let connection_listed_strip =
+        crate::proxy::headers::parse_connection_listed_from_str_map(headers);
 
     let mut out: Vec<(String, String)> = headers
         .iter()
         .filter_map(|(name, value)| {
             let lower = name.to_ascii_lowercase();
-            if SKIP_HEADERS.contains(&lower.as_str())
-                || crate::proxy::headers::is_consumer_assertion_header(&lower)
+            if crate::proxy::headers::is_backend_request_strip_header(&lower)
+                || crate::proxy::is_websocket_backend_strip_header(&lower)
+                || H3_ONLY_WEBSOCKET_BACKEND_SKIP_HEADERS.contains(&lower.as_str())
+                || connection_listed_strip
+                    .iter()
+                    .any(|listed| listed == lower.as_str())
             {
                 return None;
             }

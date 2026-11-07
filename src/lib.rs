@@ -9202,6 +9202,17 @@ pub mod _test_support {
         crate::proxy::collect_forwardable_websocket_headers(raw_headers, proxy_headers)
     }
 
+    /// The H3 (RFC 9220) counterpart of
+    /// [`collect_forwardable_websocket_headers_for_test`], so parity tests can
+    /// drive both WebSocket frontends' backend handshake filters with one
+    /// fixture.
+    pub fn collect_forwardable_h3_websocket_headers_for_test(
+        proxy_headers: &HashMap<String, String>,
+        is_early_data: bool,
+    ) -> Vec<(String, String)> {
+        crate::http3::websocket::collect_forwardable_h3_headers(proxy_headers, is_early_data)
+    }
+
     /// Forward a `permessage-deflate` offer the way a passthrough proxy does;
     /// returns whether an offer was forwarded (issue #5769).
     pub fn push_permessage_deflate_offer_for_test(
