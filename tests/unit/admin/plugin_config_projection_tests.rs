@@ -291,6 +291,81 @@ fn waf_header_present_secret_values_are_projected() {
     assert_no_canaries(&projected, &["waf-exemption-secret-canary"]);
 }
 
+/// `custom_rules[].conditions.headers` and
+/// `rule_overrides.<id>.conditions.headers` scope a rule to a header value an
+/// operator may set to a shared secret or a credential, under a vendor name no
+/// heuristic matches. A `null` (presence-only) condition discloses nothing and
+/// stays `null`.
+#[test]
+fn waf_condition_header_values_are_projected() {
+    let raw = json!({
+        "mode": "enforce",
+        "custom_rules": [{
+            "id": "custom-1",
+            "category": "custom",
+            "pattern": "drop table",
+            "action": "block",
+            "conditions": {
+                "paths": ["/api"],
+                "headers": {
+                    "Ocp-Apim-Subscription-Key": "waf-custom-condition-canary",
+                    "x-debug": null
+                }
+            }
+        }],
+        "rule_overrides": {
+            "942100": {
+                "action": "log",
+                "conditions": {
+                    "headers": {
+                        "Ocp-Apim-Subscription-Key": "waf-override-condition-canary",
+                        "x-debug": null
+                    }
+                }
+            }
+        }
+    });
+    assert!(
+        placeholder_sites("waf", &raw).is_empty(),
+        "the stored config carries no placeholder"
+    );
+
+    let projected = project("waf", raw);
+    let custom = &projected["custom_rules"][0];
+    let custom_headers = &custom["conditions"]["headers"];
+    assert_eq!(custom_headers["Ocp-Apim-Subscription-Key"], REDACTED);
+    assert_eq!(custom_headers["x-debug"], Value::Null);
+    let override_headers = &projected["rule_overrides"]["942100"]["conditions"]["headers"];
+    assert_eq!(override_headers["Ocp-Apim-Subscription-Key"], REDACTED);
+    assert_eq!(override_headers["x-debug"], Value::Null);
+    // Header names and rule metadata stay visible.
+    assert_eq!(custom["id"], "custom-1");
+    assert_eq!(custom["action"], "block");
+    assert_eq!(custom["pattern"], "drop table");
+    assert_eq!(custom["conditions"]["paths"], json!(["/api"]));
+    assert_eq!(projected["rule_overrides"]["942100"]["action"], "log");
+    assert_eq!(projected["mode"], "enforce");
+    assert_no_canaries(
+        &projected,
+        &[
+            "waf-custom-condition-canary",
+            "waf-override-condition-canary",
+        ],
+    );
+
+    // Echoing the masked values back is detected at both sites.
+    let mut sites = placeholder_sites("waf", &projected);
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            "/config/custom_rules/0/conditions/headers/Ocp-Apim-Subscription-Key".to_string(),
+            "/config/rule_overrides/942100/conditions/headers/Ocp-Apim-Subscription-Key"
+                .to_string(),
+        ]
+    );
+}
+
 #[test]
 fn fault_injection_match_header_values_are_projected() {
     let projected = project(

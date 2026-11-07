@@ -282,8 +282,18 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("ai_prompt_shield", NONE),
     (
         "waf",
-        // `header_present` values are shared secrets that suppress every rule.
-        &[secret(&["global_exemptions", "header_present", "*"])],
+        &[
+            // `header_present` values are shared secrets that suppress every
+            // rule.
+            secret(&["global_exemptions", "header_present", "*"]),
+            // `conditions.headers` values scope a rule to requests carrying a
+            // header value; operators may target with a shared secret or a
+            // credential-bearing header, as for `fault_injection`. A `null`
+            // (presence-only) condition stays `null`. `custom_rules` is an
+            // array and `rule_overrides` is keyed by rule id; `*` covers both.
+            secret(&["custom_rules", "*", "conditions", "headers", "*"]),
+            secret(&["rule_overrides", "*", "conditions", "headers", "*"]),
+        ],
     ),
     (
         "fault_injection",

@@ -1744,6 +1744,8 @@ Fields covered by the schema include:
 | `mcp_gateway` | `servers.*.headers.*` | `[REDACTED]` |
 | `ai_tool_governor` | `approval.headers.*` | `[REDACTED]` |
 | `openapi_validator` | `bypass.header_present.*` | `[REDACTED]` (shared secrets that skip validation) |
+| `waf` | `global_exemptions.header_present.*` | `[REDACTED]` (shared secrets that suppress every rule) |
+| `waf` | `custom_rules.*.conditions.headers.*`, `rule_overrides.*.conditions.headers.*` | `[REDACTED]` (a `null` presence-only condition stays `null`) |
 | `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
 
