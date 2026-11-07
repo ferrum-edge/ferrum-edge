@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, which the H1/H2 handshake already stripped. Both frontends now use
   one shared predicate; H3 still replaces `Early-Data` itself and drops
   pseudo-headers.
+- **The stock xDS client applies a staged ACKed slice when its NACK breaker
+  trips** (#7029). When five consecutive invalid responses of one type arrived
+  inside the 25 ms debounce window, the `stock_xds` client closed the stream
+  and dropped the already-ACKed slice it had staged, so the data plane kept
+  serving the previous slice while the control plane considered the newer one
+  delivered. Like the Ferrum `xds` client, it now applies that slice before the
+  stream closes on any response-handling error. It still discards the slice
+  when the bearer credential that produced it has rotated, been invalidated, or
+  passed its deadline.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch

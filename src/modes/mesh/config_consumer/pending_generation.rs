@@ -3,12 +3,12 @@
 //!
 //! An ADS client stages a complete, already-ACKed generation and commits it
 //! when the debounce fires (`MeshStreamTimings::apply_debounce`, bounded by
-//! `apply_max_delay`) or at a clean remote end of stream. Stream errors differ
-//! per client: the `xds` client also commits the staged generation before it
-//! surfaces any stream error (including a NACK-circuit-breaker trip), while the
-//! `stock_xds` client drops it on every stream error and keeps only the
-//! last-installed slice. The machine itself only decides WHAT is staged; each
-//! caller decides when to feed it [`PendingGenerationEvent::Commit`].
+//! `apply_max_delay`) or at a clean remote end of stream. Both clients also
+//! commit the staged generation before they surface an error from handling a
+//! response (including a NACK-circuit-breaker trip); the `stock_xds` client
+//! does so only while its credential fence still admits the commit, and never
+//! on a credential retirement. The machine itself only decides WHAT is staged;
+//! each caller decides when to feed it [`PendingGenerationEvent::Commit`].
 //!
 //! A generation is only ever staged once the client's own completeness gate
 //! held at ACK time, so it is independent of any LATER response: a NACK's
