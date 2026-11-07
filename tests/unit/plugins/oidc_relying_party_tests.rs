@@ -2316,15 +2316,34 @@ async fn none_client_auth_refuses_a_named_discovered_token_endpoint() {
     }
     let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
     clear_jwks_cache();
-    let wait = std::time::Duration::from_millis(1500);
+    let wait = std::time::Duration::from_secs(10);
 
-    let (_server, named_none) = plugin_for(
+    let (named_server, named_none) = plugin_for(
         "https://localhost:8443/token".to_string(),
         json!({"method": "none"}),
     )
     .await;
+    // Wait until the discovery task has actually fetched the document, so the
+    // refusal below is a decision rather than a task that never ran.
+    let deadline = std::time::Instant::now() + wait;
+    while named_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the discovery task never fetched the document"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert!(
-        !oidc_discovery_published_within_for_test(&named_none, wait).await,
+        !oidc_discovery_published_within_for_test(
+            &named_none,
+            std::time::Duration::from_millis(500)
+        )
+        .await,
         "none must refuse a named discovered token endpoint"
     );
 
