@@ -7014,8 +7014,8 @@ At least one non-empty `pii_patterns`, `custom_pii_patterns`, `blocked_phrases`,
 | `methods` | Object | — | **Required, non-empty.** Map of `/package.Service/Method` → method contract. Only these methods are inspected. Every dotted service segment and the method identifier must be a protobuf/gRPC identifier; an optional leading slash is normalized and duplicates after normalization are rejected |
 | `methods.<path>.response_type` | String | — | **Required.** Fully-qualified response message type, resolved in the descriptor pool at construction |
 | `methods.<path>.text_fields` | String[] | all string fields | Non-empty list of dotted field paths (e.g. `reply.text`), each with 1–32 segments that remain non-empty after trimming whitespace. Paths must be unique after segment trimming, end at a `string` field, and may traverse repeated messages but not `map` fields. Omit to inspect every string field recursively |
-| `max_message_bytes` | Integer | `1048576` | Per-message ceiling, applied to the declared frame length and enforced while inflating a compressed frame — inflation stops at the tighter of this ceiling and the remaining `max_scan_bytes` budget. Aggregate decoded/decompressed payload across frames is additionally capped by `max_scan_bytes` |
-| `max_messages` | Integer | `64` | Maximum length-prefixed frames in one buffered response |
+| `max_message_bytes` | Integer | `1048576` | Per-message ceiling, applied to the declared frame length and enforced while inflating a compressed frame — inflation stops at the tighter of this ceiling and the remaining `max_scan_bytes` budget. Aggregate decoded/decompressed payload across frames is additionally capped by `max_scan_bytes`. Hard maximum 67108864 (the `max_scan_bytes` ceiling) |
+| `max_messages` | Integer | `64` | Maximum length-prefixed frames in one buffered response. Hard maximum 1024: zero-length frames consume no decoded-byte budget, so the count needs its own bound |
 
 Semantics:
 

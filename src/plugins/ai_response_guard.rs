@@ -133,6 +133,25 @@ const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 1_048_576;
 /// rather than silently partially inspected.
 const DEFAULT_GRPC_MAX_MESSAGES: usize = 64;
 
+/// Deployment hard maximum for `grpc.max_message_bytes` (64 MiB), equal to the
+/// `max_scan_bytes` ceiling.
+///
+/// The aggregate decoded-payload budget (`max_scan_bytes`, itself capped at
+/// [`MAX_SCAN_BYTES_CEILING`]) already refuses any response whose decoded bytes
+/// exceed it, so a per-message ceiling above that can never produce an
+/// inspection; it could only authorize a larger declared frame length.
+pub const HARD_MAX_GRPC_MAX_MESSAGE_BYTES: usize = MAX_SCAN_BYTES_CEILING;
+
+/// Deployment hard maximum for `grpc.max_messages` (1024 frames), 16x the
+/// default of 64 — the same bound `ai_transcript_audit` enforces.
+///
+/// The decoded-byte scan budget bounds decoded PAYLOAD, not frame COUNT: a body
+/// of legal zero-length 5-byte frames consumes no decoded-byte budget at all, so
+/// an operator-configured `max_messages` in the millions would let a response
+/// drive an equally large `Vec` of frames and per-frame walk. 1024 frames keeps
+/// real server-streaming inspection practical while bounding that vector.
+pub const HARD_MAX_GRPC_MAX_MESSAGES: usize = 1_024;
+
 /// Recursion depth ceiling for the protobuf message walk.
 const GRPC_MAX_MESSAGE_DEPTH: usize = 32;
 
@@ -3967,8 +3986,20 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
 
     let max_message_bytes = optional_positive_usize(grpc, "max_message_bytes")?
         .unwrap_or(DEFAULT_GRPC_MAX_MESSAGE_BYTES);
+    if max_message_bytes > HARD_MAX_GRPC_MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "ai_response_guard: `grpc.max_message_bytes` must be at most \
+             {HARD_MAX_GRPC_MAX_MESSAGE_BYTES} (deployment hard maximum)"
+        ));
+    }
     let max_messages =
         optional_positive_usize(grpc, "max_messages")?.unwrap_or(DEFAULT_GRPC_MAX_MESSAGES);
+    if max_messages > HARD_MAX_GRPC_MAX_MESSAGES {
+        return Err(format!(
+            "ai_response_guard: `grpc.max_messages` must be at most \
+             {HARD_MAX_GRPC_MAX_MESSAGES} (deployment hard maximum)"
+        ));
+    }
 
     let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
         return Err(

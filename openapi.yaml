@@ -39286,20 +39286,29 @@ components:
             max_message_bytes:
               type: integer
               minimum: 1
+              maximum: 67108864
               default: 1048576
               description: >-
                 Per-message ceiling, applied to the declared frame length and
                 enforced while inflating a gzip-compressed frame; inflation
                 stops at the tighter of this ceiling and the remaining
                 max_scan_bytes budget. Aggregate decoded payload across frames
-                is additionally capped by max_scan_bytes.
+                is additionally capped by max_scan_bytes. Bounded by an
+                immutable deployment maximum of 67108864 (64 MiB), equal to the
+                max_scan_bytes ceiling — a larger per-message value could never
+                produce an inspection.
             max_messages:
               type: integer
               minimum: 1
+              maximum: 1024
               default: 64
               description: >-
                 Maximum number of length-prefixed frames one buffered gRPC
-                response may carry.
+                response may carry. Bounded by an immutable deployment maximum
+                of 1024 frames: the decoded-byte scan budget bounds decoded
+                payload, not frame count, so legal zero-length frames would
+                otherwise let an operator-configured value drive an effectively
+                unbounded frame vector.
 
     AiToolGovernorConfig:
       type: object
