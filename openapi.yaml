@@ -981,10 +981,15 @@ paths:
         finalized into the certificate this request names, and that stored
         certificate carries the same `order_url` (it is the certificate this CA
         order produced), the endpoint returns `200` with the usual
-        `{order, certificate}` body and no directory request — both for a repeat
-        of a finalize that already succeeded and for a renewal that completed
-        the same CA order while this request was in flight. Any other terminal
-        or changed order stays `409`. `409` is also returned, before any directory
+        `{order, certificate}` body. A repeat of a finalize that already
+        succeeded is answered before any directory request. When a renewal or
+        a concurrent finalize completes the same CA order while this request is
+        in its directory I/O, the request still performs that I/O, then finds
+        the order and certificate already published and also returns `200`,
+        whether or not `allow_overwrite` is set (without it, the existing
+        certificate record is not replaced). Any other terminal or changed
+        order, and an existing certificate record from another CA order, stays
+        `409`. `409` is also returned, before any directory
         request, when the certificate the order is persisted under (the
         request's `certificate_id`, else the order's) already has another
         active order as its latest order.

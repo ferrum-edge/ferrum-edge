@@ -698,13 +698,15 @@ pub(super) async fn handle_finalize_acme_order(
         // produced is answered as the success it already was.
         if !order.status.is_active() {
             if let Ok(certificate_id) = acme_finalize_certificate_id(&order, &request) {
-                match acme_completed_finalize_certificate(
+                match crate::tls::acme::completed_finalize(
+                    &order_store,
                     &certificate_store,
-                    &order,
+                    &order.id,
                     &certificate_id,
+                    order.order_url.as_deref(),
                 ) {
-                    Ok(Some(certificate)) => {
-                        return Ok(acme_finalize_success_response(&order, &certificate));
+                    Ok(Some((current, certificate))) => {
+                        return Ok(acme_finalize_success_response(&current, &certificate));
                     }
                     Ok(None) => {}
                     Err(error) => return Ok(acme_error_response(error)),
@@ -897,6 +899,30 @@ pub(super) async fn handle_finalize_acme_order(
         };
         let certificate = match stored_certificate {
             Ok(record) => record,
+            Err(AcmeError::AlreadyExists(existing_id)) => {
+                // Without `allow_overwrite` a certificate record that is already
+                // there is a conflict — unless it is this very CA order's
+                // certificate: a renewal (or a concurrent finalize) completed
+                // the same order and published it while this request was in
+                // CA I/O. That is the outcome this request asked for, so it is
+                // answered as the same success; unrelated material stays `409`.
+                return Ok(
+                    match crate::tls::acme::completed_finalize(
+                        &order_store,
+                        &completed_certificate_store,
+                        &order.id,
+                        &certificate_id,
+                        order.order_url.as_deref(),
+                    ) {
+                        Ok(Some((current, certificate))) => {
+                            persist_acme_account_credentials(&current).await;
+                            acme_finalize_success_response(&current, &certificate)
+                        }
+                        Ok(None) => acme_error_response(AcmeError::AlreadyExists(existing_id)),
+                        Err(error) => acme_error_response(error),
+                    },
+                );
+            }
             Err(error) => return Ok(acme_error_response(error)),
         };
 
@@ -928,22 +954,18 @@ pub(super) async fn handle_finalize_acme_order(
                 // the order is `valid` with the `order_url` finalized here, and
                 // the stored certificate is the one it produced. Anything else
                 // (a delete, a rewrite, a different order) stays a conflict.
-                match completed_order_store.get_order(&order_id) {
-                    Ok(current) if current.order_url == finalized_order_url => {
-                        match acme_completed_finalize_certificate(
-                            &completed_certificate_store,
-                            &current,
-                            &published_certificate_id,
-                        ) {
-                            Ok(Some(certificate)) => {
-                                persist_acme_account_credentials(&current).await;
-                                return Ok(acme_finalize_success_response(&current, &certificate));
-                            }
-                            Ok(None) => {}
-                            Err(error) => return Ok(acme_error_response(error)),
-                        }
+                match crate::tls::acme::completed_finalize(
+                    &completed_order_store,
+                    &completed_certificate_store,
+                    &order_id,
+                    &published_certificate_id,
+                    finalized_order_url.as_deref(),
+                ) {
+                    Ok(Some((current, certificate))) => {
+                        persist_acme_account_credentials(&current).await;
+                        return Ok(acme_finalize_success_response(&current, &certificate));
                     }
-                    Ok(_) | Err(AcmeError::OrderNotFound(_)) => {}
+                    Ok(None) => {}
                     Err(error) => return Ok(acme_error_response(error)),
                 }
                 return Ok(super::json_response(
@@ -2332,69 +2354,31 @@ fn acme_finalize_success_response(
     )
 }
 
-/// The stored certificate `order` was already completed into, when `order` is
-/// a finished finalize of the certificate this request names
-/// (`crate::tls::acme::order_produced_certificate`). `Ok(None)` for anything
-/// else, including no stored certificate; a store that cannot be read is an
-/// error rather than "not completed".
-#[cfg(feature = "acme")]
-fn acme_completed_finalize_certificate(
-    certificate_store: &crate::tls::acme::AcmeCertificateStore,
-    order: &AcmeOrderRecord,
-    certificate_id: &str,
-) -> Result<Option<AcmeCertificateRecord>, AcmeError> {
-    if order.status != AcmeOrderStatus::Valid
-        || order.certificate_id.as_deref() != Some(certificate_id)
-    {
-        return Ok(None);
-    }
-    let certificate = match certificate_store.get_certificate(certificate_id) {
-        Ok(certificate) => certificate,
-        Err(AcmeError::NotFound(_)) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(crate::tls::acme::order_produced_certificate(order, &certificate).then_some(certificate))
-}
-
 /// Refuse an order create/replace that the store would refuse, before the
-/// directory request that prepares the new order.
+/// directory request that prepares the new order
+/// (`crate::tls::acme::order_replacement_refusal`, the decision itself).
 ///
-/// Preparing an order creates it with the CA, which cannot be undone, so a
-/// write that is going to be refused must be refused first: an existing id
-/// without `allow_overwrite`, or a replacement the stored order's lifecycle
-/// forbids (`AcmeOrderStatus::admits_overwrite_with` — every order this API
-/// writes is a freshly prepared `pending_challenges` one, so a `valid`,
-/// `failed`, or `cancelled` order, or one that already moved past
-/// `pending_challenges`, cannot be replaced). The store re-checks both under
-/// its lock, so a change between this read and the write is still refused
-/// there. A brand-new id, or one the request supplied in an invalid form (the
-/// normal path reports that), passes through.
+/// Every order this API writes is a freshly prepared `pending_challenges`
+/// one, so an existing id without `allow_overwrite`, a `ready`/`processing`
+/// order (backwards), or a `valid`/`failed`/`cancelled` one (reopening it) is
+/// refused here, before a CA order is created that could not be stored. With
+/// no `id` the order id is generated and cannot collide.
 #[cfg(feature = "acme")]
 fn acme_order_replacement_precheck(
     store: &crate::tls::acme::AcmeOrderStore,
     id: Option<&str>,
     allow_overwrite: bool,
 ) -> Option<Response<Full<Bytes>>> {
-    let id = id?;
-    let existing = match store.get_order(id) {
-        Ok(existing) => existing,
-        Err(AcmeError::OrderNotFound(_) | AcmeError::InvalidId(_)) => return None,
-        Err(error) => return Some(acme_error_response(error)),
-    };
-    if !allow_overwrite {
-        return Some(acme_error_response(AcmeError::OrderAlreadyExists(
-            existing.id,
-        )));
+    match crate::tls::acme::order_replacement_refusal(
+        store,
+        id?,
+        allow_overwrite,
+        AcmeOrderStatus::PendingChallenges,
+    ) {
+        Ok(None) => None,
+        Ok(Some(refusal)) => Some(acme_error_response(refusal)),
+        Err(error) => Some(acme_error_response(error)),
     }
-    let next = AcmeOrderStatus::PendingChallenges;
-    if existing.status.admits_overwrite_with(next) {
-        return None;
-    }
-    Some(acme_error_response(AcmeError::IllegalOrderTransition {
-        id: existing.id,
-        from: existing.status,
-        to: next,
-    }))
 }
 
 #[cfg(feature = "acme")]

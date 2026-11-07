@@ -12,9 +12,10 @@
 //! final `valid` write (pinned in the lib's `acme_final_publication_tests`).
 
 use ferrum_edge::tls::acme::{
-    AcmeAccountStore, AcmeCertificateRecord, AcmeError, AcmeHttp01ChallengeRecord,
-    AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderFinalization, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeOrderStore, order_produced_certificate, renewal_account_credentials,
+    AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStore, AcmeError,
+    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput,
+    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeOrderStore, completed_finalize,
+    order_produced_certificate, order_replacement_refusal, renewal_account_credentials,
 };
 
 const DIRECTORY_URL: &str = "https://acme.example/directory";
@@ -751,4 +752,348 @@ fn renewal_prefers_the_account_store_over_the_latest_order_credentials() {
         .unwrap(),
         None
     );
+}
+
+// Admin finalize's idempotent answers and the create/renew pre-check are
+// decided by `completed_finalize` and `order_replacement_refusal` over the
+// stores; the handlers only map the answer to `200`/`409`. The handlers
+// themselves cannot be driven here: they need the `acme` feature, and the
+// in-flight case needs a real CA round trip before the decision is made.
+
+fn open_certificates(dir: &tempfile::TempDir) -> AcmeCertificateStore {
+    AcmeCertificateStore::open(dir.path()).expect("open certificate store")
+}
+
+/// Seed an active order, then complete it the way a renewal does: the order
+/// is committed `valid` and its certificate is published with the order's
+/// `order_url`. Returns the snapshot an Admin finalize would have read before
+/// that happened.
+fn seed_and_complete_by_renewal(
+    orders: &AcmeOrderStore,
+    certificates: &AcmeCertificateStore,
+) -> AcmeOrderRecord {
+    let snapshot = seed(
+        orders,
+        order(
+            "edge-order",
+            Some(CERTIFICATE_ID),
+            AcmeOrderStatus::Processing,
+        ),
+    );
+    orders
+        .complete_order_if_current(&snapshot, CERTIFICATE_ID.to_string())
+        .unwrap()
+        .expect("renewal completes the order");
+    certificates
+        .upsert_certificate(
+            issued_certificate(CERTIFICATE_ID, snapshot.order_url.as_deref()),
+            false,
+        )
+        .expect("renewal publishes the certificate");
+    snapshot
+}
+
+#[test]
+fn repeat_finalize_of_a_completed_order_is_answered_as_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let orders = open_store(&dir);
+    let certificates = open_certificates(&dir);
+    seed_and_complete_by_renewal(&orders, &certificates);
+
+    // The handler's pre-check: the stored order is terminal, and it is asked
+    // with the stored order's own URL before any CA I/O.
+    let stored = orders.get_order("edge-order").unwrap();
+    assert_eq!(stored.status, AcmeOrderStatus::Valid);
+    let (order, certificate) = completed_finalize(
+        &orders,
+        &certificates,
+        "edge-order",
+        CERTIFICATE_ID,
+        stored.order_url.as_deref(),
+    )
+    .unwrap()
+    .expect("a repeat finalize of a completed order is a success");
+    assert_eq!(order.id, "edge-order");
+    assert_eq!(order.status, AcmeOrderStatus::Valid);
+    assert_eq!(certificate.id, CERTIFICATE_ID);
+    assert_eq!(certificate.order_url, stored.order_url);
+}
+
+#[test]
+fn in_flight_completion_without_allow_overwrite_is_answered_as_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let orders = open_store(&dir);
+    let certificates = open_certificates(&dir);
+    // Admin finalize read the active order, then spent its CA I/O while a
+    // renewal completed the same CA order and published its certificate.
+    let snapshot = seed_and_complete_by_renewal(&orders, &certificates);
+
+    // The request's own certificate write (default `allow_overwrite: false`)
+    // meets the renewal's record...
+    let refused = certificates
+        .upsert_certificate(
+            issued_certificate(CERTIFICATE_ID, snapshot.order_url.as_deref()),
+            false,
+        )
+        .expect_err("the renewal published first");
+    assert!(matches!(refused, AcmeError::AlreadyExists(_)), "{refused}");
+
+    // ...and the follow-up question, asked with the URL this request finalized,
+    // recognises it as this very order's completion.
+    let completed = completed_finalize(
+        &orders,
+        &certificates,
+        &snapshot.id,
+        CERTIFICATE_ID,
+        snapshot.order_url.as_deref(),
+    )
+    .unwrap();
+    let (order, certificate) = completed.expect("same CA order, same certificate: success");
+    assert_eq!(order.status, AcmeOrderStatus::Valid);
+    assert_eq!(certificate.order_url, snapshot.order_url);
+
+    // The order compare-and-set path asks the same question after its own
+    // stale-snapshot commit is refused.
+    assert!(
+        orders
+            .complete_order_if_current(&snapshot, CERTIFICATE_ID.to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        completed_finalize(
+            &orders,
+            &certificates,
+            &snapshot.id,
+            CERTIFICATE_ID,
+            snapshot.order_url.as_deref(),
+        )
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[test]
+fn unrelated_or_unfinished_state_is_not_a_completed_finalize() {
+    // Certificate material from another CA order: still a conflict.
+    let dir = tempfile::tempdir().unwrap();
+    let orders = open_store(&dir);
+    let certificates = open_certificates(&dir);
+    let snapshot = seed(
+        &orders,
+        order(
+            "edge-order",
+            Some(CERTIFICATE_ID),
+            AcmeOrderStatus::Processing,
+        ),
+    );
+    orders
+        .complete_order_if_current(&snapshot, CERTIFICATE_ID.to_string())
+        .unwrap()
+        .expect("commit");
+    certificates
+        .upsert_certificate(
+            issued_certificate(CERTIFICATE_ID, Some("https://acme.example/order/other")),
+            false,
+        )
+        .unwrap();
+    assert!(
+        completed_finalize(
+            &orders,
+            &certificates,
+            "edge-order",
+            CERTIFICATE_ID,
+            snapshot.order_url.as_deref(),
+        )
+        .unwrap()
+        .is_none(),
+        "a certificate from another CA order is unrelated material"
+    );
+
+    // The order still active (material published, order write not landed).
+    let dir = tempfile::tempdir().unwrap();
+    let orders = open_store(&dir);
+    let certificates = open_certificates(&dir);
+    let active = seed(
+        &orders,
+        order(
+            "edge-order",
+            Some(CERTIFICATE_ID),
+            AcmeOrderStatus::Processing,
+        ),
+    );
+    certificates
+        .upsert_certificate(
+            issued_certificate(CERTIFICATE_ID, active.order_url.as_deref()),
+            false,
+        )
+        .unwrap();
+    assert!(
+        completed_finalize(
+            &orders,
+            &certificates,
+            "edge-order",
+            CERTIFICATE_ID,
+            active.order_url.as_deref(),
+        )
+        .unwrap()
+        .is_none(),
+        "an order that is not `valid` is not completed"
+    );
+
+    // Completed, but not as the CA order this request finalized, or not into
+    // the certificate it names.
+    let dir = tempfile::tempdir().unwrap();
+    let orders = open_store(&dir);
+    let certificates = open_certificates(&dir);
+    let snapshot = seed_and_complete_by_renewal(&orders, &certificates);
+    assert!(
+        completed_finalize(
+            &orders,
+            &certificates,
+            "edge-order",
+            CERTIFICATE_ID,
+            Some("https://acme.example/order/other"),
+        )
+        .unwrap()
+        .is_none(),
+        "the order now names a different CA order"
+    );
+    assert!(
+        completed_finalize(
+            &orders,
+            &certificates,
+            "edge-order",
+            "other-cert",
+            snapshot.order_url.as_deref(),
+        )
+        .unwrap()
+        .is_none(),
+        "the order was finalized into another certificate"
+    );
+
+    // Deleted meanwhile, and the certificate missing.
+    orders.delete_order("edge-order").unwrap();
+    assert!(
+        completed_finalize(
+            &orders,
+            &certificates,
+            "edge-order",
+            CERTIFICATE_ID,
+            snapshot.order_url.as_deref(),
+        )
+        .unwrap()
+        .is_none(),
+        "a deleted order is not completed"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let orders = open_store(&dir);
+    let certificates = open_certificates(&dir);
+    let snapshot = seed(
+        &orders,
+        order(
+            "edge-order",
+            Some(CERTIFICATE_ID),
+            AcmeOrderStatus::Processing,
+        ),
+    );
+    orders
+        .complete_order_if_current(&snapshot, CERTIFICATE_ID.to_string())
+        .unwrap()
+        .expect("commit");
+    assert!(
+        completed_finalize(
+            &orders,
+            &certificates,
+            "edge-order",
+            CERTIFICATE_ID,
+            snapshot.order_url.as_deref(),
+        )
+        .unwrap()
+        .is_none(),
+        "no stored certificate is not completion"
+    );
+}
+
+#[test]
+fn replacement_precheck_refuses_ready_and_terminal_orders_before_preparation() {
+    let next = AcmeOrderStatus::PendingChallenges;
+    for stored in [
+        AcmeOrderStatus::Ready,
+        AcmeOrderStatus::Processing,
+        AcmeOrderStatus::Valid,
+        AcmeOrderStatus::Failed,
+        AcmeOrderStatus::Cancelled,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let orders = open_store(&dir);
+        seed(&orders, order("edge-order", Some(CERTIFICATE_ID), stored));
+        match order_replacement_refusal(&orders, "edge-order", true, next).unwrap() {
+            Some(AcmeError::IllegalOrderTransition { id, from, to }) => {
+                assert_eq!(id, "edge-order");
+                assert_eq!((from, to), (stored, next));
+            }
+            other => panic!("{stored:?} must be refused, got {other:?}"),
+        }
+        // Without `allow_overwrite` an existing id is refused outright.
+        assert!(matches!(
+            order_replacement_refusal(&orders, "edge-order", false, next).unwrap(),
+            Some(AcmeError::OrderAlreadyExists(_))
+        ));
+    }
+}
+
+#[test]
+fn replacement_precheck_admits_new_ids_and_pending_replacements() {
+    let dir = tempfile::tempdir().unwrap();
+    let orders = open_store(&dir);
+    let next = AcmeOrderStatus::PendingChallenges;
+    assert!(
+        order_replacement_refusal(&orders, "fresh", false, next)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        order_replacement_refusal(&orders, "fresh", true, next)
+            .unwrap()
+            .is_none()
+    );
+    seed(
+        &orders,
+        order(
+            "edge-order",
+            Some(CERTIFICATE_ID),
+            AcmeOrderStatus::PendingChallenges,
+        ),
+    );
+    assert!(
+        order_replacement_refusal(&orders, "edge-order", true, next)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn replacement_precheck_agrees_with_the_store() {
+    // The pre-check runs before CA preparation and the store decides again
+    // under its lock; the two must never disagree.
+    let next = AcmeOrderStatus::PendingChallenges;
+    for stored in ALL_STATUSES {
+        for allow_overwrite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let orders = open_store(&dir);
+            seed(&orders, order("edge-order", Some(CERTIFICATE_ID), stored));
+            let refusal =
+                order_replacement_refusal(&orders, "edge-order", allow_overwrite, next).unwrap();
+            let write = orders.upsert_order(
+                order("edge-order", Some(CERTIFICATE_ID), next),
+                allow_overwrite,
+            );
+            assert_eq!(
+                refusal.is_none(),
+                write.is_ok(),
+                "{stored:?} allow_overwrite={allow_overwrite}: {refusal:?} vs {write:?}"
+            );
+        }
+    }
 }

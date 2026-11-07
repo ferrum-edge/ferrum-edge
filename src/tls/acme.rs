@@ -1815,6 +1815,86 @@ pub fn order_produced_certificate(
         && certificate.order_url.as_deref() == Some(order_url)
 }
 
+/// The stored `(order, certificate)` pair when a finalize of `order_id` into
+/// `certificate_id` has already completed, `Ok(None)` otherwise.
+///
+/// Admin finalize asks this in three places, each of which would otherwise
+/// answer `409`: before any CA I/O when the order is already terminal (a repeat
+/// of a finalize that succeeded), when its certificate write finds the record
+/// already present (a renewal or a concurrent finalize published it first), and
+/// when its order compare-and-set is refused (that renewal or finalize also
+/// completed the order). Both records are re-read from the stores, so the
+/// answer is about the current state rather than the request's snapshot.
+///
+/// Completed means: the order still exists and is `valid`, it still names the
+/// CA order this request finalized (`finalized_order_url`; `None` accepts the
+/// stored order's own URL), it was finalized into `certificate_id`, and the
+/// stored certificate is the one it produced ([`order_produced_certificate`]).
+/// A deleted order, a different or still-active order, a missing certificate,
+/// or one issued for another CA order is not completion. A store that cannot
+/// be read is an error, never "not completed".
+pub fn completed_finalize(
+    order_store: &AcmeOrderStore,
+    certificate_store: &AcmeCertificateStore,
+    order_id: &str,
+    certificate_id: &str,
+    finalized_order_url: Option<&str>,
+) -> Result<Option<(AcmeOrderRecord, AcmeCertificateRecord)>, AcmeError> {
+    let order = match order_store.get_order(order_id) {
+        Ok(order) => order,
+        Err(AcmeError::OrderNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if finalized_order_url.is_some_and(|url| order.order_url.as_deref() != Some(url))
+        || order.status != AcmeOrderStatus::Valid
+        || order.certificate_id.as_deref() != Some(certificate_id)
+    {
+        return Ok(None);
+    }
+    let certificate = match certificate_store.get_certificate(certificate_id) {
+        Ok(certificate) => certificate,
+        Err(AcmeError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(order_produced_certificate(&order, &certificate).then_some((order, certificate)))
+}
+
+/// The refusal an order write of a new `next`-status record under `id` would
+/// meet, decided before the caller prepares that record with the CA.
+///
+/// Preparing an order creates it with the CA, which cannot be undone, so the
+/// Admin API asks this first: `Ok(Some(OrderAlreadyExists))` for an existing
+/// id without `allow_overwrite`, `Ok(Some(IllegalOrderTransition))` when the
+/// stored order's status does not admit `next`
+/// ([`AcmeOrderStatus::admits_overwrite_with`]), and `Ok(None)` when the write
+/// may proceed — including a brand-new id, or an id the store rejects as
+/// malformed (the write itself reports that). [`AcmeOrderStore::upsert_order`]
+/// makes the same decision again under its lock, so a change after this read
+/// is still refused there.
+pub fn order_replacement_refusal(
+    order_store: &AcmeOrderStore,
+    id: &str,
+    allow_overwrite: bool,
+    next: AcmeOrderStatus,
+) -> Result<Option<AcmeError>, AcmeError> {
+    let existing = match order_store.get_order(id) {
+        Ok(existing) => existing,
+        Err(AcmeError::OrderNotFound(_) | AcmeError::InvalidId(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !allow_overwrite {
+        return Ok(Some(AcmeError::OrderAlreadyExists(existing.id)));
+    }
+    if existing.status.admits_overwrite_with(next) {
+        return Ok(None);
+    }
+    Ok(Some(AcmeError::IllegalOrderTransition {
+        id: existing.id,
+        from: existing.status,
+        to: next,
+    }))
+}
+
 /// Whether `current` is still exactly the order a caller read as `expected`.
 ///
 /// `updated_at` is stamped by every store write and `created_at` by the write
