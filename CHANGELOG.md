@@ -24,23 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend, which the H1/H2 handshake already stripped. Both frontends now use
   one shared predicate; H3 still replaces `Early-Data` itself and drops
   pseudo-headers.
-- **A withdrawn inbound redirect port no longer stays redirect-eligible after
-  a partial scope write** (#7025). If the node-agent wrote a pod's widened
-  inbound redirect scope and then failed the pod-IP flag (or IPv6) write, a
-  later event reverting to the previously tracked ports returned early and the
-  withdrawn port stayed in the BPF scope. While a redirect write is pending the
-  node-agent now rewrites the full scope on every event and clears the pending
-  failure once it converges. A failed pod-IP move gets the same treatment:
-  the abandoned target address is recorded, a later event (even one that
-  reverts to the tracked address) re-converges the tracked address and removes
-  the abandoned scope, instead of leaving the record pending for the pod's
-  lifetime. Pod removal now drops every live-pod capture
-  failure record, including the redirect one it used to miss, so a removed pod
-  no longer pins the node in `partially_attached` or makes every retry tick
-  retract and republish the Ambient UDP registry proof. A failed cgroup program
-  detach is also retained, so its retry is no longer reported as successful
-  while the pod's cgroup still exists. Per-pod capture failures are now typed
-  records rather than parsed strings.
+- **Admin restore keeps its mTLS DNS fence on a half-restored namespace**
+  (#7032). The restore's "multi-phase restore is incomplete" hold shared one
+  state with per-mutation tracking, so a completed import that returned
+  errors settled it; if the compensating rollback was then never polled (for
+  example namespace admission failing before it started) or the request was
+  cancelled, guard Drop released the fence over a cleared, partially imported
+  namespace on SQL backends. The restore phase is now tracked separately
+  (cleared, imported, rolled back, rollback incomplete), and both the explicit
+  release and Drop keep the fence until the import succeeds or the rollback
+  completes. A rollback that runs but fails now retains the fence too: the
+  `500` response keeps `rollback: "incomplete"` and says the guard was
+  retained, and recovery follows the `unknown_outcome` procedure. A guard
+  reacquired for recovery gets the incomplete phase inside its acquisition
+  task, so cancelling during reacquisition no longer releases it. A nested
+  mutation restores the prior uncertain state instead of settling it.
 - **A failed SQL failback no longer leaves the primary pool live behind
   failover topology** (#7033). On a store bootstrapped from
   `FERRUM_DB_CONFIG_BACKUP_PATH`, a primary failback published the primary pool
@@ -67,6 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loading is retried before each CNI request and recovers without a restart;
   malformed or invalid content stays rejected until the file is repaired and
   the node-agent restarts.
+- **A withdrawn inbound redirect port no longer stays redirect-eligible after
+  a partial scope write** (#7025). If the node-agent wrote a pod's widened
+  inbound redirect scope and then failed the pod-IP flag (or IPv6) write, a
+  later event reverting to the previously tracked ports returned early and the
+  withdrawn port stayed in the BPF scope. While a redirect write is pending the
+  node-agent now rewrites the full scope on every event and clears the pending
+  failure once it converges. A failed pod-IP move gets the same treatment:
+  the abandoned target address is recorded, a later event (even one that
+  reverts to the tracked address) re-converges the tracked address and removes
+  the abandoned scope, instead of leaving the record pending for the pod's
+  lifetime. Pod removal now drops every live-pod capture
+  failure record, including the redirect one it used to miss, so a removed pod
+  no longer pins the node in `partially_attached` or makes every retry tick
+  retract and republish the Ambient UDP registry proof. A failed cgroup program
+  detach is also retained, so its retry is no longer reported as successful
+  while the pod's cgroup still exists. Per-pod capture failures are now typed
+  records rather than parsed strings.
 - **Node-agent readiness stays withdrawn while an Ambient UDP registry proof
   retraction is pending** (#7024). A failed retraction of a published
   `.udp-registry-synced` marker left the proof counted as published, so the

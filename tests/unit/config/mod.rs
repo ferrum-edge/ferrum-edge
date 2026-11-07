@@ -74,6 +74,7 @@ mod sidecar_ingress_stream_tests;
 mod sidecar_outbound_policy_tests;
 mod sql_dialect_tests;
 mod stable_file_tests;
+mod store_policy_tests;
 mod stream_proxy_config_tests;
 mod test_db_fault_tests;
 mod tls_offload_threads_tests;

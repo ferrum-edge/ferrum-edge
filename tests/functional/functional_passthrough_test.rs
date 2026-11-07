@@ -12,7 +12,7 @@ use rustls::pki_types::pem::PemObject;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::process::Child;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -161,8 +161,10 @@ fn mint_observability_token() -> String {
 /// require JSON `ready: true`. `ready` flips only after every listener bind,
 /// including the stream listener this file actually dials.
 ///
-/// Barrier (same contract as `TestGateway` / `wait_for_owned_gateway`):
-/// 1. `Child::try_wait` around every probe — a dead child voids the attempt.
+/// Barrier (`TestGateway`'s health-only path, via the shared
+/// `wait_for_child_gateway_readiness`; not JWT ownership):
+/// 1. `Child::try_wait` before every probe and after the successful one — a
+///    dead child voids the attempt.
 /// 2. Authenticated `/health` detail tier for this attempt's bearer token with
 ///    `ready: true`.
 ///
@@ -175,45 +177,14 @@ async fn wait_for_owned_gateway(
     admin_port: u16,
     observability_token: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    const STARTUP_TIMEOUT_SECS: u64 = 30;
-    const PROBE_SLICE: Duration = Duration::from_secs(1);
-    let deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
-    let mut last_observation = String::from("no response yet");
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Err(format!(
-                "passthrough gateway exited during startup with {status} \
-                 (last observation: {last_observation})"
-            )
-            .into());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(format!(
-                "passthrough gateway did not prove ownership of admin port {admin_port} \
-                 within {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
-            )
-            .into());
-        }
-        match crate::common::probe_gateway_identity(
-            admin_port,
-            observability_token,
-            remaining.min(PROBE_SLICE),
-        )
-        .await
-        {
-            Ok(()) => {
-                if let Some(status) = child.try_wait()? {
-                    return Err(format!(
-                        "passthrough gateway exited after reporting ready with {status}"
-                    )
-                    .into());
-                }
-                return Ok(());
-            }
-            Err(err) => last_observation = err.to_string(),
-        }
-    }
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+    crate::common::wait_for_child_gateway_readiness(
+        child,
+        admin_port,
+        observability_token,
+        STARTUP_TIMEOUT,
+    )
+    .await
 }
 
 /// Start the gateway with retry on port-binding failures.
