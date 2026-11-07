@@ -4269,3 +4269,84 @@ fn every_tracing_capture_registers_the_interest_floor_first() {
          capture: {offenders:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stream per-port LB lane admission: TCP, UDP/DTLS, mesh raw-TCP egress, mesh
+// UDP egress. The four paths once carried their own copies of this decision
+// and drifted (per-port `LEAST_CONN`, the subset refinement). The behaviour of
+// the shared `backend_dispatch::stream_port_lane` is pinned in
+// `stream_port_lane_tests.rs`; this table pins that every stream path calls
+// it, with the selection subset it actually selects from, and keeps no copy.
+// ---------------------------------------------------------------------------
+
+/// `(path, selection_subset argument)` for every stream path that selects a
+/// load-balanced target. Only TCP selects inside a route subset:
+/// `upstream_subset` is a validation error on udp/dtls, and mesh relay proxies
+/// select from the entry upstream.
+const STREAM_PORT_LANE_SITES: &[(&str, &str)] = &[
+    ("src/proxy/tcp_proxy.rs", "proxy.upstream_subset.as_deref()"),
+    ("src/proxy/udp_proxy.rs", "None"),
+    ("src/proxy/mesh_tcp_egress.rs", "None"),
+    ("src/proxy/mesh_udp_capture.rs", "None"),
+];
+
+/// The top-level arguments of every `stream_port_lane(` call in `text`.
+fn stream_port_lane_call_args(text: &str) -> Vec<Vec<String>> {
+    const CALL: &str = "backend_dispatch::stream_port_lane(";
+    let mut calls = Vec::new();
+    for (at, _) in text.match_indices(CALL) {
+        let bytes = text.as_bytes();
+        let open = at + CALL.len() - 1;
+        let close = after_matching_close(bytes, open) - 1;
+        let compact: String = text[open + 1..close].split_whitespace().collect();
+        let mut depth = 0i32;
+        let mut start = 0;
+        let mut args = Vec::new();
+        for (i, c) in compact.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(compact[start..i].to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if start < compact.len() {
+            args.push(compact[start..].to_string());
+        }
+        calls.push(args);
+    }
+    calls
+}
+
+#[test]
+fn every_stream_path_admits_its_port_lane_through_the_shared_policy() {
+    for &(path, subset) in STREAM_PORT_LANE_SITES {
+        let production = without_cfg_test_items(&source(path));
+        let calls = stream_port_lane_call_args(&production);
+        assert_eq!(
+            calls.len(),
+            1,
+            "{path} must make exactly one production per-port lane decision \
+             through backend_dispatch::stream_port_lane"
+        );
+        assert_eq!(
+            calls[0].last().map(String::as_str),
+            Some(subset),
+            "{path} must pass its own selection subset explicitly"
+        );
+        for copy in [
+            "override_config.locality_lb_setting.is_some()",
+            "HashOnStrategy::Ip",
+            "LoadBalancerAlgorithm::LeastLatency",
+        ] {
+            assert!(
+                !production.contains(copy),
+                "{path} re-implements part of the stream lane policy (`{copy}`); \
+                 call backend_dispatch::stream_port_lane instead"
+            );
+        }
+    }
+}

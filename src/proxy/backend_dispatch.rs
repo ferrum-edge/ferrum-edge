@@ -595,6 +595,112 @@ pub(crate) fn stream_health_port_scope(
     .then_some(dispatch_port)
 }
 
+/// Why a stream path refuses the per-port LB lane its effective port override
+/// asks for. Each stream path maps the refusal onto its own surface (a typed
+/// `StreamSetupError` on TCP and UDP/DTLS, a `warn!` plus close on mesh
+/// egress), so the wording and the teardown stay per protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamPortLaneRefusal {
+    /// Per-port `LEAST_LATENCY`. UDP/DTLS has no per-request RTT sample, so a
+    /// per-port latency lane would be fed on TCP and silently inert elsewhere;
+    /// it stays refused on every stream path until stream latency sampling
+    /// exists on all of them.
+    LeastLatency,
+    /// The lane engages but the effective hash key is not the source IP. Stream
+    /// paths have no request headers or cookies, so they hash only by client IP.
+    NonIpHashKey,
+}
+
+/// The per-port LB lane admission policy shared by every stream path (TCP,
+/// UDP/DTLS, mesh raw-TCP egress, mesh UDP egress).
+///
+/// `health_port_scope` is the value [`stream_health_port_scope`] returned for
+/// the upstream's single dispatch port; `None` means no lane. A lane engages
+/// only when the port's override sets a selection-affecting field (algorithm,
+/// `hash_on`, or `locality_lb_setting`); timeout-, keepalive-, idle- and
+/// passive-health-only overrides scope health without bypassing upstream LB.
+/// Checks run in a fixed order: per-port `LEAST_LATENCY` is refused before the
+/// selection-affecting test, and the source-IP hash requirement applies only
+/// once a lane engages. `LEAST_CONN` is supported: every stream connection or
+/// session holds a `LoadBalancerConnectionGuard` for its lifetime (issue
+/// #4514), which feeds the counters `select_for_port` reads.
+///
+/// `selection_subset` is the subset the caller selects from. It is explicit
+/// because the paths differ: TCP selects inside the route's `upstream_subset`,
+/// UDP/DTLS rejects `upstream_subset` at validation, and mesh relay proxies
+/// select from the entry upstream. With a subset and no per-port algorithm,
+/// `hash_on` only affects selection when the subset's effective algorithm is
+/// consistent hashing, and the hash-key lookup is subset-scoped too.
+pub(crate) fn stream_port_lane(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    health_port_scope: Option<u16>,
+    selection_subset: Option<&str>,
+) -> Result<Option<u16>, StreamPortLaneRefusal> {
+    let Some(port) = health_port_scope else {
+        return Ok(None);
+    };
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(None);
+    };
+    if matches!(
+        override_config.algorithm,
+        Some(LoadBalancerAlgorithm::LeastLatency)
+    ) {
+        return Err(StreamPortLaneRefusal::LeastLatency);
+    }
+    if !stream_port_override_affects_selection(
+        proxy,
+        balancers,
+        upstream_id,
+        port,
+        override_config,
+        selection_subset,
+    ) {
+        return Ok(None);
+    }
+    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        balancers,
+        &proxy.namespace,
+        upstream_id,
+        Some(port),
+        selection_subset,
+    );
+    if !matches!(strategy, HashOnStrategy::Ip) {
+        return Err(StreamPortLaneRefusal::NonIpHashKey);
+    }
+    Ok(Some(port))
+}
+
+fn stream_port_override_affects_selection(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+    override_config: &crate::config::types::ResolvedPortOverride,
+    selection_subset: Option<&str>,
+) -> bool {
+    if selection_subset.is_some() && override_config.algorithm.is_none() {
+        return override_config.locality_lb_setting.is_some()
+            || (override_config.hash_on.is_some()
+                && LoadBalancerCache::effective_algorithm_from(
+                    balancers,
+                    &proxy.namespace,
+                    upstream_id,
+                    Some(port),
+                    selection_subset,
+                ) == Some(LoadBalancerAlgorithm::ConsistentHashing));
+    }
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+}
+
 pub(crate) fn health_context_for_selection<'a>(
     proxy: &Proxy,
     health_checker: &'a HealthChecker,
