@@ -3455,3 +3455,61 @@ async fn plugin_tls_certificate_bundles_are_projected_for_non_admins_and_audit()
         assert_eq!(stored.pointer(bundle_pointer), Some(&json!(bundle)));
     }
 }
+
+/// A PEM private-key block in a plugin-config field with no TLS name is
+/// withheld by its content alone. An operator that echoes the resulting
+/// `[REDACTED]` back must be refused: once echoed the marker carries no PEM to
+/// classify, so the exact placeholder is reserved at every string field.
+#[tokio::test]
+async fn unclassified_private_key_echo_is_refused_for_operators() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let operator = token("ops", Some("operator"));
+    let path = "/plugins/config/unclassified-pem";
+    let write_path = "/plugins/config/unclassified-pem?expected_proxy_ids=";
+    let bundle = plugin_tls_bundle_pem();
+
+    // Disabled configs are stored without plugin construction, so an
+    // arbitrary nested field is accepted.
+    let plugin = json!({
+        "id": "unclassified-pem",
+        "plugin_name": "stdout_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {"note": {"nested": [bundle, "kept-visible"]}}
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "stdout_logging create failed: {body:?}");
+
+    let (status, etag, masked) =
+        send_json(reqwest::Method::GET, &base, path, &operator, None, None).await;
+    assert_eq!(status, 200, "operator plugin get failed: {masked:?}");
+    assert_eq!(masked["config"]["note"]["nested"][0], "[REDACTED]");
+    assert_eq!(masked["config"]["note"]["nested"][1], "kept-visible");
+    assert!(
+        !masked.to_string().contains(PLUGIN_TLS_BUNDLE_KEY),
+        "operator read leaked the key: {masked}"
+    );
+    let etag = etag.expect("plugin config GET carries an ETag");
+
+    let (status, _, refused) = send_json(
+        reqwest::Method::PUT,
+        &base,
+        write_path,
+        &operator,
+        Some(&etag),
+        Some(&masked),
+    )
+    .await;
+    assert_eq!(status, 400, "masked key echo was accepted: {refused:?}");
+    let error = refused["error"].as_str().expect("error message");
+    assert!(
+        error.contains("/config/note/nested/0"),
+        "unexpected refusal: {error}"
+    );
+
+    let (_, _, stored) = send_json(reqwest::Method::GET, &base, path, &admin, None, None).await;
+    assert_eq!(stored["config"]["note"]["nested"][0], json!(bundle));
+}

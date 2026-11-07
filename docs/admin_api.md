@@ -1506,6 +1506,15 @@ written as sent. One real value looks exactly like a placeholder: a URL whose
 userinfo is the username `redacted` with no password, at a masked field. An
 operator cannot write that value, but an admin can.
 
+The exact string `[REDACTED]` is the exception: in a proxy, upstream, or
+plugin config it is refused at **any** string field, not only at fields the
+read masks. Stored TLS private-key material is withheld by its content
+wherever it occurs (see
+[Backend TLS private keys in reads](#backend-tls-private-keys-in-reads)), so a
+masked key in a field with no TLS name looks, once echoed back, exactly like
+`[REDACTED]` typed into an ordinary field. An operator cannot store the literal
+string `[REDACTED]` in these resources; an admin can.
+
 To change a resource that holds a masked secret, an operator must do one of these:
 
 - **Send the real value.** A new token or header value is an ordinary write, so

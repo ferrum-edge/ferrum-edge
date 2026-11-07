@@ -54,7 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Header names, match kinds (`exact` / `prefix` / `regex`) and routing metadata
   stay visible, and a `null` presence-only `waf` condition stays `null`. An
   `operator` write that echoes the placeholder back at one of these fields is
-  refused with `400`. `admin` reads and `GET /backup` stay raw. The collector,
+  refused with `400`. Because a PEM private key is withheld by its content in
+  any field, an `operator` write carrying the exact string `[REDACTED]` in any
+  string field of a proxy, upstream, or plugin config is now refused too.
+  `admin` reads and `GET /backup` stay raw. The collector,
   JWKS, control-plane and federation URLs in a `mesh_authz` `mesh_slice` now
   get the same structural endpoint projection as other collector URLs.
 - **Non-admin admin-API reads no longer return inline backend TLS private

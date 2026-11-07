@@ -2216,12 +2216,29 @@ fn placeholder_sites_ignore_a_later_layer_rendering_an_earlier_layers_output() {
     );
 }
 
-/// A placeholder only matters where the projection masks: the same string in a
-/// field the read shows verbatim was put there by the caller, not the read.
+/// A structural URL marker only matters where the projection masks: the same
+/// string in a field the read shows verbatim was put there by the caller, not
+/// the read.
 #[test]
-fn placeholder_outside_a_masked_site_is_not_reported() {
-    let config = json!({"service": "[REDACTED]", "batch_size": 50});
+fn url_marker_outside_a_masked_site_is_not_reported() {
+    let config = json!({
+        "service": "https://collector.example.com/[REDACTED_PATH]",
+        "batch_size": 50
+    });
     assert!(placeholder_sites("http_logging", &config).is_empty());
+}
+
+/// The exact `[REDACTED]` placeholder is reported at every string site: the
+/// TLS-material layer withholds a PEM private-key block by content in any
+/// field, so an echoed marker in an unclassified field cannot be told apart
+/// from a masked key, and the placeholder is reserved instead.
+#[test]
+fn exact_placeholder_is_reported_at_any_string_site() {
+    let config = json!({"service": "[REDACTED]", "batch_size": 50});
+    assert_eq!(
+        placeholder_sites("http_logging", &config),
+        ["/config/service"]
+    );
 }
 
 #[test]

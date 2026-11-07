@@ -445,7 +445,11 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         "mtls_auth",
         // Inline CA certificates; a pasted certificate-plus-key bundle is
         // withheld.
-        &[certificate_source(&["allowed_issuers", "*", "ca_certificate_pem"])],
+        &[certificate_source(&[
+            "allowed_issuers",
+            "*",
+            "ca_certificate_pem",
+        ])],
     ),
     (
         "jwks_auth",
@@ -1006,6 +1010,14 @@ fn tls_source_withheld(value: &Value, field: TlsMaterialField) -> bool {
 /// renderer too lets an `operator` write that echoes it back be refused (issue
 /// #5925) instead of storing `[REDACTED]` as the source.
 ///
+/// The exact `[REDACTED]` placeholder is routed through `rendering` at every
+/// string site, classified or not: a stored value this layer withholds by its
+/// content alone leaves nothing to classify once it is echoed back. A
+/// non-admin write that carries the literal `[REDACTED]` in any string of a
+/// Proxy, Upstream, or plugin config is therefore refused, which reserves the
+/// placeholder in those bodies the way it is already reserved for consumer
+/// credentials.
+///
 /// The Proxy and Upstream projections run this over their whole body, and the
 /// plugin-config projection runs it as its last layer.
 pub fn withhold_tls_material_with(
@@ -1338,7 +1350,13 @@ impl<'r> Projector<'r> {
     /// it).
     fn withhold_tls_material(&mut self, value: &mut Value, field: Option<TlsMaterialField>) {
         if let Some(text) = value.as_str() {
-            if tls_material_withheld(text, field) {
+            // Content-based withholding (a PEM private-key block in a field
+            // with no TLS classification) leaves nothing in an echoed
+            // `[REDACTED]` to classify, so the exact placeholder is routed
+            // through the renderer at every string site: the write path then
+            // refuses it wherever this layer could have masked a stored value.
+            // Reads are unchanged, since the placeholder renders as itself.
+            if text == REDACTED_PLACEHOLDER || tls_material_withheld(text, field) {
                 self.render(value, json!(REDACTED_PLACEHOLDER));
             }
             return;
