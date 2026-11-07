@@ -1014,19 +1014,35 @@ impl OidcRelyingParty {
             .map(|url| validate_url_string(&url, "provider[0].discovery_url", UrlAudience::Gateway))
             .transpose()?;
         let authorization_endpoint = authorization_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].authorization_endpoint", UrlAudience::Browser))
+            .map(|url| {
+                validate_url_string(
+                    &url,
+                    "provider[0].authorization_endpoint",
+                    UrlAudience::Browser,
+                )
+            })
             .transpose()?;
         let token_endpoint = token_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].token_endpoint", UrlAudience::Gateway))
+            .map(|url| {
+                validate_url_string(&url, "provider[0].token_endpoint", UrlAudience::Gateway)
+            })
             .transpose()?;
         let userinfo_endpoint = userinfo_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].userinfo_endpoint", UrlAudience::Gateway))
+            .map(|url| {
+                validate_url_string(&url, "provider[0].userinfo_endpoint", UrlAudience::Gateway)
+            })
             .transpose()?;
         let jwks_uri = jwks_uri
             .map(|url| validate_url_string(&url, "provider[0].jwks_uri", UrlAudience::Gateway))
             .transpose()?;
         let end_session_endpoint = end_session_endpoint
-            .map(|url| validate_url_string(&url, "provider[0].end_session_endpoint", UrlAudience::Browser))
+            .map(|url| {
+                validate_url_string(
+                    &url,
+                    "provider[0].end_session_endpoint",
+                    UrlAudience::Browser,
+                )
+            })
             .transpose()?;
 
         let client_id = required_string(provider_obj, "client_id", "provider[0]")?;
@@ -1363,7 +1379,13 @@ impl OidcRelyingParty {
         // rejected plugin configs have no background side effects.
         let post_logout_redirect_uri =
             optional_string(provider_obj, "post_logout_redirect_uri", "provider[0]")?
-                .map(|url| validate_url_string(&url, "provider[0].post_logout_redirect_uri", UrlAudience::Browser))
+                .map(|url| {
+                    validate_url_string(
+                        &url,
+                        "provider[0].post_logout_redirect_uri",
+                        UrlAudience::Browser,
+                    )
+                })
                 .transpose()?;
         let initial_jwks_store = if start_background_tasks {
             jwks_uri
@@ -5718,7 +5740,10 @@ mod tests {
             assert!(validate_url_string(denied, "token_endpoint", UrlAudience::Gateway).is_err());
         }
         // Browser-followed redirects keep the `localhost` development case.
-        for allowed in ["http://localhost:8080/authorize", "http://127.0.0.1:8080/authorize"] {
+        for allowed in [
+            "http://localhost:8080/authorize",
+            "http://127.0.0.1:8080/authorize",
+        ] {
             assert!(
                 validate_url_string(allowed, "authorization_endpoint", UrlAudience::Browser)
                     .is_ok()

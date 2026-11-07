@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **Cleartext auth endpoints are admitted only for loopback IP literals,
+  never the name `localhost`.** `oauth2_introspection` (credentialed
+  `http://` endpoints and `client_auth.method: none`), `jwks_auth`
+  (`jwks_uri` / `discovery_url`), `oidc_relying_party` (`discovery_url`,
+  `token_endpoint`, `userinfo_endpoint`, `jwks_uri`, discovered endpoints and
+  `client_auth.method: none`) and `ai_transcript_audit`
+  (`sink.allow_insecure_loopback`) accepted `localhost` / `*.localhost` as
+  loopback, so a DNS override or resolver mapping could carry client secrets,
+  authorization codes, audit transcripts, or an attacker-chosen key set over
+  cleartext to another host. They now follow the #6659 rule: only
+  `127.0.0.0/8` and `::1` literals qualify. **Upgrade:** replace
+  `http://localhost` with `http://127.0.0.1` (or `[::1]`) in these fields.
+  Browser-followed OIDC URLs (`authorization_endpoint`,
+  `end_session_endpoint`, `redirect_uri`, `post_logout_redirect_uri`) keep
+  `localhost`.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The
   Kubernetes translator mapped `mtls.mode: UNSET`, an omitted mode or `mtls`

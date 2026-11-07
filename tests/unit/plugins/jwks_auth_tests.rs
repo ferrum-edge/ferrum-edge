@@ -570,7 +570,10 @@ fn remote_key_endpoints_require_https_and_reject_userinfo() {
 
         // A name never proves the key set is fetched from this machine: DNS
         // overrides and the resolver decide where it connects (#6659).
-        for named_endpoint in ["http://localhost:8080/keys", "http://api.localhost:8080/keys"] {
+        for named_endpoint in [
+            "http://localhost:8080/keys",
+            "http://api.localhost:8080/keys",
+        ] {
             let error = JwksAuth::new(&endpoint_config(field, named_endpoint), default_client())
                 .err()
                 .expect("cleartext localhost name must reject");
