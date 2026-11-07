@@ -3850,27 +3850,25 @@ fn upstream_audit_body(resource: &Upstream) -> Value {
 
 /// The redacted Upstream projection for `viewer` reads, audit diffs, and (with
 /// a fingerprint [`RedactionRendering`]) the read-only configuration export:
-/// the Consul ACL token is withheld, and every URL-shaped string in the body
-/// (a Consul `address`, for example) has any userinfo removed.
+/// everything [`upstream_operator_projection`] withholds, plus any userinfo in
+/// a URL-shaped string anywhere in the body (a Consul `address`, for example).
 ///
 /// Operator reads deliberately do not use this: operators write upstreams, and
 /// a GET-then-PUT of a userinfo-stripped body would silently replace stored
-/// credentials with `redacted@`. They get [`upstream_consul_token_redacted`].
+/// credentials with `redacted@`. They get [`upstream_operator_projection`].
 pub(crate) fn upstream_audit_body_with(
     resource: &Upstream,
     rendering: &dyn RedactionRendering,
 ) -> Value {
-    let mut body = upstream_consul_token_redacted(resource, rendering);
+    let mut body = upstream_operator_projection(resource, rendering);
     crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
     body
 }
 
-/// An Upstream body with only the Consul ACL token withheld: the `operator`
-/// read projection.
-fn upstream_consul_token_redacted(
-    resource: &Upstream,
-    rendering: &dyn RedactionRendering,
-) -> Value {
+/// The `operator` Upstream read projection: the Consul ACL token and stored
+/// backend TLS private-key material ([`withhold_tls_private_key_material`])
+/// are withheld; everything else, URL userinfo included, stays verbatim.
+fn upstream_operator_projection(resource: &Upstream, rendering: &dyn RedactionRendering) -> Value {
     let mut body = json!(resource);
     if let Some(token) = body
         .get_mut("service_discovery")
@@ -3882,6 +3880,7 @@ fn upstream_consul_token_redacted(
         let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
         *token = rendering.render(UPSTREAM_CONSUL_TOKEN_POINTER, &stored, marker);
     }
+    withhold_tls_private_key_material(&mut body, rendering);
     body
 }
 
@@ -3889,14 +3888,134 @@ fn upstream_consul_token_redacted(
 const UPSTREAM_CONSUL_TOKEN_POINTER: &str = "/service_discovery/consul/token";
 
 /// The redacted Proxy projection for `viewer` reads, audit diffs, and (with a
-/// fingerprint [`RedactionRendering`]) the read-only configuration export: any
-/// URL-shaped string carrying userinfo is stripped. `admin` and `operator` reads
-/// stay raw, because both roles write proxies and a GET-then-PUT must not
-/// replace stored userinfo with `redacted@`.
+/// fingerprint [`RedactionRendering`]) the read-only configuration export:
+/// everything [`proxy_operator_projection`] withholds, plus any userinfo in a
+/// URL-shaped string anywhere in the body.
+///
+/// Operator reads deliberately do not use this: operators write proxies, and a
+/// GET-then-PUT must not replace stored userinfo with `redacted@`.
 pub(crate) fn proxy_audit_body_with(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
-    let mut body = json!(resource);
+    let mut body = proxy_operator_projection(resource, rendering);
     crate::admin::plugin_config_projection::strip_url_userinfo_with(&mut body, "", rendering);
     body
+}
+
+/// The `operator` Proxy read projection: only stored backend TLS private-key
+/// material ([`withhold_tls_private_key_material`]) is withheld; everything
+/// else, URL userinfo included, stays verbatim.
+fn proxy_operator_projection(resource: &Proxy, rendering: &dyn RedactionRendering) -> Value {
+    let mut body = json!(resource);
+    withhold_tls_private_key_material(&mut body, rendering);
+    body
+}
+
+/// How a field name in a serialized Proxy or Upstream body classifies the TLS
+/// material source it holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TlsMaterialField {
+    /// Names a private key: withheld unless it is plainly a reference.
+    PrivateKey,
+    /// Names a certificate or CA bundle: public unless it carries a PEM
+    /// private-key block.
+    Public,
+}
+
+/// The TLS material slot a field name denotes, for every slot reachable from a
+/// serialized Proxy or Upstream: the top-level `backend_tls_*` fields, a
+/// [`crate::config::types::BackendTlsConfig`] (`port_overrides.<port>.tls`),
+/// and a [`crate::modes::mesh::config::MeshTrafficPolicyTls`]
+/// (`subsets[].traffic_policy.tls`). Matched by name wherever it occurs, so a
+/// slot nested somewhere new is classified without a code change.
+fn tls_material_field(name: &str) -> Option<TlsMaterialField> {
+    match name {
+        "backend_tls_client_key_path" | "client_key_path" | "private_key" => {
+            Some(TlsMaterialField::PrivateKey)
+        }
+        "backend_tls_client_cert_path"
+        | "backend_tls_server_ca_cert_path"
+        | "client_cert_path"
+        | "server_ca_cert_path"
+        | "client_certificate"
+        | "ca_certificates" => Some(TlsMaterialField::Public),
+        _ => None,
+    }
+}
+
+/// Withhold stored private-key material anywhere in a Proxy or Upstream body,
+/// for every non-admin projection.
+///
+/// TLS material fields accept inline PEM as well as references. A reference
+/// (a path, or a `k8s://`, `vault://`, `managed://`, `pkcs11://`, or
+/// `system://` source) names material without disclosing it and stays
+/// visible; a value that is or may be key material is replaced through
+/// `rendering` at its exact JSON pointer (see [`private_key_material_withheld`]).
+/// Routing the exact placeholder at a TLS material field through the renderer
+/// too lets an `operator` write that echoes it back be refused (issue #5925)
+/// instead of storing `[REDACTED]` as the source.
+fn withhold_tls_private_key_material(body: &mut Value, rendering: &dyn RedactionRendering) {
+    let mut pointer = String::new();
+    withhold_private_key_material_at(body, None, &mut pointer, rendering);
+}
+
+fn withhold_private_key_material_at(
+    value: &mut Value,
+    field: Option<TlsMaterialField>,
+    pointer: &mut String,
+    rendering: &dyn RedactionRendering,
+) {
+    if let Some(text) = value.as_str() {
+        if private_key_material_withheld(text, field) {
+            let stored = std::mem::take(value);
+            let marker = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+            *value = rendering.render(pointer, &stored, marker);
+        }
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let mark = pointer.len();
+                crate::config::types::push_json_pointer_segment(pointer, key);
+                let child_field = tls_material_field(key);
+                withhold_private_key_material_at(child, child_field, pointer, rendering);
+                pointer.truncate(mark);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                let mark = pointer.len();
+                crate::config::types::push_json_pointer_segment(pointer, &index.to_string());
+                withhold_private_key_material_at(item, field, pointer, rendering);
+                pointer.truncate(mark);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a stored string in a Proxy or Upstream body is withheld from
+/// non-admin reads.
+///
+/// A PEM private-key block is withheld wherever it appears (a cert-plus-key
+/// bundle pasted into a certificate field, say). A private-key field fails
+/// closed further: any PEM armour, or a line break or other control character
+/// (never part of a path or typed URI), is treated as inline material.
+/// Certificates and CA bundles are public and otherwise stay visible.
+fn private_key_material_withheld(value: &str, field: Option<TlsMaterialField>) -> bool {
+    if crate::plugins::kafka_logging::contains_inline_private_key(value) {
+        return true;
+    }
+    let Some(field) = field else {
+        return false;
+    };
+    if value == crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER {
+        return true;
+    }
+    if field == TlsMaterialField::Public {
+        return false;
+    }
+    let upper = value.to_ascii_uppercase();
+    upper.contains("-----BEGIN") || value.chars().any(char::is_control)
 }
 
 pub(crate) async fn check_port_available(
@@ -4147,9 +4266,10 @@ impl AdminResource for Upstream {
     ) -> Value {
         match role {
             AdminRole::Admin => Self::response_body(resource),
-            // Operators write upstreams: withhold only the Consul token (as
-            // before issue #5904) so a GET-then-PUT keeps stored URL userinfo.
-            AdminRole::Operator => upstream_consul_token_redacted(resource, rendering),
+            // Operators write upstreams: withhold only stored secrets (the
+            // Consul token and backend TLS private keys) so a GET-then-PUT
+            // keeps stored URL userinfo.
+            AdminRole::Operator => upstream_operator_projection(resource, rendering),
             AdminRole::Viewer => upstream_audit_body_with(resource, rendering),
         }
     }
@@ -5186,9 +5306,10 @@ impl AdminResource for Proxy {
         rendering: &dyn RedactionRendering,
     ) -> Value {
         match role {
-            // Both roles write proxies: a GET-then-PUT must round-trip the
-            // stored body unchanged.
-            AdminRole::Admin | AdminRole::Operator => Self::response_body(resource),
+            AdminRole::Admin => Self::response_body(resource),
+            // Operators write proxies: withhold only stored backend TLS
+            // private keys so a GET-then-PUT keeps stored URL userinfo.
+            AdminRole::Operator => proxy_operator_projection(resource, rendering),
             AdminRole::Viewer => proxy_audit_body_with(resource, rendering),
         }
     }
