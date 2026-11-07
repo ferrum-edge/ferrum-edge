@@ -3011,12 +3011,11 @@ impl OidcRelyingParty {
         ))
     }
 
-    // Reached only through the lib target's `_test_support` shim by external
-    // unit tests; the bin target recompiles this module without that caller.
-    #[allow(dead_code)]
     /// Whether the discovery task published a document within `wait`, without
     /// consuming the plugin. A refused document is retried with backoff, so
     /// the task itself never ends on refusal.
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
     #[allow(dead_code)]
     pub(crate) async fn discovery_published_within_for_tests(&self, wait: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + wait;
@@ -3031,6 +3030,9 @@ impl OidcRelyingParty {
         }
     }
 
+    // Reached only through the lib target's `_test_support` shim by external
+    // unit tests; the bin target recompiles this module without that caller.
+    #[allow(dead_code)]
     pub(crate) async fn resolved_discovery_endpoints_for_tests(
         mut self,
     ) -> Option<(Option<String>, Option<String>)> {
@@ -5377,6 +5379,21 @@ async fn fetch_discovery(
         .and_then(Value::as_str)
         .map(|url| validate_discovered_url(discovery_url, url, "revocation_endpoint"))
         .transpose()?;
+    // Logout revocation POSTs the session refresh token through the same
+    // unauthenticated `none` exchange, so it obeys the token endpoint's rule.
+    if token_endpoint_requires_loopback
+        && revocation_endpoint.as_deref().is_some_and(|endpoint| {
+            !Url::parse(endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(is_loopback_ip_literal_host))
+                .unwrap_or(false)
+        })
+    {
+        return Err(
+            "discovered revocation_endpoint must be a loopback IP literal when client_auth.method is none"
+                .to_string(),
+        );
+    }
     Ok(DiscoveryDoc {
         authorization_endpoint,
         token_endpoint,
@@ -5819,6 +5836,28 @@ mod tests {
 
         let literal = serve("{origin}/token").await;
         assert!(fetch(&literal, true).await.is_ok());
+
+        // Logout revocation carries the refresh token through the same
+        // unauthenticated exchange, so a named revocation endpoint is refused
+        // under `none` too.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": server.uri(),
+                "authorization_endpoint": format!("{}/authorize", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "revocation_endpoint": "https://revoke.example.com/revoke",
+                "jwks_uri": format!("{}/jwks", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        let error = fetch(&server, true)
+            .await
+            .err()
+            .expect("none must refuse a named discovered revocation endpoint");
+        assert!(error.contains("revocation_endpoint"), "{error}");
+        assert!(fetch(&server, false).await.is_ok());
     }
 
     #[test]
