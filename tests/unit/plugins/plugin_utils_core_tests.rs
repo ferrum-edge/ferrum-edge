@@ -2805,3 +2805,27 @@ fn extended_reassembler_fails_closed_on_unmodelled_cohere_v2_content() {
         );
     }
 }
+
+/// The one parsed-host check behind every credentialed cleartext exemption in
+/// `oauth2_introspection`, `jwks_auth`, `oidc_relying_party`, and
+/// `ai_transcript_audit` (#6659): loopback IP literals only, never a name.
+#[test]
+fn loopback_ip_literal_host_admits_addresses_never_names() {
+    use ferrum_edge::plugins::utils::socket_host::is_loopback_ip_literal_host;
+
+    for host in ["127.0.0.1", "127.42.0.9", "::1", "[::1]"] {
+        assert!(is_loopback_ip_literal_host(host), "{host}");
+    }
+    for host in [
+        "localhost",
+        "LOCALHOST",
+        "localhost.",
+        "api.localhost",
+        "127.0.0.1.example.com",
+        "10.0.0.1",
+        "[::2]",
+        "",
+    ] {
+        assert!(!is_loopback_ip_literal_host(host), "{host}");
+    }
+}
