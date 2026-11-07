@@ -8026,7 +8026,9 @@ pub mod _test_support {
 
     // ── config/mongo_store: Admin write-topology / publication test seams ────
     pub use crate::config::mongo_store::{
-        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+        AdmissionFence as MongoAdmissionFence, AdmissionFenceProbe as MongoAdmissionFenceProbe,
+        AdmissionFenceReason as MongoAdmissionFenceReason, MongoReconnectTopology,
+        MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
     };
 
     // External test crates only: mirror production `config_changes` shapes without
@@ -8099,6 +8101,56 @@ pub mod _test_support {
         store: &crate::config::mongo_store::MongoStore,
     ) -> tokio::sync::OwnedRwLockReadGuard<()> {
         store.acquire_connection_generation_pin_for_test().await
+    }
+
+    /// Retain an mTLS DNS admission fence exactly as an uncertain single-call
+    /// guard's Drop does, handing over a real generation read pin (#7031).
+    pub async fn mongo_store_retain_mtls_dns_admission_fence_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        owner: &str,
+    ) {
+        store
+            .retain_mtls_dns_admission_fence_for_test(namespace, owner)
+            .await;
+    }
+
+    /// Register a live multi-step persistent admission pin (holding the
+    /// generation read pin) whose borrowed mutation became uncertain (#7031).
+    pub async fn mongo_store_insert_uncertain_persistent_admission_pin_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        guard_owner: &str,
+    ) {
+        store
+            .insert_uncertain_persistent_admission_pin_for_test(namespace, guard_owner)
+            .await;
+    }
+
+    /// Explicit per-namespace mTLS DNS admission fence state (no I/O).
+    pub fn mongo_store_mtls_dns_admission_fence(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+    ) -> crate::config::mongo_store::AdmissionFence {
+        store.mtls_dns_admission_fence(namespace)
+    }
+
+    /// The fail-closed fence gate admission runs under its generation pin.
+    pub fn mongo_store_ensure_mtls_dns_admission_unfenced_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+    ) -> Result<(), anyhow::Error> {
+        store.ensure_mtls_dns_admission_unfenced_for_test(namespace)
+    }
+
+    /// Apply one exit-probe outcome to every retained fence on `namespace`
+    /// through the production decision; returns how many were cleared.
+    pub fn mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        namespace: &str,
+        probe: crate::config::mongo_store::AdmissionFenceProbe,
+    ) -> usize {
+        store.apply_mtls_dns_admission_fence_probe_for_test(namespace, probe)
     }
 
     /// Active published Mongo database name (white-box accessor).

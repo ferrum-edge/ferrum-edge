@@ -468,8 +468,9 @@ mod inner {
     /// A guard starts before any protected write exists, so cancellation while
     /// validating may clean up. Once a MongoDB mutation has been dispatched,
     /// an error or cancelled future cannot prove whether the server committed
-    /// it; that state must retain both the datastore fence and the connection
-    /// generation pin. Only an explicit `release()` call declares the outcome
+    /// it; that state must retain the durable datastore fence and record an
+    /// explicit process-local [`AdmissionFence::Retained`] for the namespace
+    /// (issue #7031). Only an explicit `release()` call declares the outcome
     /// settled and authorizes owner-qualified cleanup (including a Drop retry).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum DurableAdmissionMutationState {
@@ -540,6 +541,250 @@ mod inner {
         uncertain_outcome: Arc<AtomicBool>,
     }
 
+    /// Bound on one exit re-verification probe of a retained admission fence.
+    /// The probe runs before an admission takes the connection-generation
+    /// read pin, so a slow or unreachable original topology delays only the
+    /// refused admission, never a reconnect.
+    const MONGO_ADMISSION_FENCE_REVERIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Why a namespace's mTLS DNS admission fence was retained.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AdmissionFenceReason {
+        /// A single-call admission guard was dropped (cancelled or errored)
+        /// after its protected MongoDB mutation was dispatched.
+        UncertainMutation,
+        /// A multi-step admission guard (restore / namespace clear + replay)
+        /// ended while one of its borrowed mutations had an uncertain outcome.
+        UncertainGuardedOperation,
+    }
+
+    impl AdmissionFenceReason {
+        /// Fixed, bounded label for `/health` and logs.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::UncertainMutation => "uncertain_mutation",
+                Self::UncertainGuardedOperation => "uncertain_guarded_operation",
+            }
+        }
+    }
+
+    /// Explicit per-namespace mTLS DNS admission fence state (issue #7031).
+    ///
+    /// Safety property: a dispatched mutation whose outcome is unknown may
+    /// still commit. While that is possible this process must not admit a
+    /// conflicting mTLS DNS identity into the same namespace — not on the
+    /// original topology and not on any topology a later reconnect or
+    /// failover publishes, where the durable lock document may be absent.
+    ///
+    /// The fence used to be implicit: an `OwnedRwLockReadGuard` on
+    /// `connection_generation` that was never dropped, which made every later
+    /// reconnect/failover in the process fail fast until restart. The fence is
+    /// now namespace-scoped state that admission consults directly, so the
+    /// generation pin is released and reconnect/failover proceed while the
+    /// fenced namespace keeps failing closed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum AdmissionFence {
+        /// No retained uncertainty for the namespace.
+        Clear,
+        /// At least one uncertain mutation is retained for the namespace.
+        Retained {
+            /// Unix epoch milliseconds of the oldest retained entry.
+            since_unix_ms: u64,
+            /// Reason of the oldest retained entry.
+            reason: AdmissionFenceReason,
+            /// Number of retained owners fencing this namespace.
+            retained: usize,
+        },
+    }
+
+    /// Outcome of one exit re-verification probe against the ORIGINAL
+    /// connection bundle of a retained fence.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AdmissionFenceProbe {
+        /// The owner-qualified durable lock document still exists: the
+        /// operator has not declared the outcome resolved.
+        DurableFencePresent,
+        /// The owner-qualified durable lock document is gone (majority read on
+        /// the original topology). Only this process's own explicit release
+        /// or an operator — after verifying the write outcome — removes it,
+        /// and our release path refuses while uncertain, so absence is the
+        /// operator's resolution signal.
+        DurableFenceAbsent,
+        /// The original topology could not be read (error or timeout). The
+        /// fence stays: absence was not proven.
+        Unverifiable,
+    }
+
+    struct RetainedAdmissionFence {
+        namespace: String,
+        owner: String,
+        since_unix_ms: u64,
+        reason: AdmissionFenceReason,
+        // The exact bundle the uncertain mutation was dispatched on. It keeps
+        // generated TLS files alive for the probe and is the ONLY connection
+        // the exit probe trusts: absence of the lock document on a different,
+        // later-published topology proves nothing about the original write.
+        connection: Arc<MongoConnectionBundle>,
+    }
+
+    /// Process-local registry of retained mTLS DNS admission fences, shared by
+    /// every clone of one [`MongoStore`] and every guard it hands out.
+    #[derive(Default)]
+    struct MongoAdmissionFences {
+        // Keyed by `"{namespace}:{owner}"`; one namespace may in principle
+        // carry more than one retained owner.
+        retained: DashMap<String, RetainedAdmissionFence>,
+    }
+
+    impl MongoAdmissionFences {
+        fn key(namespace: &str, owner: &str) -> String {
+            format!("{namespace}:{owner}")
+        }
+
+        /// Record (idempotently) that `namespace` is fenced by `owner`, THEN
+        /// release the supplied generation pin. Ordering is load-bearing: the
+        /// fence must be visible before a reconnect that the pin release
+        /// unblocks can publish a topology on which the namespace would
+        /// otherwise look unfenced. Admission checks the fence only after it
+        /// holds its own generation read pin, so the RwLock hand-off orders
+        /// the two.
+        fn retain(
+            &self,
+            namespace: &str,
+            owner: &str,
+            reason: AdmissionFenceReason,
+            connection: Arc<MongoConnectionBundle>,
+            generation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        ) {
+            let key = Self::key(namespace, owner);
+            let newly_retained = match self.retained.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(_) => false,
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    vacant.insert(RetainedAdmissionFence {
+                        namespace: namespace.to_string(),
+                        owner: owner.to_string(),
+                        since_unix_ms: u64::try_from(Utc::now().timestamp_millis()).unwrap_or(0),
+                        reason,
+                        connection,
+                    });
+                    true
+                }
+            };
+            if newly_retained {
+                crate::plugins::prometheus_metrics::global_registry()
+                    .record_mtls_dns_admission_fence_retained();
+            }
+            drop(generation_guard);
+        }
+
+        fn fence_for(&self, namespace: &str) -> AdmissionFence {
+            let mut oldest: Option<(u64, AdmissionFenceReason)> = None;
+            let mut retained = 0usize;
+            for entry in self.retained.iter() {
+                if entry.namespace != namespace {
+                    continue;
+                }
+                retained += 1;
+                if oldest.is_none_or(|(since, _)| entry.since_unix_ms < since) {
+                    oldest = Some((entry.since_unix_ms, entry.reason));
+                }
+            }
+            match oldest {
+                Some((since_unix_ms, reason)) => AdmissionFence::Retained {
+                    since_unix_ms,
+                    reason,
+                    retained,
+                },
+                None => AdmissionFence::Clear,
+            }
+        }
+
+        /// Fail closed while `namespace` is fenced. No I/O.
+        fn ensure_unfenced(&self, namespace: &str) -> Result<(), anyhow::Error> {
+            match self.fence_for(namespace) {
+                AdmissionFence::Clear => Ok(()),
+                AdmissionFence::Retained { reason, .. } => Err(anyhow::Error::new(
+                    MtlsDnsAdmissionUnavailable,
+                )
+                .context(format!(
+                    "MongoDB mTLS DNS admission for namespace {:?} is fenced in this admin \
+                         process because a prior protected mutation outcome is uncertain \
+                         (reason={}); verify the write outcome, then remove the owner-qualified \
+                         lock document so the next admission attempt can re-verify and clear \
+                         the fence",
+                    crate::startup::sanitize_startup_scalar(namespace),
+                    reason.as_str()
+                ))),
+            }
+        }
+
+        /// Snapshot of the retained entries for `namespace` that an exit probe
+        /// must re-verify: `(key, owner, original connection)`.
+        fn probe_targets(
+            &self,
+            namespace: &str,
+        ) -> Vec<(String, String, Arc<MongoConnectionBundle>)> {
+            self.retained
+                .iter()
+                .filter(|entry| entry.namespace == namespace)
+                .map(|entry| {
+                    (
+                        entry.key().clone(),
+                        entry.owner.clone(),
+                        entry.connection.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        /// Apply one probe outcome. Only a proven-absent durable lock clears
+        /// the entry; present or unverifiable keeps it. Returns whether the
+        /// entry was cleared.
+        fn apply_probe(&self, key: &str, probe: AdmissionFenceProbe) -> bool {
+            if probe != AdmissionFenceProbe::DurableFenceAbsent {
+                return false;
+            }
+            let cleared = self.retained.remove(key).is_some();
+            if cleared {
+                crate::plugins::prometheus_metrics::global_registry()
+                    .record_mtls_dns_admission_fence_cleared();
+            }
+            cleared
+        }
+
+        fn status(&self) -> crate::config::db_backend::MtlsDnsAdmissionFenceStatus {
+            let mut namespaces = BTreeSet::new();
+            let mut oldest: Option<u64> = None;
+            let mut retained_fences = 0usize;
+            for entry in self.retained.iter() {
+                retained_fences += 1;
+                let _ = namespaces.insert(entry.namespace.clone());
+                if oldest.is_none_or(|since| entry.since_unix_ms < since) {
+                    oldest = Some(entry.since_unix_ms);
+                }
+            }
+            crate::config::db_backend::MtlsDnsAdmissionFenceStatus {
+                retained_fences,
+                namespaces: namespaces.into_iter().collect(),
+                oldest_retained_since_unix_ms: oldest,
+            }
+        }
+    }
+
+    impl Drop for MongoAdmissionFences {
+        fn drop(&mut self) {
+            // The process-wide gauge sums every store's fences; a dropped
+            // store (all clones gone) must not leave its count behind.
+            let remaining = self.retained.len();
+            if remaining > 0 {
+                let registry = crate::plugins::prometheus_metrics::global_registry();
+                for _ in 0..remaining {
+                    registry.record_mtls_dns_admission_fence_cleared();
+                }
+            }
+        }
+    }
+
     struct MongoLockGuard {
         // Collection handle bound to the reusable DEDICATED lease client/pool,
         // deliberately separate from the store's work pool so acquire, renew,
@@ -565,10 +810,11 @@ mod inner {
         // guards own it directly. Multi-step guards transfer it into
         // `MongoStore::persistent_admission_pins` between guarded operations.
         connection_generation_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-        // If an in-flight mutation future is cancelled or errors, Drop moves
-        // the generation pin here instead of releasing it. That keeps this
-        // process from reconnecting around the fail-closed datastore fence.
-        retained_admission_pins: Arc<DashMap<String, MongoAdmissionConnectionPin>>,
+        // If an in-flight mutation future is cancelled or errors, Drop records
+        // an explicit namespace fence here and only then releases its
+        // generation pin (issue #7031). Admission for the namespace keeps
+        // failing closed on every topology while reconnect/failover proceed.
+        admission_fences: Arc<MongoAdmissionFences>,
         // Borrowed guards set this flag if cancellation or an uncertain Mongo
         // error prevents an explicit outcome settlement. The outer owner then
         // refuses release and keeps its datastore fence and generation pin.
@@ -721,9 +967,20 @@ mod inner {
                     && let Some(uncertain) = &self.persistent_outcome_uncertain
                 {
                     uncertain.store(true, Ordering::Release);
+                    // Fence the namespace immediately. The outer persistent
+                    // pin still owns the generation read pin; it is handed off
+                    // to this same fence (and released) when the outer owner
+                    // releases or abandons the guard.
+                    self.admission_fences.retain(
+                        &self.lock_id,
+                        &self.owner,
+                        AdmissionFenceReason::UncertainGuardedOperation,
+                        self._connection.clone(),
+                        None,
+                    );
                     error!(
-                        "Retaining outer MongoDB {} guard {} because a borrowed mutation \
-                         outcome is uncertain",
+                        "Retaining outer MongoDB {} guard {} and fencing its namespace because a \
+                         borrowed mutation outcome is uncertain",
                         self.label,
                         crate::startup::sanitize_startup_scalar(&self.lock_id)
                     );
@@ -731,20 +988,23 @@ mod inner {
                 return;
             }
             if durable_admission_drop_must_retain(self.mode, self.mutation_state) {
-                let retained_key = format!("{}:{}", self.lock_id, self.owner);
-                if let Some(generation_guard) = self.connection_generation_guard.take() {
-                    let _ = self.retained_admission_pins.insert(
-                        retained_key,
-                        MongoAdmissionConnectionPin {
-                            connection: self._connection.clone(),
-                            _generation_guard: generation_guard,
-                        },
-                    );
-                }
+                // Record the explicit namespace fence, then release the
+                // generation pin (inside `retain`, after the fence is
+                // visible) so reconnect/failover are no longer blocked for
+                // the life of the process (issue #7031).
+                self.admission_fences.retain(
+                    &self.lock_id,
+                    &self.owner,
+                    AdmissionFenceReason::UncertainMutation,
+                    self._connection.clone(),
+                    self.connection_generation_guard.take(),
+                );
                 error!(
-                    "Retaining MongoDB {} lock {} and its connection generation because the \
-                     protected mutation outcome is uncertain; verify the write outcome and \
-                     restart this admin process before manually removing the owner-qualified lock",
+                    "Retaining MongoDB {} lock {} and fencing its namespace in this process \
+                     because the protected mutation outcome is uncertain; reconnect and failover \
+                     stay available. Verify the write outcome, then remove the owner-qualified \
+                     lock document; the next admission attempt for the namespace re-verifies \
+                     against the original topology and clears the fence",
                     self.label,
                     crate::startup::sanitize_startup_scalar(&self.lock_id)
                 );
@@ -1145,11 +1405,13 @@ mod inner {
         // token indexes the exact connection bundle and generation pin that
         // every clear/replay batch must borrow until explicit release.
         persistent_admission_pins: Arc<DashMap<String, MongoPersistentAdmissionPin>>,
-        // An uncertain mutation deliberately leaks neither availability nor
-        // safety silently: retain its connection pin for this process's
-        // lifetime, log operator recovery guidance, and leave the durable
-        // owner-qualified fence in MongoDB.
-        retained_admission_pins: Arc<DashMap<String, MongoAdmissionConnectionPin>>,
+        // An uncertain mutation leaves the durable owner-qualified fence in
+        // MongoDB and an explicit per-namespace process-local fence here
+        // (issue #7031). The fence no longer holds a `connection_generation`
+        // read pin, so reconnect/failover proceed while admissions for the
+        // fenced namespace keep failing closed until an exit probe against
+        // the ORIGINAL bundle proves the durable lock was removed.
+        admission_fences: Arc<MongoAdmissionFences>,
         // Settings captured at startup so failover rebuilds use identical
         // ClientOptions for every non-URL field.
         conn_settings: MongoConnSettings,
@@ -1261,7 +1523,7 @@ mod inner {
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
                 topology_epoch: Arc::new(AtomicU64::new(1)),
                 persistent_admission_pins: Arc::new(DashMap::new()),
-                retained_admission_pins: Arc::new(DashMap::new()),
+                admission_fences: Arc::new(MongoAdmissionFences::default()),
                 conn_settings,
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
@@ -1778,10 +2040,12 @@ mod inner {
                 )
             })?;
             // Never swap generations while an admission guard is validating,
-            // mutating, cleaning up, or spanning a restore rollback. In
-            // particular, an uncertain write retains a read pin indefinitely;
-            // reconnect must fail fast rather than wait forever or route later
-            // writes around its fail-closed fence.
+            // mutating, cleaning up, or spanning a restore rollback; reconnect
+            // fails fast rather than waiting. An uncertain write does NOT hold
+            // this pin past its guard (issue #7031): it is retained as an
+            // explicit per-namespace `AdmissionFence` that admission consults
+            // on every topology, so later writes cannot route around the
+            // fail-closed fence and reconnect/failover are not wedged.
             let _generation_guard = self.connection_generation.try_write().map_err(|_| {
                 anyhow::anyhow!(
                     "MongoDB reconnect deferred while an mTLS DNS admission operation pins the current connection generation"
@@ -1907,7 +2171,7 @@ mod inner {
                 admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
                 topology_epoch: Arc::new(AtomicU64::new(1)),
                 persistent_admission_pins: Arc::new(DashMap::new()),
-                retained_admission_pins: Arc::new(DashMap::new()),
+                admission_fences: Arc::new(MongoAdmissionFences::default()),
                 conn_settings: settings,
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
@@ -2739,6 +3003,11 @@ mod inner {
                 .map(str::to_string)
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             let lock_id = lock_id.to_string();
+            // Exit path of a retained fence (issue #7031): re-verify it against
+            // the original topology BEFORE taking the generation read pin, so
+            // a slow probe never defers a reconnect. The authoritative fence
+            // check below runs after the pin is held.
+            self.reverify_admission_fences(&lock_id).await;
             let (connection, connection_generation_guard, persistent_outcome_uncertain) =
                 if guard_owner.is_some() {
                     let persistent_pin =
@@ -2758,6 +3027,7 @@ mod inner {
                             "MongoDB mTLS DNS admission guard retained because a prior protected mutation outcome is uncertain",
                         ));
                     }
+                    self.admission_fences.ensure_unfenced(&lock_id)?;
                     (
                         persistent_pin.pin.connection.clone(),
                         None,
@@ -2765,6 +3035,11 @@ mod inner {
                     )
                 } else {
                     let generation_guard = self.connection_generation.clone().read_owned().await;
+                    // Checked only while the generation read pin is held: a
+                    // fence is recorded before its own generation pin drops,
+                    // so any connection loaded under this pin was published
+                    // after every fence that predates it became visible.
+                    self.admission_fences.ensure_unfenced(&lock_id)?;
                     (self.connection(), Some(generation_guard), None)
                 };
             let collection = connection
@@ -2805,7 +3080,7 @@ mod inner {
                     mutation_state: DurableAdmissionMutationState::NotStarted,
                     delete_on_release: false,
                     connection_generation_guard,
-                    retained_admission_pins: self.retained_admission_pins.clone(),
+                    admission_fences: self.admission_fences.clone(),
                     persistent_outcome_uncertain,
                     _connection: connection,
                 });
@@ -2842,7 +3117,7 @@ mod inner {
                             mutation_state: DurableAdmissionMutationState::NotStarted,
                             delete_on_release: true,
                             connection_generation_guard,
-                            retained_admission_pins: self.retained_admission_pins.clone(),
+                            admission_fences: self.admission_fences.clone(),
                             persistent_outcome_uncertain,
                             _connection: connection,
                         });
@@ -2865,6 +3140,159 @@ mod inner {
                 }
                 tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL).await;
             }
+        }
+
+        /// Convert an uncertain multi-step admission guard into an explicit
+        /// namespace fence: the persistent pin (and with it the connection
+        /// generation read pin) is dropped only after the fence is recorded.
+        /// The durable owner-qualified lock document is left in place. Every
+        /// later borrowed call with this owner fails closed because the
+        /// persistent pin is gone.
+        fn retain_uncertain_persistent_admission_pin(&self, guard_owner: &str) {
+            let Some((_, persistent_pin)) = self.persistent_admission_pins.remove(guard_owner)
+            else {
+                return;
+            };
+            persistent_pin
+                .uncertain_outcome
+                .store(true, Ordering::Release);
+            let MongoPersistentAdmissionPin { namespace, pin, .. } = persistent_pin;
+            let MongoAdmissionConnectionPin {
+                connection,
+                _generation_guard: generation_guard,
+            } = pin;
+            self.admission_fences.retain(
+                &namespace,
+                guard_owner,
+                AdmissionFenceReason::UncertainGuardedOperation,
+                connection,
+                Some(generation_guard),
+            );
+            error!(
+                namespace = %crate::startup::sanitize_startup_scalar(&namespace),
+                "MongoDB mTLS DNS admission guard retained as a namespace fence because a \
+                 protected mutation outcome is uncertain; reconnect and failover stay available, \
+                 admissions for the namespace fail closed until the owner-qualified lock document \
+                 is removed after verifying the write outcome"
+            );
+        }
+
+        /// Exit re-verification for every retained fence on `namespace`.
+        ///
+        /// Each fence is probed ONLY through the exact connection bundle its
+        /// uncertain mutation was dispatched on, with a majority read on the
+        /// primary. A lock document missing from a later failover topology
+        /// says nothing about the original write, so the current connection
+        /// is never consulted. Failure or timeout keeps the fence.
+        async fn reverify_admission_fences(&self, namespace: &str) {
+            for (key, owner, connection) in self.admission_fences.probe_targets(namespace) {
+                let probe =
+                    Self::probe_retained_admission_fence(&connection, namespace, &owner).await;
+                if self.admission_fences.apply_probe(&key, probe) {
+                    info!(
+                        namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                        "MongoDB mTLS DNS admission fence cleared: the owner-qualified lock \
+                         document is absent on the original topology"
+                    );
+                } else {
+                    debug!(
+                        namespace = %crate::startup::sanitize_startup_scalar(namespace),
+                        probe = ?probe,
+                        "MongoDB mTLS DNS admission fence retained after re-verification"
+                    );
+                }
+            }
+        }
+
+        async fn probe_retained_admission_fence(
+            connection: &MongoConnectionBundle,
+            namespace: &str,
+            owner: &str,
+        ) -> AdmissionFenceProbe {
+            let collection = connection
+                .lease_client
+                .database(connection.db.name())
+                .collection::<Document>("mtls_dns_admission_locks");
+            let lookup = async {
+                collection
+                    .find_one(doc! { "_id": namespace, "owner": owner })
+                    .read_concern(ReadConcern::majority())
+                    .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
+                    .await
+            };
+            match tokio::time::timeout(MONGO_ADMISSION_FENCE_REVERIFY_TIMEOUT, lookup).await {
+                Ok(Ok(Some(_))) => AdmissionFenceProbe::DurableFencePresent,
+                Ok(Ok(None)) => AdmissionFenceProbe::DurableFenceAbsent,
+                Ok(Err(_)) | Err(_) => AdmissionFenceProbe::Unverifiable,
+            }
+        }
+
+        /// Explicit fence state for one namespace (no I/O).
+        pub fn mtls_dns_admission_fence(&self, namespace: &str) -> AdmissionFence {
+            self.admission_fences.fence_for(namespace)
+        }
+
+        /// Test seam: retain a fence for `namespace` exactly as an uncertain
+        /// single-call guard's Drop does, handing over a real generation read
+        /// pin so tests can prove the pin is released while the fence stays.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub async fn retain_mtls_dns_admission_fence_for_test(&self, namespace: &str, owner: &str) {
+            let generation_guard = self.connection_generation.clone().read_owned().await;
+            self.admission_fences.retain(
+                namespace,
+                owner,
+                AdmissionFenceReason::UncertainMutation,
+                self.connection(),
+                Some(generation_guard),
+            );
+        }
+
+        /// Test seam: register a live multi-step persistent pin (holding the
+        /// generation read pin) whose borrowed mutation became uncertain.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub async fn insert_uncertain_persistent_admission_pin_for_test(
+            &self,
+            namespace: &str,
+            guard_owner: &str,
+        ) {
+            let generation_guard = self.connection_generation.clone().read_owned().await;
+            let _ = self.persistent_admission_pins.insert(
+                guard_owner.to_string(),
+                MongoPersistentAdmissionPin {
+                    namespace: namespace.to_string(),
+                    pin: MongoAdmissionConnectionPin {
+                        connection: self.connection(),
+                        _generation_guard: generation_guard,
+                    },
+                    uncertain_outcome: Arc::new(AtomicBool::new(true)),
+                },
+            );
+        }
+
+        /// Test seam: the fail-closed fence gate admission runs under its
+        /// generation read pin (no I/O).
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn ensure_mtls_dns_admission_unfenced_for_test(
+            &self,
+            namespace: &str,
+        ) -> Result<(), anyhow::Error> {
+            self.admission_fences.ensure_unfenced(namespace)
+        }
+
+        /// Test seam: apply one exit-probe outcome to every retained fence on
+        /// `namespace` through the production decision. Returns how many
+        /// entries were cleared.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn apply_mtls_dns_admission_fence_probe_for_test(
+            &self,
+            namespace: &str,
+            probe: AdmissionFenceProbe,
+        ) -> usize {
+            self.admission_fences
+                .probe_targets(namespace)
+                .into_iter()
+                .filter(|(key, _, _)| self.admission_fences.apply_probe(key, probe))
+                .count()
         }
 
         async fn acquire_renewable_lease(
@@ -3061,7 +3489,7 @@ mod inner {
                 mutation_state: DurableAdmissionMutationState::NotStarted,
                 delete_on_release: true,
                 connection_generation_guard: None,
-                retained_admission_pins: self.retained_admission_pins.clone(),
+                admission_fences: self.admission_fences.clone(),
                 persistent_outcome_uncertain: None,
                 _connection: connection,
             })
@@ -9877,6 +10305,19 @@ mod inner {
             self.failover_topology.note_admin_write();
         }
 
+        fn mtls_dns_admission_fence_status(
+            &self,
+        ) -> crate::config::db_backend::MtlsDnsAdmissionFenceStatus {
+            self.admission_fences.status()
+        }
+
+        fn retain_uncertain_mtls_dns_admission_guard(&self, namespace: &str, guard_owner: &str) {
+            // The pin's own recorded namespace is fenced even if the caller's
+            // namespace disagreed: fencing is the fail-closed direction.
+            let _ = namespace;
+            self.retain_uncertain_persistent_admission_pin(guard_owner);
+        }
+
         async fn acquire_write_topology_permit(
             &self,
         ) -> crate::config::db_backend::DbWriteTopologyPermit {
@@ -14918,7 +15359,7 @@ mod inner {
             namespace: &str,
             guard_owner: &str,
         ) -> Result<(), anyhow::Error> {
-            let connection = {
+            let (connection, outcome_uncertain) = {
                 let persistent_pin = self.persistent_admission_pins.get(guard_owner).ok_or_else(
                     || {
                         anyhow::anyhow!(
@@ -14933,14 +15374,21 @@ mod inner {
                          {namespace:?}"
                     );
                 }
-                if persistent_pin.uncertain_outcome.load(Ordering::Acquire) {
-                    anyhow::bail!(
-                        "MongoDB mTLS DNS admission guard for namespace {namespace:?} retained \
-                         because a protected mutation outcome is uncertain"
-                    );
-                }
-                persistent_pin.pin.connection.clone()
+                (
+                    persistent_pin.pin.connection.clone(),
+                    persistent_pin.uncertain_outcome.load(Ordering::Acquire),
+                )
             };
+            if outcome_uncertain {
+                // The durable lock stays (no delete), but the generation pin
+                // is handed to the explicit namespace fence instead of being
+                // held for the life of the process (issue #7031).
+                self.retain_uncertain_persistent_admission_pin(guard_owner);
+                anyhow::bail!(
+                    "MongoDB mTLS DNS admission guard for namespace {namespace:?} retained \
+                     because a protected mutation outcome is uncertain"
+                );
+            }
             let result = connection
                 .lease_client
                 .database(connection.db.name())
@@ -19398,7 +19846,7 @@ mod inner {
                 admin_write_topology: std::sync::Arc::new(tokio::sync::RwLock::new(())),
                 topology_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
                 persistent_admission_pins: std::sync::Arc::new(DashMap::new()),
-                retained_admission_pins: std::sync::Arc::new(DashMap::new()),
+                admission_fences: std::sync::Arc::new(MongoAdmissionFences::default()),
                 conn_settings: settings,
                 db_type_str: "mongodb".to_string(),
                 slow_query_threshold_ms: None,
@@ -20342,8 +20790,8 @@ mod inner {
 #[allow(unused_imports)]
 // The binary target has no `_test_support` consumer for these test seams.
 pub use inner::{
-    MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
-    MongoStore,
+    AdmissionFence, AdmissionFenceProbe, AdmissionFenceReason, MongoReconnectTopology,
+    MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks, MongoStore,
 };
 // Narrow crate-internal test seams (exposed only through `_test_support`):
 // timeout-precedence application, identity reservation rollback/release

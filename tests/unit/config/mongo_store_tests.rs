@@ -9,17 +9,23 @@
 //! detection without requiring a live DocumentDB backend.
 
 use ferrum_edge::_test_support::{
-    MongoConfigChangeOp, MongoReconnectTopology, MongoReconnectTransitionTestHooks,
-    decode_mongo_config_change_record, mongo_migration_lease_acquire_filter_classic,
-    mongo_migration_lease_acquire_update_classic, mongo_migration_lease_duration_millis,
-    mongo_migration_lease_renew_update_classic, mongo_mtls_dns_admission_drop_must_retain,
-    mongo_mtls_dns_admission_lock_filter, mongo_mtls_dns_admission_lock_update,
-    mongo_pipeline_update_unsupported, mongo_store_acquire_connection_generation_pin_for_test,
-    mongo_store_new_unconnected_for_test, mongo_store_published_database_name_for_test,
+    MongoAdmissionFence, MongoAdmissionFenceProbe, MongoAdmissionFenceReason, MongoConfigChangeOp,
+    MongoReconnectTopology, MongoReconnectTransitionTestHooks, decode_mongo_config_change_record,
+    mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
+    mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
+    mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
+    mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
+    mongo_store_acquire_connection_generation_pin_for_test,
+    mongo_store_apply_mtls_dns_admission_fence_probe_for_test,
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test,
+    mongo_store_insert_uncertain_persistent_admission_pin_for_test,
+    mongo_store_mtls_dns_admission_fence, mongo_store_new_unconnected_for_test,
+    mongo_store_published_database_name_for_test,
+    mongo_store_retain_mtls_dns_admission_fence_for_test,
     mongo_store_set_reconnect_transition_hooks_for_test,
     mongo_store_try_publish_reconnected_bundle_for_test, mtls_dns_policy_requires_consumer_load,
 };
-use ferrum_edge::config::db_backend::DatabaseBackend;
+use ferrum_edge::config::db_backend::{DatabaseBackend, MtlsDnsAdmissionUnavailable};
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use mongodb::bson::{Bson, Document, doc};
 use serde_json::json;
@@ -1281,6 +1287,281 @@ async fn admission_pin_defers_publish_without_topology_change() {
     assert_eq!(
         mongo_store_published_database_name_for_test(&store),
         "after_admission_pin"
+    );
+}
+
+fn assert_namespace_fenced(store: &ferrum_edge::config::mongo_store::MongoStore, namespace: &str) {
+    let refused = mongo_store_ensure_mtls_dns_admission_unfenced_for_test(store, namespace)
+        .expect_err("a fenced namespace must refuse mTLS DNS admission");
+    assert!(
+        refused
+            .downcast_ref::<MtlsDnsAdmissionUnavailable>()
+            .is_some(),
+        "fence refusal must be the typed fail-closed admission error, got: {refused:#}"
+    );
+}
+
+/// Issue #7031: an uncertain mTLS DNS admission mutation used to keep a
+/// `connection_generation` read pin forever, so every later reconnect and
+/// failover failed fast until restart. The explicit namespace fence must
+/// release that pin (reconnect/failover proceed) while admissions for the
+/// fenced namespace keep failing closed across every published topology.
+#[tokio::test(flavor = "current_thread")]
+async fn retained_admission_fence_does_not_block_reconnect_or_failover() {
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
+
+    match mongo_store_mtls_dns_admission_fence(&store, "ferrum") {
+        MongoAdmissionFence::Retained {
+            reason, retained, ..
+        } => {
+            assert_eq!(reason, MongoAdmissionFenceReason::UncertainMutation);
+            assert_eq!(retained, 1);
+        }
+        MongoAdmissionFence::Clear => panic!("uncertain mutation must retain a namespace fence"),
+    }
+    assert_namespace_fenced(&store, "ferrum");
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test(&store, "other")
+        .expect("other namespaces are not fenced");
+
+    // Failover is no longer wedged by the retained fence.
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "failover_db",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("a retained admission fence must not block failover publication");
+    assert!(!store.failover_topology_status().primary_active);
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "failover_db"
+    );
+    assert_namespace_fenced(&store, "ferrum");
+
+    // Nor is a later primary reconnect.
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "primary_db",
+        MongoReconnectTopology::Primary,
+        "mongodb://primary.example/test",
+    )
+    .await
+    .expect("a retained admission fence must not block primary reconnect");
+    assert!(store.failover_topology_status().primary_active);
+    assert_namespace_fenced(&store, "ferrum");
+
+    // The fence is surfaced for authenticated /health and /metrics.
+    let status = store.mtls_dns_admission_fence_status();
+    assert!(status.fenced());
+    assert_eq!(status.retained_fences, 1);
+    assert_eq!(status.namespaces, vec!["ferrum".to_string()]);
+    assert!(status.oldest_retained_since_unix_ms.is_some());
+    assert!(
+        ferrum_edge::plugins::prometheus_metrics::global_registry()
+            .mtls_dns_admission_fences_retained()
+            >= 1,
+        "the retained-fence gauge must count this fence"
+    );
+}
+
+/// Issue #7031 exit: only a probe of the ORIGINAL connection proving the
+/// owner-qualified durable lock absent clears the fence; a present lock or an
+/// unverifiable probe keeps admissions failing closed.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_fence_exit_requires_proven_absence_of_durable_lock() {
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    mongo_store_retain_mtls_dns_admission_fence_for_test(&store, "ferrum", "uncertain-owner").await;
+
+    for probe in [
+        MongoAdmissionFenceProbe::DurableFencePresent,
+        MongoAdmissionFenceProbe::Unverifiable,
+    ] {
+        assert_eq!(
+            mongo_store_apply_mtls_dns_admission_fence_probe_for_test(&store, "ferrum", probe),
+            0,
+            "{probe:?} must keep the fence"
+        );
+        assert_namespace_fenced(&store, "ferrum");
+    }
+
+    assert_eq!(
+        mongo_store_apply_mtls_dns_admission_fence_probe_for_test(
+            &store,
+            "ferrum",
+            MongoAdmissionFenceProbe::DurableFenceAbsent,
+        ),
+        1,
+        "proven absence of the owner-qualified lock must clear the fence"
+    );
+    assert_eq!(
+        mongo_store_mtls_dns_admission_fence(&store, "ferrum"),
+        MongoAdmissionFence::Clear
+    );
+    mongo_store_ensure_mtls_dns_admission_unfenced_for_test(&store, "ferrum")
+        .expect("a cleared fence admits again");
+    assert!(!store.mtls_dns_admission_fence_status().fenced());
+}
+
+/// A multi-step (restore) guard legitimately pins the generation while it is
+/// active. Once a borrowed mutation is uncertain, release (which refuses) and
+/// the abandon hook must hand the pin to a namespace fence instead of holding
+/// it for the life of the process.
+#[tokio::test(flavor = "current_thread")]
+async fn uncertain_multi_step_guard_converts_generation_pin_into_namespace_fence() {
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+
+    // Release path.
+    mongo_store_insert_uncertain_persistent_admission_pin_for_test(
+        &store,
+        "tenant-a",
+        "restore-owner",
+    )
+    .await;
+    let blocked = mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "blocked",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect_err("an active multi-step guard still pins the generation");
+    assert!(blocked.to_string().contains("admission operation pins"));
+
+    let refused = store
+        .release_mtls_dns_admission_guard("tenant-a", "restore-owner")
+        .await
+        .expect_err("release must refuse an uncertain multi-step guard");
+    assert!(refused.to_string().contains("uncertain"), "got: {refused}");
+    match mongo_store_mtls_dns_admission_fence(&store, "tenant-a") {
+        MongoAdmissionFence::Retained { reason, .. } => {
+            assert_eq!(reason, MongoAdmissionFenceReason::UncertainGuardedOperation);
+        }
+        MongoAdmissionFence::Clear => panic!("refused release must retain a namespace fence"),
+    }
+    assert_namespace_fenced(&store, "tenant-a");
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_release_refusal",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("the converted fence must not keep the generation pinned");
+    store
+        .release_mtls_dns_admission_guard("tenant-a", "restore-owner")
+        .await
+        .expect_err("the converted owner stays unusable (fail closed)");
+    assert_namespace_fenced(&store, "tenant-a");
+
+    // Abandon path (Admin lifecycle Drop with an uncertain outcome).
+    mongo_store_insert_uncertain_persistent_admission_pin_for_test(
+        &store,
+        "tenant-b",
+        "abandoned-owner",
+    )
+    .await;
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "blocked_again",
+        MongoReconnectTopology::Primary,
+        "mongodb://primary.example/test",
+    )
+    .await
+    .expect_err("an active multi-step guard still pins the generation");
+    store.retain_uncertain_mtls_dns_admission_guard("tenant-b", "abandoned-owner");
+    assert_namespace_fenced(&store, "tenant-b");
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_abandon",
+        MongoReconnectTopology::Primary,
+        "mongodb://primary.example/test",
+    )
+    .await
+    .expect("an abandoned uncertain guard must not keep the generation pinned");
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "after_abandon"
+    );
+
+    let status = store.mtls_dns_admission_fence_status();
+    assert_eq!(status.retained_fences, 2);
+    assert_eq!(
+        status.namespaces,
+        vec!["tenant-a".to_string(), "tenant-b".to_string()]
+    );
+}
+
+/// Ordering seams that cannot be exercised without a live MongoDB: the exit
+/// probe runs before the generation pin is taken (never defers reconnect),
+/// the authoritative fence check runs under the pin, the probe reads only the
+/// original bundle with majority read concern, and an uncertain guard Drop
+/// hands its generation pin to the fence rather than retaining it.
+#[test]
+fn admission_fence_is_checked_under_the_generation_pin_and_probes_the_original_bundle() {
+    let acquire = mongo_fn_body("        async fn acquire_durable_admission_lock(");
+    let reverify = acquire
+        .find("self.reverify_admission_fences(&lock_id).await")
+        .expect("admission must attempt the fence exit probe");
+    let pin = acquire
+        .find("self.connection_generation.clone().read_owned().await")
+        .expect("admission takes the generation read pin");
+    let checks: Vec<usize> = acquire
+        .match_indices("self.admission_fences.ensure_unfenced(&lock_id)?")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        2,
+        "both admission branches must check the fence"
+    );
+    assert!(
+        reverify < pin,
+        "the exit probe must run before the generation pin"
+    );
+    assert!(
+        checks.iter().any(|check| *check > pin),
+        "the owned-guard fence check must run while the generation pin is held"
+    );
+
+    let probe = mongo_fn_body("        async fn probe_retained_admission_fence(")
+        .split_once("\n        }\n")
+        .map(|(body, _)| body)
+        .expect("probe body ends at its closing brace");
+    assert!(probe.contains("read_concern(ReadConcern::majority())"));
+    assert!(probe.contains("ReadPreference::Primary"));
+    assert!(
+        !probe.contains("self."),
+        "the exit probe must only use the retained original bundle"
+    );
+
+    let drop_start = MONGO_STORE_SOURCE
+        .find("impl Drop for MongoLockGuard {")
+        .expect("MongoLockGuard Drop");
+    let drop_body = &MONGO_STORE_SOURCE[drop_start..];
+    let drop_body = &drop_body[..drop_body
+        .find("impl MongoConnectionBundle {")
+        .expect("Drop ends before MongoConnectionBundle impl")];
+    let retain = drop_body
+        .find("AdmissionFenceReason::UncertainMutation,")
+        .expect("an uncertain guard Drop must retain a namespace fence");
+    assert!(
+        drop_body[retain..]
+            .split_once(");")
+            .is_some_and(|(call, _)| call.contains("self.connection_generation_guard.take()")),
+        "an uncertain guard Drop must hand its generation pin to the fence"
+    );
+    assert!(
+        !drop_body.contains("retained_admission_pins"),
+        "the never-removed retained generation pins must not return"
+    );
+
+    assert!(
+        ADMIN_SOURCE.contains(
+            ".retain_uncertain_mtls_dns_admission_guard(&self.namespace, &self.guard_owner);"
+        ),
+        "an abandoned uncertain Admin guard must hand off its generation pin"
     );
 }
 

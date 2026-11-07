@@ -447,6 +447,12 @@ Observability endpoints are tiered. Unauthenticated `/health` and `/status` retu
 - Each CP's authenticated `/health` detail shows database connectivity and pool stats — monitor these to detect DB issues
 - Authenticated `/health` also reports `database.failover_topology` and
   `admin_writes_enabled` while on a failover URL (see [admin_api.md](admin_api.md))
+- On MongoDB, an uncertain protected mTLS DNS admission mutation retains a
+  per-namespace admission fence instead of pinning the connection generation,
+  so failover/reconnect stay available; authenticated `/health` reports
+  `database.mtls_dns_admission_fence` and `/metrics` exports
+  `ferrum_database_mtls_dns_admission_fences_retained` (see
+  [mongodb.md](mongodb.md#retained-mtls-dns-admission-fences))
 - Each DP's authenticated `/health` detail shows `cached_config` with `loaded_at` and a `dp_config` object (`cp_authority`, `snapshot_age_seconds`, `stale`) — see [cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age)
 - Authenticated `/overload` detail shows resource pressure — useful for capacity planning
 

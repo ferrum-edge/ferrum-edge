@@ -3352,6 +3352,33 @@ async fn handle_admin_request_inner(
                     }
                 }
             }
+
+            // Process-local mTLS DNS admission fences (issue #7031). Present
+            // only while at least one namespace is fenced; authenticated
+            // detail tier only, like `failover_topology`. Does not change
+            // `status`/`ready`: reconnect/failover stay available and only
+            // the fenced namespaces' mTLS DNS admissions fail closed.
+            let fence = db.mtls_dns_admission_fence_status();
+            if fence.fenced() {
+                let mut fence_info = json!({
+                    "fenced": true,
+                    "retained_fences": fence.retained_fences,
+                    "namespaces": fence.namespaces,
+                });
+                if let Some(since) = fence.oldest_retained_since_unix_ms {
+                    fence_info["oldest_retained_since_unix_ms"] = json!(since);
+                }
+                match health_status.get_mut("database") {
+                    Some(serde_json::Value::Object(map)) => {
+                        map.insert("mtls_dns_admission_fence".to_string(), fence_info);
+                    }
+                    _ => {
+                        health_status["database"] = json!({
+                            "mtls_dns_admission_fence": fence_info
+                        });
+                    }
+                }
+            }
         }
 
         // Acquire pairs with the Release store in each mode's startup path
@@ -6869,6 +6896,11 @@ impl Drop for MtlsDnsAdmissionGuardLifecycle {
                 namespace = %self.namespace,
                 "mTLS DNS admission guard retained because a dispatched mutation has an uncertain outcome"
             );
+            // Keep the durable fence and fail closed for the namespace, but
+            // let the backend drop any process-wide reconnect pin the guard
+            // held (issue #7031): this owner will never call release.
+            self.db
+                .retain_uncertain_mtls_dns_admission_guard(&self.namespace, &self.guard_owner);
             return;
         }
 
