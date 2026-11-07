@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **`ferrum_xds_warming_partial_applies_total` is no longer exported**
+  (#7027). The xDS data plane only builds a mesh slice once every required
+  type (CDS/EDS/LDS/RDS/ECDS) reports the same `version_info`, so a slice is
+  never applied under version skew and the counter could never leave 0.
+  Remove any dashboard panel or alert that queries it. Required-version skew
+  is still visible as a waiting state through `convergence.version_skew` on
+  the JWT-authenticated `GET /mesh/config-drift`.
+
 ### Fixed
 - **HTTP/3 WebSocket handshakes strip the same request headers as H1/H2.**
   The H3 frontend's backend WebSocket handshake kept its own hop-by-hop list
