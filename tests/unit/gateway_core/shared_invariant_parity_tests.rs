@@ -3568,9 +3568,11 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         "crate::proxy::refresh_initial_backend_gateway_assertion_headers(",
     ),
     (
+        // Delegates to the H1/H2 WebSocket strip predicate, whose leading
+        // shared-namespace check is the "H1/H2 WebSocket handshake" site above.
         "H3 WebSocket handshake",
         "src/http3/websocket.rs",
-        "crate::proxy::headers::is_consumer_assertion_header(&lower)",
+        "crate::proxy::is_websocket_backend_strip_header(&lower)",
     ),
     (
         "H3-to-gRPC bridge trusted overlay",
