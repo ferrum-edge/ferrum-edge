@@ -281,7 +281,9 @@ impl VaultClientWrapper {
             .address(parsed_addr.as_str())
             .token(&vault_token);
 
-        // vaultrs must never read a CA file itself: its `VaultClient::new`
+        // vaultrs must never read a CA file itself (its `identity` default
+        // still reads `VAULT_CLIENT_CERT` / `VAULT_CLIENT_KEY`, a tracked
+        // follow-up): its `VaultClient::new`
         // reads every `ca_certs` path with a blocking `std::fs::read`, and an
         // unset list defaults to the ambient `VAULT_CACERT` / `VAULT_CAPATH`.
         // `FERRUM_TLS_CA_BUNDLE_PATH` is the one trust input, read below
@@ -294,11 +296,29 @@ impl VaultClientWrapper {
             .map_err(|e| format!("Failed to build Vault client settings: {}", e))?;
 
         let ca_certs = vault_ca_certs(&settings.address).await?;
-        let mut client = vaultrs::client::VaultClient::new(settings)
+        // `VaultClient::new` is used only for its endpoint middleware (token,
+        // API version, namespace): its own reqwest client is replaced below.
+        // For an `https` address that throwaway client would initialize the
+        // platform verifier with no extra roots, which fails on a host without
+        // system CA certificates even when `FERRUM_TLS_CA_BUNDLE_PATH` supplies
+        // the only trust anchor. Build it over a plaintext-scheme copy of the
+        // address instead (vaultrs then installs an empty `tls_certs_only`
+        // store and loads no roots), and restore the real settings and base URL
+        // before installing the Ferrum transport. No request is ever sent
+        // through the throwaway client.
+        let mut construction_settings = settings.clone();
+        if construction_settings.address.scheme() == "https" {
+            construction_settings
+                .address
+                .set_scheme("http")
+                .map_err(|_| "Failed to create Vault client".to_string())?;
+        }
+        let mut client = vaultrs::client::VaultClient::new(construction_settings)
             .map_err(|e| format!("Failed to create Vault client: {}", e))?;
+        client.http.base = settings.address.as_str().to_string();
+        client.settings = settings;
         // Replace the transport vaultrs built with one that carries the
-        // plaintext policy past the first hop. Endpoint middleware (token,
-        // API version, namespace) and the base address are untouched.
+        // plaintext policy past the first hop and trusts the configured bundle.
         client.http.http = vault_transport(&client.settings, ca_certs, allow_plaintext)?;
 
         Ok(Self { client })

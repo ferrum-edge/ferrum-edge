@@ -24,8 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses the same detached, non-blocking, regular-file, 4 MiB-capped reader as
   Azure Key Vault, client construction is bounded by the fetch timeout, and a
   non-PEM or certificate-free bundle fails closed with a reference-free error.
-  A non-UTF-8 `FERRUM_TLS_CA_BUNDLE_PATH` is now read like Azure's instead
-  of being silently skipped. **Upgrade:** the vaultrs `VAULT_CACERT` / `VAULT_CAPATH` fallbacks
+  Direct Vault lookups read a non-UTF-8 `FERRUM_TLS_CA_BUNDLE_PATH` like
+  Azure's instead of silently skipping it (startup still rejects non-UTF-8
+  `FERRUM_*` values), and construction no longer needs system CA roots when
+  the bundle supplies the trust anchor. **Upgrade:** the vaultrs `VAULT_CACERT` / `VAULT_CAPATH` fallbacks
   are no longer consulted; set `FERRUM_TLS_CA_BUNDLE_PATH` instead.
 - **Istio PeerAuthentication `UNSET` and omitted mTLS modes now inherit
   from the next-higher tier instead of becoming `PERMISSIVE`.** The

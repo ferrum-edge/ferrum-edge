@@ -952,6 +952,7 @@ async fn vault_redirect_limit_matches_reqwest_default() {
     );
 }
 
+#[cfg(unix)]
 /// Run one Vault construction-and-reference check on its own thread and
 /// runtime, so a construction that blocks the calling thread (a plain
 /// `std::fs::read` of a FIFO) fails the test instead of hanging it.
@@ -1063,6 +1064,12 @@ async fn vault_ignores_ambient_vaultrs_ca_fallbacks() {
     let dir = tempfile::tempdir().expect("temp dir");
     let missing = dir.path().join("missing-vault-cacert.pem");
     guard.set("VAULT_CACERT", missing.to_string_lossy());
+    // A directory whose entry is not a certificate: vaultrs would read and
+    // fail to parse it.
+    let capath = dir.path().join("vault-capath");
+    std::fs::create_dir(&capath).expect("create VAULT_CAPATH");
+    std::fs::write(capath.join("not-a-cert.pem"), "not a certificate").expect("write entry");
+    guard.set("VAULT_CAPATH", capath.to_string_lossy());
 
     let err = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
         .await
@@ -1168,5 +1175,76 @@ async fn vault_batch_client_construction_is_bounded_by_the_fetch_timeout() {
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "construction should give up at ~1s, not hang"
+    );
+}
+
+/// With no system CA certificates at all, the configured bundle is still the
+/// whole trust story: client construction must not initialize a platform
+/// verifier that needs system roots, and the https fetch must succeed through
+/// the bundle CA alone. `rustls-native-certs` reads `SSL_CERT_FILE` /
+/// `SSL_CERT_DIR` on Linux, so pointing both at empty locations removes the
+/// system roots for this (nextest-isolated) process.
+#[cfg(all(feature = "secrets-azure", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn vault_https_works_with_only_the_configured_bundle_and_no_system_roots() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let empty_file = dir.path().join("empty-ca-file.pem");
+    std::fs::write(&empty_file, "").expect("write empty CA file");
+    let empty_dir = dir.path().join("empty-ca-dir");
+    std::fs::create_dir(&empty_dir).expect("create empty CA dir");
+    guard.set_other("SSL_CERT_FILE", empty_file.to_string_lossy());
+    guard.set_other("SSL_CERT_DIR", empty_dir.to_string_lossy());
+
+    let fake = AzureKeyVaultFake::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/app"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(kv2_body("bundle-only-value")))
+        .mount(&fake.server)
+        .await;
+    guard.set("VAULT_ADDR", fake.uri());
+    guard.set("VAULT_TOKEN", "root");
+    fake.trust_ca(&guard);
+
+    let resolved = resolve_external_reference("vault", "secret/data/app#field", "FERRUM_TEST")
+        .await
+        .expect("the bundle alone must be enough trust for the Vault transport");
+    assert!(
+        resolved.value == "bundle-only-value",
+        "unexpected resolved value"
+    );
+}
+
+/// Direct provider lookup reads `FERRUM_TLS_CA_BUNDLE_PATH` as an `OsString`,
+/// like Azure, so a non-UTF-8 path is read (here: refused as a directory)
+/// rather than silently skipped. Startup resolution still rejects a non-UTF-8
+/// `FERRUM_*` value before any provider runs; that policy is unchanged.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_direct_lookup_reads_a_non_utf8_ca_bundle_path() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let guard = EnvGuard::new();
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let raw_name = std::ffi::OsStr::from_bytes(b"vault-ca-\xff-dir");
+    let raw_dir = dir.path().join(raw_name);
+    std::fs::create_dir(&raw_dir).expect("create non-UTF-8 directory");
+    // SAFETY: serialized by `#[serial]`.
+    unsafe { std::env::set_var("FERRUM_TLS_CA_BUNDLE_PATH", raw_dir.as_os_str()) };
+
+    let outcome = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST").await;
+    // Remove the non-Unicode value before the guard's `std::env::vars()`
+    // snapshot on drop, which would panic on it.
+    // SAFETY: serialized by `#[serial]`.
+    unsafe { std::env::remove_var("FERRUM_TLS_CA_BUNDLE_PATH") };
+    drop(guard);
+    let err = outcome.err().expect("a directory CA bundle must fail");
+    assert!(
+        err.contains("FERRUM_TLS_CA_BUNDLE_PATH") && err.contains("regular file"),
+        "the non-UTF-8 path must be read, got: {err}"
     );
 }
