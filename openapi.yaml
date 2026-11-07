@@ -10705,10 +10705,13 @@ components:
             `trigger` and of `mesh_route_dispatch` / `waf` / `mesh_authz`
             match rules, `request_termination` `trigger.header_value`, and
             `transaction_debugger` `capture_request_header_value`;
-            `docs/admin_api.md` lists every covered path. Inline PEM private
-            keys in plugin key fields (including the VirtualService L4
-            proxies and upstreams a `mesh_authz` `mesh_slice` embeds) are
-            replaced by `[REDACTED]`; key references stay visible. Mesh
+            `docs/admin_api.md` lists every covered path. TLS material is
+            classified exactly as in Proxy and Upstream reads: inline PEM
+            private keys in plugin key fields, and certificate-plus-key
+            bundles in certificate or CA fields or anywhere else in a plugin
+            config (including the VirtualService L4 proxies and upstreams a
+            `mesh_authz` `mesh_slice` embeds), are replaced by `[REDACTED]`;
+            key references and certificate-only PEM stay visible. Mesh
             `workload_metrics` tracing-provider collector URLs, and the
             collector, JWKS, control-plane, and federation URLs in a
             `mesh_authz` `mesh_slice`, receive the same structural

@@ -24,6 +24,12 @@
 //!    string anywhere in the tree that parses as a URL carrying userinfo has
 //!    that userinfo removed, so `https://user:pass@host/x` can never survive a
 //!    projection even on a path no rule names.
+//! 4. **TLS-material sweep** ([`withhold_tls_material_with`]) — any string
+//!    carrying a PEM private-key block is withheld wherever it occurs, and a
+//!    field named as a private-key source fails closed on any PEM armour or
+//!    control character. This is the same classification the Proxy and
+//!    Upstream projections use, so a certificate-plus-key bundle pasted into
+//!    a certificate field is withheld identically on every resource.
 //!
 //! Because layer 2 runs after layer 1 and only ever replaces a value with the
 //! redaction marker, adding a schema rule can never widen disclosure relative
@@ -113,11 +119,19 @@ pub enum FieldSensitivity {
     /// A TLS private-key source, which accepts inline PEM as well as a
     /// reference (a path, `file://`, `k8s://`, `vault://`, `managed://`, …).
     ///
-    /// Inline key material (anything containing a PEM `-----BEGIN` boundary)
-    /// is replaced by [`REDACTED_PLACEHOLDER`]; a reference only names where
-    /// the gateway loads the key from and stays visible. A non-string fails
-    /// closed.
+    /// Classified by [`tls_material_withheld`] as
+    /// [`TlsMaterialField::PrivateKey`]: inline key material is replaced by
+    /// [`REDACTED_PLACEHOLDER`], while a reference only names where the gateway
+    /// loads the key from and stays visible. A non-string fails closed.
     PrivateKeySource,
+    /// A certificate or CA-bundle source (inline PEM or a reference).
+    ///
+    /// Classified by [`tls_material_withheld`] as
+    /// [`TlsMaterialField::Public`]: certificate-only PEM and references stay
+    /// visible, and a value carrying a PEM private-key block (a
+    /// certificate-plus-key bundle) is replaced by [`REDACTED_PLACEHOLDER`]. A
+    /// non-string fails closed.
+    CertificateSource,
 }
 
 /// One schema-declared sensitive path.
@@ -162,6 +176,13 @@ const fn private_key_source(path: &'static [&'static str]) -> SensitivityRule {
     }
 }
 
+const fn certificate_source(path: &'static [&'static str]) -> SensitivityRule {
+    SensitivityRule {
+        path,
+        sensitivity: FieldSensitivity::CertificateSource,
+    }
+}
+
 /// The `redis_url` rule shared by every Redis-backed plugin.
 const REDIS_BACKED: &[SensitivityRule] = &[redis_url(&["redis_url"])];
 
@@ -185,9 +206,9 @@ const NONE: &[SensitivityRule] = &[];
 /// headers and the check-URL `path_prefix` of an external authorization
 /// provider, two opaque operator-authored payloads (Istio ProxyConfig
 /// `environment` values and ECDS extension `value` bytes), all withheld; the
-/// backend client keys of the embedded VirtualService L4 `Proxy` / `Upstream`
-/// objects, withheld when inline; and collector, JWKS, control-plane, and
-/// federation URLs, projected structurally. Every other slice field is
+/// TLS sources of the embedded VirtualService L4 `Proxy` / `Upstream` objects,
+/// classified by the TLS-material sweep; and collector, JWKS, control-plane,
+/// and federation URLs, projected structurally. Every other slice field is
 /// inventory (workloads, services, hosts, addresses, ports, labels), public
 /// material (trust bundles, inline JWKS), header-name lists, file paths, or
 /// static telemetry tags; DestinationRule and Upstream subset `private_key`,
@@ -303,30 +324,11 @@ const MESH_AUTHZ: &[SensitivityRule] = &[
     secret(&["mesh_slice", "proxy_configs", "*", "environment", "*"]),
     secret(&["mesh_slice", "extension_configs", "*", "value"]),
     // The VirtualService L4 proxies and upstreams are full serialized `Proxy` /
-    // `Upstream` objects; their backend client keys accept inline PEM. (Their
-    // Consul token and subset TLS `private_key` are masked by the name
-    // heuristic, URL userinfo by the structural sweep.)
-    private_key_source(&[
-        "mesh_slice",
-        "virtual_service_l4_proxies",
-        "*",
-        "backend_tls_client_key_path",
-    ]),
-    private_key_source(&[
-        "mesh_slice",
-        "virtual_service_l4_upstreams",
-        "*",
-        "backend_tls_client_key_path",
-    ]),
-    private_key_source(&[
-        "mesh_slice",
-        "virtual_service_l4_upstreams",
-        "*",
-        "port_overrides",
-        "*",
-        "tls",
-        "client_key_path",
-    ]),
+    // `Upstream` objects. Their TLS key, certificate, and CA sources
+    // (`backend_tls_*`, `port_overrides.*.tls.*`, subset `traffic_policy.tls`)
+    // are classified by field name by the TLS-material sweep, exactly as the
+    // standalone Proxy and Upstream projections classify them; their Consul
+    // token is masked by the name heuristic and URL userinfo by the URL sweep.
     // The telemetry tracing-provider envelope is the same `TracingProvider`
     // the `workload_metrics` rules cover; keep the four fields in step with
     // them (a parity test enforces it).
@@ -439,7 +441,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("grpc_method_router", REDIS_BACKED),
     // ---- Authentication ---------------------------------------------------
     ("spiffe_identity", NONE),
-    ("mtls_auth", NONE),
+    (
+        "mtls_auth",
+        // Inline CA certificates; a pasted certificate-plus-key bundle is
+        // withheld.
+        &[certificate_source(&["allowed_issuers", "*", "ca_certificate_pem"])],
+    ),
     (
         "jwks_auth",
         &[
@@ -492,7 +499,14 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ),
     ("basic_auth", NONE),
     ("hmac_auth", NONE),
-    ("soap_ws_security", NONE),
+    (
+        "soap_ws_security",
+        // Trusted certificate sources (inline PEM or references).
+        &[
+            certificate_source(&["x509_signature", "trusted_certs", "*"]),
+            certificate_source(&["saml", "trusted_signing_certs", "*"]),
+        ],
+    ),
     // ---- Authorization ----------------------------------------------------
     ("access_control", NONE),
     ("tcp_connection_throttle", NONE),
@@ -618,14 +632,9 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             secret(&["rules", "*", "match", "headers", "*", "*"]),
             secret(&["rules", "*", "match", "without_headers", "*", "*"]),
             secret(&["rules", "*", "match", "query_params", "*", "*"]),
-            // A route-local backend client key may be inline PEM.
-            private_key_source(&[
-                "rules",
-                "*",
-                "destination",
-                "backend_tls",
-                "client_key_path",
-            ]),
+            // The route-local `destination.backend_tls` key, certificate, and
+            // CA sources are classified by field name by the TLS-material
+            // sweep.
         ],
     ),
     (
@@ -720,8 +729,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ),
     (
         "udp_logging",
-        // The DTLS client key may be inline PEM.
-        &[private_key_source(&["dtls_key_path"])],
+        // The DTLS key, certificate, and CA sources accept inline PEM.
+        &[
+            private_key_source(&["dtls_key_path"]),
+            certificate_source(&["dtls_cert_path"]),
+            certificate_source(&["dtls_ca_cert_path"]),
+        ],
     ),
     (
         "ws_logging",
@@ -898,6 +911,7 @@ pub fn project_plugin_config_with(
     }
     projector.redact_by_name(config);
     projector.strip_url_userinfo(config);
+    projector.withhold_tls_material(config, None);
 }
 
 /// The structural URL-userinfo sweep on its own: every string anywhere in
@@ -911,6 +925,95 @@ pub fn strip_url_userinfo_with(
     rendering: &dyn RedactionRendering,
 ) {
     Projector::new(root_pointer, rendering).strip_url_userinfo(value);
+}
+
+/// How a field name classifies the TLS material source it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TlsMaterialField {
+    /// Names a private key: withheld unless it is plainly a reference.
+    PrivateKey,
+    /// Names a certificate or CA bundle: public unless it carries a PEM
+    /// private-key block.
+    Public,
+}
+
+/// The TLS material slot a field name denotes, for every slot reachable from a
+/// serialized Proxy or Upstream: the top-level `backend_tls_*` fields, a
+/// [`crate::config::types::BackendTlsConfig`] (`port_overrides.<port>.tls`,
+/// a `mesh_route_dispatch` route's `destination.backend_tls`), and a
+/// [`crate::modes::mesh::config::MeshTrafficPolicyTls`]
+/// (`subsets[].traffic_policy.tls`). Matched by name wherever it occurs, so a
+/// slot nested somewhere new is classified without a code change.
+pub fn tls_material_field(name: &str) -> Option<TlsMaterialField> {
+    match name {
+        "backend_tls_client_key_path" | "client_key_path" | "private_key" => {
+            Some(TlsMaterialField::PrivateKey)
+        }
+        "backend_tls_client_cert_path"
+        | "backend_tls_server_ca_cert_path"
+        | "client_cert_path"
+        | "server_ca_cert_path"
+        | "client_certificate"
+        | "ca_certificates" => Some(TlsMaterialField::Public),
+        _ => None,
+    }
+}
+
+/// Whether a stored string is withheld from non-admin reads as TLS private-key
+/// material.
+///
+/// A PEM private-key block is withheld wherever it appears (a cert-plus-key
+/// bundle pasted into a certificate field, say). A private-key field fails
+/// closed further: any PEM armour, or a line break or other control character
+/// (never part of a path or typed URI), is treated as inline material.
+/// Certificates and CA bundles are public and otherwise stay visible. The
+/// exact placeholder at a TLS material field is reported too, so an echoed
+/// write is found.
+pub fn tls_material_withheld(value: &str, field: Option<TlsMaterialField>) -> bool {
+    if crate::plugins::kafka_logging::contains_inline_private_key(value) {
+        return true;
+    }
+    let Some(field) = field else {
+        return false;
+    };
+    if value == REDACTED_PLACEHOLDER {
+        return true;
+    }
+    if field == TlsMaterialField::Public {
+        return false;
+    }
+    let upper = value.to_ascii_uppercase();
+    upper.contains("-----BEGIN") || value.chars().any(char::is_control)
+}
+
+/// Whether a schema-declared TLS source value is withheld; a non-string fails
+/// closed.
+fn tls_source_withheld(value: &Value, field: TlsMaterialField) -> bool {
+    value
+        .as_str()
+        .is_none_or(|raw| tls_material_withheld(raw, Some(field)))
+}
+
+/// Withhold stored TLS private-key material anywhere under `value`.
+///
+/// TLS material fields accept inline PEM as well as references. A reference
+/// (a path, or a `k8s://`, `vault://`, `managed://`, `pkcs11://`, or
+/// `system://` source) names material without disclosing it and stays
+/// visible; a value that is or may be key material (see
+/// [`tls_material_withheld`], with the field classified by
+/// [`tls_material_field`]) is replaced through `rendering` at its exact JSON
+/// pointer. Routing the exact placeholder at a TLS material field through the
+/// renderer too lets an `operator` write that echoes it back be refused (issue
+/// #5925) instead of storing `[REDACTED]` as the source.
+///
+/// The Proxy and Upstream projections run this over their whole body, and the
+/// plugin-config projection runs it as its last layer.
+pub fn withhold_tls_material_with(
+    value: &mut Value,
+    root_pointer: &str,
+    rendering: &dyn RedactionRendering,
+) {
+    Projector::new(root_pointer, rendering).withhold_tls_material(value, None);
 }
 
 /// Trigger leaf predicates whose `value` operands are compared against a field
@@ -1090,14 +1193,18 @@ impl<'r> Projector<'r> {
                 // is replaced wholesale rather than walked.
                 None => json!(REDACTED_PLACEHOLDER),
             },
-            FieldSensitivity::PrivateKeySource => match value.as_str() {
-                // A reference discloses no key material. The exact placeholder
-                // still goes through the renderer so an echoed write is found.
-                Some(raw) if !raw.contains("-----BEGIN") && raw != REDACTED_PLACEHOLDER => {
+            FieldSensitivity::PrivateKeySource => {
+                if !tls_source_withheld(value, TlsMaterialField::PrivateKey) {
                     return;
                 }
-                _ => json!(REDACTED_PLACEHOLDER),
-            },
+                json!(REDACTED_PLACEHOLDER)
+            }
+            FieldSensitivity::CertificateSource => {
+                if !tls_source_withheld(value, TlsMaterialField::Public) {
+                    return;
+                }
+                json!(REDACTED_PLACEHOLDER)
+            }
             FieldSensitivity::RedisUrl => match value.as_str() {
                 Some(raw) => json!(redis_rate_limiter::redact_url_userinfo(raw)),
                 None => json!(REDACTED_PLACEHOLDER),
@@ -1223,6 +1330,35 @@ impl<'r> Projector<'r> {
                 self.apply_sensitivity(operand, FieldSensitivity::Secret);
             }
             self.leave(mark);
+        }
+    }
+
+    /// TLS-material layer; see [`withhold_tls_material_with`]. `field` is the
+    /// classification of the key `value` sits under (array entries inherit
+    /// it).
+    fn withhold_tls_material(&mut self, value: &mut Value, field: Option<TlsMaterialField>) {
+        if let Some(text) = value.as_str() {
+            if tls_material_withheld(text, field) {
+                self.render(value, json!(REDACTED_PLACEHOLDER));
+            }
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    let mark = self.enter(key);
+                    self.withhold_tls_material(child, tls_material_field(key));
+                    self.leave(mark);
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    let mark = self.enter(&index.to_string());
+                    self.withhold_tls_material(item, field);
+                    self.leave(mark);
+                }
+            }
+            _ => {}
         }
     }
 

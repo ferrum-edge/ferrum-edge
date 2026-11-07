@@ -818,6 +818,96 @@ fn inline_private_key_sources_are_projected() {
     assert_no_canaries(&udp, &["pk-inline-canary"]);
 }
 
+/// A certificate or CA source keeps certificate-only PEM and references
+/// visible but withholds a pasted certificate-plus-key bundle, through the same
+/// classification the Proxy and Upstream projections use. A PEM private-key
+/// block is withheld on any other path too, including a custom plugin's.
+#[test]
+fn certificate_plus_key_bundles_are_withheld_in_certificate_sources() {
+    let cert = "-----BEGIN CERTIFICATE-----\ncert-only-visible\n-----END CERTIFICATE-----\n";
+    let key = "-----BEGIN PRIVATE KEY-----\nbundle-key-canary\n-----END PRIVATE KEY-----\n";
+    let bundle = format!("{cert}{key}");
+
+    let route = json!({"rules": [
+        {"match": {"methods": ["GET"]}, "destination": {"backend_tls": {
+            "client_cert_path": bundle,
+            "server_ca_cert_path": cert
+        }}},
+        {"match": {"methods": ["POST"]}, "destination": {"backend_tls": {
+            "client_cert_path": "k8s://shop/tls#tls.crt"
+        }}}
+    ]});
+    let udp = json!({
+        "host": "logs.internal",
+        "dtls": true,
+        "dtls_cert_path": bundle,
+        "dtls_ca_cert_path": cert
+    });
+    let soap = json!({
+        "x509_signature": {"enabled": true, "trusted_certs": [cert, bundle]},
+        "saml": {"enabled": true, "trusted_signing_certs": [bundle]}
+    });
+    let mtls = json!({"allowed_issuers": [{"cn": "Edge CA", "ca_certificate_pem": bundle}]});
+    let custom = json!({"anything": {"nested": [bundle]}});
+    let l4 = json!({"mesh_slice": {"virtual_service_l4_proxies": [{
+        "id": "istio-vs-l4_shop_db",
+        "backend_tls_server_ca_cert_path": bundle,
+        "backend_tls_client_cert_path": cert
+    }]}});
+
+    for (plugin, raw, sites) in [
+        (
+            "mesh_route_dispatch",
+            route,
+            vec!["/config/rules/0/destination/backend_tls/client_cert_path"],
+        ),
+        ("udp_logging", udp, vec!["/config/dtls_cert_path"]),
+        (
+            "soap_ws_security",
+            soap,
+            vec![
+                "/config/saml/trusted_signing_certs/0",
+                "/config/x509_signature/trusted_certs/1",
+            ],
+        ),
+        (
+            "mtls_auth",
+            mtls,
+            vec!["/config/allowed_issuers/0/ca_certificate_pem"],
+        ),
+        ("custom_thing", custom, vec!["/config/anything/nested/0"]),
+        (
+            "mesh_authz",
+            l4,
+            vec!["/config/mesh_slice/virtual_service_l4_proxies/0/backend_tls_server_ca_cert_path"],
+        ),
+    ] {
+        assert!(
+            placeholder_sites(plugin, &raw).is_empty(),
+            "{plugin}: the stored config carries no placeholder"
+        );
+        let projected = project(plugin, raw);
+        for site in &sites {
+            let pointer = site.strip_prefix("/config").expect("config pointer");
+            assert_eq!(
+                projected.pointer(pointer),
+                Some(&json!(REDACTED)),
+                "{plugin}: {projected}"
+            );
+        }
+        assert_no_canaries(&projected, &["bundle-key-canary"]);
+        assert!(
+            projected.to_string().contains("cert-only-visible")
+                || plugin == "mtls_auth"
+                || plugin == "custom_thing",
+            "{plugin}: certificate-only PEM was withheld: {projected}"
+        );
+        let mut found = placeholder_sites(plugin, &projected);
+        found.sort();
+        assert_eq!(found, sites, "{plugin}");
+    }
+}
+
 /// A resource-level plugin `trigger` withholds every header, query and cookie
 /// operand at any depth of the `all` / `any` / `not` tree; names, match kinds,
 /// flags, structure, and non-client predicates stay visible.

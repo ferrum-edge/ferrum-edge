@@ -3299,3 +3299,159 @@ async fn cached_reads_withhold_nested_inline_tls_private_keys() {
     assert_eq!(at(&raw, PORT_KEY), key_pem.as_str());
     assert_eq!(at(&raw, SUBSET_CA), bundle.as_str());
 }
+
+const PLUGIN_TLS_CERT_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nplugin-cert-only-visible\n-----END CERTIFICATE-----\n";
+const PLUGIN_TLS_KEY_PEM: &str =
+    "-----BEGIN PRIVATE KEY-----\nplugin-cert-bundle-key-canary\n-----END PRIVATE KEY-----\n";
+const PLUGIN_TLS_BUNDLE_KEY: &str = "plugin-cert-bundle-key-canary";
+
+fn plugin_tls_bundle_pem() -> String {
+    format!("{PLUGIN_TLS_CERT_PEM}{PLUGIN_TLS_KEY_PEM}")
+}
+
+/// A plugin certificate source that carries a pasted certificate-plus-key
+/// bundle (`udp_logging` `dtls_cert_path`, a `mesh_route_dispatch` route-local
+/// `client_cert_path`) is withheld from viewer and operator reads (single and
+/// list) and the audit diff, exactly as the Proxy and Upstream projections
+/// withhold it. Certificate-only PEM and key references stay visible, admin
+/// reads stay raw, and an operator write that echoes the placeholder is refused
+/// and leaves the stored bundle intact.
+#[tokio::test]
+async fn plugin_tls_certificate_bundles_are_projected_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+    let bundle = plugin_tls_bundle_pem();
+
+    // Disabled configs are stored without plugin construction, so the PEM
+    // blocks need not parse.
+    let cases = [
+        (
+            json!({
+                "id": "tls-bundle-udp",
+                "plugin_name": "udp_logging",
+                "scope": "global",
+                "enabled": false,
+                "config": {
+                    "host": "logs.internal",
+                    "port": 5514,
+                    "dtls": true,
+                    "dtls_cert_path": bundle,
+                    "dtls_key_path": "k8s://ferrum/udp-client#tls.key",
+                    "dtls_ca_cert_path": PLUGIN_TLS_CERT_PEM
+                }
+            }),
+            "/config/dtls_cert_path",
+            "/config/dtls_ca_cert_path",
+            "/config/dtls_key_path",
+        ),
+        (
+            json!({
+                "id": "tls-bundle-route",
+                "plugin_name": "mesh_route_dispatch",
+                "scope": "global",
+                "enabled": false,
+                "config": {"rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {
+                        "backend_host": "db.internal",
+                        "backend_port": 5432,
+                        "backend_tls": {
+                            "client_cert_path": bundle,
+                            "client_key_path": "k8s://ferrum/db-client#tls.key",
+                            "server_ca_cert_path": PLUGIN_TLS_CERT_PEM
+                        }
+                    }
+                }]}
+            }),
+            "/config/rules/0/destination/backend_tls/client_cert_path",
+            "/config/rules/0/destination/backend_tls/server_ca_cert_path",
+            "/config/rules/0/destination/backend_tls/client_key_path",
+        ),
+    ];
+
+    for (plugin, bundle_pointer, cert_pointer, reference_pointer) in &cases {
+        let id = plugin["id"].as_str().expect("case id");
+        let (status, body) = post_json(&base, "/plugins/config", &admin, plugin).await;
+        assert_eq!(status, 201, "{id} create failed: {body:?}");
+
+        let audit_body = wait_for_audit_total(
+            &base,
+            &format!("/audit?resource_type=plugin_config&resource_id={id}"),
+            &admin,
+            1,
+        )
+        .await;
+        let audit_items = audit_body["items"].as_array().expect("audit items");
+        let mut projections = vec![audit_items[0]["diff"]["after"].clone()];
+        let path = format!("/plugins/config/{id}");
+        for bearer in [&viewer, &operator] {
+            let (status, projected) = get_json(&base, &path, bearer).await;
+            assert_eq!(status, 200, "{id} non-admin read failed: {projected:?}");
+            projections.push(projected);
+
+            let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+            assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+            let listed = list["data"]
+                .as_array()
+                .expect("plugin list data")
+                .iter()
+                .find(|item| item["id"] == id)
+                .expect("listed config")
+                .clone();
+            projections.push(listed);
+        }
+        for projection in &projections {
+            assert_eq!(
+                projection.pointer(bundle_pointer),
+                Some(&json!("[REDACTED]")),
+                "{id}: {projection}"
+            );
+            assert_eq!(
+                projection.pointer(cert_pointer),
+                plugin.pointer(cert_pointer),
+                "{id}: {projection}"
+            );
+            assert_eq!(
+                projection.pointer(reference_pointer),
+                plugin.pointer(reference_pointer),
+                "{id}: {projection}"
+            );
+            assert!(
+                !projection.to_string().contains(PLUGIN_TLS_BUNDLE_KEY),
+                "{id} leaked the bundled key: {projection}"
+            );
+        }
+
+        // Admin reads stay raw for read-modify-write.
+        let (status, raw) = get_json(&base, &path, &admin).await;
+        assert_eq!(status, 200, "{id} admin read failed: {raw:?}");
+        assert_eq!(raw.pointer(bundle_pointer), Some(&json!(bundle)), "{id}");
+
+        // An operator write that echoes the masked bundle is refused.
+        let (status, etag, masked) =
+            send_json(reqwest::Method::GET, &base, &path, &operator, None, None).await;
+        assert_eq!(status, 200, "{id} operator read failed: {masked:?}");
+        let etag = etag.expect("plugin config GET carries an ETag");
+        let write_path = format!("{path}?expected_proxy_ids=");
+        let (status, _, refused) = send_json(
+            reqwest::Method::PUT,
+            &base,
+            &write_path,
+            &operator,
+            Some(&etag),
+            Some(&masked),
+        )
+        .await;
+        assert_eq!(status, 400, "{id} echo accepted: {refused:?}");
+        let error = refused["error"].as_str().expect("error message");
+        assert!(error.contains(bundle_pointer), "{id} refusal: {error}");
+        let (_, _, stored) =
+            send_json(reqwest::Method::GET, &base, &path, &admin, None, None).await;
+        assert_eq!(stored.pointer(bundle_pointer), Some(&json!(bundle)));
+    }
+}

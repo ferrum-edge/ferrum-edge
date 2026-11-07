@@ -821,3 +821,36 @@ fn export_fingerprints_inline_backend_tls_private_keys_and_keeps_references() {
         "k8s://ferrum/p8443#tls.key"
     );
 }
+
+/// A certificate-plus-key bundle in a plugin certificate source is
+/// fingerprinted exactly like the Proxy and Upstream TLS fields, while a
+/// certificate-only CA source and a key reference are exported verbatim.
+#[test]
+fn export_fingerprints_plugin_certificate_plus_key_bundles() {
+    let mut config = fixture(KEYAUTH_KEY);
+    let bundle = format!("{INLINE_CLIENT_CERT}{INLINE_CLIENT_KEY}");
+    let udp: ferrum_edge::config::types::PluginConfig = serde_json::from_value(json!({
+        "id": "udp-dtls",
+        "plugin_name": "udp_logging",
+        "scope": "global",
+        "enabled": false,
+        "config": {
+            "host": "logs.internal",
+            "dtls": true,
+            "dtls_cert_path": bundle,
+            "dtls_key_path": "k8s://ferrum/udp-client#tls.key",
+            "dtls_ca_cert_path": INLINE_CLIENT_CERT
+        },
+        "created_at": STAMP,
+        "updated_at": STAMP
+    }))
+    .expect("udp_logging fixture");
+    config.plugin_configs.push(udp);
+
+    let export = export(config, ADMIN_SECRET);
+    let udp = &plugin(&export, "udp-dtls")["config"];
+    assert!(is_fingerprint(&udp["dtls_cert_path"]), "{udp}");
+    assert_eq!(udp["dtls_ca_cert_path"], INLINE_CLIENT_CERT);
+    assert_eq!(udp["dtls_key_path"], "k8s://ferrum/udp-client#tls.key");
+    assert!(!export.to_string().contains(INLINE_CLIENT_KEY_BODY));
+}

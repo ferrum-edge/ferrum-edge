@@ -40,7 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ai_semantic_firewall` `privacy.snippet_hash_salt`
   - inline PEM private keys in `mesh_route_dispatch`
     `rules[].destination.backend_tls.client_key_path` and `udp_logging`
-    `dtls_key_path` (key references stay visible)
+    `dtls_key_path`, and certificate-plus-key bundles pasted into a plugin
+    certificate or CA source (`dtls_cert_path`, `dtls_ca_cert_path`, the
+    route-local `client_cert_path` / `server_ca_cert_path`, `soap_ws_security`
+    trusted certificates, `mtls_auth` `ca_certificate_pem`) or anywhere else in
+    a plugin config. Key references and certificate-only PEM stay visible; the
+    classification is shared with the Proxy and Upstream projections
   - the `header` / `query` / `cookie` operands of every plugin config's
     resource-level `trigger` (a sibling of `config`, previously never
     projected), at any depth of its `all` / `any` / `not` tree
