@@ -1241,6 +1241,137 @@ fn mcp_gateway_per_server_upstream_urls_are_projected() {
     assert_no_canaries(&projected, &["mcp-token-canary"]);
 }
 
+/// `mcp_gateway` `servers.<id>.headers`, `ai_tool_governor` `approval.headers`
+/// and `openapi_validator` `bypass.header_present` accept literal values under
+/// arbitrary header names. Vendor credential names such as
+/// `Ocp-Apim-Subscription-Key` or `x-functions-key` match no name heuristic, so
+/// the schema must withhold every value regardless of its header name.
+#[test]
+fn upstream_and_approval_header_values_are_secret_regardless_of_name() {
+    let mcp = project(
+        "mcp_gateway",
+        json!({
+            "servers": {
+                "github": {
+                    "upstream_url": "https://mcp.example.com/mcp",
+                    "namespace": "gh",
+                    "headers": {
+                        "Ocp-Apim-Subscription-Key": "mcp-apim-canary",
+                        "x-functions-key": "mcp-functions-canary",
+                        "x-honeycomb-team": "mcp-honeycomb-canary"
+                    }
+                }
+            }
+        }),
+    );
+    let headers = &mcp["servers"]["github"]["headers"];
+    for name in [
+        "Ocp-Apim-Subscription-Key",
+        "x-functions-key",
+        "x-honeycomb-team",
+    ] {
+        assert_eq!(headers[name], REDACTED, "mcp_gateway header {name}");
+    }
+    // Header names and routing metadata stay visible.
+    assert_eq!(mcp["servers"]["github"]["namespace"], "gh");
+    assert_no_canaries(
+        &mcp,
+        &[
+            "mcp-apim-canary",
+            "mcp-functions-canary",
+            "mcp-honeycomb-canary",
+        ],
+    );
+
+    let governor = project(
+        "ai_tool_governor",
+        json!({
+            "mode": "enforce",
+            "approval": {
+                "endpoint_url": "https://approvals.example.com",
+                "timeout_ms": 1500,
+                "headers": {
+                    "Ocp-Apim-Subscription-Key": "governor-apim-canary",
+                    "x-tenant": "governor-tenant-canary"
+                }
+            }
+        }),
+    );
+    let headers = &governor["approval"]["headers"];
+    for name in ["Ocp-Apim-Subscription-Key", "x-tenant"] {
+        assert_eq!(headers[name], REDACTED, "ai_tool_governor header {name}");
+    }
+    assert_eq!(governor["approval"]["timeout_ms"], 1500);
+    assert_eq!(governor["mode"], "enforce");
+    assert_no_canaries(
+        &governor,
+        &["governor-apim-canary", "governor-tenant-canary"],
+    );
+
+    let validator = project(
+        "openapi_validator",
+        json!({
+            "bypass": {
+                "paths": ["/health"],
+                "header_present": {"x-skip-validation": "openapi-bypass-secret-canary"}
+            }
+        }),
+    );
+    assert_eq!(
+        validator["bypass"]["header_present"]["x-skip-validation"],
+        REDACTED
+    );
+    assert_eq!(validator["bypass"]["paths"], json!(["/health"]));
+    assert_no_canaries(&validator, &["openapi-bypass-secret-canary"]);
+}
+
+/// An `operator` write that echoes the masked header value back is refused
+/// rather than overwriting the stored credential with the placeholder.
+#[test]
+fn masked_upstream_and_approval_header_values_are_placeholder_sites() {
+    let mcp = project(
+        "mcp_gateway",
+        json!({
+            "servers": {
+                "gh": {
+                    "upstream_url": "https://mcp.example.com",
+                    "namespace": "gh",
+                    "headers": {"x-functions-key": "mcp-functions-canary"}
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        placeholder_sites("mcp_gateway", &mcp),
+        vec!["/config/servers/gh/headers/x-functions-key".to_string()]
+    );
+
+    let governor = project(
+        "ai_tool_governor",
+        json!({
+            "approval": {
+                "endpoint_url": "https://approvals.example.com",
+                "headers": {"x-tenant": "governor-tenant-canary"}
+            }
+        }),
+    );
+    assert_eq!(
+        placeholder_sites("ai_tool_governor", &governor),
+        vec!["/config/approval/headers/x-tenant".to_string()]
+    );
+
+    let validator = project(
+        "openapi_validator",
+        json!({
+            "bypass": {"header_present": {"x-skip": "openapi-bypass-secret-canary"}}
+        }),
+    );
+    assert_eq!(
+        placeholder_sites("openapi_validator", &validator),
+        vec!["/config/bypass/header_present/x-skip".to_string()]
+    );
+}
+
 #[test]
 fn chargeback_clickhouse_endpoint_and_insert_params_are_projected() {
     let projected = project(

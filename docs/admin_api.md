@@ -1741,6 +1741,9 @@ Fields covered by the schema include:
 | `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
 | `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |
 | `mcp_gateway` | `servers.*.upstream_url` | structural URL |
+| `mcp_gateway` | `servers.*.headers.*` | `[REDACTED]` |
+| `ai_tool_governor` | `approval.headers.*` | `[REDACTED]` |
+| `openapi_validator` | `bypass.header_present.*` | `[REDACTED]` (shared secrets that skip validation) |
 | `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
 

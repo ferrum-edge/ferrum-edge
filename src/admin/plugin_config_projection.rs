@@ -292,7 +292,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         &[secret(&["match", "headers", "*"])],
     ),
     ("body_validator", NONE),
-    ("openapi_validator", NONE),
+    (
+        "openapi_validator",
+        // `bypass.header_present` values are shared secrets that skip
+        // validation, exactly like the `waf` exemption above.
+        &[secret(&["bypass", "header_present", "*"])],
+    ),
     (
         "ai_semantic_firewall",
         &[endpoint_url(&["provider", "endpoint"])],
@@ -303,6 +308,10 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         &[
             endpoint_url(&["endpoint_url"]),
             endpoint_url(&["approval", "endpoint_url"]),
+            // Static headers attached to every approval webhook call; the
+            // approval service's credential lives here under an arbitrary
+            // name, so every value is secret, as for `otel_tracing`.
+            secret(&["approval", "headers", "*"]),
         ],
     ),
     (
@@ -319,6 +328,10 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             // stored without construction, so nothing has screened it at all.
             endpoint_url(&["servers", "*", "upstream_url"]),
             endpoint_url(&["upstream_url"]),
+            // Per-server upstream request headers usually carry the hosted MCP
+            // server's credential under a vendor name (`Ocp-Apim-Subscription-Key`,
+            // `x-functions-key`), so every value is secret, as for `otel_tracing`.
+            secret(&["servers", "*", "headers", "*"]),
         ],
     ),
     ("a2a_gateway", NONE),

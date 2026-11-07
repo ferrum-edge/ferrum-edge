@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Non-admin plugin-config reads withhold `mcp_gateway`, `ai_tool_governor`
+  and `openapi_validator` header values.** `viewer` and `operator` reads of
+  plugin configs (`GET /plugins/config`, `GET /plugins/config/{id}`,
+  `GET /config/export`) returned `mcp_gateway` `servers.*.headers`,
+  `ai_tool_governor` `approval.headers` and `openapi_validator`
+  `bypass.header_present` values verbatim whenever the header name matched no
+  sensitive-name pattern (for example `Ocp-Apim-Subscription-Key` or
+  `x-honeycomb-team`). Every value of those maps is now withheld
+  (`[REDACTED]`, or a keyed fingerprint in the export) whatever the header
+  name; header names stay visible. An
+  `operator` write that echoes the placeholder back at one of these fields is
+  refused with `400`. `admin` reads and `GET /backup` stay raw.
 - **HTTP/3 WebSocket handshakes strip the same request headers as H1/H2.**
   The H3 frontend's backend WebSocket handshake kept its own hop-by-hop list
   and forwarded a client's `Content-Length` and `Expect` and the internal
