@@ -11,6 +11,8 @@
 mod aws;
 #[cfg(feature = "secrets-azure")]
 mod azure;
+#[cfg(any(feature = "secrets-azure", feature = "secrets-vault"))]
+mod ca_bundle;
 pub mod credential_file;
 pub mod env;
 pub mod file;
@@ -1293,7 +1295,7 @@ impl RedactionPlan {
 // carries `from_static_token()` for that injection.
 #[cfg(feature = "secrets-azure")]
 #[doc(hidden)]
-pub use azure::hold_ca_bundle_reader_permit_for_test as azure_hold_ca_bundle_reader_permit_for_test;
+pub use ca_bundle::hold_ca_bundle_reader_permit_for_test as azure_hold_ca_bundle_reader_permit_for_test;
 #[cfg(feature = "secrets-azure")]
 pub use azure::{
     AzureCredentials, AzureSecret, apply_tls_version_option as azure_apply_tls_version_option,

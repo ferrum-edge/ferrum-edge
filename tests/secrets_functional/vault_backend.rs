@@ -949,3 +949,122 @@ async fn vault_redirect_limit_matches_reqwest_default() {
         "an eleventh redirect must be refused"
     );
 }
+
+/// Run one Vault construction-and-reference check on its own thread and
+/// runtime, so a construction that blocks the calling thread (a plain
+/// `std::fs::read` of a FIFO) fails the test instead of hanging it.
+fn vault_reference_outcome_off_thread(timeout: Duration) -> Option<Result<String, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = runtime.block_on(resolve_external_reference(
+            "vault",
+            "invalid-reference",
+            "FERRUM_TEST",
+        ));
+        let _ = tx.send(outcome);
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
+/// `FERRUM_TLS_CA_BUNDLE_PATH` goes through the same hardened reader Azure
+/// uses (#6603): a FIFO without a writer must be refused at once rather than
+/// block the startup secret-resolution runtime on `open(2)`/`read(2)`, where
+/// no fetch timeout can fire.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn vault_fifo_ca_bundle_is_refused_without_blocking() {
+    let guard = EnvGuard::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let fifo = dir.path().join("vault-ca-fifo-sentinel");
+    let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("fifo path");
+    // SAFETY: `c_path` is a valid NUL-terminated path for the call's duration.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed");
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "fifo-token-sentinel");
+    guard.set("FERRUM_TLS_CA_BUNDLE_PATH", fifo.to_string_lossy());
+
+    let outcome = vault_reference_outcome_off_thread(Duration::from_secs(5));
+    if outcome.is_none() {
+        // Release a reader blocked in `open(2)` before failing.
+        let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    }
+    let err = outcome
+        .expect("a FIFO CA bundle must not block Vault client construction")
+        .err()
+        .expect("a FIFO CA bundle must fail");
+    assert!(
+        err.contains("FERRUM_TLS_CA_BUNDLE_PATH")
+            && err.contains("regular file")
+            && !err.contains("vault-ca-fifo-sentinel")
+            && !err.contains("fifo-token-sentinel"),
+        "expected a reference-free regular-file error, got: {err}"
+    );
+}
+
+/// The Vault CA bundle is capped and type-checked like Azure's, and its
+/// diagnostics name the variable and failure class, never the path.
+#[tokio::test]
+#[serial]
+async fn vault_invalid_ca_bundle_is_refused_with_a_reference_free_error() {
+    let guard = EnvGuard::new();
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    let not_pem = dir.path().join("vault-not-pem-sentinel.pem");
+    std::fs::write(&not_pem, "this is not a certificate").expect("write bundle");
+    let oversized = dir.path().join("vault-oversized-ca-sentinel.pem");
+    std::fs::File::create(&oversized)
+        .expect("create oversized bundle")
+        .set_len(5 * 1024 * 1024)
+        .expect("size oversized bundle");
+    let directory = dir.path().join("vault-ca-directory-sentinel");
+    std::fs::create_dir(&directory).expect("create directory");
+
+    for (source, expected, sentinel) in [
+        (&not_pem, "no certificates", "vault-not-pem-sentinel"),
+        (&oversized, "limit", "vault-oversized-ca-sentinel"),
+        (&directory, "regular file", "vault-ca-directory-sentinel"),
+    ] {
+        guard.set("FERRUM_TLS_CA_BUNDLE_PATH", source.to_string_lossy());
+        let err = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+            .await
+            .err()
+            .expect("an invalid CA bundle must fail");
+        assert!(
+            err.contains("FERRUM_TLS_CA_BUNDLE_PATH")
+                && err.contains(expected)
+                && !err.contains(sentinel),
+            "expected a reference-free `{expected}` error, got: {err}"
+        );
+    }
+}
+
+/// vaultrs falls back to `VAULT_CACERT` / `VAULT_CAPATH` (read with a blocking
+/// `std::fs::read`) when it is handed no CA list. Ferrum's trust input is
+/// `FERRUM_TLS_CA_BUNDLE_PATH` alone, so the ambient fallbacks are never read.
+#[tokio::test]
+#[serial]
+async fn vault_ignores_ambient_vaultrs_ca_fallbacks() {
+    let guard = EnvGuard::new();
+    guard.set("VAULT_ADDR", "https://127.0.0.1:8200");
+    guard.set("VAULT_TOKEN", "root");
+    let dir = tempfile::tempdir().expect("temp dir");
+    let missing = dir.path().join("missing-vault-cacert.pem");
+    guard.set("VAULT_CACERT", missing.to_string_lossy());
+
+    let err = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
+        .await
+        .err()
+        .expect("the reference is invalid");
+    assert!(
+        err.contains("Invalid Vault KV v2 reference"),
+        "construction must succeed without reading VAULT_CACERT, got: {err}"
+    );
+}

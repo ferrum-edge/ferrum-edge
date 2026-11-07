@@ -151,6 +151,7 @@ fn warn_plaintext_opt_in() {
 ///   included, to a remote proxy in plaintext.
 fn vault_transport(
     settings: &vaultrs::client::VaultClientSettings,
+    ca_certs: Vec<reqwest::Certificate>,
     allow_plaintext: bool,
 ) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::ClientBuilder::new().tls_backend_rustls();
@@ -160,14 +161,8 @@ fn vault_transport(
     builder = builder.tls_danger_accept_invalid_certs(!settings.verify);
     if settings.address.scheme() == "http" {
         builder = builder.tls_certs_only(Vec::new());
-    } else {
-        for path in &settings.ca_certs {
-            let pem = std::fs::read(path)
-                .map_err(|e| format!("Failed to read the Vault CA certificate bundle: {e}"))?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem)
-                .map_err(|e| format!("Failed to parse the Vault CA certificate bundle: {e}"))?;
-            builder = builder.tls_certs_merge(certs);
-        }
+    } else if !ca_certs.is_empty() {
+        builder = builder.tls_certs_merge(ca_certs);
     }
     if let Some(identity) = &settings.identity {
         builder = builder.identity(identity.clone());
@@ -219,6 +214,39 @@ fn vault_transport(
         .map_err(|e| format!("Failed to create Vault client: {e}"))
 }
 
+/// Diagnostic label for this provider's `FERRUM_TLS_CA_BUNDLE_PATH` reads.
+const VAULT_CA_BUNDLE_LABEL: &str = "Vault TLS";
+
+/// Extra trust roots for an `https` Vault transport from
+/// `FERRUM_TLS_CA_BUNDLE_PATH`, merged with the platform roots.
+///
+/// Unset or empty: none. A plaintext `http` address uses no TLS, so the bundle
+/// is not read at all. Otherwise it is read through the shared detached,
+/// non-blocking, regular-file, size-capped reader, so a FIFO or a stalled
+/// mount cannot block the startup secret-resolution runtime, and a bundle that
+/// is not PEM or carries no certificate fails closed. Errors name the variable
+/// and the failure class, never the path or the bytes.
+async fn vault_ca_certs(address: &url::Url) -> Result<Vec<reqwest::Certificate>, String> {
+    use super::ca_bundle::CA_BUNDLE_PATH_ENV;
+
+    if address.scheme() == "http" {
+        return Ok(Vec::new());
+    }
+    let Some(path) = env::var_os(CA_BUNDLE_PATH_ENV).filter(|path| !path.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let pem = super::ca_bundle::read_ca_bundle_detached(path, VAULT_CA_BUNDLE_LABEL).await?;
+    let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|_| {
+        format!("{CA_BUNDLE_PATH_ENV} is not a valid PEM CA bundle ({VAULT_CA_BUNDLE_LABEL})")
+    })?;
+    if certs.is_empty() {
+        return Err(format!(
+            "{CA_BUNDLE_PATH_ENV} contains no certificates ({VAULT_CA_BUNDLE_LABEL})"
+        ));
+    }
+    Ok(certs)
+}
+
 /// Reusable Vault client for batch secret resolution.
 /// Created once and shared across multiple Vault secret fetches.
 pub struct VaultClientWrapper {
@@ -227,7 +255,11 @@ pub struct VaultClientWrapper {
 
 impl VaultClientWrapper {
     /// Create a new Vault client from standard env vars (`VAULT_ADDR`, `VAULT_TOKEN`).
-    pub fn new() -> Result<Self, String> {
+    ///
+    /// Async because `FERRUM_TLS_CA_BUNDLE_PATH` is read through the shared
+    /// detached, non-blocking, size-capped reader; callers bound it with the
+    /// secret fetch timeout.
+    pub async fn new() -> Result<Self, String> {
         let vault_addr = env::var("VAULT_ADDR")
             .map_err(|_| "VAULT_ADDR must be set to resolve secrets from Vault".to_string())?;
         let vault_token = env::var("VAULT_TOKEN")
@@ -249,22 +281,25 @@ impl VaultClientWrapper {
             .address(parsed_addr.as_str())
             .token(&vault_token);
 
-        if let Ok(ca_path) = env::var("FERRUM_TLS_CA_BUNDLE_PATH")
-            && !ca_path.is_empty()
-        {
-            settings_builder.ca_certs(vec![ca_path]);
-        }
+        // vaultrs must never read a CA file itself: its `VaultClient::new`
+        // reads every `ca_certs` path with a blocking `std::fs::read`, and an
+        // unset list defaults to the ambient `VAULT_CACERT` / `VAULT_CAPATH`.
+        // `FERRUM_TLS_CA_BUNDLE_PATH` is the one trust input, read below
+        // through the hardened shared reader and installed on the replacement
+        // transport.
+        settings_builder.ca_certs(Vec::new());
 
         let settings = settings_builder
             .build()
             .map_err(|e| format!("Failed to build Vault client settings: {}", e))?;
 
+        let ca_certs = vault_ca_certs(&settings.address).await?;
         let mut client = vaultrs::client::VaultClient::new(settings)
             .map_err(|e| format!("Failed to create Vault client: {}", e))?;
         // Replace the transport vaultrs built with one that carries the
         // plaintext policy past the first hop. Endpoint middleware (token,
         // API version, namespace) and the base address are untouched.
-        client.http.http = vault_transport(&client.settings, allow_plaintext)?;
+        client.http.http = vault_transport(&client.settings, ca_certs, allow_plaintext)?;
 
         Ok(Self { client })
     }
@@ -278,7 +313,7 @@ impl VaultClientWrapper {
 /// Fetch a single secret from Vault (creates a new client).
 /// For batch resolution, use `VaultClientWrapper`.
 pub async fn fetch_secret(reference: &str, key: &str) -> Result<String, String> {
-    let wrapper = VaultClientWrapper::new()?;
+    let wrapper = VaultClientWrapper::new().await?;
     wrapper.fetch_secret(reference, key).await
 }
 
