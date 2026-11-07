@@ -1581,11 +1581,7 @@ impl AiFederation {
 
             let google_project_id = optional_str(pv, "google_project_id")?.map(String::from);
             let google_region = optional_str(pv, "google_region")?.map(String::from);
-            let aws_region = config_or_env_str(
-                pv,
-                "aws_region",
-                Some(&["AWS_DEFAULT_REGION", "AWS_REGION"]),
-            );
+            let aws_region = config_or_env_str(pv, "aws_region", Some(AWS_REGION_ENV));
 
             // Validate provider-specific required fields
             validate_provider_config(provider_type, &name, pv)?;
@@ -2135,14 +2131,9 @@ fn build_auth(
         }
 
         ProviderType::AwsBedrock => {
-            let region = config_or_env_str(
-                config,
-                "aws_region",
-                Some(&["AWS_DEFAULT_REGION", "AWS_REGION"]),
-            )
-            .ok_or(format!(
-                "ai_federation: provider {name:?} missing `aws_region`"
-            ))?;
+            let region = config_or_env_str(config, "aws_region", Some(AWS_REGION_ENV)).ok_or(
+                format!("ai_federation: provider {name:?} missing `aws_region`"),
+            )?;
             let mut sources = AwsCredentialSources {
                 access_key_id_from_env: !config_str_present(config, "aws_access_key_id"),
                 secret_access_key_from_env: !config_str_present(config, "aws_secret_access_key"),
@@ -2203,7 +2194,13 @@ fn build_auth(
 /// `aws_bedrock` key pair also resolved from the environment.
 const AWS_SESSION_TOKEN_ENV: &[&str] = &["AWS_SESSION_TOKEN"];
 
+/// Environment fallback for `aws_region`. Shared by the constructor and
+/// [`stream_route_plan`] so both resolve the field identically.
+const AWS_REGION_ENV: &[&str] = &["AWS_DEFAULT_REGION", "AWS_REGION"];
+
 /// Read a string value from config, falling back to environment variables.
+///
+/// An empty string counts as absent, both in config and in the environment.
 fn config_or_env_str(config: &Value, field: &str, env_vars: Option<&[&str]>) -> Option<String> {
     if let Some(s) = config.get(field).and_then(|v| v.as_str())
         && !s.is_empty()
@@ -7105,6 +7102,14 @@ fn stream_target_for(
 /// (issue #3298), so that policy's reload compatibility needs every provider
 /// destination a stream could commit. Buffered federation makes its own
 /// plugin-client call outside proxy dispatch and contributes nothing.
+///
+/// The plan is the configured route definition only. Health-driven movement is
+/// deliberately outside it: a provider `circuit_breaker` (its presence or its
+/// thresholds) and `fallback_on_status_codes` decide at request time whether a
+/// stream skips to the next provider, but every provider that could take the
+/// stream is already a destination here, so that movement never reaches an
+/// untracked key and adding, editing, or removing a breaker keeps the learned
+/// limits (issue #7018).
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct StreamRoutePlan {
     pub(crate) fallback_enabled: bool,
@@ -7135,6 +7140,14 @@ pub(crate) struct StreamRouteDestination {
     pub(crate) port: u16,
 }
 
+/// Whether an `ai_federation` config enables `streaming`, the only mode in
+/// which it writes `route_override_*`. Exactly the condition under which
+/// [`stream_route_plan`] returns a plan, without resolving any provider, so a
+/// caller can gate on it before paying for the plan.
+pub(crate) fn streaming_enabled(config: &Value) -> bool {
+    parse_streaming_policy(config).is_ok_and(|policy| policy.enabled)
+}
+
 /// Resolve the streaming routing plan of an `ai_federation` config, or `None`
 /// when `streaming` is not enabled and the plugin never writes a route
 /// override.
@@ -7145,7 +7158,7 @@ pub(crate) struct StreamRouteDestination {
 /// fields resolve to no destination rather than an error because the
 /// constructor rejects the same config before it can publish.
 pub(crate) fn stream_route_plan(config: &Value) -> Option<StreamRoutePlan> {
-    if !parse_streaming_policy(config).is_ok_and(|policy| policy.enabled) {
+    if !streaming_enabled(config) {
         return None;
     }
     let flag = |field: &'static str| optional_bool(config, field).ok().flatten();
@@ -7201,6 +7214,11 @@ fn stream_route_destination(provider: &Value) -> Option<StreamRouteDestination> 
         return None;
     }
     let field = |name: &'static str| optional_str(provider, name).ok().flatten();
+    // `aws_region` resolves exactly as the constructor resolves it: an empty
+    // string is absent and the AWS region environment variables fill it.
+    // Reading the raw field would fail `validate_dns_label` on `""` and hide a
+    // destination the constructor accepts and dials (issue #7018).
+    let aws_region = config_or_env_str(provider, "aws_region", Some(AWS_REGION_ENV));
     let template = build_url_template(
         provider_type,
         field("base_url"),
@@ -7209,7 +7227,7 @@ fn stream_route_destination(provider: &Value) -> Option<StreamRouteDestination> 
         field("azure_api_version").unwrap_or(DEFAULT_AZURE_API_VERSION),
         field("google_region"),
         field("google_project_id"),
-        field("aws_region"),
+        aws_region.as_deref(),
     )
     .ok()?;
     // Every eligible provider renders a model-independent endpoint; a

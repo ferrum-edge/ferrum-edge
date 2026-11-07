@@ -68,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published. The fence is never cleared by a failback. Status fields are still
   read separately, so `/status` can briefly show a mixed view while a
   transition is in progress, but that view no longer persists after an error.
+- **Streaming `ai_federation` providers with an empty `aws_region` are
+  adaptive route keys** (#7018). The constructor treats `"aws_region": ""` as
+  absent, so an OpenAI-compatible provider carrying it streams to its
+  `base_url` host, but the route plan read the raw value, failed region
+  validation, and left that provider without a destination. A later move of
+  its host then kept the `adaptive_concurrency` policy's learned limits and
+  admitted the new destination untracked. The plan now resolves the field
+  exactly as the constructor does. Each plugin-cache build also resolves a
+  federation config's plan once, shared by every adaptive policy and reload
+  pass, instead of once per protected proxy, policy, and pass, and only for
+  configs with `streaming.enabled` that are effective on a protected proxy.
 - **Mesh pool growth backoff is measured from the failure.** A failed HBONE or Sidecar mesh-mTLS growth dial now backs its destination off for 10 s from when it fails rather than from when it started, so a dial that ran its full connect timeout still backs off for 10 s instead of being retried at once.
 - **CNI STATUS fails while durable CNI ownership refuses claims** (#7024).
   Any load error for the node-agent's durable CNI ownership file used to latch
