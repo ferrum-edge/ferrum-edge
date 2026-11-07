@@ -12075,6 +12075,25 @@ pub trait Plugin: Any + Send + Sync {
         PluginResult::Continue
     }
 
+    /// Remove client-supplied copies of the request headers this instance owns
+    /// as gateway assertions, without installing anything.
+    ///
+    /// The per-instance execution-trigger wrapper calls this in place of
+    /// [`Plugin::before_proxy`] when the instance's trigger skips the request.
+    /// It is deliberately outside the trigger boundary, like credential-redaction
+    /// discovery: a skipped instance installs no assertion, but a header it
+    /// documents as always sanitized must still never reach the backend carrying
+    /// a client-chosen value. Implementations must strip exactly what
+    /// `before_proxy` strips unconditionally, must not undo a value a sibling
+    /// instance already installed, must be synchronous and allocation-light, and
+    /// must never log header values. The default owns nothing.
+    fn sanitize_owned_request_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &mut HashMap<String, String>,
+    ) {
+    }
+
     /// Returns `true` when `before_proxy` can dispatch external work or
     /// synthesize a terminal response and therefore must wait until an active
     /// backend-path policy has authorized the resolved route and target path.

@@ -1157,6 +1157,53 @@ async fn test_default_config_forwards_nothing() {
     assert!(!headers.contains_key(FORWARDED));
 }
 
+/// The trigger-skip sanitizer strips every client spelling and every value
+/// other than the request's admitted identity, keeps the canonical header an
+/// admitted sibling instance installed, and owns nothing without
+/// `forward_identity`.
+#[test]
+fn test_skip_sanitizer_strips_client_copies_but_keeps_the_admitted_identity() {
+    let plugin = SpiffeIdentity::new(&json!({"forward_identity": true})).unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    let forged = || {
+        HashMap::from([
+            (
+                FORWARDED.to_string(),
+                "spiffe://attacker.example/ns/forged/sa/x".to_string(),
+            ),
+            (
+                "X_Ferrum_Peer_Spiffe_Id".to_string(),
+                LIFETIME_SVID.to_string(),
+            ),
+            ("accept".to_string(), "*/*".to_string()),
+        ])
+    };
+
+    let mut headers = forged();
+    plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
+    assert_eq!(headers.len(), 1, "no admitted identity: {headers:?}");
+    assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
+
+    ctx.peer_spiffe_id = Some(SpiffeId::new(LIFETIME_SVID).unwrap());
+    let mut headers = forged();
+    plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
+    assert!(!headers.contains_key(FORWARDED), "a forged value is stripped");
+    assert!(!headers.contains_key("X_Ferrum_Peer_Spiffe_Id"));
+
+    let mut headers = HashMap::from([(FORWARDED.to_string(), LIFETIME_SVID.to_string())]);
+    plugin.sanitize_owned_request_headers(&mut ctx, &mut headers);
+    assert_eq!(
+        headers.get(FORWARDED).map(String::as_str),
+        Some(LIFETIME_SVID),
+        "an admitted sibling's installed identity is not undone"
+    );
+
+    let passive = SpiffeIdentity::new(&json!({})).unwrap();
+    let mut headers = forged();
+    passive.sanitize_owned_request_headers(&mut ctx, &mut headers);
+    assert_eq!(headers, forged(), "without forward_identity nothing is owned");
+}
+
 #[test]
 fn test_forward_identity_must_be_a_boolean() {
     for invalid in [json!("x-spiffe-id"), json!(1), json!(null), json!([])] {

@@ -85,6 +85,12 @@ use async_trait::async_trait;
 /// no-contribution answer in the proxy's `all(...)` fold: a skipped instance may
 /// neither need the body retained nor pin the response to the buffered path.
 ///
+/// Fail-safe work is NOT suppressed: credential-redaction discovery, and the
+/// removal of client copies of request headers the instance owns as gateway
+/// assertions (`sanitize_owned_request_headers`, run where `before_proxy` would
+/// have been). A trigger may only remove work, never add disclosure or let a
+/// client forge a gateway assertion.
+///
 /// Static chain-shape declarations (`supported_protocols`,
 /// `requires_*_body_buffering`, `modifies_request_*`) are deliberately NOT
 /// gated: they describe the published generation, not one request, and gating
@@ -1754,9 +1760,24 @@ impl Plugin for PluginInstanceWrapper {
         headers: &mut std::collections::HashMap<String, String>,
     ) -> PluginResult {
         if !self.runs(ctx, TriggerPhase::PostAuth) {
+            // A skipped instance installs nothing, but it still owns the
+            // headers it documents as always sanitized (`claim_headers`
+            // destinations, `x-ferrum-peer-spiffe-id`). Leaving their client
+            // copies would let a trigger forward a client-chosen value the
+            // backend reads as a gateway assertion; like credential-redaction
+            // discovery, this fail-safe work is never gated.
+            self.inner.sanitize_owned_request_headers(ctx, headers);
             return PluginResult::Continue;
         }
         self.inner.before_proxy(ctx, headers).await
+    }
+    /// Deliberately UNGATED: see `before_proxy` above, its only caller.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner.sanitize_owned_request_headers(ctx, headers);
     }
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
         self.inner.defer_before_proxy_until_backend_path_resolved()

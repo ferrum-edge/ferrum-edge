@@ -16085,3 +16085,182 @@ async fn unrouted_correlation_policies_are_global_ordered_and_rebuilt() {
     cache.rebuild(&without_globals).unwrap();
     assert!(cache.unrouted_correlation_plugins().is_empty());
 }
+
+// ── Trigger-skipped owners still sanitize gateway-owned request headers ─────
+
+/// Run one published chain the way the dispatchers do (`on_request_received`
+/// takes the trigger decision, `before_proxy` reuses it) and return the
+/// backend-bound header map.
+async fn backend_headers_after_before_proxy(
+    cache: &PluginCache,
+    ctx: &mut RequestContext,
+    mut headers: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let plugins = cache.get_plugins("ferrum", "p1");
+    for plugin in plugins.iter() {
+        plugin.on_request_received(ctx).await;
+    }
+    for plugin in plugins.iter() {
+        assert!(matches!(
+            plugin.before_proxy(ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    headers
+}
+
+/// `None`: no trigger. `Some(method)`: a trigger selecting only `POST`, driven
+/// by a request with `method`, so `GET` is the skipped request.
+const OWNED_HEADER_TRIGGER_CASES: [Option<&str>; 3] = [None, Some("POST"), Some("GET")];
+
+fn post_only_trigger() -> PluginTrigger {
+    serde_json::from_value(json!({"when": {"match": {"method": ["POST"]}}})).unwrap()
+}
+
+/// Regression: a `jwks_auth` / `oauth2_introspection` / `oidc_relying_party`
+/// instance whose execution trigger skips a request must still remove the
+/// client copies of the `claim_headers` destinations it owns. Those headers are
+/// documented as gateway-owned and always sanitized, so a client that misses
+/// the trigger (for example a sibling `key_auth` consumer) must not be able to
+/// forward a forged `X-User-Email` to the backend. Before the fix the wrapper
+/// returned from `before_proxy` without running the only sanitizer.
+#[tokio::test]
+async fn trigger_skipped_claim_owning_auth_instance_still_strips_owned_destinations() {
+    for plugin_name in ["jwks_auth", "oauth2_introspection", "oidc_relying_party"] {
+        for case in OWNED_HEADER_TRIGGER_CASES {
+            let mut config = minimal_plugin_config(plugin_name);
+            config["providers"][0]["claim_headers"] = json!({"email": "X-User-Email"});
+            let mut auth = make_plugin_config_with_json(
+                "auth",
+                plugin_name,
+                config,
+                PluginScope::Proxy,
+                Some("p1"),
+            );
+            auth.trigger = case.map(|_| post_only_trigger());
+            let cache = PluginCache::new(&make_config(
+                vec![make_proxy("p1", "/", vec!["auth"])],
+                vec![auth],
+            ))
+            .unwrap_or_else(|error| panic!("{plugin_name}: {error}"));
+            let method = case.unwrap_or("GET");
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                method.to_string(),
+                "/api/orders".to_string(),
+            );
+            let forged = HashMap::from([
+                ("x-user-email".to_string(), "ceo@corp.example".to_string()),
+                ("X_User_Email".to_string(), "ceo@corp.example".to_string()),
+                ("x-unrelated".to_string(), "kept".to_string()),
+            ]);
+            let headers = backend_headers_after_before_proxy(&cache, &mut ctx, forged).await;
+
+            let skipped = case == Some("GET");
+            assert_eq!(
+                ctx.metadata
+                    .get("plugin_trigger.auth.skipped")
+                    .map(String::as_str),
+                skipped.then_some("true"),
+                "{plugin_name} {case:?}: unexpected trigger decision"
+            );
+            assert!(
+                !headers.keys().any(|name| {
+                    name.eq_ignore_ascii_case("x-user-email")
+                        || name.eq_ignore_ascii_case("x_user_email")
+                }),
+                "{plugin_name} {case:?}: a client claim-destination copy reached the backend"
+            );
+            assert_eq!(
+                headers.get("x-unrelated").map(String::as_str),
+                Some("kept"),
+                "{plugin_name} {case:?}: only owned destinations are sanitized"
+            );
+        }
+    }
+}
+
+/// An auth instance that owns no claim destination has nothing to sanitize: a
+/// skipped instance leaves a same-named client header alone, exactly as the
+/// untriggered instance does.
+#[tokio::test]
+async fn trigger_skipped_auth_instance_without_claim_headers_strips_nothing() {
+    for case in OWNED_HEADER_TRIGGER_CASES {
+        let mut auth = make_plugin_config_with_json(
+            "auth",
+            "jwks_auth",
+            minimal_plugin_config("jwks_auth"),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        auth.trigger = case.map(|_| post_only_trigger());
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["auth"])],
+            vec![auth],
+        ))
+        .unwrap();
+        let method = case.unwrap_or("GET");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api/orders".to_string(),
+        );
+        let client = HashMap::from([("x-user-email".to_string(), "me@example".to_string())]);
+        let headers = backend_headers_after_before_proxy(&cache, &mut ctx, client).await;
+        assert_eq!(
+            headers.get("x-user-email").map(String::as_str),
+            Some("me@example"),
+            "{case:?}"
+        );
+    }
+}
+
+/// Same contract for `spiffe_identity` `forward_identity`: the fixed
+/// `x-ferrum-peer-spiffe-id` header is gateway-owned on every request, so a
+/// trigger-skipped instance must still drop a client-chosen value.
+#[tokio::test]
+async fn trigger_skipped_spiffe_identity_still_strips_forwarded_identity_header() {
+    for case in OWNED_HEADER_TRIGGER_CASES {
+        let mut spiffe = make_plugin_config_with_json(
+            "sid",
+            "spiffe_identity",
+            json!({"forward_identity": true}),
+            PluginScope::Proxy,
+            Some("p1"),
+        );
+        spiffe.trigger = case.map(|_| post_only_trigger());
+        let cache = PluginCache::new(&make_config(
+            vec![make_proxy("p1", "/", vec!["sid"])],
+            vec![spiffe],
+        ))
+        .unwrap();
+        let method = case.unwrap_or("GET");
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api/orders".to_string(),
+        );
+        let forged = HashMap::from([
+            (
+                "x-ferrum-peer-spiffe-id".to_string(),
+                "spiffe://corp.example/ns/admin/sa/root".to_string(),
+            ),
+            (
+                "X_Ferrum_Peer_Spiffe_Id".to_string(),
+                "spiffe://corp.example/ns/admin/sa/root".to_string(),
+            ),
+        ]);
+        let headers = backend_headers_after_before_proxy(&cache, &mut ctx, forged).await;
+        assert_eq!(
+            ctx.metadata
+                .get("plugin_trigger.sid.skipped")
+                .map(String::as_str),
+            (case == Some("GET")).then_some("true"),
+            "{case:?}: unexpected trigger decision"
+        );
+        assert!(
+            headers.is_empty(),
+            "{case:?}: a client SPIFFE identity copy reached the backend: {headers:?}"
+        );
+    }
+}

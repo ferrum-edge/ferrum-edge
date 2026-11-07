@@ -31,7 +31,7 @@ use super::utils::auth_flow::{
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
-    emit_claim_headers_to_attempt, parse_claim_headers,
+    emit_claim_headers_to_attempt, parse_claim_headers, sanitize_claim_header_destinations,
 };
 use super::utils::claim_resolver::{extract_claim_string, extract_claim_string_exact};
 use super::utils::jwks_cache::{
@@ -3337,6 +3337,15 @@ impl super::Plugin for OidcRelyingParty {
             names.push("authorization".to_string());
         }
         Some(names)
+    }
+    /// A trigger-skipped instance still strips its owned claim destinations,
+    /// so a client copy is never forwarded as a gateway claim assertion.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        sanitize_claim_header_destinations(ctx, headers, &self.provider.claim_header_destinations);
     }
     async fn before_proxy(
         &self,

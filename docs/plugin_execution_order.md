@@ -1613,6 +1613,24 @@ is intentionally unauthenticated; if another instance applies, that instance's
 ordinary credential requirement and `WWW-Authenticate` challenge remain in
 force.
 
+Two pieces of fail-safe request work stay **outside** the trigger boundary,
+because gating them could only add disclosure or forgery, never remove work:
+
+- **Credential-redaction discovery** (`mark_query_credentials_for_redaction`,
+  `request_headers_to_redact`): a skipped auth instance still marks the query
+  parameters and headers that carry its credentials, so a trigger never leaks
+  a token into a log line.
+- **Owned request-header sanitization** (`sanitize_owned_request_headers`):
+  where `before_proxy` would have run, a skipped instance still removes the
+  client copies of the request headers it owns as gateway assertions and
+  installs nothing. Today that is every `claim_headers` / `output_claim_headers`
+  destination of `jwks_auth`, `oauth2_introspection`, and `oidc_relying_party`,
+  and `spiffe_identity`'s `x-ferrum-peer-spiffe-id` with `forward_identity`.
+  Without it a client that misses the trigger could forward a forged value the
+  backend reads as a gateway assertion. Sanitization is claimed per
+  destination per request, so a trigger-admitted sibling instance that shares
+  a destination keeps the value it installs, in either order.
+
 `response_caching` has one configuration-specific restriction: its default
 `add_cache_status_header: true` publishes named response-trailer ownership, a
 contextless generation-wide capability, so that form cannot carry a trigger.

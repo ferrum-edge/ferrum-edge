@@ -17,6 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the JWT-authenticated `GET /mesh/config-drift`.
 
 ### Fixed
+- **A trigger-skipped instance still strips the gateway-owned request headers
+  it owns.** `claim_headers` / `output_claim_headers` destinations on
+  `jwks_auth`, `oauth2_introspection` and `oidc_relying_party` are documented
+  as always sanitized, and `spiffe_identity` with `forward_identity` owns
+  `x-ferrum-peer-spiffe-id` on every request. When such an instance carried an
+  execution trigger that a request missed, its whole `before_proxy` hook was
+  skipped, so a client-supplied copy (for example `X-User-Email` sent by a
+  `key_auth` consumer on a multi-auth route) reached the backend as if it were
+  a gateway assertion. A skipped instance now removes those client copies
+  through a new ungated `Plugin::sanitize_owned_request_headers` hook (no-op by
+  default) and installs nothing; a trigger-admitted sibling that installs a
+  verified value for the same header is unaffected. A route that relied on a
+  client value under one of those names reaching the backend on
+  trigger-excluded requests no longer receives it.
 - **Non-admin admin-API reads no longer return inline backend TLS private
   keys.** `backend_tls_client_key_path` on proxies and upstreams accepts
   inline PEM, but `viewer` and `operator` reads (`GET /proxies[/{id}]`,

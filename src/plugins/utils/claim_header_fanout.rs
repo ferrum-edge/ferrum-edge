@@ -399,6 +399,24 @@ pub fn apply_claim_headers_from_context(
     }
 }
 
+/// Strip every gateway-owned destination this instance still has to claim,
+/// without installing anything.
+///
+/// Used through [`crate::plugins::Plugin::sanitize_owned_request_headers`]
+/// when the owning instance's execution trigger skips the request: it
+/// authenticated nothing and installs nothing, but a client copy of a
+/// destination it owns must still never reach the backend as a gateway claim
+/// assertion. Sanitization is claimed exactly as in
+/// [`apply_claim_headers_from_context`], so an admitted instance sharing a
+/// destination keeps the value it installs in either order.
+pub fn sanitize_claim_header_destinations(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    destinations: &ClaimHeaderDestinations,
+) {
+    sanitize_owned_claim_header_destinations(ctx, headers, destinations);
+}
+
 /// Remove every gateway-owned destination this instance still has to claim.
 ///
 /// Runs before installation so an absent, wrong-type, or unusable claim can

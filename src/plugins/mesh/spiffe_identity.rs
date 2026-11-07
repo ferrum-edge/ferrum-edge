@@ -715,6 +715,31 @@ impl Plugin for SpiffeIdentity {
         PluginResult::Continue
     }
 
+    /// A trigger-skipped `forward_identity` instance forwards no identity, but
+    /// still removes every client-supplied [`FORWARDED_IDENTITY_HEADER`] copy,
+    /// so a trigger can never turn a client-chosen value into the gateway's
+    /// assertion. The one copy kept is the canonical name carrying exactly the
+    /// request's admitted peer SPIFFE ID: that is the value an admitted sibling
+    /// instance earlier in the chain installed, and the value this instance
+    /// would itself have installed.
+    fn sanitize_owned_request_headers(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        use crate::proxy::headers::field_names_equivalent_for_backends;
+
+        if !self.forward_identity {
+            return;
+        }
+        let admitted = ctx.peer_spiffe_id.as_ref().map(|id| id.as_str());
+        headers.retain(|name, value| {
+            let owned = field_names_equivalent_for_backends(name, FORWARDED_IDENTITY_HEADER);
+            let installed = name == FORWARDED_IDENTITY_HEADER && admitted == Some(value.as_str());
+            !owned || installed
+        });
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         // A pre-stamped peer identity (e.g. the node-waypoint eBPF-attested pod
         // SPIFFE ID set by the stream accept loop) must win over peer-cert
