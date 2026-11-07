@@ -3150,7 +3150,7 @@ fn adaptive_concurrency_build_resolves_each_federation_plan_once() {
         .expect("federation config should exist");
     reloaded.plugin_configs[federation_index].config = federation("replacement-ai.example");
     let all_proxies: HashSet<NamespacedResourceId> = (1..=POLICIES)
-        .map(|index| NamespacedResourceId::new("default", &format!("proxy-{index}")))
+        .map(|index| NamespacedResourceId::new("default", format!("proxy-{index}")))
         .collect();
     let before = ai_federation_route_plan_resolutions_for_test();
     cache
