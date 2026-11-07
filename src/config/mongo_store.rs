@@ -1796,6 +1796,11 @@ mod inner {
                 crate::config::db_backend::checked_next_config_topology_epoch(
                     self.topology_epoch.load(Ordering::Acquire),
                 )?;
+            // Revalidate the failback permit right before publication so a
+            // stale permit aborts with nothing published (issue #7033).
+            if let Some(permit) = primary_failback_permit.as_ref() {
+                self.failover_topology.revalidate_primary_failback(permit)?;
+            }
             if topology == MongoReconnectTopology::Failover {
                 self.failover_topology.mark_failover(url_redacted);
             }

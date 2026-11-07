@@ -8830,10 +8830,20 @@ impl DatabaseStore {
         // helper uses a CAS so concurrent callers don't run migrations twice,
         // and restores the flag on failure so a transient error doesn't
         // silently skip migrations forever.
-        if let Err(error) = self
-            .maybe_apply_deferred_migrations_on_pool(new_pool.clone())
-            .await
-        {
+        //
+        // The failback permit is then revalidated right before publication: a
+        // permit gone stale (an Admin write admitted on failover since the
+        // fence check) aborts here with nothing published.
+        let staged = async {
+            self.maybe_apply_deferred_migrations_on_pool(new_pool.clone())
+                .await?;
+            if let Some(permit) = primary_failback_permit.as_ref() {
+                self.failover_topology.revalidate_primary_failback(permit)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = staged {
             tokio::spawn(async move {
                 new_pool.close().await;
             });
