@@ -1763,7 +1763,12 @@ write can fail part-way (the scope lands, then the pod-IP flag or the other
 family fails), the tracked scope is not trusted while that marker is pending:
 the next pod event rewrites the full scope even when its ports equal the
 tracked set, so a port the spec has since withdrawn cannot stay
-redirect-eligible, and the marker clears once a full write succeeds. Pod
+redirect-eligible, and the marker clears once a full write succeeds. A pod-IP
+move follows the same rule: a move whose scope landed at the new address before
+the pod-IP write failed records that target address, the next event (even one
+naming the tracked address) re-converges the tracked address, and the abandoned
+target's pod-IP entry and scope are removed (as a durable removal retry if that
+fails). Pod removal also retires such abandoned targets. Pod
 removal prunes every live-pod capture-failure marker (pod-IP, probe-port,
 UDP-readiness and redirect updates); only teardown blockers (pod-IP, probe-port
 and cgroup map removals, program detach) survive until their retry succeeds,

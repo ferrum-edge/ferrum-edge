@@ -148,10 +148,12 @@ struct CniOwnedAttachment {
 /// `forget_capture_failure` / `forget_capture_failures_matching`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum CaptureFailureOp {
-    /// A live pod's IPv4 pod-IP map (or its moved redirect scope) write failed.
-    PodIpUpdate,
-    /// A live pod's IPv6 pod-IP map (or its moved redirect scope) write failed.
-    PodIp6Update,
+    /// A live pod's move to this IPv4 address failed part-way: its redirect
+    /// scope and/or pod-IP entry may already be written there while the tracked
+    /// address was not advanced.
+    PodIpUpdate(std::net::Ipv4Addr),
+    /// IPv6 counterpart of `PodIpUpdate`.
+    PodIp6Update(std::net::Ipv6Addr),
     /// A live pod's node probe-port maps could not be brought to `desired_ports`.
     NodeProbePortUpdate { desired_ports: Vec<u16> },
     /// A live pod's Ambient UDP readiness bit could not be reconciled.
@@ -187,8 +189,8 @@ impl CaptureFailureOp {
             | Self::NodeProbePortRemove { .. }
             | Self::IncludePortsRemove { .. }
             | Self::WorkloadIdentityRemove { .. } => true,
-            Self::PodIpUpdate
-            | Self::PodIp6Update
+            Self::PodIpUpdate(_)
+            | Self::PodIp6Update(_)
             | Self::NodeProbePortUpdate { .. }
             | Self::UdpReadiness
             | Self::InboundRedirectUpdate => false,
@@ -7484,6 +7486,17 @@ fn handle_pod_added_inner(
                 "Pod already enrolled, reconciled state"
             );
             drop(state);
+            // Before the recovery check, so a failed removal's durable blocker
+            // is visible to it.
+            remove_abandoned_pod_ip_targets(
+                backend,
+                pod_states,
+                metrics,
+                pod_uid,
+                &pod_ip_reconcile.abandoned_pod_ips,
+                &pod_ip6_reconcile.abandoned_pod_ips,
+                "abandoned pod IP move",
+            );
             if pod_ip_reconcile.recovered_pending_failure
                 || pod_ip6_reconcile.recovered_pending_failure
                 || node_probe_reconcile.recovered_pending_failure
@@ -8065,6 +8078,10 @@ fn handle_pod_added_inner(
 #[derive(Debug)]
 struct PodIpReconcileResult<Ip> {
     stale_pod_ip: Option<Ip>,
+    /// Targets of earlier failed moves that the converged address superseded.
+    /// Their scope (and any pod-IP entry) may have been written, so the caller
+    /// removes them once it no longer holds the pod's state guard.
+    abandoned_pod_ips: Vec<Ip>,
     recovered_pending_failure: bool,
     pod_ip_update_failed: bool,
 }
@@ -8073,9 +8090,64 @@ impl<Ip> Default for PodIpReconcileResult<Ip> {
     fn default() -> Self {
         Self {
             stale_pod_ip: None,
+            abandoned_pod_ips: Vec::new(),
             recovered_pending_failure: false,
             pod_ip_update_failed: false,
         }
+    }
+}
+
+/// IPv4 targets of pending failed pod-IP moves for one pod-state identity.
+fn pending_pod_ip_update_targets(state_key: &str) -> Vec<std::net::Ipv4Addr> {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .map(|record| {
+            record
+                .iter()
+                .filter_map(|op| match op {
+                    CaptureFailureOp::PodIpUpdate(ip) => Some(*ip),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// IPv6 targets of pending failed pod-IP moves for one pod-state identity.
+fn pending_pod_ip6_update_targets(state_key: &str) -> Vec<std::net::Ipv6Addr> {
+    PENDING_CAPTURE_FAILURES
+        .get(state_key)
+        .map(|record| {
+            record
+                .iter()
+                .filter_map(|op| match op {
+                    CaptureFailureOp::PodIp6Update(ip) => Some(*ip),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remove the pod-IP entry and redirect scope a failed pod-IP move may have
+/// written at addresses the pod no longer moves to. Ownership by another
+/// tracked pod is respected, and a failed removal is queued as a durable
+/// `PodIpRemove` blocker by the removal helpers. Must be called without
+/// holding a `pod_states` guard.
+fn remove_abandoned_pod_ip_targets(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    pod_uid: &str,
+    abandoned_v4: &[std::net::Ipv4Addr],
+    abandoned_v6: &[std::net::Ipv6Addr],
+    removal_reason: &'static str,
+) {
+    for ip in abandoned_v4 {
+        remove_pod_ip_if_unowned(backend, pod_states, metrics, pod_uid, *ip, removal_reason);
+    }
+    for ip in abandoned_v6 {
+        remove_pod_ip6_if_unowned(backend, pod_states, metrics, pod_uid, *ip, removal_reason);
     }
 }
 
@@ -8145,7 +8217,12 @@ fn reconcile_existing_pod_ip(
     let Some(new_ip) = pod_ip else {
         return PodIpReconcileResult::default();
     };
-    if state.pod_ip == Some(new_ip) {
+    // A failed move may have written scope (and the pod-IP entry) at its
+    // target while the tracked address stayed put. While any such record is
+    // pending, an event naming the tracked address must not return early: it
+    // re-converges that address and retires the abandoned target (#7025).
+    let pending_targets = pending_pod_ip_update_targets(state_key);
+    if state.pod_ip == Some(new_ip) && pending_targets.is_empty() {
         return PodIpReconcileResult::default();
     }
 
@@ -8163,7 +8240,7 @@ fn reconcile_existing_pod_ip(
             "Failed to move the inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
-        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate);
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
@@ -8174,17 +8251,24 @@ fn reconcile_existing_pod_ip(
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IP map for existing pod");
         metrics.record_attach_error();
-        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate);
+        remember_capture_failure(state_key, CaptureFailureOp::PodIpUpdate(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
         };
     }
-    forget_capture_failure(state_key, &CaptureFailureOp::PodIpUpdate);
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::PodIpUpdate(_))
+    });
     let old_ip = state.pod_ip;
     state.pod_ip = Some(new_ip);
+    let abandoned_pod_ips = pending_targets
+        .into_iter()
+        .filter(|ip| *ip != new_ip && Some(*ip) != old_ip)
+        .collect();
     PodIpReconcileResult {
-        stale_pod_ip: old_ip,
+        stale_pod_ip: old_ip.filter(|ip| *ip != new_ip),
+        abandoned_pod_ips,
         recovered_pending_failure: true,
         pod_ip_update_failed: false,
     }
@@ -8202,7 +8286,9 @@ fn reconcile_existing_pod_ip6(
     let Some(new_ip) = pod_ip else {
         return PodIpReconcileResult::default();
     };
-    if state.pod_ip6 == Some(new_ip) {
+    // Same pending-move contract as the IPv4 reconcile (#7025).
+    let pending_targets = pending_pod_ip6_update_targets(state_key);
+    if state.pod_ip6 == Some(new_ip) && pending_targets.is_empty() {
         return PodIpReconcileResult::default();
     }
 
@@ -8223,7 +8309,7 @@ fn reconcile_existing_pod_ip6(
             "Failed to move the IPv6 inbound redirect scope to the pod's new IP"
         );
         metrics.record_attach_error();
-        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update);
+        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
@@ -8234,17 +8320,24 @@ fn reconcile_existing_pod_ip6(
     if let Err(e) = backend.update_pod_ip6(new_ip, &info) {
         warn!(pod_uid = %crate::startup::sanitize_startup_scalar(pod_uid), new_ip = %crate::startup::sanitize_startup_scalar(new_ip), error = %crate::startup::sanitize_startup_scalar(&e), "Failed to update pod IPv6 map for existing pod");
         metrics.record_attach_error();
-        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update);
+        remember_capture_failure(state_key, CaptureFailureOp::PodIp6Update(new_ip));
         return PodIpReconcileResult {
             pod_ip_update_failed: true,
             ..PodIpReconcileResult::default()
         };
     }
-    forget_capture_failure(state_key, &CaptureFailureOp::PodIp6Update);
+    forget_capture_failures_matching(state_key, |op| {
+        matches!(op, CaptureFailureOp::PodIp6Update(_))
+    });
     let old_ip = state.pod_ip6;
     state.pod_ip6 = Some(new_ip);
+    let abandoned_pod_ips = pending_targets
+        .into_iter()
+        .filter(|ip| *ip != new_ip && Some(*ip) != old_ip)
+        .collect();
     PodIpReconcileResult {
-        stale_pod_ip: old_ip,
+        stale_pod_ip: old_ip.filter(|ip| *ip != new_ip),
+        abandoned_pod_ips,
         recovered_pending_failure: true,
         pod_ip_update_failed: false,
     }
@@ -9203,7 +9296,11 @@ pub fn handle_pod_removed(
     // pod that no longer exists. Leaving one would keep the node
     // PARTIALLY_ATTACHED forever and make every retry tick re-retract the
     // Ambient UDP registry proof (#7025). Removal blockers survive: teardown
-    // below and the periodic retries own them.
+    // below and the periodic retries own them. A failed pod-IP move may have
+    // written scope at its target, so those targets are snapshotted first and
+    // removed below (as durable removal blockers when that fails).
+    let abandoned_v4 = pending_pod_ip_update_targets(&state_key);
+    let abandoned_v6 = pending_pod_ip6_update_targets(&state_key);
     forget_live_pod_capture_failures(&state_key);
     // Drop this pod's per-pod registry entry (if publishing is enabled) so the
     // mesh proxy's in-netns capture listeners stop discovering a torn-down pod.
@@ -9218,6 +9315,28 @@ pub fn handle_pod_removed(
     }
 
     let removed = pod_states.remove(pod_uid);
+    // Teardown below owns the tracked addresses (and their removal order);
+    // only addresses the pod never converged to are retired here.
+    let (tracked_v4, tracked_v6) = removed
+        .as_ref()
+        .map_or((None, None), |(_, state)| (state.pod_ip, state.pod_ip6));
+    let abandoned_v4: Vec<std::net::Ipv4Addr> = abandoned_v4
+        .into_iter()
+        .filter(|ip| Some(*ip) != tracked_v4)
+        .collect();
+    let abandoned_v6: Vec<std::net::Ipv6Addr> = abandoned_v6
+        .into_iter()
+        .filter(|ip| Some(*ip) != tracked_v6)
+        .collect();
+    remove_abandoned_pod_ip_targets(
+        backend,
+        pod_states,
+        metrics,
+        pod_uid,
+        &abandoned_v4,
+        &abandoned_v6,
+        "abandoned pod IP move on pod removal",
+    );
     let Some((_, state)) = removed else {
         if let Some(failed_attempt) = failed_attempt {
             // `None` proves the attempt failed before the BPF mutation phase;
@@ -19215,7 +19334,7 @@ mod tests {
         handle_pod_added(&mut backend, &pod_states, &config, &metrics, &event);
 
         let state_key = pod_state_key(&pod_states, "pod-uid-1");
-        let failure_key = CaptureFailureOp::PodIpUpdate;
+        let failure_key = CaptureFailureOp::PodIpUpdate(std::net::Ipv4Addr::new(10, 0, 0, 8));
         assert!(has_capture_failure(&state_key, &failure_key));
         assert_eq!(
             metrics.snapshot().capture_state,

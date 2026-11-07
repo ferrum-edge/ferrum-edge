@@ -113,6 +113,10 @@ fn seventeenth_port_installs_capture_all_for_pod_and_container_cgroups() {
 /// NodeWaypoint config whose inbound tc ingress redirect is armed (IPv4-only
 /// capture listener), rooted at a scratch cgroup tree.
 fn redirect_config(cgroup_root: String) -> NodeAgentConfig {
+    redirect_config_with_ipv6(cgroup_root, false)
+}
+
+fn redirect_config_with_ipv6(cgroup_root: String, supports_ipv6: bool) -> NodeAgentConfig {
     let mut config = config();
     config.cgroup_root = cgroup_root;
     config.capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
@@ -120,7 +124,7 @@ fn redirect_config(cgroup_root: String) -> NodeAgentConfig {
     config.capture_contract.node_waypoint_ingress_redirect_mark =
         NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
     config.capture_contract.ingress_capture_port = 15006;
-    config.capture_contract.ingress_capture_supports_ipv6 = false;
+    config.capture_contract.ingress_capture_supports_ipv6 = supports_ipv6;
     assert!(config.capture_contract.ingress_redirect_enabled());
     config
 }
@@ -137,6 +141,18 @@ fn redirect_scope_v4(
         .collect()
 }
 
+fn redirect_scope_v6(
+    backend: &MockEbpfBackend,
+    ip: std::net::Ipv6Addr,
+) -> std::collections::BTreeSet<u16> {
+    backend
+        .pod_inbound_ports6
+        .iter()
+        .filter(|(entry_ip, _)| *entry_ip == ip)
+        .map(|(_, port)| *port)
+        .collect()
+}
+
 fn drive_redirect_pod(
     backend: &mut MockEbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
@@ -145,9 +161,30 @@ fn drive_redirect_pod(
     pod_ip: std::net::Ipv4Addr,
     inbound_redirect_ports: Vec<u16>,
 ) {
+    drive_redirect_pod_with_ips(
+        backend,
+        pod_states,
+        config,
+        metrics,
+        PodSourceIps {
+            ipv4: Some(pod_ip),
+            ipv6: None,
+        },
+        inbound_redirect_ports,
+    );
+}
+
+fn drive_redirect_pod_with_ips(
+    backend: &mut MockEbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    pod_source_ips: PodSourceIps,
+    inbound_redirect_ports: Vec<u16>,
+) {
     let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
     let annotations = HashMap::new();
-    let pod_ip_str = pod_ip.to_string();
+    let pod_ip_str = pod_source_ips.ipv4.map(|ip| ip.to_string());
     let event = PodEvent {
         pod_uid: "pod-uid-1",
         pod_name: "test-pod",
@@ -155,11 +192,8 @@ fn drive_redirect_pod(
         service_account: None,
         labels: &labels,
         annotations: &annotations,
-        pod_ip_str: Some(pod_ip_str.as_str()),
-        pod_source_ips: PodSourceIps {
-            ipv4: Some(pod_ip),
-            ipv6: None,
-        },
+        pod_ip_str: pod_ip_str.as_deref(),
+        pod_source_ips,
         node_probe_ports: Vec::new(),
         inbound_redirect_ports,
         veth_iface_override: Some("veth-mock"),
@@ -273,9 +307,15 @@ fn pod_removal_prunes_every_live_pod_capture_failure_record() {
     assert!(pod_states.contains_key("pod-uid-1"));
 
     let state_key = pod_state_key(&pod_states, "pod-uid-1");
+    // Targets of failed pod-IP moves whose redirect scope landed before the
+    // pod-IP write failed: removal must retire them, not just the record.
+    let abandoned_v4: std::net::Ipv4Addr = "10.0.0.77".parse().unwrap();
+    let abandoned_v6: std::net::Ipv6Addr = "fd00::77".parse().unwrap();
+    backend.pod_inbound_ports.insert((abandoned_v4, 8080));
+    backend.pod_inbound_ports6.insert((abandoned_v6, 8080));
     let live_records = [
-        CaptureFailureOp::PodIpUpdate,
-        CaptureFailureOp::PodIp6Update,
+        CaptureFailureOp::PodIpUpdate(abandoned_v4),
+        CaptureFailureOp::PodIp6Update(abandoned_v6),
         CaptureFailureOp::NodeProbePortUpdate {
             desired_ports: vec![8080],
         },
@@ -297,6 +337,8 @@ fn pod_removal_prunes_every_live_pod_capture_failure_record() {
     handle_pod_removed(&mut backend, &pod_states, &config, &metrics, "pod-uid-1");
 
     assert!(!pod_states.contains_key("pod-uid-1"));
+    assert!(redirect_scope_v4(&backend, abandoned_v4).is_empty());
+    assert!(redirect_scope_v6(&backend, abandoned_v6).is_empty());
     for record in &live_records {
         assert!(
             !has_capture_failure(&state_key, record),
@@ -322,4 +364,169 @@ fn pod_removal_prunes_every_live_pod_capture_failure_record() {
         metrics.snapshot().capture_state,
         NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED
     );
+}
+
+/// Issue #7025, pod-IP sibling: a move to a new IPv4 address that writes the
+/// scope there and then fails the pod-IP write must not pend forever when the
+/// next event reverts to the tracked address. The revert re-converges the
+/// tracked address, retires the abandoned target's scope, and clears the record.
+#[test]
+fn pod_ip_move_failure_followed_by_reverting_event_retires_the_abandoned_target() {
+    let cgroup_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+    let config = redirect_config(cgroup_root.path().to_string_lossy().to_string());
+    let mut backend = MockEbpfBackend::default();
+    backend.load_programs().unwrap();
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    let metrics = NodeAgentMetrics::default();
+    let tracked_ip: std::net::Ipv4Addr = "10.0.0.5".parse().unwrap();
+    let moved_ip: std::net::Ipv4Addr = "10.0.0.7".parse().unwrap();
+    let state_key = pod_state_key(&pod_states, "pod-uid-1");
+
+    drive_redirect_pod(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        tracked_ip,
+        vec![8080],
+    );
+    assert_eq!(
+        redirect_scope_v4(&backend, tracked_ip),
+        std::collections::BTreeSet::from([8080])
+    );
+
+    backend.fail_update_pod_ip = true;
+    drive_redirect_pod(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        moved_ip,
+        vec![8080],
+    );
+    assert_eq!(
+        pod_states.get("pod-uid-1").unwrap().pod_ip,
+        Some(tracked_ip)
+    );
+    assert_eq!(
+        redirect_scope_v4(&backend, moved_ip),
+        std::collections::BTreeSet::from([8080]),
+        "the scope moved before the pod-IP write failed"
+    );
+    assert!(has_capture_failure(
+        &state_key,
+        &CaptureFailureOp::PodIpUpdate(moved_ip)
+    ));
+
+    backend.fail_update_pod_ip = false;
+    drive_redirect_pod(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        tracked_ip,
+        vec![8080],
+    );
+    assert_eq!(
+        pod_states.get("pod-uid-1").unwrap().pod_ip,
+        Some(tracked_ip)
+    );
+    assert_eq!(
+        redirect_scope_v4(&backend, tracked_ip),
+        std::collections::BTreeSet::from([8080])
+    );
+    assert!(backend.pod_ips[&tracked_ip].inbound_redirect_enabled());
+    assert!(
+        redirect_scope_v4(&backend, moved_ip).is_empty(),
+        "the abandoned target's scope must be cleared"
+    );
+    assert!(!backend.pod_ips.contains_key(&moved_ip));
+    assert!(!has_capture_failure(
+        &state_key,
+        &CaptureFailureOp::PodIpUpdate(moved_ip)
+    ));
+    assert!(!has_pending_capture_failures(&pod_states));
+}
+
+/// IPv6 counterpart of the pod-IP move regression (dual-stack pod with an
+/// IPv6-capable capture listener; the IPv4 address never changes).
+#[test]
+fn pod_ip6_move_failure_followed_by_reverting_event_retires_the_abandoned_target() {
+    let cgroup_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+    let config = redirect_config_with_ipv6(cgroup_root.path().to_string_lossy().to_string(), true);
+    let mut backend = MockEbpfBackend::default();
+    backend.load_programs().unwrap();
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    let metrics = NodeAgentMetrics::default();
+    let ip4: std::net::Ipv4Addr = "10.0.0.5".parse().unwrap();
+    let tracked_ip6: std::net::Ipv6Addr = "fd00::5".parse().unwrap();
+    let moved_ip6: std::net::Ipv6Addr = "fd00::7".parse().unwrap();
+    let state_key = pod_state_key(&pod_states, "pod-uid-1");
+    let ips = |ip6: std::net::Ipv6Addr| PodSourceIps {
+        ipv4: Some(ip4),
+        ipv6: Some(ip6),
+    };
+
+    drive_redirect_pod_with_ips(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        ips(tracked_ip6),
+        vec![8080],
+    );
+    assert_eq!(
+        redirect_scope_v6(&backend, tracked_ip6),
+        std::collections::BTreeSet::from([8080])
+    );
+
+    backend.fail_update_pod_ip = true;
+    drive_redirect_pod_with_ips(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        ips(moved_ip6),
+        vec![8080],
+    );
+    assert_eq!(
+        pod_states.get("pod-uid-1").unwrap().pod_ip6,
+        Some(tracked_ip6)
+    );
+    assert_eq!(
+        redirect_scope_v6(&backend, moved_ip6),
+        std::collections::BTreeSet::from([8080])
+    );
+    assert!(has_capture_failure(
+        &state_key,
+        &CaptureFailureOp::PodIp6Update(moved_ip6)
+    ));
+
+    backend.fail_update_pod_ip = false;
+    drive_redirect_pod_with_ips(
+        &mut backend,
+        &pod_states,
+        &config,
+        &metrics,
+        ips(tracked_ip6),
+        vec![8080],
+    );
+    assert_eq!(
+        pod_states.get("pod-uid-1").unwrap().pod_ip6,
+        Some(tracked_ip6)
+    );
+    assert_eq!(
+        redirect_scope_v6(&backend, tracked_ip6),
+        std::collections::BTreeSet::from([8080])
+    );
+    assert!(backend.pod_ips6[&tracked_ip6].inbound_redirect_enabled());
+    assert!(redirect_scope_v6(&backend, moved_ip6).is_empty());
+    assert!(!backend.pod_ips6.contains_key(&moved_ip6));
+    assert!(!has_capture_failure(
+        &state_key,
+        &CaptureFailureOp::PodIp6Update(moved_ip6)
+    ));
+    assert!(!has_pending_capture_failures(&pod_states));
 }

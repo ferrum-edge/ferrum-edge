@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later event reverting to the previously tracked ports returned early and the
   withdrawn port stayed in the BPF scope. While a redirect write is pending the
   node-agent now rewrites the full scope on every event and clears the pending
-  failure once it converges. Pod removal now drops every live-pod capture
+  failure once it converges. A failed pod-IP move gets the same treatment:
+  the abandoned target address is recorded, a later event (even one that
+  reverts to the tracked address) re-converges the tracked address and removes
+  the abandoned scope, instead of leaving the record pending for the pod's
+  lifetime. Pod removal now drops every live-pod capture
   failure record, including the redirect one it used to miss, so a removed pod
   no longer pins the node in `partially_attached` or makes every retry tick
   retract and republish the Ambient UDP registry proof. A failed cgroup program
